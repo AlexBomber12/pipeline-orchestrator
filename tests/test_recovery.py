@@ -260,9 +260,11 @@ def test_recover_no_doing_no_prs_stays_idle(
 def test_recover_get_open_prs_failure_sets_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failing GitHub API call during recovery must transition to ERROR so
-    the operator notices, rather than silently going IDLE and picking up a
-    new task that might collide with an unknown in-flight PR."""
+    """A failing GitHub API call during recovery must transition to ERROR
+    AND return False so run_cycle leaves _recovered unset and retries
+    discovery on the next cycle (rather than silently going IDLE and
+    picking up a new task that might collide with an unknown in-flight
+    PR)."""
     monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
 
     def boom(repo: str) -> list[PRInfo]:
@@ -271,8 +273,9 @@ def test_recover_get_open_prs_failure_sets_error(
     monkeypatch.setattr(runner_module.github_client, "get_open_prs", boom)
 
     runner = _make_runner()
-    asyncio.run(runner.recover_state())
+    result = asyncio.run(runner.recover_state())
 
+    assert result is False
     assert runner.state.state == PipelineState.ERROR
     assert "gh auth token expired" in (runner.state.error_message or "")
 
@@ -295,8 +298,9 @@ def test_recover_state_runs_only_once_per_process(
 
     calls: list[str] = []
 
-    async def counting_recover() -> None:
+    async def counting_recover() -> bool:
         calls.append("recover")
+        return True
 
     runner = _make_runner()
     runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
@@ -362,6 +366,95 @@ def test_run_cycle_dirty_tree_does_not_clobber_recovered_watch(
     assert runner.state.error_message is None
 
 
+def test_run_cycle_transient_discovery_failure_stays_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When recover_state's discovery phase fails (e.g. GitHub unreachable),
+    _recovered must stay False so the next cycle retries. Otherwise the
+    daemon would drift detached from an in-flight PR and a later
+    handle_error SKIP/FIX could push it onto new queue work. The second
+    cycle, once get_open_prs recovers, must re-run discovery and attach
+    to the in-flight DOING task's PR."""
+    task = _doing_task()
+    matching_pr = PRInfo(
+        number=17,
+        branch="pr-042-inflight",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+    )
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
+
+    probe_calls: list[int] = []
+
+    def probe(repo: str) -> list[PRInfo]:
+        probe_calls.append(1)
+        if len(probe_calls) == 1:
+            raise RuntimeError("gh api rate limited")
+        return [matching_pr]
+
+    monkeypatch.setattr(runner_module.github_client, "get_open_prs", probe)
+
+    async def noop_ensure() -> None:
+        return None
+
+    def clean_preflight() -> bool:
+        return True
+
+    runner = _make_runner()
+    runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
+    runner.preflight = clean_preflight  # type: ignore[method-assign]
+
+    # First cycle: discovery fails, cycle bails with ERROR.
+    asyncio.run(runner.run_cycle())
+    assert runner._recovered is False
+    assert runner.state.state == PipelineState.ERROR
+    assert "rate limited" in (runner.state.error_message or "")
+    assert runner.state.current_pr is None
+
+    # Second cycle: discovery succeeds; runner attaches to the in-flight
+    # PR and transitions to WATCH. _recovered is now set and later cycles
+    # will skip recovery as normal.
+    asyncio.run(runner.run_cycle())
+    assert runner._recovered is True
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 17
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == "PR-042"
+
+
+def test_run_cycle_coding_failure_during_recovery_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If recover_state decides CODING and the re-run of handle_coding
+    then fails, discovery has nevertheless completed and _recovered must
+    be set. Re-running handle_coding on the next cycle would be unsafe
+    (it could create a duplicate PR for the same task); the failure
+    belongs to the normal ERROR path, not to a second recovery attempt."""
+    task = _doing_task()
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: []
+    )
+
+    coding_calls: list[int] = []
+
+    async def failing_coding() -> None:
+        coding_calls.append(1)
+        runner.state.state = PipelineState.ERROR
+        runner.state.error_message = "claude CLI crashed"
+
+    runner = _make_runner()
+    runner.handle_coding = failing_coding  # type: ignore[method-assign]
+
+    result = asyncio.run(runner.recover_state())
+
+    assert result is True  # discovery completed, do not retry recovery
+    assert coding_calls == [1]
+    assert runner.state.state == PipelineState.ERROR
+    assert "claude CLI crashed" in (runner.state.error_message or "")
+
+
 def test_run_cycle_subsequent_cycle_still_runs_preflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -371,8 +464,8 @@ def test_run_cycle_subsequent_cycle_still_runs_preflight(
     async def noop_ensure() -> None:
         return None
 
-    async def noop_recover() -> None:
-        return None
+    async def noop_recover() -> bool:
+        return True
 
     async def noop_idle() -> None:
         return None

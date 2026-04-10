@@ -169,7 +169,7 @@ class PipelineRunner:
             cwd=self.repo_path,
         )
 
-    async def recover_state(self) -> None:
+    async def recover_state(self) -> bool:
         """Reconstruct state from QUEUE.md + GitHub on daemon startup.
 
         Decision tree:
@@ -179,15 +179,25 @@ class PipelineRunner:
              polling the existing PR).
            - No matching PR -> CODING + re-run ``handle_coding()``
              (Claude CLI run was interrupted before pushing).
-        2. If no DOING task but an open PR exists on this repo:
-           - Attach as an orphan -> WATCH, and if a DONE task in QUEUE.md
-             matches the PR's branch set that as ``current_task`` (the task
-             was marked DONE but the PR has not yet merged).
+        2. If no DOING task but an open PR whose branch matches a DONE
+           task exists -> WATCH (task marked DONE locally but PR not yet
+           merged). Unrelated open PRs are ignored.
         3. Otherwise, stay IDLE.
 
         Runs before ``preflight`` so that even a dirty working tree left
         behind by a crashed cycle does not block recovery. Runs exactly
-        once per process (see ``_recovered`` in ``__init__``).
+        once per process on success (see ``_recovered`` in ``__init__``).
+
+        Returns ``True`` once discovery has completed (whether or not a
+        subsequent re-run of ``handle_coding`` then failed — that failure
+        is handled through the normal ERROR path and must not trigger a
+        second, non-idempotent recovery attempt). Returns ``False`` only
+        when discovery itself could not run — typically a transient
+        GitHub outage during ``get_open_prs`` — so ``run_cycle`` can
+        leave ``_recovered`` unset and retry on the next cycle. Without
+        this distinction, a transient GitHub error at startup would
+        strand the runner detached from an in-flight PR and later allow
+        ``handle_error`` to SKIP/FIX it onto new queue work.
         """
         queue_path = str(Path(self.repo_path) / "tasks" / "QUEUE.md")
         tasks = parse_queue(queue_path)
@@ -199,7 +209,7 @@ class PipelineRunner:
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"recover_state: get_open_prs failed: {exc}"
             self.log_event(f"recover_state failed: {exc}")
-            return
+            return False
 
         if doing is not None:
             self.state.current_task = doing
@@ -215,7 +225,7 @@ class PipelineRunner:
                     f"Recovered: DOING task {doing.pr_id} "
                     f"-> WATCH PR #{matching.number}"
                 )
-                return
+                return True
 
             self.state.state = PipelineState.CODING
             self.log_event(
@@ -223,7 +233,11 @@ class PipelineRunner:
                 "-> re-running CODING"
             )
             await self.handle_coding()
-            return
+            # Even if handle_coding left the runner in ERROR, discovery
+            # itself completed and must not be retried: re-running
+            # handle_coding a second time on the next cycle could create
+            # a duplicate PR for the same task.
+            return True
 
         # No DOING task. An open PR should only be recovered if its branch
         # matches a DONE task in QUEUE.md (task marked DONE locally but PR
@@ -245,7 +259,7 @@ class PipelineRunner:
             self.state.current_task = done_task
             self.state.state = PipelineState.WATCH
             self.log_event(f"Recovered: orphan PR #{orphan_pr.number} -> WATCH")
-            return
+            return True
 
         if prs:
             self.log_event(
@@ -254,6 +268,7 @@ class PipelineRunner:
             )
         else:
             self.log_event("Recovered: no DOING tasks, no open PRs -> IDLE")
+        return True
 
     def preflight(self) -> bool:
         """Return ``True`` iff the working tree is clean."""
@@ -296,7 +311,17 @@ class PipelineRunner:
             # Run before preflight: a crashed cycle may have left a dirty
             # working tree, and recover_state needs to reconstruct the
             # in-memory state from QUEUE.md + GitHub regardless.
-            await self.recover_state()
+            recovery_complete = await self.recover_state()
+            if not recovery_complete:
+                # Discovery phase failed transiently (e.g. GitHub
+                # unreachable). Leave _recovered unset so the next cycle
+                # retries discovery before the runner drifts away from an
+                # in-flight PR. Publish the ERROR so the operator sees
+                # it, then bail for this cycle; running handle_error on a
+                # half-recovered state could SKIP the in-flight task onto
+                # new queue work.
+                await self.publish_state()
+                return
             self._recovered = True
             just_recovered = True
 
