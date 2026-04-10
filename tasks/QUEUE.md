@@ -54,7 +54,7 @@
 - Depends on: PR-008
 
 ## PR-010: Daemon recovery and error handling
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-010.md
 - Branch: pr-010-recovery
 - Depends on: PR-009

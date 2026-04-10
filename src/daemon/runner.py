@@ -24,6 +24,7 @@ from src.models import (
     PipelineState,
     RepoState,
     ReviewStatus,
+    TaskStatus,
 )
 from src.queue_parser import get_next_task, parse_queue
 
@@ -72,6 +73,11 @@ class PipelineRunner:
             name=self.name,
             last_updated=datetime.now(timezone.utc),
         )
+        # One-shot guard so recover_state runs exactly once per process, on
+        # the first cycle after startup. Reconstructing state from QUEUE.md +
+        # GitHub on every cycle would clobber in-memory progress made in
+        # earlier cycles of the same run.
+        self._recovered = False
 
     async def publish_state(self) -> None:
         """Serialize ``self.state`` and write it to Redis."""
@@ -125,6 +131,123 @@ class PipelineRunner:
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("git fetch timed out") from exc
 
+    def sync_to_main(self) -> None:
+        """Hard-sync the working tree to ``origin/{branch}``.
+
+        Only safe to call when the runner is IDLE (no active Claude working
+        branch to clobber). Uses ``git reset --hard`` instead of ``git pull``
+        so that any stray local modifications from a prior crashed cycle are
+        discarded deterministically, guaranteeing QUEUE.md and tasks/ reflect
+        the tip of the base branch before ``parse_queue`` reads them.
+
+        Raises the underlying ``subprocess`` exception on failure so the
+        caller can translate it into ERROR state with appropriate context.
+        """
+        branch = self.repo_config.branch
+        subprocess.run(
+            ["git", "fetch", "origin", branch],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+            cwd=self.repo_path,
+        )
+        subprocess.run(
+            ["git", "checkout", branch],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+            cwd=self.repo_path,
+        )
+        subprocess.run(
+            ["git", "reset", "--hard", f"origin/{branch}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+            cwd=self.repo_path,
+        )
+
+    async def recover_state(self) -> None:
+        """Reconstruct state from QUEUE.md + GitHub on daemon startup.
+
+        Decision tree:
+
+        1. If QUEUE.md has a DOING task:
+           - Matching open PR on that branch -> WATCH (runner resumes
+             polling the existing PR).
+           - No matching PR -> CODING + re-run ``handle_coding()``
+             (Claude CLI run was interrupted before pushing).
+        2. If no DOING task but an open PR exists on this repo:
+           - Attach as an orphan -> WATCH, and if a DONE task in QUEUE.md
+             matches the PR's branch set that as ``current_task`` (the task
+             was marked DONE but the PR has not yet merged).
+        3. Otherwise, stay IDLE.
+
+        Runs before ``preflight`` so that even a dirty working tree left
+        behind by a crashed cycle does not block recovery. Runs exactly
+        once per process (see ``_recovered`` in ``__init__``).
+        """
+        queue_path = str(Path(self.repo_path) / "tasks" / "QUEUE.md")
+        tasks = parse_queue(queue_path)
+        doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
+
+        try:
+            prs = github_client.get_open_prs(self.owner_repo)
+        except Exception as exc:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = f"recover_state: get_open_prs failed: {exc}"
+            self.log_event(f"recover_state failed: {exc}")
+            return
+
+        if doing is not None:
+            self.state.current_task = doing
+            matching = (
+                next((p for p in prs if p.branch == doing.branch), None)
+                if doing.branch
+                else None
+            )
+            if matching is not None:
+                self.state.current_pr = matching
+                self.state.state = PipelineState.WATCH
+                self.log_event(
+                    f"Recovered: DOING task {doing.pr_id} "
+                    f"-> WATCH PR #{matching.number}"
+                )
+                return
+
+            self.state.state = PipelineState.CODING
+            self.log_event(
+                f"Recovered: DOING task {doing.pr_id}, no PR "
+                "-> re-running CODING"
+            )
+            await self.handle_coding()
+            return
+
+        if prs:
+            # No DOING task but an open PR exists: attach to it. The runner
+            # only ever drives one PR at a time, so picking prs[0] is safe
+            # under the one-task-at-a-time invariant enforced by
+            # get_next_task.
+            orphan = prs[0]
+            self.state.current_pr = orphan
+            done_match = next(
+                (
+                    t
+                    for t in tasks
+                    if t.status == TaskStatus.DONE and t.branch == orphan.branch
+                ),
+                None,
+            )
+            if done_match is not None:
+                self.state.current_task = done_match
+            self.state.state = PipelineState.WATCH
+            self.log_event(f"Recovered: orphan PR #{orphan.number} -> WATCH")
+            return
+
+        self.log_event("Recovered: no DOING tasks, no open PRs -> IDLE")
+
     def preflight(self) -> bool:
         """Return ``True`` iff the working tree is clean."""
         try:
@@ -161,6 +284,13 @@ class PipelineRunner:
             await self.publish_state()
             return
 
+        if not self._recovered:
+            # Run before preflight: a crashed cycle may have left a dirty
+            # working tree, and recover_state needs to reconstruct the
+            # in-memory state from QUEUE.md + GitHub regardless.
+            await self.recover_state()
+            self._recovered = True
+
         if not self.preflight():
             await self.publish_state()
             return
@@ -185,34 +315,16 @@ class PipelineRunner:
         await self.publish_state()
 
     async def handle_idle(self) -> None:
-        """Pull latest main, pick the next task, and hand off to CODING."""
-        branch = self.repo_config.branch
-        # Checkout the base branch before pulling so that parse_queue always
-        # reads QUEUE.md from the tip of <branch>. Without this, a previous
-        # cycle that left the repo on a feature branch would cause git pull
-        # to update the wrong branch and parse_queue to read stale/unmerged
-        # queue state, potentially picking the wrong next task.
+        """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
+        # sync_to_main is only safe in IDLE state: it runs git reset --hard
+        # on the base branch, which would destroy any in-flight Claude work
+        # on a feature branch. We are IDLE here, so that's fine.
         try:
-            subprocess.run(
-                ["git", "checkout", branch],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=True,
-                cwd=self.repo_path,
-            )
-            subprocess.run(
-                ["git", "pull", "origin", branch],
-                capture_output=True,
-                text=True,
-                timeout=60,
-                check=True,
-                cwd=self.repo_path,
-            )
+            self.sync_to_main()
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             self.state.state = PipelineState.ERROR
-            self.state.error_message = f"git pull failed: {exc}"
-            self.log_event(f"git pull failed: {exc}")
+            self.state.error_message = f"sync_to_main failed: {exc}"
+            self.log_event(f"sync_to_main failed: {exc}")
             return
 
         queue_path = str(Path(self.repo_path) / "tasks" / "QUEUE.md")

@@ -143,12 +143,20 @@ def test_handle_idle_no_tasks_leaves_state_idle(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert any("No tasks" in e["event"] for e in runner.state.history)
-    # Checkout must happen before pull so parse_queue reads QUEUE.md from
-    # the configured base branch, not whatever branch the repo was left on.
-    commands = [cmd[:2] for cmd in calls]
-    checkout_idx = commands.index(["git", "checkout"])
-    pull_idx = commands.index(["git", "pull"])
-    assert checkout_idx < pull_idx
+    # sync_to_main must run fetch -> checkout -> reset --hard in order so
+    # that parse_queue reads QUEUE.md from the tip of origin/{branch}, not
+    # whatever branch/commit the repo was left on by a prior cycle.
+    commands = [cmd[:3] for cmd in calls]
+    fetch_idx = commands.index(["git", "fetch", "origin"])
+    checkout_idx = next(
+        i for i, cmd in enumerate(commands) if cmd[:2] == ["git", "checkout"]
+    )
+    reset_idx = next(
+        i for i, cmd in enumerate(commands) if cmd[:2] == ["git", "reset"]
+    )
+    assert fetch_idx < checkout_idx < reset_idx
+    # No git pull anywhere: sync_to_main replaced it with reset --hard.
+    assert not any(cmd[:2] == ["git", "pull"] for cmd in calls)
 
 
 def test_handle_idle_picks_task_and_drives_coding(
@@ -648,8 +656,15 @@ def test_run_cycle_resets_stale_transient_state(
     _patch_subprocess(monkeypatch, stdout="")
     monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
     monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: []
+    )
 
     runner = _make_runner()
+    # _recovered=True skips recover_state so this test exercises the
+    # defensive transient-state reset, not the (separately tested)
+    # recovery path that would have caught a mid-coding crash first.
+    runner._recovered = True
     runner.state.state = PipelineState.CODING  # simulate crash mid-coding
     asyncio.run(runner.run_cycle())
 

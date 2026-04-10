@@ -1,0 +1,306 @@
+"""Tests for PipelineRunner.recover_state and the _recovered one-shot gate."""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+import pytest
+
+from src.config import AppConfig, DaemonConfig, RepoConfig
+from src.daemon import runner as runner_module
+from src.daemon.runner import PipelineRunner
+from src.models import (
+    CIStatus,
+    PipelineState,
+    PRInfo,
+    QueueTask,
+    ReviewStatus,
+    TaskStatus,
+)
+
+
+class _FakeRedis:
+    """Minimal async Redis double capturing ``set`` calls."""
+
+    def __init__(self) -> None:
+        self.writes: list[tuple[str, str]] = []
+
+    async def set(self, key: str, value: str) -> None:
+        self.writes.append((key, value))
+
+
+def _repo_cfg(**overrides: Any) -> RepoConfig:
+    base: dict[str, Any] = {
+        "url": "https://github.com/octo/demo.git",
+        "branch": "main",
+        "auto_merge": True,
+        "review_timeout_min": 30,
+        "poll_interval_sec": 60,
+    }
+    base.update(overrides)
+    return RepoConfig(**base)
+
+
+def _make_runner() -> PipelineRunner:
+    return PipelineRunner(
+        _repo_cfg(),
+        AppConfig(repositories=[], daemon=DaemonConfig()),
+        _FakeRedis(),
+    )
+
+
+def _doing_task() -> QueueTask:
+    return QueueTask(
+        pr_id="PR-042",
+        title="In-flight",
+        status=TaskStatus.DOING,
+        branch="pr-042-inflight",
+    )
+
+
+def _done_task() -> QueueTask:
+    return QueueTask(
+        pr_id="PR-041",
+        title="Merged upstream",
+        status=TaskStatus.DONE,
+        branch="pr-041-done",
+    )
+
+
+def _todo_task() -> QueueTask:
+    return QueueTask(
+        pr_id="PR-043",
+        title="Next up",
+        status=TaskStatus.TODO,
+        branch="pr-043-next",
+    )
+
+
+def test_recover_doing_task_with_matching_pr_recovers_to_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DOING task + matching open PR on that branch -> WATCH, no CODING run."""
+    task = _doing_task()
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
+    matching_pr = PRInfo(
+        number=17,
+        branch="pr-042-inflight",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: [matching_pr]
+    )
+
+    coding_called = False
+
+    async def boom() -> None:  # pragma: no cover - must not fire
+        nonlocal coding_called
+        coding_called = True
+
+    runner = _make_runner()
+    runner.handle_coding = boom  # type: ignore[method-assign]
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == "PR-042"
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 17
+    assert coding_called is False
+    assert any(
+        "Recovered: DOING task PR-042" in e["event"] and "WATCH PR #17" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_recover_doing_task_without_pr_rerun_coding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DOING task + no matching PR -> CODING + re-run handle_coding()."""
+    task = _doing_task()
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: []
+    )
+
+    coding_calls: list[PipelineState] = []
+
+    async def fake_coding() -> None:
+        # Capture the state at the moment handle_coding was invoked so the
+        # test can prove recover_state transitioned to CODING before calling.
+        coding_calls.append(runner.state.state)
+
+    runner = _make_runner()
+    runner.handle_coding = fake_coding  # type: ignore[method-assign]
+    asyncio.run(runner.recover_state())
+
+    assert coding_calls == [PipelineState.CODING]
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == "PR-042"
+    assert runner.state.current_pr is None
+    assert any(
+        "Recovered: DOING task PR-042" in e["event"]
+        and "re-running CODING" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_recover_no_doing_with_orphan_pr_recovers_to_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No DOING task but an open PR exists -> WATCH, and DONE task with
+    matching branch is attached as current_task."""
+    done = _done_task()
+    todo = _todo_task()
+    monkeypatch.setattr(
+        runner_module, "parse_queue", lambda path: [done, todo]
+    )
+    orphan = PRInfo(
+        number=88,
+        branch="pr-041-done",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.APPROVED,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: [orphan]
+    )
+
+    runner = _make_runner()
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 88
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == "PR-041"
+    assert any(
+        "Recovered: orphan PR #88" in e["event"] for e in runner.state.history
+    )
+
+
+def test_recover_orphan_pr_without_matching_done_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Orphan PR with no matching DONE task in QUEUE.md -> WATCH with no
+    current_task (branch was renamed, pruned, or never in QUEUE)."""
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
+    orphan = PRInfo(number=99, branch="stray-branch")
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: [orphan]
+    )
+
+    runner = _make_runner()
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 99
+    assert runner.state.current_task is None
+
+
+def test_recover_no_doing_no_prs_stays_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Clean slate: no DOING tasks and no open PRs -> stays IDLE."""
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [_todo_task()])
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: []
+    )
+
+    runner = _make_runner()
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.current_pr is None
+    assert any(
+        "no DOING tasks, no open PRs" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_recover_get_open_prs_failure_sets_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing GitHub API call during recovery must transition to ERROR so
+    the operator notices, rather than silently going IDLE and picking up a
+    new task that might collide with an unknown in-flight PR."""
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
+
+    def boom(repo: str) -> list[PRInfo]:
+        raise RuntimeError("gh auth token expired")
+
+    monkeypatch.setattr(runner_module.github_client, "get_open_prs", boom)
+
+    runner = _make_runner()
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "gh auth token expired" in (runner.state.error_message or "")
+
+
+def test_recover_state_runs_only_once_per_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run_cycle must call recover_state exactly once; subsequent cycles
+    must honor the _recovered flag and skip it."""
+    # Make ensure_repo_cloned, preflight, and handle_idle cheap no-ops so the
+    # test isolates the recovery gate.
+    async def noop_ensure() -> None:
+        return None
+
+    def clean_preflight() -> bool:
+        return True
+
+    async def noop_idle() -> None:
+        return None
+
+    calls: list[str] = []
+
+    async def counting_recover() -> None:
+        calls.append("recover")
+
+    runner = _make_runner()
+    runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
+    runner.preflight = clean_preflight  # type: ignore[method-assign]
+    runner.handle_idle = noop_idle  # type: ignore[method-assign]
+    runner.recover_state = counting_recover  # type: ignore[method-assign]
+
+    asyncio.run(runner.run_cycle())
+    asyncio.run(runner.run_cycle())
+    asyncio.run(runner.run_cycle())
+
+    assert calls == ["recover"]
+    assert runner._recovered is True
+
+
+def test_sync_to_main_runs_fetch_checkout_reset_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """sync_to_main must run fetch -> checkout -> reset --hard in that order
+    against the configured base branch. Reset --hard is how we guarantee
+    QUEUE.md reflects origin, not a stray working-tree edit from a crash."""
+    calls: list[list[str]] = []
+
+    class _FakeProc:
+        def __init__(self) -> None:
+            self.stdout = ""
+            self.stderr = ""
+            self.returncode = 0
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeProc:
+        calls.append(cmd)
+        return _FakeProc()
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    runner.sync_to_main()
+
+    assert calls == [
+        ["git", "fetch", "origin", "main"],
+        ["git", "checkout", "main"],
+        ["git", "reset", "--hard", "origin/main"],
+    ]
