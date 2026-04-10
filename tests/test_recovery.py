@@ -316,6 +316,111 @@ def test_recover_state_runs_only_once_per_process(
     assert runner._recovered is True
 
 
+def test_run_cycle_recovered_watch_does_not_dispatch_handle_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact P1-D regression: recovery resurrects a PR that happens
+    to be CHANGES_REQUESTED / CI-failing. If run_cycle dispatched
+    handle_watch on the recovery cycle, handle_watch would immediately
+    call handle_fix, which runs claude_cli.fix_review against a working
+    tree that preflight did NOT validate. In crash-recovery scenarios
+    with leftover local edits that would push unintended files into the
+    recovered PR. The recovery cycle must publish recovered state and
+    return; the next cycle runs the normal preflight + dispatch path."""
+    task = _doing_task()
+    # CI FAILURE + CHANGES_REQUESTED is the exact shape that would
+    # trigger handle_watch -> handle_fix -> claude_cli.fix_review.
+    recovered_pr = PRInfo(
+        number=17,
+        branch="pr-042-inflight",
+        ci_status=CIStatus.FAILURE,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: [recovered_pr]
+    )
+
+    async def noop_ensure() -> None:
+        return None
+
+    watch_calls: list[int] = []
+
+    async def spy_watch() -> None:
+        watch_calls.append(1)
+
+    fix_calls: list[int] = []
+
+    async def spy_fix() -> None:
+        fix_calls.append(1)
+
+    preflight_calls: list[int] = []
+
+    def spy_preflight() -> bool:
+        preflight_calls.append(1)
+        return True
+
+    runner = _make_runner()
+    runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
+    runner.handle_watch = spy_watch  # type: ignore[method-assign]
+    runner.handle_fix = spy_fix  # type: ignore[method-assign]
+    runner.preflight = spy_preflight  # type: ignore[method-assign]
+
+    asyncio.run(runner.run_cycle())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 17
+    assert watch_calls == [], "handle_watch must not dispatch on recovery cycle"
+    assert fix_calls == [], "handle_fix must not dispatch on recovery cycle"
+    assert preflight_calls == [], "preflight must not run on recovery cycle"
+    assert runner._recovered is True
+    # Verify Redis got the recovered state before the cycle ended.
+    assert isinstance(runner.redis, _FakeRedis)
+    assert runner.redis.writes, "publish_state should have been called once"
+
+
+def test_run_cycle_recovered_idle_does_not_dispatch_handle_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even the clean-slate IDLE recovery path stops after publishing on
+    the recovery cycle. handle_idle's sync_to_main could safely clean any
+    leftover state, but making IDLE the only dispatched recovery state
+    complicates the invariant and obscures the 'recovery cycle only
+    discovers' contract. The next cycle's handle_idle will sync_to_main
+    and pick up the next task normally."""
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: []
+    )
+
+    async def noop_ensure() -> None:
+        return None
+
+    idle_calls: list[int] = []
+
+    async def spy_idle() -> None:
+        idle_calls.append(1)
+
+    preflight_calls: list[int] = []
+
+    def spy_preflight() -> bool:
+        preflight_calls.append(1)
+        return True
+
+    runner = _make_runner()
+    runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
+    runner.handle_idle = spy_idle  # type: ignore[method-assign]
+    runner.preflight = spy_preflight  # type: ignore[method-assign]
+
+    asyncio.run(runner.run_cycle())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert idle_calls == [], "handle_idle must not dispatch on recovery cycle"
+    assert preflight_calls == [], "preflight must not run on recovery cycle"
+    assert runner._recovered is True
+
+
 def test_run_cycle_dirty_tree_does_not_clobber_recovered_watch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

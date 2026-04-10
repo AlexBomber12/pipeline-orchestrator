@@ -306,7 +306,6 @@ class PipelineRunner:
             await self.publish_state()
             return
 
-        just_recovered = False
         if not self._recovered:
             # Run before preflight: a crashed cycle may have left a dirty
             # working tree, and recover_state needs to reconstruct the
@@ -316,22 +315,28 @@ class PipelineRunner:
                 # Discovery phase failed transiently (e.g. GitHub
                 # unreachable). Leave _recovered unset so the next cycle
                 # retries discovery before the runner drifts away from an
-                # in-flight PR. Publish the ERROR so the operator sees
-                # it, then bail for this cycle; running handle_error on a
-                # half-recovered state could SKIP the in-flight task onto
-                # new queue work.
+                # in-flight PR.
                 await self.publish_state()
                 return
             self._recovered = True
-            just_recovered = True
+            # Stop the cycle after publishing the recovered state.
+            # Dispatching on the recovery cycle would run claude_cli
+            # (via handle_watch -> handle_fix, handle_coding, etc.)
+            # against a working tree that preflight has NOT validated —
+            # the exact crash case recover_state is built for can
+            # legitimately leave leftover edits from a mid-coding
+            # interruption, and fix_review would push those into the
+            # recovered PR. The next cycle runs preflight normally
+            # before any dispatch: a clean tree proceeds, a dirty tree
+            # flips to ERROR for operator intervention before any
+            # Claude-driven write hits the repo. IDLE recovery also
+            # waits for the next cycle, at which point handle_idle's
+            # sync_to_main hard-resets any leftover state before
+            # parse_queue runs.
+            await self.publish_state()
+            return
 
-        # Skip preflight on the recovery cycle: the exact crash case
-        # recover_state is built for (mid-coding interruption) leaves a
-        # legitimately dirty tree, and letting preflight clobber the
-        # recovered WATCH/CODING state to ERROR would strand the daemon
-        # permanently since _recovered is already set and the next cycle
-        # would not re-attempt recovery.
-        if not just_recovered and not self.preflight():
+        if not self.preflight():
             await self.publish_state()
             return
 
