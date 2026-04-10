@@ -441,6 +441,63 @@ def test_handle_watch_within_timeout_stays_watching(
     assert runner.state.state == PipelineState.WATCH
 
 
+def test_handle_watch_approved_but_ci_pending_applies_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """APPROVED + CI PENDING used to fall through the branches in handle_watch,
+    leaving the runner stuck in WATCH forever. It should now apply the review
+    timeout and transition to HUNG when the PR stays pending for too long."""
+    stale = datetime.now(timezone.utc) - timedelta(minutes=90)
+    pr = PRInfo(
+        number=5,
+        branch="pr-001",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.APPROVED,
+        last_activity=stale,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: [pr]
+    )
+
+    runner = _make_runner(review_timeout_min=30)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.HUNG
+    assert any(
+        "review=APPROVED" in e["event"] and "ci=PENDING" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_watch_approved_ci_pending_within_timeout_waits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = datetime.now(timezone.utc) - timedelta(minutes=2)
+    pr = PRInfo(
+        number=5,
+        branch="pr-001",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.APPROVED,
+        last_activity=fresh,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: [pr]
+    )
+
+    runner = _make_runner(review_timeout_min=30)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert any(
+        "waiting" in e["event"] and "review=APPROVED" in e["event"]
+        for e in runner.state.history
+    )
+
+
 def test_handle_watch_pr_closed_returns_to_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

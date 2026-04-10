@@ -317,23 +317,29 @@ class PipelineRunner:
             await self.handle_fix()
             return
 
-        if review in (ReviewStatus.EYES, ReviewStatus.PENDING):
-            last_activity = found.last_activity or self.state.last_updated
-            if last_activity.tzinfo is None:
-                last_activity = last_activity.replace(tzinfo=timezone.utc)
-            now = datetime.now(timezone.utc)
-            elapsed_min = (now - last_activity).total_seconds() / 60
-            timeout_min = self.repo_config.review_timeout_min
-            if elapsed_min >= timeout_min:
-                self.state.state = PipelineState.HUNG
-                self.log_event(
-                    f"PR #{found.number} hung after {elapsed_min:.0f}m"
-                )
-            else:
-                self.log_event(
-                    f"PR #{found.number} waiting "
-                    f"({review.value}, {elapsed_min:.0f}/{timeout_min}m)"
-                )
+        # Any remaining combination is a waiting state that should still be
+        # subject to the review timeout. This explicitly includes
+        # ``APPROVED + ci PENDING``: previously that pair matched none of the
+        # branches above and the runner could block on permanently pending CI
+        # without ever transitioning to ``HUNG``.
+        last_activity = found.last_activity or self.state.last_updated
+        if last_activity.tzinfo is None:
+            last_activity = last_activity.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        elapsed_min = (now - last_activity).total_seconds() / 60
+        timeout_min = self.repo_config.review_timeout_min
+        if elapsed_min >= timeout_min:
+            self.state.state = PipelineState.HUNG
+            self.log_event(
+                f"PR #{found.number} hung after {elapsed_min:.0f}m "
+                f"(review={review.value}, ci={ci.value})"
+            )
+        else:
+            self.log_event(
+                f"PR #{found.number} waiting "
+                f"(review={review.value}, ci={ci.value}, "
+                f"{elapsed_min:.0f}/{timeout_min}m)"
+            )
 
     async def handle_fix(self) -> None:
         """Run ``FIX REVIEW`` via the claude CLI and return to WATCH."""
