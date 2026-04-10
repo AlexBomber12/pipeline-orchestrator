@@ -34,3 +34,39 @@
 - Tasks file: tasks/PR-006.md
 - Branch: pr-006-dashboard-detail
 - Depends on: PR-005
+
+## PR-007: Claude CLI wrapper
+- Status: TODO
+- Tasks file: tasks/PR-007.md
+- Branch: pr-007-claude-cli
+- Depends on: PR-002
+
+## PR-008: Pipeline runner state machine
+- Status: TODO
+- Tasks file: tasks/PR-008.md
+- Branch: pr-008-runner
+- Depends on: PR-007, PR-003, PR-004
+
+## PR-009: Daemon main loop
+- Status: TODO
+- Tasks file: tasks/PR-009.md
+- Branch: pr-009-daemon-main
+- Depends on: PR-008
+
+## PR-010: Daemon recovery and error handling
+- Status: TODO
+- Tasks file: tasks/PR-010.md
+- Branch: pr-010-recovery
+- Depends on: PR-009
+
+## PR-011: Repo scaffolding on connect
+- Status: TODO
+- Tasks file: tasks/PR-011.md
+- Branch: pr-011-scaffolding
+- Depends on: PR-009
+
+## PR-012: Fix sprint 1 issues
+- Status: TODO
+- Tasks file: tasks/PR-012.md
+- Branch: pr-012-sprint1-fixes
+- Depends on: PR-006
