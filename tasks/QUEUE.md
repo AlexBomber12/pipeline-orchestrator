@@ -18,7 +18,7 @@
 - Depends on: PR-002
 
 ## PR-004: GitHub client
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-004.md
 - Branch: pr-004-github-client
 - Depends on: PR-002
