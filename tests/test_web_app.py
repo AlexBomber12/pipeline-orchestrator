@@ -227,6 +227,27 @@ def test_get_repo_state_unknown_repo_returns_idle_default(
     assert state.current_pr is None
 
 
+def test_get_repo_state_unknown_repo_ignores_stale_redis_key(
+    two_repo_config: Path,
+) -> None:
+    """Repos missing from config must not surface stale Redis payloads."""
+    stale = RepoState(
+        url="https://github.com/example/ghost.git",
+        name="ghost",
+        state=PipelineState.CODING,
+        current_task=None,
+        current_pr=None,
+        last_updated=datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc),
+    )
+    fake = _FakeRedis({"pipeline:ghost": stale.model_dump_json()})
+
+    state = asyncio.run(get_repo_state("ghost", redis_client=fake))
+
+    assert state.name == "ghost"
+    assert state.url == ""
+    assert state.state == PipelineState.IDLE
+
+
 def test_get_repo_state_uses_redis_payload(two_repo_config: Path) -> None:
     now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
     stored = RepoState(

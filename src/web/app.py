@@ -61,16 +61,20 @@ async def get_repo_state(
     Looks the repo up in ``config.yml`` to recover the canonical URL, then
     tries to fetch ``pipeline:{name}`` from Redis. Falls back to a default
     ``IDLE`` state if the repo is unknown, Redis is unavailable, or the
-    stored payload cannot be decoded.
+    stored payload cannot be decoded. Redis is not consulted for repos
+    missing from ``config.yml`` so a stale ``pipeline:{name}`` key left
+    over from a removed repo cannot resurface as live state.
     """
     cfg = load_config(config_path)
     url = ""
+    found = False
     for repo in cfg.repositories:
         if repo_name_from_url(repo.url) == name:
             url = repo.url
+            found = True
             break
 
-    if redis_client is not None:
+    if found and redis_client is not None:
         try:
             payload = await redis_client.get(f"pipeline:{name}")
         except Exception:
