@@ -42,7 +42,7 @@
 - Depends on: PR-002
 
 ## PR-008: Pipeline runner state machine
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-008.md
 - Branch: pr-008-runner
 - Depends on: PR-007, PR-003, PR-004
