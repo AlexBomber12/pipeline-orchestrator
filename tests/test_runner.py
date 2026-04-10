@@ -133,7 +133,7 @@ def test_log_event_caps_history_at_100(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_handle_idle_no_tasks_leaves_state_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_subprocess(monkeypatch)
+    calls = _patch_subprocess(monkeypatch)
     monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
     monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
 
@@ -143,6 +143,12 @@ def test_handle_idle_no_tasks_leaves_state_idle(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert any("No tasks" in e["event"] for e in runner.state.history)
+    # Checkout must happen before pull so parse_queue reads QUEUE.md from
+    # the configured base branch, not whatever branch the repo was left on.
+    commands = [cmd[:2] for cmd in calls]
+    checkout_idx = commands.index(["git", "checkout"])
+    pull_idx = commands.index(["git", "pull"])
+    assert checkout_idx < pull_idx
 
 
 def test_handle_idle_picks_task_and_drives_coding(
@@ -213,6 +219,59 @@ def test_handle_coding_errors_when_no_pr_found(
     assert "no PR found" in (runner.state.error_message or "")
 
 
+def test_handle_coding_rejects_unmatched_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When no open PR matches current_task.branch, fail fast instead of
+    attaching to an unrelated newest open PR."""
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "run_planned_pr",
+        lambda path: (0, "ok", ""),
+    )
+    unrelated = PRInfo(number=99, branch="other-branch")
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [unrelated],
+    )
+
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
+    )
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_pr is None
+    assert "pr-001" in (runner.state.error_message or "")
+
+
+def test_handle_coding_errors_when_task_has_no_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "run_planned_pr",
+        lambda path: (0, "ok", ""),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [PRInfo(number=1, branch="anything")],
+    )
+
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )  # no branch
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_pr is None
+    assert "no branch" in (runner.state.error_message or "").lower()
+
+
 def test_handle_watch_approved_and_green_merges(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -245,6 +304,42 @@ def test_handle_watch_approved_and_green_merges(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is None
     assert runner.state.current_task is None
+
+
+def test_handle_watch_green_but_auto_merge_disabled_stays_watching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = PRInfo(
+        number=5,
+        branch="pr-001",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.APPROVED,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: [pr]
+    )
+
+    merged: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "merge_pr",
+        lambda repo, number: merged.append((repo, number)),
+    )
+
+    runner = _make_runner(auto_merge=False)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_watch())
+
+    assert merged == []
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert any(
+        "auto_merge disabled" in e["event"] for e in runner.state.history
+    )
 
 
 def test_handle_watch_changes_requested_triggers_fix(

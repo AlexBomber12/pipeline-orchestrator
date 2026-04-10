@@ -22,7 +22,6 @@ from src.config import AppConfig, RepoConfig
 from src.models import (
     CIStatus,
     PipelineState,
-    PRInfo,
     RepoState,
     ReviewStatus,
 )
@@ -187,9 +186,23 @@ class PipelineRunner:
 
     async def handle_idle(self) -> None:
         """Pull latest main, pick the next task, and hand off to CODING."""
+        branch = self.repo_config.branch
+        # Checkout the base branch before pulling so that parse_queue always
+        # reads QUEUE.md from the tip of <branch>. Without this, a previous
+        # cycle that left the repo on a feature branch would cause git pull
+        # to update the wrong branch and parse_queue to read stale/unmerged
+        # queue state, potentially picking the wrong next task.
         try:
             subprocess.run(
-                ["git", "pull", "origin", self.repo_config.branch],
+                ["git", "checkout", branch],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+                cwd=self.repo_path,
+            )
+            subprocess.run(
+                ["git", "pull", "origin", branch],
                 capture_output=True,
                 text=True,
                 timeout=60,
@@ -235,18 +248,24 @@ class PipelineRunner:
         target_branch = (
             self.state.current_task.branch if self.state.current_task else None
         )
-        candidate: PRInfo | None = None
-        if target_branch:
-            for pr in prs:
-                if pr.branch == target_branch:
-                    candidate = pr
-                    break
-        if candidate is None and prs:
-            candidate = max(prs, key=lambda p: p.number)
+        if not target_branch:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = (
+                "Current task has no branch; cannot identify PR"
+            )
+            self.log_event(self.state.error_message)
+            return
 
+        # Match strictly by branch. Falling back to the newest open PR would
+        # attach the runner to an unrelated PR if the PLANNED PR run failed
+        # to open the expected branch, which could then trigger unintended
+        # WATCH/FIX/MERGE actions on someone else's work.
+        candidate = next((pr for pr in prs if pr.branch == target_branch), None)
         if candidate is None:
             self.state.state = PipelineState.ERROR
-            self.state.error_message = "Claude CLI succeeded but no PR found"
+            self.state.error_message = (
+                f"Claude CLI succeeded but no PR found for branch {target_branch!r}"
+            )
             self.log_event(self.state.error_message)
             return
 
@@ -283,7 +302,16 @@ class PipelineRunner:
         ci = found.ci_status
         review = found.review_status
         if ci == CIStatus.SUCCESS and review == ReviewStatus.APPROVED:
-            await self.handle_merge()
+            if self.repo_config.auto_merge:
+                await self.handle_merge()
+            else:
+                # Honor repositories configured with auto_merge: false.
+                # Stay in WATCH so a human can merge manually; handle_watch
+                # will return to IDLE on the next cycle once the PR closes.
+                self.log_event(
+                    f"PR #{found.number} green but auto_merge disabled; "
+                    "awaiting manual merge"
+                )
             return
         if review == ReviewStatus.CHANGES_REQUESTED or ci == CIStatus.FAILURE:
             await self.handle_fix()
