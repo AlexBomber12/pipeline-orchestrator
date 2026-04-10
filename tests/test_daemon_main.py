@@ -115,6 +115,47 @@ def test_main_warns_when_no_repos_configured(
     assert any("No repositories configured" in rec.getMessage() for rec in warnings)
 
 
+def test_main_skips_runner_whose_init_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _PickyRunner(_FakeRunner):
+        def __init__(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            redis_client: Any,
+        ) -> None:
+            if "broken" in repo_config.url:
+                raise ValueError(f"Not a recognizable GitHub URL: {repo_config.url!r}")
+            super().__init__(repo_config, app_config, redis_client)
+
+    config = AppConfig(
+        repositories=[
+            _repo("not-a-valid-url-broken"),
+            _repo("https://github.com/octo/beta.git"),
+        ],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    _patch_main(monkeypatch, config, runner_cls=_PickyRunner)
+
+    with caplog.at_level(logging.ERROR, logger=main_module.logger.name):
+        with pytest.raises(_StopLoop):
+            asyncio.run(main_module.main())
+
+    # The broken repo must not produce a runner, but the good one still must
+    # be built AND driven through run_cycle so one misconfigured entry cannot
+    # take the whole daemon down at startup.
+    assert len(_FakeRunner.instances) == 1
+    assert _FakeRunner.instances[0].name == "beta"
+    assert _FakeRunner.instances[0].cycles == 1
+    errors = [rec for rec in caplog.records if rec.levelno == logging.ERROR]
+    assert any(
+        "Failed to initialize runner" in rec.getMessage() and "broken" in rec.getMessage()
+        for rec in errors
+    )
+
+
 def test_main_continues_when_one_runner_raises(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

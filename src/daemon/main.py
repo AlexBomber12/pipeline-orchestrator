@@ -48,10 +48,26 @@ async def main() -> None:
             "No repositories configured; daemon will idle until config.yml is updated"
         )
 
-    runners = [
-        PipelineRunner(repo_config=repo, app_config=config, redis_client=redis_client)
-        for repo in config.repositories
-    ]
+    # Build runners one at a time inside try/except so a single misconfigured
+    # entry (e.g. an invalid URL that makes ``PipelineRunner.__init__`` raise
+    # via ``get_repo_full_name``) cannot abort startup and take the whole
+    # daemon down before the poll loop even begins.
+    runners: list[PipelineRunner] = []
+    for repo in config.repositories:
+        try:
+            runners.append(
+                PipelineRunner(
+                    repo_config=repo,
+                    app_config=config,
+                    redis_client=redis_client,
+                )
+            )
+        except Exception:
+            logger.error(
+                "Failed to initialize runner for %s; skipping",
+                repo.url,
+                exc_info=True,
+            )
 
     while True:
         for runner in runners:
