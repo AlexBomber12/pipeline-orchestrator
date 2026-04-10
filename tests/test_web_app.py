@@ -31,7 +31,11 @@ class _FakeRedis:
 
 
 class _BoomRedis:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
     async def get(self, key: str) -> str | None:
+        self.calls.append(key)
         raise RuntimeError("redis is down")
 
 
@@ -135,11 +139,15 @@ def test_get_all_repo_states_uses_redis_when_present(
 def test_get_all_repo_states_falls_back_when_redis_raises(
     two_repo_config: Path,
 ) -> None:
-    states = asyncio.run(get_all_repo_states(redis_client=_BoomRedis()))
+    boom = _BoomRedis()
+    states = asyncio.run(get_all_repo_states(redis_client=boom))
 
     assert len(states) == 2
     for state in states:
         assert state.state == PipelineState.IDLE
+    # After the first failure further Redis lookups must be skipped so an
+    # unreachable broker cannot turn each repo into another timing-out call.
+    assert boom.calls == ["pipeline:alpha"]
 
 
 def test_index_route_returns_html(

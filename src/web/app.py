@@ -46,20 +46,24 @@ async def get_all_repo_states(
 
     For each configured repo, look up ``pipeline:{name}`` in Redis. If the
     key is missing or Redis is unavailable, fall back to a default ``IDLE``
-    state with the current timestamp.
+    state with the current timestamp. Once a Redis read fails inside a single
+    request, further Redis lookups are skipped so an unreachable broker
+    cannot turn each configured repo into another timing-out call.
     """
     cfg = load_config(config_path)
     states: list[RepoState] = []
+    redis_available = redis_client is not None
 
     for repo in cfg.repositories:
         name = repo_name_from_url(repo.url)
         state: RepoState | None = None
 
-        if redis_client is not None:
+        if redis_available:
             try:
                 payload = await redis_client.get(f"pipeline:{name}")
             except Exception:
                 payload = None
+                redis_available = False
             if payload:
                 try:
                     state = RepoState.model_validate_json(payload)
