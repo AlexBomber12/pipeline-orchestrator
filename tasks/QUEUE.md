@@ -48,7 +48,7 @@
 - Depends on: PR-007, PR-003, PR-004
 
 ## PR-009: Daemon main loop
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-009.md
 - Branch: pr-009-daemon-main
 - Depends on: PR-008
