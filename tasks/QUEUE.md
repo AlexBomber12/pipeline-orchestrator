@@ -24,7 +24,7 @@
 - Depends on: PR-002
 
 ## PR-005: Dashboard base layout and repo list
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-005.md
 - Branch: pr-005-dashboard-base
 - Depends on: PR-003, PR-004
