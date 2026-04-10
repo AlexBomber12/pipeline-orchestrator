@@ -19,8 +19,8 @@ def run_claude(
 ) -> tuple[int, str, str]:
     """Invoke the ``claude`` CLI with ``prompt`` inside ``cwd``.
 
-    Returns ``(returncode, stdout, stderr)``. On timeout or when the CLI is
-    missing, returns ``(-1, "", <error message>)`` instead of raising.
+    Returns ``(returncode, stdout, stderr)``. On timeout, missing CLI, or
+    missing ``cwd``, returns ``(-1, "", <error message>)`` instead of raising.
     """
     cmd = ["claude", "--print", "--dangerously-skip-permissions", prompt]
     logger.info("running claude CLI with prompt: %s", prompt[:80])
@@ -36,7 +36,16 @@ def run_claude(
     except subprocess.TimeoutExpired:
         logger.error("claude CLI timed out after %ss", timeout)
         return (-1, "", f"Timeout after {timeout}s")
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
+        # subprocess.run raises FileNotFoundError for two distinct cases:
+        # 1. the executable (cmd[0]) is not on PATH
+        # 2. the cwd directory does not exist
+        # exc.filename distinguishes them so the daemon can pick the right
+        # recovery path (reinstall CLI vs. reclone repo).
+        missing = exc.filename
+        if missing and missing != cmd[0]:
+            logger.error("claude CLI cwd not found: %s", missing)
+            return (-1, "", f"cwd not found: {missing}")
         logger.error("claude CLI not found on PATH")
         return (-1, "", "claude CLI not found")
 

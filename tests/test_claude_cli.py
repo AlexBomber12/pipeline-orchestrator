@@ -57,7 +57,46 @@ def test_run_claude_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     assert run_claude("prompt", "/tmp", timeout=5) == (-1, "", "Timeout after 5s")
 
 
-def test_run_claude_file_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_claude_file_not_found_missing_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """subprocess raises FileNotFoundError(filename=<executable>) when the
+    binary is not on PATH."""
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        raise FileNotFoundError(2, "No such file or directory", "claude")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert run_claude("prompt", "/tmp") == (-1, "", "claude CLI not found")
+
+
+def test_run_claude_file_not_found_missing_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """subprocess raises FileNotFoundError(filename=<cwd>) when the working
+    directory does not exist. It must not be reported as a missing CLI."""
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        raise FileNotFoundError(
+            2, "No such file or directory", "/data/repos/missing"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert run_claude("prompt", "/data/repos/missing") == (
+        -1,
+        "",
+        "cwd not found: /data/repos/missing",
+    )
+
+
+def test_run_claude_file_not_found_without_filename(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the exception carries no filename we cannot tell which path was
+    missing; fall back to reporting the CLI as the likely cause."""
+
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         raise FileNotFoundError()
 
