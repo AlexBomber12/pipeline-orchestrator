@@ -36,7 +36,7 @@
 - Depends on: PR-005
 
 ## PR-007: Claude CLI wrapper
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-007.md
 - Branch: pr-007-claude-cli
 - Depends on: PR-002
