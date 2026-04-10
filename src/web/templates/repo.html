@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+
+{% block title %}{{ repo.name }} - Pipeline Orchestrator{% endblock %}
+
+{% block content %}
+<div class="mb-6">
+    <a href="/" class="inline-flex items-center gap-2 text-sm text-accent hover:underline">
+        <span aria-hidden="true">&larr;</span>
+        <span>All repositories</span>
+    </a>
+</div>
+
+<div hx-get="/partials/repo/{{ repo.name }}" hx-trigger="every 5s" hx-swap="innerHTML">
+    {% include "components/repo_detail.html" %}
+</div>
+{% endblock %}

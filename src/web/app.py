@@ -38,6 +38,52 @@ def repo_name_from_url(url: str) -> str:
     return last
 
 
+def _default_repo_state(name: str, url: str) -> RepoState:
+    """Return a default ``IDLE`` state for ``name``/``url``."""
+    return RepoState(
+        url=url,
+        name=name,
+        state=PipelineState.IDLE,
+        current_task=None,
+        current_pr=None,
+        error_message=None,
+        last_updated=datetime.now(timezone.utc),
+    )
+
+
+async def get_repo_state(
+    name: str,
+    redis_client: aioredis.Redis | None,
+    config_path: str = CONFIG_PATH,
+) -> RepoState:
+    """Return the state for a single repo by name.
+
+    Looks the repo up in ``config.yml`` to recover the canonical URL, then
+    tries to fetch ``pipeline:{name}`` from Redis. Falls back to a default
+    ``IDLE`` state if the repo is unknown, Redis is unavailable, or the
+    stored payload cannot be decoded.
+    """
+    cfg = load_config(config_path)
+    url = ""
+    for repo in cfg.repositories:
+        if repo_name_from_url(repo.url) == name:
+            url = repo.url
+            break
+
+    if redis_client is not None:
+        try:
+            payload = await redis_client.get(f"pipeline:{name}")
+        except Exception:
+            payload = None
+        if payload:
+            try:
+                return RepoState.model_validate_json(payload)
+            except Exception:
+                pass
+
+    return _default_repo_state(name, url)
+
+
 async def get_all_repo_states(
     redis_client: aioredis.Redis | None,
     config_path: str = CONFIG_PATH,
@@ -71,15 +117,7 @@ async def get_all_repo_states(
                     state = None
 
         if state is None:
-            state = RepoState(
-                url=repo.url,
-                name=name,
-                state=PipelineState.IDLE,
-                current_task=None,
-                current_pr=None,
-                error_message=None,
-                last_updated=datetime.now(timezone.utc),
-            )
+            state = _default_repo_state(name, repo.url)
 
         states.append(state)
 
@@ -134,14 +172,21 @@ async def partial_repo_list(request: Request) -> HTMLResponse:
 
 @app.get("/repo/{name}", response_class=HTMLResponse)
 async def repo_detail(request: Request, name: str) -> HTMLResponse:
-    """Placeholder repo detail page.
-
-    The repo cards on the index page link here. The full detail view is
-    delivered by PR-006; until then this route returns a minimal valid
-    HTML page so the link does not 404.
-    """
+    redis_client = getattr(request.app.state, "redis", None)
+    state = await get_repo_state(name, redis_client)
     return templates.TemplateResponse(
         request,
-        "repo_detail.html",
-        {"title": name, "name": name},
+        "repo.html",
+        {"title": name, "repo": state},
+    )
+
+
+@app.get("/partials/repo/{name}", response_class=HTMLResponse)
+async def partial_repo_detail(request: Request, name: str) -> HTMLResponse:
+    redis_client = getattr(request.app.state, "redis", None)
+    state = await get_repo_state(name, redis_client)
+    return templates.TemplateResponse(
+        request,
+        "components/repo_detail.html",
+        {"repo": state},
     )
