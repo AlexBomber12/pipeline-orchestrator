@@ -6,7 +6,7 @@
 - Branch: pr-001-bootstrap
 
 ## PR-002: Config loader and data models
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-002.md
 - Branch: pr-002-models
 - Depends on: PR-001
