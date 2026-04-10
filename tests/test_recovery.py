@@ -180,15 +180,50 @@ def test_recover_no_doing_with_orphan_pr_recovers_to_watch(
     )
 
 
-def test_recover_orphan_pr_without_matching_done_task(
+def test_recover_orphan_pr_without_matching_done_task_stays_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Orphan PR with no matching DONE task in QUEUE.md -> WATCH with no
-    current_task (branch was renamed, pruned, or never in QUEUE)."""
+    """An unrelated open PR (no matching DONE task in QUEUE.md) must NOT
+    be attached: otherwise the runner would later drive merge/fix against
+    a PR outside its queue — potentially a human contributor's work."""
     monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
-    orphan = PRInfo(number=99, branch="stray-branch")
+    unrelated = PRInfo(number=99, branch="stray-branch")
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [orphan]
+        runner_module.github_client, "get_open_prs", lambda repo: [unrelated]
+    )
+
+    runner = _make_runner()
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+    assert runner.state.current_task is None
+    assert any(
+        "not matched to any DONE task" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_recover_attaches_only_to_done_matched_pr_among_many(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When multiple open PRs exist, recovery must pick the one whose
+    branch matches a DONE task and ignore unrelated PRs entirely."""
+    done = _done_task()
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [done])
+
+    unrelated_first = PRInfo(number=200, branch="dependabot/npm/foo")
+    matching = PRInfo(
+        number=201,
+        branch="pr-041-done",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.APPROVED,
+    )
+    unrelated_last = PRInfo(number=202, branch="user/experiment")
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [unrelated_first, matching, unrelated_last],
     )
 
     runner = _make_runner()
@@ -196,8 +231,9 @@ def test_recover_orphan_pr_without_matching_done_task(
 
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
-    assert runner.state.current_pr.number == 99
-    assert runner.state.current_task is None
+    assert runner.state.current_pr.number == 201
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == "PR-041"
 
 
 def test_recover_no_doing_no_prs_stays_idle(
@@ -274,6 +310,90 @@ def test_recover_state_runs_only_once_per_process(
 
     assert calls == ["recover"]
     assert runner._recovered is True
+
+
+def test_run_cycle_dirty_tree_does_not_clobber_recovered_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact crash-recovery case: a DOING task with a matching open PR,
+    and the working tree is dirty because the prior cycle crashed. Preflight
+    must NOT fire on the recovery cycle — otherwise it would overwrite the
+    WATCH state with ERROR and _recovered would already be True, stranding
+    the daemon."""
+    task = _doing_task()
+    matching_pr = PRInfo(
+        number=17,
+        branch="pr-042-inflight",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+    )
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: [matching_pr]
+    )
+
+    async def noop_ensure() -> None:
+        return None
+
+    async def noop_watch() -> None:
+        return None
+
+    preflight_calls: list[bool] = []
+
+    def fail_preflight() -> bool:
+        # If preflight ever runs on the recovery cycle it will report a
+        # dirty tree and flip state to ERROR — exactly the P1 regression.
+        preflight_calls.append(True)
+        runner.state.state = PipelineState.ERROR
+        runner.state.error_message = "working tree dirty: leftover.py"
+        return False
+
+    runner = _make_runner()
+    runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
+    runner.preflight = fail_preflight  # type: ignore[method-assign]
+    runner.handle_watch = noop_watch  # type: ignore[method-assign]
+
+    asyncio.run(runner.run_cycle())
+
+    assert preflight_calls == [], "preflight must not run on recovery cycle"
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 17
+    assert runner.state.error_message is None
+
+
+def test_run_cycle_subsequent_cycle_still_runs_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the recovery cycle, preflight must resume gating normal cycles:
+    skipping it only on the first cycle, not permanently."""
+
+    async def noop_ensure() -> None:
+        return None
+
+    async def noop_recover() -> None:
+        return None
+
+    async def noop_idle() -> None:
+        return None
+
+    preflight_calls: list[int] = []
+
+    def ok_preflight() -> bool:
+        preflight_calls.append(1)
+        return True
+
+    runner = _make_runner()
+    runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
+    runner.recover_state = noop_recover  # type: ignore[method-assign]
+    runner.preflight = ok_preflight  # type: ignore[method-assign]
+    runner.handle_idle = noop_idle  # type: ignore[method-assign]
+
+    asyncio.run(runner.run_cycle())  # recovery cycle: skips preflight
+    asyncio.run(runner.run_cycle())  # normal cycle: runs preflight
+    asyncio.run(runner.run_cycle())  # normal cycle: runs preflight
+
+    assert preflight_calls == [1, 1]
 
 
 def test_sync_to_main_runs_fetch_checkout_reset_in_order(

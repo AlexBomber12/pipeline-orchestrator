@@ -225,28 +225,35 @@ class PipelineRunner:
             await self.handle_coding()
             return
 
-        if prs:
-            # No DOING task but an open PR exists: attach to it. The runner
-            # only ever drives one PR at a time, so picking prs[0] is safe
-            # under the one-task-at-a-time invariant enforced by
-            # get_next_task.
-            orphan = prs[0]
-            self.state.current_pr = orphan
-            done_match = next(
-                (
-                    t
-                    for t in tasks
-                    if t.status == TaskStatus.DONE and t.branch == orphan.branch
-                ),
-                None,
-            )
-            if done_match is not None:
-                self.state.current_task = done_match
+        # No DOING task. An open PR should only be recovered if its branch
+        # matches a DONE task in QUEUE.md (task marked DONE locally but PR
+        # not yet merged). Attaching to a random open PR would let WATCH
+        # later run merge/fix against an unrelated human or bot PR on the
+        # same repo, which could mutate work outside the queue.
+        done_by_branch = {
+            t.branch: t
+            for t in tasks
+            if t.status == TaskStatus.DONE and t.branch
+        }
+        recoverable = next(
+            ((pr, done_by_branch[pr.branch]) for pr in prs if pr.branch in done_by_branch),
+            None,
+        )
+        if recoverable is not None:
+            orphan_pr, done_task = recoverable
+            self.state.current_pr = orphan_pr
+            self.state.current_task = done_task
             self.state.state = PipelineState.WATCH
-            self.log_event(f"Recovered: orphan PR #{orphan.number} -> WATCH")
+            self.log_event(f"Recovered: orphan PR #{orphan_pr.number} -> WATCH")
             return
 
-        self.log_event("Recovered: no DOING tasks, no open PRs -> IDLE")
+        if prs:
+            self.log_event(
+                f"Recovered: {len(prs)} open PR(s) not matched to any "
+                "DONE task -> IDLE"
+            )
+        else:
+            self.log_event("Recovered: no DOING tasks, no open PRs -> IDLE")
 
     def preflight(self) -> bool:
         """Return ``True`` iff the working tree is clean."""
@@ -284,14 +291,22 @@ class PipelineRunner:
             await self.publish_state()
             return
 
+        just_recovered = False
         if not self._recovered:
             # Run before preflight: a crashed cycle may have left a dirty
             # working tree, and recover_state needs to reconstruct the
             # in-memory state from QUEUE.md + GitHub regardless.
             await self.recover_state()
             self._recovered = True
+            just_recovered = True
 
-        if not self.preflight():
+        # Skip preflight on the recovery cycle: the exact crash case
+        # recover_state is built for (mid-coding interruption) leaves a
+        # legitimately dirty tree, and letting preflight clobber the
+        # recovered WATCH/CODING state to ERROR would strand the daemon
+        # permanently since _recovered is already set and the next cycle
+        # would not re-attempt recovery.
+        if not just_recovered and not self.preflight():
             await self.publish_state()
             return
 
