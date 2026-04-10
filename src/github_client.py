@@ -101,14 +101,8 @@ def get_open_prs(repo: str) -> list[PRInfo]:
 
 def get_pr_review_status(repo: str, pr_number: int) -> ReviewStatus:
     """Derive a Codex review status from PR issue comments and their reactions."""
-    comments = run_gh(
-        [
-            "api",
-            "--paginate",
-            f"repos/{repo}/issues/{pr_number}/comments",
-        ],
-    )
-    if not isinstance(comments, list):
+    comments = _gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments")
+    if comments is None:
         return ReviewStatus.PENDING
 
     for comment in reversed(comments):
@@ -118,15 +112,11 @@ def get_pr_review_status(repo: str, pr_number: int) -> ReviewStatus:
 
         comment_id = comment.get("id")
         if comment_id is not None:
-            reactions = run_gh(
-                [
-                    "api",
-                    "--paginate",
-                    f"repos/{repo}/issues/comments/{comment_id}/reactions",
-                ],
+            reactions = _gh_api_paginated(
+                f"repos/{repo}/issues/comments/{comment_id}/reactions"
             )
-            if isinstance(reactions, list):
-                contents = {r.get("content") for r in reactions}
+            if reactions is not None:
+                contents = {r.get("content") for r in reactions if isinstance(r, dict)}
                 if "+1" in contents:
                     return ReviewStatus.APPROVED
                 if "eyes" in contents:
@@ -149,6 +139,29 @@ def merge_pr(repo: str, pr_number: int) -> None:
 def post_comment(repo: str, pr_number: int, body: str) -> None:
     """Post a comment on a PR via ``gh pr comment``."""
     run_gh(["pr", "comment", str(pr_number), "--body", body], repo=repo)
+
+
+def _gh_api_paginated(path: str) -> list[dict] | None:
+    """Fetch every page of a GitHub REST endpoint that returns a JSON array.
+
+    Uses ``gh api --paginate --slurp``: ``--paginate`` walks all pages and
+    ``--slurp`` wraps them into a single outer JSON array (one entry per page).
+    Without ``--slurp`` ``gh`` writes one JSON document per page back-to-back,
+    which is not parseable as a single document. The pages are then flattened
+    into a single list of items. Returns ``None`` if the response is not a
+    list (which would indicate an unexpected ``gh`` output).
+    """
+    raw = run_gh(["api", "--paginate", "--slurp", path])
+    if not isinstance(raw, list):
+        return None
+
+    items: list[dict] = []
+    for page in raw:
+        if isinstance(page, list):
+            items.extend(item for item in page if isinstance(item, dict))
+        elif isinstance(page, dict):
+            items.append(page)
+    return items
 
 
 def _ci_status_from_rollup(rollup: object) -> CIStatus:

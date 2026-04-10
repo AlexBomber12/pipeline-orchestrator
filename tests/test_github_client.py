@@ -87,24 +87,33 @@ def test_run_gh_returns_raw_string_when_not_json(
     assert run_gh(["auth", "status"]) == "ok"
 
 
-def test_get_pr_review_status_paginates_gh_api_calls(
+def test_get_pr_review_status_paginates_and_slurps_gh_api_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Both the comments and reactions lookups must request all pages."""
+    """Both the comments and reactions lookups must use --paginate --slurp.
+
+    Without --slurp, multi-page responses are written as several JSON
+    documents back-to-back, which json.loads cannot parse — so the function
+    would silently return PENDING. The fake mimics --slurp's behavior:
+    pages are wrapped in an outer array.
+    """
+    import json as _json
+
     invocations: list[list[str]] = []
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         invocations.append(cmd)
         path = cmd[-1]
         if path.endswith("/comments"):
-            payload = [{"id": 1, "user": {"login": "chatgpt-codex-bot"}, "body": ""}]
+            pages = [
+                [{"id": 1, "user": {"login": "user"}, "body": "hi"}],
+                [{"id": 2, "user": {"login": "chatgpt-codex-bot"}, "body": ""}],
+            ]
         elif path.endswith("/reactions"):
-            payload = [{"content": "+1"}]
+            pages = [[{"content": "+1"}]]
         else:
-            payload = []
-        import json as _json
-
-        return _FakeCompletedProcess(stdout=_json.dumps(payload))
+            pages = []
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
@@ -113,3 +122,20 @@ def test_get_pr_review_status_paginates_gh_api_calls(
     assert len(invocations) == 2
     for cmd in invocations:
         assert "--paginate" in cmd, f"missing --paginate in {cmd}"
+        assert "--slurp" in cmd, f"missing --slurp in {cmd}"
+
+
+def test_get_pr_review_status_pending_when_no_codex_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PR with no Codex bot comments should resolve to PENDING."""
+    import json as _json
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(
+            stdout=_json.dumps([[{"id": 1, "user": {"login": "human"}, "body": "hi"}]])
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert get_pr_review_status("owner/name", 42) == ReviewStatus.PENDING
