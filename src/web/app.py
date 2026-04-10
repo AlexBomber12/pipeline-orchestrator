@@ -130,3 +130,18 @@ async def partial_repo_list(request: Request) -> HTMLResponse:
         "components/repo_list.html",
         {"repos": states},
     )
+
+
+@app.get("/repo/{name}", response_class=HTMLResponse)
+async def repo_detail(request: Request, name: str) -> HTMLResponse:
+    """Placeholder repo detail page.
+
+    The repo cards on the index page link here. The full detail view is
+    delivered by PR-006; until then this route returns a minimal valid
+    HTML page so the link does not 404.
+    """
+    return templates.TemplateResponse(
+        request,
+        "repo_detail.html",
+        {"title": name, "name": name},
+    )

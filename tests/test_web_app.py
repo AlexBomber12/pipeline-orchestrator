@@ -208,3 +208,19 @@ def test_partial_repo_list_empty_state(
 
     assert response.status_code == 200
     assert "No repositories configured" in response.text
+
+
+def test_repo_detail_route_returns_placeholder(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/repo/alpha")
+
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    body = response.text
+    assert "alpha" in body
+    assert "PR-006" in body
+    assert "Back to dashboard" in body
