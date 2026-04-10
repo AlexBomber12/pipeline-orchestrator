@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Pipeline Orchestrator{% endblock %}</title>
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+        rel="stylesheet">
+
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        'surface-1': '#0a0a0f',
+                        'surface-2': '#12121a',
+                        'surface-3': '#1a1a25',
+                        'accent': '#22d3ee',
+                        'ok': '#34d399',
+                        'warn': '#fbbf24',
+                        'fail': '#f87171',
+                        'hung': '#a78bfa',
+                    },
+                    fontFamily: {
+                        'sans': ['"DM Sans"', 'system-ui', 'sans-serif'],
+                        'mono': ['"JetBrains Mono"', 'ui-monospace', 'monospace'],
+                    },
+                },
+            },
+        };
+    </script>
+
+    <style>
+        body {
+            font-family: 'DM Sans', system-ui, sans-serif;
+        }
+
+        .font-mono,
+        code,
+        pre {
+            font-family: 'JetBrains Mono', ui-monospace, monospace;
+        }
+
+        @keyframes pulse-dot {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
+        .pulse-dot {
+            animation: pulse-dot 2s ease-in-out infinite;
+        }
+    </style>
+</head>
+<body class="bg-surface-1 text-gray-200 min-h-screen">
+    <nav class="border-b border-white/5 bg-surface-2">
+        <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <div class="w-9 h-9 rounded-md bg-accent/10 border border-accent/30 flex items-center justify-center">
+                    <span class="font-mono text-accent text-sm font-semibold">PO</span>
+                </div>
+                <h1 class="text-lg font-semibold tracking-tight">Pipeline Orchestrator</h1>
+            </div>
+            <div id="clock" class="font-mono text-sm text-gray-400">--:--:--</div>
+        </div>
+    </nav>
+
+    <main class="max-w-7xl mx-auto px-6 py-8">
+        {% block content %}{% endblock %}
+    </main>
+
+    <script>
+        (function () {
+            const el = document.getElementById('clock');
+            function tick() {
+                const now = new Date();
+                const hh = String(now.getHours()).padStart(2, '0');
+                const mm = String(now.getMinutes()).padStart(2, '0');
+                const ss = String(now.getSeconds()).padStart(2, '0');
+                el.textContent = `${hh}:${mm}:${ss}`;
+            }
+            tick();
+            setInterval(tick, 1000);
+        })();
+    </script>
+</body>
+</html>
