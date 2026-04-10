@@ -7,7 +7,8 @@ from typing import Any
 
 import pytest
 
-from src.github_client import get_repo_full_name, run_gh
+from src.github_client import get_pr_review_status, get_repo_full_name, run_gh
+from src.models import ReviewStatus
 
 
 class _FakeCompletedProcess:
@@ -84,3 +85,31 @@ def test_run_gh_returns_raw_string_when_not_json(
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert run_gh(["auth", "status"]) == "ok"
+
+
+def test_get_pr_review_status_paginates_gh_api_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both the comments and reactions lookups must request all pages."""
+    invocations: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        invocations.append(cmd)
+        path = cmd[-1]
+        if path.endswith("/comments"):
+            payload = [{"id": 1, "user": {"login": "chatgpt-codex-bot"}, "body": ""}]
+        elif path.endswith("/reactions"):
+            payload = [{"content": "+1"}]
+        else:
+            payload = []
+        import json as _json
+
+        return _FakeCompletedProcess(stdout=_json.dumps(payload))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert get_pr_review_status("owner/name", 42) == ReviewStatus.APPROVED
+
+    assert len(invocations) == 2
+    for cmd in invocations:
+        assert "--paginate" in cmd, f"missing --paginate in {cmd}"

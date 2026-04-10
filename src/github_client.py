@@ -102,7 +102,11 @@ def get_open_prs(repo: str) -> list[PRInfo]:
 def get_pr_review_status(repo: str, pr_number: int) -> ReviewStatus:
     """Derive a Codex review status from PR issue comments and their reactions."""
     comments = run_gh(
-        ["api", f"repos/{repo}/issues/{pr_number}/comments"],
+        [
+            "api",
+            "--paginate",
+            f"repos/{repo}/issues/{pr_number}/comments",
+        ],
     )
     if not isinstance(comments, list):
         return ReviewStatus.PENDING
@@ -115,7 +119,11 @@ def get_pr_review_status(repo: str, pr_number: int) -> ReviewStatus:
         comment_id = comment.get("id")
         if comment_id is not None:
             reactions = run_gh(
-                ["api", f"repos/{repo}/issues/comments/{comment_id}/reactions"],
+                [
+                    "api",
+                    "--paginate",
+                    f"repos/{repo}/issues/comments/{comment_id}/reactions",
+                ],
             )
             if isinstance(reactions, list):
                 contents = {r.get("content") for r in reactions}
