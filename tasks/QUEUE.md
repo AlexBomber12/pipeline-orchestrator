@@ -12,7 +12,7 @@
 - Depends on: PR-001
 
 ## PR-003: Queue parser
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-003.md
 - Branch: pr-003-queue-parser
 - Depends on: PR-002
