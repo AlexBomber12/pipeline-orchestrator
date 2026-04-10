@@ -19,7 +19,12 @@ from src.models import (
     TaskStatus,
 )
 from src.web import app as web_app
-from src.web.app import app, get_all_repo_states, repo_name_from_url
+from src.web.app import (
+    app,
+    get_all_repo_states,
+    get_repo_state,
+    repo_name_from_url,
+)
 
 
 class _FakeRedis:
@@ -210,8 +215,77 @@ def test_partial_repo_list_empty_state(
     assert "No repositories configured" in response.text
 
 
-def test_repo_detail_route_returns_placeholder(
-    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+def test_get_repo_state_unknown_repo_returns_idle_default(
+    empty_config: Path,
+) -> None:
+    state = asyncio.run(get_repo_state("ghost", redis_client=None))
+
+    assert state.name == "ghost"
+    assert state.url == ""
+    assert state.state == PipelineState.IDLE
+    assert state.current_task is None
+    assert state.current_pr is None
+
+
+def test_get_repo_state_unknown_repo_ignores_stale_redis_key(
+    two_repo_config: Path,
+) -> None:
+    """Repos missing from config must not surface stale Redis payloads."""
+    stale = RepoState(
+        url="https://github.com/example/ghost.git",
+        name="ghost",
+        state=PipelineState.CODING,
+        current_task=None,
+        current_pr=None,
+        last_updated=datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc),
+    )
+    fake = _FakeRedis({"pipeline:ghost": stale.model_dump_json()})
+
+    state = asyncio.run(get_repo_state("ghost", redis_client=fake))
+
+    assert state.name == "ghost"
+    assert state.url == ""
+    assert state.state == PipelineState.IDLE
+
+
+def test_get_repo_state_uses_redis_payload(two_repo_config: Path) -> None:
+    now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="alpha",
+        state=PipelineState.WATCH,
+        current_task=QueueTask(
+            pr_id="PR-007",
+            title="Sample task",
+            status=TaskStatus.DOING,
+            task_file="tasks/PR-007.md",
+        ),
+        current_pr=PRInfo(
+            number=17,
+            branch="pr-007-sample",
+            ci_status=CIStatus.PENDING,
+            review_status=ReviewStatus.EYES,
+            push_count=2,
+            url="https://github.com/example/alpha/pull/17",
+        ),
+        last_updated=now,
+        history=[
+            {"time": "12:00:01", "state": "CODING", "event": "started coding"},
+            {"time": "12:00:42", "state": "WATCH", "event": "watching CI"},
+        ],
+    )
+    fake = _FakeRedis({"pipeline:alpha": stored.model_dump_json()})
+
+    state = asyncio.run(get_repo_state("alpha", redis_client=fake))
+
+    assert state.state == PipelineState.WATCH
+    assert state.current_pr is not None
+    assert state.current_pr.number == 17
+    assert state.history[-1]["event"] == "watching CI"
+
+
+def test_repo_detail_route_renders_full_page(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
 
@@ -221,6 +295,90 @@ def test_repo_detail_route_returns_placeholder(
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
     body = response.text
+    assert "<!DOCTYPE" in body
     assert "alpha" in body
-    assert "PR-006" in body
-    assert "Back to dashboard" in body
+    assert "All repositories" in body
+    assert 'hx-get="/partials/repo/alpha"' in body
+    assert 'hx-trigger="every 5s"' in body
+    assert "Current Task" in body
+    assert "Current PR" in body
+    assert "Event log" in body
+
+
+def test_partial_repo_detail_returns_html_fragment(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo/alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "<!DOCTYPE" not in body  # fragment, not full document
+    assert "alpha" in body
+    assert "IDLE" in body
+    assert "Current Task" in body
+    assert "Current PR" in body
+    assert "Event log" in body
+
+
+def test_partial_repo_detail_renders_redis_payload(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="alpha",
+        state=PipelineState.CODING,
+        current_task=QueueTask(
+            pr_id="PR-042",
+            title="Wire it up",
+            status=TaskStatus.DOING,
+            task_file="tasks/PR-042.md",
+        ),
+        current_pr=PRInfo(
+            number=99,
+            branch="pr-042-wire-it-up",
+            ci_status=CIStatus.SUCCESS,
+            review_status=ReviewStatus.APPROVED,
+            push_count=3,
+            url="https://github.com/example/alpha/pull/99",
+        ),
+        last_updated=now,
+        history=[
+            {"time": "11:59:00", "state": "PREFLIGHT", "event": "preflight ok"},
+            {"time": "12:00:00", "state": "CODING", "event": "claude started"},
+        ],
+    )
+
+    class _StubClientWithPayload:
+        async def get(self, key: str) -> str | None:
+            if key == "pipeline:alpha":
+                return stored.model_dump_json()
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
+    class _StubAioredisWithPayload:
+        @staticmethod
+        def from_url(
+            url: str, decode_responses: bool = True
+        ) -> _StubClientWithPayload:
+            return _StubClientWithPayload()
+
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredisWithPayload())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo/alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "PR-042" in body
+    assert "Wire it up" in body
+    assert "#99" in body
+    assert "https://github.com/example/alpha/pull/99" in body
+    assert "pr-042-wire-it-up" in body
+    assert "claude started" in body
+    assert "CODING" in body

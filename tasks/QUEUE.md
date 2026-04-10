@@ -30,7 +30,7 @@
 - Depends on: PR-003, PR-004
 
 ## PR-006: Dashboard repo detail and HTMX polling
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-006.md
 - Branch: pr-006-dashboard-detail
 - Depends on: PR-005
