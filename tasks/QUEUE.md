@@ -1,7 +1,7 @@
 # Task Queue
 
 ## PR-001: Project bootstrap
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-001.md
 - Branch: pr-001-bootstrap
 

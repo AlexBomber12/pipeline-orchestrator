@@ -1,0 +1,15 @@
+repositories: []
+
+daemon:
+  poll_interval_sec: 60
+  review_timeout_min: 60
+  hung_fallback_codex_review: true
+  error_handler_use_ai: true
+
+web:
+  host: 0.0.0.0
+  port: 8000
+
+auth:
+  claude_config_dir: /data/auth/claude
+  gh_config_dir: /data/auth/gh
