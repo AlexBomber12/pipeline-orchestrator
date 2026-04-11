@@ -60,7 +60,7 @@
 - Depends on: PR-009
 
 ## PR-011: Repo scaffolding on connect
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-011.md
 - Branch: pr-011-scaffolding
 - Depends on: PR-009
