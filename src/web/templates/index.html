@@ -3,6 +3,12 @@
 {% block title %}Dashboard - Pipeline Orchestrator{% endblock %}
 
 {% block content %}
+<div hx-get="/partials/alerts"
+     hx-trigger="every 10s"
+     hx-swap="innerHTML">
+    {% include "components/alerts_panel.html" %}
+</div>
+
 <div class="mb-6"
      hx-get="/partials/stats"
      hx-trigger="every 10s"
