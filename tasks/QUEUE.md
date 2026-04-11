@@ -66,7 +66,7 @@
 - Depends on: PR-009
 
 ## PR-012: Fix sprint 1 issues
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-012.md
 - Branch: pr-012-sprint1-fixes
 - Depends on: PR-006

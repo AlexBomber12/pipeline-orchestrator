@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 
 from pydantic import BaseModel, Field
@@ -64,5 +64,7 @@ class RepoState(BaseModel):
     current_task: QueueTask | None = None
     current_pr: PRInfo | None = None
     error_message: str | None = None
-    last_updated: datetime
+    last_updated: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
     history: list[dict] = Field(default_factory=list)
