@@ -70,3 +70,39 @@
 - Tasks file: tasks/PR-012.md
 - Branch: pr-012-sprint1-fixes
 - Depends on: PR-006
+
+## PR-013: Extract shared utils
+- Status: TODO
+- Tasks file: tasks/PR-013.md
+- Branch: pr-013-utils
+- Depends on: PR-012
+
+## PR-014: Config writer and hot reload
+- Status: TODO
+- Tasks file: tasks/PR-014.md
+- Branch: pr-014-config-writer
+- Depends on: PR-013
+
+## PR-015: Settings page - repositories
+- Status: TODO
+- Tasks file: tasks/PR-015.md
+- Branch: pr-015-settings-repos
+- Depends on: PR-014
+
+## PR-016: Settings page - daemon and auth status
+- Status: TODO
+- Tasks file: tasks/PR-016.md
+- Branch: pr-016-settings-daemon
+- Depends on: PR-015
+
+## PR-017: Dashboard observability - event log and stats
+- Status: TODO
+- Tasks file: tasks/PR-017.md
+- Branch: pr-017-observability
+- Depends on: PR-013
+
+## PR-018: Dashboard alerts panel
+- Status: TODO
+- Tasks file: tasks/PR-018.md
+- Branch: pr-018-alerts
+- Depends on: PR-017
