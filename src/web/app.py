@@ -269,30 +269,63 @@ async def delete_settings_repo(
     return _render_settings_repo_list(request)
 
 
+_BOOL_TRUE = {"true", "1", "yes", "on"}
+_BOOL_FALSE = {"false", "0", "no", "off"}
+
+
+def _coerce_bool(value: str, field: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in _BOOL_TRUE:
+        return True
+    if lowered in _BOOL_FALSE:
+        return False
+    raise ValueError(f"{field} must be a boolean")
+
+
+def _coerce_int(value: str, field: str) -> int:
+    try:
+        return int(value.strip())
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an integer") from exc
+
+
 @app.put("/settings/repos", response_class=HTMLResponse)
 async def put_settings_repo(
     request: Request,
     url: str,
     branch: str | None = Form(None),
-    auto_merge: bool | None = Form(None),
-    review_timeout_min: int | None = Form(None),
-    poll_interval_sec: int | None = Form(None),
+    auto_merge: str | None = Form(None),
+    review_timeout_min: str | None = Form(None),
+    poll_interval_sec: str | None = Form(None),
 ) -> HTMLResponse:
     """Update a repository by its full URL.
 
     The URL is the unique key in the config (basenames can collide across
     owners), so settings mutations key off the normalized URL instead of
     the repo name.
+
+    All fields are taken as ``str | None`` rather than their final types so
+    that an empty form value (``review_timeout_min=``, sent when a user
+    clears a numeric input) is handled here as a no-op update instead of
+    tripping FastAPI's request parser, which would return a raw JSON 422
+    that HTMX then swaps into the repo list and wedges the UI.
     """
     updates: dict[str, object] = {}
-    if branch is not None:
+    if branch is not None and branch != "":
         updates["branch"] = branch
-    if auto_merge is not None:
-        updates["auto_merge"] = auto_merge
-    if review_timeout_min is not None:
-        updates["review_timeout_min"] = review_timeout_min
-    if poll_interval_sec is not None:
-        updates["poll_interval_sec"] = poll_interval_sec
+    try:
+        if auto_merge is not None and auto_merge != "":
+            updates["auto_merge"] = _coerce_bool(auto_merge, "auto_merge")
+        if review_timeout_min is not None and review_timeout_min != "":
+            updates["review_timeout_min"] = _coerce_int(
+                review_timeout_min, "review_timeout_min"
+            )
+        if poll_interval_sec is not None and poll_interval_sec != "":
+            updates["poll_interval_sec"] = _coerce_int(
+                poll_interval_sec, "poll_interval_sec"
+            )
+    except ValueError as exc:
+        return _render_settings_error(request, str(exc), 422)
 
     try:
         update_repository(url, path=CONFIG_PATH, **updates)

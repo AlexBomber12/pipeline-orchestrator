@@ -194,6 +194,78 @@ def test_put_repo_updates_multiple_fields(one_repo_config: Path) -> None:
     assert cfg.repositories[0].branch == "main"
 
 
+def test_put_repo_empty_numeric_inputs_are_no_ops(
+    one_repo_config: Path,
+) -> None:
+    """Cleared number inputs (``review_timeout_min=``, ``poll_interval_sec=``)
+    must not trip FastAPI's request parser.
+
+    Regression for a P1 bug where declaring the fields as
+    ``int | None = Form(None)`` caused FastAPI to reject the request during
+    parsing with a raw JSON 422; combined with ``htmx:beforeSwap`` forcing
+    422 swaps, HTMX would replace ``#settings-repo-list`` with the JSON
+    payload and wedge the UI until a full reload.
+    """
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/repos",
+            params={"url": "https://github.com/example/alpha.git"},
+            data={
+                "branch": "develop",
+                "review_timeout_min": "",
+                "poll_interval_sec": "",
+            },
+        )
+
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    cfg = load_config(str(one_repo_config))
+    # Branch updated, numerics untouched by empty submissions.
+    assert cfg.repositories[0].branch == "develop"
+    assert cfg.repositories[0].review_timeout_min == 60
+    assert cfg.repositories[0].poll_interval_sec == 60
+
+
+def test_put_repo_invalid_int_returns_422_html(
+    one_repo_config: Path,
+) -> None:
+    """Non-numeric values for ``review_timeout_min`` render the error partial
+    with status 422 (HTML), not FastAPI's default JSON 422."""
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/repos",
+            params={"url": "https://github.com/example/alpha.git"},
+            data={"review_timeout_min": "abc"},
+        )
+
+    assert response.status_code == 422
+    assert "text/html" in response.headers["content-type"]
+    body = response.text
+    assert 'id="settings-error"' in body
+    assert "review_timeout_min" in body
+    # Config untouched.
+    cfg = load_config(str(one_repo_config))
+    assert cfg.repositories[0].review_timeout_min == 60
+
+
+def test_put_repo_invalid_bool_returns_422_html(
+    one_repo_config: Path,
+) -> None:
+    """Unknown bool strings for ``auto_merge`` render the error partial."""
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/repos",
+            params={"url": "https://github.com/example/alpha.git"},
+            data={"auto_merge": "maybe"},
+        )
+
+    assert response.status_code == 422
+    assert "text/html" in response.headers["content-type"]
+    assert "auto_merge" in response.text
+    cfg = load_config(str(one_repo_config))
+    assert cfg.repositories[0].auto_merge is True
+
+
 def test_put_nonexistent_repo_returns_404(empty_config: Path) -> None:
     with TestClient(app) as client:
         response = client.put(
