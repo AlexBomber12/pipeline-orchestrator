@@ -19,6 +19,7 @@ import redis.asyncio as aioredis
 
 from src import claude_cli, github_client
 from src.config import AppConfig, RepoConfig
+from src.daemon import scaffolder
 from src.models import (
     CIStatus,
     PipelineState,
@@ -115,6 +116,20 @@ class PipelineRunner:
                 raise RuntimeError(f"git clone failed: {detail}") from exc
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError("git clone timed out") from exc
+            # Scaffold only on a fresh clone, not on every cycle. Scaffolding
+            # adds any missing pipeline orchestrator files (AGENTS.md,
+            # tasks/QUEUE.md, scripts/*, .gitignore) and pushes a commit back
+            # upstream so the repo satisfies the runbook before the daemon
+            # starts picking tasks from it.
+            try:
+                actions = scaffolder.scaffold_repo(self.repo_path)
+            except Exception as exc:
+                self.log_event(f"scaffold_repo failed: {exc}")
+            else:
+                if actions:
+                    self.log_event(
+                        f"scaffold_repo created: {', '.join(actions)}"
+                    )
             return
 
         try:
