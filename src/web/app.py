@@ -9,10 +9,11 @@ Redis the dashboard renders a default ``IDLE`` state derived from
 from __future__ import annotations
 
 import os
+import subprocess
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI, Form, Request
@@ -23,6 +24,7 @@ from src.config import (
     add_repository,
     load_config,
     remove_repository,
+    update_daemon_config,
     update_repository,
 )
 from src.models import PipelineState, RepoState
@@ -232,6 +234,173 @@ async def settings_page(request: Request) -> HTMLResponse:
             "repos": cfg.repositories,
             "daemon": cfg.daemon,
         },
+    )
+
+
+def _render_settings_daemon(request: Request) -> HTMLResponse:
+    """Render the daemon settings form for a successful response.
+
+    Uses ``settings_daemon_response.html`` rather than the bare
+    ``settings_daemon.html`` partial so HTMX also receives an OOB clear
+    of ``#settings-daemon-error`` — otherwise an error banner left over
+    from a prior 422/503 PUT would keep hanging around after a subsequent
+    successful mutation.
+    """
+    cfg = load_config(CONFIG_PATH)
+    return templates.TemplateResponse(
+        request,
+        "components/settings_daemon_response.html",
+        {"daemon": cfg.daemon},
+    )
+
+
+def _render_settings_daemon_error(
+    request: Request, message: str, status_code: int
+) -> HTMLResponse:
+    cfg = load_config(CONFIG_PATH)
+    return templates.TemplateResponse(
+        request,
+        "components/settings_daemon_error.html",
+        {"daemon": cfg.daemon, "message": message},
+        status_code=status_code,
+    )
+
+
+@app.get("/partials/settings/daemon", response_class=HTMLResponse)
+async def partial_settings_daemon(request: Request) -> HTMLResponse:
+    return _render_settings_daemon(request)
+
+
+@app.put("/settings/daemon", response_class=HTMLResponse)
+async def put_settings_daemon(
+    request: Request,
+    poll_interval_sec: str | None = Form(None),
+    review_timeout_min: str | None = Form(None),
+    hung_fallback_codex_review: str | None = Form(None),
+    error_handler_use_ai: str | None = Form(None),
+) -> HTMLResponse:
+    """Update daemon settings.
+
+    Mirrors ``put_settings_repo`` in accepting every field as ``str | None``
+    so that a cleared number input (``review_timeout_min=``) is handled as
+    a no-op instead of tripping FastAPI's request parser. Numeric fields
+    must stay strictly positive: a zero or negative ``poll_interval_sec``
+    would busy-loop the daemon, and a zero or negative ``review_timeout_min``
+    would flag every in-flight PR as hung the moment it is created.
+    """
+    updates: dict[str, Any] = {}
+    try:
+        if poll_interval_sec is not None and poll_interval_sec != "":
+            updates["poll_interval_sec"] = _coerce_int(
+                poll_interval_sec, "poll_interval_sec", min_value=1
+            )
+        if review_timeout_min is not None and review_timeout_min != "":
+            updates["review_timeout_min"] = _coerce_int(
+                review_timeout_min, "review_timeout_min", min_value=1
+            )
+        if (
+            hung_fallback_codex_review is not None
+            and hung_fallback_codex_review != ""
+        ):
+            updates["hung_fallback_codex_review"] = _coerce_bool(
+                hung_fallback_codex_review, "hung_fallback_codex_review"
+            )
+        if error_handler_use_ai is not None and error_handler_use_ai != "":
+            updates["error_handler_use_ai"] = _coerce_bool(
+                error_handler_use_ai, "error_handler_use_ai"
+            )
+    except ValueError as exc:
+        return _render_settings_daemon_error(request, str(exc), 422)
+
+    try:
+        update_daemon_config(path=CONFIG_PATH, **updates)
+    except ValueError as exc:
+        return _render_settings_daemon_error(request, str(exc), 422)
+    except OSError as exc:
+        return _render_settings_daemon_error(
+            request, f"Failed to write config.yml: {exc}", 503
+        )
+    return _render_settings_daemon(request)
+
+
+_AUTH_CHECK_TIMEOUT_SEC = 5
+
+
+def _run_auth_command(cmd: list[str]) -> tuple[int, str, str]:
+    """Run ``cmd`` for an auth status probe and return (rc, stdout, stderr).
+
+    Any failure to spawn (``FileNotFoundError``, ``PermissionError``) or
+    the subprocess exceeding ``_AUTH_CHECK_TIMEOUT_SEC`` is reported as a
+    non-zero return code so the caller can render a red status dot without
+    crashing the request.
+    """
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_AUTH_CHECK_TIMEOUT_SEC,
+            check=False,
+        )
+    except FileNotFoundError:
+        return 127, "", f"{cmd[0]} not found"
+    except PermissionError as exc:
+        return 126, "", str(exc)
+    except subprocess.TimeoutExpired:
+        return 124, "", f"{cmd[0]} timed out after {_AUTH_CHECK_TIMEOUT_SEC}s"
+    return completed.returncode, completed.stdout or "", completed.stderr or ""
+
+
+def _check_claude_auth() -> dict[str, str]:
+    """Probe the ``claude`` CLI and report its authorization status."""
+    rc, stdout, stderr = _run_auth_command(["claude", "--version"])
+    if rc == 0:
+        output = (stdout or stderr).strip()
+        detail = output.splitlines()[0] if output else "claude CLI available"
+        return {"status": "ok", "detail": detail}
+    detail = (stderr or stdout).strip() or "claude CLI not available"
+    return {"status": "error", "detail": detail}
+
+
+def _check_gh_auth() -> dict[str, str]:
+    """Probe the ``gh`` CLI and report its authorization status."""
+    rc, stdout, stderr = _run_auth_command(["gh", "auth", "status"])
+    # ``gh auth status`` prints its report to stderr on recent versions and
+    # to stdout on older ones, so merge both streams before scanning.
+    combined = f"{stdout}\n{stderr}".strip()
+    if rc == 0 and "Logged in" in combined:
+        detail = ""
+        for line in combined.splitlines():
+            stripped = line.strip()
+            if "Logged in" in stripped:
+                detail = stripped
+                break
+        return {"status": "ok", "detail": detail or "Logged in"}
+    if combined:
+        detail = combined.splitlines()[0].strip()
+    else:
+        detail = "gh CLI not configured"
+    return {"status": "error", "detail": detail}
+
+
+def _collect_auth_status() -> dict[str, dict[str, str]]:
+    return {
+        "claude": _check_claude_auth(),
+        "gh": _check_gh_auth(),
+    }
+
+
+@app.get("/api/auth-status")
+async def api_auth_status() -> JSONResponse:
+    return JSONResponse(_collect_auth_status())
+
+
+@app.get("/partials/settings/auth-status", response_class=HTMLResponse)
+async def partial_settings_auth_status(request: Request) -> HTMLResponse:
+    return templates.TemplateResponse(
+        request,
+        "components/settings_auth.html",
+        {"auth": _collect_auth_status()},
     )
 
 

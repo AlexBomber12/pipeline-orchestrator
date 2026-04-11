@@ -1,0 +1,8 @@
+{% include "components/settings_daemon.html" %}
+{#
+  OOB clear of #settings-daemon-error. Successful PUTs to /settings/daemon
+  return this template, and HTMX applies the OOB element to the out-of-band
+  #settings-daemon-error div so any message left over from a prior 422/503
+  response is wiped as the form re-renders in the happy path.
+#}
+<div id="settings-daemon-error" hx-swap-oob="innerHTML"></div>
