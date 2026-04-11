@@ -832,6 +832,27 @@ def test_ensure_repo_cloned_raises_non_missing_ref_fetch_failure(
             asyncio.run(runner.ensure_repo_cloned())
 
 
+def _populate_fully_scaffolded_repo(repo: Any) -> None:
+    """Create every file ``_repo_looks_scaffolded`` checks for.
+
+    Tests that assert the fs probe returns True must provide the full
+    set: AGENTS.md (or CLAUDE.md), tasks/QUEUE.md, scripts/ci.sh,
+    scripts/make-review-artifacts.sh, and a .gitignore that contains
+    ``artifacts/``. Partial coverage is intentionally not accepted
+    by the probe — see the comment on ``_repo_looks_scaffolded`` for
+    why.
+    """
+    (repo / "AGENTS.md").write_text("# AGENTS\n")
+    (repo / "tasks").mkdir()
+    (repo / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "ci.sh").write_text("#!/usr/bin/env bash\n")
+    (repo / "scripts" / "make-review-artifacts.sh").write_text(
+        "#!/usr/bin/env bash\n"
+    )
+    (repo / ".gitignore").write_text("artifacts/\n")
+
+
 def test_ensure_repo_cloned_skips_scaffold_when_repo_already_looks_scaffolded(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
@@ -847,11 +868,7 @@ def test_ensure_repo_cloned_skips_scaffold_when_repo_already_looks_scaffolded(
     """
     existing = tmp_path / "clone-target"
     existing.mkdir()
-    (existing / "AGENTS.md").write_text("# AGENTS\n")
-    (existing / "tasks").mkdir()
-    (existing / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
-    (existing / "scripts").mkdir()
-    (existing / "scripts" / "ci.sh").write_text("#!/usr/bin/env bash\n")
+    _populate_fully_scaffolded_repo(existing)
 
     # The helper should recognise this directory as already scaffolded.
     assert runner_module._repo_looks_scaffolded(str(existing)) is True
@@ -885,6 +902,46 @@ def test_ensure_repo_cloned_skips_scaffold_when_repo_already_looks_scaffolded(
     assert runner._scaffolded is True
 
 
+def test_repo_looks_scaffolded_rejects_partial_provisioning(
+    tmp_path: Any,
+) -> None:
+    """The fs probe must require **every** asset scaffold_repo would
+    commit — not just the three most visible files. A repo that
+    pre-existed with ``AGENTS.md`` + ``tasks/QUEUE.md`` +
+    ``scripts/ci.sh`` but no ``scripts/make-review-artifacts.sh``
+    (or no ``artifacts/`` entry in ``.gitignore``) must NOT be
+    classified as scaffolded: the daemon would otherwise skip
+    scaffold_repo permanently, leaving those files uncreated, and
+    the first ``make-review-artifacts.sh`` run would dirty the
+    working tree until ``preflight`` forces ERROR.
+    """
+    base = tmp_path / "partial"
+    base.mkdir()
+    (base / "AGENTS.md").write_text("# AGENTS\n")
+    (base / "tasks").mkdir()
+    (base / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
+    (base / "scripts").mkdir()
+    (base / "scripts" / "ci.sh").write_text("#!/usr/bin/env bash\n")
+    # Missing: scripts/make-review-artifacts.sh and .gitignore.
+    assert runner_module._repo_looks_scaffolded(str(base)) is False
+
+    # Add the missing review-artifacts script — still missing .gitignore.
+    (base / "scripts" / "make-review-artifacts.sh").write_text(
+        "#!/usr/bin/env bash\n"
+    )
+    assert runner_module._repo_looks_scaffolded(str(base)) is False
+
+    # Add a .gitignore that does NOT mention artifacts/.
+    (base / ".gitignore").write_text("node_modules/\n*.pyc\n")
+    assert runner_module._repo_looks_scaffolded(str(base)) is False
+
+    # Finally append artifacts/ — the probe should now return True.
+    (base / ".gitignore").write_text(
+        "node_modules/\n*.pyc\nartifacts/\n"
+    )
+    assert runner_module._repo_looks_scaffolded(str(base)) is True
+
+
 def test_ensure_repo_cloned_retries_scaffold_on_missing_ref_after_restart(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
@@ -900,11 +957,7 @@ def test_ensure_repo_cloned_retries_scaffold_on_missing_ref_after_restart(
     existing = tmp_path / "clone-target"
     existing.mkdir()
     # Scaffolding files are on disk (prior cycle committed them)...
-    (existing / "AGENTS.md").write_text("# AGENTS\n")
-    (existing / "tasks").mkdir()
-    (existing / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
-    (existing / "scripts").mkdir()
-    (existing / "scripts" / "ci.sh").write_text("#!/usr/bin/env bash\n")
+    _populate_fully_scaffolded_repo(existing)
 
     # ...but fetch reports the branch is missing upstream (the prior
     # cycle's initial push failed transiently).

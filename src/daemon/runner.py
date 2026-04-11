@@ -64,8 +64,8 @@ _FETCH_MISSING_REF_NEEDLE = "couldn't find remote ref"
 
 
 def _repo_looks_scaffolded(repo_path: str) -> bool:
-    """Return ``True`` if ``repo_path`` already contains the pipeline
-    orchestrator scaffolding files.
+    """Return ``True`` if ``repo_path`` already contains every file
+    that ``scaffolder.scaffold_repo`` would commit upstream.
 
     A daemon restart on a previously-scaffolded clone must not re-run
     ``scaffolder.scaffold_repo``: its upfront ``git checkout {branch}``
@@ -75,6 +75,18 @@ def _repo_looks_scaffolded(repo_path: str) -> bool:
     instead of letting ``recover_state`` do its job. We infer the
     "already scaffolded" signal from the local filesystem so it
     survives process restarts (``_scaffolded`` itself is in-memory).
+
+    The probe must cover **every** asset scaffold_repo is responsible
+    for, not just the three most visible ones — otherwise a partially
+    provisioned repo (pre-existing ``AGENTS.md`` + ``tasks/QUEUE.md``
+    + ``scripts/ci.sh`` but no ``scripts/make-review-artifacts.sh`` or
+    no ``artifacts/`` entry in ``.gitignore``) would permanently skip
+    scaffolding on restart, leaving the missing files uncreated and
+    letting later artifact generation dirty the working tree until
+    ``preflight`` forces ERROR. ``artifacts/`` itself is intentionally
+    not checked because it is gitignored and can be deleted at any
+    time — scaffold_repo handles the recreate-without-commit case
+    idempotently.
     """
     path = Path(repo_path)
     if not path.exists():
@@ -82,7 +94,21 @@ def _repo_looks_scaffolded(repo_path: str) -> bool:
     has_agents = (path / "AGENTS.md").exists() or (path / "CLAUDE.md").exists()
     has_queue = (path / "tasks" / "QUEUE.md").exists()
     has_ci = (path / "scripts" / "ci.sh").exists()
-    return has_agents and has_queue and has_ci
+    has_review_artifacts = (
+        path / "scripts" / "make-review-artifacts.sh"
+    ).exists()
+    gitignore = path / ".gitignore"
+    has_gitignore_artifacts = (
+        gitignore.exists()
+        and "artifacts/" in gitignore.read_text().splitlines()
+    )
+    return (
+        has_agents
+        and has_queue
+        and has_ci
+        and has_review_artifacts
+        and has_gitignore_artifacts
+    )
 
 
 class PipelineRunner:
