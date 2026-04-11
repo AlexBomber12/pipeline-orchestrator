@@ -29,6 +29,7 @@ from src.models import (
     TaskStatus,
 )
 from src.queue_parser import get_next_task, parse_queue, parse_queue_text
+from src.utils import repo_name_from_url
 
 logger = logging.getLogger(__name__)
 
@@ -39,15 +40,6 @@ _TRANSIENT_STATES = {
 }
 
 _HISTORY_LIMIT = 100
-
-
-def repo_name_from_url(url: str) -> str:
-    """Return the repo name (last URL segment without ``.git``)."""
-    cleaned = url.rstrip("/")
-    last = cleaned.rsplit("/", 1)[-1]
-    if last.endswith(".git"):
-        last = last[: -len(".git")]
-    return last
 
 
 def repo_owner_from_url(url: str) -> str:
