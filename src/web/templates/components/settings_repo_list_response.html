@@ -1,0 +1,8 @@
+{% include "components/settings_repo_list.html" %}
+{#
+  OOB clear of #settings-error. Successful POST/PUT/DELETE responses to
+  /settings/repos return this template, and HTMX applies the OOB element to
+  the out-of-band #settings-error div, wiping any message left over from a
+  prior 422/503 response so the UI stops showing a stale failure banner.
+#}
+<div id="settings-error" hx-swap-oob="innerHTML"></div>

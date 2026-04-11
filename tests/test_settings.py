@@ -394,6 +394,47 @@ def test_put_repo_handles_readonly_config(
     assert cfg.repositories[0].branch == "main"
 
 
+def test_successful_mutation_oob_clears_stale_settings_error(
+    one_repo_config: Path,
+) -> None:
+    """Successful POST/PUT/DELETE responses must OOB-clear ``#settings-error``.
+
+    Regression for a P2 bug where ``_render_settings_repo_list`` only
+    swapped ``#settings-repo-list`` on success, so an OOB error banner
+    posted by a previous 422/503 response persisted unchanged through
+    subsequent successful mutations and the UI kept showing a stale
+    failure message.
+    """
+    with TestClient(app) as client:
+        # POST success clears the error div.
+        post = client.post(
+            "/settings/repos",
+            data={"url": "https://github.com/example/second"},
+        )
+        assert post.status_code == 200
+        assert 'id="settings-error"' in post.text
+        assert 'hx-swap-oob="innerHTML"' in post.text
+
+        # PUT success clears the error div.
+        put = client.put(
+            "/settings/repos",
+            params={"url": "https://github.com/example/alpha.git"},
+            data={"branch": "develop"},
+        )
+        assert put.status_code == 200
+        assert 'id="settings-error"' in put.text
+        assert 'hx-swap-oob="innerHTML"' in put.text
+
+        # DELETE success clears the error div.
+        delete = client.delete(
+            "/settings/repos",
+            params={"url": "https://github.com/example/second"},
+        )
+        assert delete.status_code == 200
+        assert 'id="settings-error"' in delete.text
+        assert 'hx-swap-oob="innerHTML"' in delete.text
+
+
 def test_post_repo_error_includes_error_message(one_repo_config: Path) -> None:
     with TestClient(app) as client:
         response = client.post(

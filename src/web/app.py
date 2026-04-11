@@ -194,10 +194,17 @@ async def partial_repo_detail(request: Request, name: str) -> HTMLResponse:
 
 
 def _render_settings_repo_list(request: Request) -> HTMLResponse:
+    """Render the settings repo list for a successful mutation response.
+
+    The response includes an OOB clear of ``#settings-error`` so that any
+    error banner left over from a prior 422/503 mutation is wiped as soon
+    as a subsequent mutation succeeds (otherwise HTMX keeps the stale
+    message because success responses only swap ``#settings-repo-list``).
+    """
     cfg = load_config(CONFIG_PATH)
     return templates.TemplateResponse(
         request,
-        "components/settings_repo_list.html",
+        "components/settings_repo_list_response.html",
         {"repos": cfg.repositories},
     )
 
