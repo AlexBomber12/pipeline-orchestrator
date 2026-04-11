@@ -8,6 +8,7 @@ Redis the dashboard renders a default ``IDLE`` state derived from
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 from contextlib import asynccontextmanager
@@ -383,24 +384,36 @@ def _check_gh_auth() -> dict[str, str]:
     return {"status": "error", "detail": detail}
 
 
-def _collect_auth_status() -> dict[str, dict[str, str]]:
-    return {
-        "claude": _check_claude_auth(),
-        "gh": _check_gh_auth(),
-    }
+async def _collect_auth_status() -> dict[str, dict[str, str]]:
+    """Return ``{"claude": ..., "gh": ...}`` auth status dicts.
+
+    Each probe invokes a blocking ``subprocess.run`` call with a 5s
+    timeout, so they would block the event loop if awaited directly from
+    an async handler. Dispatching them through ``asyncio.to_thread`` and
+    ``asyncio.gather`` moves the blocking work onto the default thread
+    pool and runs both probes concurrently, so the dashboard's 30s HTMX
+    auth-status poll cannot stall the worker for up to ~10s (two serial
+    5s timeouts) whenever a CLI is missing or slow.
+    """
+    claude, gh = await asyncio.gather(
+        asyncio.to_thread(_check_claude_auth),
+        asyncio.to_thread(_check_gh_auth),
+    )
+    return {"claude": claude, "gh": gh}
 
 
 @app.get("/api/auth-status")
 async def api_auth_status() -> JSONResponse:
-    return JSONResponse(_collect_auth_status())
+    return JSONResponse(await _collect_auth_status())
 
 
 @app.get("/partials/settings/auth-status", response_class=HTMLResponse)
 async def partial_settings_auth_status(request: Request) -> HTMLResponse:
+    auth = await _collect_auth_status()
     return templates.TemplateResponse(
         request,
         "components/settings_auth.html",
-        {"auth": _collect_auth_status()},
+        {"auth": auth},
     )
 
 

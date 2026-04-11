@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -786,6 +787,51 @@ def test_api_auth_status_handles_timeout(
     assert "timed out" in payload["claude"]["detail"]
     assert payload["gh"]["status"] == "error"
     assert "timed out" in payload["gh"]["detail"]
+
+
+def test_auth_status_probes_run_concurrently_off_loop(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both probes must dispatch to the threadpool in parallel.
+
+    Regression for a P1 Codex finding: the original implementation ran
+    `_check_claude_auth` and `_check_gh_auth` serially from the async
+    handler, blocking the event loop for up to ~10s (two 5s timeouts)
+    whenever a CLI was missing. The fix uses `asyncio.gather` +
+    `asyncio.to_thread` so both probes run concurrently in the threadpool.
+
+    This test proves the fix by installing a `threading.Barrier(parties=2)`
+    that both probes must rendez-vous on before `subprocess.run` returns.
+    If the probes still run serially, the first one blocks forever waiting
+    for the second to show up and the test times out; if they run
+    concurrently, both reach the barrier and the request completes.
+    """
+    barrier = threading.Barrier(parties=2, timeout=5)
+
+    def fake_run(
+        cmd: list[str], *args: object, **kwargs: object
+    ) -> _FakeCompleted:
+        # Block until the sibling probe also reaches the barrier. With a
+        # serial implementation this wait times out because the second
+        # probe is never dispatched.
+        barrier.wait()
+        if cmd and cmd[0] == "claude":
+            return _FakeCompleted(0, stdout="claude 1.2.3\n")
+        if cmd and cmd[0] == "gh":
+            return _FakeCompleted(
+                0, stderr="  ✓ Logged in to github.com as octocat\n"
+            )
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(web_app.subprocess, "run", fake_run)
+
+    with TestClient(app) as client:
+        response = client.get("/api/auth-status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["claude"]["status"] == "ok"
+    assert payload["gh"]["status"] == "ok"
 
 
 def test_partial_auth_status_renders_status_dots(
