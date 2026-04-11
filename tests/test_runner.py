@@ -490,6 +490,94 @@ def test_handle_watch_approved_but_ci_pending_applies_timeout(
     )
 
 
+def test_handle_watch_falls_back_to_daemon_review_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a repo omits ``review_timeout_min``, hung detection must fall
+    back to ``daemon.review_timeout_min``.
+
+    Regression for a P2 Codex finding on PR-016: the runner previously
+    only consulted ``self.repo_config.review_timeout_min``, so the new
+    "Default review timeout" control in the Settings daemon section was
+    persisted to ``config.yml`` but ignored at runtime — users thought
+    they'd changed hung behavior while the daemon kept using whatever
+    per-repo value the config had.
+    """
+    stale = datetime.now(timezone.utc) - timedelta(minutes=40)
+    pr = PRInfo(
+        number=7,
+        branch="pr-002",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.EYES,
+        last_activity=stale,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: [pr]
+    )
+
+    # ``review_timeout_min=None`` on the repo → the runner must use the
+    # daemon's 30-minute default. 40 minutes of inactivity is past that,
+    # so the PR flips to HUNG.
+    repo_cfg = RepoConfig(
+        url="https://github.com/octo/demo.git",
+        branch="main",
+        auto_merge=True,
+        review_timeout_min=None,
+        poll_interval_sec=60,
+    )
+    app_cfg = AppConfig(
+        repositories=[], daemon=DaemonConfig(review_timeout_min=30)
+    )
+    runner = PipelineRunner(repo_cfg, app_cfg, _FakeRedis())
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=7, branch="pr-002")
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.HUNG
+
+
+def test_handle_watch_repo_timeout_override_wins_over_daemon_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit per-repo ``review_timeout_min`` must override the
+    daemon-level default.
+
+    Belt-and-suspenders for the P2 fix: raising the daemon default must
+    not silently shorten or lengthen the timeout on repos that pinned
+    their own value via the existing per-repo Settings control (PR-015).
+    """
+    stale = datetime.now(timezone.utc) - timedelta(minutes=90)
+    pr = PRInfo(
+        number=8,
+        branch="pr-003",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.EYES,
+        last_activity=stale,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: [pr]
+    )
+
+    # repo pins 120 min, daemon default is 30 min. 90 minutes of
+    # inactivity is below the repo override, so the PR stays WATCH.
+    repo_cfg = RepoConfig(
+        url="https://github.com/octo/demo.git",
+        branch="main",
+        auto_merge=True,
+        review_timeout_min=120,
+        poll_interval_sec=60,
+    )
+    app_cfg = AppConfig(
+        repositories=[], daemon=DaemonConfig(review_timeout_min=30)
+    )
+    runner = PipelineRunner(repo_cfg, app_cfg, _FakeRedis())
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=8, branch="pr-003")
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.WATCH
+
+
 def test_handle_watch_approved_ci_pending_within_timeout_waits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -863,7 +863,16 @@ class PipelineRunner:
             last_activity = last_activity.replace(tzinfo=timezone.utc)
         now = datetime.now(timezone.utc)
         elapsed_min = (now - last_activity).total_seconds() / 60
-        timeout_min = self.repo_config.review_timeout_min
+        # ``RepoConfig.review_timeout_min`` is an optional per-repo
+        # override; when unset, fall back to the daemon-level default
+        # (``daemon.review_timeout_min``) so PR-016's Settings UI control
+        # actually steers hung-detection for every repo that has not
+        # opted into a custom timeout.
+        timeout_min = (
+            self.repo_config.review_timeout_min
+            if self.repo_config.review_timeout_min is not None
+            else self.app_config.daemon.review_timeout_min
+        )
         if elapsed_min >= timeout_min:
             self.state.state = PipelineState.HUNG
             self.log_event(

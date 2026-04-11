@@ -59,13 +59,15 @@
             <td class="px-4 py-2">
                 <input type="number"
                        name="review_timeout_min"
-                       value="{{ repo.review_timeout_min }}"
+                       value="{{ repo.review_timeout_min if repo.review_timeout_min is not none else '' }}"
+                       placeholder="{{ daemon.review_timeout_min if daemon is defined else '' }}"
                        min="1"
-                       class="w-20 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none"
+                       class="w-20 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 placeholder:text-gray-600 focus:border-accent focus:outline-none"
                        hx-put="{{ put_url }}"
                        hx-trigger="change"
                        hx-target="#settings-repo-list"
-                       hx-swap="innerHTML">
+                       hx-swap="innerHTML"
+                       title="Leave blank to inherit the daemon default ({{ daemon.review_timeout_min if daemon is defined else 60 }} min).">
             </td>
             <td class="px-4 py-2">
                 <input type="number"

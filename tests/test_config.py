@@ -88,7 +88,12 @@ def test_repo_config_defaults() -> None:
     assert repo.url == "https://github.com/example/repo.git"
     assert repo.branch == "main"
     assert repo.auto_merge is True
-    assert repo.review_timeout_min == 60
+    # ``review_timeout_min`` is an optional override that defaults to
+    # ``None``; when unset, the runner falls back to
+    # ``daemon.review_timeout_min`` so a repo added through the Settings
+    # UI without a custom timeout inherits whatever PR-016's daemon
+    # control is set to.
+    assert repo.review_timeout_min is None
     assert repo.poll_interval_sec == 60
 
 

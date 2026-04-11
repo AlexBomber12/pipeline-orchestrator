@@ -1,0 +1,19 @@
+<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+    {% for label, key in [("Claude CLI", "claude"), ("GitHub CLI", "gh")] %}
+    {% set entry = auth[key] %}
+    {% set ok = entry.status == "ok" %}
+    <div class="rounded-lg border border-white/10 bg-surface-3 p-4">
+        <div class="flex items-center gap-3 mb-2">
+            <span class="w-2.5 h-2.5 rounded-full {% if ok %}bg-ok{% else %}bg-fail{% endif %}"
+                  aria-hidden="true"></span>
+            <span class="text-sm font-medium text-gray-200">{{ label }}</span>
+            <span class="ml-auto text-xs uppercase tracking-wide {% if ok %}text-ok{% else %}text-fail{% endif %}">
+                {% if ok %}Authorized{% else %}Error{% endif %}
+            </span>
+        </div>
+        <div class="font-mono text-xs text-gray-400 break-all">
+            {{ entry.detail or ("claude CLI available" if ok else "Not configured") }}
+        </div>
+    </div>
+    {% endfor %}
+</div>

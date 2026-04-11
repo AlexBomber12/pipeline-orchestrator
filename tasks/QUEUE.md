@@ -90,7 +90,7 @@
 - Depends on: PR-014
 
 ## PR-016: Settings page - daemon and auth status
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-016.md
 - Branch: pr-016-settings-daemon
 - Depends on: PR-015

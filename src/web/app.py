@@ -8,11 +8,13 @@ Redis the dashboard renders a default ``IDLE`` state derived from
 
 from __future__ import annotations
 
+import asyncio
 import os
+import subprocess
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI, Form, Request
@@ -23,6 +25,7 @@ from src.config import (
     add_repository,
     load_config,
     remove_repository,
+    update_daemon_config,
     update_repository,
 )
 from src.models import PipelineState, RepoState
@@ -200,12 +203,16 @@ def _render_settings_repo_list(request: Request) -> HTMLResponse:
     error banner left over from a prior 422/503 mutation is wiped as soon
     as a subsequent mutation succeeds (otherwise HTMX keeps the stale
     message because success responses only swap ``#settings-repo-list``).
+    The daemon block is passed alongside the repo list so the
+    ``review_timeout_min`` input can render the daemon-level default as
+    placeholder text whenever a repo has not opted into a per-repo
+    override.
     """
     cfg = load_config(CONFIG_PATH)
     return templates.TemplateResponse(
         request,
         "components/settings_repo_list_response.html",
-        {"repos": cfg.repositories},
+        {"repos": cfg.repositories, "daemon": cfg.daemon},
     )
 
 
@@ -216,7 +223,11 @@ def _render_settings_error(
     return templates.TemplateResponse(
         request,
         "components/settings_error.html",
-        {"message": message, "repos": cfg.repositories},
+        {
+            "message": message,
+            "repos": cfg.repositories,
+            "daemon": cfg.daemon,
+        },
         status_code=status_code,
     )
 
@@ -232,6 +243,210 @@ async def settings_page(request: Request) -> HTMLResponse:
             "repos": cfg.repositories,
             "daemon": cfg.daemon,
         },
+    )
+
+
+def _render_settings_daemon(request: Request) -> HTMLResponse:
+    """Render the daemon settings form for a successful response.
+
+    Uses ``settings_daemon_response.html`` rather than the bare
+    ``settings_daemon.html`` partial so HTMX also receives an OOB clear
+    of ``#settings-daemon-error`` — otherwise an error banner left over
+    from a prior 422/503 PUT would keep hanging around after a subsequent
+    successful mutation.
+    """
+    cfg = load_config(CONFIG_PATH)
+    return templates.TemplateResponse(
+        request,
+        "components/settings_daemon_response.html",
+        {"daemon": cfg.daemon},
+    )
+
+
+def _render_settings_daemon_error(
+    request: Request, message: str, status_code: int
+) -> HTMLResponse:
+    cfg = load_config(CONFIG_PATH)
+    return templates.TemplateResponse(
+        request,
+        "components/settings_daemon_error.html",
+        {"daemon": cfg.daemon, "message": message},
+        status_code=status_code,
+    )
+
+
+@app.get("/partials/settings/daemon", response_class=HTMLResponse)
+async def partial_settings_daemon(request: Request) -> HTMLResponse:
+    return _render_settings_daemon(request)
+
+
+@app.put("/settings/daemon", response_class=HTMLResponse)
+async def put_settings_daemon(
+    request: Request,
+    poll_interval_sec: str | None = Form(None),
+    review_timeout_min: str | None = Form(None),
+    hung_fallback_codex_review: str | None = Form(None),
+    error_handler_use_ai: str | None = Form(None),
+) -> HTMLResponse:
+    """Update daemon settings.
+
+    Mirrors ``put_settings_repo`` in accepting every field as ``str | None``
+    so that a cleared number input (``review_timeout_min=``) is handled as
+    a no-op instead of tripping FastAPI's request parser. Numeric fields
+    must stay strictly positive: a zero or negative ``poll_interval_sec``
+    would busy-loop the daemon, and a zero or negative ``review_timeout_min``
+    would flag every in-flight PR as hung the moment it is created.
+    """
+    updates: dict[str, Any] = {}
+    try:
+        if poll_interval_sec is not None and poll_interval_sec != "":
+            updates["poll_interval_sec"] = _coerce_int(
+                poll_interval_sec, "poll_interval_sec", min_value=1
+            )
+        if review_timeout_min is not None and review_timeout_min != "":
+            updates["review_timeout_min"] = _coerce_int(
+                review_timeout_min, "review_timeout_min", min_value=1
+            )
+        if (
+            hung_fallback_codex_review is not None
+            and hung_fallback_codex_review != ""
+        ):
+            updates["hung_fallback_codex_review"] = _coerce_bool(
+                hung_fallback_codex_review, "hung_fallback_codex_review"
+            )
+        if error_handler_use_ai is not None and error_handler_use_ai != "":
+            updates["error_handler_use_ai"] = _coerce_bool(
+                error_handler_use_ai, "error_handler_use_ai"
+            )
+    except ValueError as exc:
+        return _render_settings_daemon_error(request, str(exc), 422)
+
+    try:
+        update_daemon_config(path=CONFIG_PATH, **updates)
+    except ValueError as exc:
+        return _render_settings_daemon_error(request, str(exc), 422)
+    except OSError as exc:
+        return _render_settings_daemon_error(
+            request, f"Failed to write config.yml: {exc}", 503
+        )
+    return _render_settings_daemon(request)
+
+
+_AUTH_CHECK_TIMEOUT_SEC = 5
+
+
+def _run_auth_command(
+    cmd: list[str], env: dict[str, str] | None = None
+) -> tuple[int, str, str]:
+    """Run ``cmd`` for an auth status probe and return (rc, stdout, stderr).
+
+    Any failure to spawn (``FileNotFoundError``, ``PermissionError``) or
+    the subprocess exceeding ``_AUTH_CHECK_TIMEOUT_SEC`` is reported as a
+    non-zero return code so the caller can render a red status dot without
+    crashing the request.
+    """
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_AUTH_CHECK_TIMEOUT_SEC,
+            check=False,
+            env=env,
+        )
+    except FileNotFoundError:
+        return 127, "", f"{cmd[0]} not found"
+    except PermissionError as exc:
+        return 126, "", str(exc)
+    except subprocess.TimeoutExpired:
+        return 124, "", f"{cmd[0]} timed out after {_AUTH_CHECK_TIMEOUT_SEC}s"
+    return completed.returncode, completed.stdout or "", completed.stderr or ""
+
+
+def _auth_probe_env(**overrides: str) -> dict[str, str]:
+    """Return the environment block used for an auth CLI probe.
+
+    ``docker-compose.yml`` only sets ``CLAUDE_CONFIG_DIR`` / ``GH_CONFIG_DIR``
+    on the ``daemon`` service; the ``web`` service inherits none of them and
+    would otherwise probe the wrong credential location (the web container's
+    home directory, not ``/data/auth``). Reading the paths from ``config.yml``
+    and injecting them into the subprocess environment keeps the dashboard
+    in lock-step with whatever auth context the daemon was built to use, so
+    "Authorized" on the dashboard matches "the daemon can actually run".
+    """
+    env = os.environ.copy()
+    env.update(overrides)
+    return env
+
+
+def _check_claude_auth() -> dict[str, str]:
+    """Probe the ``claude`` CLI and report its authorization status."""
+    cfg = load_config(CONFIG_PATH)
+    env = _auth_probe_env(CLAUDE_CONFIG_DIR=cfg.auth.claude_config_dir)
+    rc, stdout, stderr = _run_auth_command(["claude", "--version"], env=env)
+    if rc == 0:
+        output = (stdout or stderr).strip()
+        detail = output.splitlines()[0] if output else "claude CLI available"
+        return {"status": "ok", "detail": detail}
+    detail = (stderr or stdout).strip() or "claude CLI not available"
+    return {"status": "error", "detail": detail}
+
+
+def _check_gh_auth() -> dict[str, str]:
+    """Probe the ``gh`` CLI and report its authorization status."""
+    cfg = load_config(CONFIG_PATH)
+    env = _auth_probe_env(GH_CONFIG_DIR=cfg.auth.gh_config_dir)
+    rc, stdout, stderr = _run_auth_command(
+        ["gh", "auth", "status"], env=env
+    )
+    # ``gh auth status`` prints its report to stderr on recent versions and
+    # to stdout on older ones, so merge both streams before scanning.
+    combined = f"{stdout}\n{stderr}".strip()
+    if rc == 0 and "Logged in" in combined:
+        detail = ""
+        for line in combined.splitlines():
+            stripped = line.strip()
+            if "Logged in" in stripped:
+                detail = stripped
+                break
+        return {"status": "ok", "detail": detail or "Logged in"}
+    if combined:
+        detail = combined.splitlines()[0].strip()
+    else:
+        detail = "gh CLI not configured"
+    return {"status": "error", "detail": detail}
+
+
+async def _collect_auth_status() -> dict[str, dict[str, str]]:
+    """Return ``{"claude": ..., "gh": ...}`` auth status dicts.
+
+    Each probe invokes a blocking ``subprocess.run`` call with a 5s
+    timeout, so they would block the event loop if awaited directly from
+    an async handler. Dispatching them through ``asyncio.to_thread`` and
+    ``asyncio.gather`` moves the blocking work onto the default thread
+    pool and runs both probes concurrently, so the dashboard's 30s HTMX
+    auth-status poll cannot stall the worker for up to ~10s (two serial
+    5s timeouts) whenever a CLI is missing or slow.
+    """
+    claude, gh = await asyncio.gather(
+        asyncio.to_thread(_check_claude_auth),
+        asyncio.to_thread(_check_gh_auth),
+    )
+    return {"claude": claude, "gh": gh}
+
+
+@app.get("/api/auth-status")
+async def api_auth_status() -> JSONResponse:
+    return JSONResponse(await _collect_auth_status())
+
+
+@app.get("/partials/settings/auth-status", response_class=HTMLResponse)
+async def partial_settings_auth_status(request: Request) -> HTMLResponse:
+    auth = await _collect_auth_status()
+    return templates.TemplateResponse(
+        request,
+        "components/settings_auth.html",
+        {"auth": auth},
     )
 
 
@@ -337,27 +552,41 @@ async def put_settings_repo(
     owners), so settings mutations key off the normalized URL instead of
     the repo name.
 
-    All fields are taken as ``str | None`` rather than their final types so
-    that an empty form value (``review_timeout_min=``, sent when a user
-    clears a numeric input) is handled here as a no-op update instead of
-    tripping FastAPI's request parser, which would return a raw JSON 422
-    that HTMX then swaps into the repo list and wedges the UI.
+    All fields are taken as ``str | None`` rather than their final types
+    so a triggered HTMX change event for a single input (which only sends
+    that one field) doesn't trip FastAPI's request parser on the fields
+    it didn't send. Semantics per field:
+
+    * ``None`` (field absent from the form payload): leave the stored
+      value alone.
+    * Non-empty string: parse and update.
+    * Empty string on ``review_timeout_min``: clear the per-repo override
+      so the runner falls back to ``daemon.review_timeout_min`` — this is
+      the only way for an upgraded deployment (whose existing
+      ``config.yml`` still has explicit per-repo values) to opt a repo
+      into the daemon-level default after PR-016.
+    * Empty string on any other field: no-op. ``poll_interval_sec`` has
+      no daemon-level fallback, so clearing it to ``None`` would be
+      meaningless; ``branch`` / ``auto_merge`` are required values.
     """
-    updates: dict[str, object] = {}
+    updates: dict[str, object | None] = {}
     if branch is not None and branch != "":
         updates["branch"] = branch
     try:
         if auto_merge is not None and auto_merge != "":
             updates["auto_merge"] = _coerce_bool(auto_merge, "auto_merge")
-        # Both numerics must stay strictly positive. The HTML ``min="1"``
-        # is client-side only, and the daemon's hung-detection treats any
-        # PR with ``elapsed_min >= review_timeout_min`` as hung, so a
-        # persisted zero or negative value would flag every PR on that
-        # repo as hung the moment it's created.
-        if review_timeout_min is not None and review_timeout_min != "":
-            updates["review_timeout_min"] = _coerce_int(
-                review_timeout_min, "review_timeout_min", min_value=1
-            )
+        # Both numerics must stay strictly positive when set. The HTML
+        # ``min="1"`` is client-side only, and the daemon's hung-detection
+        # treats any PR with ``elapsed_min >= review_timeout_min`` as
+        # hung, so a persisted zero or negative value would flag every PR
+        # on that repo as hung the moment it's created.
+        if review_timeout_min is not None:
+            if review_timeout_min == "":
+                updates["review_timeout_min"] = None
+            else:
+                updates["review_timeout_min"] = _coerce_int(
+                    review_timeout_min, "review_timeout_min", min_value=1
+                )
         if poll_interval_sec is not None and poll_interval_sec != "":
             updates["poll_interval_sec"] = _coerce_int(
                 poll_interval_sec, "poll_interval_sec", min_value=1

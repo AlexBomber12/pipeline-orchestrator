@@ -12,6 +12,14 @@ services:
       - .:/app
     environment:
       REDIS_URL: redis://redis:6379/0
+      # Mirror the daemon's auth dirs so ``/api/auth-status`` probes the
+      # same credential location the daemon actually uses. Without these
+      # the dashboard reports "not authorized" even when the daemon is
+      # logged in, because the web container would fall back to its own
+      # home directory. ``src.web.app`` also reads these paths from
+      # ``config.yml`` as a belt-and-suspenders fallback.
+      CLAUDE_CONFIG_DIR: /data/auth/claude
+      GH_CONFIG_DIR: /data/auth/gh
     depends_on:
       - redis
 

@@ -1,0 +1,65 @@
+<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+    <label class="flex flex-col gap-1 text-sm">
+        <span class="text-gray-400">Poll interval (seconds)</span>
+        <input type="number"
+               name="poll_interval_sec"
+               value="{{ daemon.poll_interval_sec }}"
+               min="1"
+               class="w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+               hx-put="/settings/daemon"
+               hx-trigger="change"
+               hx-target="#settings-daemon"
+               hx-swap="innerHTML">
+    </label>
+    <label class="flex flex-col gap-1 text-sm">
+        <span class="text-gray-400">Default review timeout (minutes)</span>
+        <input type="number"
+               name="review_timeout_min"
+               value="{{ daemon.review_timeout_min }}"
+               min="1"
+               class="w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+               hx-put="/settings/daemon"
+               hx-trigger="change"
+               hx-target="#settings-daemon"
+               hx-swap="innerHTML">
+    </label>
+</div>
+
+<div class="space-y-3 pt-4 mt-4 border-t border-white/5">
+    <label class="flex items-center gap-3 text-sm">
+        <input type="checkbox"
+               name="hung_fallback_codex_review"
+               value="true"
+               {% if daemon.hung_fallback_codex_review %}checked{% endif %}
+               class="accent-accent"
+               hx-put="/settings/daemon"
+               hx-trigger="change"
+               hx-target="#settings-daemon"
+               hx-swap="innerHTML"
+               hx-vals='{"hung_fallback_codex_review": "{{ "false" if daemon.hung_fallback_codex_review else "true" }}"}'>
+        <span>
+            <span class="text-gray-200">HUNG fallback: post <span class="font-mono">@codex review</span></span>
+            <span class="block text-xs text-gray-500">
+                When a PR exceeds its review timeout, re-ping Codex on the anchor comment.
+            </span>
+        </span>
+    </label>
+    <label class="flex items-center gap-3 text-sm">
+        <input type="checkbox"
+               name="error_handler_use_ai"
+               value="true"
+               {% if daemon.error_handler_use_ai %}checked{% endif %}
+               class="accent-accent"
+               hx-put="/settings/daemon"
+               hx-trigger="change"
+               hx-target="#settings-daemon"
+               hx-swap="innerHTML"
+               hx-vals='{"error_handler_use_ai": "{{ "false" if daemon.error_handler_use_ai else "true" }}"}'>
+        <span>
+            <span class="text-gray-200">Error handler: use AI diagnosis</span>
+            <span class="block text-xs text-gray-500">
+                Let Claude analyze failures before falling back to the default recovery flow.
+            </span>
+        </span>
+    </label>
+</div>
