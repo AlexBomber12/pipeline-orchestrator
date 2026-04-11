@@ -250,6 +250,140 @@ def _build_activity_feed(
     return [payload for _, payload in items[:_ACTIVITY_FEED_LIMIT]]
 
 
+_ALERT_KIND_ORDER = {"ERROR": 0, "HUNG": 1}
+
+
+def _format_alert_duration(seconds: int) -> str:
+    """Return a human-readable duration for an alert card.
+
+    Used by the alerts panel to render how long a repo has been in the
+    ERROR/HUNG state. Negative inputs (clock skew, a state whose
+    ``last_updated`` is a few ms in the future) are clamped to zero so
+    the UI never renders "-3 sec".
+    """
+    if seconds < 0:
+        seconds = 0
+    if seconds < 60:
+        return f"{seconds} sec"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} min"
+    hours = minutes // 60
+    remaining = minutes % 60
+    if remaining == 0:
+        return f"{hours}h"
+    return f"{hours}h {remaining}min"
+
+
+def _most_recent_transition_into(
+    history: list[dict[str, Any]], target_state: str
+) -> datetime | None:
+    """Return the time of the most recent transition INTO ``target_state``.
+
+    History is appended in chronological order by ``Runner.log_event``.
+    A "transition" here is the first entry of the most recent consecutive
+    run of ``target_state`` entries — subsequent entries in the same run
+    are just repeat polls where the state didn't actually change. Scans
+    forward and overwrites the candidate every time a new run starts so
+    the final value is the start of the latest run.
+
+    Returns ``None`` if ``history`` has no ``target_state`` entries, or
+    if every such entry carries an unparseable ``time`` field (legacy
+    ``HH:MM:SS`` payloads written before PR-013's ISO conversion).
+    """
+    run_start: datetime | None = None
+    prev_state: str | None = None
+    for entry in history:
+        current = str(entry.get("state", ""))
+        if current == target_state and prev_state != target_state:
+            parsed = _parse_history_time(str(entry.get("time", "")))
+            if parsed is not None:
+                run_start = parsed
+        prev_state = current
+    return run_start
+
+
+def _alert_reference_time(state: RepoState) -> datetime:
+    """Return the "since" timestamp an alert card should display.
+
+    HUNG prefers ``current_pr.last_activity`` (the daemon's own
+    hung-detection signal) when it is set. Otherwise — and for every
+    ERROR card — scan ``state.history`` for the most recent transition
+    into the current state. This matters because ``publish_state``
+    rewrites ``state.last_updated`` on every daemon cycle (see
+    ``src/daemon/runner.py``), so using ``last_updated`` as the "since"
+    timestamp would make an hours-old ERROR card display "a few sec"
+    forever and break duration-based sorting in the alerts bucket.
+
+    Falls through to ``state.last_updated`` only when history carries
+    no matching transition (a bootstrap cycle or a legacy payload with
+    unparseable timestamps) — in that case "now-ish" is the best signal
+    we have and the alert still renders.
+    """
+    if (
+        state.state == PipelineState.HUNG
+        and state.current_pr is not None
+        and state.current_pr.last_activity is not None
+    ):
+        return state.current_pr.last_activity
+    transition = _most_recent_transition_into(
+        state.history, state.state.value
+    )
+    if transition is not None:
+        return transition
+    return state.last_updated
+
+
+def _build_alerts(states: list[RepoState]) -> list[dict[str, Any]]:
+    """Collect alert cards for every repo currently in HUNG or ERROR.
+
+    Each alert dict is self-contained so the template does not need to
+    reach back into ``RepoState``. Sort order: ERROR first (highest
+    severity), then HUNG, then by duration descending so the longest-
+    standing problem bubbles to the top of its severity bucket.
+    """
+    now = datetime.now(timezone.utc)
+    alerts: list[dict[str, Any]] = []
+
+    for state in states:
+        if state.state not in _ALERT_STATES:
+            continue
+        kind = state.state.value  # "ERROR" or "HUNG"
+        since = _alert_reference_time(state)
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        duration_sec = int((now - since).total_seconds())
+        alert: dict[str, Any] = {
+            "kind": kind,
+            "repo_name": state.name,
+            "repo_url": f"/repo/{state.name}",
+            "duration_seconds": max(duration_sec, 0),
+            "duration_text": _format_alert_duration(duration_sec),
+            "since_iso": since.astimezone(timezone.utc).isoformat(),
+        }
+        if kind == "ERROR":
+            alert["error_message"] = state.error_message or ""
+        else:
+            pr = state.current_pr
+            if pr is not None:
+                alert["pr_number"] = pr.number
+                alert["pr_url"] = pr.url
+                alert["review_status"] = pr.review_status.value
+            else:
+                alert["pr_number"] = None
+                alert["pr_url"] = ""
+                alert["review_status"] = ""
+        alerts.append(alert)
+
+    alerts.sort(
+        key=lambda a: (
+            _ALERT_KIND_ORDER.get(a["kind"], 99),
+            -a["duration_seconds"],
+        )
+    )
+    return alerts
+
+
 def _compute_stats(states: list[RepoState]) -> dict[str, Any]:
     """Aggregate cross-repo stats for the dashboard cards and JSON API.
 
@@ -388,6 +522,7 @@ async def index(request: Request) -> HTMLResponse:
     states = await get_all_repo_states(redis_client)
     stats = _compute_stats(states)
     feed = _build_activity_feed(states)
+    alerts = _build_alerts(states)
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -396,6 +531,7 @@ async def index(request: Request) -> HTMLResponse:
             "repos": states,
             "stats": stats,
             "feed": feed,
+            "alerts": alerts,
         },
     )
 
@@ -446,6 +582,18 @@ async def partial_activity_feed(request: Request) -> HTMLResponse:
         request,
         "components/activity_feed.html",
         {"feed": feed},
+    )
+
+
+@app.get("/partials/alerts", response_class=HTMLResponse)
+async def partial_alerts(request: Request) -> HTMLResponse:
+    redis_client = getattr(request.app.state, "redis", None)
+    states = await get_all_repo_states(redis_client)
+    alerts = _build_alerts(states)
+    return templates.TemplateResponse(
+        request,
+        "components/alerts_panel.html",
+        {"alerts": alerts},
     )
 
 

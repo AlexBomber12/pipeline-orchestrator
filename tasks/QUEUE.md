@@ -102,7 +102,7 @@
 - Depends on: PR-013
 
 ## PR-018: Dashboard alerts panel
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-018.md
 - Branch: pr-018-alerts
 - Depends on: PR-017
