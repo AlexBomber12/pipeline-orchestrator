@@ -72,19 +72,19 @@
 - Depends on: PR-006
 
 ## PR-013: Extract shared utils
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-013.md
 - Branch: pr-013-utils
 - Depends on: PR-012
 
 ## PR-014: Config writer and hot reload
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-014.md
 - Branch: pr-014-config-writer
 - Depends on: PR-013
 
 ## PR-015: Settings page - repositories
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-015.md
 - Branch: pr-015-settings-repos
 - Depends on: PR-014

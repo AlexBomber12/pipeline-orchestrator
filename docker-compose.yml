@@ -5,7 +5,9 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./config.yml:/app/config.yml:ro
+      # Writable: the settings page mutates config.yml via
+      # src.config.save_config (atomic rename-into-place).
+      - ./config.yml:/app/config.yml
       - ./data:/data
       - .:/app
     environment:
