@@ -533,6 +533,53 @@ def test_scaffold_repo_pushes_when_rev_list_probe_fails(
     assert push_cmds == [["git", "push", "origin", "main"]]
 
 
+def test_scaffold_repo_pushes_when_rev_list_probe_times_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the ``git rev-list --count`` probe raises
+    ``TimeoutExpired`` (e.g. a lock-contention stall), scaffolder
+    must fall back to "cannot verify sync, push to be safe" instead
+    of letting the exception abort ``scaffold_repo``. Aborting
+    before push would keep a previously stranded scaffolding commit
+    unpublished until manual intervention.
+    """
+    repo = _init_empty_repo(tmp_path)
+    # Fully provision locally so ``to_stage`` is empty and the
+    # retry/no-commit branch calls ``_local_has_unpushed_commits``.
+    (repo / "AGENTS.md").write_text("# AGENTS\n")
+    (repo / "tasks").mkdir()
+    (repo / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "ci.sh").write_text("#!/usr/bin/env bash\n")
+    (repo / "scripts" / "ci.sh").chmod(0o755)
+    (repo / "scripts" / "make-review-artifacts.sh").write_text(
+        "#!/usr/bin/env bash\n"
+    )
+    (repo / "scripts" / "make-review-artifacts.sh").chmod(0o755)
+    (repo / "artifacts").mkdir()
+    (repo / ".gitignore").write_text("artifacts/\n")
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            # origin/main exists so rev-list runs.
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        if cmd[:2] == ["git", "rev-list"]:
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+
+    # Must NOT raise TimeoutExpired out of scaffold_repo.
+    scaffolder.scaffold_repo(str(repo), "main")
+
+    # Push must still have happened despite the probe timeout.
+    push_cmds = [cmd for cmd in calls if cmd[:2] == ["git", "push"]]
+    assert push_cmds == [["git", "push", "origin", "main"]]
+
+
 def test_scaffold_repo_retries_stranded_push_with_no_new_commit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

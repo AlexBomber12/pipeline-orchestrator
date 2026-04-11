@@ -76,61 +76,78 @@ def _base_branch_ahead_of_origin(repo_path: str, branch: str) -> bool:
     (HEAD on a feature branch, base branch clean and in sync) does
     not get reset.
 
-    Any probe failure returns ``True`` to err on the side of running
-    the scaffold retry rather than silently accepting the fs-seeded
-    ``_scaffolded=True``: scaffold_repo is idempotent and the retry
-    will either push the stranded commit, no-op on a synced repo, or
-    defer on a dirty tree. Returning False on a probe error would
-    let the runner declare scaffolding done while the remote is
-    actually behind, and ``recover_state`` would keep reading stale
-    data from ``origin/{branch}:tasks/QUEUE.md``.
+    Any probe failure — non-zero exit, non-integer output, or
+    ``TimeoutExpired`` on a stalled git invocation — returns
+    ``True`` to err on the side of running the scaffold retry
+    rather than silently accepting the fs-seeded
+    ``_scaffolded=True``. scaffold_repo is idempotent and the retry
+    will either push the stranded commit, no-op on a synced repo,
+    or defer on a dirty tree. Returning False on a probe error
+    would let the runner declare scaffolding done while the remote
+    is actually behind, and ``recover_state`` would keep reading
+    stale data from ``origin/{branch}:tasks/QUEUE.md``.
     """
-    local = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
-        capture_output=True,
-        text=True,
-        cwd=repo_path,
-        check=False,
-        timeout=30,
-    )
-    if local.returncode != 0:
-        # No local base branch yet. The ordinary scaffold retry path
-        # will create it (either via checkout or symbolic-ref), so
-        # treat this as "needs retry" too.
+    try:
+        local = subprocess.run(
+            [
+                "git",
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{branch}",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=repo_path,
+            check=False,
+            timeout=30,
+        )
+        if local.returncode != 0:
+            # No local base branch yet. The ordinary scaffold retry
+            # path will create it (either via checkout or
+            # symbolic-ref), so treat this as "needs retry" too.
+            return True
+        remote = subprocess.run(
+            [
+                "git",
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"refs/remotes/origin/{branch}",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=repo_path,
+            check=False,
+            timeout=30,
+        )
+        if remote.returncode != 0:
+            # Remote ref missing after a "successful" fetch is
+            # weird — the missing-ref tolerance upstream in
+            # ensure_repo_cloned usually catches this before we get
+            # here. Err on the side of retry.
+            return True
+        ahead = subprocess.run(
+            [
+                "git",
+                "rev-list",
+                "--count",
+                f"refs/remotes/origin/{branch}..refs/heads/{branch}",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=repo_path,
+            check=False,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logger.warning(
+            "_base_branch_ahead_of_origin: %s timed out; treating "
+            "as ahead to force scaffold retry",
+            exc.cmd,
+        )
         return True
-    remote = subprocess.run(
-        [
-            "git",
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            f"refs/remotes/origin/{branch}",
-        ],
-        capture_output=True,
-        text=True,
-        cwd=repo_path,
-        check=False,
-        timeout=30,
-    )
-    if remote.returncode != 0:
-        # Remote ref missing after a "successful" fetch is weird —
-        # the missing-ref tolerance upstream in ensure_repo_cloned
-        # usually catches this before we get here. Err on the side
-        # of retry.
-        return True
-    ahead = subprocess.run(
-        [
-            "git",
-            "rev-list",
-            "--count",
-            f"refs/remotes/origin/{branch}..refs/heads/{branch}",
-        ],
-        capture_output=True,
-        text=True,
-        cwd=repo_path,
-        check=False,
-        timeout=30,
-    )
+
     if ahead.returncode != 0:
         logger.warning(
             "_base_branch_ahead_of_origin: rev-list probe failed "

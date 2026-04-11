@@ -1092,6 +1092,56 @@ def test_ensure_repo_cloned_resets_scaffolded_when_base_branch_ahead(
     )
 
 
+def test_ensure_repo_cloned_resets_scaffolded_on_probe_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """A ``TimeoutExpired`` on any of the three
+    ``_base_branch_ahead_of_origin`` probes must fall back to
+    "ahead" so the scaffold retry still runs. Without this, the
+    helper would raise a non-``RuntimeError`` out of
+    ``ensure_repo_cloned`` and ``run_cycle`` would skip its normal
+    ERROR-state/publish path — most visible during transient git
+    stalls (lock contention, slow storage).
+    """
+    existing = tmp_path / "clone-target"
+    existing.mkdir()
+    _populate_fully_scaffolded_repo(existing)
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "rev-list"]:
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    scaffold_calls: list[str] = []
+
+    def fake_scaffold(path: str, branch: str) -> list[str]:
+        scaffold_calls.append(branch)
+        return []
+
+    monkeypatch.setattr(
+        runner_module.scaffolder, "scaffold_repo", fake_scaffold
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(existing)
+    runner._scaffolded = runner_module._repo_looks_scaffolded(
+        str(existing)
+    )
+    assert runner._scaffolded is True
+
+    # Must NOT raise TimeoutExpired out of ensure_repo_cloned.
+    asyncio.run(runner.ensure_repo_cloned())
+
+    # The timeout was interpreted as "ahead" → scaffold retry ran.
+    assert scaffold_calls == ["main"]
+    assert runner._scaffolded is True
+
+
 def test_ensure_repo_cloned_preserves_scaffolded_when_base_branch_synced(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,

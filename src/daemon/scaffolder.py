@@ -101,35 +101,45 @@ def _local_has_unpushed_commits(repo_path: str, branch: str) -> bool:
 
     Both probes use ``check=False`` so missing refs and transient git
     failures don't raise out of the idempotency check itself. A
-    non-zero exit from ``rev-list`` or a non-integer count is
-    interpreted as "cannot verify sync, push to be safe": returning
-    False there would let ``scaffold_repo`` declare success on a
-    just-committed scaffolding commit that is actually stranded
-    locally, leaving the runner to set ``_scaffolded = True`` on a
-    state that ``recover_state`` then reads as missing upstream.
-    Pushing an already-synced branch is a cheap "Everything up-to-
-    date" no-op, so erring on the side of True is safe.
+    non-zero exit from ``rev-list``, a non-integer count, or a
+    ``TimeoutExpired`` on any probe is interpreted as "cannot verify
+    sync, push to be safe": returning False there would let
+    ``scaffold_repo`` declare success on a just-committed scaffolding
+    commit that is actually stranded locally, leaving the runner to
+    set ``_scaffolded = True`` on a state that ``recover_state`` then
+    reads as missing upstream. Pushing an already-synced branch is a
+    cheap "Everything up-to-date" no-op, so erring on the side of
+    True is safe.
     """
     remote_ref = f"refs/remotes/origin/{branch}"
-    exists = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", remote_ref],
-        capture_output=True,
-        text=True,
-        cwd=repo_path,
-        check=False,
-        timeout=_LOCAL_GIT_TIMEOUT,
-    )
-    if exists.returncode != 0:
-        return not _head_is_unborn(repo_path)
+    try:
+        exists = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", remote_ref],
+            capture_output=True,
+            text=True,
+            cwd=repo_path,
+            check=False,
+            timeout=_LOCAL_GIT_TIMEOUT,
+        )
+        if exists.returncode != 0:
+            return not _head_is_unborn(repo_path)
 
-    ahead = subprocess.run(
-        ["git", "rev-list", "--count", f"{remote_ref}..HEAD"],
-        capture_output=True,
-        text=True,
-        cwd=repo_path,
-        check=False,
-        timeout=_LOCAL_GIT_TIMEOUT,
-    )
+        ahead = subprocess.run(
+            ["git", "rev-list", "--count", f"{remote_ref}..HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=repo_path,
+            check=False,
+            timeout=_LOCAL_GIT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logger.warning(
+            "scaffold_repo: %s timed out; treating as unpushed to be "
+            "safe",
+            exc.cmd,
+        )
+        return True
+
     if ahead.returncode != 0:
         logger.warning(
             "scaffold_repo: rev-list probe failed (rc=%s); treating as "
