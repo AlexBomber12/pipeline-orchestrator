@@ -19,11 +19,22 @@ def parse_queue(queue_path: str) -> list[QueueTask]:
     path = Path(queue_path)
     if not path.is_file():
         return []
+    return parse_queue_text(path.read_text(encoding="utf-8"))
 
+
+def parse_queue_text(text: str) -> list[QueueTask]:
+    """Parse QUEUE.md content from an in-memory string.
+
+    Same grammar as ``parse_queue``; split out so callers that already
+    have QUEUE.md content in memory — e.g. ``PipelineRunner.recover_state``
+    reading it from ``origin/{branch}`` via ``git show`` to avoid a
+    destructive checkout/reset during recovery — can parse it without
+    writing anything back to the working tree.
+    """
     tasks: list[QueueTask] = []
     current: dict | None = None
 
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    for raw_line in text.splitlines():
         line = raw_line.rstrip()
         header_match = _HEADER_RE.match(line)
         if header_match:
