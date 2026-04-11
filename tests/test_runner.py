@@ -774,6 +774,10 @@ def test_ensure_repo_cloned_tolerates_fetch_failure_before_first_scaffold(
 
     runner = _make_runner()
     runner.repo_path = str(existing)
+    # Simulate the pre-scaffold state explicitly — _make_runner's
+    # default repo_path doesn't exist so __init__ already seeded
+    # _scaffolded=False, but we re-assert here for clarity.
+    runner._scaffolded = False
 
     # fetch failure before first scaffold: must NOT raise, must still
     # call scaffold_repo, and must set _scaffolded True on success.
@@ -784,19 +788,21 @@ def test_ensure_repo_cloned_tolerates_fetch_failure_before_first_scaffold(
     # The tolerated fetch failure leaves a breadcrumb in history so
     # the operator can see what happened.
     assert any(
-        "fetch failed before scaffold" in e["event"]
+        "will retry scaffold" in e["event"]
         for e in runner.state.history
     )
 
 
-def test_ensure_repo_cloned_raises_fetch_failure_after_scaffold_success(
+def test_ensure_repo_cloned_raises_non_missing_ref_fetch_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
 ) -> None:
-    """Once scaffolding has succeeded (``_scaffolded = True``), a
-    ``git fetch`` failure must raise normally — the tolerance only
-    applies before the first successful scaffold so we don't mask
-    real network/auth issues on an otherwise-healthy repo.
+    """``git fetch`` failures that are NOT the missing-remote-ref
+    case must raise immediately, regardless of ``_scaffolded`` state.
+    The earlier tolerance was too broad: an auth/network blip before
+    the first scaffold would silently let ``recover_state`` proceed
+    with stale local ``origin/{branch}`` data, even though we have
+    no way to refresh it on this cycle.
     """
     existing = tmp_path / "clone-target"
     existing.mkdir()
@@ -804,15 +810,138 @@ def test_ensure_repo_cloned_raises_fetch_failure_after_scaffold_success(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         if cmd[:2] == ["git", "fetch"]:
             raise subprocess.CalledProcessError(
-                128, cmd, stderr="network error"
+                128,
+                cmd,
+                stderr=(
+                    "fatal: Authentication failed for "
+                    "'https://github.com/octo/demo.git'"
+                ),
             )
         return _FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
 
+    # Assert both code paths raise on non-missing-ref fetch failures:
+    # the pre-scaffold state (was previously tolerated too broadly)
+    # AND the post-scaffold state.
+    for scaffolded in (False, True):
+        runner = _make_runner()
+        runner.repo_path = str(existing)
+        runner._scaffolded = scaffolded
+        with pytest.raises(RuntimeError, match="git fetch failed"):
+            asyncio.run(runner.ensure_repo_cloned())
+
+
+def test_ensure_repo_cloned_skips_scaffold_when_repo_already_looks_scaffolded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """On a daemon restart with an existing clone that already has
+    the scaffolding files on disk, ``scaffold_repo`` must NOT run.
+    Its upfront ``git checkout {branch}`` would clobber a dirty
+    working tree left by an interrupted coding cycle, masking the
+    real crash-recovery path handled by ``recover_state``. The
+    ``_scaffolded`` gate is seeded from ``_repo_looks_scaffolded``
+    at ``__init__`` time so it survives process restarts (the
+    in-memory flag itself does not).
+    """
+    existing = tmp_path / "clone-target"
+    existing.mkdir()
+    (existing / "AGENTS.md").write_text("# AGENTS\n")
+    (existing / "tasks").mkdir()
+    (existing / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
+    (existing / "scripts").mkdir()
+    (existing / "scripts" / "ci.sh").write_text("#!/usr/bin/env bash\n")
+
+    # The helper should recognise this directory as already scaffolded.
+    assert runner_module._repo_looks_scaffolded(str(existing)) is True
+
+    _patch_subprocess(monkeypatch)
+
+    scaffold_calls: list[str] = []
+
+    def fake_scaffold(path: str, branch: str) -> list[str]:
+        scaffold_calls.append(branch)
+        return []
+
+    monkeypatch.setattr(
+        runner_module.scaffolder, "scaffold_repo", fake_scaffold
+    )
+
     runner = _make_runner()
     runner.repo_path = str(existing)
-    runner._scaffolded = True  # simulate prior success
+    # Re-seed the gate using the helper, mirroring what __init__ would
+    # have done if ``/data/repos/demo`` were this test-local path.
+    runner._scaffolded = runner_module._repo_looks_scaffolded(
+        str(existing)
+    )
+    assert runner._scaffolded is True
 
-    with pytest.raises(RuntimeError, match="git fetch failed"):
-        asyncio.run(runner.ensure_repo_cloned())
+    asyncio.run(runner.ensure_repo_cloned())
+
+    # scaffold_repo must not have run: the repo already looks
+    # scaffolded, so no git checkout runs against the working tree.
+    assert scaffold_calls == []
+    assert runner._scaffolded is True
+
+
+def test_ensure_repo_cloned_retries_scaffold_on_missing_ref_after_restart(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """Even on a restart where the local fs looks scaffolded, if
+    ``git fetch`` reports the missing-remote-ref condition the
+    scaffold retry must still run so the stranded commit from a
+    prior cycle is re-pushed. Without this, a crashed daemon after
+    a transient first-push failure would sit in ERROR forever
+    because ``_scaffolded`` seeded True at ``__init__`` would
+    otherwise skip the retry.
+    """
+    existing = tmp_path / "clone-target"
+    existing.mkdir()
+    # Scaffolding files are on disk (prior cycle committed them)...
+    (existing / "AGENTS.md").write_text("# AGENTS\n")
+    (existing / "tasks").mkdir()
+    (existing / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
+    (existing / "scripts").mkdir()
+    (existing / "scripts" / "ci.sh").write_text("#!/usr/bin/env bash\n")
+
+    # ...but fetch reports the branch is missing upstream (the prior
+    # cycle's initial push failed transiently).
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "fetch"]:
+            raise subprocess.CalledProcessError(
+                128,
+                cmd,
+                stderr="fatal: couldn't find remote ref main",
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    scaffold_calls: list[str] = []
+
+    def fake_scaffold(path: str, branch: str) -> list[str]:
+        scaffold_calls.append(branch)
+        return []
+
+    monkeypatch.setattr(
+        runner_module.scaffolder, "scaffold_repo", fake_scaffold
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(existing)
+    # Simulate the post-__init__ state: fs check passed so
+    # _scaffolded is seeded True, but fetch will report missing ref
+    # and force the retry.
+    runner._scaffolded = runner_module._repo_looks_scaffolded(
+        str(existing)
+    )
+    assert runner._scaffolded is True
+
+    asyncio.run(runner.ensure_repo_cloned())
+
+    # The missing-ref fetch reset the gate and ran scaffold_repo so
+    # the stranded commit gets re-pushed.
+    assert scaffold_calls == ["main"]
+    assert runner._scaffolded is True

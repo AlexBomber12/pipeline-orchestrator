@@ -55,6 +55,36 @@ def repo_owner_from_url(url: str) -> str:
     return github_client.get_repo_full_name(url)
 
 
+# Substring used to detect the one fetch failure we want to tolerate
+# before scaffolding has succeeded: ``git fetch origin {branch}`` on a
+# remote that does not yet have ``refs/heads/{branch}`` exits with this
+# message. Every other fetch failure (auth, network, transport) must
+# raise so the runner does not silently proceed with stale local state.
+_FETCH_MISSING_REF_NEEDLE = "couldn't find remote ref"
+
+
+def _repo_looks_scaffolded(repo_path: str) -> bool:
+    """Return ``True`` if ``repo_path`` already contains the pipeline
+    orchestrator scaffolding files.
+
+    A daemon restart on a previously-scaffolded clone must not re-run
+    ``scaffolder.scaffold_repo``: its upfront ``git checkout {branch}``
+    would fail on the dirty working tree left by an interrupted coding
+    cycle, masking the real crash-recovery path and stranding the
+    runner in ERROR with a confusing "scaffold_repo failed" message
+    instead of letting ``recover_state`` do its job. We infer the
+    "already scaffolded" signal from the local filesystem so it
+    survives process restarts (``_scaffolded`` itself is in-memory).
+    """
+    path = Path(repo_path)
+    if not path.exists():
+        return False
+    has_agents = (path / "AGENTS.md").exists() or (path / "CLAUDE.md").exists()
+    has_queue = (path / "tasks" / "QUEUE.md").exists()
+    has_ci = (path / "scripts" / "ci.sh").exists()
+    return has_agents and has_queue and has_ci
+
+
 class PipelineRunner:
     """State machine for one repository."""
 
@@ -80,19 +110,20 @@ class PipelineRunner:
         # GitHub on every cycle would clobber in-memory progress made in
         # earlier cycles of the same run.
         self._recovered = False
-        # Scaffold retry gate. Starts False; ``ensure_repo_cloned`` calls
-        # ``scaffolder.scaffold_repo`` on every cycle until it succeeds
-        # and then sets this to True. Without the retry loop, a
-        # transient scaffold failure (first-push timeout, auth blip)
-        # would leave ``origin/{branch}`` without ``tasks/QUEUE.md`` and
-        # every subsequent cycle would take the fetch path and never
-        # re-scaffold, stranding the runner in an unrecoverable ERROR
-        # because ``_parse_base_queue`` reads from
-        # ``origin/{branch}:tasks/QUEUE.md``. scaffold_repo itself is
-        # idempotent at the remote level: on retry it detects the
-        # stranded commit and re-pushes it; once fully sync'd it is a
-        # cheap no-op.
-        self._scaffolded = False
+        # Scaffold retry gate. Seeded from a local-filesystem probe so a
+        # daemon restart on an already-scaffolded clone does NOT call
+        # ``scaffolder.scaffold_repo`` again: scaffold_repo begins with
+        # ``git checkout {branch}``, which fails on the dirty working
+        # tree left by an interrupted coding cycle, and that failure
+        # would then mask the real crash-recovery path handled by
+        # ``recover_state``. When ``_scaffolded`` is False (fresh clone,
+        # or a restart on a repo missing scaffolding files),
+        # ``ensure_repo_cloned`` calls ``scaffold_repo`` on every cycle
+        # until it succeeds and then sets this to True. scaffold_repo
+        # itself is idempotent at the remote level: on retry it detects
+        # a stranded commit from a prior cycle and re-pushes it; once
+        # fully sync'd it is a cheap no-op.
+        self._scaffolded = _repo_looks_scaffolded(self.repo_path)
 
     async def publish_state(self) -> None:
         """Serialize ``self.state`` and write it to Redis."""
@@ -134,6 +165,7 @@ class PipelineRunner:
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError("git clone timed out") from exc
         else:
+            fetch_missing_ref = False
             try:
                 subprocess.run(
                     ["git", "fetch", "origin", self.repo_config.branch],
@@ -145,34 +177,48 @@ class PipelineRunner:
                 )
             except subprocess.CalledProcessError as exc:
                 detail = (exc.stderr or exc.stdout or "").strip()
-                if self._scaffolded:
-                    # Normal fetch failure on an already-provisioned
-                    # repo — surface it so the operator notices.
+                if _FETCH_MISSING_REF_NEEDLE in detail.lower():
+                    # ``origin/{branch}`` does not exist on the remote.
+                    # Typical cause: a prior cycle cloned this repo and
+                    # committed scaffolding locally, but the initial
+                    # push failed transiently so the branch never got
+                    # published upstream. Fall through to the scaffold
+                    # retry block below which will re-push the stranded
+                    # commit. Narrow on the exact needle so auth /
+                    # transport / network errors still raise — those
+                    # would otherwise let the runner proceed with stale
+                    # local ``origin/{branch}`` data and
+                    # ``recover_state`` could make decisions from an
+                    # outdated queue snapshot.
+                    fetch_missing_ref = True
+                    self.log_event(
+                        f"git fetch: {detail}; will retry scaffold"
+                    )
+                else:
                     raise RuntimeError(
                         f"git fetch failed: {detail}"
                     ) from exc
-                # Scaffolding never succeeded, so ``origin/{branch}``
-                # may still be missing (a prior cycle cloned and
-                # committed locally but the initial push failed). In
-                # that case ``git fetch origin {branch}`` fails with
-                # "couldn't find remote ref". Tolerate the failure
-                # here and fall through to the scaffold retry below
-                # which will re-push the stranded commit.
-                self.log_event(
-                    "git fetch failed before scaffold completed, will "
-                    f"retry scaffold: {detail}"
-                )
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError("git fetch timed out") from exc
 
-        # Scaffold on every cycle until it succeeds. scaffold_repo is
-        # idempotent at both the local and remote level: on a fresh
-        # clone it creates the orchestrator files and pushes; on retry
-        # after a transient push failure it re-pushes the stranded
-        # commit; once fully sync'd it is a cheap no-op. Failures must
-        # not be swallowed — we raise ``RuntimeError`` so ``run_cycle``
-        # flips the runner to ERROR with a visible message, and leave
-        # ``_scaffolded`` unset so the next cycle retries.
+            if fetch_missing_ref:
+                # The only way to get ``origin/{branch}`` published is
+                # for scaffold_repo to re-push the local commit. Reset
+                # the scaffold gate (which may have been seeded True
+                # by ``_repo_looks_scaffolded`` at __init__ because
+                # the files are on disk) so the retry block below
+                # actually runs.
+                self._scaffolded = False
+
+        # Scaffold on every cycle until ``_scaffolded`` is set.
+        # scaffold_repo is idempotent at both the local and remote
+        # level: on a fresh clone it creates the orchestrator files
+        # and pushes; on retry after a transient push failure it
+        # re-pushes the stranded commit; once fully sync'd it is a
+        # cheap no-op. Failures must not be swallowed — we raise
+        # ``RuntimeError`` so ``run_cycle`` flips the runner to ERROR
+        # with a visible message, and leave ``_scaffolded`` unset so
+        # the next cycle retries.
         if not self._scaffolded:
             try:
                 actions = scaffolder.scaffold_repo(
