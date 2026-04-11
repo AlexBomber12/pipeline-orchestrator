@@ -63,6 +63,38 @@ def repo_owner_from_url(url: str) -> str:
 _FETCH_MISSING_REF_NEEDLE = "couldn't find remote ref"
 
 
+def _working_tree_dirty(repo_path: str) -> bool:
+    """Return ``True`` if ``git status --porcelain`` reports any change.
+
+    Used by ``ensure_repo_cloned`` to defer scaffolding on a restart
+    that finds a partially-scaffolded repo (``_repo_looks_scaffolded``
+    is False) but also finds uncommitted edits from an interrupted
+    coding cycle. Running ``scaffolder.scaffold_repo`` in that state
+    would fail on the upfront ``git checkout {branch}`` and raise
+    RuntimeError every cycle, so ``recover_state`` and ``preflight``
+    would never get to run and the runner would be stuck reporting
+    ``scaffold_repo failed`` instead of the real crash-recovery
+    condition. Returning True here tells the caller to defer
+    scaffolding until the tree is clean again.
+
+    Any git failure (command error, timeout) returns False so the
+    scaffold retry path still runs — a broken git is a separate
+    problem that scaffold_repo's own error handling will surface.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            cwd=repo_path,
+            check=True,
+            timeout=30,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+    return bool(result.stdout.strip())
+
+
 def _repo_looks_scaffolded(repo_path: str) -> bool:
     """Return ``True`` if ``repo_path`` already contains every file
     that ``scaffolder.scaffold_repo`` would commit upstream.
@@ -245,17 +277,39 @@ class PipelineRunner:
         # ``RuntimeError`` so ``run_cycle`` flips the runner to ERROR
         # with a visible message, and leave ``_scaffolded`` unset so
         # the next cycle retries.
+        #
+        # BUT: a restart that finds a partially-scaffolded repo
+        # (``_repo_looks_scaffolded`` was False so __init__ left
+        # ``_scaffolded`` False) AND a dirty working tree from an
+        # interrupted coding cycle would raise ``scaffold_repo
+        # failed`` every cycle, because ``scaffold_repo`` starts with
+        # ``git checkout {branch}`` which hits "Your local changes
+        # would be overwritten". That masks the real crash-recovery
+        # condition: ``recover_state`` and ``preflight`` never get to
+        # run and the runner sits permanently ERROR on a scaffold
+        # error instead of the real dirty-tree error. Defer scaffold
+        # when the tree is dirty so the state machine can proceed,
+        # and let a later cycle retry once the tree has been cleaned
+        # up by recovery/fix loops or a manual operator intervention.
         if not self._scaffolded:
-            try:
-                actions = scaffolder.scaffold_repo(
-                    self.repo_path, self.repo_config.branch
-                )
-            except Exception as exc:
-                raise RuntimeError(f"scaffold_repo failed: {exc}") from exc
-            self._scaffolded = True
-            if actions:
+            if not path.exists() or not _working_tree_dirty(self.repo_path):
+                try:
+                    actions = scaffolder.scaffold_repo(
+                        self.repo_path, self.repo_config.branch
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"scaffold_repo failed: {exc}"
+                    ) from exc
+                self._scaffolded = True
+                if actions:
+                    self.log_event(
+                        f"scaffold_repo created: {', '.join(actions)}"
+                    )
+            else:
                 self.log_event(
-                    f"scaffold_repo created: {', '.join(actions)}"
+                    "scaffold_repo deferred: working tree dirty, letting "
+                    "recover_state and preflight run first"
                 )
 
     def sync_to_main(self) -> None:

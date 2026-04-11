@@ -902,6 +902,72 @@ def test_ensure_repo_cloned_skips_scaffold_when_repo_already_looks_scaffolded(
     assert runner._scaffolded is True
 
 
+def test_ensure_repo_cloned_defers_scaffold_when_working_tree_dirty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """A restart on a partially-scaffolded repo (``_repo_looks_
+    scaffolded`` returns False) that also has a dirty working tree
+    from an interrupted coding cycle must NOT call scaffold_repo:
+    scaffold_repo starts with ``git checkout {branch}`` which would
+    hit "Your local changes would be overwritten" and raise every
+    cycle, masking the real crash-recovery path. ``ensure_repo_
+    cloned`` must instead defer scaffolding so ``recover_state`` /
+    ``preflight`` can run and either clean up the tree or surface
+    the real error; a later cycle with a clean tree will retry.
+    """
+    existing = tmp_path / "clone-target"
+    existing.mkdir()
+    # Partial scaffolding: only AGENTS.md. Missing tasks/QUEUE.md,
+    # scripts/ci.sh, scripts/make-review-artifacts.sh, and the
+    # .gitignore entry — so _repo_looks_scaffolded returns False.
+    (existing / "AGENTS.md").write_text("# AGENTS\n")
+    assert runner_module._repo_looks_scaffolded(str(existing)) is False
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "status"] and "--porcelain" in cmd:
+            # Dirty working tree: interrupted coding left a modified
+            # file and an untracked file.
+            return _FakeCompletedProcess(
+                args=cmd,
+                stdout=" M src/foo.py\n?? src/bar.py\n",
+                returncode=0,
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    scaffold_calls: list[str] = []
+
+    def fake_scaffold(path: str, branch: str) -> list[str]:
+        scaffold_calls.append(branch)
+        return ["tasks/QUEUE.md"]
+
+    monkeypatch.setattr(
+        runner_module.scaffolder, "scaffold_repo", fake_scaffold
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(existing)
+    runner._scaffolded = False  # partial fs → __init__ would also set False
+
+    # Must NOT raise: the scaffold is deferred, not executed.
+    asyncio.run(runner.ensure_repo_cloned())
+
+    # scaffold_repo must not have run — its git checkout would have
+    # clobbered the dirty tree.
+    assert scaffold_calls == []
+    # _scaffolded stays False so the next cycle (with a clean tree)
+    # will retry.
+    assert runner._scaffolded is False
+    # A defer breadcrumb is logged so the operator can see why
+    # scaffold_repo did not run.
+    assert any(
+        "scaffold_repo deferred" in e["event"]
+        for e in runner.state.history
+    )
+
+
 def test_repo_looks_scaffolded_rejects_partial_provisioning(
     tmp_path: Any,
 ) -> None:
