@@ -10,7 +10,13 @@
     </a>
 </div>
 
+{# Only the summary block is inside the 5s polling container. The event
+   log lives outside so HTMX cannot wipe it from the DOM when the
+   summary refreshes — it self-polls via /partials/repo/{name}/events
+   with the active filter carried in hx-vals. #}
 <div hx-get="/partials/repo/{{ repo.name }}" hx-trigger="every 5s" hx-swap="innerHTML">
-    {% include "components/repo_detail.html" %}
+    {% include "components/repo_summary.html" %}
 </div>
+
+{% include "components/event_log.html" %}
 {% endblock %}

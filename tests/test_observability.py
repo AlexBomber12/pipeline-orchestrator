@@ -618,6 +618,66 @@ def test_partial_repo_events_response_preserves_selected_filter(
     assert 'hx-vals=\'{"filter": "errors"}\'' in body
 
 
+def test_repo_full_page_mounts_event_log_outside_polling_container(
+    observability_config: Path,
+) -> None:
+    """Regression for P1: event log must NOT be a child of the 5s poll.
+
+    repo.html wraps the summary in a container that polls
+    /partials/repo/{name} with ``hx-swap="innerHTML"``; if the event
+    log lived inside that container, the first 5s tick would swap the
+    summary fragment in as new innerHTML and wipe the event log (and
+    its self-poll + filter state) from the DOM entirely. The fixed
+    layout keeps the event log as a sibling of the polling container
+    so it stays mounted across refreshes.
+    """
+    now = datetime.now(timezone.utc)
+    alpha = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="alpha",
+        state=PipelineState.CODING,
+        last_updated=now,
+        history=[
+            {
+                "time": _iso(now),
+                "state": "CODING",
+                "event": "started coding",
+            },
+        ],
+    )
+    fake = _FakeRedis({"pipeline:alpha": alpha.model_dump_json()})
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.get("/repo/alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    poll_open = '<div hx-get="/partials/repo/alpha"'
+    log_anchor = '<section id="repo-event-log"'
+    assert poll_open in body
+    assert log_anchor in body
+    # Counting <div / </div> tags from the polling container's own
+    # opening tag through the event-log section's opening tag must
+    # balance — if the log is still a child of the polling div, we'll
+    # see one more open than close because the polling </div> will not
+    # have appeared yet when we reach the log. Balanced counts mean
+    # the polling container already closed, so the log is a sibling
+    # and the 5s innerHTML swap can never wipe it from the DOM.
+    start = body.index(poll_open)
+    end = body.index(log_anchor)
+    window = body[start:end]
+    opens = window.count("<div")
+    closes = window.count("</div>")
+    assert closes == opens, (
+        "event log must live OUTSIDE the /partials/repo/{name} polling "
+        f"container (opens={opens}, closes={closes})"
+    )
+    # the full page still renders the event log on initial load
+    assert "Event log" in body
+    assert "started coding" in body
+
+
 def test_partial_repo_events_default_filter_is_all(
     observability_config: Path,
 ) -> None:

@@ -1,9 +1,9 @@
 {# Repo header + current-task + current-PR cards.
 
-   Split out of repo_detail.html so the /partials/repo/{name} poll can
-   refresh the summary on its own cadence without overwriting the event
-   log section (and thereby clobbering a user-selected filter). The
-   event log polls itself via components/event_log.html. #}
+   Rendered on its own by /partials/repo/{name} so the 5s polling
+   container in repo.html refreshes only the summary while the event
+   log (which lives as a sibling, outside the polling container)
+   stays mounted and keeps its user-selected filter. #}
 {% set state_styles = {
     'IDLE':      {'dot': 'bg-gray-500',  'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30',  'pulse': false},
     'PREFLIGHT': {'dot': 'bg-gray-500',  'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30',  'pulse': false},

@@ -1,9 +1,0 @@
-{# Full repo detail = summary cards + self-polling event log.
-
-   Used by /repo/{name} for the initial full-page render. On subsequent
-   HTMX traffic the summary block and event log poll independently —
-   /partials/repo/{name} returns just the summary (keeping the event
-   log untouched) while the event log self-polls via /partials/repo/
-   {name}/events, carrying the selected filter in hx-vals. #}
-{% include "components/repo_summary.html" %}
-{% include "components/event_log.html" %}
