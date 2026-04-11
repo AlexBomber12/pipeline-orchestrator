@@ -552,27 +552,41 @@ async def put_settings_repo(
     owners), so settings mutations key off the normalized URL instead of
     the repo name.
 
-    All fields are taken as ``str | None`` rather than their final types so
-    that an empty form value (``review_timeout_min=``, sent when a user
-    clears a numeric input) is handled here as a no-op update instead of
-    tripping FastAPI's request parser, which would return a raw JSON 422
-    that HTMX then swaps into the repo list and wedges the UI.
+    All fields are taken as ``str | None`` rather than their final types
+    so a triggered HTMX change event for a single input (which only sends
+    that one field) doesn't trip FastAPI's request parser on the fields
+    it didn't send. Semantics per field:
+
+    * ``None`` (field absent from the form payload): leave the stored
+      value alone.
+    * Non-empty string: parse and update.
+    * Empty string on ``review_timeout_min``: clear the per-repo override
+      so the runner falls back to ``daemon.review_timeout_min`` — this is
+      the only way for an upgraded deployment (whose existing
+      ``config.yml`` still has explicit per-repo values) to opt a repo
+      into the daemon-level default after PR-016.
+    * Empty string on any other field: no-op. ``poll_interval_sec`` has
+      no daemon-level fallback, so clearing it to ``None`` would be
+      meaningless; ``branch`` / ``auto_merge`` are required values.
     """
-    updates: dict[str, object] = {}
+    updates: dict[str, object | None] = {}
     if branch is not None and branch != "":
         updates["branch"] = branch
     try:
         if auto_merge is not None and auto_merge != "":
             updates["auto_merge"] = _coerce_bool(auto_merge, "auto_merge")
-        # Both numerics must stay strictly positive. The HTML ``min="1"``
-        # is client-side only, and the daemon's hung-detection treats any
-        # PR with ``elapsed_min >= review_timeout_min`` as hung, so a
-        # persisted zero or negative value would flag every PR on that
-        # repo as hung the moment it's created.
-        if review_timeout_min is not None and review_timeout_min != "":
-            updates["review_timeout_min"] = _coerce_int(
-                review_timeout_min, "review_timeout_min", min_value=1
-            )
+        # Both numerics must stay strictly positive when set. The HTML
+        # ``min="1"`` is client-side only, and the daemon's hung-detection
+        # treats any PR with ``elapsed_min >= review_timeout_min`` as
+        # hung, so a persisted zero or negative value would flag every PR
+        # on that repo as hung the moment it's created.
+        if review_timeout_min is not None:
+            if review_timeout_min == "":
+                updates["review_timeout_min"] = None
+            else:
+                updates["review_timeout_min"] = _coerce_int(
+                    review_timeout_min, "review_timeout_min", min_value=1
+                )
         if poll_interval_sec is not None and poll_interval_sec != "":
             updates["poll_interval_sec"] = _coerce_int(
                 poll_interval_sec, "poll_interval_sec", min_value=1
