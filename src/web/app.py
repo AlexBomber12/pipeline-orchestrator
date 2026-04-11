@@ -20,8 +20,6 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 from src.config import (
-    AppConfig,
-    RepoConfig,
     add_repository,
     load_config,
     remove_repository,
@@ -195,14 +193,6 @@ async def partial_repo_detail(request: Request, name: str) -> HTMLResponse:
     )
 
 
-def _find_repo_by_name(cfg: AppConfig, name: str) -> RepoConfig | None:
-    """Return the ``RepoConfig`` matching ``name`` or ``None``."""
-    for repo in cfg.repositories:
-        if repo_name_from_url(repo.url) == name:
-            return repo
-    return None
-
-
 def _render_settings_repo_list(request: Request) -> HTMLResponse:
     cfg = load_config(CONFIG_PATH)
     return templates.TemplateResponse(
@@ -262,39 +252,38 @@ async def post_settings_repo(
     return _render_settings_repo_list(request)
 
 
-@app.delete("/settings/repos/{name}", response_class=HTMLResponse)
+@app.delete("/settings/repos", response_class=HTMLResponse)
 async def delete_settings_repo(
-    request: Request, name: str
+    request: Request, url: str
 ) -> HTMLResponse:
-    cfg = load_config(CONFIG_PATH)
-    repo = _find_repo_by_name(cfg, name)
-    if repo is None:
-        return _render_settings_error(
-            request, f"Repository not found: {name}", 404
-        )
+    """Remove a repository by its full URL.
+
+    The URL is the unique key in the config (basenames can collide across
+    owners), so settings mutations key off the normalized URL instead of
+    the repo name.
+    """
     try:
-        remove_repository(repo.url, path=CONFIG_PATH)
+        remove_repository(url, path=CONFIG_PATH)
     except ValueError as exc:
         return _render_settings_error(request, str(exc), 404)
     return _render_settings_repo_list(request)
 
 
-@app.put("/settings/repos/{name}", response_class=HTMLResponse)
+@app.put("/settings/repos", response_class=HTMLResponse)
 async def put_settings_repo(
     request: Request,
-    name: str,
+    url: str,
     branch: str | None = Form(None),
     auto_merge: bool | None = Form(None),
     review_timeout_min: int | None = Form(None),
     poll_interval_sec: int | None = Form(None),
 ) -> HTMLResponse:
-    cfg = load_config(CONFIG_PATH)
-    repo = _find_repo_by_name(cfg, name)
-    if repo is None:
-        return _render_settings_error(
-            request, f"Repository not found: {name}", 404
-        )
+    """Update a repository by its full URL.
 
+    The URL is the unique key in the config (basenames can collide across
+    owners), so settings mutations key off the normalized URL instead of
+    the repo name.
+    """
     updates: dict[str, object] = {}
     if branch is not None:
         updates["branch"] = branch
@@ -306,7 +295,9 @@ async def put_settings_repo(
         updates["poll_interval_sec"] = poll_interval_sec
 
     try:
-        update_repository(repo.url, path=CONFIG_PATH, **updates)
+        update_repository(url, path=CONFIG_PATH, **updates)
     except ValueError as exc:
-        return _render_settings_error(request, str(exc), 422)
+        message = str(exc)
+        status = 404 if message.startswith("Repository not found") else 422
+        return _render_settings_error(request, message, status)
     return _render_settings_repo_list(request)

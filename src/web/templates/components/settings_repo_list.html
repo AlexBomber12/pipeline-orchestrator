@@ -25,6 +25,8 @@
         {% endif %}
         {% for repo in repos %}
         {% set name = repo_name(repo.url) %}
+        {% set put_url = "/settings/repos?url=" ~ (repo.url | urlencode) %}
+        {% set delete_url = "/settings/repos?url=" ~ (repo.url | urlencode) %}
         <tr class="border-t border-white/5">
             <td class="px-4 py-2">
                 <div class="font-mono text-gray-200">{{ name }}</div>
@@ -37,7 +39,7 @@
                        name="branch"
                        value="{{ repo.branch }}"
                        class="w-28 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none"
-                       hx-put="/settings/repos/{{ name }}"
+                       hx-put="{{ put_url }}"
                        hx-trigger="change"
                        hx-target="#settings-repo-list"
                        hx-swap="innerHTML">
@@ -48,7 +50,7 @@
                        value="true"
                        {% if repo.auto_merge %}checked{% endif %}
                        class="accent-accent"
-                       hx-put="/settings/repos/{{ name }}"
+                       hx-put="{{ put_url }}"
                        hx-trigger="change"
                        hx-target="#settings-repo-list"
                        hx-swap="innerHTML"
@@ -60,7 +62,7 @@
                        value="{{ repo.review_timeout_min }}"
                        min="1"
                        class="w-20 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none"
-                       hx-put="/settings/repos/{{ name }}"
+                       hx-put="{{ put_url }}"
                        hx-trigger="change"
                        hx-target="#settings-repo-list"
                        hx-swap="innerHTML">
@@ -71,7 +73,7 @@
                        value="{{ repo.poll_interval_sec }}"
                        min="1"
                        class="w-20 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none"
-                       hx-put="/settings/repos/{{ name }}"
+                       hx-put="{{ put_url }}"
                        hx-trigger="change"
                        hx-target="#settings-repo-list"
                        hx-swap="innerHTML">
@@ -79,7 +81,7 @@
             <td class="px-4 py-2 text-right">
                 <button type="button"
                         class="text-xs font-medium px-2 py-1 rounded border border-fail/30 text-fail hover:bg-fail/10"
-                        hx-delete="/settings/repos/{{ name }}"
+                        hx-delete="{{ delete_url }}"
                         hx-target="#settings-repo-list"
                         hx-swap="innerHTML"
                         hx-confirm="Remove {{ name }}?">

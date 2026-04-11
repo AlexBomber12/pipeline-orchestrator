@@ -135,7 +135,10 @@ def test_post_repo_duplicate_returns_422(one_repo_config: Path) -> None:
 
 def test_delete_repo_removes_from_config(one_repo_config: Path) -> None:
     with TestClient(app) as client:
-        response = client.delete("/settings/repos/alpha")
+        response = client.delete(
+            "/settings/repos",
+            params={"url": "https://github.com/example/alpha.git"},
+        )
 
     assert response.status_code == 200
     cfg = load_config(str(one_repo_config))
@@ -144,7 +147,10 @@ def test_delete_repo_removes_from_config(one_repo_config: Path) -> None:
 
 def test_delete_nonexistent_repo_returns_404(empty_config: Path) -> None:
     with TestClient(app) as client:
-        response = client.delete("/settings/repos/ghost")
+        response = client.delete(
+            "/settings/repos",
+            params={"url": "https://github.com/example/ghost"},
+        )
 
     assert response.status_code == 404
     assert "not found" in response.text.lower()
@@ -153,7 +159,8 @@ def test_delete_nonexistent_repo_returns_404(empty_config: Path) -> None:
 def test_put_repo_updates_branch(one_repo_config: Path) -> None:
     with TestClient(app) as client:
         response = client.put(
-            "/settings/repos/alpha",
+            "/settings/repos",
+            params={"url": "https://github.com/example/alpha.git"},
             data={"branch": "develop"},
         )
 
@@ -169,7 +176,8 @@ def test_put_repo_updates_branch(one_repo_config: Path) -> None:
 def test_put_repo_updates_multiple_fields(one_repo_config: Path) -> None:
     with TestClient(app) as client:
         response = client.put(
-            "/settings/repos/alpha",
+            "/settings/repos",
+            params={"url": "https://github.com/example/alpha.git"},
             data={
                 "auto_merge": "false",
                 "review_timeout_min": "120",
@@ -189,12 +197,63 @@ def test_put_repo_updates_multiple_fields(one_repo_config: Path) -> None:
 def test_put_nonexistent_repo_returns_404(empty_config: Path) -> None:
     with TestClient(app) as client:
         response = client.put(
-            "/settings/repos/ghost",
+            "/settings/repos",
+            params={"url": "https://github.com/example/ghost"},
             data={"branch": "develop"},
         )
 
     assert response.status_code == 404
     assert "not found" in response.text.lower()
+
+
+def test_basename_collision_put_and_delete_target_correct_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two repos with the same basename must be keyed off full URL.
+
+    Regression for a P1 bug where ``_find_repo_by_name`` matched the first
+    repo whose basename equaled ``{name}``, which silently mutated or
+    deleted the wrong entry whenever two owners published a repo with the
+    same trailing segment (for example ``owner-a/api`` and ``owner-b/api``).
+    """
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/owner-a/api\n"
+        "    branch: main\n"
+        "  - url: https://github.com/owner-b/api\n"
+        "    branch: main\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        # Update the second repo; the first must be untouched.
+        response = client.put(
+            "/settings/repos",
+            params={"url": "https://github.com/owner-b/api"},
+            data={"branch": "develop"},
+        )
+        assert response.status_code == 200
+
+        loaded = load_config(str(cfg))
+        assert loaded.repositories[0].url == "https://github.com/owner-a/api"
+        assert loaded.repositories[0].branch == "main"
+        assert loaded.repositories[1].url == "https://github.com/owner-b/api"
+        assert loaded.repositories[1].branch == "develop"
+
+        # Delete the first repo; the second (now on develop) must survive.
+        response = client.delete(
+            "/settings/repos",
+            params={"url": "https://github.com/owner-a/api"},
+        )
+        assert response.status_code == 200
+
+        loaded = load_config(str(cfg))
+        assert len(loaded.repositories) == 1
+        assert loaded.repositories[0].url == "https://github.com/owner-b/api"
+        assert loaded.repositories[0].branch == "develop"
 
 
 def test_post_repo_error_includes_error_message(one_repo_config: Path) -> None:
