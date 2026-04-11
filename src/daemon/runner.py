@@ -22,11 +22,12 @@ from src.config import AppConfig, RepoConfig
 from src.models import (
     CIStatus,
     PipelineState,
+    QueueTask,
     RepoState,
     ReviewStatus,
     TaskStatus,
 )
-from src.queue_parser import get_next_task, parse_queue
+from src.queue_parser import get_next_task, parse_queue, parse_queue_text
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +170,43 @@ class PipelineRunner:
             cwd=self.repo_path,
         )
 
+    def _parse_base_queue(self) -> list[QueueTask] | None:
+        """Return QUEUE.md parsed from ``origin/{branch}``, or ``None``.
+
+        ``recover_state`` runs before ``preflight``, so the working tree
+        may be dirty or checked out on a different branch than
+        ``repo_config.branch``:
+
+        - A fresh ``git clone`` lands HEAD on the remote's default
+          branch (``origin/HEAD``), which may not match the configured
+          base branch. ``ensure_repo_cloned`` does not checkout after
+          clone, so an un-guarded ``parse_queue`` would read the default
+          branch's QUEUE.md and miss in-flight tasks tracked on a
+          different configured branch.
+        - A crashed prior cycle may have left the tree on a feature
+          branch with uncommitted edits.
+
+        Reading via ``git show origin/{branch}:tasks/QUEUE.md`` sidesteps
+        both: it yields the authoritative queue snapshot from the
+        configured base branch without touching the working tree, so
+        recovery stays non-destructive. Returns ``None`` when the read
+        fails (ref missing, timeout, tasks/QUEUE.md absent on base),
+        letting the caller translate the failure into a retryable ERROR.
+        """
+        branch = self.repo_config.branch
+        try:
+            result = subprocess.run(
+                ["git", "show", f"origin/{branch}:tasks/QUEUE.md"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+                cwd=self.repo_path,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return None
+        return parse_queue_text(result.stdout)
+
     async def recover_state(self) -> bool:
         """Reconstruct state from QUEUE.md + GitHub on daemon startup.
 
@@ -199,8 +237,24 @@ class PipelineRunner:
         strand the runner detached from an in-flight PR and later allow
         ``handle_error`` to SKIP/FIX it onto new queue work.
         """
-        queue_path = str(Path(self.repo_path) / "tasks" / "QUEUE.md")
-        tasks = parse_queue(queue_path)
+        tasks = self._parse_base_queue()
+        if tasks is None:
+            # Read failure on origin/{branch}:tasks/QUEUE.md. Treat as a
+            # retryable discovery error: returning False leaves
+            # _recovered unset, and the next cycle will try again. A
+            # half-recovered state based on an empty or stale queue
+            # could otherwise let handle_idle pick new work while an
+            # in-flight PR is still open.
+            branch = self.repo_config.branch
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = (
+                f"recover_state: read QUEUE.md from origin/{branch} failed"
+            )
+            self.log_event(
+                f"recover_state: read QUEUE.md from origin/{branch} failed"
+            )
+            return False
+
         doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
 
         try:

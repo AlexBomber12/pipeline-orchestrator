@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from typing import Any
 
 import pytest
@@ -82,7 +83,6 @@ def test_recover_doing_task_with_matching_pr_recovers_to_watch(
 ) -> None:
     """DOING task + matching open PR on that branch -> WATCH, no CODING run."""
     task = _doing_task()
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
     matching_pr = PRInfo(
         number=17,
         branch="pr-042-inflight",
@@ -100,6 +100,7 @@ def test_recover_doing_task_with_matching_pr_recovers_to_watch(
         coding_called = True
 
     runner = _make_runner()
+    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
     runner.handle_coding = boom  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
@@ -120,7 +121,6 @@ def test_recover_doing_task_without_pr_rerun_coding(
 ) -> None:
     """DOING task + no matching PR -> CODING + re-run handle_coding()."""
     task = _doing_task()
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo: []
     )
@@ -133,6 +133,7 @@ def test_recover_doing_task_without_pr_rerun_coding(
         coding_calls.append(runner.state.state)
 
     runner = _make_runner()
+    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
@@ -155,9 +156,6 @@ def test_recover_no_doing_with_done_matched_pr_recovers_to_watch(
     the recovery log line records the matched task id and status."""
     done = _done_task()
     todo = _todo_task()
-    monkeypatch.setattr(
-        runner_module, "parse_queue", lambda path: [done, todo]
-    )
     done_pr = PRInfo(
         number=88,
         branch="pr-041-done",
@@ -169,6 +167,7 @@ def test_recover_no_doing_with_done_matched_pr_recovers_to_watch(
     )
 
     runner = _make_runner()
+    runner._parse_base_queue = lambda: [done, todo]  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
     assert runner.state.state == PipelineState.WATCH
@@ -199,7 +198,6 @@ def test_recover_no_doing_with_todo_matched_pr_recovers_to_watch(
         status=TaskStatus.TODO,
         branch="pr-010-recovery",
     )
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [todo])
     in_flight = PRInfo(
         number=17,
         branch="pr-010-recovery",
@@ -211,6 +209,7 @@ def test_recover_no_doing_with_todo_matched_pr_recovers_to_watch(
     )
 
     runner = _make_runner()
+    runner._parse_base_queue = lambda: [todo]  # type: ignore[method-assign]
     result = asyncio.run(runner.recover_state())
 
     assert result is True
@@ -244,15 +243,13 @@ def test_recover_unrelated_open_pr_stays_idle(
         status=TaskStatus.TODO,
         branch="pr-050-queued",
     )
-    monkeypatch.setattr(
-        runner_module, "parse_queue", lambda path: [queued_todo]
-    )
     unrelated = PRInfo(number=99, branch="dependabot/npm/foo")
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo: [unrelated]
     )
 
     runner = _make_runner()
+    runner._parse_base_queue = lambda: [queued_todo]  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
     assert runner.state.state == PipelineState.IDLE
@@ -269,8 +266,6 @@ def test_recover_attaches_only_to_done_matched_pr_among_many(
     """When multiple open PRs exist, recovery must pick the one whose
     branch matches a DONE task and ignore unrelated PRs entirely."""
     done = _done_task()
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [done])
-
     unrelated_first = PRInfo(number=200, branch="dependabot/npm/foo")
     matching = PRInfo(
         number=201,
@@ -286,6 +281,7 @@ def test_recover_attaches_only_to_done_matched_pr_among_many(
     )
 
     runner = _make_runner()
+    runner._parse_base_queue = lambda: [done]  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
     assert runner.state.state == PipelineState.WATCH
@@ -299,12 +295,12 @@ def test_recover_no_doing_no_prs_stays_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Clean slate: no DOING tasks and no open PRs -> stays IDLE."""
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [_todo_task()])
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo: []
     )
 
     runner = _make_runner()
+    runner._parse_base_queue = lambda: [_todo_task()]  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
     assert runner.state.state == PipelineState.IDLE
@@ -325,12 +321,12 @@ def test_recover_clean_slate_resets_prior_error_state(
     to IDLE and clear error_message — otherwise the runner would return
     True, run_cycle would publish the still-ERROR state, and (with
     error_handler_use_ai disabled) the queue would never progress."""
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo: []
     )
 
     runner = _make_runner()
+    runner._parse_base_queue = lambda: []  # type: ignore[method-assign]
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = (
         "recover_state: get_open_prs failed: gh api rate limited"
@@ -352,13 +348,13 @@ def test_recover_clean_slate_resets_error_with_unrelated_prs_present(
     PRs that don't match any DONE task (e.g. a dependabot PR). That path
     is semantically 'no in-flight work to resume' and must restore IDLE
     from any prior ERROR state, not just the strictly empty-PR case."""
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
     unrelated = PRInfo(number=77, branch="dependabot/npm/foo")
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo: [unrelated]
     )
 
     runner = _make_runner()
+    runner._parse_base_queue = lambda: []  # type: ignore[method-assign]
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "recover_state: get_open_prs failed: boom"
 
@@ -378,7 +374,6 @@ def test_recover_get_open_prs_failure_sets_error(
     discovery on the next cycle (rather than silently going IDLE and
     picking up a new task that might collide with an unknown in-flight
     PR)."""
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
 
     def boom(repo: str) -> list[PRInfo]:
         raise RuntimeError("gh auth token expired")
@@ -386,6 +381,7 @@ def test_recover_get_open_prs_failure_sets_error(
     monkeypatch.setattr(runner_module.github_client, "get_open_prs", boom)
 
     runner = _make_runner()
+    runner._parse_base_queue = lambda: []  # type: ignore[method-assign]
     result = asyncio.run(runner.recover_state())
 
     assert result is False
@@ -449,7 +445,6 @@ def test_run_cycle_recovered_watch_does_not_dispatch_handle_watch(
         ci_status=CIStatus.FAILURE,
         review_status=ReviewStatus.CHANGES_REQUESTED,
     )
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo: [recovered_pr]
     )
@@ -474,6 +469,7 @@ def test_run_cycle_recovered_watch_does_not_dispatch_handle_watch(
         return True
 
     runner = _make_runner()
+    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
     runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
     runner.handle_watch = spy_watch  # type: ignore[method-assign]
     runner.handle_fix = spy_fix  # type: ignore[method-assign]
@@ -502,7 +498,6 @@ def test_run_cycle_recovered_idle_does_not_dispatch_handle_idle(
     complicates the invariant and obscures the 'recovery cycle only
     discovers' contract. The next cycle's handle_idle will sync_to_main
     and pick up the next task normally."""
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo: []
     )
@@ -522,6 +517,7 @@ def test_run_cycle_recovered_idle_does_not_dispatch_handle_idle(
         return True
 
     runner = _make_runner()
+    runner._parse_base_queue = lambda: []  # type: ignore[method-assign]
     runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
     runner.handle_idle = spy_idle  # type: ignore[method-assign]
     runner.preflight = spy_preflight  # type: ignore[method-assign]
@@ -549,7 +545,6 @@ def test_run_cycle_dirty_tree_does_not_clobber_recovered_watch(
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.PENDING,
     )
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo: [matching_pr]
     )
@@ -571,6 +566,7 @@ def test_run_cycle_dirty_tree_does_not_clobber_recovered_watch(
         return False
 
     runner = _make_runner()
+    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
     runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
     runner.preflight = fail_preflight  # type: ignore[method-assign]
     runner.handle_watch = noop_watch  # type: ignore[method-assign]
@@ -600,7 +596,6 @@ def test_run_cycle_transient_discovery_failure_stays_retryable(
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.PENDING,
     )
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
 
     probe_calls: list[int] = []
 
@@ -619,6 +614,7 @@ def test_run_cycle_transient_discovery_failure_stays_retryable(
         return True
 
     runner = _make_runner()
+    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
     runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
     runner.preflight = clean_preflight  # type: ignore[method-assign]
 
@@ -650,7 +646,6 @@ def test_run_cycle_coding_failure_during_recovery_is_not_retried(
     (it could create a duplicate PR for the same task); the failure
     belongs to the normal ERROR path, not to a second recovery attempt."""
     task = _doing_task()
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo: []
     )
@@ -663,6 +658,7 @@ def test_run_cycle_coding_failure_during_recovery_is_not_retried(
         runner.state.error_message = "claude CLI crashed"
 
     runner = _make_runner()
+    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
     runner.handle_coding = failing_coding  # type: ignore[method-assign]
 
     result = asyncio.run(runner.recover_state())
@@ -735,3 +731,137 @@ def test_sync_to_main_runs_fetch_checkout_reset_in_order(
         ["git", "checkout", "main"],
         ["git", "reset", "--hard", "origin/main"],
     ]
+
+
+def test_parse_base_queue_reads_from_origin_configured_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1-G regression: _parse_base_queue must read QUEUE.md from
+    origin/{repo_config.branch} via git show, NOT from the working tree.
+    On a fresh clone ensure_repo_cloned leaves HEAD on the remote's
+    default branch (origin/HEAD), which may not be the configured base
+    branch. Reading parse_queue off the working tree in that state
+    would return the wrong queue snapshot, miss in-flight PRs, and let
+    the next cycle re-run PLANNED PR on active work."""
+    captured: list[list[str]] = []
+
+    class _FakeProc:
+        stdout = (
+            "## PR-010: Daemon recovery and error handling\n"
+            "- Status: TODO\n"
+            "- Branch: pr-010-recovery\n"
+            "- Depends on: PR-009\n"
+        )
+        stderr = ""
+        returncode = 0
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeProc:
+        captured.append(cmd)
+        return _FakeProc()
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()  # configured branch: "main"
+    tasks = runner._parse_base_queue()
+
+    assert captured == [
+        ["git", "show", "origin/main:tasks/QUEUE.md"],
+    ], "must read from origin/{configured branch}, not HEAD or a file path"
+    assert tasks is not None
+    assert len(tasks) == 1
+    assert tasks[0].pr_id == "PR-010"
+    assert tasks[0].status == TaskStatus.TODO
+    assert tasks[0].branch == "pr-010-recovery"
+
+
+def test_parse_base_queue_respects_non_default_configured_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same guarantee when repo_config.branch is not 'main' — the git
+    show ref must track the configured branch, not a hardcoded default."""
+    captured: list[list[str]] = []
+
+    class _FakeProc:
+        stdout = ""
+        stderr = ""
+        returncode = 0
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeProc:
+        captured.append(cmd)
+        return _FakeProc()
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = PipelineRunner(
+        _repo_cfg(branch="release/2026.04"),
+        AppConfig(repositories=[], daemon=DaemonConfig()),
+        _FakeRedis(),
+    )
+    runner._parse_base_queue()
+
+    assert captured == [
+        ["git", "show", "origin/release/2026.04:tasks/QUEUE.md"],
+    ]
+
+
+def test_parse_base_queue_returns_none_on_git_show_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """git show failing (ref missing, tasks/QUEUE.md absent on base, or
+    subprocess timeout) must surface as None so recover_state can
+    translate it into a retryable ERROR rather than silently proceeding
+    with an empty queue snapshot and losing track of in-flight work."""
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> None:
+        raise subprocess.CalledProcessError(
+            128, cmd, stderr="fatal: invalid object name 'origin/main'"
+        )
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    assert runner._parse_base_queue() is None
+
+
+def test_parse_base_queue_returns_none_on_git_show_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same surface for TimeoutExpired — recover_state must not
+    distinguish the two in its retry handling."""
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> None:
+        raise subprocess.TimeoutExpired(cmd, 30)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    assert runner._parse_base_queue() is None
+
+
+def test_recover_state_queue_read_failure_sets_error_and_returns_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When _parse_base_queue returns None (git show failed), recovery
+    must set ERROR and return False so _recovered stays unset and the
+    next cycle retries discovery. Proceeding with an empty list would
+    let the runner fall through to clean-slate IDLE and pick new work
+    even if an in-flight PR still exists on the configured branch."""
+    # get_open_prs is irrelevant here — we must bail before reaching it.
+    gh_calls: list[str] = []
+
+    def spy_gh(repo: str) -> list[PRInfo]:
+        gh_calls.append(repo)
+        return []
+
+    monkeypatch.setattr(runner_module.github_client, "get_open_prs", spy_gh)
+
+    runner = _make_runner()
+    runner._parse_base_queue = lambda: None  # type: ignore[method-assign]
+
+    result = asyncio.run(runner.recover_state())
+
+    assert result is False
+    assert runner.state.state == PipelineState.ERROR
+    assert "read QUEUE.md" in (runner.state.error_message or "")
+    assert "origin/main" in (runner.state.error_message or "")
+    assert gh_calls == [], "must bail before probing GitHub"
