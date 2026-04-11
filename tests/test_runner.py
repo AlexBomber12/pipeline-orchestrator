@@ -202,6 +202,11 @@ def test_handle_idle_picks_task_and_drives_coding(
         "get_open_prs",
         lambda repo: [opened_pr],
     )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
 
     runner = _make_runner()
     asyncio.run(runner.handle_idle())
@@ -264,6 +269,149 @@ def test_handle_coding_rejects_unmatched_branch(
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.current_pr is None
     assert "pr-001" in (runner.state.error_message or "")
+
+
+def test_handle_coding_posts_codex_review_after_pr_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-019: ``handle_coding`` must explicitly post ``@codex review`` on the
+    newly-opened PR so Codex kicks off a review for every iteration instead
+    of relying on GitHub-side Automatic Reviews (which we want configured
+    for PR creation only, to avoid duplicate reviews)."""
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "run_planned_pr",
+        lambda path: (0, "ok", ""),
+    )
+    opened_pr = PRInfo(number=42, branch="pr-019")
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [opened_pr],
+    )
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-019", title="t", status=TaskStatus.DOING, branch="pr-019"
+    )
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 42
+    assert posted == [(runner.owner_repo, 42, "@codex review")]
+    assert any(
+        "Posted @codex review on PR #42" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_coding_survives_post_comment_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``post_comment`` failure after PR creation must be non-fatal:
+    the runner stays in ``WATCH`` and logs a warning. Codex may still
+    auto-trigger on push, and a transient ``gh`` hiccup must not flip an
+    otherwise healthy pipeline to ``ERROR``."""
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "run_planned_pr",
+        lambda path: (0, "ok", ""),
+    )
+    opened_pr = PRInfo(number=42, branch="pr-019")
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [opened_pr],
+    )
+
+    def boom(repo: str, number: int, body: str) -> None:
+        raise RuntimeError("gh transient failure")
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", boom)
+
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-019", title="t", status=TaskStatus.DOING, branch="pr-019"
+    )
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.error_message is None
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 42
+    assert any(
+        "Warning: failed to post @codex review" in e["event"]
+        and "gh transient failure" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_fix_posts_codex_review_after_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-019: after a successful fix push, ``handle_fix`` must post
+    ``@codex review`` so Codex reviews the freshly-pushed iteration."""
+    monkeypatch.setattr(
+        runner_module.claude_cli, "fix_review", lambda path: (0, "", "")
+    )
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019")
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.push_count == 1
+    assert posted == [(runner.owner_repo, 77, "@codex review")]
+    assert any(
+        "Posted @codex review on PR #77" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_fix_survives_post_comment_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``post_comment`` failure after a fix push must be non-fatal: the
+    push already succeeded, so the runner stays in ``WATCH`` and only
+    logs a warning."""
+    monkeypatch.setattr(
+        runner_module.claude_cli, "fix_review", lambda path: (0, "", "")
+    )
+
+    def boom(repo: str, number: int, body: str) -> None:
+        raise RuntimeError("gh rate limited")
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", boom)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019")
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.error_message is None
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.push_count == 1
+    assert any(
+        "Warning: failed to post @codex review" in e["event"]
+        and "gh rate limited" in e["event"]
+        for e in runner.state.history
+    )
 
 
 def test_handle_coding_errors_when_task_has_no_branch(
@@ -376,6 +524,11 @@ def test_handle_watch_changes_requested_triggers_fix(
     monkeypatch.setattr(
         runner_module.claude_cli, "fix_review", lambda path: (0, "", "")
     )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
 
     runner = _make_runner()
     runner.state.state = PipelineState.WATCH
@@ -402,6 +555,11 @@ def test_handle_watch_ci_failure_triggers_fix(
     )
     monkeypatch.setattr(
         runner_module.claude_cli, "fix_review", lambda path: (0, "", "")
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
     )
 
     runner = _make_runner()

@@ -808,6 +808,7 @@ class PipelineRunner:
         self.state.current_pr = candidate
         self.state.state = PipelineState.WATCH
         self.log_event(f"Opened PR #{candidate.number} -> WATCH")
+        self._post_codex_review(candidate.number)
 
     async def handle_watch(self) -> None:
         """Poll PR status and decide whether to merge, fix, hang, or wait."""
@@ -908,6 +909,8 @@ class PipelineRunner:
 
         self.state.state = PipelineState.WATCH
         self.log_event(f"Fix pushed, iteration #{iteration}")
+        if self.state.current_pr is not None:
+            self._post_codex_review(self.state.current_pr.number)
 
     async def handle_merge(self) -> None:
         """Merge the current PR and return to IDLE."""
@@ -929,6 +932,31 @@ class PipelineRunner:
         self.state.current_task = None
         self.state.state = PipelineState.IDLE
         self.log_event(f"Merged PR #{number} -> IDLE")
+
+    def _post_codex_review(self, pr_number: int) -> None:
+        """Post ``@codex review`` on ``pr_number``; non-fatal on failure.
+
+        Called after PR creation (``handle_coding``) and after every
+        fix push (``handle_fix``) so Codex kicks off a review for each
+        iteration instead of relying on the GitHub-side Automatic
+        Reviews trigger (which covers PR creation but not every push,
+        and which we disable on the repo to avoid duplicate reviews).
+
+        A ``post_comment`` failure is logged as a warning and the
+        runner stays in ``WATCH``: Codex may still auto-trigger on
+        push, and a transient ``gh`` error must not flip an otherwise
+        healthy pipeline to ``ERROR``.
+        """
+        try:
+            github_client.post_comment(
+                self.owner_repo, pr_number, "@codex review"
+            )
+            self.log_event(f"Posted @codex review on PR #{pr_number}")
+        except Exception as exc:
+            self.log_event(
+                f"Warning: failed to post @codex review on PR "
+                f"#{pr_number}: {exc}"
+            )
 
     async def handle_hung(self) -> None:
         """Nudge the reviewer with ``@codex review`` or give up, per config."""

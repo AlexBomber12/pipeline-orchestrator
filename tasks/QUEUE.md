@@ -108,7 +108,7 @@
 - Depends on: PR-017
 
 ## PR-019: AGENTS.md layering and explicit Codex review trigger
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-019.md
 - Branch: pr-019-agents-codex
 - Depends on: PR-013

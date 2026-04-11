@@ -51,6 +51,10 @@ Definitions
   - contains any `artifacts/` path
   If none exist, use the first PR author comment in the conversation.
 
+The daemon posts `@codex review` after PR creation and after every fix
+push. Codex Automatic Reviews should be configured for PR creation only
+(not every push) to avoid duplicate reviews.
+
 Fix loop (used in `FIX REVIEW` mode)
 1. Fetch PR comments, reviews, and reactions via GitHub CLI (`gh`). No screenshots.
 2. Locate the review anchor comment and check Codex reactions.
