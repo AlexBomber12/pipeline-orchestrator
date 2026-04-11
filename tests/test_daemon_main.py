@@ -156,6 +156,118 @@ def test_main_skips_runner_whose_init_raises(
     )
 
 
+def test_main_reload_detects_new_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the reload window a new repo must get its own runner."""
+    first = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    second = AppConfig(
+        repositories=[
+            _repo("https://github.com/octo/alpha.git"),
+            _repo("https://github.com/octo/beta.git"),
+        ],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+
+    _reset_fake_runner()
+    load_calls = {"n": 0}
+
+    def fake_load_config() -> AppConfig:
+        load_calls["n"] += 1
+        return first if load_calls["n"] == 1 else second
+
+    monkeypatch.setattr(main_module, "load_config", fake_load_config)
+    monkeypatch.setattr(
+        main_module.aioredis,
+        "from_url",
+        lambda url, decode_responses: _FakeRedisClient(),
+    )
+    monkeypatch.setattr(main_module, "PipelineRunner", _FakeRunner)
+    # Reload on every second cycle so the test doesn't need long loops.
+    monkeypatch.setattr(main_module, "CONFIG_RELOAD_EVERY_CYCLES", 2)
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        # Cycle 0: alpha-only. Cycle 1: (no reload yet, idx=1, 1%2 != 0).
+        # Cycle 2: reload fires, beta added, run_cycle runs on both.
+        if len(sleep_calls) >= 3:
+            raise _StopLoop
+
+    monkeypatch.setattr(main_module.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    names = sorted(r.name for r in _FakeRunner.instances)
+    assert names == ["alpha", "beta"], names
+
+    alpha = next(r for r in _FakeRunner.instances if r.name == "alpha")
+    beta = next(r for r in _FakeRunner.instances if r.name == "beta")
+    # Alpha built at startup + ran once per loop iteration (3 total cycles).
+    assert alpha.cycles == 3
+    # Beta was added at cycle 2 and only runs that cycle + the third.
+    assert beta.cycles == 1
+    # After the reload, alpha's app_config should point at the new object.
+    assert alpha.app_config is second
+
+
+def test_main_reload_drops_removed_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the reload window a removed repo must stop running."""
+    first = AppConfig(
+        repositories=[
+            _repo("https://github.com/octo/alpha.git"),
+            _repo("https://github.com/octo/beta.git"),
+        ],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    second = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+
+    _reset_fake_runner()
+    load_calls = {"n": 0}
+
+    def fake_load_config() -> AppConfig:
+        load_calls["n"] += 1
+        return first if load_calls["n"] == 1 else second
+
+    monkeypatch.setattr(main_module, "load_config", fake_load_config)
+    monkeypatch.setattr(
+        main_module.aioredis,
+        "from_url",
+        lambda url, decode_responses: _FakeRedisClient(),
+    )
+    monkeypatch.setattr(main_module, "PipelineRunner", _FakeRunner)
+    monkeypatch.setattr(main_module, "CONFIG_RELOAD_EVERY_CYCLES", 2)
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        if len(sleep_calls) >= 3:
+            raise _StopLoop
+
+    monkeypatch.setattr(main_module.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    alpha = next(r for r in _FakeRunner.instances if r.name == "alpha")
+    beta = next(r for r in _FakeRunner.instances if r.name == "beta")
+    # Beta runs on cycles 0 and 1; after reload on cycle 2 it is dropped
+    # and does NOT run that cycle.
+    assert beta.cycles == 2
+    assert alpha.cycles == 3
+
+
 def test_main_continues_when_one_runner_raises(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
