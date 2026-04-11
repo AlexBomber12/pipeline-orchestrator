@@ -2,6 +2,23 @@
 
 These rules apply to every PR and every task in this repo.
 
+This file has three layered sections:
+
+1. **ORCHESTRATOR CORE** — managed by Pipeline Orchestrator. Contains the
+   work-mode trigger phrases, runbooks, queue protocol, Codex Review gate,
+   artifact requirements, daemon mode, branch naming, and queue stability
+   rules. Manual edits will be preserved but may be overwritten on
+   orchestrator upgrades.
+2. **PROJECT CONFIG** — customize per repo. Tech stack, repo invariants,
+   allowed MCP servers, secrets handling, CI specifics, test requirements.
+3. **LESSONS LEARNED** — evolve over time as you discover recurring
+   patterns.
+
+## === ORCHESTRATOR CORE (do not edit) ===
+
+This section is managed by Pipeline Orchestrator. Manual edits will be
+preserved but may be overwritten on orchestrator upgrades.
+
 Quick rules
 - Always choose a work mode using an exact trigger phrase from the Work Modes section.
 - PLANNED PRs must follow `tasks/QUEUE.md` and the corresponding `tasks/PR-*.md` file exactly.
@@ -11,7 +28,7 @@ Quick rules
 - Codex Review is "green" only when the Codex bot reacts with thumbs up (`+1`) on the PR's review anchor comment (see Codex Review gate). Do not use screenshots.
 - Do not drift from the plan and do not add "nice-to-have" work.
 
-## Work Modes
+### Work Modes
 Exact trigger phrases:
 - `PLANNED PR`
 - `MICRO PR: <one sentence description>`
@@ -22,14 +39,14 @@ Meaning:
 - `MICRO PR: ...`: a tiny change. Do not touch `tasks/QUEUE.md` and do not create `tasks/PR-*.md`.
 - `FIX REVIEW`: fix feedback on an existing PR branch.
 
-## Daemon Mode
+### Daemon Mode
 
 When triggered by the pipeline orchestrator daemon (non-interactive):
 - Do not ask for confirmation or clarification.
 - If something is unclear, commit what you have and note the ambiguity in the PR description.
 - Log all decisions to stdout for the daemon to capture.
 
-## Codex Review gate (GitHub PR)
+### Codex Review gate (GitHub PR)
 
 This repo treats Codex Review as a single pass/fail signal.
 
@@ -51,6 +68,10 @@ Definitions
   - contains any `artifacts/` path
   If none exist, use the first PR author comment in the conversation.
 
+The pipeline orchestrator daemon posts `@codex review` after PR creation
+and after every fix push. Codex Automatic Reviews should be configured for
+PR creation only (not every push) to avoid duplicate reviews.
+
 Fix loop (used in `FIX REVIEW` mode)
 1. Fetch PR comments, reviews, and reactions via GitHub CLI (`gh`). No screenshots.
 2. Locate the review anchor comment and check Codex reactions.
@@ -65,45 +86,7 @@ Fix loop (used in `FIX REVIEW` mode)
    - if thumbs up appears on the anchor comment, stop
    - if a new Codex feedback comment appears, repeat the loop
 
-## MCP servers and tool usage
-
-Allowed MCP servers (by name)
-- github (optional)
-
-Rules
-- Use GitHub CLI (`gh`) or GitHub MCP to read PR conversation, reviews, and reactions. This is the source of truth for the Codex Review gate.
-- If an MCP server is not listed above, do not use it.
-
-## Repo invariants
-These are non-negotiable contracts:
-- `/data` is the single runtime state root.
-  - Cloned repos: `/data/repos/<repo-name>/`
-  - Auth tokens: `/data/auth/claude/`, `/data/auth/gh/`
-  - Secrets: `/data/secrets/`
-- Docker Compose defines 3 services: `web` (FastAPI dashboard), `daemon` (pipeline state machine), `redis` (state bridge).
-- Dashboard is read-only, zero AI, zero tokens.
-- Daemon is stateless: recovers from QUEUE.md + GitHub on restart.
-- Config lives in `config.yml` at project root.
-
-## Tech stack
-- Python 3.12
-- FastAPI + Jinja2 + HTMX
-- Tailwind CSS (CDN)
-- Redis (state bridge between daemon and web)
-- Docker + Docker Compose
-- `gh` CLI for GitHub API
-- `claude` CLI for AI coding agent
-
-## Local gates
-Single entrypoint: `scripts/ci.sh`.
-
-If `scripts/ci.sh` does not exist yet, use the fallback:
-- `python -m ruff check .`
-- `python -m pytest -q` (if tests exist)
-
-Do not claim "green" unless the exit code is 0.
-
-## Required review artifacts
+### Required review artifacts
 Single entrypoint: `scripts/make-review-artifacts.sh`.
 
 If the script does not exist yet, manual fallback:
@@ -113,7 +96,7 @@ If the script does not exist yet, manual fallback:
 
 Artifacts are required for every PR.
 
-## Branch naming
+### Branch naming
 - PLANNED: use `Branch:` from the active `tasks/PR-*.md` as the source of truth.
 - If `Branch:` is missing, use `pr-<sanitized-pr-id>`:
   - lowercase
@@ -121,9 +104,9 @@ Artifacts are required for every PR.
   - allow only `[a-z0-9-]`
 - MICRO: `micro-YYYYMMDD-<short-slug>`
 
-## PLANNED PR runbook (queue-driven)
+### PLANNED PR runbook (queue-driven)
 
-### Rules
+#### Rules
 - Preflight: `git status --porcelain` must be empty. If not, stop and list dirty files.
 - Task selection:
   - if any item is `DOING`, take the earliest `DOING`
@@ -140,7 +123,7 @@ Artifacts are required for every PR.
   - when CI is green and before push: set `- Status: DONE`
   - only change the `- Status:` line for the current PR
 
-### Checklist
+#### Checklist
 - [ ] Preflight clean
 - [ ] Selected PR from `tasks/QUEUE.md`; recorded `PR_ID` and `TASK_FILE`
 - [ ] Read `TASK_FILE`
@@ -154,7 +137,7 @@ Artifacts are required for every PR.
 - [ ] Created PR via GitHub CLI (`gh`) or provided manual PR steps
 - [ ] Final report prepared (see below)
 
-### Final report (PR description or final message)
+#### Final report (PR description or final message)
 - PR_ID
 - TASK_FILE
 - Branch
@@ -163,9 +146,9 @@ Artifacts are required for every PR.
 - Artifacts: `artifacts/ci.log`, `artifacts/pr.patch`, `artifacts/structure.txt`
 - Manual test steps (if applicable)
 
-## MICRO PR runbook
+### MICRO PR runbook
 
-### Eligibility (all must be true)
+#### Eligibility (all must be true)
 - <= 3 files changed
 - <= 100 lines changed (excluding lockfile noise)
 - no DB migrations/schema changes
@@ -175,11 +158,11 @@ Artifacts are required for every PR.
 
 If any condition fails, MICRO is not allowed. Use PLANNED PR.
 
-### Rules
+#### Rules
 - Do not create `tasks/PR-*.md`
 - Do not edit `tasks/QUEUE.md`
 
-### Checklist
+#### Checklist
 - [ ] Preflight clean
 - [ ] `git fetch origin main`
 - [ ] Branch `micro-YYYYMMDD-<short-slug>` from `origin/main`
@@ -189,7 +172,7 @@ If any condition fails, MICRO is not allowed. Use PLANNED PR.
 - [ ] Commit: `MICRO: <short summary>`
 - [ ] Pushed branch and opened PR
 
-## REVIEW FIX runbook (existing PR branch)
+### REVIEW FIX runbook (existing PR branch)
 - Do not select a new task from `tasks/QUEUE.md`
 - Do not create a new branch
 - Stay on the existing PR branch
@@ -200,7 +183,54 @@ If any condition fails, MICRO is not allowed. Use PLANNED PR.
 - Generate review artifacts
 - Commit and push to the same PR branch
 
-## Queue stability rules (PLANNED PR only)
+### Queue stability rules (PLANNED PR only)
 - `tasks/` is the source of truth.
 - Do not rewrite tasks retroactively during a PR.
 - If the user updates `tasks/` while you are working, stop and ask for explicit direction: continue as-is, incorporate changes, or revert.
+
+## === PROJECT CONFIG (customize per repo) ===
+
+Fill in the placeholders below for this specific project. The orchestrator
+does not manage this section — edit it freely.
+
+### Tech stack
+- Language: Python 3.12  # TODO: update for your project
+- Framework: # TODO
+- Database: # TODO
+
+### Repo invariants
+# TODO: define your project's non-negotiable contracts (e.g. "/data is
+# the single runtime state root", "Dashboard is read-only", service
+# boundaries, etc.)
+
+### MCP servers
+Allowed MCP servers (by name):
+- github (optional)
+# TODO: add project-specific MCP servers
+
+Rules
+- Use GitHub CLI (`gh`) or GitHub MCP to read PR conversation, reviews, and reactions. This is the source of truth for the Codex Review gate.
+- If an MCP server is not listed above, do not use it.
+
+### Test requirements
+- Tests required for every PR: true  # set to false for prototypes
+- Minimum test coverage: none  # or specify percentage
+
+### CI specifics
+- Single entrypoint: `scripts/ci.sh`
+# TODO: describe what your CI checks (lint, type, unit, integration)
+
+If `scripts/ci.sh` does not exist yet, use the fallback:
+- `python -m ruff check .`
+- `python -m pytest -q` (if tests exist)
+
+Do not claim "green" unless the exit code is 0.
+
+## === LESSONS LEARNED (evolve over time) ===
+
+Add rules here as you discover recurring patterns. Examples:
+- "Always add type hints to new Python code"
+- "Wrap async network calls in `try/except` and log the exception"
+- "Codex frequently flags missing docstrings on public functions — add them proactively"
+
+<!-- TODO: populate as the project matures -->
