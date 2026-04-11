@@ -30,7 +30,13 @@ class RepoConfig(BaseModel):
     url: str
     branch: str = "main"
     auto_merge: bool = True
-    review_timeout_min: int = 60
+    # Optional per-repo override. ``None`` means "inherit
+    # ``daemon.review_timeout_min``": the runner's hung-detection logic
+    # falls back to the daemon-level setting whenever the repo itself
+    # does not pin a timeout, so PR-016's "Default review timeout" UI
+    # control actually steers every repo that has not opted into a
+    # custom value.
+    review_timeout_min: int | None = None
     poll_interval_sec: int = 60
 
 
@@ -96,7 +102,10 @@ def save_config(config: AppConfig, path: str = "config.yml") -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    payload = config.model_dump(mode="json")
+    # ``exclude_none=True`` keeps optional fields (``RepoConfig.review_timeout_min``)
+    # out of the on-disk YAML when they are unset. Otherwise they would be
+    # serialized as ``null``, which is both ugly and ambiguous on re-read.
+    payload = config.model_dump(mode="json", exclude_none=True)
     yaml_text = yaml.dump(payload, default_flow_style=False, sort_keys=False)
 
     fd, tmp_path = tempfile.mkstemp(

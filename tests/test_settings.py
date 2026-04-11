@@ -789,6 +789,64 @@ def test_api_auth_status_handles_timeout(
     assert "timed out" in payload["gh"]["detail"]
 
 
+def test_auth_probes_inject_config_auth_dirs_into_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Auth CLI probes must inject ``CLAUDE_CONFIG_DIR`` / ``GH_CONFIG_DIR``.
+
+    Regression for a P1 Codex finding on PR-016: ``docker-compose.yml``
+    only wires those env vars on the ``daemon`` service, so the ``web``
+    service inherited neither and ``claude --version`` / ``gh auth status``
+    were reading the web container's home directory instead of the
+    shared ``/data/auth`` location the daemon uses. The dashboard would
+    then report "not authorized" even when the daemon was correctly
+    logged in. The probes now read ``auth.claude_config_dir`` and
+    ``auth.gh_config_dir`` from ``config.yml`` and inject them into the
+    subprocess environment, so the Auth Status panel reflects the real
+    auth context operators actually care about.
+    """
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories: []\n"
+        "auth:\n"
+        "  claude_config_dir: /custom/claude-home\n"
+        "  gh_config_dir: /custom/gh-home\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    # Scrub any inherited auth dirs so the assertion below can't be
+    # fooled by the developer's ambient environment.
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+
+    captured: dict[str, dict[str, str]] = {}
+
+    def fake_run(
+        cmd: list[str], *args: object, **kwargs: object
+    ) -> _FakeCompleted:
+        env = kwargs.get("env") or {}
+        if cmd and cmd[0] == "claude":
+            captured["claude"] = dict(env)
+            return _FakeCompleted(0, stdout="claude 1.2.3\n")
+        if cmd and cmd[0] == "gh":
+            captured["gh"] = dict(env)
+            return _FakeCompleted(
+                0,
+                stderr="  ✓ Logged in to github.com as octocat\n",
+            )
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(web_app.subprocess, "run", fake_run)
+
+    with TestClient(app) as client:
+        response = client.get("/api/auth-status")
+
+    assert response.status_code == 200
+    assert captured["claude"].get("CLAUDE_CONFIG_DIR") == "/custom/claude-home"
+    assert captured["gh"].get("GH_CONFIG_DIR") == "/custom/gh-home"
+
+
 def test_auth_status_probes_run_concurrently_off_loop(
     empty_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

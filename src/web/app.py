@@ -203,12 +203,16 @@ def _render_settings_repo_list(request: Request) -> HTMLResponse:
     error banner left over from a prior 422/503 mutation is wiped as soon
     as a subsequent mutation succeeds (otherwise HTMX keeps the stale
     message because success responses only swap ``#settings-repo-list``).
+    The daemon block is passed alongside the repo list so the
+    ``review_timeout_min`` input can render the daemon-level default as
+    placeholder text whenever a repo has not opted into a per-repo
+    override.
     """
     cfg = load_config(CONFIG_PATH)
     return templates.TemplateResponse(
         request,
         "components/settings_repo_list_response.html",
-        {"repos": cfg.repositories},
+        {"repos": cfg.repositories, "daemon": cfg.daemon},
     )
 
 
@@ -219,7 +223,11 @@ def _render_settings_error(
     return templates.TemplateResponse(
         request,
         "components/settings_error.html",
-        {"message": message, "repos": cfg.repositories},
+        {
+            "message": message,
+            "repos": cfg.repositories,
+            "daemon": cfg.daemon,
+        },
         status_code=status_code,
     )
 
@@ -327,7 +335,9 @@ async def put_settings_daemon(
 _AUTH_CHECK_TIMEOUT_SEC = 5
 
 
-def _run_auth_command(cmd: list[str]) -> tuple[int, str, str]:
+def _run_auth_command(
+    cmd: list[str], env: dict[str, str] | None = None
+) -> tuple[int, str, str]:
     """Run ``cmd`` for an auth status probe and return (rc, stdout, stderr).
 
     Any failure to spawn (``FileNotFoundError``, ``PermissionError``) or
@@ -342,6 +352,7 @@ def _run_auth_command(cmd: list[str]) -> tuple[int, str, str]:
             text=True,
             timeout=_AUTH_CHECK_TIMEOUT_SEC,
             check=False,
+            env=env,
         )
     except FileNotFoundError:
         return 127, "", f"{cmd[0]} not found"
@@ -352,9 +363,27 @@ def _run_auth_command(cmd: list[str]) -> tuple[int, str, str]:
     return completed.returncode, completed.stdout or "", completed.stderr or ""
 
 
+def _auth_probe_env(**overrides: str) -> dict[str, str]:
+    """Return the environment block used for an auth CLI probe.
+
+    ``docker-compose.yml`` only sets ``CLAUDE_CONFIG_DIR`` / ``GH_CONFIG_DIR``
+    on the ``daemon`` service; the ``web`` service inherits none of them and
+    would otherwise probe the wrong credential location (the web container's
+    home directory, not ``/data/auth``). Reading the paths from ``config.yml``
+    and injecting them into the subprocess environment keeps the dashboard
+    in lock-step with whatever auth context the daemon was built to use, so
+    "Authorized" on the dashboard matches "the daemon can actually run".
+    """
+    env = os.environ.copy()
+    env.update(overrides)
+    return env
+
+
 def _check_claude_auth() -> dict[str, str]:
     """Probe the ``claude`` CLI and report its authorization status."""
-    rc, stdout, stderr = _run_auth_command(["claude", "--version"])
+    cfg = load_config(CONFIG_PATH)
+    env = _auth_probe_env(CLAUDE_CONFIG_DIR=cfg.auth.claude_config_dir)
+    rc, stdout, stderr = _run_auth_command(["claude", "--version"], env=env)
     if rc == 0:
         output = (stdout or stderr).strip()
         detail = output.splitlines()[0] if output else "claude CLI available"
@@ -365,7 +394,11 @@ def _check_claude_auth() -> dict[str, str]:
 
 def _check_gh_auth() -> dict[str, str]:
     """Probe the ``gh`` CLI and report its authorization status."""
-    rc, stdout, stderr = _run_auth_command(["gh", "auth", "status"])
+    cfg = load_config(CONFIG_PATH)
+    env = _auth_probe_env(GH_CONFIG_DIR=cfg.auth.gh_config_dir)
+    rc, stdout, stderr = _run_auth_command(
+        ["gh", "auth", "status"], env=env
+    )
     # ``gh auth status`` prints its report to stderr on recent versions and
     # to stdout on older ones, so merge both streams before scanning.
     combined = f"{stdout}\n{stderr}".strip()
