@@ -249,6 +249,54 @@ def test_put_repo_invalid_int_returns_422_html(
     assert cfg.repositories[0].review_timeout_min == 60
 
 
+def test_put_repo_non_positive_review_timeout_returns_422(
+    one_repo_config: Path,
+) -> None:
+    """``review_timeout_min`` must stay >= 1 server-side.
+
+    Regression for a P2 bug where ``_coerce_int`` only parsed the value
+    (``min="1"`` on the ``<input>`` is client-side only), so a request
+    with ``review_timeout_min=0`` or a negative number would be persisted
+    to ``config.yml`` and the daemon would mark every PR on that repo as
+    hung immediately because ``elapsed_min >= timeout_min``.
+    """
+    with TestClient(app) as client:
+        for bad in ("0", "-5"):
+            response = client.put(
+                "/settings/repos",
+                params={"url": "https://github.com/example/alpha.git"},
+                data={"review_timeout_min": bad},
+            )
+            assert response.status_code == 422, bad
+            assert "text/html" in response.headers["content-type"]
+            assert "review_timeout_min" in response.text
+            assert "at least 1" in response.text
+
+    # Config untouched across both attempts.
+    cfg = load_config(str(one_repo_config))
+    assert cfg.repositories[0].review_timeout_min == 60
+
+
+def test_put_repo_non_positive_poll_interval_returns_422(
+    one_repo_config: Path,
+) -> None:
+    """``poll_interval_sec`` must also stay >= 1 server-side."""
+    with TestClient(app) as client:
+        for bad in ("0", "-30"):
+            response = client.put(
+                "/settings/repos",
+                params={"url": "https://github.com/example/alpha.git"},
+                data={"poll_interval_sec": bad},
+            )
+            assert response.status_code == 422, bad
+            assert "text/html" in response.headers["content-type"]
+            assert "poll_interval_sec" in response.text
+            assert "at least 1" in response.text
+
+    cfg = load_config(str(one_repo_config))
+    assert cfg.repositories[0].poll_interval_sec == 60
+
+
 def test_put_repo_invalid_bool_returns_422_html(
     one_repo_config: Path,
 ) -> None:

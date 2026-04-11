@@ -312,11 +312,14 @@ def _coerce_bool(value: str, field: str) -> bool:
     raise ValueError(f"{field} must be a boolean")
 
 
-def _coerce_int(value: str, field: str) -> int:
+def _coerce_int(value: str, field: str, min_value: int | None = None) -> int:
     try:
-        return int(value.strip())
+        parsed = int(value.strip())
     except ValueError as exc:
         raise ValueError(f"{field} must be an integer") from exc
+    if min_value is not None and parsed < min_value:
+        raise ValueError(f"{field} must be at least {min_value}")
+    return parsed
 
 
 @app.put("/settings/repos", response_class=HTMLResponse)
@@ -346,13 +349,18 @@ async def put_settings_repo(
     try:
         if auto_merge is not None and auto_merge != "":
             updates["auto_merge"] = _coerce_bool(auto_merge, "auto_merge")
+        # Both numerics must stay strictly positive. The HTML ``min="1"``
+        # is client-side only, and the daemon's hung-detection treats any
+        # PR with ``elapsed_min >= review_timeout_min`` as hung, so a
+        # persisted zero or negative value would flag every PR on that
+        # repo as hung the moment it's created.
         if review_timeout_min is not None and review_timeout_min != "":
             updates["review_timeout_min"] = _coerce_int(
-                review_timeout_min, "review_timeout_min"
+                review_timeout_min, "review_timeout_min", min_value=1
             )
         if poll_interval_sec is not None and poll_interval_sec != "":
             updates["poll_interval_sec"] = _coerce_int(
-                poll_interval_sec, "poll_interval_sec"
+                poll_interval_sec, "poll_interval_sec", min_value=1
             )
     except ValueError as exc:
         return _render_settings_error(request, str(exc), 422)
