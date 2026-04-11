@@ -9,10 +9,11 @@ Redis the dashboard renders a default ``IDLE`` state derived from
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import subprocess
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -128,6 +129,242 @@ async def get_all_repo_states(
     return states
 
 
+_MERGE_EVENT_MARKER = "Merged PR"
+_ITERATION_EVENT_MARKER = "Fix pushed, iteration"
+_ACTIVE_STATES = frozenset(
+    {PipelineState.CODING, PipelineState.WATCH, PipelineState.FIX}
+)
+_ALERT_STATES = frozenset({PipelineState.HUNG, PipelineState.ERROR})
+_ACTIVITY_FEED_LIMIT = 50
+# Sentinel used as the sort key for feed entries whose ``time`` field is
+# a legacy/unparseable value. Pushing them to epoch-start makes sure they
+# sink to the bottom of the newest-first feed, so a repo that happens to
+# be actively updated (and therefore has a recent ``last_updated``) can
+# never float its legacy history above genuinely new entries from other
+# repos during a mixed-format upgrade window.
+_FEED_UNKNOWN_TIME = datetime.min.replace(tzinfo=timezone.utc)
+_EVENT_FILTERS = ("all", "errors", "state")
+_EVENT_ERROR_STATES = frozenset(
+    {PipelineState.ERROR.value, PipelineState.HUNG.value}
+)
+_REPO_BADGE_PALETTE = (
+    "bg-accent/15 text-accent border-accent/30",
+    "bg-ok/15 text-ok border-ok/30",
+    "bg-warn/15 text-warn border-warn/30",
+    "bg-fail/15 text-fail border-fail/30",
+    "bg-hung/15 text-hung border-hung/30",
+    "bg-sky-500/15 text-sky-300 border-sky-500/30",
+    "bg-purple-500/15 text-purple-300 border-purple-500/30",
+    "bg-pink-500/15 text-pink-300 border-pink-500/30",
+)
+
+
+def _parse_history_time(value: str) -> datetime | None:
+    """Parse a history entry's ``time`` field into an aware ``datetime``.
+
+    The daemon writes ISO-8601 UTC timestamps (via ``datetime.isoformat``),
+    but older fixtures and pre-PR-013 payloads may store a bare ``HH:MM:SS``
+    clock string. Return ``None`` in the latter case so the caller can
+    decide whether to fall back to the owning repo's ``last_updated`` or
+    simply skip the entry for date-aware stats.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _format_history_time(value: str) -> str:
+    """Return an ``HH:MM:SS`` display string for a history ``time`` field."""
+    parsed = _parse_history_time(value)
+    if parsed is None:
+        return value
+    return parsed.astimezone(timezone.utc).strftime("%H:%M:%S")
+
+
+def _repo_badge_abbrev(name: str) -> str:
+    """Return the 3-char uppercase repo name badge shown in the feed."""
+    if not name:
+        return "???"
+    return name[:3].upper()
+
+
+def _repo_badge_style(name: str) -> str:
+    """Return a Tailwind class string for ``name``'s activity-feed badge.
+
+    Hash-based so each repo gets a stable colour across reloads without
+    having to persist anything. We hash with SHA-1 (not security-sensitive,
+    just a well-distributed bucket function) and modulo into the palette.
+    """
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()
+    idx = int(digest, 16) % len(_REPO_BADGE_PALETTE)
+    return _REPO_BADGE_PALETTE[idx]
+
+
+def _activity_feed_entry(
+    state: RepoState, entry: dict[str, Any]
+) -> tuple[datetime, dict[str, Any]]:
+    """Build one activity-feed item plus its sort key.
+
+    Entries whose ``time`` field cannot be parsed (legacy ``HH:MM:SS``
+    payloads written before ISO timestamps landed) get a
+    ``_FEED_UNKNOWN_TIME`` sentinel for sort ordering. That sinks them to
+    the bottom of the newest-first feed instead of pinning them to the
+    owning repo's ``last_updated`` — an active repo's ``last_updated``
+    tracks "now", which would otherwise float every legacy entry to the
+    top and drown out genuinely recent events from other repos.
+    """
+    time_str = str(entry.get("time", ""))
+    parsed = _parse_history_time(time_str)
+    sort_key = parsed or _FEED_UNKNOWN_TIME
+    return sort_key, {
+        "repo_name": state.name,
+        "repo_abbrev": _repo_badge_abbrev(state.name),
+        "repo_style": _repo_badge_style(state.name),
+        "time": _format_history_time(time_str),
+        "state": entry.get("state", PipelineState.IDLE.value),
+        "event": entry.get("event", ""),
+    }
+
+
+def _build_activity_feed(
+    states: list[RepoState],
+) -> list[dict[str, Any]]:
+    """Merge histories across repos into one newest-first feed.
+
+    Each entry carries the owning repo name, a 3-char abbreviation and a
+    stable colour class so the template can render a repo badge without
+    reaching back into Python. Capped at ``_ACTIVITY_FEED_LIMIT`` to keep
+    the HTMX payload small.
+    """
+    items: list[tuple[datetime, dict[str, Any]]] = []
+    for state in states:
+        for entry in state.history:
+            items.append(_activity_feed_entry(state, entry))
+    items.sort(key=lambda item: item[0], reverse=True)
+    return [payload for _, payload in items[:_ACTIVITY_FEED_LIMIT]]
+
+
+def _compute_stats(states: list[RepoState]) -> dict[str, Any]:
+    """Aggregate cross-repo stats for the dashboard cards and JSON API.
+
+    Derives everything from in-memory ``RepoState`` objects:
+
+    * ``repos`` - number of configured repositories.
+    * ``active`` - repos currently in CODING/WATCH/FIX.
+    * ``alerts`` - repos currently in HUNG/ERROR.
+    * ``done_today`` / ``done_week`` - count of ``Merged PR`` events in the
+      merged history whose timestamp falls inside the window. Entries
+      without a parseable ``time`` are excluded from the windows but still
+      counted in ``per_repo[].done_total``.
+    * ``avg_iterations_per_merge`` - total ``Fix pushed, iteration`` events
+      divided by total merges. Zero if no merges have happened yet.
+    """
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    week_start = now - timedelta(days=7)
+
+    repos_count = len(states)
+    active_count = sum(1 for s in states if s.state in _ACTIVE_STATES)
+    alerts_count = sum(1 for s in states if s.state in _ALERT_STATES)
+
+    merges_today = 0
+    merges_week = 0
+    merges_total = 0
+    iterations_total = 0
+    per_repo: list[dict[str, Any]] = []
+
+    for state in states:
+        done_total = 0
+        events_today = 0
+        for entry in state.history:
+            event = str(entry.get("event", ""))
+            parsed = _parse_history_time(str(entry.get("time", "")))
+            if _MERGE_EVENT_MARKER in event:
+                done_total += 1
+                merges_total += 1
+                if parsed is not None:
+                    if parsed.astimezone(timezone.utc).date() == today:
+                        merges_today += 1
+                    if parsed >= week_start:
+                        merges_week += 1
+            if _ITERATION_EVENT_MARKER in event:
+                iterations_total += 1
+            if parsed is not None and parsed.astimezone(
+                timezone.utc
+            ).date() == today:
+                events_today += 1
+        per_repo.append(
+            {
+                "name": state.name,
+                "state": state.state.value,
+                "done_total": done_total,
+                "events_today": events_today,
+            }
+        )
+
+    if merges_total:
+        avg_iterations = round(iterations_total / merges_total, 2)
+    else:
+        avg_iterations = 0.0
+
+    return {
+        "repos": repos_count,
+        "active": active_count,
+        "alerts": alerts_count,
+        "done_today": merges_today,
+        "done_week": merges_week,
+        "avg_iterations_per_merge": avg_iterations,
+        "per_repo": per_repo,
+    }
+
+
+def _filter_history(
+    history: list[dict[str, Any]], filter_name: str
+) -> list[dict[str, Any]]:
+    """Return ``history`` filtered by ``filter_name`` for the repo event log.
+
+    * ``all`` - unchanged.
+    * ``errors`` - only entries whose ``state`` is ``ERROR`` or ``HUNG``.
+    * ``state`` - only entries that represent a state transition, i.e.
+      the first entry and any entry whose state differs from the previous
+      entry's state. This collapses long runs of same-state "progress"
+      events (e.g. repeated ``Fix pushed, iteration #N`` lines in FIX)
+      while still surfacing every distinct state change.
+
+    Any other value is treated as ``all`` to keep the HTMX handler
+    forgiving of URL tampering.
+    """
+    if filter_name == "errors":
+        return [
+            entry
+            for entry in history
+            if str(entry.get("state", "")) in _EVENT_ERROR_STATES
+        ]
+    if filter_name == "state":
+        filtered: list[dict[str, Any]] = []
+        previous: str | None = None
+        for entry in history:
+            current = str(entry.get("state", ""))
+            if current != previous:
+                filtered.append(entry)
+                previous = current
+        return filtered
+    return list(history)
+
+
+def _normalize_event_filter(value: str | None) -> str:
+    """Coerce a raw ``filter=`` query value to a known filter name."""
+    if value in _EVENT_FILTERS:
+        return value
+    return "all"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     redis_url = os.environ.get("REDIS_URL", DEFAULT_REDIS_URL)
@@ -149,10 +386,17 @@ app = FastAPI(title="Pipeline Orchestrator", lifespan=lifespan)
 async def index(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
     states = await get_all_repo_states(redis_client)
+    stats = _compute_stats(states)
+    feed = _build_activity_feed(states)
     return templates.TemplateResponse(
         request,
         "index.html",
-        {"title": "Dashboard", "repos": states},
+        {
+            "title": "Dashboard",
+            "repos": states,
+            "stats": stats,
+            "feed": feed,
+        },
     )
 
 
@@ -161,6 +405,13 @@ async def api_states(request: Request) -> JSONResponse:
     redis_client = getattr(request.app.state, "redis", None)
     states = await get_all_repo_states(redis_client)
     return JSONResponse([s.model_dump(mode="json") for s in states])
+
+
+@app.get("/api/stats")
+async def api_stats(request: Request) -> JSONResponse:
+    redis_client = getattr(request.app.state, "redis", None)
+    states = await get_all_repo_states(redis_client)
+    return JSONResponse(_compute_stats(states))
 
 
 @app.get("/partials/repo-list", response_class=HTMLResponse)
@@ -174,6 +425,30 @@ async def partial_repo_list(request: Request) -> HTMLResponse:
     )
 
 
+@app.get("/partials/stats", response_class=HTMLResponse)
+async def partial_stats(request: Request) -> HTMLResponse:
+    redis_client = getattr(request.app.state, "redis", None)
+    states = await get_all_repo_states(redis_client)
+    stats = _compute_stats(states)
+    return templates.TemplateResponse(
+        request,
+        "components/stats_cards.html",
+        {"stats": stats},
+    )
+
+
+@app.get("/partials/activity-feed", response_class=HTMLResponse)
+async def partial_activity_feed(request: Request) -> HTMLResponse:
+    redis_client = getattr(request.app.state, "redis", None)
+    states = await get_all_repo_states(redis_client)
+    feed = _build_activity_feed(states)
+    return templates.TemplateResponse(
+        request,
+        "components/activity_feed.html",
+        {"feed": feed},
+    )
+
+
 @app.get("/repo/{name}", response_class=HTMLResponse)
 async def repo_detail(request: Request, name: str) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
@@ -181,18 +456,60 @@ async def repo_detail(request: Request, name: str) -> HTMLResponse:
     return templates.TemplateResponse(
         request,
         "repo.html",
-        {"title": name, "repo": state},
+        {
+            "title": name,
+            "repo": state,
+            "events": _filter_history(list(state.history), "all"),
+            "event_filter": "all",
+        },
     )
 
 
 @app.get("/partials/repo/{name}", response_class=HTMLResponse)
 async def partial_repo_detail(request: Request, name: str) -> HTMLResponse:
+    """Return ONLY the repo summary cards for the 5s HTMX poll.
+
+    Deliberately does not include the event log: the log self-polls via
+    ``/partials/repo/{name}/events`` so the user's chosen filter tab
+    survives across summary refreshes (an earlier revision rendered the
+    full detail here with ``event_filter="all"`` baked in, which silently
+    reset the tab mid-review on every tick).
+    """
     redis_client = getattr(request.app.state, "redis", None)
     state = await get_repo_state(name, redis_client)
     return templates.TemplateResponse(
         request,
-        "components/repo_detail.html",
+        "components/repo_summary.html",
         {"repo": state},
+    )
+
+
+@app.get(
+    "/partials/repo/{name}/events",
+    response_class=HTMLResponse,
+)
+async def partial_repo_events(
+    request: Request, name: str, filter: str | None = None
+) -> HTMLResponse:
+    """Return the repo event-log fragment filtered to ``filter``.
+
+    Used by the filter tabs on the repo detail page. ``filter`` defaults
+    to ``all`` when the query parameter is missing or unknown so an HTMX
+    request without a filter value (or a tampered one) still lands on a
+    valid view instead of 4xx-ing mid-page.
+    """
+    redis_client = getattr(request.app.state, "redis", None)
+    state = await get_repo_state(name, redis_client)
+    filter_name = _normalize_event_filter(filter)
+    events = _filter_history(list(state.history), filter_name)
+    return templates.TemplateResponse(
+        request,
+        "components/event_log.html",
+        {
+            "repo": state,
+            "events": events,
+            "event_filter": filter_name,
+        },
     )
 
 

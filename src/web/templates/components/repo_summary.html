@@ -1,3 +1,9 @@
+{# Repo header + current-task + current-PR cards.
+
+   Rendered on its own by /partials/repo/{name} so the 5s polling
+   container in repo.html refreshes only the summary while the event
+   log (which lives as a sibling, outside the polling container)
+   stays mounted and keeps its user-selected filter. #}
 {% set state_styles = {
     'IDLE':      {'dot': 'bg-gray-500',  'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30',  'pulse': false},
     'PREFLIGHT': {'dot': 'bg-gray-500',  'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30',  'pulse': false},
@@ -105,24 +111,3 @@
         {% endif %}
     </section>
 </div>
-
-<section class="rounded-lg border border-white/5 bg-surface-2 p-5">
-    <h3 class="text-sm font-semibold text-gray-300 mb-3">Event log</h3>
-    {% if repo.history %}
-    <ul class="max-h-96 overflow-y-auto divide-y divide-white/5 font-mono text-xs">
-        {% for entry in repo.history|reverse %}
-        {% set entry_state = entry.get('state', 'IDLE') %}
-        {% set entry_style = state_styles.get(entry_state, state_styles['IDLE']) %}
-        <li class="flex items-center gap-3 py-2">
-            <span class="text-gray-500 shrink-0">{{ entry.get('time', '--:--:--') }}</span>
-            <span class="text-[10px] font-medium px-1.5 py-0.5 rounded border {{ entry_style.badge }} shrink-0">
-                {{ entry_state }}
-            </span>
-            <span class="text-gray-300 truncate">{{ entry.get('event', '') }}</span>
-        </li>
-        {% endfor %}
-    </ul>
-    {% else %}
-    <p class="text-gray-600 italic text-sm">No events yet</p>
-    {% endif %}
-</section>

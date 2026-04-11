@@ -96,7 +96,7 @@
 - Depends on: PR-015
 
 ## PR-017: Dashboard observability - event log and stats
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-017.md
 - Branch: pr-017-observability
 - Depends on: PR-013
