@@ -9,7 +9,13 @@ calls ``run_cycle`` inside a try/except so that one repo's failure cannot
 take down the others, then sleeps ``daemon.poll_interval_sec`` before
 iterating again. Running with an empty repository list is valid: the
 daemon logs a warning and keeps polling so that a future ``config.yml``
-edit (re-read on restart) has somewhere to land.
+edit has somewhere to land.
+
+Every ``CONFIG_RELOAD_EVERY_CYCLES`` iterations the loop re-reads
+``config.yml`` and reconciles the live set of runners with the new
+configuration: repositories that have been added get a fresh runner,
+repositories that have been removed are dropped, and settings changes
+are propagated onto existing runners without restarting the process.
 """
 
 from __future__ import annotations
@@ -17,10 +23,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from typing import Any
 
 import redis.asyncio as aioredis
 
-from src.config import load_config
+from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
 from src.daemon.runner import PipelineRunner
 
 logging.basicConfig(
@@ -32,6 +39,74 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
+
+#: Re-read ``config.yml`` every N poll cycles. At the default
+#: ``poll_interval_sec=60`` this is roughly one reload per five minutes,
+#: which is frequent enough for settings-page edits to take effect without
+#: thrashing the filesystem each poll.
+CONFIG_RELOAD_EVERY_CYCLES = 5
+
+
+def _build_runner(
+    repo: RepoConfig, config: AppConfig, redis_client: Any
+) -> PipelineRunner | None:
+    """Construct a runner, logging and swallowing init failures."""
+    try:
+        return PipelineRunner(
+            repo_config=repo,
+            app_config=config,
+            redis_client=redis_client,
+        )
+    except Exception:
+        logger.error(
+            "Failed to initialize runner for %s; skipping",
+            repo.url,
+            exc_info=True,
+        )
+        return None
+
+
+def _sync_runners(
+    runners: dict[str, PipelineRunner],
+    config: AppConfig,
+    redis_client: Any,
+) -> None:
+    """Reconcile ``runners`` with ``config.repositories`` in place.
+
+    * New URLs get a freshly constructed :class:`PipelineRunner`.
+    * Removed URLs are dropped from the dict.
+    * Surviving URLs have their ``repo_config`` and ``app_config``
+      swapped in place so settings changes take effect on the next cycle.
+
+    Runners are keyed by normalized URL so that equivalent forms of the
+    same GitHub URL (``.git`` suffix, trailing slash) do not create or
+    destroy runners across reloads.
+    """
+    desired: dict[str, RepoConfig] = {}
+    for repo in config.repositories:
+        desired[normalize_repo_url(repo.url)] = repo
+
+    # Drop runners whose repos are no longer in the config.
+    for key in list(runners.keys()):
+        if key not in desired:
+            logger.info("Removing runner for %s (no longer in config)", key)
+            del runners[key]
+
+    # Add new runners and refresh configs on existing ones.
+    for key, repo in desired.items():
+        if key in runners:
+            runners[key].repo_config = repo
+            runners[key].app_config = config
+            continue
+        runner = _build_runner(repo, config, redis_client)
+        if runner is not None:
+            runners[key] = runner
+            logger.info("Added runner for %s", repo.url)
+
+
+def _configs_differ(a: AppConfig, b: AppConfig) -> bool:
+    """Return True iff ``a`` and ``b`` serialize to different JSON."""
+    return a.model_dump_json() != b.model_dump_json()
 
 
 async def main() -> None:
@@ -48,27 +123,28 @@ async def main() -> None:
             "No repositories configured; daemon will idle until config.yml is updated"
         )
 
-    runners: list[PipelineRunner] = []
-    for repo in config.repositories:
-        # Per-repo try/except: an invalid URL makes PipelineRunner.__init__
-        # raise via get_repo_full_name, which must not take the daemon down.
-        try:
-            runner = PipelineRunner(
-                repo_config=repo,
-                app_config=config,
-                redis_client=redis_client,
-            )
-        except Exception:
-            logger.error(
-                "Failed to initialize runner for %s; skipping",
-                repo.url,
-                exc_info=True,
-            )
-            continue
-        runners.append(runner)
+    runners: dict[str, PipelineRunner] = {}
+    _sync_runners(runners, config, redis_client)
 
+    cycle = 0
     while True:
-        for runner in runners:
+        # Check for config changes every N cycles. We skip the check on
+        # the very first iteration because runners were just built from
+        # the current config above.
+        if cycle > 0 and cycle % CONFIG_RELOAD_EVERY_CYCLES == 0:
+            try:
+                new_config = load_config()
+            except Exception:
+                logger.error("Failed to reload config.yml", exc_info=True)
+            else:
+                if _configs_differ(new_config, config):
+                    logger.info(
+                        "Config change detected; reconciling runners"
+                    )
+                    config = new_config
+                    _sync_runners(runners, config, redis_client)
+
+        for runner in list(runners.values()):
             try:
                 await runner.run_cycle()
             except Exception:
@@ -76,6 +152,7 @@ async def main() -> None:
                     "run_cycle failed for %s", runner.name, exc_info=True
                 )
         await asyncio.sleep(config.daemon.poll_interval_sec)
+        cycle += 1
 
 
 if __name__ == "__main__":
