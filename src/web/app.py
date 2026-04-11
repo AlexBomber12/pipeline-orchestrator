@@ -21,21 +21,13 @@ from fastapi.templating import Jinja2Templates
 
 from src.config import load_config
 from src.models import PipelineState, RepoState
+from src.utils import repo_name_from_url
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 CONFIG_PATH = "config.yml"
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
-
-
-def repo_name_from_url(url: str) -> str:
-    """Return the repo name (last URL segment without ``.git``)."""
-    cleaned = url.rstrip("/")
-    last = cleaned.rsplit("/", 1)[-1]
-    if last.endswith(".git"):
-        last = last[: -len(".git")]
-    return last
 
 
 def _default_repo_state(name: str, url: str) -> RepoState:

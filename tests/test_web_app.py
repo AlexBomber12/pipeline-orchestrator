@@ -23,7 +23,6 @@ from src.web.app import (
     app,
     get_all_repo_states,
     get_repo_state,
-    repo_name_from_url,
 )
 
 
@@ -79,18 +78,6 @@ def two_repo_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     )
     monkeypatch.chdir(tmp_path)
     return cfg
-
-
-def test_repo_name_from_url_strips_git_suffix() -> None:
-    assert repo_name_from_url("https://github.com/example/alpha.git") == "alpha"
-
-
-def test_repo_name_from_url_without_git_suffix() -> None:
-    assert repo_name_from_url("https://github.com/example/beta") == "beta"
-
-
-def test_repo_name_from_url_trailing_slash() -> None:
-    assert repo_name_from_url("https://github.com/example/gamma/") == "gamma"
 
 
 def test_get_all_repo_states_no_redis_returns_idle_defaults(
