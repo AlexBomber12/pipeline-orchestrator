@@ -147,24 +147,25 @@ def test_recover_doing_task_without_pr_rerun_coding(
     )
 
 
-def test_recover_no_doing_with_orphan_pr_recovers_to_watch(
+def test_recover_no_doing_with_done_matched_pr_recovers_to_watch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No DOING task but an open PR exists -> WATCH, and DONE task with
-    matching branch is attached as current_task."""
+    """A DONE task whose PR is still open (marked DONE locally but not
+    yet merged) -> WATCH. The DONE task is attached as current_task and
+    the recovery log line records the matched task id and status."""
     done = _done_task()
     todo = _todo_task()
     monkeypatch.setattr(
         runner_module, "parse_queue", lambda path: [done, todo]
     )
-    orphan = PRInfo(
+    done_pr = PRInfo(
         number=88,
         branch="pr-041-done",
         ci_status=CIStatus.SUCCESS,
         review_status=ReviewStatus.APPROVED,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [orphan]
+        runner_module.github_client, "get_open_prs", lambda repo: [done_pr]
     )
 
     runner = _make_runner()
@@ -176,18 +177,77 @@ def test_recover_no_doing_with_orphan_pr_recovers_to_watch(
     assert runner.state.current_task is not None
     assert runner.state.current_task.pr_id == "PR-041"
     assert any(
-        "Recovered: orphan PR #88" in e["event"] for e in runner.state.history
+        "Recovered: DONE task PR-041" in e["event"]
+        and "WATCH PR #88" in e["event"]
+        for e in runner.state.history
     )
 
 
-def test_recover_orphan_pr_without_matching_done_task_stays_idle(
+def test_recover_no_doing_with_todo_matched_pr_recovers_to_watch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An unrelated open PR (no matching DONE task in QUEUE.md) must NOT
-    be attached: otherwise the runner would later drive merge/fix against
-    a PR outside its queue — potentially a human contributor's work."""
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
-    unrelated = PRInfo(number=99, branch="stray-branch")
+    """P1-F regression: tasks flip TODO -> DONE in a single commit as
+    part of their own implementation PR, so on a restart from main an
+    in-flight task is still TODO until its PR merges. Recovery must
+    match open PRs against TODO tasks — otherwise the orphan-PR path
+    falls back to clean-slate IDLE and the next cycle's handle_idle
+    re-runs PLANNED PR on the already-open PR, running claude_cli a
+    second time on active work."""
+    todo = QueueTask(
+        pr_id="PR-010",
+        title="Daemon recovery",
+        status=TaskStatus.TODO,
+        branch="pr-010-recovery",
+    )
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [todo])
+    in_flight = PRInfo(
+        number=17,
+        branch="pr-010-recovery",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: [in_flight]
+    )
+
+    runner = _make_runner()
+    result = asyncio.run(runner.recover_state())
+
+    assert result is True
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 17
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == "PR-010"
+    assert runner.state.current_task.status == TaskStatus.TODO
+    assert any(
+        "Recovered: TODO task PR-010" in e["event"]
+        and "WATCH PR #17" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_recover_unrelated_open_pr_stays_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An open PR whose branch is not in QUEUE.md (human contributor,
+    dependabot, renovate, etc.) must NOT be attached: otherwise the
+    runner would later drive merge/fix against a PR outside its queue.
+    The queue-match guard stays even after widening the match to TODO
+    tasks — only branches that appear in QUEUE.md are eligible."""
+    # QUEUE.md has a TODO task on one branch; the open PR is on a
+    # different, unrelated branch. The TODO task must NOT be attached
+    # to the unrelated PR just because TODO is now eligible for match.
+    queued_todo = QueueTask(
+        pr_id="PR-050",
+        title="Unrelated queued work",
+        status=TaskStatus.TODO,
+        branch="pr-050-queued",
+    )
+    monkeypatch.setattr(
+        runner_module, "parse_queue", lambda path: [queued_todo]
+    )
+    unrelated = PRInfo(number=99, branch="dependabot/npm/foo")
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo: [unrelated]
     )
@@ -199,8 +259,7 @@ def test_recover_orphan_pr_without_matching_done_task_stays_idle(
     assert runner.state.current_pr is None
     assert runner.state.current_task is None
     assert any(
-        "not matched to any DONE task" in e["event"]
-        for e in runner.state.history
+        "not matched to any" in e["event"] for e in runner.state.history
     )
 
 

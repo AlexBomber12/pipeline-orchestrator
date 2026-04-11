@@ -239,26 +239,40 @@ class PipelineRunner:
             # a duplicate PR for the same task.
             return True
 
-        # No DOING task. An open PR should only be recovered if its branch
-        # matches a DONE task in QUEUE.md (task marked DONE locally but PR
-        # not yet merged). Attaching to a random open PR would let WATCH
-        # later run merge/fix against an unrelated human or bot PR on the
-        # same repo, which could mutate work outside the queue.
-        done_by_branch = {
+        # No DOING task in QUEUE.md. In this workflow a task's status
+        # flips TODO -> DONE in a single commit as part of its own
+        # implementation PR — QUEUE.md on main never occupies DOING —
+        # so the queue's base view shows an in-flight task as TODO until
+        # its implementation PR merges. Match open PRs against any
+        # queued task (TODO or DONE), not DONE-only: if we miss the
+        # TODO case, recovery falls back to clean-slate IDLE and the
+        # next cycle's handle_idle re-runs PLANNED PR on the already-
+        # open PR, running claude_cli a second time on active work.
+        # The queue-match guard still applies: unrelated open PRs
+        # (human contributors, dependabot, etc.) whose branch is not
+        # in QUEUE.md are ignored so WATCH cannot hijack them.
+        queued_by_branch = {
             t.branch: t
             for t in tasks
-            if t.status == TaskStatus.DONE and t.branch
+            if t.branch and t.status in (TaskStatus.TODO, TaskStatus.DONE)
         }
         recoverable = next(
-            ((pr, done_by_branch[pr.branch]) for pr in prs if pr.branch in done_by_branch),
+            (
+                (pr, queued_by_branch[pr.branch])
+                for pr in prs
+                if pr.branch in queued_by_branch
+            ),
             None,
         )
         if recoverable is not None:
-            orphan_pr, done_task = recoverable
-            self.state.current_pr = orphan_pr
-            self.state.current_task = done_task
+            matched_pr, matched_task = recoverable
+            self.state.current_pr = matched_pr
+            self.state.current_task = matched_task
             self.state.state = PipelineState.WATCH
-            self.log_event(f"Recovered: orphan PR #{orphan_pr.number} -> WATCH")
+            self.log_event(
+                f"Recovered: {matched_task.status.value} task "
+                f"{matched_task.pr_id} -> WATCH PR #{matched_pr.number}"
+            )
             return True
 
         # Clean-slate recovery: no in-flight work to resume. Reset the
@@ -278,7 +292,7 @@ class PipelineRunner:
         if prs:
             self.log_event(
                 f"Recovered: {len(prs)} open PR(s) not matched to any "
-                "DONE task -> IDLE"
+                "queued task -> IDLE"
             )
         else:
             self.log_event("Recovered: no DOING tasks, no open PRs -> IDLE")
