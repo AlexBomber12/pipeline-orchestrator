@@ -327,6 +327,90 @@ def test_scaffold_repo_sets_timeouts_on_every_git_call(
             assert kwargs["timeout"] == scaffolder._LOCAL_GIT_TIMEOUT
 
 
+def test_scaffold_repo_handles_unborn_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Onboarding a brand-new empty GitHub repo leaves ``HEAD`` unborn
+    (no commits on any branch), and ``git checkout {branch}`` fails
+    with ``pathspec ... did not match``. The scaffolder must recover
+    by pointing ``HEAD`` at the configured branch via ``symbolic-ref``
+    and then proceed with scaffolding and the initial commit.
+    """
+    repo = _init_empty_repo(tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        if cmd[:2] == ["git", "checkout"]:
+            raise subprocess.CalledProcessError(
+                1,
+                cmd,
+                stderr="error: pathspec 'main' did not match any file(s)",
+            )
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            # Unborn HEAD: rev-parse returns non-zero without raising
+            # (scaffolder uses check=False for this probe).
+            return _FakeCompletedProcess(args=cmd, returncode=1)
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+
+    actions = scaffolder.scaffold_repo(str(repo), "main")
+
+    # Scaffolding continued past the failed checkout, wrote the files,
+    # and reported them.
+    assert (repo / "AGENTS.md").exists()
+    assert (repo / "tasks" / "QUEUE.md").exists()
+    assert "AGENTS.md" in actions
+    assert "tasks/QUEUE.md" in actions
+
+    # The unborn-HEAD fallback must call symbolic-ref with the configured
+    # branch, not ``git checkout -b`` or a generic retry.
+    symbolic_ref_calls = [
+        cmd for cmd in calls if cmd[:2] == ["git", "symbolic-ref"]
+    ]
+    assert symbolic_ref_calls == [
+        ["git", "symbolic-ref", "HEAD", "refs/heads/main"]
+    ]
+
+    # And the happy path below it still runs: add -> commit -> push
+    # targeting the configured branch, creating the branch upstream.
+    assert any(cmd[:2] == ["git", "add"] for cmd in calls)
+    assert any(cmd[:2] == ["git", "commit"] for cmd in calls)
+    push_cmd = next(cmd for cmd in calls if cmd[:2] == ["git", "push"])
+    assert push_cmd == ["git", "push", "origin", "main"]
+
+
+def test_scaffold_repo_reraises_checkout_failure_when_head_is_born(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When checkout fails on a non-empty repo (e.g. the configured
+    branch genuinely does not exist), the scaffolder must re-raise
+    instead of silently recovering — that's a real misconfiguration
+    and the operator needs to see it.
+    """
+    repo = _init_empty_repo(tmp_path)
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "checkout"]:
+            raise subprocess.CalledProcessError(
+                1,
+                cmd,
+                stderr="error: pathspec 'missing' did not match",
+            )
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            # Born HEAD: rev-parse succeeds, so we know the repo has
+            # commits and the checkout failure is not about an unborn
+            # HEAD — it's a real missing branch.
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        scaffolder.scaffold_repo(str(repo), "missing")
+
+
 def test_scaffold_repo_propagates_git_push_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

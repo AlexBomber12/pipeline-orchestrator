@@ -63,6 +63,26 @@ def _run_git(
     )
 
 
+def _head_is_unborn(repo_path: str) -> bool:
+    """Return ``True`` if ``repo_path`` has no commits on any branch.
+
+    A freshly cloned empty repository leaves ``HEAD`` pointing at a
+    symbolic ref that does not yet resolve to a commit. ``git rev-parse
+    --verify HEAD`` returns non-zero in that state. We run it with
+    ``check=False`` so the caller can branch on the result without
+    catching an exception.
+    """
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", "HEAD"],
+        capture_output=True,
+        text=True,
+        cwd=repo_path,
+        check=False,
+        timeout=_LOCAL_GIT_TIMEOUT,
+    )
+    return result.returncode != 0
+
+
 def scaffold_repo(repo_path: str, branch: str) -> list[str]:
     """Create any missing pipeline orchestrator files in ``repo_path``.
 
@@ -86,7 +106,28 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
     # from ``branch``; passing the branch name to ``git checkout``
     # creates a local tracking branch if one does not yet exist. If the
     # tree already sits on ``branch`` this is a cheap no-op.
-    _run_git(repo_path, "checkout", branch)
+    #
+    # Empty-repo onboarding: when the daemon clones a brand-new GitHub
+    # repository with no commits, ``HEAD`` is unborn and ``git checkout
+    # <branch>`` fails with ``pathspec ... did not match`` because no
+    # refs exist yet. Catching that failure and checking for unborn
+    # ``HEAD`` lets us recover by pointing ``HEAD`` at the configured
+    # branch via ``symbolic-ref``; the scaffolding commit below then
+    # materializes the branch, and the push publishes it upstream.
+    try:
+        _run_git(repo_path, "checkout", branch)
+    except subprocess.CalledProcessError:
+        if not _head_is_unborn(repo_path):
+            # Non-empty repo where the configured branch genuinely
+            # does not exist locally or on origin — that is a real
+            # misconfiguration and must surface as an error.
+            raise
+        _run_git(
+            repo_path,
+            "symbolic-ref",
+            "HEAD",
+            f"refs/heads/{branch}",
+        )
 
     repo = Path(repo_path)
     created: list[str] = []
