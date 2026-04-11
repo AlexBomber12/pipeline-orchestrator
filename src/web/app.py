@@ -15,11 +15,18 @@ from pathlib import Path
 from typing import AsyncIterator
 
 import redis.asyncio as aioredis
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
-from src.config import load_config
+from src.config import (
+    AppConfig,
+    RepoConfig,
+    add_repository,
+    load_config,
+    remove_repository,
+    update_repository,
+)
 from src.models import PipelineState, RepoState
 from src.utils import repo_name_from_url
 
@@ -186,3 +193,120 @@ async def partial_repo_detail(request: Request, name: str) -> HTMLResponse:
         "components/repo_detail.html",
         {"repo": state},
     )
+
+
+def _find_repo_by_name(cfg: AppConfig, name: str) -> RepoConfig | None:
+    """Return the ``RepoConfig`` matching ``name`` or ``None``."""
+    for repo in cfg.repositories:
+        if repo_name_from_url(repo.url) == name:
+            return repo
+    return None
+
+
+def _render_settings_repo_list(request: Request) -> HTMLResponse:
+    cfg = load_config(CONFIG_PATH)
+    return templates.TemplateResponse(
+        request,
+        "components/settings_repo_list.html",
+        {"repos": cfg.repositories},
+    )
+
+
+def _render_settings_error(
+    request: Request, message: str, status_code: int
+) -> HTMLResponse:
+    cfg = load_config(CONFIG_PATH)
+    return templates.TemplateResponse(
+        request,
+        "components/settings_error.html",
+        {"message": message, "repos": cfg.repositories},
+        status_code=status_code,
+    )
+
+
+@app.get("/settings", response_class=HTMLResponse)
+async def settings_page(request: Request) -> HTMLResponse:
+    cfg = load_config(CONFIG_PATH)
+    return templates.TemplateResponse(
+        request,
+        "settings.html",
+        {
+            "title": "Settings",
+            "repos": cfg.repositories,
+            "daemon": cfg.daemon,
+        },
+    )
+
+
+@app.get("/partials/settings/repo-list", response_class=HTMLResponse)
+async def partial_settings_repo_list(request: Request) -> HTMLResponse:
+    return _render_settings_repo_list(request)
+
+
+@app.post("/settings/repos", response_class=HTMLResponse)
+async def post_settings_repo(
+    request: Request,
+    url: str = Form(...),
+    branch: str = Form("main"),
+    auto_merge: bool = Form(True),
+) -> HTMLResponse:
+    try:
+        add_repository(
+            url,
+            path=CONFIG_PATH,
+            branch=branch,
+            auto_merge=auto_merge,
+        )
+    except ValueError as exc:
+        return _render_settings_error(request, str(exc), 422)
+    return _render_settings_repo_list(request)
+
+
+@app.delete("/settings/repos/{name}", response_class=HTMLResponse)
+async def delete_settings_repo(
+    request: Request, name: str
+) -> HTMLResponse:
+    cfg = load_config(CONFIG_PATH)
+    repo = _find_repo_by_name(cfg, name)
+    if repo is None:
+        return _render_settings_error(
+            request, f"Repository not found: {name}", 404
+        )
+    try:
+        remove_repository(repo.url, path=CONFIG_PATH)
+    except ValueError as exc:
+        return _render_settings_error(request, str(exc), 404)
+    return _render_settings_repo_list(request)
+
+
+@app.put("/settings/repos/{name}", response_class=HTMLResponse)
+async def put_settings_repo(
+    request: Request,
+    name: str,
+    branch: str | None = Form(None),
+    auto_merge: bool | None = Form(None),
+    review_timeout_min: int | None = Form(None),
+    poll_interval_sec: int | None = Form(None),
+) -> HTMLResponse:
+    cfg = load_config(CONFIG_PATH)
+    repo = _find_repo_by_name(cfg, name)
+    if repo is None:
+        return _render_settings_error(
+            request, f"Repository not found: {name}", 404
+        )
+
+    updates: dict[str, object] = {}
+    if branch is not None:
+        updates["branch"] = branch
+    if auto_merge is not None:
+        updates["auto_merge"] = auto_merge
+    if review_timeout_min is not None:
+        updates["review_timeout_min"] = review_timeout_min
+    if poll_interval_sec is not None:
+        updates["poll_interval_sec"] = poll_interval_sec
+
+    try:
+        update_repository(repo.url, path=CONFIG_PATH, **updates)
+    except ValueError as exc:
+        return _render_settings_error(request, str(exc), 422)
+    return _render_settings_repo_list(request)

@@ -1,0 +1,114 @@
+{% macro repo_name(url) -%}
+    {%- set cleaned = url.rstrip('/') -%}
+    {%- set last = cleaned.rsplit('/', 1)[-1] -%}
+    {%- if last.endswith('.git') -%}{{ last[:-4] }}{%- else -%}{{ last }}{%- endif -%}
+{%- endmacro %}
+
+<table class="w-full text-sm">
+    <thead class="bg-surface-3 text-xs uppercase tracking-wide text-gray-500">
+        <tr>
+            <th class="text-left px-4 py-2 font-medium">Repository</th>
+            <th class="text-left px-4 py-2 font-medium">Branch</th>
+            <th class="text-left px-4 py-2 font-medium">Auto merge</th>
+            <th class="text-left px-4 py-2 font-medium">Review timeout (min)</th>
+            <th class="text-left px-4 py-2 font-medium">Poll interval (sec)</th>
+            <th class="px-4 py-2"></th>
+        </tr>
+    </thead>
+    <tbody>
+        {% if not repos %}
+        <tr>
+            <td colspan="6" class="px-4 py-6 text-center text-gray-500 italic">
+                No repositories configured. Add one below.
+            </td>
+        </tr>
+        {% endif %}
+        {% for repo in repos %}
+        {% set name = repo_name(repo.url) %}
+        <tr class="border-t border-white/5">
+            <td class="px-4 py-2">
+                <div class="font-mono text-gray-200">{{ name }}</div>
+                <div class="font-mono text-xs text-gray-500 truncate max-w-xs" title="{{ repo.url }}">
+                    {{ repo.url }}
+                </div>
+            </td>
+            <td class="px-4 py-2">
+                <input type="text"
+                       name="branch"
+                       value="{{ repo.branch }}"
+                       class="w-28 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none"
+                       hx-put="/settings/repos/{{ name }}"
+                       hx-trigger="change"
+                       hx-target="#settings-repo-list"
+                       hx-swap="innerHTML">
+            </td>
+            <td class="px-4 py-2">
+                <input type="checkbox"
+                       name="auto_merge"
+                       value="true"
+                       {% if repo.auto_merge %}checked{% endif %}
+                       class="accent-accent"
+                       hx-put="/settings/repos/{{ name }}"
+                       hx-trigger="change"
+                       hx-target="#settings-repo-list"
+                       hx-swap="innerHTML"
+                       hx-vals='{"auto_merge": "{{ "false" if repo.auto_merge else "true" }}"}'>
+            </td>
+            <td class="px-4 py-2">
+                <input type="number"
+                       name="review_timeout_min"
+                       value="{{ repo.review_timeout_min }}"
+                       min="1"
+                       class="w-20 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none"
+                       hx-put="/settings/repos/{{ name }}"
+                       hx-trigger="change"
+                       hx-target="#settings-repo-list"
+                       hx-swap="innerHTML">
+            </td>
+            <td class="px-4 py-2">
+                <input type="number"
+                       name="poll_interval_sec"
+                       value="{{ repo.poll_interval_sec }}"
+                       min="1"
+                       class="w-20 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none"
+                       hx-put="/settings/repos/{{ name }}"
+                       hx-trigger="change"
+                       hx-target="#settings-repo-list"
+                       hx-swap="innerHTML">
+            </td>
+            <td class="px-4 py-2 text-right">
+                <button type="button"
+                        class="text-xs font-medium px-2 py-1 rounded border border-fail/30 text-fail hover:bg-fail/10"
+                        hx-delete="/settings/repos/{{ name }}"
+                        hx-target="#settings-repo-list"
+                        hx-swap="innerHTML"
+                        hx-confirm="Remove {{ name }}?">
+                    Delete
+                </button>
+            </td>
+        </tr>
+        {% endfor %}
+        <tr class="border-t border-white/5 bg-surface-3/40">
+            <td colspan="6" class="px-4 py-3">
+                <form class="flex flex-wrap items-center gap-2"
+                      hx-post="/settings/repos"
+                      hx-target="#settings-repo-list"
+                      hx-swap="innerHTML">
+                    <input type="url"
+                           name="url"
+                           required
+                           placeholder="https://github.com/owner/repo"
+                           class="flex-1 min-w-[20rem] bg-surface-3 border border-white/10 rounded px-3 py-1.5 text-gray-200 focus:border-accent focus:outline-none">
+                    <input type="text"
+                           name="branch"
+                           value="main"
+                           class="w-28 bg-surface-3 border border-white/10 rounded px-3 py-1.5 text-gray-200 focus:border-accent focus:outline-none">
+                    <button type="submit"
+                            class="px-3 py-1.5 rounded bg-accent/10 border border-accent/30 text-accent text-sm font-medium hover:bg-accent/20">
+                        Add Repository
+                    </button>
+                </form>
+            </td>
+        </tr>
+    </tbody>
+</table>

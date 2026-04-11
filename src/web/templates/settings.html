@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+
+{% block title %}Settings - Pipeline Orchestrator{% endblock %}
+
+{% block content %}
+<div class="space-y-10">
+    <section>
+        <div class="flex items-baseline justify-between mb-4">
+            <h2 class="text-xl font-semibold tracking-tight">Repositories</h2>
+            <span class="font-mono text-sm text-gray-500">{{ repos|length }} total</span>
+        </div>
+
+        <div id="settings-error" class="mb-4"></div>
+
+        <div id="settings-repo-list"
+             class="rounded-lg border border-white/5 bg-surface-2 overflow-hidden">
+            {% include "components/settings_repo_list.html" %}
+        </div>
+    </section>
+
+    <section>
+        <h2 class="text-xl font-semibold tracking-tight mb-4">Daemon</h2>
+        <div class="rounded-lg border border-white/5 bg-surface-2 p-5 text-sm text-gray-500">
+            Daemon and auth status coming in PR-016.
+        </div>
+    </section>
+</div>
+{% endblock %}

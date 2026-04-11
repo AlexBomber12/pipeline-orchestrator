@@ -7,6 +7,16 @@
 
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <script>
+        document.addEventListener('htmx:configRequest', function () {});
+        document.addEventListener('htmx:beforeSwap', function (evt) {
+            const status = evt.detail.xhr.status;
+            if (status === 404 || status === 422) {
+                evt.detail.shouldSwap = true;
+                evt.detail.isError = false;
+            }
+        });
+    </script>
 
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -68,7 +78,17 @@
                 </div>
                 <h1 class="text-lg font-semibold tracking-tight">Pipeline Orchestrator</h1>
             </div>
-            <div id="clock" class="font-mono text-sm text-gray-400">--:--:--</div>
+            <div class="flex items-center gap-6">
+                <a href="/"
+                   class="text-sm font-medium {% if title == 'Settings' %}text-gray-400 hover:text-gray-200{% else %}text-accent{% endif %}">
+                    Dashboard
+                </a>
+                <a href="/settings"
+                   class="text-sm font-medium {% if title == 'Settings' %}text-accent{% else %}text-gray-400 hover:text-gray-200{% endif %}">
+                    Settings
+                </a>
+                <div id="clock" class="font-mono text-sm text-gray-400">--:--:--</div>
+            </div>
         </div>
     </nav>
 
