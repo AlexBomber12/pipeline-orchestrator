@@ -275,15 +275,50 @@ def _format_alert_duration(seconds: int) -> str:
     return f"{hours}h {remaining}min"
 
 
+def _most_recent_transition_into(
+    history: list[dict[str, Any]], target_state: str
+) -> datetime | None:
+    """Return the time of the most recent transition INTO ``target_state``.
+
+    History is appended in chronological order by ``Runner.log_event``.
+    A "transition" here is the first entry of the most recent consecutive
+    run of ``target_state`` entries — subsequent entries in the same run
+    are just repeat polls where the state didn't actually change. Scans
+    forward and overwrites the candidate every time a new run starts so
+    the final value is the start of the latest run.
+
+    Returns ``None`` if ``history`` has no ``target_state`` entries, or
+    if every such entry carries an unparseable ``time`` field (legacy
+    ``HH:MM:SS`` payloads written before PR-013's ISO conversion).
+    """
+    run_start: datetime | None = None
+    prev_state: str | None = None
+    for entry in history:
+        current = str(entry.get("state", ""))
+        if current == target_state and prev_state != target_state:
+            parsed = _parse_history_time(str(entry.get("time", "")))
+            if parsed is not None:
+                run_start = parsed
+        prev_state = current
+    return run_start
+
+
 def _alert_reference_time(state: RepoState) -> datetime:
     """Return the "since" timestamp an alert card should display.
 
-    HUNG uses ``current_pr.last_activity`` when present (that is the
-    signal the daemon marks stale to decide the PR is hung in the first
-    place) and falls back to ``state.last_updated`` otherwise. ERROR
-    uses ``state.last_updated`` directly — error_message transitions
-    rewrite ``last_updated`` whenever the daemon trips the state, so
-    that is the freshest signal available to the dashboard.
+    HUNG prefers ``current_pr.last_activity`` (the daemon's own
+    hung-detection signal) when it is set. Otherwise — and for every
+    ERROR card — scan ``state.history`` for the most recent transition
+    into the current state. This matters because ``publish_state``
+    rewrites ``state.last_updated`` on every daemon cycle (see
+    ``src/daemon/runner.py``), so using ``last_updated`` as the "since"
+    timestamp would make an hours-old ERROR card display "a few sec"
+    forever and break duration-based sorting in the alerts bucket.
+
+    Falls through to ``state.last_updated`` only when history carries
+    no matching transition (a bootstrap cycle or a legacy payload with
+    unparseable timestamps) — in that case "now-ish" is the best signal
+    we have and the alert still renders.
     """
     if (
         state.state == PipelineState.HUNG
@@ -291,6 +326,11 @@ def _alert_reference_time(state: RepoState) -> datetime:
         and state.current_pr.last_activity is not None
     ):
         return state.current_pr.last_activity
+    transition = _most_recent_transition_into(
+        state.history, state.state.value
+    )
+    if transition is not None:
+        return transition
     return state.last_updated
 
 

@@ -26,8 +26,13 @@ from src.web import app as web_app
 from src.web.app import (
     _build_alerts,
     _format_alert_duration,
+    _most_recent_transition_into,
     app,
 )
+
+
+def _iso(ts: datetime) -> str:
+    return ts.astimezone(timezone.utc).isoformat()
 
 
 class _FakeRedis:
@@ -217,6 +222,120 @@ def test_build_alerts_falls_back_to_last_updated_when_no_pr() -> None:
     assert len(alerts) == 1
     assert alerts[0]["duration_text"] == "12 min"
     assert alerts[0]["pr_number"] is None
+
+
+def test_most_recent_transition_into_picks_latest_run_start() -> None:
+    """Helper returns the start of the MOST RECENT run of ``target_state``.
+
+    Repeated same-state log entries inside a single run are repeat polls
+    (the daemon logs from FIX, WATCH, etc. on every cycle even when the
+    state hasn't actually flipped) — the transition is only the first
+    entry of each run, and we want the start of the latest run so the
+    alert duration reflects "time since the most recent error", not the
+    first error ever seen.
+    """
+    t1 = datetime(2026, 4, 11, 9, 0, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 4, 11, 9, 5, 0, tzinfo=timezone.utc)
+    t3 = datetime(2026, 4, 11, 9, 10, 0, tzinfo=timezone.utc)
+    t4 = datetime(2026, 4, 11, 9, 15, 0, tzinfo=timezone.utc)
+    t5 = datetime(2026, 4, 11, 9, 20, 0, tzinfo=timezone.utc)
+    t6 = datetime(2026, 4, 11, 9, 25, 0, tzinfo=timezone.utc)
+    history = [
+        {"time": _iso(t1), "state": "CODING", "event": "start"},
+        {"time": _iso(t2), "state": "ERROR", "event": "boom 1"},
+        {"time": _iso(t3), "state": "ERROR", "event": "still boom 1"},
+        {"time": _iso(t4), "state": "IDLE", "event": "recovered"},
+        {"time": _iso(t5), "state": "ERROR", "event": "boom 2"},
+        {"time": _iso(t6), "state": "ERROR", "event": "still boom 2"},
+    ]
+    # latest ERROR run starts at t5, not t2
+    assert _most_recent_transition_into(history, "ERROR") == t5
+    # state never present -> None
+    assert _most_recent_transition_into(history, "HUNG") is None
+    # empty history -> None
+    assert _most_recent_transition_into([], "ERROR") is None
+    # entries with unparseable time are skipped but run detection still
+    # advances via ``prev_state``, so a later run with a valid time wins
+    history_with_legacy = [
+        {"time": "09:00:00", "state": "ERROR", "event": "legacy"},
+        {"time": _iso(t5), "state": "IDLE", "event": "reset"},
+        {"time": _iso(t6), "state": "ERROR", "event": "parseable boom"},
+    ]
+    assert _most_recent_transition_into(history_with_legacy, "ERROR") == t6
+
+
+def test_build_alerts_error_duration_survives_publish_state_rewrite() -> None:
+    """Regression for P2: ERROR duration must not reset every daemon cycle.
+
+    ``Runner.publish_state`` rewrites ``state.last_updated`` to ``now``
+    on every cycle (see ``src/daemon/runner.py``), so basing the alert
+    "since" timestamp on ``last_updated`` makes hours-old errors always
+    render as "a few sec" and breaks the duration-desc sort inside the
+    ERROR bucket. The fix derives ``since`` from the most recent ERROR
+    transition in ``state.history`` instead.
+    """
+    now = datetime.now(timezone.utc)
+    error_transition = now - timedelta(minutes=47)
+    stale = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="alpha",
+        state=PipelineState.ERROR,
+        error_message="claude CLI exited 1",
+        # last_updated just got rewritten by a publish_state tick
+        last_updated=now - timedelta(seconds=2),
+        history=[
+            {
+                "time": _iso(now - timedelta(minutes=50)),
+                "state": "CODING",
+                "event": "started",
+            },
+            {
+                "time": _iso(error_transition),
+                "state": "ERROR",
+                "event": "boom",
+            },
+            # a later ERROR entry inside the same run — this is a
+            # repeat poll, not a new transition
+            {
+                "time": _iso(now - timedelta(minutes=3)),
+                "state": "ERROR",
+                "event": "still broken",
+            },
+        ],
+    )
+    [alert] = _build_alerts([stale])
+    # Duration is measured from the transition INTO ERROR, not from the
+    # most recent "still broken" poll and not from last_updated.
+    assert alert["duration_text"] == "47 min"
+
+
+def test_build_alerts_hung_duration_falls_back_to_history_transition() -> None:
+    """HUNG without ``current_pr.last_activity`` must also survive the
+    ``publish_state`` rewrite by scanning history for the most recent
+    transition into HUNG instead of reading ``last_updated`` directly.
+    """
+    now = datetime.now(timezone.utc)
+    hung_transition = now - timedelta(hours=1, minutes=30)
+    bare = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="alpha",
+        state=PipelineState.HUNG,
+        last_updated=now - timedelta(seconds=1),
+        history=[
+            {
+                "time": _iso(now - timedelta(hours=2)),
+                "state": "WATCH",
+                "event": "watching review",
+            },
+            {
+                "time": _iso(hung_transition),
+                "state": "HUNG",
+                "event": "marked hung",
+            },
+        ],
+    )
+    [alert] = _build_alerts([bare])
+    assert alert["duration_text"] == "1h 30min"
 
 
 def test_build_alerts_error_card_carries_message_and_repo_link() -> None:
