@@ -909,8 +909,23 @@ class PipelineRunner:
 
         self.state.state = PipelineState.WATCH
         self.log_event(f"Fix pushed, iteration #{iteration}")
-        if self.state.current_pr is not None:
-            self._post_codex_review(self.state.current_pr.number)
+        # A post failure here must be fatal, unlike after PR creation:
+        # the PR is still in ``CHANGES_REQUESTED`` from the prior Codex
+        # review, so if we cannot re-request a review, the next
+        # ``handle_watch`` cycle will loop right back into
+        # ``handle_fix`` and keep pushing fixes without ever waiting
+        # on a new review. Surface an ERROR that operators can resolve
+        # (e.g. by manually posting ``@codex review``).
+        if (
+            self.state.current_pr is not None
+            and not self._post_codex_review(self.state.current_pr.number)
+        ):
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = (
+                f"Failed to post @codex review on PR "
+                f"#{self.state.current_pr.number} after fix push; "
+                "manual review trigger required to avoid fix/push loop"
+            )
 
     async def handle_merge(self) -> None:
         """Merge the current PR and return to IDLE."""
@@ -933,30 +948,36 @@ class PipelineRunner:
         self.state.state = PipelineState.IDLE
         self.log_event(f"Merged PR #{number} -> IDLE")
 
-    def _post_codex_review(self, pr_number: int) -> None:
-        """Post ``@codex review`` on ``pr_number``; non-fatal on failure.
+    def _post_codex_review(self, pr_number: int) -> bool:
+        """Post ``@codex review`` on ``pr_number``.
 
         Called after PR creation (``handle_coding``) and after every
         fix push (``handle_fix``) so Codex kicks off a review for each
         iteration instead of relying on the GitHub-side Automatic
-        Reviews trigger (which covers PR creation but not every push,
-        and which we disable on the repo to avoid duplicate reviews).
+        Reviews trigger (which we want configured for PR creation only
+        to avoid duplicate reviews).
 
-        A ``post_comment`` failure is logged as a warning and the
-        runner stays in ``WATCH``: Codex may still auto-trigger on
-        push, and a transient ``gh`` error must not flip an otherwise
-        healthy pipeline to ``ERROR``.
+        Returns ``True`` on success and ``False`` on a logged failure.
+        The caller decides whether a failure is fatal: after a fix
+        push it must be, otherwise the next ``handle_watch`` cycle
+        still sees the prior ``CHANGES_REQUESTED`` signal and loops
+        back into ``handle_fix`` immediately, pushing a new fix every
+        poll interval without ever re-requesting a review. After PR
+        creation it can stay a warning because Codex Automatic Reviews
+        still fires on the creation event itself.
         """
         try:
             github_client.post_comment(
                 self.owner_repo, pr_number, "@codex review"
             )
             self.log_event(f"Posted @codex review on PR #{pr_number}")
+            return True
         except Exception as exc:
             self.log_event(
                 f"Warning: failed to post @codex review on PR "
                 f"#{pr_number}: {exc}"
             )
+            return False
 
     async def handle_hung(self) -> None:
         """Nudge the reviewer with ``@codex review`` or give up, per config."""

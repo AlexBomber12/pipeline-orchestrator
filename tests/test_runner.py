@@ -383,12 +383,21 @@ def test_handle_fix_posts_codex_review_after_push(
     )
 
 
-def test_handle_fix_survives_post_comment_failure(
+def test_handle_fix_errors_when_post_comment_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A ``post_comment`` failure after a fix push must be non-fatal: the
-    push already succeeded, so the runner stays in ``WATCH`` and only
-    logs a warning."""
+    """PR-019 Codex P1: a ``post_comment`` failure after a fix push must
+    flip the runner to ``ERROR``.
+
+    The push itself already succeeded, but the PR is still sitting on the
+    prior Codex ``CHANGES_REQUESTED`` signal. If we stayed in ``WATCH``
+    after failing to re-request a review, the next ``handle_watch`` cycle
+    would see ``CHANGES_REQUESTED`` and immediately loop back into
+    ``handle_fix``, pushing a new fix every poll interval without ever
+    waiting on Codex. Surfacing ``ERROR`` forces operators to resolve the
+    gh failure (e.g. by manually posting ``@codex review``) instead of
+    trapping the daemon in a silent fix/push loop.
+    """
     monkeypatch.setattr(
         runner_module.claude_cli, "fix_review", lambda path: (0, "", "")
     )
@@ -403,10 +412,11 @@ def test_handle_fix_survives_post_comment_failure(
     runner.state.current_pr = PRInfo(number=77, branch="pr-019")
     asyncio.run(runner.handle_fix())
 
-    assert runner.state.state == PipelineState.WATCH
-    assert runner.state.error_message is None
+    assert runner.state.state == PipelineState.ERROR
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.push_count == 1
+    assert "#77" in (runner.state.error_message or "")
+    assert "fix/push loop" in (runner.state.error_message or "")
     assert any(
         "Warning: failed to post @codex review" in e["event"]
         and "gh rate limited" in e["event"]
