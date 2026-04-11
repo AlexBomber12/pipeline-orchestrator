@@ -307,7 +307,11 @@ def test_partial_repo_detail_returns_html_fragment(
     assert "IDLE" in body
     assert "Current Task" in body
     assert "Current PR" in body
-    assert "Event log" in body
+    # Event log has been split out of /partials/repo/{name} — it now
+    # self-polls via /partials/repo/{name}/events so the selected filter
+    # tab survives across summary refreshes. See
+    # test_partial_repo_events_* in test_observability.py for coverage.
+    assert "Event log" not in body
 
 
 def test_partial_repo_detail_renders_redis_payload(
@@ -367,5 +371,7 @@ def test_partial_repo_detail_renders_redis_payload(
     assert "#99" in body
     assert "https://github.com/example/alpha/pull/99" in body
     assert "pr-042-wire-it-up" in body
-    assert "claude started" in body
     assert "CODING" in body
+    # Event log lives on /partials/repo/{name}/events now, so history
+    # entries are no longer rendered by the summary partial.
+    assert "claude started" not in body

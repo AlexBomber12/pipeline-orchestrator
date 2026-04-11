@@ -136,6 +136,13 @@ _ACTIVE_STATES = frozenset(
 )
 _ALERT_STATES = frozenset({PipelineState.HUNG, PipelineState.ERROR})
 _ACTIVITY_FEED_LIMIT = 50
+# Sentinel used as the sort key for feed entries whose ``time`` field is
+# a legacy/unparseable value. Pushing them to epoch-start makes sure they
+# sink to the bottom of the newest-first feed, so a repo that happens to
+# be actively updated (and therefore has a recent ``last_updated``) can
+# never float its legacy history above genuinely new entries from other
+# repos during a mixed-format upgrade window.
+_FEED_UNKNOWN_TIME = datetime.min.replace(tzinfo=timezone.utc)
 _EVENT_FILTERS = ("all", "errors", "state")
 _EVENT_ERROR_STATES = frozenset(
     {PipelineState.ERROR.value, PipelineState.HUNG.value}
@@ -202,10 +209,19 @@ def _repo_badge_style(name: str) -> str:
 def _activity_feed_entry(
     state: RepoState, entry: dict[str, Any]
 ) -> tuple[datetime, dict[str, Any]]:
-    """Build one activity-feed item plus its sort key."""
+    """Build one activity-feed item plus its sort key.
+
+    Entries whose ``time`` field cannot be parsed (legacy ``HH:MM:SS``
+    payloads written before ISO timestamps landed) get a
+    ``_FEED_UNKNOWN_TIME`` sentinel for sort ordering. That sinks them to
+    the bottom of the newest-first feed instead of pinning them to the
+    owning repo's ``last_updated`` — an active repo's ``last_updated``
+    tracks "now", which would otherwise float every legacy entry to the
+    top and drown out genuinely recent events from other repos.
+    """
     time_str = str(entry.get("time", ""))
     parsed = _parse_history_time(time_str)
-    sort_key = parsed or state.last_updated
+    sort_key = parsed or _FEED_UNKNOWN_TIME
     return sort_key, {
         "repo_name": state.name,
         "repo_abbrev": _repo_badge_abbrev(state.name),
@@ -451,16 +467,20 @@ async def repo_detail(request: Request, name: str) -> HTMLResponse:
 
 @app.get("/partials/repo/{name}", response_class=HTMLResponse)
 async def partial_repo_detail(request: Request, name: str) -> HTMLResponse:
+    """Return ONLY the repo summary cards for the 5s HTMX poll.
+
+    Deliberately does not include the event log: the log self-polls via
+    ``/partials/repo/{name}/events`` so the user's chosen filter tab
+    survives across summary refreshes (an earlier revision rendered the
+    full detail here with ``event_filter="all"`` baked in, which silently
+    reset the tab mid-review on every tick).
+    """
     redis_client = getattr(request.app.state, "redis", None)
     state = await get_repo_state(name, redis_client)
     return templates.TemplateResponse(
         request,
-        "components/repo_detail.html",
-        {
-            "repo": state,
-            "event_filter": "all",
-            "events": _filter_history(list(state.history), "all"),
-        },
+        "components/repo_summary.html",
+        {"repo": state},
     )
 
 

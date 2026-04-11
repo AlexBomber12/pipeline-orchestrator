@@ -230,6 +230,52 @@ def test_build_activity_feed_merges_and_sorts_newest_first() -> None:
     assert feed[0]["time"] == "11:00:00"
 
 
+def test_build_activity_feed_sinks_legacy_timestamps() -> None:
+    """Legacy ``HH:MM:SS`` entries must NOT float on ``last_updated``.
+
+    Regression for a bug where a repo that was actively updated (and so
+    carried a recent ``last_updated``) would have every legacy-formatted
+    history entry pinned to "now", shoving genuinely recent entries from
+    other repos out of the top-50 feed during mixed-format upgrade
+    windows. The fix pushes unparseable timestamps to epoch-start so
+    they sink to the bottom instead.
+    """
+    now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=timezone.utc)
+    legacy_repo = _coding_state(
+        "alpha",
+        "https://github.com/example/alpha.git",
+        history=[
+            {"time": "09:00:00", "state": "CODING", "event": "legacy-1"},
+            {"time": "09:05:00", "state": "CODING", "event": "legacy-2"},
+        ],
+    )
+    # last_updated is "now" — the bug would have promoted legacy entries
+    # to this timestamp and pushed beta's genuinely-newer entry off the
+    # top of the feed.
+    legacy_repo.last_updated = now
+
+    beta = _coding_state(
+        "beta",
+        "https://github.com/example/beta.git",
+        history=[
+            {
+                "time": _iso(now - timedelta(minutes=30)),
+                "state": "WATCH",
+                "event": "beta recent",
+            }
+        ],
+    )
+
+    feed = _build_activity_feed([legacy_repo, beta])
+    events = [entry["event"] for entry in feed]
+    # beta's real timestamp must win over alpha's legacy entries even
+    # though alpha's last_updated > beta's entry timestamp.
+    assert events[0] == "beta recent"
+    # legacy entries are still included (so upgrade windows don't lose
+    # data), they just sink below real timestamps.
+    assert set(events[1:]) == {"legacy-1", "legacy-2"}
+
+
 def test_build_activity_feed_caps_at_fifty() -> None:
     base = datetime(2026, 4, 11, 9, 0, 0, tzinfo=timezone.utc)
     history = [
@@ -495,9 +541,16 @@ def test_partial_repo_events_filters_by_query(
     assert 'filter=state' in body
 
 
-def test_partial_repo_detail_includes_event_log_header(
+def test_partial_repo_detail_returns_summary_only(
     observability_config: Path,
 ) -> None:
+    """Summary poll must NOT include the event log.
+
+    The event log self-polls via /partials/repo/{name}/events so the
+    user's selected filter tab survives across summary refreshes;
+    bundling the event log back into the summary partial would silently
+    reset the filter to ``all`` on every 5s tick.
+    """
     now = datetime.now(timezone.utc)
     alpha = RepoState(
         url="https://github.com/example/alpha.git",
@@ -520,8 +573,79 @@ def test_partial_repo_detail_includes_event_log_header(
 
     assert response.status_code == 200
     body = response.text
-    # event log heading plus count badge (1 events)
+    assert "Current Task" in body
+    assert "Event log" not in body
+    assert "started coding" not in body
+
+
+def test_partial_repo_events_response_preserves_selected_filter(
+    observability_config: Path,
+) -> None:
+    """The /events fragment must bake the active filter into hx-vals.
+
+    Without this, the event log's own 5s poll would fire with no filter
+    value, silently falling back to ``all`` on the server and reverting
+    the user's ``errors`` or ``state changes`` selection mid-review.
+    """
+    now = datetime.now(timezone.utc)
+    alpha = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="alpha",
+        state=PipelineState.ERROR,
+        last_updated=now,
+        history=[
+            {
+                "time": _iso(now),
+                "state": "ERROR",
+                "event": "boom",
+            },
+        ],
+    )
+    fake = _FakeRedis({"pipeline:alpha": alpha.model_dump_json()})
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.get(
+            "/partials/repo/alpha/events", params={"filter": "errors"}
+        )
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'id="repo-event-log"' in body
+    assert 'hx-trigger="every 5s"' in body
+    # the active filter round-trips through hx-vals so the next poll
+    # continues to request the filtered view instead of resetting
+    assert 'hx-vals=\'{"filter": "errors"}\'' in body
+
+
+def test_partial_repo_events_default_filter_is_all(
+    observability_config: Path,
+) -> None:
+    now = datetime.now(timezone.utc)
+    alpha = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="alpha",
+        state=PipelineState.CODING,
+        last_updated=now,
+        history=[
+            {
+                "time": _iso(now),
+                "state": "CODING",
+                "event": "started coding",
+            },
+        ],
+    )
+    fake = _FakeRedis({"pipeline:alpha": alpha.model_dump_json()})
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.get("/partials/repo/alpha/events")
+
+    assert response.status_code == 200
+    body = response.text
     assert "Event log" in body
     assert "1 events" in body
-    # filter tabs render inline
+    assert 'hx-vals=\'{"filter": "all"}\'' in body
+    # filter tabs render so users can switch modes
     assert "filter=errors" in body
+    assert "filter=state" in body
