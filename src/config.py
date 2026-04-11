@@ -182,7 +182,10 @@ def update_repository(
         raise ValueError(f"Repository not found: {url}")
 
     existing = config.repositories[idx]
-    merged = existing.model_copy(update=updates)
+    # model_copy(update=...) does NOT re-run validators in Pydantic v2, so
+    # rebuild via model_validate to reject malformed patches (e.g. non-int
+    # poll_interval_sec) before writing anything to disk.
+    merged = RepoConfig.model_validate({**existing.model_dump(), **updates})
     config.repositories[idx] = merged
     save_config(config, path)
     return config
@@ -200,6 +203,10 @@ def update_daemon_config(
         raise ValueError(f"Unknown daemon fields: {sorted(unknown)}")
 
     config = load_config(path)
-    config.daemon = config.daemon.model_copy(update=updates)
+    # Same reasoning as update_repository: go through model_validate so a
+    # malformed patch raises instead of corrupting the on-disk config.
+    config.daemon = DaemonConfig.model_validate(
+        {**config.daemon.model_dump(), **updates}
+    )
     save_config(config, path)
     return config

@@ -253,6 +253,29 @@ def test_update_repository_raises_on_unknown_field(tmp_path: Path) -> None:
         )
 
 
+def test_update_repository_validates_patch_types(tmp_path: Path) -> None:
+    """Malformed patches must raise and leave config.yml untouched."""
+    path = tmp_path / "config.yml"
+    save_config(AppConfig(), str(path))
+    add_repository(
+        "https://github.com/octo/alpha.git",
+        str(path),
+        review_timeout_min=30,
+    )
+    before = path.read_text(encoding="utf-8")
+
+    with pytest.raises(Exception):
+        update_repository(
+            "https://github.com/octo/alpha.git",
+            str(path),
+            review_timeout_min="not-an-int",
+        )
+
+    assert path.read_text(encoding="utf-8") == before
+    reloaded = load_config(str(path))
+    assert reloaded.repositories[0].review_timeout_min == 30
+
+
 def test_update_daemon_config_updates_fields(tmp_path: Path) -> None:
     path = tmp_path / "config.yml"
     save_config(AppConfig(), str(path))
@@ -279,3 +302,18 @@ def test_update_daemon_config_rejects_unknown_field(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="Unknown daemon fields"):
         update_daemon_config(str(path), bogus=True)
+
+
+def test_update_daemon_config_validates_patch_types(tmp_path: Path) -> None:
+    """Malformed daemon patches must raise and leave config.yml untouched."""
+    path = tmp_path / "config.yml"
+    save_config(AppConfig(), str(path))
+    update_daemon_config(str(path), poll_interval_sec=45)
+    before = path.read_text(encoding="utf-8")
+
+    with pytest.raises(Exception):
+        update_daemon_config(str(path), poll_interval_sec="nope")
+
+    assert path.read_text(encoding="utf-8") == before
+    reloaded = load_config(str(path))
+    assert reloaded.daemon.poll_interval_sec == 45
