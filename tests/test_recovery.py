@@ -257,6 +257,60 @@ def test_recover_no_doing_no_prs_stays_idle(
     )
 
 
+def test_recover_clean_slate_resets_prior_error_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1-E regression: cycle 1 discovery failed (state=ERROR,
+    error_message set, _recovered=False). Cycle 2 discovery succeeds but
+    finds no in-flight work. recover_state must explicitly reset state
+    to IDLE and clear error_message — otherwise the runner would return
+    True, run_cycle would publish the still-ERROR state, and (with
+    error_handler_use_ai disabled) the queue would never progress."""
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: []
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = (
+        "recover_state: get_open_prs failed: gh api rate limited"
+    )
+
+    result = asyncio.run(runner.recover_state())
+
+    assert result is True
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None
+    assert runner.state.current_task is None
+    assert runner.state.current_pr is None
+
+
+def test_recover_clean_slate_resets_error_with_unrelated_prs_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The clean-slate reset must also fire when the repository has open
+    PRs that don't match any DONE task (e.g. a dependabot PR). That path
+    is semantically 'no in-flight work to resume' and must restore IDLE
+    from any prior ERROR state, not just the strictly empty-PR case."""
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
+    unrelated = PRInfo(number=77, branch="dependabot/npm/foo")
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: [unrelated]
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "recover_state: get_open_prs failed: boom"
+
+    result = asyncio.run(runner.recover_state())
+
+    assert result is True
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None
+    assert runner.state.current_pr is None
+
+
 def test_recover_get_open_prs_failure_sets_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

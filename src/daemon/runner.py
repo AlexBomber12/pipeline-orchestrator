@@ -261,6 +261,20 @@ class PipelineRunner:
             self.log_event(f"Recovered: orphan PR #{orphan_pr.number} -> WATCH")
             return True
 
+        # Clean-slate recovery: no in-flight work to resume. Reset the
+        # runner to IDLE explicitly — a prior cycle's failed discovery
+        # may have left self.state.state == ERROR with an error_message
+        # set, and the WATCH/CODING branches above restore state only on
+        # their own code paths. Without this reset, a successful retry
+        # that lands in clean-slate would return True and run_cycle
+        # would publish the still-ERROR state; the runner would then
+        # stop making queue progress (and with error_handler_use_ai
+        # disabled, handle_error is a no-op so it would stay stuck).
+        self.state.state = PipelineState.IDLE
+        self.state.error_message = None
+        self.state.current_task = None
+        self.state.current_pr = None
+
         if prs:
             self.log_event(
                 f"Recovered: {len(prs)} open PR(s) not matched to any "
