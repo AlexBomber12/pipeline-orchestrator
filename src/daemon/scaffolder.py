@@ -24,6 +24,16 @@ TEMPLATES_DIR = Path(__file__).resolve().parent.parent.parent / "templates"
 _GITIGNORE_ENTRY = "artifacts/"
 _COMMIT_MESSAGE = "chore: initialize pipeline orchestrator structure"
 
+# Timeouts for git subprocess calls, mirroring the limits used elsewhere
+# in the daemon (see ``PipelineRunner``). Without an explicit timeout a
+# stalled network operation or an auth prompt during the first-clone
+# scaffolding path could block ``ensure_repo_cloned`` indefinitely and
+# freeze that runner cycle. Local operations (checkout/add/commit)
+# finish quickly, so 30s is generous; push is the one call that crosses
+# the network and gets the higher 120s ceiling.
+_LOCAL_GIT_TIMEOUT = 30
+_PUSH_GIT_TIMEOUT = 120
+
 
 def _copy_template(src_name: str, dest: Path, executable: bool = False) -> None:
     """Copy ``templates/<src_name>`` to ``dest`` and chmod if requested."""
@@ -32,14 +42,24 @@ def _copy_template(src_name: str, dest: Path, executable: bool = False) -> None:
         dest.chmod(0o755)
 
 
-def _run_git(repo_path: str, *args: str) -> subprocess.CompletedProcess[str]:
-    """Run a git command inside ``repo_path`` and capture output."""
+def _run_git(
+    repo_path: str,
+    *args: str,
+    timeout: int = _LOCAL_GIT_TIMEOUT,
+) -> subprocess.CompletedProcess[str]:
+    """Run a git command inside ``repo_path`` and capture output.
+
+    ``timeout`` is required (defaulting to the local-operation limit);
+    network-facing calls like ``push`` must pass the higher push limit
+    explicitly so a stalled remote cannot hang the runner cycle.
+    """
     return subprocess.run(
         ["git", *args],
         capture_output=True,
         text=True,
         cwd=repo_path,
         check=True,
+        timeout=timeout,
     )
 
 
@@ -144,10 +164,13 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
     try:
         _run_git(repo_path, "add", *to_stage)
         _run_git(repo_path, "commit", "-m", _COMMIT_MESSAGE)
-        _run_git(repo_path, "push", "origin", branch)
+        _run_git(repo_path, "push", "origin", branch, timeout=_PUSH_GIT_TIMEOUT)
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout or "").strip()
         logger.warning("scaffold_repo git step failed: %s", detail)
+        raise
+    except subprocess.TimeoutExpired as exc:
+        logger.warning("scaffold_repo git step timed out: %s", exc.cmd)
         raise
 
     logger.info("scaffold_repo created: %s", ", ".join(created))

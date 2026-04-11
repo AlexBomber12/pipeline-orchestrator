@@ -291,3 +291,57 @@ def test_scaffold_repo_propagates_git_push_failure(
 
     with pytest.raises(subprocess.CalledProcessError):
         scaffolder.scaffold_repo(str(repo), "main")
+
+
+def test_scaffold_repo_sets_timeouts_on_every_git_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every git subprocess must enforce a ``timeout`` so a stalled
+    network operation or auth prompt on first connect cannot hang the
+    runner cycle. ``push`` is the only network-facing call and gets the
+    higher ceiling; local ops use the lower limit.
+    """
+    repo = _init_empty_repo(tmp_path)
+    captured: list[tuple[list[str], dict[str, Any]]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured.append((cmd, kwargs))
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+
+    scaffolder.scaffold_repo(str(repo), "main")
+
+    # Every git call carried a timeout kwarg.
+    assert captured, "scaffolder did not issue any git calls"
+    for cmd, kwargs in captured:
+        assert "timeout" in kwargs, f"{cmd} ran without a timeout"
+        assert kwargs["timeout"] > 0
+
+    # The network-facing push gets the higher ceiling; every other git
+    # call uses the lower local-op limit.
+    for cmd, kwargs in captured:
+        if cmd[:2] == ["git", "push"]:
+            assert kwargs["timeout"] == scaffolder._PUSH_GIT_TIMEOUT
+        else:
+            assert kwargs["timeout"] == scaffolder._LOCAL_GIT_TIMEOUT
+
+
+def test_scaffold_repo_propagates_git_push_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stalled ``git push`` must raise ``TimeoutExpired`` out of the
+    scaffolder so ``ensure_repo_cloned``'s broad error handler can log
+    and move on, rather than the runner cycle hanging indefinitely.
+    """
+    repo = _init_empty_repo(tmp_path)
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "push"]:
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        scaffolder.scaffold_repo(str(repo), "main")
