@@ -664,7 +664,11 @@ def test_run_cycle_resets_stale_transient_state(
     # _recovered=True skips recover_state so this test exercises the
     # defensive transient-state reset, not the (separately tested)
     # recovery path that would have caught a mid-coding crash first.
+    # _scaffolded=True skips the scaffold retry in ensure_repo_cloned
+    # so this test focuses on the transient-state reset rather than
+    # scaffolding behavior.
     runner._recovered = True
+    runner._scaffolded = True
     runner.state.state = PipelineState.CODING  # simulate crash mid-coding
     asyncio.run(runner.run_cycle())
 
@@ -673,3 +677,142 @@ def test_run_cycle_resets_stale_transient_state(
     assert any("stale transient state" in e["event"] for e in runner.state.history)
     assert isinstance(runner.redis, _FakeRedis)
     assert runner.redis.writes, "publish_state should have been called"
+
+
+def test_ensure_repo_cloned_retries_scaffold_after_transient_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """A transient scaffold failure (e.g. initial push timeout) must
+    not be swallowed and must leave ``_scaffolded`` unset so the next
+    cycle retries. Once scaffold_repo finally succeeds,
+    ``_scaffolded`` flips to True and scaffold_repo is never called
+    again. Without this loop, the first-clone push failure strands
+    ``origin/{branch}`` without ``tasks/QUEUE.md`` and the runner sits
+    in ERROR forever because ``_parse_base_queue`` keeps reading a
+    missing file.
+    """
+    _patch_subprocess(monkeypatch)
+
+    scaffold_calls: list[str] = []
+    attempts = {"n": 0}
+
+    def fake_scaffold(path: str, branch: str) -> list[str]:
+        attempts["n"] += 1
+        scaffold_calls.append(branch)
+        if attempts["n"] == 1:
+            raise RuntimeError("simulated push timeout")
+        return ["AGENTS.md", "tasks/QUEUE.md"]
+
+    monkeypatch.setattr(
+        runner_module.scaffolder, "scaffold_repo", fake_scaffold
+    )
+
+    runner = _make_runner()
+    # Point repo_path at a non-existent directory so ensure_repo_cloned
+    # takes the clone branch on every call (clone is mocked to a no-op
+    # via _patch_subprocess).
+    runner.repo_path = str(tmp_path / "clone-target")
+
+    # Cycle 1: scaffold raises -> RuntimeError out of
+    # ensure_repo_cloned (no longer silently swallowed).
+    with pytest.raises(RuntimeError, match="scaffold_repo failed"):
+        asyncio.run(runner.ensure_repo_cloned())
+    assert runner._scaffolded is False
+    assert scaffold_calls == ["main"]
+
+    # Cycle 2: scaffold succeeds -> _scaffolded flips True and the
+    # created files are logged.
+    asyncio.run(runner.ensure_repo_cloned())
+    assert runner._scaffolded is True
+    assert scaffold_calls == ["main", "main"]
+    assert any(
+        "scaffold_repo created" in e["event"] for e in runner.state.history
+    )
+
+    # Cycle 3: scaffold_repo is NOT called again — _scaffolded gates
+    # the entire retry loop.
+    asyncio.run(runner.ensure_repo_cloned())
+    assert scaffold_calls == ["main", "main"]
+
+
+def test_ensure_repo_cloned_tolerates_fetch_failure_before_first_scaffold(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """On a previously-cloned but never-successfully-scaffolded repo,
+    ``git fetch origin {branch}`` can fail with "couldn't find remote
+    ref" because the prior cycle's scaffolding push never landed.
+    ``ensure_repo_cloned`` must tolerate that failure and still call
+    scaffold_repo, which is idempotent at the remote level and will
+    re-push the stranded commit.
+    """
+    # Make the path exist so ensure_repo_cloned takes the fetch branch.
+    existing = tmp_path / "clone-target"
+    existing.mkdir()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "fetch"]:
+            raise subprocess.CalledProcessError(
+                128,
+                cmd,
+                stderr="fatal: couldn't find remote ref main",
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    scaffold_calls: list[str] = []
+
+    def fake_scaffold(path: str, branch: str) -> list[str]:
+        scaffold_calls.append(branch)
+        return ["AGENTS.md"]
+
+    monkeypatch.setattr(
+        runner_module.scaffolder, "scaffold_repo", fake_scaffold
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(existing)
+
+    # fetch failure before first scaffold: must NOT raise, must still
+    # call scaffold_repo, and must set _scaffolded True on success.
+    asyncio.run(runner.ensure_repo_cloned())
+
+    assert scaffold_calls == ["main"]
+    assert runner._scaffolded is True
+    # The tolerated fetch failure leaves a breadcrumb in history so
+    # the operator can see what happened.
+    assert any(
+        "fetch failed before scaffold" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_ensure_repo_cloned_raises_fetch_failure_after_scaffold_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """Once scaffolding has succeeded (``_scaffolded = True``), a
+    ``git fetch`` failure must raise normally — the tolerance only
+    applies before the first successful scaffold so we don't mask
+    real network/auth issues on an otherwise-healthy repo.
+    """
+    existing = tmp_path / "clone-target"
+    existing.mkdir()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "fetch"]:
+            raise subprocess.CalledProcessError(
+                128, cmd, stderr="network error"
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    runner.repo_path = str(existing)
+    runner._scaffolded = True  # simulate prior success
+
+    with pytest.raises(RuntimeError, match="git fetch failed"):
+        asyncio.run(runner.ensure_repo_cloned())

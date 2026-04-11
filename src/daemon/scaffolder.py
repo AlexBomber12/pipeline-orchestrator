@@ -83,6 +83,52 @@ def _head_is_unborn(repo_path: str) -> bool:
     return result.returncode != 0
 
 
+def _local_has_unpushed_commits(repo_path: str, branch: str) -> bool:
+    """Return ``True`` if the local branch is ahead of ``origin/{branch}``.
+
+    Two situations both count as "ahead":
+
+    - ``refs/remotes/origin/{branch}`` does not exist at all: the
+      initial scaffolding push never created the branch upstream.
+      Typically this means a prior cycle committed locally but the
+      push failed transiently (timeout, auth blip). If ``HEAD`` has
+      any commit we must push to publish it; if ``HEAD`` is also
+      unborn there is nothing to push yet.
+    - ``refs/remotes/origin/{branch}`` exists but ``git rev-list
+      --count origin/{branch}..HEAD`` is greater than zero: a stranded
+      commit from a prior cycle never reached the remote.
+
+    Both probes use ``check=False`` so missing refs and transient git
+    failures don't raise out of the idempotency check itself.
+    """
+    remote_ref = f"refs/remotes/origin/{branch}"
+    exists = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", remote_ref],
+        capture_output=True,
+        text=True,
+        cwd=repo_path,
+        check=False,
+        timeout=_LOCAL_GIT_TIMEOUT,
+    )
+    if exists.returncode != 0:
+        return not _head_is_unborn(repo_path)
+
+    ahead = subprocess.run(
+        ["git", "rev-list", "--count", f"{remote_ref}..HEAD"],
+        capture_output=True,
+        text=True,
+        cwd=repo_path,
+        check=False,
+        timeout=_LOCAL_GIT_TIMEOUT,
+    )
+    if ahead.returncode != 0:
+        return False
+    try:
+        return int(ahead.stdout.strip()) > 0
+    except ValueError:
+        return False
+
+
 def scaffold_repo(repo_path: str, branch: str) -> list[str]:
     """Create any missing pipeline orchestrator files in ``repo_path``.
 
@@ -182,9 +228,6 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
     if gitignore_touched:
         created.append(".gitignore")
 
-    if not created:
-        return []
-
     # Stage only the concrete files and edits we produced. Directory
     # entries in ``created`` are kept for the returned log but are not
     # passed to ``git add`` directly — git tracks files, not empty
@@ -193,26 +236,57 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
     # particular is an empty directory covered by the ``.gitignore``
     # entry, so there is nothing for git to track there.
     to_stage = [path for path in created if not path.endswith("/")]
-    if not to_stage:
-        # Only untrackable entries (e.g. a lone ``artifacts/`` directory)
-        # were created. Running ``git add``/``commit`` here would fail
-        # with "nothing to commit", surfacing as a scaffolding error
-        # even though nothing was actually wrong — the filesystem now
-        # matches the runbook and the next cycle sees a clean no-op.
-        logger.info("scaffold_repo created (no git writes): %s", ", ".join(created))
-        return created
 
-    try:
-        _run_git(repo_path, "add", *to_stage)
-        _run_git(repo_path, "commit", "-m", _COMMIT_MESSAGE)
-        _run_git(repo_path, "push", "origin", branch, timeout=_PUSH_GIT_TIMEOUT)
-    except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or exc.stdout or "").strip()
-        logger.warning("scaffold_repo git step failed: %s", detail)
-        raise
-    except subprocess.TimeoutExpired as exc:
-        logger.warning("scaffold_repo git step timed out: %s", exc.cmd)
-        raise
+    if to_stage:
+        # New scaffolding to commit. Running ``git add``/``commit`` on
+        # an empty ``to_stage`` is skipped because commit would fail
+        # with "nothing to commit" — covered by the else branch
+        # (``_local_has_unpushed_commits``) which still runs and may
+        # push a stranded commit.
+        try:
+            _run_git(repo_path, "add", *to_stage)
+            _run_git(repo_path, "commit", "-m", _COMMIT_MESSAGE)
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or "").strip()
+            logger.warning("scaffold_repo git commit failed: %s", detail)
+            raise
+        except subprocess.TimeoutExpired as exc:
+            logger.warning("scaffold_repo git commit timed out: %s", exc.cmd)
+            raise
 
-    logger.info("scaffold_repo created: %s", ", ".join(created))
+    # Push whenever the local branch is ahead of ``origin/{branch}``.
+    # This single probe covers three distinct situations:
+    #
+    # - Happy path: we just committed new scaffolding and need to
+    #   publish it.
+    # - Retry path: a prior cycle committed scaffolding but the push
+    #   failed transiently (timeout, auth blip). The files are
+    #   already on disk and the commit is already in place so
+    #   ``created`` may be empty this time, but ``origin/{branch}``
+    #   is still missing the scaffolding commit. Re-push the stranded
+    #   commit so ``_parse_base_queue`` can read
+    #   ``origin/{branch}:tasks/QUEUE.md`` on the next cycle.
+    # - No-op path: the repo is fully provisioned locally and already
+    #   in sync with the remote — skip the push entirely, preserving
+    #   scaffold_repo's idempotent "do nothing on a clean repo"
+    #   promise.
+    if _local_has_unpushed_commits(repo_path, branch):
+        try:
+            _run_git(
+                repo_path,
+                "push",
+                "origin",
+                branch,
+                timeout=_PUSH_GIT_TIMEOUT,
+            )
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or "").strip()
+            logger.warning("scaffold_repo git push failed: %s", detail)
+            raise
+        except subprocess.TimeoutExpired as exc:
+            logger.warning("scaffold_repo git push timed out: %s", exc.cmd)
+            raise
+
+    if created:
+        logger.info("scaffold_repo created: %s", ", ".join(created))
     return created

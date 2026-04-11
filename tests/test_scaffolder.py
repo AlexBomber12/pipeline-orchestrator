@@ -25,12 +25,38 @@ class _FakeCompletedProcess:
         self.returncode = returncode
 
 
-def _patch_git(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
-    """Capture git subprocess calls issued by scaffolder."""
+def _patch_git(
+    monkeypatch: pytest.MonkeyPatch, *, synced: bool = False
+) -> list[list[str]]:
+    """Capture git subprocess calls issued by scaffolder.
+
+    By default models a fresh-clone scenario where
+    ``origin/{branch}`` does not yet exist, so the scaffolder's
+    unpushed-commits probe decides the local branch needs to be
+    pushed. Pass ``synced=True`` to model a fully sync'd repo where
+    both the local tree and the remote already have every scaffolding
+    file and the probe returns False (no push). ``HEAD`` is treated as
+    born in both modes — the unborn-HEAD path is covered by its own
+    dedicated tests with hand-rolled ``fake_run`` functions.
+    """
     calls: list[list[str]] = []
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         calls.append(cmd)
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            ref = cmd[-1]
+            if ref.startswith("refs/remotes/origin/"):
+                return _FakeCompletedProcess(
+                    args=cmd, returncode=0 if synced else 1
+                )
+            # HEAD probe: always born in the default helper.
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        if cmd[:2] == ["git", "rev-list"]:
+            # Reached only when origin ref exists. Synced mode reports
+            # zero commits ahead so no push is issued.
+            return _FakeCompletedProcess(
+                args=cmd, returncode=0, stdout="0\n"
+            )
         return _FakeCompletedProcess(args=cmd)
 
     monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
@@ -195,9 +221,11 @@ def test_scaffold_repo_preserves_existing_ci_sh(
 def test_scaffold_repo_skips_commit_when_fully_provisioned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A fully-provisioned repo yields an empty action list and performs
-    only the initial checkout — scaffolding is idempotent across
-    repeated calls, with no add/commit/push."""
+    """A fully-provisioned, fully-synced repo yields an empty action
+    list and performs no add/commit/push — scaffolding is idempotent
+    across repeated calls. The unpushed-commits probe still runs
+    (checkout, rev-parse, rev-list) but reports no stranded commit.
+    """
     repo = _init_empty_repo(tmp_path)
     (repo / "AGENTS.md").write_text("# AGENTS\n")
     (repo / "tasks").mkdir()
@@ -211,23 +239,28 @@ def test_scaffold_repo_skips_commit_when_fully_provisioned(
     (repo / "scripts" / "make-review-artifacts.sh").chmod(0o755)
     (repo / "artifacts").mkdir()
     (repo / ".gitignore").write_text("artifacts/\n")
-    calls = _patch_git(monkeypatch)
+    calls = _patch_git(monkeypatch, synced=True)
 
     actions = scaffolder.scaffold_repo(str(repo), "main")
 
     assert actions == []
-    # Only the initial ``git checkout`` runs. No add/commit/push.
-    assert calls == [["git", "checkout", "main"]]
+    # Checkout first, then only read-only git probes (rev-parse,
+    # rev-list). Critically: no add/commit/push.
+    assert calls[0] == ["git", "checkout", "main"]
+    assert not any(cmd[:2] == ["git", "add"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "commit"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
 
 
 def test_scaffold_repo_skips_git_when_only_artifacts_dir_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """If the only missing entry is the untrackable ``artifacts/``
-    directory, scaffolding must create it locally but skip add/commit/
-    push — git would otherwise fail with "nothing to commit" and
-    surface as a scaffolding error for a case that needed no upstream
-    change at all.
+    directory (the repo was fully provisioned and synced upstream
+    previously), scaffolding must create it locally but skip add/
+    commit/push — git would otherwise fail with "nothing to commit"
+    and surface as a scaffolding error for a case that needed no
+    upstream change at all.
     """
     repo = _init_empty_repo(tmp_path)
     (repo / "AGENTS.md").write_text("# AGENTS\n")
@@ -241,8 +274,9 @@ def test_scaffold_repo_skips_git_when_only_artifacts_dir_missing(
     )
     (repo / "scripts" / "make-review-artifacts.sh").chmod(0o755)
     (repo / ".gitignore").write_text("artifacts/\n")
-    # Note: no artifacts/ directory — this is the only gap.
-    calls = _patch_git(monkeypatch)
+    # Note: no artifacts/ directory — this is the only gap. The remote
+    # is fully in sync, so ``synced=True``.
+    calls = _patch_git(monkeypatch, synced=True)
 
     actions = scaffolder.scaffold_repo(str(repo), "main")
 
@@ -250,9 +284,12 @@ def test_scaffold_repo_skips_git_when_only_artifacts_dir_missing(
     # logging.
     assert (repo / "artifacts").is_dir()
     assert actions == ["artifacts/"]
-    # But there's nothing trackable to commit, so git is never invoked
-    # beyond the initial checkout.
-    assert calls == [["git", "checkout", "main"]]
+    # No git writes: no add, no commit, no push. The initial checkout
+    # and the read-only unpushed-commits probes are the only calls.
+    assert calls[0] == ["git", "checkout", "main"]
+    assert not any(cmd[:2] == ["git", "add"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "commit"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
 
 
 def test_scaffold_repo_appends_artifacts_without_duplicating(
@@ -285,6 +322,12 @@ def test_scaffold_repo_propagates_git_push_failure(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         if cmd[:2] == ["git", "push"]:
             raise subprocess.CalledProcessError(1, cmd, stderr="push denied")
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            ref = cmd[-1]
+            if ref.startswith("refs/remotes/origin/"):
+                # origin/main missing → probe decides a push is needed.
+                return _FakeCompletedProcess(args=cmd, returncode=1)
+            return _FakeCompletedProcess(args=cmd, returncode=0)
         return _FakeCompletedProcess(args=cmd)
 
     monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
@@ -306,6 +349,13 @@ def test_scaffold_repo_sets_timeouts_on_every_git_call(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         captured.append((cmd, kwargs))
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            ref = cmd[-1]
+            if ref.startswith("refs/remotes/origin/"):
+                # Force the unpushed-commits probe to decide a push
+                # is needed so the push call is exercised too.
+                return _FakeCompletedProcess(args=cmd, returncode=1)
+            return _FakeCompletedProcess(args=cmd, returncode=0)
         return _FakeCompletedProcess(args=cmd)
 
     monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
@@ -317,6 +367,10 @@ def test_scaffold_repo_sets_timeouts_on_every_git_call(
     for cmd, kwargs in captured:
         assert "timeout" in kwargs, f"{cmd} ran without a timeout"
         assert kwargs["timeout"] > 0
+
+    # A push call was reached so both the local and the push limits
+    # are actually exercised.
+    assert any(cmd[:2] == ["git", "push"] for cmd, _ in captured)
 
     # The network-facing push gets the higher ceiling; every other git
     # call uses the lower local-op limit.
@@ -334,10 +388,16 @@ def test_scaffold_repo_handles_unborn_head(
     (no commits on any branch), and ``git checkout {branch}`` fails
     with ``pathspec ... did not match``. The scaffolder must recover
     by pointing ``HEAD`` at the configured branch via ``symbolic-ref``
-    and then proceed with scaffolding and the initial commit.
+    and then proceed with scaffolding, the initial commit, and the
+    initial push that creates ``origin/{branch}``.
     """
     repo = _init_empty_repo(tmp_path)
     calls: list[list[str]] = []
+    # ``HEAD`` starts unborn (empty clone) and becomes born after the
+    # scaffolding commit lands. The fake git responds accordingly so
+    # the unborn-detection probe returns True before the commit and
+    # False afterward.
+    committed = {"done": False}
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         calls.append(cmd)
@@ -347,10 +407,19 @@ def test_scaffold_repo_handles_unborn_head(
                 cmd,
                 stderr="error: pathspec 'main' did not match any file(s)",
             )
+        if cmd[:2] == ["git", "commit"]:
+            committed["done"] = True
+            return _FakeCompletedProcess(args=cmd)
         if cmd[:3] == ["git", "rev-parse", "--verify"]:
-            # Unborn HEAD: rev-parse returns non-zero without raising
-            # (scaffolder uses check=False for this probe).
-            return _FakeCompletedProcess(args=cmd, returncode=1)
+            ref = cmd[-1]
+            if ref.startswith("refs/remotes/origin/"):
+                # Remote branch does not yet exist on a brand-new
+                # empty GitHub repo.
+                return _FakeCompletedProcess(args=cmd, returncode=1)
+            # HEAD probe: unborn until the scaffolding commit.
+            return _FakeCompletedProcess(
+                args=cmd, returncode=0 if committed["done"] else 1
+            )
         return _FakeCompletedProcess(args=cmd)
 
     monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
@@ -411,6 +480,61 @@ def test_scaffold_repo_reraises_checkout_failure_when_head_is_born(
         scaffolder.scaffold_repo(str(repo), "missing")
 
 
+def test_scaffold_repo_retries_stranded_push_with_no_new_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prior cycle committed the scaffolding locally but the push
+    failed transiently, so the local commit is stranded and
+    ``origin/{branch}`` still lacks ``tasks/QUEUE.md``. On the retry
+    cycle every file is already present locally, so ``created`` is
+    empty, but the scaffolder must still re-push the stranded commit
+    — otherwise the runner's ``_parse_base_queue`` keeps reading an
+    empty QUEUE.md from origin and stays stuck in ERROR forever.
+    """
+    repo = _init_empty_repo(tmp_path)
+    # Fully provision the repo locally — this is what the filesystem
+    # looks like after a successful local commit whose push timed out.
+    (repo / "AGENTS.md").write_text("# AGENTS\n")
+    (repo / "tasks").mkdir()
+    (repo / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "ci.sh").write_text("#!/usr/bin/env bash\n")
+    (repo / "scripts" / "ci.sh").chmod(0o755)
+    (repo / "scripts" / "make-review-artifacts.sh").write_text(
+        "#!/usr/bin/env bash\n"
+    )
+    (repo / "scripts" / "make-review-artifacts.sh").chmod(0o755)
+    (repo / "artifacts").mkdir()
+    (repo / ".gitignore").write_text("artifacts/\n")
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            # origin/main exists on the remote (fetched earlier) and
+            # HEAD is born — the stranded-commit state is signalled by
+            # rev-list --count returning 1.
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        if cmd[:2] == ["git", "rev-list"]:
+            return _FakeCompletedProcess(args=cmd, returncode=0, stdout="1\n")
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+
+    actions = scaffolder.scaffold_repo(str(repo), "main")
+
+    # Nothing new was created: every file is already in place.
+    assert actions == []
+    # But the push must have run to publish the stranded commit.
+    push_cmds = [cmd for cmd in calls if cmd[:2] == ["git", "push"]]
+    assert push_cmds == [["git", "push", "origin", "main"]]
+    # And no new commit was produced — the local commit from the
+    # previous cycle is exactly what's being re-pushed.
+    assert not any(cmd[:2] == ["git", "add"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "commit"] for cmd in calls)
+
+
 def test_scaffold_repo_propagates_git_push_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -423,6 +547,11 @@ def test_scaffold_repo_propagates_git_push_timeout(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         if cmd[:2] == ["git", "push"]:
             raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            ref = cmd[-1]
+            if ref.startswith("refs/remotes/origin/"):
+                return _FakeCompletedProcess(args=cmd, returncode=1)
+            return _FakeCompletedProcess(args=cmd, returncode=0)
         return _FakeCompletedProcess(args=cmd)
 
     monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
