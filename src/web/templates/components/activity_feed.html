@@ -1,0 +1,37 @@
+{% set state_styles = {
+    'IDLE':      {'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30'},
+    'PREFLIGHT': {'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30'},
+    'CODING':    {'badge': 'bg-accent/10 text-accent border-accent/30'},
+    'WATCH':     {'badge': 'bg-warn/10 text-warn border-warn/30'},
+    'FIX':       {'badge': 'bg-warn/10 text-warn border-warn/30'},
+    'MERGE':     {'badge': 'bg-ok/10 text-ok border-ok/30'},
+    'HUNG':      {'badge': 'bg-hung/10 text-hung border-hung/30'},
+    'ERROR':     {'badge': 'bg-fail/10 text-fail border-fail/30'},
+} %}
+<section class="rounded-lg border border-white/5 bg-surface-2 p-5">
+    <div class="flex items-baseline justify-between mb-3">
+        <h3 class="text-sm font-semibold text-gray-300">Activity</h3>
+        <span class="font-mono text-xs text-gray-500">{{ feed|length }} events</span>
+    </div>
+    {% if feed %}
+    <ul class="max-h-96 overflow-y-auto divide-y divide-white/5 font-mono text-xs">
+        {% for entry in feed %}
+        {% set entry_style = state_styles.get(entry.state, state_styles['IDLE']) %}
+        <li class="flex items-center gap-2 py-2">
+            <span class="text-gray-500 shrink-0">{{ entry.time }}</span>
+            <a href="/repo/{{ entry.repo_name }}"
+               title="{{ entry.repo_name }}"
+               class="text-[10px] font-semibold px-1.5 py-0.5 rounded border {{ entry.repo_style }} shrink-0 hover:opacity-80">
+                {{ entry.repo_abbrev }}
+            </a>
+            <span class="text-[10px] font-medium px-1.5 py-0.5 rounded border {{ entry_style.badge }} shrink-0">
+                {{ entry.state }}
+            </span>
+            <span class="text-gray-300 truncate">{{ entry.event }}</span>
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p class="text-gray-600 italic text-sm">No activity yet</p>
+    {% endif %}
+</section>

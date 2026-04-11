@@ -1,0 +1,51 @@
+{% set state_styles = {
+    'IDLE':      {'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30'},
+    'PREFLIGHT': {'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30'},
+    'CODING':    {'badge': 'bg-accent/10 text-accent border-accent/30'},
+    'WATCH':     {'badge': 'bg-warn/10 text-warn border-warn/30'},
+    'FIX':       {'badge': 'bg-warn/10 text-warn border-warn/30'},
+    'MERGE':     {'badge': 'bg-ok/10 text-ok border-ok/30'},
+    'HUNG':      {'badge': 'bg-hung/10 text-hung border-hung/30'},
+    'ERROR':     {'badge': 'bg-fail/10 text-fail border-fail/30'},
+} %}
+{% set filters = [
+    ('all',    'All'),
+    ('errors', 'Errors'),
+    ('state',  'State changes'),
+] %}
+<section id="repo-event-log" class="rounded-lg border border-white/5 bg-surface-2 p-5">
+    <div class="flex flex-wrap items-center gap-3 mb-3">
+        <h3 class="text-sm font-semibold text-gray-300">Event log</h3>
+        <span class="font-mono text-xs text-gray-500">{{ events|length }} events</span>
+        <div class="ml-auto flex items-center gap-1">
+            {% for slug, label in filters %}
+            {% set active = (slug == event_filter) %}
+            <button type="button"
+                    hx-get="/partials/repo/{{ repo.name }}/events?filter={{ slug }}"
+                    hx-target="#repo-event-log"
+                    hx-swap="outerHTML"
+                    class="text-[10px] font-medium px-2 py-1 rounded border transition-colors
+                           {% if active %}bg-accent/10 text-accent border-accent/30{% else %}bg-surface-3 text-gray-400 border-white/5 hover:text-gray-200 hover:border-white/10{% endif %}">
+                {{ label }}
+            </button>
+            {% endfor %}
+        </div>
+    </div>
+    {% if events %}
+    <ul class="max-h-96 overflow-y-auto divide-y divide-white/5 font-mono text-xs">
+        {% for entry in events|reverse %}
+        {% set entry_state = entry.get('state', 'IDLE') %}
+        {% set entry_style = state_styles.get(entry_state, state_styles['IDLE']) %}
+        <li class="flex items-center gap-3 py-2">
+            <span class="text-gray-500 shrink-0">{{ entry.get('time', '--:--:--') }}</span>
+            <span class="text-[10px] font-medium px-1.5 py-0.5 rounded border {{ entry_style.badge }} shrink-0">
+                {{ entry_state }}
+            </span>
+            <span class="text-gray-300 truncate">{{ entry.get('event', '') }}</span>
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p class="text-gray-600 italic text-sm">No events yet</p>
+    {% endif %}
+</section>
