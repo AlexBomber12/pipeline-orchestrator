@@ -63,6 +63,92 @@ def repo_owner_from_url(url: str) -> str:
 _FETCH_MISSING_REF_NEEDLE = "couldn't find remote ref"
 
 
+def _base_branch_ahead_of_origin(repo_path: str, branch: str) -> bool:
+    """Return ``True`` if ``refs/heads/{branch}`` has commits not yet
+    on ``refs/remotes/origin/{branch}``.
+
+    Used after a successful fetch to detect the "stranded scaffolding
+    commit across restart" state: the base branch has a local commit
+    that never reached the remote. Unlike
+    ``scaffolder._local_has_unpushed_commits``, this probe compares
+    the BASE branch refs directly rather than whatever branch
+    ``HEAD`` currently points at, so a legitimate mid-CODING restart
+    (HEAD on a feature branch, base branch clean and in sync) does
+    not get reset.
+
+    Any probe failure returns ``True`` to err on the side of running
+    the scaffold retry rather than silently accepting the fs-seeded
+    ``_scaffolded=True``: scaffold_repo is idempotent and the retry
+    will either push the stranded commit, no-op on a synced repo, or
+    defer on a dirty tree. Returning False on a probe error would
+    let the runner declare scaffolding done while the remote is
+    actually behind, and ``recover_state`` would keep reading stale
+    data from ``origin/{branch}:tasks/QUEUE.md``.
+    """
+    local = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        capture_output=True,
+        text=True,
+        cwd=repo_path,
+        check=False,
+        timeout=30,
+    )
+    if local.returncode != 0:
+        # No local base branch yet. The ordinary scaffold retry path
+        # will create it (either via checkout or symbolic-ref), so
+        # treat this as "needs retry" too.
+        return True
+    remote = subprocess.run(
+        [
+            "git",
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"refs/remotes/origin/{branch}",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=repo_path,
+        check=False,
+        timeout=30,
+    )
+    if remote.returncode != 0:
+        # Remote ref missing after a "successful" fetch is weird —
+        # the missing-ref tolerance upstream in ensure_repo_cloned
+        # usually catches this before we get here. Err on the side
+        # of retry.
+        return True
+    ahead = subprocess.run(
+        [
+            "git",
+            "rev-list",
+            "--count",
+            f"refs/remotes/origin/{branch}..refs/heads/{branch}",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=repo_path,
+        check=False,
+        timeout=30,
+    )
+    if ahead.returncode != 0:
+        logger.warning(
+            "_base_branch_ahead_of_origin: rev-list probe failed "
+            "(rc=%s); treating as ahead to force scaffold retry",
+            ahead.returncode,
+        )
+        return True
+    try:
+        return int(ahead.stdout.strip()) > 0
+    except ValueError:
+        logger.warning(
+            "_base_branch_ahead_of_origin: rev-list produced "
+            "non-integer output %r; treating as ahead",
+            ahead.stdout,
+        )
+        return True
+
+
 def _working_tree_dirty(repo_path: str) -> bool:
     """Return ``True`` if ``git status --porcelain`` reports any change.
 
@@ -267,6 +353,28 @@ class PipelineRunner:
                 # the files are on disk) so the retry block below
                 # actually runs.
                 self._scaffolded = False
+            elif self._scaffolded and _base_branch_ahead_of_origin(
+                self.repo_path, self.repo_config.branch
+            ):
+                # Fetch succeeded and ``origin/{branch}`` does exist
+                # upstream, but the local base branch has commits not
+                # yet on origin. This is the stranded-scaffold-across-
+                # restart case where origin/{branch}``already existed
+                # (so the missing-ref path above did not trigger) but
+                # a prior cycle's scaffolding push failed while the
+                # remote branch was otherwise present. Without this
+                # reset, the fs-seeded ``_scaffolded=True`` at
+                # ``__init__`` would skip the retry block forever and
+                # ``recover_state`` would keep reading stale data from
+                # ``origin/{branch}:tasks/QUEUE.md``. scaffold_repo is
+                # idempotent at the remote level so a spurious reset
+                # degrades to a fast no-op push on the retry.
+                self._scaffolded = False
+                self.log_event(
+                    f"local {self.repo_config.branch} ahead of "
+                    "origin, re-running scaffold to re-push stranded "
+                    "commits"
+                )
 
         # Scaffold on every cycle until ``_scaffolded`` is set.
         # scaffold_repo is idempotent at both the local and remote

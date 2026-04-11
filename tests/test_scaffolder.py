@@ -480,6 +480,59 @@ def test_scaffold_repo_reraises_checkout_failure_when_head_is_born(
         scaffolder.scaffold_repo(str(repo), "missing")
 
 
+def test_scaffold_repo_pushes_when_rev_list_probe_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If ``git rev-list --count`` returns non-zero or non-integer
+    output, scaffolder must err on the side of pushing rather than
+    silently declaring success. Returning "synced" on a probe error
+    would let a just-committed scaffolding (or a stranded commit
+    from a prior cycle) stay unpublished while ``scaffold_repo``
+    reports success and the runner sets ``_scaffolded = True``.
+    Pushing an already-synced branch is a cheap "Everything up-to-
+    date" no-op, so erring on the side of True is safe.
+    """
+    repo = _init_empty_repo(tmp_path)
+    # Fully provision locally so ``to_stage`` is empty and scaffold
+    # goes through the retry/no-commit branch that calls
+    # ``_local_has_unpushed_commits``.
+    (repo / "AGENTS.md").write_text("# AGENTS\n")
+    (repo / "tasks").mkdir()
+    (repo / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "ci.sh").write_text("#!/usr/bin/env bash\n")
+    (repo / "scripts" / "ci.sh").chmod(0o755)
+    (repo / "scripts" / "make-review-artifacts.sh").write_text(
+        "#!/usr/bin/env bash\n"
+    )
+    (repo / "scripts" / "make-review-artifacts.sh").chmod(0o755)
+    (repo / "artifacts").mkdir()
+    (repo / ".gitignore").write_text("artifacts/\n")
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            # origin/main exists so the rev-list probe actually runs.
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        if cmd[:2] == ["git", "rev-list"]:
+            # Probe failure — e.g. corrupted refs, concurrent gc,
+            # or a transient git bug.
+            return _FakeCompletedProcess(
+                args=cmd, returncode=128, stdout=""
+            )
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+
+    scaffolder.scaffold_repo(str(repo), "main")
+
+    # scaffold_repo must have pushed despite the probe failure.
+    push_cmds = [cmd for cmd in calls if cmd[:2] == ["git", "push"]]
+    assert push_cmds == [["git", "push", "origin", "main"]]
+
+
 def test_scaffold_repo_retries_stranded_push_with_no_new_commit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

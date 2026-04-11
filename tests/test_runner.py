@@ -75,6 +75,17 @@ def _patch_subprocess(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         calls.append(cmd)
+        # ``git rev-list --count`` must return an integer or the
+        # scaffold/runner sync probes conservatively interpret empty
+        # output as "unverifiable, force scaffold retry". Default to
+        # "0\n" (synced) so tests that don't exercise the ahead /
+        # stranded path stay green; tests that DO need to simulate
+        # an ahead state override subprocess.run directly with a
+        # hand-rolled fake_run.
+        if cmd[:2] == ["git", "rev-list"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout="0\n", returncode=0
+            )
         return _FakeCompletedProcess(
             args=cmd, stdout=stdout, returncode=returncode
         )
@@ -873,7 +884,18 @@ def test_ensure_repo_cloned_skips_scaffold_when_repo_already_looks_scaffolded(
     # The helper should recognise this directory as already scaffolded.
     assert runner_module._repo_looks_scaffolded(str(existing)) is True
 
-    _patch_subprocess(monkeypatch)
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        # Both local refs/heads/main and refs/remotes/origin/main
+        # exist, and rev-list --count reports 0 commits ahead — the
+        # repo is fully in sync, so _base_branch_ahead_of_origin
+        # returns False and no scaffold retry is triggered.
+        if cmd[:2] == ["git", "rev-list"]:
+            return _FakeCompletedProcess(
+                args=cmd, returncode=0, stdout="0\n"
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
 
     scaffold_calls: list[str] = []
 
@@ -1006,6 +1028,119 @@ def test_repo_looks_scaffolded_rejects_partial_provisioning(
         "node_modules/\n*.pyc\nartifacts/\n"
     )
     assert runner_module._repo_looks_scaffolded(str(base)) is True
+
+
+def test_ensure_repo_cloned_resets_scaffolded_when_base_branch_ahead(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """Daemon restart on a repo whose local base branch has commits
+    not yet on ``origin/{branch}``: the prior cycle committed
+    scaffolding locally but the push failed while ``origin/{branch}``
+    still existed (so the missing-ref tolerance did NOT trigger).
+    The fs check at ``__init__`` seeds ``_scaffolded=True`` but the
+    base-branch-ahead probe must reset it so scaffold_repo runs and
+    re-pushes the stranded commit. Without this, ``recover_state``
+    keeps reading stale data from ``origin/{branch}:tasks/QUEUE.md``
+    with no retry path.
+    """
+    existing = tmp_path / "clone-target"
+    existing.mkdir()
+    _populate_fully_scaffolded_repo(existing)
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            # Both refs/heads/main and refs/remotes/origin/main exist.
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        if cmd[:2] == ["git", "rev-list"]:
+            # Local base is 1 commit ahead of origin — the stranded
+            # scaffolding commit.
+            return _FakeCompletedProcess(
+                args=cmd, returncode=0, stdout="1\n"
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    scaffold_calls: list[str] = []
+
+    def fake_scaffold(path: str, branch: str) -> list[str]:
+        scaffold_calls.append(branch)
+        return []
+
+    monkeypatch.setattr(
+        runner_module.scaffolder, "scaffold_repo", fake_scaffold
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(existing)
+    runner._scaffolded = runner_module._repo_looks_scaffolded(
+        str(existing)
+    )
+    assert runner._scaffolded is True
+
+    asyncio.run(runner.ensure_repo_cloned())
+
+    # Despite the fs check seeding True, the base-branch-ahead probe
+    # reset the gate and the retry block ran scaffold_repo.
+    assert scaffold_calls == ["main"]
+    assert runner._scaffolded is True  # set back to True after retry
+    # A breadcrumb records why the retry happened.
+    assert any(
+        "ahead of origin" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_ensure_repo_cloned_preserves_scaffolded_when_base_branch_synced(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """Daemon restart on a fully-synced, fully-scaffolded repo must
+    NOT reset ``_scaffolded`` — doing so would re-run scaffold_repo
+    on every normal restart and defeat the round-5 P2 fix that
+    protected the crash-recovery path. The base-branch-ahead probe
+    should report False (synced), and the retry block should be
+    skipped.
+    """
+    existing = tmp_path / "clone-target"
+    existing.mkdir()
+    _populate_fully_scaffolded_repo(existing)
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        if cmd[:2] == ["git", "rev-list"]:
+            # 0 commits ahead — fully synced with origin.
+            return _FakeCompletedProcess(
+                args=cmd, returncode=0, stdout="0\n"
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    scaffold_calls: list[str] = []
+
+    def fake_scaffold(path: str, branch: str) -> list[str]:
+        scaffold_calls.append(branch)
+        return []
+
+    monkeypatch.setattr(
+        runner_module.scaffolder, "scaffold_repo", fake_scaffold
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(existing)
+    runner._scaffolded = runner_module._repo_looks_scaffolded(
+        str(existing)
+    )
+    assert runner._scaffolded is True
+
+    asyncio.run(runner.ensure_repo_cloned())
+
+    # scaffold_repo not called, gate preserved.
+    assert scaffold_calls == []
+    assert runner._scaffolded is True
 
 
 def test_ensure_repo_cloned_retries_scaffold_on_missing_ref_after_restart(

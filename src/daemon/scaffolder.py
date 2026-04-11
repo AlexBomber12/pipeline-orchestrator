@@ -84,9 +84,10 @@ def _head_is_unborn(repo_path: str) -> bool:
 
 
 def _local_has_unpushed_commits(repo_path: str, branch: str) -> bool:
-    """Return ``True`` if the local branch is ahead of ``origin/{branch}``.
+    """Return ``True`` if the local branch is ahead of ``origin/{branch}``,
+    OR if we cannot prove otherwise.
 
-    Two situations both count as "ahead":
+    Two situations definitively count as "ahead":
 
     - ``refs/remotes/origin/{branch}`` does not exist at all: the
       initial scaffolding push never created the branch upstream.
@@ -99,7 +100,15 @@ def _local_has_unpushed_commits(repo_path: str, branch: str) -> bool:
       commit from a prior cycle never reached the remote.
 
     Both probes use ``check=False`` so missing refs and transient git
-    failures don't raise out of the idempotency check itself.
+    failures don't raise out of the idempotency check itself. A
+    non-zero exit from ``rev-list`` or a non-integer count is
+    interpreted as "cannot verify sync, push to be safe": returning
+    False there would let ``scaffold_repo`` declare success on a
+    just-committed scaffolding commit that is actually stranded
+    locally, leaving the runner to set ``_scaffolded = True`` on a
+    state that ``recover_state`` then reads as missing upstream.
+    Pushing an already-synced branch is a cheap "Everything up-to-
+    date" no-op, so erring on the side of True is safe.
     """
     remote_ref = f"refs/remotes/origin/{branch}"
     exists = subprocess.run(
@@ -122,11 +131,21 @@ def _local_has_unpushed_commits(repo_path: str, branch: str) -> bool:
         timeout=_LOCAL_GIT_TIMEOUT,
     )
     if ahead.returncode != 0:
-        return False
+        logger.warning(
+            "scaffold_repo: rev-list probe failed (rc=%s); treating as "
+            "unpushed to be safe",
+            ahead.returncode,
+        )
+        return True
     try:
         return int(ahead.stdout.strip()) > 0
     except ValueError:
-        return False
+        logger.warning(
+            "scaffold_repo: rev-list produced non-integer output %r; "
+            "treating as unpushed to be safe",
+            ahead.stdout,
+        )
+        return True
 
 
 def scaffold_repo(repo_path: str, branch: str) -> list[str]:
@@ -236,13 +255,14 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
     # particular is an empty directory covered by the ``.gitignore``
     # entry, so there is nothing for git to track there.
     to_stage = [path for path in created if not path.endswith("/")]
+    committed_new_files = False
 
     if to_stage:
-        # New scaffolding to commit. Running ``git add``/``commit`` on
-        # an empty ``to_stage`` is skipped because commit would fail
-        # with "nothing to commit" — covered by the else branch
-        # (``_local_has_unpushed_commits``) which still runs and may
-        # push a stranded commit.
+        # New scaffolding to commit. An empty ``to_stage`` skips this
+        # block because ``git commit`` would fail with "nothing to
+        # commit" — the no-stage path still runs
+        # ``_local_has_unpushed_commits`` below and may push a
+        # stranded commit.
         try:
             _run_git(repo_path, "add", *to_stage)
             _run_git(repo_path, "commit", "-m", _COMMIT_MESSAGE)
@@ -253,24 +273,24 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
         except subprocess.TimeoutExpired as exc:
             logger.warning("scaffold_repo git commit timed out: %s", exc.cmd)
             raise
+        committed_new_files = True
 
-    # Push whenever the local branch is ahead of ``origin/{branch}``.
-    # This single probe covers three distinct situations:
+    # Push whenever either:
     #
-    # - Happy path: we just committed new scaffolding and need to
-    #   publish it.
-    # - Retry path: a prior cycle committed scaffolding but the push
-    #   failed transiently (timeout, auth blip). The files are
-    #   already on disk and the commit is already in place so
-    #   ``created`` may be empty this time, but ``origin/{branch}``
-    #   is still missing the scaffolding commit. Re-push the stranded
-    #   commit so ``_parse_base_queue`` can read
-    #   ``origin/{branch}:tasks/QUEUE.md`` on the next cycle.
-    # - No-op path: the repo is fully provisioned locally and already
-    #   in sync with the remote — skip the push entirely, preserving
-    #   scaffold_repo's idempotent "do nothing on a clean repo"
-    #   promise.
-    if _local_has_unpushed_commits(repo_path, branch):
+    # - We just committed new scaffolding. We know for certain the
+    #   local branch is ahead, so skipping
+    #   ``_local_has_unpushed_commits`` avoids the risk that a probe
+    #   failure on a just-committed state would leave the commit
+    #   stranded while ``scaffold_repo`` reports success.
+    # - No new commit this cycle, but the unpushed-commits probe
+    #   decides local is ahead of ``origin/{branch}``: the retry
+    #   path for a stranded commit from a prior cycle whose push
+    #   failed transiently.
+    # - No-op path: fully provisioned locally, fully in sync with
+    #   the remote, nothing just committed — skip the push entirely,
+    #   preserving scaffold_repo's idempotent "do nothing on a clean
+    #   repo" promise.
+    if committed_new_files or _local_has_unpushed_commits(repo_path, branch):
         try:
             _run_git(
                 repo_path,
