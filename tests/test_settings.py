@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from src import config as src_config
 from src.config import load_config
 from src.web import app as web_app
 from src.web.app import app
@@ -326,6 +327,71 @@ def test_basename_collision_put_and_delete_target_correct_repo(
         assert len(loaded.repositories) == 1
         assert loaded.repositories[0].url == "https://github.com/owner-b/api"
         assert loaded.repositories[0].branch == "develop"
+
+
+def _raise_permission_error(*args: object, **kwargs: object) -> None:
+    raise PermissionError("Read-only file system: config.yml")
+
+
+def test_post_repo_handles_readonly_config(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``save_config`` failures (e.g. read-only mount) render the HTML
+    error partial with status 503 instead of bubbling up as a 500.
+
+    Regression for a P1 bug where the default ``docker-compose.yml`` used
+    to mount ``config.yml`` read-only into the ``web`` service, so every
+    settings mutation raised ``PermissionError`` and crashed the handler.
+    """
+    monkeypatch.setattr(src_config, "save_config", _raise_permission_error)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/settings/repos",
+            data={"url": "https://github.com/example/new-repo"},
+        )
+
+    assert response.status_code == 503
+    assert "text/html" in response.headers["content-type"]
+    body = response.text
+    assert 'id="settings-error"' in body
+    assert "Failed to write config.yml" in body
+
+
+def test_delete_repo_handles_readonly_config(
+    one_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(src_config, "save_config", _raise_permission_error)
+
+    with TestClient(app) as client:
+        response = client.delete(
+            "/settings/repos",
+            params={"url": "https://github.com/example/alpha.git"},
+        )
+
+    assert response.status_code == 503
+    assert "Failed to write config.yml" in response.text
+    # Config untouched.
+    cfg = load_config(str(one_repo_config))
+    assert len(cfg.repositories) == 1
+
+
+def test_put_repo_handles_readonly_config(
+    one_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(src_config, "save_config", _raise_permission_error)
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/repos",
+            params={"url": "https://github.com/example/alpha.git"},
+            data={"branch": "develop"},
+        )
+
+    assert response.status_code == 503
+    assert "Failed to write config.yml" in response.text
+    cfg = load_config(str(one_repo_config))
+    assert cfg.repositories[0].branch == "main"
 
 
 def test_post_repo_error_includes_error_message(one_repo_config: Path) -> None:

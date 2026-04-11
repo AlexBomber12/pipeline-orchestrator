@@ -233,6 +233,25 @@ async def partial_settings_repo_list(request: Request) -> HTMLResponse:
     return _render_settings_repo_list(request)
 
 
+def _render_config_write_error(
+    request: Request, exc: OSError
+) -> HTMLResponse:
+    """Render ``settings_error.html`` for a failed ``save_config`` write.
+
+    In the default ``docker-compose.yml`` the ``web`` service gets
+    ``config.yml`` bind-mounted read-write, but operators still run into
+    ``PermissionError`` / ``OSError`` in hardened deployments (file owned by
+    another uid, host filesystem mounted read-only, disk full, etc.). Catch
+    those so a failed write renders the HTML error partial with status 503
+    instead of FastAPI's default JSON 500.
+    """
+    return _render_settings_error(
+        request,
+        f"Failed to write config.yml: {exc}",
+        503,
+    )
+
+
 @app.post("/settings/repos", response_class=HTMLResponse)
 async def post_settings_repo(
     request: Request,
@@ -249,6 +268,8 @@ async def post_settings_repo(
         )
     except ValueError as exc:
         return _render_settings_error(request, str(exc), 422)
+    except OSError as exc:
+        return _render_config_write_error(request, exc)
     return _render_settings_repo_list(request)
 
 
@@ -266,6 +287,8 @@ async def delete_settings_repo(
         remove_repository(url, path=CONFIG_PATH)
     except ValueError as exc:
         return _render_settings_error(request, str(exc), 404)
+    except OSError as exc:
+        return _render_config_write_error(request, exc)
     return _render_settings_repo_list(request)
 
 
@@ -333,4 +356,6 @@ async def put_settings_repo(
         message = str(exc)
         status = 404 if message.startswith("Repository not found") else 422
         return _render_settings_error(request, message, status)
+    except OSError as exc:
+        return _render_config_write_error(request, exc)
     return _render_settings_repo_list(request)
