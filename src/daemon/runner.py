@@ -120,9 +120,13 @@ class PipelineRunner:
             # adds any missing pipeline orchestrator files (AGENTS.md,
             # tasks/QUEUE.md, scripts/*, .gitignore) and pushes a commit back
             # upstream so the repo satisfies the runbook before the daemon
-            # starts picking tasks from it.
+            # starts picking tasks from it. Pass the configured base branch
+            # so that scaffolding lands on origin/{branch}, not on whatever
+            # default branch git clone happened to check out.
             try:
-                actions = scaffolder.scaffold_repo(self.repo_path)
+                actions = scaffolder.scaffold_repo(
+                    self.repo_path, self.repo_config.branch
+                )
             except Exception as exc:
                 self.log_event(f"scaffold_repo failed: {exc}")
             else:

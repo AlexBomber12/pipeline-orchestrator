@@ -43,20 +43,31 @@ def _run_git(repo_path: str, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _current_branch(repo_path: str) -> str:
-    """Return the current branch name for ``repo_path``."""
-    result = _run_git(repo_path, "rev-parse", "--abbrev-ref", "HEAD")
-    return result.stdout.strip()
-
-
-def scaffold_repo(repo_path: str) -> list[str]:
+def scaffold_repo(repo_path: str, branch: str) -> list[str]:
     """Create any missing pipeline orchestrator files in ``repo_path``.
 
-    Returns the list of relative paths created or edited. If the list is
-    non-empty, the new state is staged, committed, and pushed to the
-    current branch. Returns an empty list (and performs no git writes)
-    when nothing needed to change, keeping repeated calls idempotent.
+    ``branch`` is the configured base branch for the repository (from
+    ``repo_config.branch``) — scaffolding is checked out, committed, and
+    pushed against it rather than whatever branch ``git clone`` happened
+    to land on. A fresh clone leaves ``HEAD`` on the remote's default
+    branch, which is not necessarily the configured base branch; without
+    an explicit checkout the scaffolding commit can end up on the wrong
+    branch, leaving ``origin/{branch}`` without ``tasks/QUEUE.md`` and
+    later recovery/preflight logic reading stale state.
+
+    Returns the list of relative paths created or edited. If any of
+    those entries are trackable by git (i.e. not just empty
+    directories), the new state is staged, committed, and pushed to
+    ``branch``. Returns an empty list (and performs no git writes) when
+    nothing needed to change, keeping repeated calls idempotent.
     """
+    # Check out the configured base branch before inspecting the working
+    # tree. On a fresh clone the auto-created local branch may differ
+    # from ``branch``; passing the branch name to ``git checkout``
+    # creates a local tracking branch if one does not yet exist. If the
+    # tree already sits on ``branch`` this is a cheap no-op.
+    _run_git(repo_path, "checkout", branch)
+
     repo = Path(repo_path)
     created: list[str] = []
 
@@ -121,10 +132,18 @@ def scaffold_repo(repo_path: str) -> list[str]:
     # particular is an empty directory covered by the ``.gitignore``
     # entry, so there is nothing for git to track there.
     to_stage = [path for path in created if not path.endswith("/")]
+    if not to_stage:
+        # Only untrackable entries (e.g. a lone ``artifacts/`` directory)
+        # were created. Running ``git add``/``commit`` here would fail
+        # with "nothing to commit", surfacing as a scaffolding error
+        # even though nothing was actually wrong — the filesystem now
+        # matches the runbook and the next cycle sees a clean no-op.
+        logger.info("scaffold_repo created (no git writes): %s", ", ".join(created))
+        return created
+
     try:
         _run_git(repo_path, "add", *to_stage)
         _run_git(repo_path, "commit", "-m", _COMMIT_MESSAGE)
-        branch = _current_branch(repo_path)
         _run_git(repo_path, "push", "origin", branch)
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout or "").strip()

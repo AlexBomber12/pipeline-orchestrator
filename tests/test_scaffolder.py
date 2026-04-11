@@ -15,7 +15,7 @@ class _FakeCompletedProcess:
     def __init__(
         self,
         args: list[str] | None = None,
-        stdout: str = "main\n",
+        stdout: str = "",
         stderr: str = "",
         returncode: int = 0,
     ) -> None:
@@ -25,18 +25,13 @@ class _FakeCompletedProcess:
         self.returncode = returncode
 
 
-def _patch_git(
-    monkeypatch: pytest.MonkeyPatch, branch: str = "main"
-) -> list[list[str]]:
+def _patch_git(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
     """Capture git subprocess calls issued by scaffolder."""
     calls: list[list[str]] = []
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         calls.append(cmd)
-        stdout = ""
-        if cmd[:3] == ["git", "rev-parse", "--abbrev-ref"]:
-            stdout = f"{branch}\n"
-        return _FakeCompletedProcess(args=cmd, stdout=stdout)
+        return _FakeCompletedProcess(args=cmd)
 
     monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
     return calls
@@ -55,7 +50,7 @@ def test_scaffold_repo_creates_all_files_when_empty(
     repo = _init_empty_repo(tmp_path)
     calls = _patch_git(monkeypatch)
 
-    actions = scaffolder.scaffold_repo(str(repo))
+    actions = scaffolder.scaffold_repo(str(repo), "main")
 
     # All baseline files must be on disk after scaffolding.
     assert (repo / "AGENTS.md").exists()
@@ -83,6 +78,10 @@ def test_scaffold_repo_creates_all_files_when_empty(
     ):
         assert path in actions
 
+    # Checkout must be the first git call so the working tree reflects
+    # the configured base branch before any file is inspected or written.
+    assert calls[0] == ["git", "checkout", "main"]
+
     # git add must stage exactly the files we created, not the directory
     # entries that appear in the action log.
     add_cmds = [cmd for cmd in calls if cmd[:2] == ["git", "add"]]
@@ -104,6 +103,36 @@ def test_scaffold_repo_creates_all_files_when_empty(
     assert push_cmd == ["git", "push", "origin", "main"]
 
 
+def test_scaffold_repo_uses_configured_base_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scaffolding must check out and push to the configured base
+    branch, not whatever branch ``git clone`` left ``HEAD`` on.
+
+    On a fresh clone of a repo whose default branch differs from
+    ``repo_config.branch`` (e.g. legacy ``master`` vs. configured
+    ``develop``), pushing to the wrong branch would leave
+    ``origin/{configured_branch}`` without ``tasks/QUEUE.md`` and break
+    recovery/preflight logic on the next cycle.
+    """
+    repo = _init_empty_repo(tmp_path)
+    calls = _patch_git(monkeypatch)
+
+    scaffolder.scaffold_repo(str(repo), "develop")
+
+    # The first git call must be a checkout of the configured branch so
+    # nothing runs against whatever branch the clone landed on.
+    assert calls[0] == ["git", "checkout", "develop"]
+    # Push must target the same configured branch.
+    push_cmd = next(cmd for cmd in calls if cmd[:2] == ["git", "push"])
+    assert push_cmd == ["git", "push", "origin", "develop"]
+    # Branch discovery via rev-parse is gone: we trust the caller's
+    # branch argument and never consult HEAD.
+    assert not any(
+        cmd[:3] == ["git", "rev-parse", "--abbrev-ref"] for cmd in calls
+    )
+
+
 def test_scaffold_repo_preserves_existing_agents(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -112,7 +141,7 @@ def test_scaffold_repo_preserves_existing_agents(
     (repo / "AGENTS.md").write_text(existing)
     _patch_git(monkeypatch)
 
-    actions = scaffolder.scaffold_repo(str(repo))
+    actions = scaffolder.scaffold_repo(str(repo), "main")
 
     assert (repo / "AGENTS.md").read_text() == existing
     assert "AGENTS.md" not in actions
@@ -127,7 +156,7 @@ def test_scaffold_repo_accepts_claude_md_as_agents(
     (repo / "CLAUDE.md").write_text("# Project rules\n")
     _patch_git(monkeypatch)
 
-    actions = scaffolder.scaffold_repo(str(repo))
+    actions = scaffolder.scaffold_repo(str(repo), "main")
 
     assert not (repo / "AGENTS.md").exists()
     assert "AGENTS.md" not in actions
@@ -142,7 +171,7 @@ def test_scaffold_repo_preserves_existing_queue(
     (repo / "tasks" / "QUEUE.md").write_text(existing)
     _patch_git(monkeypatch)
 
-    actions = scaffolder.scaffold_repo(str(repo))
+    actions = scaffolder.scaffold_repo(str(repo), "main")
 
     assert (repo / "tasks" / "QUEUE.md").read_text() == existing
     assert "tasks/QUEUE.md" not in actions
@@ -157,7 +186,7 @@ def test_scaffold_repo_preserves_existing_ci_sh(
     (repo / "scripts" / "ci.sh").write_text(existing)
     _patch_git(monkeypatch)
 
-    actions = scaffolder.scaffold_repo(str(repo))
+    actions = scaffolder.scaffold_repo(str(repo), "main")
 
     assert (repo / "scripts" / "ci.sh").read_text() == existing
     assert "scripts/ci.sh" not in actions
@@ -167,7 +196,8 @@ def test_scaffold_repo_skips_commit_when_fully_provisioned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A fully-provisioned repo yields an empty action list and performs
-    no git writes — scaffolding is idempotent across repeated calls."""
+    only the initial checkout — scaffolding is idempotent across
+    repeated calls, with no add/commit/push."""
     repo = _init_empty_repo(tmp_path)
     (repo / "AGENTS.md").write_text("# AGENTS\n")
     (repo / "tasks").mkdir()
@@ -183,11 +213,46 @@ def test_scaffold_repo_skips_commit_when_fully_provisioned(
     (repo / ".gitignore").write_text("artifacts/\n")
     calls = _patch_git(monkeypatch)
 
-    actions = scaffolder.scaffold_repo(str(repo))
+    actions = scaffolder.scaffold_repo(str(repo), "main")
 
     assert actions == []
-    # No git writes at all when nothing changed.
-    assert calls == []
+    # Only the initial ``git checkout`` runs. No add/commit/push.
+    assert calls == [["git", "checkout", "main"]]
+
+
+def test_scaffold_repo_skips_git_when_only_artifacts_dir_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the only missing entry is the untrackable ``artifacts/``
+    directory, scaffolding must create it locally but skip add/commit/
+    push — git would otherwise fail with "nothing to commit" and
+    surface as a scaffolding error for a case that needed no upstream
+    change at all.
+    """
+    repo = _init_empty_repo(tmp_path)
+    (repo / "AGENTS.md").write_text("# AGENTS\n")
+    (repo / "tasks").mkdir()
+    (repo / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "ci.sh").write_text("#!/usr/bin/env bash\n")
+    (repo / "scripts" / "ci.sh").chmod(0o755)
+    (repo / "scripts" / "make-review-artifacts.sh").write_text(
+        "#!/usr/bin/env bash\n"
+    )
+    (repo / "scripts" / "make-review-artifacts.sh").chmod(0o755)
+    (repo / ".gitignore").write_text("artifacts/\n")
+    # Note: no artifacts/ directory — this is the only gap.
+    calls = _patch_git(monkeypatch)
+
+    actions = scaffolder.scaffold_repo(str(repo), "main")
+
+    # The empty directory was created locally and is reported for
+    # logging.
+    assert (repo / "artifacts").is_dir()
+    assert actions == ["artifacts/"]
+    # But there's nothing trackable to commit, so git is never invoked
+    # beyond the initial checkout.
+    assert calls == [["git", "checkout", "main"]]
 
 
 def test_scaffold_repo_appends_artifacts_without_duplicating(
@@ -198,7 +263,7 @@ def test_scaffold_repo_appends_artifacts_without_duplicating(
     (repo / ".gitignore").write_text(existing)
     _patch_git(monkeypatch)
 
-    scaffolder.scaffold_repo(str(repo))
+    scaffolder.scaffold_repo(str(repo), "main")
 
     lines = (repo / ".gitignore").read_text().splitlines()
     assert lines.count("artifacts/") == 1
@@ -207,7 +272,7 @@ def test_scaffold_repo_appends_artifacts_without_duplicating(
 
     # Running it again must not add a second entry.
     _patch_git(monkeypatch)
-    scaffolder.scaffold_repo(str(repo))
+    scaffolder.scaffold_repo(str(repo), "main")
     lines_after = (repo / ".gitignore").read_text().splitlines()
     assert lines_after.count("artifacts/") == 1
 
@@ -220,10 +285,9 @@ def test_scaffold_repo_propagates_git_push_failure(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         if cmd[:2] == ["git", "push"]:
             raise subprocess.CalledProcessError(1, cmd, stderr="push denied")
-        stdout = "main\n" if cmd[:3] == ["git", "rev-parse", "--abbrev-ref"] else ""
-        return _FakeCompletedProcess(args=cmd, stdout=stdout)
+        return _FakeCompletedProcess(args=cmd)
 
     monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
 
     with pytest.raises(subprocess.CalledProcessError):
-        scaffolder.scaffold_repo(str(repo))
+        scaffolder.scaffold_repo(str(repo), "main")
