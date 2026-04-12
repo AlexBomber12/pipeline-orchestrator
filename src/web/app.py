@@ -1137,6 +1137,16 @@ async def upload_tasks(
             request, f"Repository '{name}' is not cloned", 422, repo_name=name
         )
 
+    redis_client = getattr(request.app.state, "redis", None)
+    repo_state = await get_repo_state(name, redis_client)
+    if repo_state.state != PipelineState.IDLE:
+        return _render_upload_error(
+            request,
+            f"Cannot upload while repo is {repo_state.state.value}. Wait until IDLE.",
+            422,
+            repo_name=name,
+        )
+
     if not files:
         return _render_upload_error(request, "No files uploaded", 422, repo_name=name)
 
@@ -1198,7 +1208,6 @@ async def upload_tasks(
         return _render_upload_error(request, f"Git operation failed: {exc}", 422, repo_name=name)
 
     # Return refreshed repo cards
-    redis_client = getattr(request.app.state, "redis", None)
     states = await get_all_repo_states(redis_client)
     return templates.TemplateResponse(
         request,
