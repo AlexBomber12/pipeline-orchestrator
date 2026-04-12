@@ -116,21 +116,36 @@ def get_pr_review_status(
     except Exception:
         review_comments = []
 
-    # Find the FIRST issue comment by PR author and check its reactions.
-    reaction_endpoint = None
-    for c in issue_comments:
+    # Find the most recent anchor comment (PR author's "@codex review" trigger).
+    # Only accept anchors written by the PR author to avoid false matches from
+    # other users quoting the trigger text.  Using the latest anchor (not the
+    # first author comment) prevents stale approvals from earlier review rounds.
+    anchor_endpoint = None
+    for c in reversed(issue_comments):
         author = (c.get("user") or {}).get("login", "")
-        if pr_author and author == pr_author:
+        if pr_author and author != pr_author:
+            continue
+        if "@codex review" in (c.get("body") or "").lower():
             cid = c.get("id")
             if cid is not None:
-                reaction_endpoint = f"repos/{repo}/issues/comments/{cid}/reactions"
+                anchor_endpoint = f"repos/{repo}/issues/comments/{cid}/reactions"
             break
+    if anchor_endpoint is None:
+        for c in reversed(review_comments):
+            author = (c.get("user") or {}).get("login", "")
+            if pr_author and author != pr_author:
+                continue
+            if "@codex review" in (c.get("body") or "").lower():
+                cid = c.get("id")
+                if cid is not None:
+                    anchor_endpoint = f"repos/{repo}/pulls/comments/{cid}/reactions"
+                break
 
-    # Check reactions on the first PR-author comment for approval signal.
+    # Check reactions on the anchor comment for approval signal.
     # Only count reactions from Codex accounts to avoid false positives.
-    if reaction_endpoint is not None:
+    if anchor_endpoint is not None:
         try:
-            reactions = _gh_api_paginated(reaction_endpoint)
+            reactions = _gh_api_paginated(anchor_endpoint)
             if reactions:
                 codex_contents = {
                     r.get("content")
