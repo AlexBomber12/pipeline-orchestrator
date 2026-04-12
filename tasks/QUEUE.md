@@ -120,7 +120,7 @@
 - Depends on: PR-019
 
 ## PR-021: Daemon startup hardening
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-021.md
 - Branch: pr-021-daemon-hardening
 - Depends on: PR-020
