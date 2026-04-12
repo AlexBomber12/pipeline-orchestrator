@@ -1103,14 +1103,18 @@ def _git_run(
 
 
 def _render_upload_error(
-    request: Request, message: str, status_code: int
+    request: Request, message: str, status_code: int, repo_name: str = ""
 ) -> HTMLResponse:
-    return templates.TemplateResponse(
+    response = templates.TemplateResponse(
         request,
         "components/upload_error.html",
         {"message": message},
         status_code=status_code,
     )
+    if repo_name:
+        response.headers["HX-Retarget"] = f"#upload-error-{repo_name}"
+        response.headers["HX-Reswap"] = "innerHTML"
+    return response
 
 
 @app.post("/repos/{name}/upload-tasks", response_class=HTMLResponse)
@@ -1130,11 +1134,11 @@ async def upload_tasks(
     repo_path = f"{REPOS_DIR}/{name}"
     if not Path(repo_path).is_dir():
         return _render_upload_error(
-            request, f"Repository '{name}' is not cloned", 422
+            request, f"Repository '{name}' is not cloned", 422, repo_name=name
         )
 
     if not files:
-        return _render_upload_error(request, "No files uploaded", 422)
+        return _render_upload_error(request, "No files uploaded", 422, repo_name=name)
 
     # Validate file names and sizes
     has_queue = False
@@ -1147,12 +1151,13 @@ async def upload_tasks(
                 request,
                 f"Invalid file name: '{fname}'. Only QUEUE.md and PR-*.md allowed.",
                 422,
+                repo_name=name,
             )
         content = await f.read()
         total_size += len(content)
         if total_size > _UPLOAD_MAX_TOTAL_BYTES:
             return _render_upload_error(
-                request, "Total upload size exceeds 1 MB", 422
+                request, "Total upload size exceeds 1 MB", 422, repo_name=name
             )
         file_contents.append((fname, content))
         if fname == "QUEUE.md":
@@ -1160,7 +1165,7 @@ async def upload_tasks(
 
     if not has_queue:
         return _render_upload_error(
-            request, "QUEUE.md is required in the upload", 422
+            request, "QUEUE.md is required in the upload", 422, repo_name=name
         )
 
     # Determine branch from config
@@ -1181,7 +1186,7 @@ async def upload_tasks(
         for fname, content in file_contents:
             (tasks_dir / fname).write_bytes(content)
 
-        _git_run(repo_path, "add", "tasks/")
+        _git_run(repo_path, "add", *(f"tasks/{fname}" for fname, _ in file_contents))
         _git_run(
             repo_path,
             "commit",
@@ -1190,7 +1195,7 @@ async def upload_tasks(
         )
         _git_run(repo_path, "push", "origin", branch)
     except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
-        return _render_upload_error(request, f"Git operation failed: {exc}", 422)
+        return _render_upload_error(request, f"Git operation failed: {exc}", 422, repo_name=name)
 
     # Return refreshed repo cards
     redis_client = getattr(request.app.state, "redis", None)
