@@ -30,7 +30,6 @@ import redis.asyncio as aioredis
 
 from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
 from src.daemon.runner import PipelineRunner
-from src.models import PipelineState
 
 logging.basicConfig(
     level=logging.INFO,
@@ -196,8 +195,6 @@ async def main() -> None:
         for runner in list(runners.values()):
             if not runner.repo_config.active:
                 try:
-                    runner.state.active = False
-                    runner.state.state = PipelineState.IDLE
                     await runner.publish_state()
                 except Exception:
                     logger.error(

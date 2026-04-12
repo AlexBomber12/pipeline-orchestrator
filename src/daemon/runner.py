@@ -292,6 +292,7 @@ class PipelineRunner:
 
     async def publish_state(self) -> None:
         """Serialize ``self.state`` and write it to Redis."""
+        self.state.active = self.repo_config.active
         self.state.last_updated = datetime.now(timezone.utc)
         payload = self.state.model_dump_json()
         await self.redis.set(f"pipeline:{self.name}", payload)
