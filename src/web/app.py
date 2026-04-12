@@ -1135,7 +1135,7 @@ async def upload_tasks(
             break
 
     if not found:
-        return _render_upload_error(request, f"Repository '{name}' not found", 404)
+        return _render_upload_error(request, f"Repository '{name}' not found", 404, repo_name=name)
 
     repo_path = f"{REPOS_DIR}/{name}"
     if not Path(repo_path).is_dir():
@@ -1144,7 +1144,34 @@ async def upload_tasks(
         )
 
     redis_client = getattr(request.app.state, "redis", None)
-    repo_state = await get_repo_state(name, redis_client)
+    if redis_client is None:
+        return _render_upload_error(
+            request,
+            "Cannot verify repo state (Redis unavailable). Upload blocked.",
+            503,
+            repo_name=name,
+        )
+    try:
+        raw = await redis_client.get(f"pipeline:{name}")
+    except Exception:
+        return _render_upload_error(
+            request,
+            "Cannot verify repo state (Redis error). Upload blocked.",
+            503,
+            repo_name=name,
+        )
+    if raw:
+        try:
+            repo_state = RepoState.model_validate_json(raw)
+        except Exception:
+            return _render_upload_error(
+                request,
+                "Cannot verify repo state (corrupt data). Upload blocked.",
+                503,
+                repo_name=name,
+            )
+    else:
+        repo_state = RepoState(url="", name=name, state=PipelineState.IDLE)
     if repo_state.state != PipelineState.IDLE:
         return _render_upload_error(
             request,
