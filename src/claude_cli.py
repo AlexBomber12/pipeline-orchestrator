@@ -32,6 +32,7 @@ def run_claude(
             text=True,
             timeout=timeout,
             cwd=cwd,
+            stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
         logger.error("claude CLI timed out after %ss", timeout)
