@@ -31,7 +31,7 @@
     </p>
 </div>
 {% else %}
-<div class="grid gap-4 md:grid-cols-2">
+<div id="repo-grid" class="grid gap-4 md:grid-cols-2">
     {% for repo in repos %}
     {% set style = state_styles.get(repo.state.value, state_styles['IDLE']) %}
     {% set is_error = repo.state.value == 'ERROR' %}
@@ -49,6 +49,18 @@
                 {% if repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done %}
                 <span class="text-xs font-medium px-2 py-0.5 rounded border border-accent/30 text-accent">Start</span>
                 {% endif %}
+                <form hx-post="/repos/{{ repo.name }}/upload-tasks"
+                      hx-encoding="multipart/form-data"
+                      hx-target="#repo-grid"
+                      hx-swap="innerHTML">
+                    <input type="file" name="files" multiple accept=".md"
+                           onchange="this.form.requestSubmit()"
+                           class="hidden" id="upload-{{ repo.name }}">
+                    <label for="upload-{{ repo.name }}"
+                           class="text-xs font-medium px-2 py-0.5 rounded border border-white/10 text-gray-400 hover:text-accent hover:border-accent/30 transition-colors cursor-pointer">
+                        Upload tasks
+                    </label>
+                </form>
             </div>
         </div>
 

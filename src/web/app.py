@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 import redis.asyncio as aioredis
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
@@ -34,6 +34,7 @@ from src.utils import repo_name_from_url
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 CONFIG_PATH = "config.yml"
+REPOS_DIR = "/data/repos"
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
@@ -1069,3 +1070,133 @@ async def put_settings_repo(
     except OSError as exc:
         return _render_config_write_error(request, exc)
     return _render_settings_repo_list(request)
+
+
+# ---------------------------------------------------------------------------
+# Upload tasks
+# ---------------------------------------------------------------------------
+
+_UPLOAD_MAX_TOTAL_BYTES = 1_000_000  # 1 MB
+_ALLOWED_TASK_PATTERN = r"^(QUEUE\.md|PR-\d+\.md)$"
+
+import re as _re  # noqa: E402 — kept near usage
+
+
+def _git_run(
+    repo_path: str, *args: str, timeout: int = 30
+) -> subprocess.CompletedProcess[str]:
+    """Run a git command inside *repo_path*.
+
+    Raises ``RuntimeError`` with stderr on non-zero exit.
+    """
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"git {args[0]} failed")
+    return result
+
+
+def _render_upload_error(
+    request: Request, message: str, status_code: int
+) -> HTMLResponse:
+    return templates.TemplateResponse(
+        request,
+        "components/upload_error.html",
+        {"message": message},
+        status_code=status_code,
+    )
+
+
+@app.post("/repos/{name}/upload-tasks", response_class=HTMLResponse)
+async def upload_tasks(
+    request: Request, name: str, files: list[UploadFile] = []
+) -> HTMLResponse:
+    cfg = load_config(CONFIG_PATH)
+    found = False
+    for repo in cfg.repositories:
+        if repo_name_from_url(repo.url) == name:
+            found = True
+            break
+
+    if not found:
+        return _render_upload_error(request, f"Repository '{name}' not found", 404)
+
+    repo_path = f"{REPOS_DIR}/{name}"
+    if not Path(repo_path).is_dir():
+        return _render_upload_error(
+            request, f"Repository '{name}' is not cloned", 422
+        )
+
+    if not files:
+        return _render_upload_error(request, "No files uploaded", 422)
+
+    # Validate file names and sizes
+    has_queue = False
+    total_size = 0
+    file_contents: list[tuple[str, bytes]] = []
+    for f in files:
+        fname = f.filename or ""
+        if not _re.match(_ALLOWED_TASK_PATTERN, fname):
+            return _render_upload_error(
+                request,
+                f"Invalid file name: '{fname}'. Only QUEUE.md and PR-*.md allowed.",
+                422,
+            )
+        content = await f.read()
+        total_size += len(content)
+        if total_size > _UPLOAD_MAX_TOTAL_BYTES:
+            return _render_upload_error(
+                request, "Total upload size exceeds 1 MB", 422
+            )
+        file_contents.append((fname, content))
+        if fname == "QUEUE.md":
+            has_queue = True
+
+    if not has_queue:
+        return _render_upload_error(
+            request, "QUEUE.md is required in the upload", 422
+        )
+
+    # Determine branch from config
+    branch = "main"
+    for repo in cfg.repositories:
+        if repo_name_from_url(repo.url) == name:
+            branch = repo.branch
+            break
+
+    # Git operations and file writes
+    try:
+        _git_run(repo_path, "checkout", branch)
+        _git_run(repo_path, "pull", "origin", branch)
+
+        tasks_dir = Path(repo_path) / "tasks"
+        tasks_dir.mkdir(exist_ok=True)
+
+        for fname, content in file_contents:
+            (tasks_dir / fname).write_bytes(content)
+
+        _git_run(repo_path, "add", "tasks/")
+        _git_run(
+            repo_path,
+            "commit",
+            "-m",
+            "chore: upload sprint tasks via dashboard",
+        )
+        _git_run(repo_path, "push", "origin", branch)
+    except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+        return _render_upload_error(request, f"Git operation failed: {exc}", 422)
+
+    # Return refreshed repo cards
+    redis_client = getattr(request.app.state, "redis", None)
+    states = await get_all_repo_states(redis_client)
+    return templates.TemplateResponse(
+        request,
+        "components/repo_cards.html",
+        {"repos": states},
+    )

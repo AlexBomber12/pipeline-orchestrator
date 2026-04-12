@@ -48,6 +48,7 @@
 ./src/web/templates/components/settings_repo_list_response.html
 ./src/web/templates/components/stats_cards.html
 ./src/web/templates/components/status_bar.html
+./src/web/templates/components/upload_error.html
 ./src/web/templates/index.html
 ./src/web/templates/repo.html
 ./src/web/templates/settings.html
@@ -95,5 +96,6 @@
 ./tests/test_runner.py
 ./tests/test_scaffolder.py
 ./tests/test_settings.py
+./tests/test_upload.py
 ./tests/test_utils.py
 ./tests/test_web_app.py
