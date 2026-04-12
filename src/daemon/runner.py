@@ -1258,7 +1258,16 @@ return 0
         # against the PR's HEAD, so check out the PR branch before invoking
         # ``fix_review``; otherwise Claude would patch base and the auto-commit
         # safety net would refuse to push (or worse, push to the base branch).
-        if self.state.current_pr is not None:
+        #
+        # Cross-repo (fork) PRs are skipped: the head branch lives on the
+        # contributor's fork, not the daemon's ``origin``, so ``git checkout``
+        # would fail with a pathspec error and trap the runner in ERROR for
+        # every fork PR. The auto-commit block below already skips push for
+        # the same reason — keep the two guards aligned.
+        if (
+            self.state.current_pr is not None
+            and not self.state.current_pr.is_cross_repository
+        ):
             try:
                 subprocess.run(
                     ["git", "checkout", self.state.current_pr.branch],

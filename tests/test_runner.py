@@ -548,6 +548,11 @@ def test_handle_fix_skips_auto_commit_on_cross_repo_pr(
     assert not any(cmd[:2] == ["git", "add"] for cmd in calls)
     assert not any(cmd[:2] == ["git", "commit"] for cmd in calls)
     assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
+    # The pre-fix_review checkout must also skip for cross-repo PRs:
+    # the fork branch (e.g. ``contributor:feature-x``) does not exist
+    # in ``origin``, so the checkout would fail and trap the runner
+    # in ERROR for every fork PR.
+    assert not any(cmd[:2] == ["git", "checkout"] for cmd in calls)
     assert any(
         "cross-repo" in e["event"] and "#88" in e["event"]
         for e in runner.state.history
