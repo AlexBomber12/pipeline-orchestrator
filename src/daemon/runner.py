@@ -929,6 +929,31 @@ class PipelineRunner:
 
         await self.publish_state()
 
+    _DELETE_IF_UNCHANGED_LUA = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+end
+return 0
+"""
+
+    async def _delete_upload_if_unchanged(self, key: str, expected: bytes | str) -> bool:
+        """Delete ``key`` only if its value still matches ``expected``."""
+        try:
+            result = await self.redis.eval(
+                self._DELETE_IF_UNCHANGED_LUA, 1, key, expected,
+            )
+            return bool(result)
+        except Exception:
+            logger.warning("%s: CAS delete failed for %s, falling back", self.name, key)
+            try:
+                current = await self.redis.get(key)
+                if current == expected:
+                    await self.redis.delete(key)
+                    return True
+            except Exception:
+                pass
+            return False
+
     async def process_pending_uploads(self) -> bool:
         """Commit and push any files staged by the web upload endpoint.
 
@@ -990,11 +1015,9 @@ class PipelineRunner:
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
             logger.error("%s: upload git operations failed: %s", self.name, exc)
             self.log_event(f"Upload push failed: {exc}")
-            await self.redis.delete(key)
-            shutil.rmtree(str(staging_dir), ignore_errors=True)
             return False
 
-        await self.redis.delete(key)
+        await self._delete_upload_if_unchanged(key, raw)
         shutil.rmtree(str(staging_dir), ignore_errors=True)
         return True
 
