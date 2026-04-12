@@ -1094,7 +1094,10 @@ def _git_run_sync(
         check=False,
     )
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or f"git {args[0]} failed")
+        msg = result.stderr.strip()
+        if not msg:
+            msg = result.stdout.strip() or f"git {args[0]} failed"
+        raise RuntimeError(msg)
     return result
 
 
