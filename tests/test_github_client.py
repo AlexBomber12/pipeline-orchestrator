@@ -261,6 +261,51 @@ def test_get_pr_review_status_ignores_stale_p1(
     )
 
 
+def test_get_pr_review_status_uses_latest_author_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multi-round PR: latest author comment is the anchor, old +1 ignored."""
+    import json as _json
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = cmd[-1]
+        if "issues" in path and path.endswith("/comments"):
+            pages = [
+                [
+                    {
+                        "id": 10,
+                        "user": {"login": "author"},
+                        "body": "@codex review",
+                        "created_at": "2026-01-01T00:00:00Z",
+                    },
+                    {
+                        "id": 20,
+                        "user": {"login": "author"},
+                        "body": "@codex review",
+                        "created_at": "2026-01-01T01:00:00Z",
+                    },
+                ],
+            ]
+        elif "pulls" in path and path.endswith("/comments"):
+            pages = []
+        elif "comments/20/reactions" in path:
+            # Latest anchor: no codex reaction yet
+            pages = []
+        elif "comments/10/reactions" in path:
+            # Old anchor had +1 — should NOT be consulted
+            pages = [[{"content": "+1", "user": {"login": "chatgpt-codex-bot"}}]]
+        else:
+            pages = []
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status("owner/name", 42, pr_author="author")
+        == ReviewStatus.PENDING
+    )
+
+
 def test_get_pr_review_status_handles_404(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
