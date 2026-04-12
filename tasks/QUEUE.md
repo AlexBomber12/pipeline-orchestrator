@@ -114,7 +114,7 @@
 - Depends on: PR-013
 
 ## PR-020: Stability fixes and cleanup
-- Status: DONE
+- Status: TODO
 - Tasks file: tasks/PR-020.md
 - Branch: pr-020-stability
 - Depends on: PR-019

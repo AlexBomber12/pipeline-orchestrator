@@ -1,0 +1,365 @@
+diff --git a/artifacts/ci.log b/artifacts/ci.log
+new file mode 100644
+index 0000000..8d10c02
+--- /dev/null
++++ b/artifacts/ci.log
+@@ -0,0 +1,10 @@
++==> ruff check src/
++All checks passed!
++==> pytest -q
++........................................................................ [ 30%]
++........................................................................ [ 60%]
++........................................................................ [ 90%]
++........................                                                 [100%]
++240 passed in 1.76s
++==> ci.sh OK
++ci.sh exit code: 0
+diff --git a/artifacts/pr.patch b/artifacts/pr.patch
+new file mode 100644
+index 0000000..e69de29
+diff --git a/artifacts/structure.txt b/artifacts/structure.txt
+new file mode 100644
+index 0000000..15eb30e
+--- /dev/null
++++ b/artifacts/structure.txt
+@@ -0,0 +1,95 @@
++./.env.example
++./.gitignore
++./.pytest_cache/.gitignore
++./.pytest_cache/CACHEDIR.TAG
++./.pytest_cache/README.md
++./.pytest_cache/v/cache/nodeids
++./.ruff_cache/.gitignore
++./.ruff_cache/0.11.8/6033410362127721513
++./.ruff_cache/CACHEDIR.TAG
++./AGENTS.md
++./Dockerfile
++./LICENSE
++./README.md
++./config.yml
++./docker-compose.yml
++./pyproject.toml
++./requirements.txt
++./scripts/ci.sh
++./scripts/make-review-artifacts.sh
++./src/__init__.py
++./src/claude_cli.py
++./src/config.py
++./src/daemon/__init__.py
++./src/daemon/main.py
++./src/daemon/runner.py
++./src/daemon/scaffolder.py
++./src/github_client.py
++./src/models.py
++./src/queue_parser.py
++./src/utils.py
++./src/web/__init__.py
++./src/web/app.py
++./src/web/templates/base.html
++./src/web/templates/components/activity_feed.html
++./src/web/templates/components/alerts_panel.html
++./src/web/templates/components/event_log.html
++./src/web/templates/components/repo_list.html
++./src/web/templates/components/repo_summary.html
++./src/web/templates/components/settings_auth.html
++./src/web/templates/components/settings_daemon.html
++./src/web/templates/components/settings_daemon_error.html
++./src/web/templates/components/settings_daemon_response.html
++./src/web/templates/components/settings_error.html
++./src/web/templates/components/settings_repo_list.html
++./src/web/templates/components/settings_repo_list_response.html
++./src/web/templates/components/stats_cards.html
++./src/web/templates/index.html
++./src/web/templates/repo.html
++./src/web/templates/settings.html
++./tasks/PR-001.md
++./tasks/PR-002.md
++./tasks/PR-003.md
++./tasks/PR-004.md
++./tasks/PR-005.md
++./tasks/PR-006.md
++./tasks/PR-007.md
++./tasks/PR-008.md
++./tasks/PR-009.md
++./tasks/PR-010.md
++./tasks/PR-011.md
++./tasks/PR-012.md
++./tasks/PR-013.md
++./tasks/PR-014.md
++./tasks/PR-015.md
++./tasks/PR-016.md
++./tasks/PR-017.md
++./tasks/PR-018.md
++./tasks/PR-019.md
++./tasks/PR-020.md
++./tasks/PR-021.md
++./tasks/PR-022.md
++./tasks/PR-023.md
++./tasks/PR-024.md
++./tasks/PR-025.md
++./tasks/PR-026.md
++./tasks/QUEUE.md
++./templates/AGENTS.md
++./templates/QUEUE.md
++./templates/ci.sh
++./templates/make-review-artifacts.sh
++./tests/__init__.py
++./tests/test_alerts.py
++./tests/test_claude_cli.py
++./tests/test_config.py
++./tests/test_daemon_main.py
++./tests/test_github_client.py
++./tests/test_models.py
++./tests/test_observability.py
++./tests/test_queue_parser.py
++./tests/test_recovery.py
++./tests/test_runner.py
++./tests/test_scaffolder.py
++./tests/test_settings.py
++./tests/test_utils.py
++./tests/test_web_app.py
+diff --git a/src/daemon/main.py b/src/daemon/main.py
+index b9926cf..2a2f69e 100644
+--- a/src/daemon/main.py
++++ b/src/daemon/main.py
+@@ -23,6 +23,7 @@ from __future__ import annotations
+ import asyncio
+ import logging
+ import os
++import subprocess
+ from typing import Any
+ 
+ import redis.asyncio as aioredis
+@@ -47,6 +48,42 @@ DEFAULT_REDIS_URL = "redis://localhost:6379/0"
+ CONFIG_RELOAD_EVERY_CYCLES = 5
+ 
+ 
++def _setup_git_auth() -> None:
++    """Run ``gh auth setup-git`` so git clone/push works automatically."""
++    try:
++        result = subprocess.run(
++            ["gh", "auth", "setup-git"],
++            capture_output=True,
++            text=True,
++            timeout=30,
++        )
++        if result.returncode == 0:
++            logger.info("gh auth setup-git succeeded")
++        else:
++            logger.warning(
++                "gh auth setup-git exited %d: %s",
++                result.returncode,
++                result.stderr.strip(),
++            )
++    except subprocess.TimeoutExpired:
++        logger.warning("gh auth setup-git timed out after 30s")
++    except Exception:
++        logger.warning("gh auth setup-git failed", exc_info=True)
++
++
++def _validate_auth() -> dict[str, bool]:
++    """Check whether ``claude`` and ``gh`` CLIs are authenticated."""
++    checks: dict[str, bool] = {}
++    for name, cmd in [("claude", ["claude", "--version"]), ("gh", ["gh", "auth", "status"])]:
++        try:
++            subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=True)
++            checks[name] = True
++        except Exception:
++            checks[name] = False
++    logger.info("Auth status: %s", checks)
++    return checks
++
++
+ def _build_runner(
+     repo: RepoConfig, config: AppConfig, redis_client: Any
+ ) -> PipelineRunner | None:
+@@ -111,6 +148,17 @@ def _configs_differ(a: AppConfig, b: AppConfig) -> bool:
+ 
+ async def main() -> None:
+     """Initialize runners and drive the poll loop forever."""
++    gh_dir = os.environ.get("GH_CONFIG_DIR")
++    if gh_dir:
++        os.environ["GH_CONFIG_HOME"] = gh_dir
++
++    _setup_git_auth()
++    auth = _validate_auth()
++    if not auth.get("claude") and not auth.get("gh"):
++        logger.error(
++            "No auth configured. Run: docker compose run --rm daemon bash"
++        )
++
+     config = load_config()
+     redis_url = os.environ.get("REDIS_URL", DEFAULT_REDIS_URL)
+     redis_client = aioredis.from_url(redis_url, decode_responses=True)
+diff --git a/tasks/QUEUE.md b/tasks/QUEUE.md
+index 63495cc..c3088ff 100644
+--- a/tasks/QUEUE.md
++++ b/tasks/QUEUE.md
+@@ -114,13 +114,13 @@
+ - Depends on: PR-013
+ 
+ ## PR-020: Stability fixes and cleanup
+-- Status: TODO
++- Status: DONE
+ - Tasks file: tasks/PR-020.md
+ - Branch: pr-020-stability
+ - Depends on: PR-019
+ 
+ ## PR-021: Daemon startup hardening
+-- Status: TODO
++- Status: DONE
+ - Tasks file: tasks/PR-021.md
+ - Branch: pr-021-daemon-hardening
+ - Depends on: PR-020
+diff --git a/tests/test_daemon_main.py b/tests/test_daemon_main.py
+index 384ff56..c55f034 100644
+--- a/tests/test_daemon_main.py
++++ b/tests/test_daemon_main.py
+@@ -4,7 +4,9 @@ from __future__ import annotations
+ 
+ import asyncio
+ import logging
++import subprocess
+ from typing import Any
++from unittest.mock import patch
+ 
+ import pytest
+ 
+@@ -61,6 +63,10 @@ def _patch_main(
+         lambda url, decode_responses: _FakeRedisClient(),
+     )
+     monkeypatch.setattr(main_module, "PipelineRunner", runner_cls)
++    monkeypatch.setattr(main_module, "_setup_git_auth", lambda: None)
++    monkeypatch.setattr(
++        main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
++    )
+ 
+     sleep_calls: list[float] = []
+ 
+@@ -186,6 +192,10 @@ def test_main_reload_detects_new_repository(
+         lambda url, decode_responses: _FakeRedisClient(),
+     )
+     monkeypatch.setattr(main_module, "PipelineRunner", _FakeRunner)
++    monkeypatch.setattr(main_module, "_setup_git_auth", lambda: None)
++    monkeypatch.setattr(
++        main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
++    )
+     # Reload on every second cycle so the test doesn't need long loops.
+     monkeypatch.setattr(main_module, "CONFIG_RELOAD_EVERY_CYCLES", 2)
+ 
+@@ -246,6 +256,10 @@ def test_main_reload_drops_removed_repository(
+         lambda url, decode_responses: _FakeRedisClient(),
+     )
+     monkeypatch.setattr(main_module, "PipelineRunner", _FakeRunner)
++    monkeypatch.setattr(main_module, "_setup_git_auth", lambda: None)
++    monkeypatch.setattr(
++        main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
++    )
+     monkeypatch.setattr(main_module, "CONFIG_RELOAD_EVERY_CYCLES", 2)
+ 
+     sleep_calls: list[float] = []
+@@ -297,3 +311,104 @@ def test_main_continues_when_one_runner_raises(
+     assert beta.cycles == 1, "second runner must still execute after first raises"
+     errors = [rec for rec in caplog.records if rec.levelno == logging.ERROR]
+     assert any("alpha" in rec.getMessage() for rec in errors)
++
++
++# ---------- _setup_git_auth tests ----------
++
++
++def test_setup_git_auth_calls_subprocess() -> None:
++    """_setup_git_auth must invoke 'gh auth setup-git'."""
++    with patch.object(main_module.subprocess, "run") as mock_run:
++        mock_run.return_value = subprocess.CompletedProcess(
++            args=["gh", "auth", "setup-git"], returncode=0, stdout="", stderr=""
++        )
++        main_module._setup_git_auth()
++
++    mock_run.assert_called_once()
++    args = mock_run.call_args
++    assert args[0][0] == ["gh", "auth", "setup-git"]
++    assert args[1]["timeout"] == 30
++
++
++def test_setup_git_auth_does_not_crash_on_error() -> None:
++    """_setup_git_auth must not raise on CalledProcessError."""
++    with patch.object(main_module.subprocess, "run") as mock_run:
++        mock_run.side_effect = subprocess.CalledProcessError(1, "gh")
++        # Must not raise
++        main_module._setup_git_auth()
++
++
++def test_setup_git_auth_handles_timeout() -> None:
++    """_setup_git_auth must not raise on TimeoutExpired."""
++    with patch.object(main_module.subprocess, "run") as mock_run:
++        mock_run.side_effect = subprocess.TimeoutExpired("gh", 30)
++        main_module._setup_git_auth()
++
++
++# ---------- _validate_auth tests ----------
++
++
++def test_validate_auth_returns_true_when_both_succeed() -> None:
++    with patch.object(main_module.subprocess, "run") as mock_run:
++        mock_run.return_value = subprocess.CompletedProcess(
++            args=[], returncode=0, stdout="", stderr=""
++        )
++        result = main_module._validate_auth()
++
++    assert result == {"claude": True, "gh": True}
++
++
++def test_validate_auth_returns_false_on_failure() -> None:
++    def failing_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
++        raise subprocess.CalledProcessError(1, cmd[0])
++
++    with patch.object(main_module.subprocess, "run", side_effect=failing_run):
++        result = main_module._validate_auth()
++
++    assert result == {"claude": False, "gh": False}
++
++
++def test_validate_auth_mixed_results() -> None:
++    def selective_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
++        if cmd[0] == "claude":
++            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
++        raise subprocess.CalledProcessError(1, cmd[0])
++
++    with patch.object(main_module.subprocess, "run", side_effect=selective_run):
++        result = main_module._validate_auth()
++
++    assert result == {"claude": True, "gh": False}
++
++
++# ---------- main() calls startup functions ----------
++
++
++def test_main_calls_setup_git_auth_before_runners(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """main() must call _setup_git_auth before creating runners."""
++    call_order: list[str] = []
++
++    original_setup = main_module._setup_git_auth
++
++    def tracking_setup() -> None:
++        call_order.append("setup_git_auth")
++
++    def tracking_validate() -> dict[str, bool]:
++        call_order.append("validate_auth")
++        return {"claude": True, "gh": True}
++
++    config = AppConfig(
++        repositories=[_repo("https://github.com/octo/alpha.git")],
++        daemon=DaemonConfig(poll_interval_sec=1),
++    )
++    _patch_main(monkeypatch, config)
++    # Override the _patch_main stubs with tracking versions
++    monkeypatch.setattr(main_module, "_setup_git_auth", tracking_setup)
++    monkeypatch.setattr(main_module, "_validate_auth", tracking_validate)
++
++    with pytest.raises(_StopLoop):
++        asyncio.run(main_module.main())
++
++    assert call_order.index("setup_git_auth") < call_order.index("validate_auth")
++    assert len(_FakeRunner.instances) == 1
