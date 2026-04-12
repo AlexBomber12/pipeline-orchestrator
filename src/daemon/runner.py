@@ -679,7 +679,7 @@ class PipelineRunner:
             return False
         return True
 
-    def _commit_and_push_dirty(self, message: str) -> bool:
+    def _commit_and_push_dirty(self, message: str, expected_branch: str) -> bool:
         """Commit and push any uncommitted changes left in the working tree.
 
         Claude CLI runs (``run_planned_pr``, ``fix_review``) are supposed
@@ -689,6 +689,15 @@ class PipelineRunner:
         tree dirty" and operator intervention is needed. Running
         ``scripts/ci.sh`` before committing ensures we never push broken
         code as part of the auto-commit path.
+
+        ``expected_branch`` is the branch HEAD must be on for the push
+        to be safe. ``handle_idle`` hard-syncs to ``main`` before
+        handing off to CODING, so a Claude CLI run that exits 0 without
+        switching branches would otherwise cause this method to commit
+        straight onto ``main`` and push it upstream — bypassing every
+        PR / review gate in the pipeline. Validating HEAD against the
+        caller's expected branch catches that class of failure before
+        any write hits the repo.
 
         Returns ``True`` after a successful commit + push, ``False``
         when the tree is already clean (nothing to do) or when an error
@@ -719,6 +728,42 @@ class PipelineRunner:
             return False
 
         if not status.stdout.strip():
+            return False
+
+        try:
+            head = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=True,
+                cwd=self.repo_path,
+            )
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ) as exc:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = (
+                f"auto-commit git rev-parse failed: {exc}"
+            )
+            self.log_event(self.state.error_message)
+            return False
+
+        current_branch = head.stdout.strip()
+        if current_branch != expected_branch:
+            # Refuse to commit/push when HEAD is on the wrong branch.
+            # The most dangerous instance is HEAD still on ``main``
+            # from ``sync_to_main`` because Claude CLI exited 0 without
+            # creating the feature branch; pushing that would publish
+            # uncommitted local edits straight to the base branch.
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = (
+                f"auto-commit aborted: HEAD on {current_branch!r}, "
+                f"expected {expected_branch!r}"
+            )
+            self.log_event(self.state.error_message)
             return False
 
         try:
@@ -769,7 +814,10 @@ class PipelineRunner:
                 cwd=self.repo_path,
             )
             subprocess.run(
-                ["git", "push", "origin", "HEAD"],
+                # Push the validated branch by name rather than ``HEAD``
+                # so a pre-push hook that re-points HEAD mid-operation
+                # still cannot divert the push onto the base branch.
+                ["git", "push", "origin", f"{expected_branch}:{expected_branch}"],
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -935,7 +983,7 @@ class PipelineRunner:
         commit_message = (
             f"{self.state.current_task.pr_id}: auto-commit after Claude CLI"
         )
-        self._commit_and_push_dirty(commit_message)
+        self._commit_and_push_dirty(commit_message, expected_branch=target_branch)
         if self.state.state == PipelineState.ERROR:
             return
 
@@ -1055,9 +1103,20 @@ class PipelineRunner:
             self.log_event(f"fix_review failed: {self.state.error_message}")
             return
 
-        self._commit_and_push_dirty("fix: auto-commit after review")
-        if self.state.state == PipelineState.ERROR:
-            return
+        # Only auto-commit when we know the PR branch to validate HEAD
+        # against. ``current_pr`` is set by handle_watch before routing
+        # into FIX, so the None case is defensive — skip the auto-commit
+        # safety net rather than push to an unknown branch.
+        if (
+            self.state.current_pr is not None
+            and self.state.current_pr.branch
+        ):
+            self._commit_and_push_dirty(
+                "fix: auto-commit after review",
+                expected_branch=self.state.current_pr.branch,
+            )
+            if self.state.state == PipelineState.ERROR:
+                return
 
         if self.state.current_pr is not None:
             self.state.current_pr.push_count += 1
