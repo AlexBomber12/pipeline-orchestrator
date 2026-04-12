@@ -1077,7 +1077,7 @@ async def put_settings_repo(
 # ---------------------------------------------------------------------------
 
 _UPLOAD_MAX_TOTAL_BYTES = 1_000_000  # 1 MB
-_ALLOWED_TASK_PATTERN = r"^(QUEUE\.md|PR-\d+\.md)$"
+_ALLOWED_TASK_PATTERN = r"^(QUEUE\.md|PR-[A-Za-z0-9._-]+\.md)$"
 
 import re as _re  # noqa: E402 — kept near usage
 
