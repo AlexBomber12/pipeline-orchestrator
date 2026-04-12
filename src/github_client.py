@@ -73,7 +73,7 @@ def get_open_prs(repo: str) -> list[PRInfo]:
             "--state",
             "open",
             "--json",
-            "number,headRefName,statusCheckRollup,url,updatedAt,commits",
+            "number,headRefName,statusCheckRollup,url,updatedAt,commits,author",
         ],
         repo=repo,
     )
@@ -90,7 +90,11 @@ def get_open_prs(repo: str) -> list[PRInfo]:
                 number=number,
                 branch=entry.get("headRefName", ""),
                 ci_status=_ci_status_from_rollup(entry.get("statusCheckRollup")),
-                review_status=get_pr_review_status(repo, number),
+                review_status=get_pr_review_status(
+                    repo,
+                    number,
+                    pr_author=(entry.get("author") or {}).get("login", ""),
+                ),
                 push_count=len(entry.get("commits") or []),
                 url=entry.get("url", ""),
                 last_activity=_parse_iso(entry.get("updatedAt")),
@@ -99,14 +103,21 @@ def get_open_prs(repo: str) -> list[PRInfo]:
     return prs
 
 
-def get_pr_review_status(repo: str, pr_number: int) -> ReviewStatus:
+def get_pr_review_status(
+    repo: str, pr_number: int, pr_author: str = ""
+) -> ReviewStatus:
     """Derive a Codex review status from PR issue comments, review comments, and reactions."""
     issue_comments = _gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
     review_comments = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments") or []
 
     # Find the most recent anchor comment (PR author's "@codex review" trigger).
+    # Only accept anchors written by the PR author to avoid false matches from
+    # other users quoting the trigger text.
     anchor_endpoint = None
     for c in reversed(issue_comments):
+        author = (c.get("user") or {}).get("login", "")
+        if pr_author and author != pr_author:
+            continue
         if "@codex review" in (c.get("body") or "").lower():
             cid = c.get("id")
             if cid is not None:
@@ -114,6 +125,9 @@ def get_pr_review_status(repo: str, pr_number: int) -> ReviewStatus:
             break
     if anchor_endpoint is None:
         for c in reversed(review_comments):
+            author = (c.get("user") or {}).get("login", "")
+            if pr_author and author != pr_author:
+                continue
             if "@codex review" in (c.get("body") or "").lower():
                 cid = c.get("id")
                 if cid is not None:
@@ -121,14 +135,21 @@ def get_pr_review_status(repo: str, pr_number: int) -> ReviewStatus:
                 break
 
     # Check reactions on the anchor comment for approval signal.
+    # Only count reactions from Codex accounts to avoid false positives from
+    # humans reacting with thumbs-up on the anchor comment.
     if anchor_endpoint is not None:
         try:
             reactions = _gh_api_paginated(anchor_endpoint)
             if reactions:
-                contents = {r.get("content") for r in reactions if isinstance(r, dict)}
-                if "+1" in contents:
+                codex_contents = {
+                    r.get("content")
+                    for r in reactions
+                    if isinstance(r, dict)
+                    and "codex" in ((r.get("user") or {}).get("login", "")).lower()
+                }
+                if "+1" in codex_contents:
                     return ReviewStatus.APPROVED
-                if "eyes" in contents:
+                if "eyes" in codex_contents:
                     return ReviewStatus.EYES
         except Exception:
             pass

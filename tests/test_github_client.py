@@ -113,14 +113,14 @@ def test_get_pr_review_status_paginates_and_slurps_gh_api_calls(
         elif "pulls" in path and path.endswith("/comments"):
             pages = []
         elif path.endswith("/reactions"):
-            pages = [[{"content": "+1"}]]
+            pages = [[{"content": "+1", "user": {"login": "chatgpt-codex-bot"}}]]
         else:
             pages = []
         return _FakeCompletedProcess(stdout=_json.dumps(pages))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert get_pr_review_status("owner/name", 42) == ReviewStatus.APPROVED
+    assert get_pr_review_status("owner/name", 42, pr_author="user") == ReviewStatus.APPROVED
 
     # 2 comment fetches (issue + review) + 1 reaction fetch on anchor
     assert len(invocations) == 3
