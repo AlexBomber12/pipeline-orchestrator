@@ -115,6 +115,28 @@ def get_pr_review_status(
        the anchor for P1/P2 → CHANGES_REQUESTED.
     4. Otherwise → PENDING.
     """
+    # Check for Codex reactions on the PR body (issue-level reactions).
+    # Codex bot (chatgpt-codex-connector) puts +1 on the PR body itself,
+    # not on comments, so check this first.
+    try:
+        issue_reactions = _gh_api_paginated(
+            f"repos/{repo}/issues/{pr_number}/reactions"
+        )
+        if issue_reactions:
+            codex_contents = {
+                r.get("content")
+                for r in issue_reactions
+                if isinstance(r, dict)
+                and "codex" in ((r.get("user") or {}).get("login", "")).lower()
+            }
+            if "+1" in codex_contents:
+                return ReviewStatus.APPROVED
+            if "eyes" in codex_contents:
+                return ReviewStatus.EYES
+    except RuntimeError as exc:
+        if "HTTP 404" not in str(exc):
+            raise
+
     try:
         issue_comments = _gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
     except RuntimeError as exc:
