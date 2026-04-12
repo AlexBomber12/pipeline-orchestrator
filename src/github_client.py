@@ -107,14 +107,8 @@ def get_pr_review_status(
     repo: str, pr_number: int, pr_author: str = ""
 ) -> ReviewStatus:
     """Derive a Codex review status from PR issue comments, review comments, and reactions."""
-    try:
-        issue_comments = _gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
-    except Exception:
-        issue_comments = []
-    try:
-        review_comments = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments") or []
-    except Exception:
-        review_comments = []
+    issue_comments = _gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
+    review_comments = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments") or []
 
     # Find the most recent anchor comment (PR author's "@codex review" trigger).
     # Only accept anchors written by the PR author to avoid false matches from
