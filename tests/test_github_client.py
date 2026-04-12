@@ -87,6 +87,41 @@ def test_run_gh_returns_raw_string_when_not_json(
     assert run_gh(["auth", "status"]) == "ok"
 
 
+def test_get_pr_review_status_approved_via_pr_body_reaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex +1 reaction on the PR body (issue-level) → APPROVED without needing comments."""
+    import json as _json
+
+    invocations: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        invocations.append(cmd)
+        path = cmd[-1]
+        if path.endswith(f"/issues/42/reactions"):
+            pages = [
+                [{"content": "+1", "user": {"login": "chatgpt-codex-connector"}}]
+            ]
+        elif "issues" in path and path.endswith("/comments"):
+            pages = []
+        elif "pulls" in path and path.endswith("/comments"):
+            pages = []
+        else:
+            pages = []
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status("owner/name", 42, pr_author="author")
+        == ReviewStatus.APPROVED
+    )
+
+    # Should return early after checking issue reactions — no comment fetches needed.
+    assert len(invocations) == 1
+    assert "issues/42/reactions" in invocations[0][-1]
+
+
 def test_get_pr_review_status_approved_via_first_author_comment_reaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -102,7 +137,10 @@ def test_get_pr_review_status_approved_via_first_author_comment_reaction(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         invocations.append(cmd)
         path = cmd[-1]
-        if "issues" in path and path.endswith("/comments"):
+        if path.endswith(f"/issues/42/reactions"):
+            # No codex reaction on PR body — fall through to comment logic.
+            pages = []
+        elif "issues" in path and path.endswith("/comments"):
             pages = [
                 [{"id": 10, "user": {"login": "author"}, "body": "@codex review"}],
                 [{"id": 20, "user": {"login": "chatgpt-codex-bot"}, "body": "LGTM"}],
@@ -122,8 +160,8 @@ def test_get_pr_review_status_approved_via_first_author_comment_reaction(
         == ReviewStatus.APPROVED
     )
 
-    # 2 comment fetches (issue + review) + 1 reaction fetch
-    assert len(invocations) == 3
+    # 1 issue reactions + 2 comment fetches (issue + review) + 1 comment reaction fetch
+    assert len(invocations) == 4
     for cmd in invocations:
         assert "--paginate" in cmd, f"missing --paginate in {cmd}"
         assert "--slurp" in cmd, f"missing --slurp in {cmd}"
