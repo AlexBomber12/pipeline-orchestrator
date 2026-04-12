@@ -163,6 +163,40 @@ def test_get_pr_review_status_skips_teammate_comment(
     )
 
 
+def test_get_pr_review_status_ignores_non_trigger_author_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unrelated author follow-up after the trigger should not become the anchor."""
+    import json as _json
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = cmd[-1]
+        if "issues" in path and path.endswith("/comments"):
+            pages = [
+                [
+                    {"id": 10, "user": {"login": "author"}, "body": "@codex review"},
+                    {"id": 15, "user": {"login": "author"}, "body": "actually nvm, still WIP"},
+                ],
+            ]
+        elif "pulls" in path and path.endswith("/comments"):
+            pages = []
+        elif "comments/10/reactions" in path:
+            # Reaction is on the trigger comment (id=10), not the follow-up
+            pages = [[{"content": "+1", "user": {"login": "chatgpt-codex-bot"}}]]
+        elif path.endswith("/reactions"):
+            pages = []
+        else:
+            pages = []
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status("owner/name", 42, pr_author="author")
+        == ReviewStatus.APPROVED
+    )
+
+
 def test_get_pr_review_status_pending_when_no_codex_reaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -193,7 +227,7 @@ def test_get_pr_review_status_changes_requested_on_p1(
                     {
                         "id": 10,
                         "user": {"login": "author"},
-                        "body": "please review",
+                        "body": "@codex review",
                         "created_at": "2026-01-01T00:00:00Z",
                     },
                     {

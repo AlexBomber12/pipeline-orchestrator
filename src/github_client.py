@@ -109,7 +109,7 @@ def get_pr_review_status(
     """Derive a Codex review status from PR issue comments, review comments, and reactions.
 
     Logic:
-    1. Find the latest issue comment by the PR author (not from Codex).
+    1. Find the latest ``@codex review`` trigger comment by the PR author.
     2. Check reactions on that comment from Codex: +1 → APPROVED, eyes → EYES.
     3. If neither reaction, scan Codex comments (issue + review) posted after
        the anchor for P1/P2 → CHANGES_REQUESTED.
@@ -128,13 +128,13 @@ def get_pr_review_status(
             raise
         review_comments = []
 
-    # Step 1: latest issue comment by the PR author (most recent review round).
+    # Step 1: latest "@codex review" trigger comment by the PR author.
     anchor = None
     for c in reversed(issue_comments):
         author = (c.get("user") or {}).get("login", "")
         if pr_author and author != pr_author:
             continue
-        if "codex" not in author.lower():
+        if "@codex review" in (c.get("body") or "").lower():
             anchor = c
             break
 
