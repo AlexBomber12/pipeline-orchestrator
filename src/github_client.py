@@ -166,8 +166,10 @@ def _gh_api_paginated(path: str) -> list[dict] | None:
 
 def _ci_status_from_rollup(rollup: object) -> CIStatus:
     """Map a ``statusCheckRollup`` payload to a single ``CIStatus`` value."""
-    if not isinstance(rollup, list) or not rollup:
+    if not isinstance(rollup, list):
         return CIStatus.PENDING
+    if not rollup:
+        return CIStatus.SUCCESS
 
     states: list[str] = []
     for check in rollup:
