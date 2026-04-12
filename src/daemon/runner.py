@@ -756,6 +756,28 @@ class PipelineRunner:
         task = get_next_task(tasks)
         if task is None:
             self.log_event("No tasks available")
+            try:
+                prs = github_client.get_open_prs(self.owner_repo)
+            except Exception as exc:
+                self.log_event(f"IDLE: open PR check failed: {exc}")
+                self.state.current_pr = None
+                return
+            if prs:
+                # Prefer a PR whose branch matches a DONE task, otherwise
+                # take the first open PR.
+                done_branches = {
+                    t.branch for t in tasks
+                    if t.status == TaskStatus.DONE and t.branch
+                }
+                match = next(
+                    (pr for pr in prs if pr.branch in done_branches), None
+                )
+                self.state.current_pr = match or prs[0]
+                self.log_event(
+                    f"IDLE: {len(prs)} open PR(s) detected (manual work)"
+                )
+            else:
+                self.state.current_pr = None
             return
 
         self.state.current_task = task

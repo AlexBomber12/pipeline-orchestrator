@@ -1,10 +1,65 @@
 ==> ruff check src/
 All checks passed!
 ==> pytest -q
-........................................................................ [ 30%]
-........................................................................ [ 60%]
-........................................................................ [ 90%]
-........................                                                 [100%]
-240 passed in 1.64s
-==> ci.sh OK
-ci.sh exit code: 0
+...............F.....F.................................................. [ 29%]
+........................................................................ [ 59%]
+........................................................................ [ 88%]
+............................                                             [100%]
+=================================== FAILURES ===================================
+___________________________ test_run_claude_success ____________________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x75f2df20a5a0>
+
+    def test_run_claude_success(monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, Any] = {}
+    
+        def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+            return _FakeCompletedProcess(stdout="hello", stderr="warn", returncode=0)
+    
+        monkeypatch.setattr(subprocess, "run", fake_run)
+    
+        result = run_claude("do a thing", "/data/repos/demo", timeout=42)
+    
+        assert result == (0, "hello", "warn")
+>       assert captured["cmd"] == [
+            "claude",
+            "--print",
+            "--dangerously-skip-permissions",
+            "do a thing",
+        ]
+E       AssertionError: assert ['claude', '-... 'do a thing'] == ['claude', '-... 'do a thing']
+E         
+E         At index 1 diff: '--dangerously-skip-permissions' != '--print'
+E         Right contains one more item: 'do a thing'
+E         Use -v to get more diff
+
+tests/test_claude_cli.py:39: AssertionError
+____________________ test_fix_review_uses_fix_review_prompt ____________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x75f2df20bbf0>
+
+    def test_fix_review_uses_fix_review_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, Any] = {}
+    
+        def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+            return _FakeCompletedProcess(returncode=0)
+    
+        monkeypatch.setattr(subprocess, "run", fake_run)
+    
+        fix_review("/data/repos/demo")
+    
+        assert captured["cmd"][-1] == "FIX REVIEW"
+        assert captured["kwargs"]["cwd"] == "/data/repos/demo"
+>       assert captured["kwargs"]["timeout"] == 600
+E       assert 1800 == 600
+
+tests/test_claude_cli.py:140: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_claude_cli.py::test_run_claude_success - AssertionError: as...
+FAILED tests/test_claude_cli.py::test_fix_review_uses_fix_review_prompt - ass...
+2 failed, 242 passed in 1.68s
+exit: 1

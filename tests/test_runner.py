@@ -1505,3 +1505,101 @@ def test_ensure_repo_cloned_retries_scaffold_on_missing_ref_after_restart(
     # the stranded commit gets re-pushed.
     assert scaffold_calls == ["main"]
     assert runner._scaffolded is True
+
+
+# ------------------------------------------------------------------
+# PR-022: IDLE open PR visibility
+# ------------------------------------------------------------------
+
+
+def test_handle_idle_no_tasks_but_open_pr_sets_current_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    done_task = QueueTask(
+        pr_id="PR-001",
+        title="Done",
+        status=TaskStatus.DONE,
+        branch="pr-001-done",
+    )
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [done_task])
+    monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
+
+    open_pr = PRInfo(
+        number=42,
+        branch="pr-001-done",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.PENDING,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: [open_pr]
+    )
+
+    runner = _make_runner()
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 42
+    assert any("open PR(s) detected" in e["event"] for e in runner.state.history)
+
+
+def test_handle_idle_no_tasks_no_open_prs_clears_current_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
+    monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: []
+    )
+
+    runner = _make_runner()
+    # Set a stale current_pr to verify it gets cleared.
+    runner.state.current_pr = PRInfo(number=99, branch="old")
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+
+
+def test_handle_idle_no_tasks_does_not_change_state_from_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
+    monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
+
+    open_pr = PRInfo(number=7, branch="feature-x")
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: [open_pr]
+    )
+
+    runner = _make_runner()
+    assert runner.state.state == PipelineState.IDLE
+    asyncio.run(runner.handle_idle())
+
+    # State must remain IDLE — observation only.
+    assert runner.state.state == PipelineState.IDLE
+
+
+def test_handle_idle_open_pr_check_survives_github_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
+    monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: (_ for _ in ()).throw(RuntimeError("API down")),
+    )
+
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=5, branch="stale")
+    asyncio.run(runner.handle_idle())
+
+    # Must not crash, state stays IDLE, and stale current_pr is cleared.
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+    assert any("open PR check failed" in e["event"] for e in runner.state.history)
