@@ -22,7 +22,7 @@ def run_claude(
     Returns ``(returncode, stdout, stderr)``. On timeout, missing CLI, or
     missing ``cwd``, returns ``(-1, "", <error message>)`` instead of raising.
     """
-    cmd = ["claude", "--dangerously-skip-permissions", prompt]
+    cmd = ["claude", "--print", "--dangerously-skip-permissions", prompt]
     logger.info("running claude CLI with prompt: %s", prompt[:80])
 
     try:
