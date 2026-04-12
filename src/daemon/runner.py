@@ -966,7 +966,7 @@ return 0
             raw = await self.redis.get(key)
         except Exception:
             logger.warning("%s: Redis error checking pending uploads", self.name)
-            return False
+            return None
         if not raw:
             return False
 
@@ -1026,8 +1026,9 @@ return 0
                 pass
             return None
 
-        await self._delete_upload_if_unchanged(key, raw)
-        shutil.rmtree(str(staging_dir), ignore_errors=True)
+        deleted = await self._delete_upload_if_unchanged(key, raw)
+        if deleted:
+            shutil.rmtree(str(staging_dir), ignore_errors=True)
         return True
 
     async def handle_idle(self) -> None:

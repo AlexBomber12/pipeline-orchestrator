@@ -2103,3 +2103,19 @@ def test_process_pending_uploads_cas_delete_skips_newer_manifest(
     result = asyncio.run(runner.process_pending_uploads())
     assert result is True
     assert asyncio.run(runner.redis.get(key)) == new_manifest
+    assert staging.is_dir(), "staging dir must survive when CAS delete skips newer manifest"
+
+
+def test_process_pending_uploads_redis_error_blocks_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Redis read error must return None so handle_idle skips task dispatch."""
+    runner = _make_runner()
+
+    async def broken_get(key: str) -> bytes:
+        raise ConnectionError("redis gone")
+
+    runner.redis.get = broken_get  # type: ignore[assignment]
+
+    result = asyncio.run(runner.process_pending_uploads())
+    assert result is None
