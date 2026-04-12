@@ -1094,9 +1094,8 @@ def _git_run_sync(
         check=False,
     )
     if result.returncode != 0:
-        msg = result.stderr.strip()
-        if not msg:
-            msg = result.stdout.strip() or f"git {args[0]} failed"
+        parts = [s for s in (result.stderr.strip(), result.stdout.strip()) if s]
+        msg = "\n".join(parts) or f"git {args[0]} failed"
         raise RuntimeError(msg)
     return result
 
@@ -1171,7 +1170,12 @@ async def upload_tasks(
                 repo_name=name,
             )
     else:
-        repo_state = RepoState(url="", name=name, state=PipelineState.IDLE)
+        return _render_upload_error(
+            request,
+            "Cannot verify repo state (no state recorded). Upload blocked.",
+            503,
+            repo_name=name,
+        )
     if repo_state.state != PipelineState.IDLE:
         return _render_upload_error(
             request,

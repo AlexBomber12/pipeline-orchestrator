@@ -13,6 +13,9 @@ from src.web.app import app
 
 class _StubAioredisClient:
     async def get(self, key: str) -> str | None:
+        if key.startswith("pipeline:"):
+            name = key.split(":", 1)[1]
+            return f'{{"url":"","name":"{name}","state":"IDLE"}}'
         return None
 
     async def aclose(self) -> None:
@@ -90,6 +93,30 @@ def test_upload_repo_not_cloned(
         )
     assert resp.status_code == 422
     assert "not cloned" in resp.text
+
+
+def test_upload_blocked_when_redis_key_absent(
+    one_repo_config: Path,
+    repo_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _EmptyRedis:
+        async def get(self, key: str) -> str | None:
+            return None
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(web_app, "aioredis", type("R", (), {
+        "from_url": staticmethod(lambda *a, **kw: _EmptyRedis()),
+    })())
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/alpha/upload-tasks",
+            files=[_queue_file()],
+        )
+    assert resp.status_code == 503
+    assert "no state recorded" in resp.text
 
 
 def test_upload_without_queue_md(
