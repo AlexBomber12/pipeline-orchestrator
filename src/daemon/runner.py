@@ -41,6 +41,16 @@ _TRANSIENT_STATES = {
 
 _HISTORY_LIMIT = 100
 
+# Timeout for ``scripts/ci.sh`` on the auto-commit path. Git probes
+# stay at 120s (they should return in milliseconds on a healthy repo),
+# but the CI gate runs the user repo's full test suite and 120s is
+# too tight for moderate-sized projects — a real test suite exceeding
+# the cap would flip the runner to ERROR even when the code is valid,
+# reintroducing the operator intervention this safety net is meant to
+# eliminate. 30 minutes accommodates realistic CI runs without
+# abandoning the upper bound entirely.
+_CI_SCRIPT_TIMEOUT_SEC = 1800
+
 
 def repo_owner_from_url(url: str) -> str:
     """Return ``owner/repo`` for a GitHub URL."""
@@ -771,7 +781,7 @@ class PipelineRunner:
                 ["scripts/ci.sh"],
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=_CI_SCRIPT_TIMEOUT_SEC,
                 check=True,
                 cwd=self.repo_path,
             )

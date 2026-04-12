@@ -1824,6 +1824,59 @@ def test_commit_and_push_dirty_errors_when_ci_script_missing(
     assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
 
 
+def test_commit_and_push_dirty_gives_ci_script_generous_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P2 (round 3): ``scripts/ci.sh`` runs the user repo's full
+    test suite and 120s is too tight for moderate-sized projects. A
+    real suite exceeding 2 minutes would raise ``TimeoutExpired`` and
+    flip the runner to ERROR even when the code is valid, defeating
+    the purpose of the auto-commit safety net.
+
+    Git probes (``status``, ``rev-parse``, ``add``, ``commit``,
+    ``push``) stay at 120s because they should return in milliseconds
+    on a healthy repo; only ``scripts/ci.sh`` gets the large budget.
+    """
+    ci_timeouts: list[float | int | None] = []
+    git_timeouts: list[float | int | None] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        timeout = kwargs.get("timeout")
+        if cmd[:1] == ["scripts/ci.sh"]:
+            ci_timeouts.append(timeout)
+        elif cmd[:1] == ["git"]:
+            git_timeouts.append(timeout)
+        if cmd[:2] == ["git", "status"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout=" M src/foo.py\n", returncode=0
+            )
+        if cmd[:3] == ["git", "rev-parse", "--abbrev-ref"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout="pr-001\n", returncode=0
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    result = runner._commit_and_push_dirty(
+        "auto-commit", expected_branch="pr-001"
+    )
+
+    assert result is True
+    assert len(ci_timeouts) == 1
+    # Realistic CI suites routinely run longer than 2 minutes. Pin to
+    # the module constant so a future regression that drops back to
+    # 120s fails loudly here.
+    assert ci_timeouts[0] == runner_module._CI_SCRIPT_TIMEOUT_SEC
+    assert ci_timeouts[0] >= 600, (
+        "ci.sh timeout must be generous enough for moderate test suites"
+    )
+    # Git probes keep their quick 120s cap — they should return in
+    # milliseconds, so there is no reason to bump them.
+    assert all(t == 120 for t in git_timeouts)
+
+
 def test_commit_and_push_dirty_errors_when_head_on_wrong_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
