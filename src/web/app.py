@@ -522,7 +522,7 @@ async def index(request: Request) -> HTMLResponse:
     states = await get_all_repo_states(redis_client)
     stats = _compute_stats(states)
     alerts = _build_alerts(states)
-    latest_alert = alerts[0] if alerts else None
+    latest_alert = min(alerts, key=lambda a: a["duration_seconds"]) if alerts else None
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -566,7 +566,7 @@ async def partial_stats(request: Request) -> HTMLResponse:
     states = await get_all_repo_states(redis_client)
     stats = _compute_stats(states)
     alerts = _build_alerts(states)
-    latest_alert = alerts[0] if alerts else None
+    latest_alert = min(alerts, key=lambda a: a["duration_seconds"]) if alerts else None
     return templates.TemplateResponse(
         request,
         "components/status_bar.html",
