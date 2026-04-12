@@ -104,11 +104,14 @@ def test_get_pr_review_status_paginates_and_slurps_gh_api_calls(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         invocations.append(cmd)
         path = cmd[-1]
-        if path.endswith("/comments"):
+        if "issues" in path and path.endswith("/comments"):
+            # Issue comments: one is the anchor with "@codex review"
             pages = [
-                [{"id": 1, "user": {"login": "user"}, "body": "hi"}],
-                [{"id": 2, "user": {"login": "chatgpt-codex-bot"}, "body": ""}],
+                [{"id": 10, "user": {"login": "user"}, "body": "@codex review"}],
+                [{"id": 20, "user": {"login": "chatgpt-codex-bot"}, "body": "LGTM"}],
             ]
+        elif "pulls" in path and path.endswith("/comments"):
+            pages = []
         elif path.endswith("/reactions"):
             pages = [[{"content": "+1"}]]
         else:
@@ -119,7 +122,8 @@ def test_get_pr_review_status_paginates_and_slurps_gh_api_calls(
 
     assert get_pr_review_status("owner/name", 42) == ReviewStatus.APPROVED
 
-    assert len(invocations) == 2
+    # 2 comment fetches (issue + review) + 1 reaction fetch on anchor
+    assert len(invocations) == 3
     for cmd in invocations:
         assert "--paginate" in cmd, f"missing --paginate in {cmd}"
         assert "--slurp" in cmd, f"missing --slurp in {cmd}"

@@ -101,43 +101,46 @@ def get_open_prs(repo: str) -> list[PRInfo]:
 
 def get_pr_review_status(repo: str, pr_number: int) -> ReviewStatus:
     """Derive a Codex review status from PR issue comments, review comments, and reactions."""
-    comments = _gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments")
-    if comments is None:
-        comments = []
+    issue_comments = _gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
+    review_comments = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments") or []
 
-    review_comments = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments")
-    if review_comments is None:
-        review_comments = []
+    # Find the most recent anchor comment (PR author's "@codex review" trigger).
+    anchor_endpoint = None
+    for c in reversed(issue_comments):
+        if "@codex review" in (c.get("body") or "").lower():
+            cid = c.get("id")
+            if cid is not None:
+                anchor_endpoint = f"repos/{repo}/issues/comments/{cid}/reactions"
+            break
+    if anchor_endpoint is None:
+        for c in reversed(review_comments):
+            if "@codex review" in (c.get("body") or "").lower():
+                cid = c.get("id")
+                if cid is not None:
+                    anchor_endpoint = f"repos/{repo}/pulls/comments/{cid}/reactions"
+                break
 
-    all_comments = comments + review_comments
+    # Check reactions on the anchor comment for approval signal.
+    if anchor_endpoint is not None:
+        try:
+            reactions = _gh_api_paginated(anchor_endpoint)
+            if reactions:
+                contents = {r.get("content") for r in reactions if isinstance(r, dict)}
+                if "+1" in contents:
+                    return ReviewStatus.APPROVED
+                if "eyes" in contents:
+                    return ReviewStatus.EYES
+        except Exception:
+            pass
 
-    for comment in reversed(all_comments):
+    # Check P1/P2 in Codex comments across both issue and review comments.
+    for comment in reversed(issue_comments + review_comments):
         user = (comment.get("user") or {}).get("login", "") or ""
         if "codex" not in user.lower():
             continue
-
-        comment_id = comment.get("id")
-        if comment_id is not None:
-            for endpoint in [
-                f"repos/{repo}/issues/comments/{comment_id}/reactions",
-                f"repos/{repo}/pulls/comments/{comment_id}/reactions",
-            ]:
-                try:
-                    reactions = _gh_api_paginated(endpoint)
-                except Exception:
-                    continue
-                if reactions is not None:
-                    contents = {r.get("content") for r in reactions if isinstance(r, dict)}
-                    if "+1" in contents:
-                        return ReviewStatus.APPROVED
-                    if "eyes" in contents:
-                        return ReviewStatus.EYES
-
         body = comment.get("body") or ""
         if "P1" in body or "P2" in body:
             return ReviewStatus.CHANGES_REQUESTED
-
-        return ReviewStatus.PENDING
 
     return ReviewStatus.PENDING
 
