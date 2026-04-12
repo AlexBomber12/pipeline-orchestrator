@@ -87,10 +87,10 @@ def test_run_gh_returns_raw_string_when_not_json(
     assert run_gh(["auth", "status"]) == "ok"
 
 
-def test_get_pr_review_status_approved_via_first_comment_reaction(
+def test_get_pr_review_status_approved_via_first_author_comment_reaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Codex +1 reaction on the first non-codex issue comment → APPROVED.
+    """Codex +1 reaction on the first PR-author issue comment → APPROVED.
 
     All gh api calls must use --paginate --slurp so multi-page responses
     are parseable as a single JSON document.
@@ -103,9 +103,8 @@ def test_get_pr_review_status_approved_via_first_comment_reaction(
         invocations.append(cmd)
         path = cmd[-1]
         if "issues" in path and path.endswith("/comments"):
-            # First non-codex comment is the PR author's trigger
             pages = [
-                [{"id": 10, "user": {"login": "user"}, "body": "@codex review"}],
+                [{"id": 10, "user": {"login": "author"}, "body": "@codex review"}],
                 [{"id": 20, "user": {"login": "chatgpt-codex-bot"}, "body": "LGTM"}],
             ]
         elif "pulls" in path and path.endswith("/comments"):
@@ -118,7 +117,10 @@ def test_get_pr_review_status_approved_via_first_comment_reaction(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert get_pr_review_status("owner/name", 42) == ReviewStatus.APPROVED
+    assert (
+        get_pr_review_status("owner/name", 42, pr_author="author")
+        == ReviewStatus.APPROVED
+    )
 
     # 2 comment fetches (issue + review) + 1 reaction fetch
     assert len(invocations) == 3
@@ -127,39 +129,27 @@ def test_get_pr_review_status_approved_via_first_comment_reaction(
         assert "--slurp" in cmd, f"missing --slurp in {cmd}"
 
 
-def test_get_pr_review_status_pending_when_no_codex_reaction(
+def test_get_pr_review_status_skips_teammate_comment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A PR with a human comment but no Codex reaction should resolve to PENDING."""
-    import json as _json
-
-    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        return _FakeCompletedProcess(
-            stdout=_json.dumps([[{"id": 1, "user": {"login": "human"}, "body": "hi"}]])
-        )
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    assert get_pr_review_status("owner/name", 42) == ReviewStatus.PENDING
-
-
-def test_get_pr_review_status_changes_requested_on_p1(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A Codex comment containing P1 → CHANGES_REQUESTED."""
+    """A teammate's comment before the PR author's should be ignored."""
     import json as _json
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         path = cmd[-1]
         if "issues" in path and path.endswith("/comments"):
             pages = [
-                [{"id": 10, "user": {"login": "user"}, "body": "please review"}],
-                [{"id": 20, "user": {"login": "chatgpt-codex-bot"}, "body": "P1: fix this"}],
+                [
+                    {"id": 5, "user": {"login": "teammate"}, "body": "looks interesting"},
+                    {"id": 10, "user": {"login": "author"}, "body": "@codex review"},
+                ],
             ]
         elif "pulls" in path and path.endswith("/comments"):
             pages = []
+        elif "comments/10/reactions" in path:
+            pages = [[{"content": "+1", "user": {"login": "chatgpt-codex-bot"}}]]
         elif path.endswith("/reactions"):
-            # No codex reaction on the first comment
+            # Should never reach teammate's comment
             pages = []
         else:
             pages = []
@@ -167,7 +157,108 @@ def test_get_pr_review_status_changes_requested_on_p1(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert get_pr_review_status("owner/name", 42) == ReviewStatus.CHANGES_REQUESTED
+    assert (
+        get_pr_review_status("owner/name", 42, pr_author="author")
+        == ReviewStatus.APPROVED
+    )
+
+
+def test_get_pr_review_status_pending_when_no_codex_reaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PR with an author comment but no Codex reaction should resolve to PENDING."""
+    import json as _json
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(
+            stdout=_json.dumps([[{"id": 1, "user": {"login": "author"}, "body": "hi"}]])
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.PENDING
+
+
+def test_get_pr_review_status_changes_requested_on_p1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Codex comment containing P1 after the anchor → CHANGES_REQUESTED."""
+    import json as _json
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = cmd[-1]
+        if "issues" in path and path.endswith("/comments"):
+            pages = [
+                [
+                    {
+                        "id": 10,
+                        "user": {"login": "author"},
+                        "body": "please review",
+                        "created_at": "2026-01-01T00:00:00Z",
+                    },
+                    {
+                        "id": 20,
+                        "user": {"login": "chatgpt-codex-bot"},
+                        "body": "P1: fix this",
+                        "created_at": "2026-01-01T00:01:00Z",
+                    },
+                ],
+            ]
+        elif "pulls" in path and path.endswith("/comments"):
+            pages = []
+        elif path.endswith("/reactions"):
+            pages = []
+        else:
+            pages = []
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status("owner/name", 42, pr_author="author")
+        == ReviewStatus.CHANGES_REQUESTED
+    )
+
+
+def test_get_pr_review_status_ignores_stale_p1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Codex P1 comment posted before the anchor should not count."""
+    import json as _json
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = cmd[-1]
+        if "issues" in path and path.endswith("/comments"):
+            pages = [
+                [
+                    {
+                        "id": 5,
+                        "user": {"login": "chatgpt-codex-bot"},
+                        "body": "P1: old issue",
+                        "created_at": "2026-01-01T00:00:00Z",
+                    },
+                    {
+                        "id": 10,
+                        "user": {"login": "author"},
+                        "body": "@codex review",
+                        "created_at": "2026-01-01T00:05:00Z",
+                    },
+                ],
+            ]
+        elif "pulls" in path and path.endswith("/comments"):
+            pages = []
+        elif path.endswith("/reactions"):
+            pages = []
+        else:
+            pages = []
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status("owner/name", 42, pr_author="author")
+        == ReviewStatus.PENDING
+    )
 
 
 def test_get_pr_review_status_handles_404(

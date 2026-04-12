@@ -90,7 +90,11 @@ def get_open_prs(repo: str) -> list[PRInfo]:
                 number=number,
                 branch=entry.get("headRefName", ""),
                 ci_status=_ci_status_from_rollup(entry.get("statusCheckRollup")),
-                review_status=get_pr_review_status(repo, number),
+                review_status=get_pr_review_status(
+                    repo,
+                    number,
+                    pr_author=(entry.get("author") or {}).get("login", ""),
+                ),
                 push_count=len(entry.get("commits") or []),
                 url=entry.get("url", ""),
                 last_activity=_parse_iso(entry.get("updatedAt")),
@@ -99,14 +103,16 @@ def get_open_prs(repo: str) -> list[PRInfo]:
     return prs
 
 
-def get_pr_review_status(repo: str, pr_number: int) -> ReviewStatus:
+def get_pr_review_status(
+    repo: str, pr_number: int, pr_author: str = ""
+) -> ReviewStatus:
     """Derive a Codex review status from PR issue comments, review comments, and reactions.
 
     Logic:
-    1. Find the first issue comment not posted by the Codex bot.
+    1. Find the first issue comment by the PR author (not from Codex).
     2. Check reactions on that comment from Codex: +1 → APPROVED, eyes → EYES.
-    3. If neither reaction, scan all Codex comments (issue + review) for P1/P2
-       → CHANGES_REQUESTED.
+    3. If neither reaction, scan Codex comments (issue + review) posted after
+       the anchor for P1/P2 → CHANGES_REQUESTED.
     4. Otherwise → PENDING.
     """
     try:
@@ -118,17 +124,19 @@ def get_pr_review_status(repo: str, pr_number: int) -> ReviewStatus:
     except Exception:
         review_comments = []
 
-    # Step 1: first issue comment not from the Codex bot.
-    first_comment = None
+    # Step 1: first issue comment by the PR author.
+    anchor = None
     for c in issue_comments:
-        user = (c.get("user") or {}).get("login", "")
-        if "codex" not in user.lower():
-            first_comment = c
+        author = (c.get("user") or {}).get("login", "")
+        if pr_author and author != pr_author:
+            continue
+        if "codex" not in author.lower():
+            anchor = c
             break
 
-    # Step 2: check Codex reactions on that comment.
-    if first_comment is not None:
-        cid = first_comment.get("id")
+    # Step 2: check Codex reactions on the anchor comment.
+    if anchor is not None:
+        cid = anchor.get("id")
         if cid is not None:
             try:
                 reactions = _gh_api_paginated(
@@ -149,10 +157,13 @@ def get_pr_review_status(repo: str, pr_number: int) -> ReviewStatus:
             except Exception:
                 pass
 
-    # Step 3: P1/P2 in any Codex comment body → CHANGES_REQUESTED.
+    # Step 3: P1/P2 in Codex comments after the anchor → CHANGES_REQUESTED.
+    anchor_ts = (anchor.get("created_at") or "") if anchor else ""
     for comment in issue_comments + review_comments:
         user = (comment.get("user") or {}).get("login", "") or ""
         if "codex" not in user.lower():
+            continue
+        if anchor_ts and (comment.get("created_at") or "") <= anchor_ts:
             continue
         body = comment.get("body") or ""
         if "P1" in body or "P2" in body:
