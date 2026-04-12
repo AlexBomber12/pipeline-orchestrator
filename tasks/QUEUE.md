@@ -112,3 +112,45 @@
 - Tasks file: tasks/PR-019.md
 - Branch: pr-019-agents-codex
 - Depends on: PR-013
+
+## PR-020: Stability fixes and cleanup
+- Status: TODO
+- Tasks file: tasks/PR-020.md
+- Branch: pr-020-stability
+- Depends on: PR-019
+
+## PR-021: Daemon startup hardening
+- Status: TODO
+- Tasks file: tasks/PR-021.md
+- Branch: pr-021-daemon-hardening
+- Depends on: PR-020
+
+## PR-022: IDLE open PR visibility
+- Status: TODO
+- Tasks file: tasks/PR-022.md
+- Branch: pr-022-idle-pr
+- Depends on: PR-021
+
+## PR-023: Index page redesign - zero scroll repo cards
+- Status: TODO
+- Tasks file: tasks/PR-023.md
+- Branch: pr-023-index-redesign
+- Depends on: PR-022
+
+## PR-024: Upload tasks and git push from dashboard
+- Status: TODO
+- Tasks file: tasks/PR-024.md
+- Branch: pr-024-upload-tasks
+- Depends on: PR-023
+
+## PR-025: Start stop controls per repo
+- Status: TODO
+- Tasks file: tasks/PR-025.md
+- Branch: pr-025-start-stop
+- Depends on: PR-024
+
+## PR-026: Tab title blink on alert
+- Status: TODO
+- Tasks file: tasks/PR-026.md
+- Branch: pr-026-tab-blink
+- Depends on: PR-023
