@@ -112,8 +112,10 @@ def get_pr_review_status(
 
     # Find the most recent anchor comment (PR author's "@codex review" trigger).
     # Only accept anchors written by the PR author to avoid false matches from
-    # other users quoting the trigger text.
+    # other users quoting the trigger text.  Using the latest anchor (not the
+    # first author comment) prevents stale approvals from earlier review rounds.
     anchor_endpoint = None
+    anchor_created_at: str = ""
     for c in reversed(issue_comments):
         author = (c.get("user") or {}).get("login", "")
         if pr_author and author != pr_author:
@@ -122,6 +124,7 @@ def get_pr_review_status(
             cid = c.get("id")
             if cid is not None:
                 anchor_endpoint = f"repos/{repo}/issues/comments/{cid}/reactions"
+                anchor_created_at = c.get("created_at") or ""
             break
     if anchor_endpoint is None:
         for c in reversed(review_comments):
@@ -132,11 +135,11 @@ def get_pr_review_status(
                 cid = c.get("id")
                 if cid is not None:
                     anchor_endpoint = f"repos/{repo}/pulls/comments/{cid}/reactions"
+                    anchor_created_at = c.get("created_at") or ""
                 break
 
     # Check reactions on the anchor comment for approval signal.
-    # Only count reactions from Codex accounts to avoid false positives from
-    # humans reacting with thumbs-up on the anchor comment.
+    # Only count reactions from Codex accounts to avoid false positives.
     if anchor_endpoint is not None:
         try:
             reactions = _gh_api_paginated(anchor_endpoint)
@@ -154,8 +157,17 @@ def get_pr_review_status(
         except Exception:
             pass
 
+    # Only consider Codex comments posted after the latest anchor so that
+    # stale feedback from a previous review round cannot affect the result.
+    def _after_anchor(c: dict) -> bool:
+        if not anchor_created_at:
+            return True
+        return (c.get("created_at") or "") > anchor_created_at
+
     # Check P1/P2 in Codex comments across both issue and review comments.
     for comment in reversed(issue_comments + review_comments):
+        if not _after_anchor(comment):
+            continue
         user = (comment.get("user") or {}).get("login", "") or ""
         if "codex" not in user.lower():
             continue
