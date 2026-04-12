@@ -137,7 +137,7 @@ def test_fix_review_uses_fix_review_prompt(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert captured["cmd"][-1] == "FIX REVIEW"
     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
-    assert captured["kwargs"]["timeout"] == 600
+    assert captured["kwargs"]["timeout"] == 1800
 
 
 def test_diagnose_error_builds_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
