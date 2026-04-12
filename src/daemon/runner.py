@@ -294,7 +294,12 @@ class PipelineRunner:
         """Serialize ``self.state`` and write it to Redis."""
         self.state.active = self.repo_config.active
         self.state.last_updated = datetime.now(timezone.utc)
-        payload = self.state.model_dump_json()
+        if not self.repo_config.active:
+            data = self.state.model_dump()
+            data["state"] = PipelineState.IDLE.value
+            payload = RepoState(**data).model_dump_json()
+        else:
+            payload = self.state.model_dump_json()
         await self.redis.set(f"pipeline:{self.name}", payload)
 
     def log_event(self, event: str) -> None:
