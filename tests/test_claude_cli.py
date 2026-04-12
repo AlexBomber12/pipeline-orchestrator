@@ -46,6 +46,7 @@ def test_run_claude_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured["kwargs"]["timeout"] == 42
     assert captured["kwargs"]["capture_output"] is True
     assert captured["kwargs"]["text"] is True
+    assert captured["kwargs"]["stdin"] is subprocess.DEVNULL
 
 
 def test_run_claude_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
