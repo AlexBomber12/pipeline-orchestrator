@@ -1082,13 +1082,9 @@ _ALLOWED_TASK_PATTERN = r"^(QUEUE\.md|PR-\d+\.md)$"
 import re as _re  # noqa: E402 — kept near usage
 
 
-def _git_run(
+def _git_run_sync(
     repo_path: str, *args: str, timeout: int = 30
 ) -> subprocess.CompletedProcess[str]:
-    """Run a git command inside *repo_path*.
-
-    Raises ``RuntimeError`` with stderr on non-zero exit.
-    """
     result = subprocess.run(
         ["git", *args],
         cwd=repo_path,
@@ -1100,6 +1096,12 @@ def _git_run(
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"git {args[0]} failed")
     return result
+
+
+async def _git_run(
+    repo_path: str, *args: str, timeout: int = 30
+) -> subprocess.CompletedProcess[str]:
+    return await asyncio.to_thread(_git_run_sync, repo_path, *args, timeout=timeout)
 
 
 def _render_upload_error(
@@ -1150,10 +1152,11 @@ async def upload_tasks(
     if not files:
         return _render_upload_error(request, "No files uploaded", 422, repo_name=name)
 
-    # Validate file names and sizes
+    # Validate file names and sizes (stream chunks to enforce limit early)
     has_queue = False
     total_size = 0
     file_contents: list[tuple[str, bytes]] = []
+    _CHUNK = 64 * 1024
     for f in files:
         fname = f.filename or ""
         if not _re.match(_ALLOWED_TASK_PATTERN, fname):
@@ -1163,12 +1166,18 @@ async def upload_tasks(
                 422,
                 repo_name=name,
             )
-        content = await f.read()
-        total_size += len(content)
-        if total_size > _UPLOAD_MAX_TOTAL_BYTES:
-            return _render_upload_error(
-                request, "Total upload size exceeds 1 MB", 422, repo_name=name
-            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = await f.read(_CHUNK)
+            if not chunk:
+                break
+            total_size += len(chunk)
+            if total_size > _UPLOAD_MAX_TOTAL_BYTES:
+                return _render_upload_error(
+                    request, "Total upload size exceeds 1 MB", 422, repo_name=name
+                )
+            chunks.append(chunk)
+        content = b"".join(chunks)
         file_contents.append((fname, content))
         if fname == "QUEUE.md":
             has_queue = True
@@ -1185,10 +1194,10 @@ async def upload_tasks(
             branch = repo.branch
             break
 
-    # Git operations and file writes
+    # Git operations and file writes (run in thread pool to avoid blocking)
     try:
-        _git_run(repo_path, "checkout", branch)
-        _git_run(repo_path, "pull", "origin", branch)
+        await _git_run(repo_path, "checkout", branch)
+        await _git_run(repo_path, "pull", "origin", branch)
 
         tasks_dir = Path(repo_path) / "tasks"
         tasks_dir.mkdir(exist_ok=True)
@@ -1196,14 +1205,18 @@ async def upload_tasks(
         for fname, content in file_contents:
             (tasks_dir / fname).write_bytes(content)
 
-        _git_run(repo_path, "add", *(f"tasks/{fname}" for fname, _ in file_contents))
-        _git_run(
-            repo_path,
-            "commit",
-            "-m",
-            "chore: upload sprint tasks via dashboard",
-        )
-        _git_run(repo_path, "push", "origin", branch)
+        await _git_run(repo_path, "add", *(f"tasks/{fname}" for fname, _ in file_contents))
+        try:
+            await _git_run(
+                repo_path,
+                "commit",
+                "-m",
+                "chore: upload sprint tasks via dashboard",
+            )
+        except RuntimeError as commit_exc:
+            if "nothing to commit" not in str(commit_exc):
+                raise
+        await _git_run(repo_path, "push", "origin", branch)
     except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
         return _render_upload_error(request, f"Git operation failed: {exc}", 422, repo_name=name)
 

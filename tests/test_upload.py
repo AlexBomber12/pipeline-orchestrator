@@ -125,7 +125,7 @@ def test_upload_success_calls_git(
 ) -> None:
     git_calls: list[tuple[str, ...]] = []
 
-    def fake_git_run(repo_path: str, *args: str, timeout: int = 30) -> None:
+    async def fake_git_run(repo_path: str, *args: str, timeout: int = 30) -> None:
         git_calls.append(args)
 
     monkeypatch.setattr("src.web.app._git_run", fake_git_run)
@@ -149,7 +149,8 @@ def test_upload_writes_files_to_tasks_dir(
     repo_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("src.web.app._git_run", lambda *a, **kw: None)
+    async def _noop(*a, **kw): pass
+    monkeypatch.setattr("src.web.app._git_run", _noop)
 
     with TestClient(app) as client:
         resp = client.post(
