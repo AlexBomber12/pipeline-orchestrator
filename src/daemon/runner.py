@@ -1268,11 +1268,21 @@ return 0
                     check=True,
                     cwd=self.repo_path,
                 )
-            except subprocess.CalledProcessError as exc:
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+            ) as exc:
+                # Cover non-zero exit (CalledProcessError), I/O stalls or lock
+                # contention exceeding 30s (TimeoutExpired), and missing git
+                # binary / unreadable cwd (OSError). Without these, the bare
+                # exception escapes run_cycle and the runner never publishes
+                # a clear FIX-stage ERROR.
+                stderr = getattr(exc, "stderr", "") or ""
                 self.state.state = PipelineState.ERROR
                 self.state.error_message = (
                     f"git checkout {self.state.current_pr.branch} failed: "
-                    f"{(exc.stderr or '').strip() or exc}"
+                    f"{stderr.strip() or exc}"
                 )
                 self.log_event(self.state.error_message)
                 return

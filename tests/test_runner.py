@@ -622,6 +622,39 @@ def test_handle_fix_errors_when_pr_branch_checkout_fails(
     assert fix_calls == [], "fix_review must not run when checkout fails"
 
 
+def test_handle_fix_errors_when_pr_branch_checkout_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P2: the checkout has ``timeout=30`` so a stalled git lock or
+    slow I/O can raise ``TimeoutExpired``. The except clause must catch it
+    too (alongside ``OSError``), otherwise the exception escapes the daemon
+    loop without setting ``PipelineState.ERROR`` and the state machine
+    drifts on the next cycle.
+    """
+    fix_calls: list[str] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "checkout"] and "pr-042-fix" in cmd:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=30)
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "fix_review",
+        lambda path: (fix_calls.append(path), (0, "", ""))[1],
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=42, branch="pr-042-fix")
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "pr-042-fix" in (runner.state.error_message or "")
+    assert fix_calls == [], "fix_review must not run when checkout times out"
+
+
 def test_handle_coding_errors_when_task_has_no_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
