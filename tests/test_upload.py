@@ -183,7 +183,10 @@ def test_upload_stages_files_and_sets_redis_key(
     assert resp.status_code == 200
     assert "queued" in resp.text.lower()
 
-    staging = uploads_dir / "alpha"
+    repo_upload_dir = uploads_dir / "alpha"
+    subdirs = list(repo_upload_dir.iterdir())
+    assert len(subdirs) == 1
+    staging = subdirs[0]
     assert (staging / "QUEUE.md").exists()
     assert (staging / "PR-001.md").exists()
     assert (staging / "QUEUE.md").read_bytes() == b"# Task Queue\n"
@@ -223,3 +226,5 @@ def test_upload_writes_redis_manifest(
     manifest = json.loads(redis_sets["upload:alpha:pending"])
     assert manifest["repo"] == "alpha"
     assert set(manifest["files"]) == {"QUEUE.md", "PR-002.md"}
+    assert "staging_dir" in manifest
+    assert "/alpha/" in manifest["staging_dir"]

@@ -2054,14 +2054,14 @@ def test_process_pending_uploads_preserves_upload_on_git_failure(
 
     runner = _make_runner()
     runner.repo_path = str(tmp_path)
-    manifest = json.dumps({"files": ["QUEUE.md"]})
-    key = f"upload:{runner.name}:pending"
-    asyncio.run(runner.redis.set(key, manifest))
 
-    staging = tmp_path.parent / "uploads" / runner.name
+    staging = tmp_path.parent / "uploads" / runner.name / "abc123"
     staging.mkdir(parents=True)
     (staging / "QUEUE.md").write_text("- PR-001")
-    monkeypatch.setattr(runner_module, "Path", lambda *a: Path(*a) if len(a) != 1 or a[0] != "/data/uploads" else tmp_path.parent / "uploads")
+
+    manifest = json.dumps({"files": ["QUEUE.md"], "staging_dir": str(staging)})
+    key = f"upload:{runner.name}:pending"
+    asyncio.run(runner.redis.set(key, manifest))
 
     result = asyncio.run(runner.process_pending_uploads())
     assert result is None
@@ -2079,17 +2079,16 @@ def test_process_pending_uploads_cas_delete_skips_newer_manifest(
     runner = _make_runner()
     runner.repo_path = str(tmp_path)
 
-    old_manifest = json.dumps({"files": ["QUEUE.md"]})
-    new_manifest = json.dumps({"files": ["PR-099.md"]})
-    key = f"upload:{runner.name}:pending"
-    asyncio.run(runner.redis.set(key, old_manifest))
-
-    staging = tmp_path.parent / "uploads" / runner.name
+    staging = tmp_path.parent / "uploads" / runner.name / "old123"
     staging.mkdir(parents=True, exist_ok=True)
     (staging / "QUEUE.md").write_text("- PR-001")
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir(exist_ok=True)
-    monkeypatch.setattr(runner_module, "Path", lambda *a: Path(*a) if len(a) != 1 or a[0] != "/data/uploads" else tmp_path.parent / "uploads")
+
+    old_manifest = json.dumps({"files": ["QUEUE.md"], "staging_dir": str(staging)})
+    new_manifest = json.dumps({"files": ["PR-099.md"]})
+    key = f"upload:{runner.name}:pending"
+    asyncio.run(runner.redis.set(key, old_manifest))
 
     # Simulate a new upload arriving after the daemon read the old manifest
     original_eval = runner.redis.eval

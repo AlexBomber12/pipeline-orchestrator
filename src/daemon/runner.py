@@ -977,7 +977,7 @@ return 0
             await self.redis.delete(key)
             return False
 
-        staging_dir = Path("/data/uploads") / self.name
+        staging_dir = Path(manifest["staging_dir"]) if "staging_dir" in manifest else Path("/data/uploads") / self.name
         filenames: list[str] = manifest.get("files", [])
         if not filenames or not staging_dir.is_dir():
             logger.warning("%s: upload manifest has no files or staging dir missing", self.name)

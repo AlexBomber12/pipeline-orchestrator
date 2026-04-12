@@ -1082,6 +1082,7 @@ UPLOADS_DIR = "/data/uploads"
 
 import json as _json  # noqa: E402 — kept near usage
 import re as _re  # noqa: E402 — kept near usage
+import uuid as _uuid  # noqa: E402 — kept near usage
 
 _upload_locks: dict[str, asyncio.Lock] = {}
 
@@ -1227,13 +1228,18 @@ async def upload_tasks(
     # dashboard's read-only contract with the repository working trees.
     lock = _get_upload_lock(name)
     async with lock:
-        staging_dir = Path(UPLOADS_DIR) / name
+        submission_id = _uuid.uuid4().hex[:12]
+        staging_dir = Path(UPLOADS_DIR) / name / submission_id
         await asyncio.to_thread(staging_dir.mkdir, parents=True, exist_ok=True)
 
         for fname, content in file_contents:
             await asyncio.to_thread((staging_dir / fname).write_bytes, content)
 
-        manifest = {"repo": name, "files": [fn for fn, _ in file_contents]}
+        manifest = {
+            "repo": name,
+            "files": [fn for fn, _ in file_contents],
+            "staging_dir": str(staging_dir),
+        }
         try:
             await redis_client.set(
                 f"upload:{name}:pending",

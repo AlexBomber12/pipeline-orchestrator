@@ -1,5 +1,5 @@
 diff --git a/artifacts/ci.log b/artifacts/ci.log
-index 338f6e8..25dc4b7 100644
+index 338f6e8..b85856e 100644
 --- a/artifacts/ci.log
 +++ b/artifacts/ci.log
 @@ -1,10 +1,10 @@
@@ -11,25 +11,25 @@ index 338f6e8..25dc4b7 100644
 -........................................................................ [ 84%]
 -........................................                                 [100%]
 -256 passed in 1.91s
-+........................................................................ [ 27%]
-+........................................................................ [ 54%]
-+........................................................................ [ 81%]
-+..................................................                       [100%]
-+266 passed in 1.74s
++........................................................................ [ 26%]
++........................................................................ [ 53%]
++........................................................................ [ 80%]
++...................................................                      [100%]
++267 passed in 1.87s
  ==> ci.sh OK
  ci.sh exit code: 0
 diff --git a/artifacts/pr.patch b/artifacts/pr.patch
-index 9256791..edea2be 100644
+index 9256791..ce22dbf 100644
 --- a/artifacts/pr.patch
 +++ b/artifacts/pr.patch
-@@ -1,622 +1,2372 @@
+@@ -1,622 +1,3744 @@
  diff --git a/artifacts/ci.log b/artifacts/ci.log
 -index 106d6a7..8ebb723 100644
-+index 338f6e8..461f13f 100644
++index 338f6e8..25dc4b7 100644
  --- a/artifacts/ci.log
  +++ b/artifacts/ci.log
 -@@ -1,65 +1,10 @@
-+@@ -1,10 +1,9 @@
++@@ -1,10 +1,10 @@
   ==> ruff check src/
   All checks passed!
   ==> pytest -q
@@ -110,22 +110,22 @@ index 9256791..edea2be 100644
 ++........................................................................ [ 27%]
 ++........................................................................ [ 54%]
 ++........................................................................ [ 81%]
-++................................................                         [100%]
-++264 passed in 1.70s
+++..................................................                       [100%]
+++266 passed in 1.74s
 + ==> ci.sh OK
-+-ci.sh exit code: 0
++ ci.sh exit code: 0
 +diff --git a/artifacts/pr.patch b/artifacts/pr.patch
-+index 9256791..d7dddec 100644
++index 9256791..edea2be 100644
 +--- a/artifacts/pr.patch
 ++++ b/artifacts/pr.patch
-+@@ -1,622 +1,1146 @@
++@@ -1,622 +1,2372 @@
 + diff --git a/artifacts/ci.log b/artifacts/ci.log
 +-index 106d6a7..8ebb723 100644
-++index 338f6e8..2cddc05 100644
+++index 338f6e8..461f13f 100644
 + --- a/artifacts/ci.log
 + +++ b/artifacts/ci.log
 +-@@ -1,65 +1,10 @@
-++@@ -1,10 +1,10 @@
+++@@ -1,10 +1,9 @@
 +  ==> ruff check src/
 +  All checks passed!
 +  ==> pytest -q
@@ -205,24 +205,26 @@ index 9256791..edea2be 100644
 ++-256 passed in 1.91s
 +++........................................................................ [ 27%]
 +++........................................................................ [ 54%]
-+++........................................................................ [ 82%]
-+++...............................................                          [100%]
-+++263 passed in 1.89s
++++........................................................................ [ 81%]
++++................................................                         [100%]
++++264 passed in 1.70s
 ++ ==> ci.sh OK
-++ ci.sh exit code: 0
+++-ci.sh exit code: 0
 ++diff --git a/artifacts/pr.patch b/artifacts/pr.patch
-++index 9256791..e69de29 100644
+++index 9256791..d7dddec 100644
 ++--- a/artifacts/pr.patch
 +++++ b/artifacts/pr.patch
-++@@ -1,622 +0,0 @@
-++-diff --git a/artifacts/ci.log b/artifacts/ci.log
+++@@ -1,622 +1,1146 @@
+++ diff --git a/artifacts/ci.log b/artifacts/ci.log
 ++-index 106d6a7..8ebb723 100644
-++---- a/artifacts/ci.log
-++-+++ b/artifacts/ci.log
++++index 338f6e8..2cddc05 100644
+++ --- a/artifacts/ci.log
+++ +++ b/artifacts/ci.log
 ++-@@ -1,65 +1,10 @@
-++- ==> ruff check src/
-++- All checks passed!
-++- ==> pytest -q
++++@@ -1,10 +1,10 @@
+++  ==> ruff check src/
+++  All checks passed!
+++  ==> pytest -q
 ++--...............F.....F.................................................. [ 29%]
 ++--........................................................................ [ 59%]
 ++--........................................................................ [ 88%]
@@ -292,10 +294,650 @@ index 9256791..edea2be 100644
 ++-+256 passed in 2.01s
 ++-+==> ci.sh OK
 ++-+ci.sh exit code: 0
-++-diff --git a/artifacts/structure.txt b/artifacts/structure.txt
++++-........................................................................ [ 28%]
++++-........................................................................ [ 56%]
++++-........................................................................ [ 84%]
++++-........................................                                 [100%]
++++-256 passed in 1.91s
+++++........................................................................ [ 27%]
+++++........................................................................ [ 54%]
+++++........................................................................ [ 82%]
+++++...............................................                          [100%]
+++++263 passed in 1.89s
++++ ==> ci.sh OK
++++ ci.sh exit code: 0
++++diff --git a/artifacts/pr.patch b/artifacts/pr.patch
++++index 9256791..e69de29 100644
++++--- a/artifacts/pr.patch
+++++++ b/artifacts/pr.patch
++++@@ -1,622 +0,0 @@
++++-diff --git a/artifacts/ci.log b/artifacts/ci.log
++++-index 106d6a7..8ebb723 100644
++++---- a/artifacts/ci.log
++++-+++ b/artifacts/ci.log
++++-@@ -1,65 +1,10 @@
++++- ==> ruff check src/
++++- All checks passed!
++++- ==> pytest -q
++++--...............F.....F.................................................. [ 29%]
++++--........................................................................ [ 59%]
++++--........................................................................ [ 88%]
++++--............................                                             [100%]
++++--=================================== FAILURES ===================================
++++--___________________________ test_run_claude_success ____________________________
++++--
++++--monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x75f2df20a5a0>
++++--
++++--    def test_run_claude_success(monkeypatch: pytest.MonkeyPatch) -> None:
++++--        captured: dict[str, Any] = {}
++++--    
++++--        def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
++++--            captured["cmd"] = cmd
++++--            captured["kwargs"] = kwargs
++++--            return _FakeCompletedProcess(stdout="hello", stderr="warn", returncode=0)
++++--    
++++--        monkeypatch.setattr(subprocess, "run", fake_run)
++++--    
++++--        result = run_claude("do a thing", "/data/repos/demo", timeout=42)
++++--    
++++--        assert result == (0, "hello", "warn")
++++-->       assert captured["cmd"] == [
++++--            "claude",
++++--            "--print",
++++--            "--dangerously-skip-permissions",
++++--            "do a thing",
++++--        ]
++++--E       AssertionError: assert ['claude', '-... 'do a thing'] == ['claude', '-... 'do a thing']
++++--E         
++++--E         At index 1 diff: '--dangerously-skip-permissions' != '--print'
++++--E         Right contains one more item: 'do a thing'
++++--E         Use -v to get more diff
++++--
++++--tests/test_claude_cli.py:39: AssertionError
++++--____________________ test_fix_review_uses_fix_review_prompt ____________________
++++--
++++--monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x75f2df20bbf0>
++++--
++++--    def test_fix_review_uses_fix_review_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
++++--        captured: dict[str, Any] = {}
++++--    
++++--        def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
++++--            captured["cmd"] = cmd
++++--            captured["kwargs"] = kwargs
++++--            return _FakeCompletedProcess(returncode=0)
++++--    
++++--        monkeypatch.setattr(subprocess, "run", fake_run)
++++--    
++++--        fix_review("/data/repos/demo")
++++--    
++++--        assert captured["cmd"][-1] == "FIX REVIEW"
++++--        assert captured["kwargs"]["cwd"] == "/data/repos/demo"
++++-->       assert captured["kwargs"]["timeout"] == 600
++++--E       assert 1800 == 600
++++--
++++--tests/test_claude_cli.py:140: AssertionError
++++--=========================== short test summary info ============================
++++--FAILED tests/test_claude_cli.py::test_run_claude_success - AssertionError: as...
++++--FAILED tests/test_claude_cli.py::test_fix_review_uses_fix_review_prompt - ass...
++++--2 failed, 242 passed in 1.68s
++++--exit: 1
++++-+........................................................................ [ 28%]
++++-+........................................................................ [ 56%]
++++-+........................................................................ [ 84%]
++++-+........................................                                 [100%]
++++-+256 passed in 2.01s
++++-+==> ci.sh OK
++++-+ci.sh exit code: 0
++++-diff --git a/artifacts/structure.txt b/artifacts/structure.txt
++++-index 2c5d760..bc51f12 100644
++++---- a/artifacts/structure.txt
++++-+++ b/artifacts/structure.txt
++++-@@ -12,9 +12,6 @@
++++- ./Dockerfile
++++- ./LICENSE
++++- ./README.md
++++--./artifacts/ci.log
++++--./artifacts/pr.patch
++++--./artifacts/structure.txt
++++- ./config.yml
++++- ./docker-compose.yml
++++- ./pyproject.toml
++++-@@ -39,6 +36,7 @@
++++- ./src/web/templates/components/activity_feed.html
++++- ./src/web/templates/components/alerts_panel.html
++++- ./src/web/templates/components/event_log.html
++++-+./src/web/templates/components/repo_cards.html
++++- ./src/web/templates/components/repo_list.html
++++- ./src/web/templates/components/repo_summary.html
++++- ./src/web/templates/components/settings_auth.html
++++-@@ -49,6 +47,7 @@
++++- ./src/web/templates/components/settings_repo_list.html
++++- ./src/web/templates/components/settings_repo_list_response.html
++++- ./src/web/templates/components/stats_cards.html
++++-+./src/web/templates/components/status_bar.html
++++- ./src/web/templates/index.html
++++- ./src/web/templates/repo.html
++++- ./src/web/templates/settings.html
++++-diff --git a/src/daemon/runner.py b/src/daemon/runner.py
++++-index ad95cf1..0512264 100644
++++---- a/src/daemon/runner.py
++++-+++ b/src/daemon/runner.py
++++-@@ -552,6 +552,11 @@ class PipelineRunner:
++++-             )
++++-             return False
++++- 
++++-+        self.state.queue_done = sum(
++++-+            1 for t in tasks if t.status == TaskStatus.DONE
++++-+        )
++++-+        self.state.queue_total = len(tasks)
++++-+
++++-         doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
++++- 
++++-         try:
++++-@@ -753,6 +758,10 @@ class PipelineRunner:
++++- 
++++-         queue_path = str(Path(self.repo_path) / "tasks" / "QUEUE.md")
++++-         tasks = parse_queue(queue_path)
++++-+        self.state.queue_done = sum(
++++-+            1 for t in tasks if t.status == TaskStatus.DONE
++++-+        )
++++-+        self.state.queue_total = len(tasks)
++++-         task = get_next_task(tasks)
++++-         if task is None:
++++-             self.log_event("No tasks available")
++++-diff --git a/src/models.py b/src/models.py
++++-index 2b8c333..2f7e81f 100644
++++---- a/src/models.py
++++-+++ b/src/models.py
++++-@@ -67,4 +67,6 @@ class RepoState(BaseModel):
++++-     last_updated: datetime = Field(
++++-         default_factory=lambda: datetime.now(timezone.utc)
++++-     )
++++-+    queue_done: int = 0
++++-+    queue_total: int = 0
++++-     history: list[dict] = Field(default_factory=list)
++++-diff --git a/src/web/app.py b/src/web/app.py
++++-index 41e9ce6..b0edcf9 100644
++++---- a/src/web/app.py
++++-+++ b/src/web/app.py
++++-@@ -521,8 +521,8 @@ async def index(request: Request) -> HTMLResponse:
++++-     redis_client = getattr(request.app.state, "redis", None)
++++-     states = await get_all_repo_states(redis_client)
++++-     stats = _compute_stats(states)
++++--    feed = _build_activity_feed(states)
++++-     alerts = _build_alerts(states)
++++-+    latest_alert = alerts[0] if alerts else None
++++-     return templates.TemplateResponse(
++++-         request,
++++-         "index.html",
++++-@@ -530,8 +530,7 @@ async def index(request: Request) -> HTMLResponse:
++++-             "title": "Dashboard",
++++-             "repos": states,
++++-             "stats": stats,
++++--            "feed": feed,
++++--            "alerts": alerts,
++++-+            "latest_alert": latest_alert,
++++-         },
++++-     )
++++- 
++++-@@ -556,7 +555,7 @@ async def partial_repo_list(request: Request) -> HTMLResponse:
++++-     states = await get_all_repo_states(redis_client)
++++-     return templates.TemplateResponse(
++++-         request,
++++--        "components/repo_list.html",
++++-+        "components/repo_cards.html",
++++-         {"repos": states},
++++-     )
++++- 
++++-@@ -566,10 +565,12 @@ async def partial_stats(request: Request) -> HTMLResponse:
++++-     redis_client = getattr(request.app.state, "redis", None)
++++-     states = await get_all_repo_states(redis_client)
++++-     stats = _compute_stats(states)
++++-+    alerts = _build_alerts(states)
++++-+    latest_alert = alerts[0] if alerts else None
++++-     return templates.TemplateResponse(
++++-         request,
++++--        "components/stats_cards.html",
++++--        {"stats": stats},
++++-+        "components/status_bar.html",
++++-+        {"stats": stats, "latest_alert": latest_alert},
++++-     )
++++- 
++++- 
++++-diff --git a/src/web/templates/components/repo_cards.html b/src/web/templates/components/repo_cards.html
++++-new file mode 100644
++++-index 0000000..5e7f3f4
++++---- /dev/null
++++-+++ b/src/web/templates/components/repo_cards.html
++++-@@ -0,0 +1,106 @@
++++-+{% set state_styles = {
++++-+    'IDLE':      {'dot': 'bg-gray-500',  'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30',  'pulse': false},
++++-+    'PREFLIGHT': {'dot': 'bg-gray-500',  'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30',  'pulse': false},
++++-+    'CODING':    {'dot': 'bg-accent',    'badge': 'bg-accent/10 text-accent border-accent/30',         'pulse': true},
++++-+    'WATCH':     {'dot': 'bg-warn',      'badge': 'bg-warn/10 text-warn border-warn/30',               'pulse': true},
++++-+    'FIX':       {'dot': 'bg-warn',      'badge': 'bg-warn/10 text-warn border-warn/30',               'pulse': true},
++++-+    'MERGE':     {'dot': 'bg-ok',        'badge': 'bg-ok/10 text-ok border-ok/30',                     'pulse': false},
++++-+    'HUNG':      {'dot': 'bg-hung',      'badge': 'bg-hung/10 text-hung border-hung/30',               'pulse': false},
++++-+    'ERROR':     {'dot': 'bg-fail',      'badge': 'bg-fail/10 text-fail border-fail/30',               'pulse': false},
++++-+} %}
++++-+
++++-+{% set ci_styles = {
++++-+    'PENDING': {'dot': 'bg-warn', 'pulse': true, 'label': 'CI pending'},
++++-+    'SUCCESS': {'dot': 'bg-ok',   'pulse': false, 'label': 'CI passed'},
++++-+    'FAILURE': {'dot': 'bg-fail', 'pulse': false, 'label': 'CI failed'},
++++-+} %}
++++-+
++++-+{% set review_emojis = {
++++-+    'PENDING':           '',
++++-+    'EYES':              '👀',
++++-+    'APPROVED':          '👍',
++++-+    'CHANGES_REQUESTED': '✏️',
++++-+} %}
++++-+
++++-+{% if not repos %}
++++-+<div class="rounded-lg border border-white/5 bg-surface-2 p-8 text-center">
++++-+    <p class="text-gray-300 font-medium mb-1">No repositories configured</p>
++++-+    <p class="text-gray-500 text-sm">
++++-+        Add entries under <code class="text-accent">repositories:</code> in
++++-+        <code class="text-accent">config.yml</code> to get started.
++++-+    </p>
++++-+</div>
++++-+{% else %}
++++-+<div class="grid gap-4 md:grid-cols-2">
++++-+    {% for repo in repos %}
++++-+    {% set style = state_styles.get(repo.state.value, state_styles['IDLE']) %}
++++-+    {% set is_error = repo.state.value == 'ERROR' %}
++++-+    <div class="rounded-lg border bg-surface-2 p-4 {{ 'border-l-2 border-l-fail border-white/5' if is_error else 'border-white/5' }}">
++++-+        {# Header row #}
++++-+        <div class="flex items-center justify-between mb-3">
++++-+            <div class="flex items-center gap-2 min-w-0">
++++-+                <span class="w-2.5 h-2.5 rounded-full {{ style.dot }} {% if style.pulse %}pulse-dot{% endif %} shrink-0"></span>
++++-+                <a href="/repo/{{ repo.name }}" class="font-mono text-sm text-white truncate hover:text-accent transition-colors">{{ repo.name }}</a>
++++-+                <span class="text-xs font-medium px-2 py-0.5 rounded border {{ style.badge }}">
++++-+                    {{ repo.state.value }}
++++-+                </span>
++++-+            </div>
++++-+            <div class="flex items-center gap-2 shrink-0">
++++-+                {% if repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done %}
++++-+                <span class="text-xs font-medium px-2 py-0.5 rounded border border-accent/30 text-accent">Start</span>
++++-+                {% endif %}
++++-+            </div>
++++-+        </div>
++++-+
++++-+        {% if is_error and repo.error_message %}
++++-+        {# Error variant: show error instead of normal body #}
++++-+        <div class="px-2 py-1.5 rounded bg-fail/10 border border-fail/20 text-fail text-xs truncate"
++++-+             title="{{ repo.error_message }}">
++++-+            {{ repo.error_message }}
++++-+        </div>
++++-+        {% else %}
++++-+        {# Body: 2-column grid #}
++++-+        <div class="grid grid-cols-2 gap-4 text-xs mb-2">
++++-+            <div>
++++-+                <div class="text-gray-500 mb-1">Sprint progress</div>
++++-+                <div class="text-gray-300 mb-1">{{ repo.queue_done }} / {{ repo.queue_total }} done</div>
++++-+                <div class="h-1 bg-surface-3 rounded-full overflow-hidden">
++++-+                    {% if repo.queue_total > 0 %}
++++-+                    <div class="h-full bg-ok rounded-full" style="width: {{ (repo.queue_done / repo.queue_total * 100)|round(1) }}%"></div>
++++-+                    {% endif %}
++++-+                </div>
++++-+            </div>
++++-+            <div>
++++-+                <div class="text-gray-500 mb-1">Current task</div>
++++-+                {% if repo.current_task %}
++++-+                <div class="font-mono text-gray-300 truncate" title="{{ repo.current_task.title }}">{{ repo.current_task.pr_id }} {{ repo.current_task.title }}</div>
++++-+                {% else %}
++++-+                <div class="text-gray-600 italic">No tasks</div>
++++-+                {% endif %}
++++-+            </div>
++++-+        </div>
++++-+
++++-+        {# PR row #}
++++-+        {% if repo.current_pr %}
++++-+        {% set ci = ci_styles.get(repo.current_pr.ci_status.value, ci_styles['PENDING']) %}
++++-+        {% set review_emoji = review_emojis.get(repo.current_pr.review_status.value, '') %}
++++-+        <div class="flex items-center gap-2 text-xs text-gray-400 mt-2 pt-2 border-t border-white/5">
++++-+            <a href="{{ repo.current_pr.url }}" class="font-mono text-gray-300 hover:text-accent">#{{ repo.current_pr.number }}</a>
++++-+            <span class="w-2 h-2 rounded-full {{ ci.dot }} {% if ci.pulse %}pulse-dot{% endif %}"></span>
++++-+            <span>{{ ci.label }}</span>
++++-+            {% if review_emoji %}
++++-+            <span>{{ review_emoji }}</span>
++++-+            {% endif %}
++++-+            {% if repo.current_pr.push_count > 1 %}
++++-+            <span class="text-gray-500">iter {{ repo.current_pr.push_count }}</span>
++++-+            {% endif %}
++++-+        </div>
++++-+        {% if repo.state.value == 'CODING' %}
++++-+        <div class="text-xs text-accent/70 italic mt-1">Claude is coding...</div>
++++-+        {% endif %}
++++-+        {% endif %}
++++-+        {% endif %}
++++-+    </div>
++++-+    {% endfor %}
++++-+</div>
++++-+{% endif %}
++++-diff --git a/src/web/templates/components/status_bar.html b/src/web/templates/components/status_bar.html
++++-new file mode 100644
++++-index 0000000..8946e95
++++---- /dev/null
++++-+++ b/src/web/templates/components/status_bar.html
++++-@@ -0,0 +1,30 @@
++++-+{# Compact bottom status bar for the index page. #}
++++-+<div class="rounded-lg border border-white/5 bg-surface-2 p-3">
++++-+    <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2">
++++-+        <div class="flex items-center gap-6 text-sm">
++++-+            <div>
++++-+                <span class="font-mono font-semibold text-white">{{ stats.repos }}</span>
++++-+                <span class="text-gray-500 text-xs uppercase tracking-wide ml-1">Repos</span>
++++-+            </div>
++++-+            <div>
++++-+                <span class="font-mono font-semibold text-white">{{ stats.done_today }}</span>
++++-+                <span class="text-gray-500 text-xs uppercase tracking-wide ml-1">Done today</span>
++++-+            </div>
++++-+            <div>
++++-+                <span class="font-mono font-semibold text-white">{{ stats.active }}</span>
++++-+                <span class="text-gray-500 text-xs uppercase tracking-wide ml-1">Active</span>
++++-+            </div>
++++-+            <div>
++++-+                <span class="font-mono font-semibold {% if stats.alerts > 0 %}text-fail{% else %}text-white{% endif %}">{{ stats.alerts }}</span>
++++-+                <span class="{% if stats.alerts > 0 %}text-fail/80{% else %}text-gray-500{% endif %} text-xs uppercase tracking-wide ml-1">Alerts</span>
++++-+            </div>
++++-+        </div>
++++-+        {% if latest_alert %}
++++-+        <div class="text-xs text-gray-500 truncate max-w-md">
++++-+            <span class="text-gray-400">{{ latest_alert.repo_name }}</span>
++++-+            {{ latest_alert.error_message|default(latest_alert.kind, true)|truncate(60) }}
++++-+            <span class="text-gray-600">- {{ latest_alert.duration_text }}</span>
++++-+        </div>
++++-+        {% endif %}
++++-+    </div>
++++-+</div>
++++-diff --git a/src/web/templates/index.html b/src/web/templates/index.html
++++-index 6ef89ed..2eb9be4 100644
++++---- a/src/web/templates/index.html
++++-+++ b/src/web/templates/index.html
++++-@@ -3,30 +3,10 @@
++++- {% block title %}Dashboard - Pipeline Orchestrator{% endblock %}
++++- 
++++- {% block content %}
++++--<div hx-get="/partials/alerts"
++++--     hx-trigger="every 10s"
++++--     hx-swap="innerHTML">
++++--    {% include "components/alerts_panel.html" %}
++++-+<div hx-get="/partials/repo-list" hx-trigger="every 10s" hx-swap="innerHTML" id="repo-grid">
++++-+    {% include "components/repo_cards.html" %}
++++- </div>
++++--
++++--<div class="mb-6"
++++--     hx-get="/partials/stats"
++++--     hx-trigger="every 10s"
++++--     hx-swap="innerHTML">
++++--    {% include "components/stats_cards.html" %}
++++--</div>
++++--
++++--<div class="grid gap-6 lg:grid-cols-3">
++++--    <div class="lg:col-span-2"
++++--         hx-get="/partials/repo-list"
++++--         hx-trigger="every 10s"
++++--         hx-swap="innerHTML">
++++--        {% include "components/repo_list.html" %}
++++--    </div>
++++--    <div hx-get="/partials/activity-feed"
++++--         hx-trigger="every 10s"
++++--         hx-swap="innerHTML">
++++--        {% include "components/activity_feed.html" %}
++++--    </div>
++++-+<div hx-get="/partials/stats" hx-trigger="every 10s" hx-swap="innerHTML" id="status-bar" style="margin-top: 14px;">
++++-+    {% include "components/status_bar.html" %}
++++- </div>
++++- {% endblock %}
++++-diff --git a/tasks/QUEUE.md b/tasks/QUEUE.md
++++-index d206baf..a950c9f 100644
++++---- a/tasks/QUEUE.md
++++-+++ b/tasks/QUEUE.md
++++-@@ -132,7 +132,7 @@
++++- - Depends on: PR-021
++++- 
++++- ## PR-023: Index page redesign - zero scroll repo cards
++++--- Status: TODO
++++-+- Status: DONE
++++- - Tasks file: tasks/PR-023.md
++++- - Branch: pr-023-index-redesign
++++- - Depends on: PR-022
++++-diff --git a/tests/test_alerts.py b/tests/test_alerts.py
++++-index 68e0b9a..0507f13 100644
++++---- a/tests/test_alerts.py
++++-+++ b/tests/test_alerts.py
++++-@@ -496,11 +496,11 @@ def test_alert_repo_link_points_to_repo_detail(alerts_config: Path) -> None:
++++- 
++++- 
++++- def test_index_mounts_alerts_partial(alerts_config: Path) -> None:
++++--    """Dashboard index wires the alerts panel to the 10s HTMX poll."""
++++-+    """Dashboard index wires the status bar (with inline alerts) to the 10s HTMX poll."""
++++-     with TestClient(app) as client:
++++-         response = client.get("/")
++++- 
++++-     assert response.status_code == 200
++++-     body = response.text
++++--    assert 'hx-get="/partials/alerts"' in body
++++-+    assert 'hx-get="/partials/stats"' in body
++++-     assert 'hx-trigger="every 10s"' in body
++++-diff --git a/tests/test_observability.py b/tests/test_observability.py
++++-index 08355b2..067c82c 100644
++++---- a/tests/test_observability.py
++++-+++ b/tests/test_observability.py
++++-@@ -496,10 +496,8 @@ def test_index_route_shows_stats_and_activity_blocks(
++++-     assert response.status_code == 200
++++-     body = response.text
++++-     assert 'hx-get="/partials/stats"' in body
++++--    assert 'hx-get="/partials/activity-feed"' in body
++++-     assert 'hx-get="/partials/repo-list"' in body
++++-     assert "Done today" in body
++++--    assert "Activity" in body
++++- 
++++- 
++++- def test_partial_repo_events_filters_by_query(
++++-diff --git a/tests/test_recovery.py b/tests/test_recovery.py
++++-index afec0e7..87c4cd5 100644
++++---- a/tests/test_recovery.py
++++-+++ b/tests/test_recovery.py
++++-@@ -109,6 +109,8 @@ def test_recover_doing_task_with_matching_pr_recovers_to_watch(
++++-     assert runner.state.current_task.pr_id == "PR-042"
++++-     assert runner.state.current_pr is not None
++++-     assert runner.state.current_pr.number == 17
++++-+    assert runner.state.queue_done == 0
++++-+    assert runner.state.queue_total == 1
++++-     assert coding_called is False
++++-     assert any(
++++-         "Recovered: DOING task PR-042" in e["event"] and "WATCH PR #17" in e["event"]
++++-@@ -116,6 +118,38 @@ def test_recover_doing_task_with_matching_pr_recovers_to_watch(
++++-     )
++++- 
++++- 
++++-+def test_recover_state_sets_queue_counters(
++++-+    monkeypatch: pytest.MonkeyPatch,
++++-+) -> None:
++++-+    """recover_state must populate queue_done and queue_total."""
++++-+    done_task = QueueTask(
++++-+        pr_id="PR-001", title="Done", status=TaskStatus.DONE,
++++-+        branch="pr-001-done",
++++-+    )
++++-+    doing_task = _doing_task()
++++-+    todo_task = QueueTask(
++++-+        pr_id="PR-043", title="Todo", status=TaskStatus.TODO,
++++-+        branch="pr-043-todo",
++++-+    )
++++-+    matching_pr = PRInfo(
++++-+        number=17,
++++-+        branch="pr-042-inflight",
++++-+        ci_status=CIStatus.PENDING,
++++-+        review_status=ReviewStatus.PENDING,
++++-+    )
++++-+    monkeypatch.setattr(
++++-+        runner_module.github_client, "get_open_prs", lambda repo: [matching_pr]
++++-+    )
++++-+
++++-+    runner = _make_runner()
++++-+    runner._parse_base_queue = lambda: [done_task, doing_task, todo_task]  # type: ignore[method-assign]
++++-+    runner.handle_coding = lambda: None  # type: ignore[method-assign]
++++-+    asyncio.run(runner.recover_state())
++++-+
++++-+    assert runner.state.queue_done == 1
++++-+    assert runner.state.queue_total == 3
++++-+
++++-+
++++- def test_recover_doing_task_without_pr_rerun_coding(
++++-     monkeypatch: pytest.MonkeyPatch,
++++- ) -> None:
++++-diff --git a/tests/test_runner.py b/tests/test_runner.py
++++-index 2a992a3..7a8f358 100644
++++---- a/tests/test_runner.py
++++-+++ b/tests/test_runner.py
++++-@@ -153,6 +153,8 @@ def test_handle_idle_no_tasks_leaves_state_idle(
++++- 
++++-     assert runner.state.state == PipelineState.IDLE
++++-     assert runner.state.current_task is None
++++-+    assert runner.state.queue_done == 0
++++-+    assert runner.state.queue_total == 0
++++-     assert any("No tasks" in e["event"] for e in runner.state.history)
++++-     # sync_to_main must run fetch -> checkout -> reset --hard in order so
++++-     # that parse_queue reads QUEUE.md from the tip of origin/{branch}, not
++++-@@ -217,6 +219,40 @@ def test_handle_idle_picks_task_and_drives_coding(
++++-     assert runner.state.current_pr.number == 17
++++-     assert runner.state.current_task is not None
++++-     assert runner.state.current_task.pr_id == "PR-042"
++++-+    assert runner.state.queue_done == 0
++++-+    assert runner.state.queue_total == 1
++++-+
++++-+
++++-+def test_handle_idle_sets_queue_counters_with_mixed_statuses(
++++-+    monkeypatch: pytest.MonkeyPatch,
++++-+) -> None:
++++-+    _patch_subprocess(monkeypatch)
++++-+    tasks = [
++++-+        QueueTask(pr_id="PR-001", title="Done1", status=TaskStatus.DONE, branch="pr-001"),
++++-+        QueueTask(pr_id="PR-002", title="Done2", status=TaskStatus.DONE, branch="pr-002"),
++++-+        QueueTask(pr_id="PR-003", title="Todo", status=TaskStatus.TODO, branch="pr-003"),
++++-+    ]
++++-+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: tasks)
++++-+    monkeypatch.setattr(runner_module, "get_next_task", lambda t: tasks[2])
++++-+    monkeypatch.setattr(
++++-+        runner_module.claude_cli, "run_planned_pr", lambda path: (0, "ok", "")
++++-+    )
++++-+    monkeypatch.setattr(
++++-+        runner_module.github_client,
++++-+        "get_open_prs",
++++-+        lambda repo: [PRInfo(number=1, branch="pr-003")],
++++-+    )
++++-+    monkeypatch.setattr(
++++-+        runner_module.github_client,
++++-+        "post_comment",
++++-+        lambda repo, number, body: None,
++++-+    )
++++-+
++++-+    runner = _make_runner()
++++-+    asyncio.run(runner.handle_idle())
++++-+
++++-+    assert runner.state.queue_done == 2
++++-+    assert runner.state.queue_total == 3
++++- 
++++- 
++++- def test_handle_coding_errors_when_no_pr_found(
++++-diff --git a/tests/test_web_app.py b/tests/test_web_app.py
++++-index 5448127..e250959 100644
++++---- a/tests/test_web_app.py
++++-+++ b/tests/test_web_app.py
++++-@@ -154,8 +154,8 @@ def test_index_route_returns_html(
++++-     assert "text/html" in response.headers["content-type"]
++++-     body = response.text
++++-     assert "Pipeline Orchestrator" in body
++++--    assert "Repositories" in body
++++-     assert 'hx-get="/partials/repo-list"' in body
++++-+    assert 'id="status-bar"' in body
++++- 
++++- 
++++- def test_api_states_returns_json(
++++-@@ -188,6 +188,7 @@ def test_partial_repo_list_returns_html_fragment(
++++-     assert "alpha" in body
++++-     assert "beta" in body
++++-     assert "IDLE" in body
++++-+    assert "0 / 0 done" in body
++++- 
++++- 
++++- def test_partial_repo_list_empty_state(
++++-@@ -202,6 +203,67 @@ def test_partial_repo_list_empty_state(
++++-     assert "No repositories configured" in response.text
++++- 
++++- 
++++-+def test_partial_repo_list_renders_queue_progress(
++++-+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
++++-+) -> None:
++++-+    now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
++++-+    stored = RepoState(
++++-+        url="https://github.com/example/alpha.git",
++++-+        name="alpha",
++++-+        state=PipelineState.CODING,
++++-+        current_task=QueueTask(
++++-+            pr_id="PR-005",
++++-+            title="Dashboard",
++++-+            status=TaskStatus.DOING,
++++-+        ),
++++-+        queue_done=4,
++++-+        queue_total=10,
++++-+        last_updated=now,
++++-+    )
++++-+
++++-+    class _StubClientWithQueue:
++++-+        async def get(self, key: str) -> str | None:
++++-+            if key == "pipeline:alpha":
++++-+                return stored.model_dump_json()
++++-+            return None
++++-+
++++-+        async def aclose(self) -> None:
++++-+            return None
++++-+
++++-+    class _StubAioredisWithQueue:
++++-+        @staticmethod
++++-+        def from_url(
++++-+            url: str, decode_responses: bool = True
++++-+        ) -> _StubClientWithQueue:
++++-+            return _StubClientWithQueue()
++++-+
++++-+    monkeypatch.setattr(web_app, "aioredis", _StubAioredisWithQueue())
++++-+
++++-+    with TestClient(app) as client:
++++-+        response = client.get("/partials/repo-list")
++++-+
++++-+    assert response.status_code == 200
++++-+    body = response.text
++++-+    assert "4 / 10 done" in body
++++-+    assert "PR-005" in body
++++-+
++++-+
++++-+def test_partial_stats_renders_status_bar(
++++-+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
++++-+) -> None:
++++-+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
++++-+
++++-+    with TestClient(app) as client:
++++-+        response = client.get("/partials/stats")
++++-+
++++-+    assert response.status_code == 200
++++-+    body = response.text
++++-+    assert "Repos" in body
++++-+    assert "Done today" in body
++++-+    assert "Active" in body
++++-+    assert "Alerts" in body
++++-+
++++-+
++++- def test_get_repo_state_unknown_repo_returns_idle_default(
++++-     empty_config: Path,
++++- ) -> None:
+++ diff --git a/artifacts/structure.txt b/artifacts/structure.txt
 ++-index 2c5d760..bc51f12 100644
-++---- a/artifacts/structure.txt
-++-+++ b/artifacts/structure.txt
++++index bc51f12..065e8f1 100644
+++ --- a/artifacts/structure.txt
+++ +++ b/artifacts/structure.txt
 ++-@@ -12,9 +12,6 @@
 ++- ./Dockerfile
 ++- ./LICENSE
@@ -316,12 +958,15 @@ index 9256791..edea2be 100644
 ++- ./src/web/templates/components/settings_auth.html
 ++-@@ -49,6 +47,7 @@
 ++- ./src/web/templates/components/settings_repo_list.html
-++- ./src/web/templates/components/settings_repo_list_response.html
-++- ./src/web/templates/components/stats_cards.html
++++@@ -48,6 +48,7 @@
+++  ./src/web/templates/components/settings_repo_list_response.html
+++  ./src/web/templates/components/stats_cards.html
 ++-+./src/web/templates/components/status_bar.html
-++- ./src/web/templates/index.html
-++- ./src/web/templates/repo.html
-++- ./src/web/templates/settings.html
++++ ./src/web/templates/components/status_bar.html
+++++./src/web/templates/components/upload_error.html
+++  ./src/web/templates/index.html
+++  ./src/web/templates/repo.html
+++  ./src/web/templates/settings.html
 ++-diff --git a/src/daemon/runner.py b/src/daemon/runner.py
 ++-index ad95cf1..0512264 100644
 ++---- a/src/daemon/runner.py
@@ -360,10 +1005,30 @@ index 9256791..edea2be 100644
 ++-+    queue_done: int = 0
 ++-+    queue_total: int = 0
 ++-     history: list[dict] = Field(default_factory=list)
-++-diff --git a/src/web/app.py b/src/web/app.py
++++@@ -95,5 +96,6 @@
++++ ./tests/test_runner.py
++++ ./tests/test_scaffolder.py
++++ ./tests/test_settings.py
+++++./tests/test_upload.py
++++ ./tests/test_utils.py
++++ ./tests/test_web_app.py
++++diff --git a/docker-compose.yml b/docker-compose.yml
++++index 83f1b7b..bca44b8 100644
++++--- a/docker-compose.yml
+++++++ b/docker-compose.yml
++++@@ -1,6 +1,7 @@
++++ services:
++++   web:
++++     build: .
+++++    entrypoint: ["bash", "scripts/entrypoint.sh"]
++++     command: uvicorn src.web.app:app --host 0.0.0.0 --port 8000 --reload
++++     user: "1000:1000"
++++     ports:
+++ diff --git a/src/web/app.py b/src/web/app.py
 ++-index 41e9ce6..b0edcf9 100644
-++---- a/src/web/app.py
-++-+++ b/src/web/app.py
++++index a4828b8..ad9e468 100644
+++ --- a/src/web/app.py
+++ +++ b/src/web/app.py
 ++-@@ -521,8 +521,8 @@ async def index(request: Request) -> HTMLResponse:
 ++-     redis_client = getattr(request.app.state, "redis", None)
 ++-     states = await get_all_repo_states(redis_client)
@@ -383,7 +1048,9 @@ index 9256791..edea2be 100644
 ++-+            "latest_alert": latest_alert,
 ++-         },
 ++-     )
-++- 
++++@@ -18,7 +18,7 @@ from pathlib import Path
++++ from typing import Any, AsyncIterator
+++  
 ++-@@ -556,7 +555,7 @@ async def partial_repo_list(request: Request) -> HTMLResponse:
 ++-     states = await get_all_repo_states(redis_client)
 ++-     return templates.TemplateResponse(
@@ -392,7 +1059,12 @@ index 9256791..edea2be 100644
 ++-+        "components/repo_cards.html",
 ++-         {"repos": states},
 ++-     )
-++- 
++++ import redis.asyncio as aioredis
++++-from fastapi import FastAPI, Form, Request
+++++from fastapi import FastAPI, Form, Request, UploadFile
++++ from fastapi.responses import HTMLResponse, JSONResponse
++++ from fastapi.templating import Jinja2Templates
+++  
 ++-@@ -566,10 +565,12 @@ async def partial_stats(request: Request) -> HTMLResponse:
 ++-     redis_client = getattr(request.app.state, "redis", None)
 ++-     states = await get_all_repo_states(redis_client)
@@ -406,13 +1078,217 @@ index 9256791..edea2be 100644
 ++-+        "components/status_bar.html",
 ++-+        {"stats": stats, "latest_alert": latest_alert},
 ++-     )
-++- 
-++- 
-++-diff --git a/src/web/templates/components/repo_cards.html b/src/web/templates/components/repo_cards.html
++++@@ -34,6 +34,7 @@ from src.utils import repo_name_from_url
+++  
++++ DEFAULT_REDIS_URL = "redis://localhost:6379/0"
++++ CONFIG_PATH = "config.yml"
+++++REPOS_DIR = "/data/repos"
+++  
++++ _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
++++ templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
++++@@ -1069,3 +1070,195 @@ async def put_settings_repo(
++++     except OSError as exc:
++++         return _render_config_write_error(request, exc)
++++     return _render_settings_repo_list(request)
+++++
+++++
+++++# ---------------------------------------------------------------------------
+++++# Upload tasks
+++++# ---------------------------------------------------------------------------
+++++
+++++_UPLOAD_MAX_TOTAL_BYTES = 1_000_000  # 1 MB
+++++_ALLOWED_TASK_PATTERN = r"^(QUEUE\.md|PR-[A-Za-z0-9._-]+\.md)$"
+++++
+++++import re as _re  # noqa: E402 — kept near usage
+++++
+++++
+++++def _git_run_sync(
+++++    repo_path: str, *args: str, timeout: int = 30
+++++) -> subprocess.CompletedProcess[str]:
+++++    result = subprocess.run(
+++++        ["git", *args],
+++++        cwd=repo_path,
+++++        capture_output=True,
+++++        text=True,
+++++        timeout=timeout,
+++++        check=False,
+++++    )
+++++    if result.returncode != 0:
+++++        parts = [s for s in (result.stderr.strip(), result.stdout.strip()) if s]
+++++        msg = "\n".join(parts) or f"git {args[0]} failed"
+++++        raise RuntimeError(msg)
+++++    return result
+++++
+++++
+++++async def _git_run(
+++++    repo_path: str, *args: str, timeout: int = 30
+++++) -> subprocess.CompletedProcess[str]:
+++++    return await asyncio.to_thread(_git_run_sync, repo_path, *args, timeout=timeout)
+++++
+++++
+++++def _render_upload_error(
+++++    request: Request, message: str, status_code: int, repo_name: str = ""
+++++) -> HTMLResponse:
+++++    response = templates.TemplateResponse(
+++++        request,
+++++        "components/upload_error.html",
+++++        {"message": message},
+++++        status_code=status_code,
+++++    )
+++++    if repo_name:
+++++        css_name = _re.sub(r"([.#\[\]:>+~(){}|^$*!])", r"\\\1", repo_name)
+++++        response.headers["HX-Retarget"] = f"#upload-error-{css_name}"
+++++        response.headers["HX-Reswap"] = "innerHTML"
+++++    return response
+++++
+++++
+++++@app.post("/repos/{name}/upload-tasks", response_class=HTMLResponse)
+++++async def upload_tasks(
+++++    request: Request, name: str, files: list[UploadFile] = []
+++++) -> HTMLResponse:
+++++    cfg = load_config(CONFIG_PATH)
+++++    found = False
+++++    for repo in cfg.repositories:
+++++        if repo_name_from_url(repo.url) == name:
+++++            found = True
+++++            break
+++++
+++++    if not found:
+++++        return _render_upload_error(request, f"Repository '{name}' not found", 404, repo_name=name)
+++++
+++++    repo_path = f"{REPOS_DIR}/{name}"
+++++    if not Path(repo_path).is_dir():
+++++        return _render_upload_error(
+++++            request, f"Repository '{name}' is not cloned", 422, repo_name=name
+++++        )
+++++
+++++    redis_client = getattr(request.app.state, "redis", None)
+++++    if redis_client is None:
+++++        return _render_upload_error(
+++++            request,
+++++            "Cannot verify repo state (Redis unavailable). Upload blocked.",
+++++            503,
+++++            repo_name=name,
+++++        )
+++++    try:
+++++        raw = await redis_client.get(f"pipeline:{name}")
+++++    except Exception:
+++++        return _render_upload_error(
+++++            request,
+++++            "Cannot verify repo state (Redis error). Upload blocked.",
+++++            503,
+++++            repo_name=name,
+++++        )
+++++    if raw:
+++++        try:
+++++            repo_state = RepoState.model_validate_json(raw)
+++++        except Exception:
+++++            return _render_upload_error(
+++++                request,
+++++                "Cannot verify repo state (corrupt data). Upload blocked.",
+++++                503,
+++++                repo_name=name,
+++++            )
+++++    else:
+++++        return _render_upload_error(
+++++            request,
+++++            "Cannot verify repo state (no state recorded). Upload blocked.",
+++++            503,
+++++            repo_name=name,
+++++        )
+++++    if repo_state.state != PipelineState.IDLE:
+++++        return _render_upload_error(
+++++            request,
+++++            f"Cannot upload while repo is {repo_state.state.value}. Wait until IDLE.",
+++++            422,
+++++            repo_name=name,
+++++        )
+++++
+++++    if not files:
+++++        return _render_upload_error(request, "No files uploaded", 422, repo_name=name)
+++++
+++++    # Validate file names and sizes (stream chunks to enforce limit early)
+++++    has_queue = False
+++++    total_size = 0
+++++    file_contents: list[tuple[str, bytes]] = []
+++++    _CHUNK = 64 * 1024
+++++    for f in files:
+++++        fname = f.filename or ""
+++++        if not _re.match(_ALLOWED_TASK_PATTERN, fname):
+++++            return _render_upload_error(
+++++                request,
+++++                f"Invalid file name: '{fname}'. Only QUEUE.md and PR-*.md allowed.",
+++++                422,
+++++                repo_name=name,
+++++            )
+++++        chunks: list[bytes] = []
+++++        while True:
+++++            chunk = await f.read(_CHUNK)
+++++            if not chunk:
+++++                break
+++++            total_size += len(chunk)
+++++            if total_size > _UPLOAD_MAX_TOTAL_BYTES:
+++++                return _render_upload_error(
+++++                    request, "Total upload size exceeds 1 MB", 422, repo_name=name
+++++                )
+++++            chunks.append(chunk)
+++++        content = b"".join(chunks)
+++++        file_contents.append((fname, content))
+++++        if fname == "QUEUE.md":
+++++            has_queue = True
+++++
+++++    if not has_queue:
+++++        return _render_upload_error(
+++++            request, "QUEUE.md is required in the upload", 422, repo_name=name
+++++        )
+++++
+++++    # Determine branch from config
+++++    branch = "main"
+++++    for repo in cfg.repositories:
+++++        if repo_name_from_url(repo.url) == name:
+++++            branch = repo.branch
+++++            break
+++++
+++++    # Git operations and file writes (run in thread pool to avoid blocking)
+++++    try:
+++++        await _git_run(repo_path, "checkout", branch)
+++++        await _git_run(repo_path, "pull", "origin", branch)
+++++
+++++        tasks_dir = Path(repo_path) / "tasks"
+++++        tasks_dir.mkdir(exist_ok=True)
+++++
+++++        for fname, content in file_contents:
+++++            (tasks_dir / fname).write_bytes(content)
+++++
+++++        await _git_run(repo_path, "add", *(f"tasks/{fname}" for fname, _ in file_contents))
+++++        try:
+++++            await _git_run(
+++++                repo_path,
+++++                "commit",
+++++                "-m",
+++++                "chore: upload sprint tasks via dashboard",
+++++            )
+++++        except RuntimeError as commit_exc:
+++++            if "nothing to commit" not in str(commit_exc):
+++++                raise
+++++        await _git_run(repo_path, "push", "origin", branch)
+++++    except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+++++        return _render_upload_error(request, f"Git operation failed: {exc}", 422, repo_name=name)
+++++
+++++    # Return refreshed repo cards
+++++    states = await get_all_repo_states(redis_client)
+++++    return templates.TemplateResponse(
+++++        request,
+++++        "components/repo_cards.html",
+++++        {"repos": states},
+++++    )
+++ diff --git a/src/web/templates/components/repo_cards.html b/src/web/templates/components/repo_cards.html
 ++-new file mode 100644
 ++-index 0000000..5e7f3f4
 ++---- /dev/null
-++-+++ b/src/web/templates/components/repo_cards.html
++++index 5e7f3f4..5fd953b 100644
++++--- a/src/web/templates/components/repo_cards.html
+++ +++ b/src/web/templates/components/repo_cards.html
 ++-@@ -0,0 +1,106 @@
 ++-+{% set state_styles = {
 ++-+    'IDLE':      {'dot': 'bg-gray-500',  'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30',  'pulse': false},
@@ -521,9 +1397,38 @@ index 9256791..edea2be 100644
 ++-+</div>
 ++-+{% endif %}
 ++-diff --git a/src/web/templates/components/status_bar.html b/src/web/templates/components/status_bar.html
-++-new file mode 100644
++++@@ -49,6 +49,18 @@
++++                 {% if repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done %}
++++                 <span class="text-xs font-medium px-2 py-0.5 rounded border border-accent/30 text-accent">Start</span>
++++                 {% endif %}
+++++                <form hx-post="/repos/{{ repo.name }}/upload-tasks"
+++++                      hx-encoding="multipart/form-data"
+++++                      hx-target="#repo-grid"
+++++                      hx-swap="innerHTML">
+++++                    <input type="file" name="files" multiple accept=".md"
+++++                           onchange="this.form.requestSubmit()"
+++++                           class="hidden" id="upload-{{ repo.name }}">
+++++                    <label for="upload-{{ repo.name }}"
+++++                           class="text-xs font-medium px-2 py-0.5 rounded border border-white/10 text-gray-400 hover:text-accent hover:border-accent/30 transition-colors cursor-pointer">
+++++                        Upload tasks
+++++                    </label>
+++++                </form>
++++             </div>
++++         </div>
++++ 
++++@@ -100,6 +112,7 @@
++++         {% endif %}
++++         {% endif %}
++++         {% endif %}
+++++        <div id="upload-error-{{ repo.name }}"></div>
++++     </div>
++++     {% endfor %}
++++ </div>
++++diff --git a/src/web/templates/components/upload_error.html b/src/web/templates/components/upload_error.html
+++ new file mode 100644
 ++-index 0000000..8946e95
-++---- /dev/null
++++index 0000000..a6acd01
+++ --- /dev/null
 ++-+++ b/src/web/templates/components/status_bar.html
 ++-@@ -0,0 +1,30 @@
 ++-+{# Compact bottom status bar for the index page. #}
@@ -555,7 +1460,11 @@ index 9256791..edea2be 100644
 ++-+        </div>
 ++-+        {% endif %}
 ++-+    </div>
-++-+</div>
+++++++ b/src/web/templates/components/upload_error.html
++++@@ -0,0 +1,3 @@
+++++<div class="rounded-lg border border-fail/30 bg-fail/10 px-3 py-2 text-fail text-xs mt-2">
+++++    {{ message }}
+++ +</div>
 ++-diff --git a/src/web/templates/index.html b/src/web/templates/index.html
 ++-index 6ef89ed..2eb9be4 100644
 ++---- a/src/web/templates/index.html
@@ -595,16 +1504,20 @@ index 9256791..edea2be 100644
 ++-+    {% include "components/status_bar.html" %}
 ++- </div>
 ++- {% endblock %}
-++-diff --git a/tasks/QUEUE.md b/tasks/QUEUE.md
+++ diff --git a/tasks/QUEUE.md b/tasks/QUEUE.md
 ++-index d206baf..a950c9f 100644
-++---- a/tasks/QUEUE.md
-++-+++ b/tasks/QUEUE.md
++++index a950c9f..4c3ea81 100644
+++ --- a/tasks/QUEUE.md
+++ +++ b/tasks/QUEUE.md
 ++-@@ -132,7 +132,7 @@
 ++- - Depends on: PR-021
-++- 
++++@@ -138,7 +138,7 @@
++++ - Depends on: PR-022
+++  
 ++- ## PR-023: Index page redesign - zero scroll repo cards
-++--- Status: TODO
-++-+- Status: DONE
++++ ## PR-024: Upload tasks and git push from dashboard
+++ -- Status: TODO
+++ +- Status: DONE
 ++- - Tasks file: tasks/PR-023.md
 ++- - Branch: pr-023-index-redesign
 ++- - Depends on: PR-022
@@ -679,17 +1592,75 @@ index 9256791..edea2be 100644
 ++-+    )
 ++-+    monkeypatch.setattr(
 ++-+        runner_module.github_client, "get_open_prs", lambda repo: [matching_pr]
-++-+    )
-++-+
++++ - Tasks file: tasks/PR-024.md
++++ - Branch: pr-024-upload-tasks
++++ - Depends on: PR-023
++++diff --git a/tests/test_upload.py b/tests/test_upload.py
++++new file mode 100644
++++index 0000000..2f96fac
++++--- /dev/null
+++++++ b/tests/test_upload.py
++++@@ -0,0 +1,192 @@
+++++"""Tests for the upload-tasks endpoint."""
+++++
+++++from __future__ import annotations
+++++
+++++from pathlib import Path
+++++
+++++import pytest
+++++from fastapi.testclient import TestClient
+++++
+++++from src.web import app as web_app
+++++from src.web.app import app
+++++
+++++
+++++class _StubAioredisClient:
+++++    async def get(self, key: str) -> str | None:
+++++        if key.startswith("pipeline:"):
+++++            name = key.split(":", 1)[1]
+++++            return f'{{"url":"","name":"{name}","state":"IDLE"}}'
+++++        return None
+++++
+++++    async def aclose(self) -> None:
+++++        return None
+++++
+++++
+++++class _StubAioredis:
+++++    @staticmethod
+++++    def from_url(url: str, decode_responses: bool = True) -> _StubAioredisClient:
+++++        return _StubAioredisClient()
+++++
+++++
+++++@pytest.fixture
+++++def one_repo_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+++++    cfg = tmp_path / "config.yml"
+++++    cfg.write_text(
+++++        "repositories:\n"
+++++        "  - url: https://github.com/example/alpha.git\n",
+++++        encoding="utf-8",
+++ +    )
+++++    monkeypatch.chdir(tmp_path)
+++++    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+++++    return cfg
+++ +
 ++-+    runner = _make_runner()
 ++-+    runner._parse_base_queue = lambda: [done_task, doing_task, todo_task]  # type: ignore[method-assign]
 ++-+    runner.handle_coding = lambda: None  # type: ignore[method-assign]
 ++-+    asyncio.run(runner.recover_state())
-++-+
+++ +
 ++-+    assert runner.state.queue_done == 1
 ++-+    assert runner.state.queue_total == 3
-++-+
-++-+
+++++@pytest.fixture
+++++def repo_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+++++    """Create a fake repo dir and point REPOS_DIR at it."""
+++++    repos = tmp_path / "repos"
+++++    repos.mkdir()
+++++    alpha = repos / "alpha"
+++++    alpha.mkdir()
+++++    monkeypatch.setattr(web_app, "REPOS_DIR", str(repos))
+++++    return alpha
+++ +
+++ +
 ++- def test_recover_doing_task_without_pr_rerun_coding(
 ++-     monkeypatch: pytest.MonkeyPatch,
 ++- ) -> None:
@@ -716,7 +1687,21 @@ index 9256791..edea2be 100644
 ++-+
 ++-+def test_handle_idle_sets_queue_counters_with_mixed_statuses(
 ++-+    monkeypatch: pytest.MonkeyPatch,
-++-+) -> None:
+++++def _queue_file() -> tuple[str, tuple[str, bytes, str]]:
+++++    return ("files", ("QUEUE.md", b"# Task Queue\n", "text/markdown"))
+++++
+++++
+++++def _pr_file(name: str = "PR-001.md") -> tuple[str, tuple[str, bytes, str]]:
+++++    return ("files", (name, b"# PR\n", "text/markdown"))
+++++
+++++
+++++def _bad_file() -> tuple[str, tuple[str, bytes, str]]:
+++++    return ("files", ("README.md", b"# Readme\n", "text/markdown"))
+++++
+++++
+++++def test_upload_nonexistent_repo(
+++++    one_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+++ +) -> None:
 ++-+    _patch_subprocess(monkeypatch)
 ++-+    tasks = [
 ++-+        QueueTask(pr_id="PR-001", title="Done1", status=TaskStatus.DONE, branch="pr-001"),
@@ -738,10 +1723,17 @@ index 9256791..edea2be 100644
 ++-+        "post_comment",
 ++-+        lambda repo, number, body: None,
 ++-+    )
-++-+
+++++    with TestClient(app) as client:
+++++        resp = client.post(
+++++            "/repos/ghost/upload-tasks",
+++++            files=[_queue_file()],
+++++        )
+++++    assert resp.status_code == 404
+++++    assert "not found" in resp.text
+++ +
 ++-+    runner = _make_runner()
 ++-+    asyncio.run(runner.handle_idle())
-++-+
+++ +
 ++-+    assert runner.state.queue_done == 2
 ++-+    assert runner.state.queue_total == 3
 ++- 
@@ -775,7 +1767,11 @@ index 9256791..edea2be 100644
 ++- 
 ++-+def test_partial_repo_list_renders_queue_progress(
 ++-+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
-++-+) -> None:
+++++def test_upload_repo_not_cloned(
+++++    one_repo_config: Path,
+++++    tmp_path: Path,
+++++    monkeypatch: pytest.MonkeyPatch,
+++ +) -> None:
 ++-+    now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
 ++-+    stored = RepoState(
 ++-+        url="https://github.com/example/alpha.git",
@@ -790,56 +1786,147 @@ index 9256791..edea2be 100644
 ++-+        queue_total=10,
 ++-+        last_updated=now,
 ++-+    )
-++-+
+++++    # Point REPOS_DIR to a dir that has no "alpha" sub-dir
+++++    empty_repos = tmp_path / "empty_repos"
+++++    empty_repos.mkdir()
+++++    monkeypatch.setattr(web_app, "REPOS_DIR", str(empty_repos))
+++++
+++++    with TestClient(app) as client:
+++++        resp = client.post(
+++++            "/repos/alpha/upload-tasks",
+++++            files=[_queue_file()],
+++++        )
+++++    assert resp.status_code == 422
+++++    assert "not cloned" in resp.text
+++ +
 ++-+    class _StubClientWithQueue:
-++-+        async def get(self, key: str) -> str | None:
+++++
+++++def test_upload_blocked_when_redis_key_absent(
+++++    one_repo_config: Path,
+++++    repo_dir: Path,
+++++    monkeypatch: pytest.MonkeyPatch,
+++++) -> None:
+++++    class _EmptyRedis:
+++ +        async def get(self, key: str) -> str | None:
 ++-+            if key == "pipeline:alpha":
 ++-+                return stored.model_dump_json()
-++-+            return None
+++ +            return None
 ++-+
-++-+        async def aclose(self) -> None:
-++-+            return None
-++-+
+++ +        async def aclose(self) -> None:
+++ +            return None
+++ +
 ++-+    class _StubAioredisWithQueue:
 ++-+        @staticmethod
 ++-+        def from_url(
 ++-+            url: str, decode_responses: bool = True
 ++-+        ) -> _StubClientWithQueue:
 ++-+            return _StubClientWithQueue()
-++-+
+++++    monkeypatch.setattr(web_app, "aioredis", type("R", (), {
+++++        "from_url": staticmethod(lambda *a, **kw: _EmptyRedis()),
+++++    })())
+++ +
 ++-+    monkeypatch.setattr(web_app, "aioredis", _StubAioredisWithQueue())
-++-+
-++-+    with TestClient(app) as client:
+++++    with TestClient(app) as client:
+++++        resp = client.post(
+++++            "/repos/alpha/upload-tasks",
+++++            files=[_queue_file()],
+++++        )
+++++    assert resp.status_code == 503
+++++    assert "no state recorded" in resp.text
+++ +
+++++
+++++def test_upload_without_queue_md(
+++++    one_repo_config: Path,
+++++    repo_dir: Path,
+++++) -> None:
+++ +    with TestClient(app) as client:
 ++-+        response = client.get("/partials/repo-list")
-++-+
+++++        resp = client.post(
+++++            "/repos/alpha/upload-tasks",
+++++            files=[_pr_file()],
+++++        )
+++++    assert resp.status_code == 422
+++++    assert "QUEUE.md is required" in resp.text
+++++
+++ +
 ++-+    assert response.status_code == 200
 ++-+    body = response.text
 ++-+    assert "4 / 10 done" in body
 ++-+    assert "PR-005" in body
-++-+
-++-+
+++++def test_upload_invalid_filename(
+++++    one_repo_config: Path,
+++++    repo_dir: Path,
+++++) -> None:
+++++    with TestClient(app) as client:
+++++        resp = client.post(
+++++            "/repos/alpha/upload-tasks",
+++++            files=[_queue_file(), _bad_file()],
+++++        )
+++++    assert resp.status_code == 422
+++++    assert "Invalid file name" in resp.text
+++ +
+++ +
 ++-+def test_partial_stats_renders_status_bar(
 ++-+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
-++-+) -> None:
+++++def test_upload_success_calls_git(
+++++    one_repo_config: Path,
+++++    repo_dir: Path,
+++++    monkeypatch: pytest.MonkeyPatch,
+++ +) -> None:
 ++-+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
-++-+
-++-+    with TestClient(app) as client:
+++++    git_calls: list[tuple[str, ...]] = []
+++++
+++++    async def fake_git_run(repo_path: str, *args: str, timeout: int = 30) -> None:
+++++        git_calls.append(args)
+++++
+++++    monkeypatch.setattr("src.web.app._git_run", fake_git_run)
+++ +
+++ +    with TestClient(app) as client:
 ++-+        response = client.get("/partials/stats")
-++-+
+++++        resp = client.post(
+++++            "/repos/alpha/upload-tasks",
+++++            files=[_queue_file(), _pr_file()],
+++++        )
+++++
+++++    assert resp.status_code == 200
+++++    assert git_calls[0][0] == "checkout"
+++++    assert git_calls[1][0] == "pull"
+++++    assert git_calls[2][0] == "add"
+++++    assert git_calls[3][0] == "commit"
+++++    assert git_calls[4][0] == "push"
+++++
+++ +
 ++-+    assert response.status_code == 200
 ++-+    body = response.text
 ++-+    assert "Repos" in body
 ++-+    assert "Done today" in body
 ++-+    assert "Active" in body
 ++-+    assert "Alerts" in body
-++-+
-++-+
+++++def test_upload_writes_files_to_tasks_dir(
+++++    one_repo_config: Path,
+++++    repo_dir: Path,
+++++    monkeypatch: pytest.MonkeyPatch,
+++++) -> None:
+++++    async def _noop(*a, **kw): pass
+++++    monkeypatch.setattr("src.web.app._git_run", _noop)
+++ +
+++++    with TestClient(app) as client:
+++++        resp = client.post(
+++++            "/repos/alpha/upload-tasks",
+++++            files=[_queue_file(), _pr_file("PR-001.md")],
+++++        )
+++ +
 ++- def test_get_repo_state_unknown_repo_returns_idle_default(
 ++-     empty_config: Path,
 ++- ) -> None:
+++++    assert resp.status_code == 200
+++++    tasks_dir = repo_dir / "tasks"
+++++    assert (tasks_dir / "QUEUE.md").exists()
+++++    assert (tasks_dir / "PR-001.md").exists()
+++++    assert (tasks_dir / "QUEUE.md").read_text() == "# Task Queue\n"
 + diff --git a/artifacts/structure.txt b/artifacts/structure.txt
 +-index 2c5d760..bc51f12 100644
-++index bc51f12..065e8f1 100644
+++index bc51f12..dc6ccd0 100644
 + --- a/artifacts/structure.txt
 + +++ b/artifacts/structure.txt
 +-@@ -12,9 +12,6 @@
@@ -862,54 +1949,17 @@ index 9256791..edea2be 100644
 +- ./src/web/templates/components/settings_auth.html
 +-@@ -49,6 +47,7 @@
 +- ./src/web/templates/components/settings_repo_list.html
-++@@ -48,6 +48,7 @@
+++@@ -48,6 +48,8 @@
 +  ./src/web/templates/components/settings_repo_list_response.html
 +  ./src/web/templates/components/stats_cards.html
 +-+./src/web/templates/components/status_bar.html
 ++ ./src/web/templates/components/status_bar.html
 +++./src/web/templates/components/upload_error.html
++++./src/web/templates/components/upload_success.html
 +  ./src/web/templates/index.html
 +  ./src/web/templates/repo.html
 +  ./src/web/templates/settings.html
-+-diff --git a/src/daemon/runner.py b/src/daemon/runner.py
-+-index ad95cf1..0512264 100644
-+---- a/src/daemon/runner.py
-+-+++ b/src/daemon/runner.py
-+-@@ -552,6 +552,11 @@ class PipelineRunner:
-+-             )
-+-             return False
-+- 
-+-+        self.state.queue_done = sum(
-+-+            1 for t in tasks if t.status == TaskStatus.DONE
-+-+        )
-+-+        self.state.queue_total = len(tasks)
-+-+
-+-         doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
-+- 
-+-         try:
-+-@@ -753,6 +758,10 @@ class PipelineRunner:
-+- 
-+-         queue_path = str(Path(self.repo_path) / "tasks" / "QUEUE.md")
-+-         tasks = parse_queue(queue_path)
-+-+        self.state.queue_done = sum(
-+-+            1 for t in tasks if t.status == TaskStatus.DONE
-+-+        )
-+-+        self.state.queue_total = len(tasks)
-+-         task = get_next_task(tasks)
-+-         if task is None:
-+-             self.log_event("No tasks available")
-+-diff --git a/src/models.py b/src/models.py
-+-index 2b8c333..2f7e81f 100644
-+---- a/src/models.py
-+-+++ b/src/models.py
-+-@@ -67,4 +67,6 @@ class RepoState(BaseModel):
-+-     last_updated: datetime = Field(
-+-         default_factory=lambda: datetime.now(timezone.utc)
-+-     )
-+-+    queue_done: int = 0
-+-+    queue_total: int = 0
-+-     history: list[dict] = Field(default_factory=list)
-++@@ -95,5 +96,6 @@
+++@@ -95,5 +97,6 @@
 ++ ./tests/test_runner.py
 ++ ./tests/test_scaffolder.py
 ++ ./tests/test_settings.py
@@ -928,9 +1978,145 @@ index 9256791..edea2be 100644
 ++     command: uvicorn src.web.app:app --host 0.0.0.0 --port 8000 --reload
 ++     user: "1000:1000"
 ++     ports:
++ diff --git a/src/daemon/runner.py b/src/daemon/runner.py
++-index ad95cf1..0512264 100644
+++index 0512264..ebc1330 100644
++ --- a/src/daemon/runner.py
++ +++ b/src/daemon/runner.py
++-@@ -552,6 +552,11 @@ class PipelineRunner:
++-             )
++-             return False
+++@@ -10,7 +10,9 @@ never persisted across cycles.
++  
++-+        self.state.queue_done = sum(
++-+            1 for t in tasks if t.status == TaskStatus.DONE
++-+        )
++-+        self.state.queue_total = len(tasks)
++-+
++-         doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
+++ from __future__ import annotations
+++ 
++++import json
+++ import logging
++++import shutil
+++ import subprocess
+++ from datetime import datetime, timezone
+++ from pathlib import Path
+++@@ -743,6 +745,75 @@ class PipelineRunner:
++  
++-         try:
++-@@ -753,6 +758,10 @@ class PipelineRunner:
+++         await self.publish_state()
+++ 
++++    async def process_pending_uploads(self) -> bool:
++++        """Commit and push any files staged by the web upload endpoint.
++++
++++        Returns True if an upload was processed (caller should re-sync
++++        before continuing with task selection).
++++        """
++++        key = f"upload:{self.name}:pending"
++++        try:
++++            raw = await self.redis.get(key)
++++        except Exception:
++++            logger.warning("%s: Redis error checking pending uploads", self.name)
++++            return False
++++        if not raw:
++++            return False
++++
++++        try:
++++            manifest = json.loads(raw)
++++        except (json.JSONDecodeError, TypeError):
++++            logger.error("%s: corrupt upload manifest, discarding", self.name)
++++            await self.redis.delete(key)
++++            return False
++++
++++        staging_dir = Path("/data/uploads") / self.name
++++        filenames: list[str] = manifest.get("files", [])
++++        if not filenames or not staging_dir.is_dir():
++++            logger.warning("%s: upload manifest has no files or staging dir missing", self.name)
++++            await self.redis.delete(key)
++++            return False
++++
++++        branch = self.repo_config.branch
++++        try:
++++            tasks_dir = Path(self.repo_path) / "tasks"
++++            tasks_dir.mkdir(exist_ok=True)
++++            for fname in filenames:
++++                src = staging_dir / fname
++++                if src.is_file():
++++                    shutil.copy2(str(src), str(tasks_dir / fname))
++++
++++            subprocess.run(
++++                ["git", "add"] + [f"tasks/{fn}" for fn in filenames],
++++                cwd=self.repo_path,
++++                capture_output=True, text=True, timeout=30, check=True,
++++            )
++++            commit_result = subprocess.run(
++++                ["git", "commit", "-m", "chore: upload sprint tasks via dashboard"],
++++                cwd=self.repo_path,
++++                capture_output=True, text=True, timeout=30, check=False,
++++            )
++++            if commit_result.returncode != 0:
++++                combined = f"{commit_result.stderr}\n{commit_result.stdout}"
++++                if "nothing to commit" not in combined:
++++                    raise RuntimeError(combined.strip())
++++            subprocess.run(
++++                ["git", "push", "origin", branch],
++++                cwd=self.repo_path,
++++                capture_output=True, text=True, timeout=60, check=True,
++++            )
++++            self.log_event(f"Pushed uploaded task files: {filenames}")
++++        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
++++            logger.error("%s: upload git operations failed: %s", self.name, exc)
++++            self.log_event(f"Upload push failed: {exc}")
++++            await self.redis.delete(key)
++++            shutil.rmtree(str(staging_dir), ignore_errors=True)
++++            return False
++++
++++        await self.redis.delete(key)
++++        shutil.rmtree(str(staging_dir), ignore_errors=True)
++++        return True
++++
+++     async def handle_idle(self) -> None:
+++         """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
+++         # sync_to_main is only safe in IDLE state: it runs git reset --hard
+++@@ -756,6 +827,15 @@ class PipelineRunner:
+++             self.log_event(f"sync_to_main failed: {exc}")
+++             return
++  
++++        if await self.process_pending_uploads():
++++            try:
++++                self.sync_to_main()
++++            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
++++                self.state.state = PipelineState.ERROR
++++                self.state.error_message = f"sync_to_main after upload failed: {exc}"
++++                self.log_event(f"sync_to_main after upload failed: {exc}")
++++                return
++++
++          queue_path = str(Path(self.repo_path) / "tasks" / "QUEUE.md")
++          tasks = parse_queue(queue_path)
++-+        self.state.queue_done = sum(
++-+            1 for t in tasks if t.status == TaskStatus.DONE
++-+        )
++-+        self.state.queue_total = len(tasks)
++-         task = get_next_task(tasks)
++-         if task is None:
++-             self.log_event("No tasks available")
++-diff --git a/src/models.py b/src/models.py
++-index 2b8c333..2f7e81f 100644
++---- a/src/models.py
++-+++ b/src/models.py
++-@@ -67,4 +67,6 @@ class RepoState(BaseModel):
++-     last_updated: datetime = Field(
++-         default_factory=lambda: datetime.now(timezone.utc)
++-     )
++-+    queue_done: int = 0
++-+    queue_total: int = 0
++-     history: list[dict] = Field(default_factory=list)
+++         self.state.queue_done = sum(
 + diff --git a/src/web/app.py b/src/web/app.py
 +-index 41e9ce6..b0edcf9 100644
-++index a4828b8..ad9e468 100644
+++index a4828b8..a74b5ab 100644
 + --- a/src/web/app.py
 + +++ b/src/web/app.py
 +-@@ -521,8 +521,8 @@ async def index(request: Request) -> HTMLResponse:
@@ -990,7 +2176,7 @@ index 9256791..edea2be 100644
 +  
 ++ _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 ++ templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
-++@@ -1069,3 +1070,195 @@ async def put_settings_repo(
+++@@ -1069,3 +1070,185 @@ async def put_settings_repo(
 ++     except OSError as exc:
 ++         return _render_config_write_error(request, exc)
 ++     return _render_settings_repo_list(request)
@@ -1002,32 +2188,18 @@ index 9256791..edea2be 100644
 +++
 +++_UPLOAD_MAX_TOTAL_BYTES = 1_000_000  # 1 MB
 +++_ALLOWED_TASK_PATTERN = r"^(QUEUE\.md|PR-[A-Za-z0-9._-]+\.md)$"
++++UPLOADS_DIR = "/data/uploads"
 +++
++++import json as _json  # noqa: E402 — kept near usage
 +++import re as _re  # noqa: E402 — kept near usage
 +++
-+++
-+++def _git_run_sync(
-+++    repo_path: str, *args: str, timeout: int = 30
-+++) -> subprocess.CompletedProcess[str]:
-+++    result = subprocess.run(
-+++        ["git", *args],
-+++        cwd=repo_path,
-+++        capture_output=True,
-+++        text=True,
-+++        timeout=timeout,
-+++        check=False,
-+++    )
-+++    if result.returncode != 0:
-+++        parts = [s for s in (result.stderr.strip(), result.stdout.strip()) if s]
-+++        msg = "\n".join(parts) or f"git {args[0]} failed"
-+++        raise RuntimeError(msg)
-+++    return result
++++_upload_locks: dict[str, asyncio.Lock] = {}
 +++
 +++
-+++async def _git_run(
-+++    repo_path: str, *args: str, timeout: int = 30
-+++) -> subprocess.CompletedProcess[str]:
-+++    return await asyncio.to_thread(_git_run_sync, repo_path, *args, timeout=timeout)
++++def _get_upload_lock(repo_name: str) -> asyncio.Lock:
++++    if repo_name not in _upload_locks:
++++        _upload_locks[repo_name] = asyncio.Lock()
++++    return _upload_locks[repo_name]
 +++
 +++
 +++def _render_upload_error(
@@ -1043,6 +2215,20 @@ index 9256791..edea2be 100644
 +++        css_name = _re.sub(r"([.#\[\]:>+~(){}|^$*!])", r"\\\1", repo_name)
 +++        response.headers["HX-Retarget"] = f"#upload-error-{css_name}"
 +++        response.headers["HX-Reswap"] = "innerHTML"
++++    return response
++++
++++
++++def _render_upload_success(
++++    request: Request, message: str, repo_name: str
++++) -> HTMLResponse:
++++    response = templates.TemplateResponse(
++++        request,
++++        "components/upload_success.html",
++++        {"message": message},
++++    )
++++    css_name = _re.sub(r"([.#\[\]:>+~(){}|^$*!])", r"\\\1", repo_name)
++++    response.headers["HX-Retarget"] = f"#upload-error-{css_name}"
++++    response.headers["HX-Reswap"] = "innerHTML"
 +++    return response
 +++
 +++
@@ -1146,53 +2332,73 @@ index 9256791..edea2be 100644
 +++            request, "QUEUE.md is required in the upload", 422, repo_name=name
 +++        )
 +++
-+++    # Determine branch from config
-+++    branch = "main"
-+++    for repo in cfg.repositories:
-+++        if repo_name_from_url(repo.url) == name:
-+++            branch = repo.branch
-+++            break
-+++
-+++    # Git operations and file writes (run in thread pool to avoid blocking)
-+++    try:
-+++        await _git_run(repo_path, "checkout", branch)
-+++        await _git_run(repo_path, "pull", "origin", branch)
-+++
-+++        tasks_dir = Path(repo_path) / "tasks"
-+++        tasks_dir.mkdir(exist_ok=True)
++++    # Stage files to /data/uploads/{repo}/ and enqueue for daemon processing.
++++    # Git write operations are handled by the daemon to preserve the
++++    # dashboard's read-only contract with the repository working trees.
++++    lock = _get_upload_lock(name)
++++    async with lock:
++++        staging_dir = Path(UPLOADS_DIR) / name
++++        await asyncio.to_thread(staging_dir.mkdir, parents=True, exist_ok=True)
 +++
 +++        for fname, content in file_contents:
-+++            (tasks_dir / fname).write_bytes(content)
++++            await asyncio.to_thread((staging_dir / fname).write_bytes, content)
 +++
-+++        await _git_run(repo_path, "add", *(f"tasks/{fname}" for fname, _ in file_contents))
++++        manifest = {"repo": name, "files": [fn for fn, _ in file_contents]}
 +++        try:
-+++            await _git_run(
-+++                repo_path,
-+++                "commit",
-+++                "-m",
-+++                "chore: upload sprint tasks via dashboard",
++++            await redis_client.set(
++++                f"upload:{name}:pending",
++++                _json.dumps(manifest),
 +++            )
-+++        except RuntimeError as commit_exc:
-+++            if "nothing to commit" not in str(commit_exc):
-+++                raise
-+++        await _git_run(repo_path, "push", "origin", branch)
-+++    except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
-+++        return _render_upload_error(request, f"Git operation failed: {exc}", 422, repo_name=name)
++++        except Exception:
++++            return _render_upload_error(
++++                request,
++++                "Failed to enqueue upload (Redis error).",
++++                503,
++++                repo_name=name,
++++            )
 +++
-+++    # Return refreshed repo cards
-+++    states = await get_all_repo_states(redis_client)
-+++    return templates.TemplateResponse(
++++    return _render_upload_success(
 +++        request,
-+++        "components/repo_cards.html",
-+++        {"repos": states},
++++        "Tasks queued. The daemon will commit and push on its next cycle.",
++++        repo_name=name,
 +++    )
 + diff --git a/src/web/templates/components/repo_cards.html b/src/web/templates/components/repo_cards.html
-+-new file mode 100644
-+-index 0000000..5e7f3f4
-+---- /dev/null
 ++index 5e7f3f4..5fd953b 100644
 ++--- a/src/web/templates/components/repo_cards.html
-+ +++ b/src/web/templates/components/repo_cards.html
++++++ b/src/web/templates/components/repo_cards.html
+++@@ -49,6 +49,18 @@
+++                 {% if repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done %}
+++                 <span class="text-xs font-medium px-2 py-0.5 rounded border border-accent/30 text-accent">Start</span>
+++                 {% endif %}
++++                <form hx-post="/repos/{{ repo.name }}/upload-tasks"
++++                      hx-encoding="multipart/form-data"
++++                      hx-target="#repo-grid"
++++                      hx-swap="innerHTML">
++++                    <input type="file" name="files" multiple accept=".md"
++++                           onchange="this.form.requestSubmit()"
++++                           class="hidden" id="upload-{{ repo.name }}">
++++                    <label for="upload-{{ repo.name }}"
++++                           class="text-xs font-medium px-2 py-0.5 rounded border border-white/10 text-gray-400 hover:text-accent hover:border-accent/30 transition-colors cursor-pointer">
++++                        Upload tasks
++++                    </label>
++++                </form>
+++             </div>
+++         </div>
+++ 
+++@@ -100,6 +112,7 @@
+++         {% endif %}
+++         {% endif %}
+++         {% endif %}
++++        <div id="upload-error-{{ repo.name }}"></div>
+++     </div>
+++     {% endfor %}
+++ </div>
+++diff --git a/src/web/templates/components/upload_error.html b/src/web/templates/components/upload_error.html
++ new file mode 100644
++-index 0000000..5e7f3f4
+++index 0000000..a6acd01
++ --- /dev/null
++-+++ b/src/web/templates/components/repo_cards.html
 +-@@ -0,0 +1,106 @@
 +-+{% set state_styles = {
 +-+    'IDLE':      {'dot': 'bg-gray-500',  'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30',  'pulse': false},
@@ -1225,7 +2431,11 @@ index 9256791..edea2be 100644
 +-+        Add entries under <code class="text-accent">repositories:</code> in
 +-+        <code class="text-accent">config.yml</code> to get started.
 +-+    </p>
-+-+</div>
++++++ b/src/web/templates/components/upload_error.html
+++@@ -0,0 +1,3 @@
++++<div class="rounded-lg border border-fail/30 bg-fail/10 px-3 py-2 text-fail text-xs mt-2">
++++    {{ message }}
++ +</div>
 +-+{% else %}
 +-+<div class="grid gap-4 md:grid-cols-2">
 +-+    {% for repo in repos %}
@@ -1301,37 +2511,10 @@ index 9256791..edea2be 100644
 +-+</div>
 +-+{% endif %}
 +-diff --git a/src/web/templates/components/status_bar.html b/src/web/templates/components/status_bar.html
-++@@ -49,6 +49,18 @@
-++                 {% if repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done %}
-++                 <span class="text-xs font-medium px-2 py-0.5 rounded border border-accent/30 text-accent">Start</span>
-++                 {% endif %}
-+++                <form hx-post="/repos/{{ repo.name }}/upload-tasks"
-+++                      hx-encoding="multipart/form-data"
-+++                      hx-target="#repo-grid"
-+++                      hx-swap="innerHTML">
-+++                    <input type="file" name="files" multiple accept=".md"
-+++                           onchange="this.form.requestSubmit()"
-+++                           class="hidden" id="upload-{{ repo.name }}">
-+++                    <label for="upload-{{ repo.name }}"
-+++                           class="text-xs font-medium px-2 py-0.5 rounded border border-white/10 text-gray-400 hover:text-accent hover:border-accent/30 transition-colors cursor-pointer">
-+++                        Upload tasks
-+++                    </label>
-+++                </form>
-++             </div>
-++         </div>
-++ 
-++@@ -100,6 +112,7 @@
-++         {% endif %}
-++         {% endif %}
-++         {% endif %}
-+++        <div id="upload-error-{{ repo.name }}"></div>
-++     </div>
-++     {% endfor %}
-++ </div>
-++diff --git a/src/web/templates/components/upload_error.html b/src/web/templates/components/upload_error.html
+++diff --git a/src/web/templates/components/upload_success.html b/src/web/templates/components/upload_success.html
 + new file mode 100644
 +-index 0000000..8946e95
-++index 0000000..a6acd01
+++index 0000000..7911296
 + --- /dev/null
 +-+++ b/src/web/templates/components/status_bar.html
 +-@@ -0,0 +1,30 @@
@@ -1364,9 +2547,9 @@ index 9256791..edea2be 100644
 +-+        </div>
 +-+        {% endif %}
 +-+    </div>
-+++++ b/src/web/templates/components/upload_error.html
++++++ b/src/web/templates/components/upload_success.html
 ++@@ -0,0 +1,3 @@
-+++<div class="rounded-lg border border-fail/30 bg-fail/10 px-3 py-2 text-fail text-xs mt-2">
++++<div class="rounded-lg border border-ok/30 bg-ok/10 px-3 py-2 text-ok text-xs mt-2">
 +++    {{ message }}
 + +</div>
 +-diff --git a/src/web/templates/index.html b/src/web/templates/index.html
@@ -1501,14 +2684,15 @@ index 9256791..edea2be 100644
 ++ - Depends on: PR-023
 ++diff --git a/tests/test_upload.py b/tests/test_upload.py
 ++new file mode 100644
-++index 0000000..2f96fac
+++index 0000000..c938fb9
 ++--- /dev/null
 +++++ b/tests/test_upload.py
-++@@ -0,0 +1,192 @@
+++@@ -0,0 +1,225 @@
 +++"""Tests for the upload-tasks endpoint."""
 +++
 +++from __future__ import annotations
 +++
++++import json
 +++from pathlib import Path
 +++
 +++import pytest
@@ -1519,20 +2703,30 @@ index 9256791..edea2be 100644
 +++
 +++
 +++class _StubAioredisClient:
++++    def __init__(self) -> None:
++++        self._store: dict[str, str] = {}
++++
 +++    async def get(self, key: str) -> str | None:
++++        if key in self._store:
++++            return self._store[key]
 +++        if key.startswith("pipeline:"):
 +++            name = key.split(":", 1)[1]
 +++            return f'{{"url":"","name":"{name}","state":"IDLE"}}'
 +++        return None
++++
++++    async def set(self, key: str, value: str, **kwargs: object) -> None:
++++        self._store[key] = value
 +++
 +++    async def aclose(self) -> None:
 +++        return None
 +++
 +++
 +++class _StubAioredis:
-+++    @staticmethod
-+++    def from_url(url: str, decode_responses: bool = True) -> _StubAioredisClient:
-+++        return _StubAioredisClient()
++++    def __init__(self) -> None:
++++        self.client = _StubAioredisClient()
++++
++++    def from_url(self, url: str, decode_responses: bool = True) -> _StubAioredisClient:
++++        return self.client
 +++
 +++
 +++@pytest.fixture
@@ -1544,7 +2738,8 @@ index 9256791..edea2be 100644
 +++        encoding="utf-8",
 + +    )
 +++    monkeypatch.chdir(tmp_path)
-+++    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
++++    stub = _StubAioredis()
++++    monkeypatch.setattr(web_app, "aioredis", stub)
 +++    return cfg
 + +
 +-+    runner = _make_runner()
@@ -1591,6 +2786,15 @@ index 9256791..edea2be 100644
 +-+
 +-+def test_handle_idle_sets_queue_counters_with_mixed_statuses(
 +-+    monkeypatch: pytest.MonkeyPatch,
++++@pytest.fixture
++++def uploads_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++++    """Create and point UPLOADS_DIR at a temp directory."""
++++    uploads = tmp_path / "uploads"
++++    uploads.mkdir()
++++    monkeypatch.setattr(web_app, "UPLOADS_DIR", str(uploads))
++++    return uploads
++++
++++
 +++def _queue_file() -> tuple[str, tuple[str, bytes, str]]:
 +++    return ("files", ("QUEUE.md", b"# Task Queue\n", "text/markdown"))
 +++
@@ -1690,11 +2894,11 @@ index 9256791..edea2be 100644
 +-+        queue_total=10,
 +-+        last_updated=now,
 +-+    )
-+++    # Point REPOS_DIR to a dir that has no "alpha" sub-dir
 +++    empty_repos = tmp_path / "empty_repos"
 +++    empty_repos.mkdir()
 +++    monkeypatch.setattr(web_app, "REPOS_DIR", str(empty_repos))
-+++
++ +
++-+    class _StubClientWithQueue:
 +++    with TestClient(app) as client:
 +++        resp = client.post(
 +++            "/repos/alpha/upload-tasks",
@@ -1702,8 +2906,7 @@ index 9256791..edea2be 100644
 +++        )
 +++    assert resp.status_code == 422
 +++    assert "not cloned" in resp.text
-+ +
-+-+    class _StubClientWithQueue:
++++
 +++
 +++def test_upload_blocked_when_redis_key_absent(
 +++    one_repo_config: Path,
@@ -1716,6 +2919,8 @@ index 9256791..edea2be 100644
 +-+                return stored.model_dump_json()
 + +            return None
 +-+
++++        async def set(self, key: str, value: str, **kwargs: object) -> None:
++++            pass
 + +        async def aclose(self) -> None:
 + +            return None
 + +
@@ -1725,42 +2930,48 @@ index 9256791..edea2be 100644
 +-+            url: str, decode_responses: bool = True
 +-+        ) -> _StubClientWithQueue:
 +-+            return _StubClientWithQueue()
++-+
++-+    monkeypatch.setattr(web_app, "aioredis", _StubAioredisWithQueue())
 +++    monkeypatch.setattr(web_app, "aioredis", type("R", (), {
 +++        "from_url": staticmethod(lambda *a, **kw: _EmptyRedis()),
 +++    })())
 + +
-+-+    monkeypatch.setattr(web_app, "aioredis", _StubAioredisWithQueue())
-+++    with TestClient(app) as client:
++ +    with TestClient(app) as client:
++-+        response = client.get("/partials/repo-list")
 +++        resp = client.post(
 +++            "/repos/alpha/upload-tasks",
 +++            files=[_queue_file()],
 +++        )
 +++    assert resp.status_code == 503
 +++    assert "no state recorded" in resp.text
-+ +
-+++
-+++def test_upload_without_queue_md(
-+++    one_repo_config: Path,
-+++    repo_dir: Path,
-+++) -> None:
-+ +    with TestClient(app) as client:
-+-+        response = client.get("/partials/repo-list")
-+++        resp = client.post(
-+++            "/repos/alpha/upload-tasks",
-+++            files=[_pr_file()],
-+++        )
-+++    assert resp.status_code == 422
-+++    assert "QUEUE.md is required" in resp.text
 +++
 + +
 +-+    assert response.status_code == 200
 +-+    body = response.text
 +-+    assert "4 / 10 done" in body
 +-+    assert "PR-005" in body
++++def test_upload_without_queue_md(
++++    one_repo_config: Path,
++++    repo_dir: Path,
++++    uploads_dir: Path,
++++) -> None:
++++    with TestClient(app) as client:
++++        resp = client.post(
++++            "/repos/alpha/upload-tasks",
++++            files=[_pr_file()],
++++        )
++++    assert resp.status_code == 422
++++    assert "QUEUE.md is required" in resp.text
++ +
++ +
++-+def test_partial_stats_renders_status_bar(
++-+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 +++def test_upload_invalid_filename(
 +++    one_repo_config: Path,
 +++    repo_dir: Path,
-+++) -> None:
++++    uploads_dir: Path,
++ +) -> None:
++-+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
 +++    with TestClient(app) as client:
 +++        resp = client.post(
 +++            "/repos/alpha/upload-tasks",
@@ -1768,23 +2979,13 @@ index 9256791..edea2be 100644
 +++        )
 +++    assert resp.status_code == 422
 +++    assert "Invalid file name" in resp.text
++++
 + +
-+ +
-+-+def test_partial_stats_renders_status_bar(
-+-+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
-+++def test_upload_success_calls_git(
++++def test_upload_stages_files_and_sets_redis_key(
 +++    one_repo_config: Path,
 +++    repo_dir: Path,
-+++    monkeypatch: pytest.MonkeyPatch,
-+ +) -> None:
-+-+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
-+++    git_calls: list[tuple[str, ...]] = []
-+++
-+++    async def fake_git_run(repo_path: str, *args: str, timeout: int = 30) -> None:
-+++        git_calls.append(args)
-+++
-+++    monkeypatch.setattr("src.web.app._git_run", fake_git_run)
-+ +
++++    uploads_dir: Path,
++++) -> None:
 + +    with TestClient(app) as client:
 +-+        response = client.get("/partials/stats")
 +++        resp = client.post(
@@ -1793,12 +2994,7 @@ index 9256791..edea2be 100644
 +++        )
 +++
 +++    assert resp.status_code == 200
-+++    assert git_calls[0][0] == "checkout"
-+++    assert git_calls[1][0] == "pull"
-+++    assert git_calls[2][0] == "add"
-+++    assert git_calls[3][0] == "commit"
-+++    assert git_calls[4][0] == "push"
-+++
++++    assert "queued" in resp.text.lower()
 + +
 +-+    assert response.status_code == 200
 +-+    body = response.text
@@ -1806,28 +3002,49 @@ index 9256791..edea2be 100644
 +-+    assert "Done today" in body
 +-+    assert "Active" in body
 +-+    assert "Alerts" in body
-+++def test_upload_writes_files_to_tasks_dir(
++++    staging = uploads_dir / "alpha"
++++    assert (staging / "QUEUE.md").exists()
++++    assert (staging / "PR-001.md").exists()
++++    assert (staging / "QUEUE.md").read_bytes() == b"# Task Queue\n"
++++
++++
++++def test_upload_writes_redis_manifest(
 +++    one_repo_config: Path,
 +++    repo_dir: Path,
++++    uploads_dir: Path,
 +++    monkeypatch: pytest.MonkeyPatch,
 +++) -> None:
-+++    async def _noop(*a, **kw): pass
-+++    monkeypatch.setattr("src.web.app._git_run", _noop)
++++    redis_sets: dict[str, str] = {}
 + +
++++    class _TrackingRedis:
++++        async def get(self, key: str) -> str | None:
++++            if key.startswith("pipeline:"):
++++                name = key.split(":", 1)[1]
++++                return f'{{"url":"","name":"{name}","state":"IDLE"}}'
++++            return None
++++        async def set(self, key: str, value: str, **kwargs: object) -> None:
++++            redis_sets[key] = value
++++        async def aclose(self) -> None:
++++            return None
++++
++++    monkeypatch.setattr(web_app, "aioredis", type("R", (), {
++++        "from_url": staticmethod(lambda *a, **kw: _TrackingRedis()),
++++    })())
++++
 +++    with TestClient(app) as client:
 +++        resp = client.post(
 +++            "/repos/alpha/upload-tasks",
-+++            files=[_queue_file(), _pr_file("PR-001.md")],
++++            files=[_queue_file(), _pr_file("PR-002.md")],
 +++        )
 + +
 +- def test_get_repo_state_unknown_repo_returns_idle_default(
 +-     empty_config: Path,
 +- ) -> None:
 +++    assert resp.status_code == 200
-+++    tasks_dir = repo_dir / "tasks"
-+++    assert (tasks_dir / "QUEUE.md").exists()
-+++    assert (tasks_dir / "PR-001.md").exists()
-+++    assert (tasks_dir / "QUEUE.md").read_text() == "# Task Queue\n"
++++    assert "upload:alpha:pending" in redis_sets
++++    manifest = json.loads(redis_sets["upload:alpha:pending"])
++++    assert manifest["repo"] == "alpha"
++++    assert set(manifest["files"]) == {"QUEUE.md", "PR-002.md"}
  diff --git a/artifacts/structure.txt b/artifacts/structure.txt
 -index 2c5d760..bc51f12 100644
 +index bc51f12..dc6ccd0 100644
@@ -1884,7 +3101,7 @@ index 9256791..edea2be 100644
 +     ports:
  diff --git a/src/daemon/runner.py b/src/daemon/runner.py
 -index ad95cf1..0512264 100644
-+index 0512264..ebc1330 100644
++index 0512264..38434f5 100644
  --- a/src/daemon/runner.py
  +++ b/src/daemon/runner.py
 -@@ -552,6 +552,11 @@ class PipelineRunner:
@@ -1906,17 +3123,43 @@ index 9256791..edea2be 100644
 + import subprocess
 + from datetime import datetime, timezone
 + from pathlib import Path
-+@@ -743,6 +745,75 @@ class PipelineRunner:
++@@ -743,6 +745,107 @@ class PipelineRunner:
   
 -         try:
 -@@ -753,6 +758,10 @@ class PipelineRunner:
 +         await self.publish_state()
-+ 
-++    async def process_pending_uploads(self) -> bool:
+  
+++    _DELETE_IF_UNCHANGED_LUA = """
+++if redis.call("get", KEYS[1]) == ARGV[1] then
+++    return redis.call("del", KEYS[1])
+++end
+++return 0
+++"""
+++
+++    async def _delete_upload_if_unchanged(self, key: str, expected: bytes | str) -> bool:
+++        """Delete ``key`` only if its value still matches ``expected``."""
+++        try:
+++            result = await self.redis.eval(
+++                self._DELETE_IF_UNCHANGED_LUA, 1, key, expected,
+++            )
+++            return bool(result)
+++        except Exception:
+++            logger.warning("%s: CAS delete failed for %s, falling back", self.name, key)
+++            try:
+++                current = await self.redis.get(key)
+++                if current == expected:
+++                    await self.redis.delete(key)
+++                    return True
+++            except Exception:
+++                pass
+++            return False
+++
+++    async def process_pending_uploads(self) -> bool | None:
 ++        """Commit and push any files staged by the web upload endpoint.
 ++
-++        Returns True if an upload was processed (caller should re-sync
-++        before continuing with task selection).
+++        Returns ``True`` if an upload was pushed, ``False`` if there was
+++        nothing pending, or ``None`` if a pending upload failed (caller
+++        should skip task dispatch so it retries next cycle).
 ++        """
 ++        key = f"upload:{self.name}:pending"
 ++        try:
@@ -1973,22 +3216,32 @@ index 9256791..edea2be 100644
 ++        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
 ++            logger.error("%s: upload git operations failed: %s", self.name, exc)
 ++            self.log_event(f"Upload push failed: {exc}")
-++            await self.redis.delete(key)
-++            shutil.rmtree(str(staging_dir), ignore_errors=True)
-++            return False
+++            try:
+++                subprocess.run(
+++                    ["git", "reset", "--hard", f"origin/{branch}"],
+++                    cwd=self.repo_path,
+++                    capture_output=True, text=True, timeout=30, check=False,
+++                )
+++            except Exception:
+++                pass
+++            return None
 ++
-++        await self.redis.delete(key)
+++        await self._delete_upload_if_unchanged(key, raw)
 ++        shutil.rmtree(str(staging_dir), ignore_errors=True)
 ++        return True
 ++
 +     async def handle_idle(self) -> None:
 +         """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
 +         # sync_to_main is only safe in IDLE state: it runs git reset --hard
-+@@ -756,6 +827,15 @@ class PipelineRunner:
++@@ -756,6 +859,19 @@ class PipelineRunner:
 +             self.log_event(f"sync_to_main failed: {exc}")
 +             return
-  
-++        if await self.process_pending_uploads():
++ 
+++        upload_result = await self.process_pending_uploads()
+++        if upload_result is None:
+++            self.log_event("Pending upload failed; skipping task dispatch to retry next cycle")
+++            return
+++        if upload_result:
 ++            try:
 ++                self.sync_to_main()
 ++            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
@@ -2518,13 +3771,28 @@ index 9256791..edea2be 100644
 -+++ b/tests/test_alerts.py
 -@@ -496,11 +496,11 @@ def test_alert_repo_link_points_to_repo_detail(alerts_config: Path) -> None:
 - 
-- 
++ - Tasks file: tasks/PR-024.md
++ - Branch: pr-024-upload-tasks
++ - Depends on: PR-023
++diff --git a/tests/test_runner.py b/tests/test_runner.py
++index 7a8f358..61596d5 100644
++--- a/tests/test_runner.py
+++++ b/tests/test_runner.py
++@@ -3,8 +3,10 @@
++ from __future__ import annotations
+  
 - def test_index_mounts_alerts_partial(alerts_config: Path) -> None:
 --    """Dashboard index wires the alerts panel to the 10s HTMX poll."""
 -+    """Dashboard index wires the status bar (with inline alerts) to the 10s HTMX poll."""
 -     with TestClient(app) as client:
 -         response = client.get("/")
-- 
++ import asyncio
+++import json
++ import subprocess
++ from datetime import datetime, timedelta, timezone
+++from pathlib import Path
++ from typing import Any
+  
 -     assert response.status_code == 200
 -     body = response.text
 --    assert 'hx-get="/partials/alerts"' in body
@@ -2542,8 +3810,14 @@ index 9256791..edea2be 100644
 -     assert 'hx-get="/partials/repo-list"' in body
 -     assert "Done today" in body
 --    assert "Activity" in body
-- 
-- 
++ import pytest
++@@ -27,9 +29,31 @@ class _FakeRedis:
+  
++     def __init__(self) -> None:
++         self.writes: list[tuple[str, str]] = []
+++        self.store: dict[str, str] = {}
+++        self.deleted: list[str] = []
+  
 - def test_partial_repo_events_filters_by_query(
 -diff --git a/tests/test_recovery.py b/tests/test_recovery.py
 -index afec0e7..87c4cd5 100644
@@ -2560,11 +3834,42 @@ index 9256791..edea2be 100644
 -         "Recovered: DOING task PR-042" in e["event"] and "WATCH PR #17" in e["event"]
 -@@ -116,6 +118,38 @@ def test_recover_doing_task_with_matching_pr_recovers_to_watch(
 -     )
-- 
-- 
++     async def set(self, key: str, value: str) -> None:
++         self.writes.append((key, value))
+++        self.store[key] = value
+++
+++    async def get(self, key: str) -> str | None:
+++        return self.store.get(key)
+++
+++    async def delete(self, key: str) -> int:
+++        self.deleted.append(key)
+++        if key in self.store:
+++            del self.store[key]
+++            return 1
+++        return 0
+++
+++    async def eval(self, script: str, numkeys: int, *args: Any) -> int:
+++        key = args[0]
+++        expected = args[1]
+++        current = self.store.get(key)
+++        if current == expected:
+++            del self.store[key]
+++            return 1
+++        return 0
+  
+  
 -+def test_recover_state_sets_queue_counters(
--+    monkeypatch: pytest.MonkeyPatch,
--+) -> None:
++ class _FakeCompletedProcess:
++@@ -1639,3 +1663,71 @@ def test_handle_idle_open_pr_check_survives_github_failure(
++     assert runner.state.state == PipelineState.IDLE
++     assert runner.state.current_pr is None
++     assert any("open PR check failed" in e["event"] for e in runner.state.history)
+++
+++
+++def test_process_pending_uploads_preserves_upload_on_git_failure(
+ +    monkeypatch: pytest.MonkeyPatch,
+++    tmp_path: Path,
+ +) -> None:
 -+    """recover_state must populate queue_done and queue_total."""
 -+    done_task = QueueTask(
 -+        pr_id="PR-001", title="Done", status=TaskStatus.DONE,
@@ -2583,9 +3888,167 @@ index 9256791..edea2be 100644
 -+    )
 -+    monkeypatch.setattr(
 -+        runner_module.github_client, "get_open_prs", lambda repo: [matching_pr]
-+ - Tasks file: tasks/PR-024.md
-+ - Branch: pr-024-upload-tasks
-+ - Depends on: PR-023
+-+    )
+++    """On transient git failure, Redis key and staging dir must survive for retry."""
+++
+++    def failing_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+++        if cmd[:2] == ["git", "rev-list"]:
+++            return _FakeCompletedProcess(args=cmd, stdout="0\n", returncode=0)
+++        if cmd[:2] == ["git", "add"]:
+++            raise subprocess.CalledProcessError(1, cmd, stderr="git error")
+++        return _FakeCompletedProcess(args=cmd, returncode=0)
+++
+++    monkeypatch.setattr(runner_module.subprocess, "run", failing_run)
+ +
+ +    runner = _make_runner()
+-+    runner._parse_base_queue = lambda: [done_task, doing_task, todo_task]  # type: ignore[method-assign]
+-+    runner.handle_coding = lambda: None  # type: ignore[method-assign]
+-+    asyncio.run(runner.recover_state())
+++    runner.repo_path = str(tmp_path)
+++    manifest = json.dumps({"files": ["QUEUE.md"]})
+++    key = f"upload:{runner.name}:pending"
+++    asyncio.run(runner.redis.set(key, manifest))
+ +
+-+    assert runner.state.queue_done == 1
+-+    assert runner.state.queue_total == 3
+++    staging = tmp_path.parent / "uploads" / runner.name
+++    staging.mkdir(parents=True)
+++    (staging / "QUEUE.md").write_text("- PR-001")
+++    monkeypatch.setattr(runner_module, "Path", lambda *a: Path(*a) if len(a) != 1 or a[0] != "/data/uploads" else tmp_path.parent / "uploads")
+ +
+++    result = asyncio.run(runner.process_pending_uploads())
+++    assert result is None
+++    assert asyncio.run(runner.redis.get(key)) == manifest
+++    assert staging.is_dir()
+ +
+- def test_recover_doing_task_without_pr_rerun_coding(
+-     monkeypatch: pytest.MonkeyPatch,
+- ) -> None:
+-diff --git a/tests/test_runner.py b/tests/test_runner.py
+-index 2a992a3..7a8f358 100644
+---- a/tests/test_runner.py
+-+++ b/tests/test_runner.py
+-@@ -153,6 +153,8 @@ def test_handle_idle_no_tasks_leaves_state_idle(
+- 
+-     assert runner.state.state == PipelineState.IDLE
+-     assert runner.state.current_task is None
+-+    assert runner.state.queue_done == 0
+-+    assert runner.state.queue_total == 0
+-     assert any("No tasks" in e["event"] for e in runner.state.history)
+-     # sync_to_main must run fetch -> checkout -> reset --hard in order so
+-     # that parse_queue reads QUEUE.md from the tip of origin/{branch}, not
+-@@ -217,6 +219,40 @@ def test_handle_idle_picks_task_and_drives_coding(
+-     assert runner.state.current_pr.number == 17
+-     assert runner.state.current_task is not None
+-     assert runner.state.current_task.pr_id == "PR-042"
+-+    assert runner.state.queue_done == 0
+-+    assert runner.state.queue_total == 1
+-+
+-+
+-+def test_handle_idle_sets_queue_counters_with_mixed_statuses(
+++
+++def test_process_pending_uploads_cas_delete_skips_newer_manifest(
+ +    monkeypatch: pytest.MonkeyPatch,
+++    tmp_path: Path,
+ +) -> None:
+++    """After a successful push, a newer manifest must not be deleted."""
+ +    _patch_subprocess(monkeypatch)
+-+    tasks = [
+-+        QueueTask(pr_id="PR-001", title="Done1", status=TaskStatus.DONE, branch="pr-001"),
+-+        QueueTask(pr_id="PR-002", title="Done2", status=TaskStatus.DONE, branch="pr-002"),
+-+        QueueTask(pr_id="PR-003", title="Todo", status=TaskStatus.TODO, branch="pr-003"),
+-+    ]
+-+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: tasks)
+-+    monkeypatch.setattr(runner_module, "get_next_task", lambda t: tasks[2])
+-+    monkeypatch.setattr(
+-+        runner_module.claude_cli, "run_planned_pr", lambda path: (0, "ok", "")
+-+    )
+-+    monkeypatch.setattr(
+-+        runner_module.github_client,
+-+        "get_open_prs",
+-+        lambda repo: [PRInfo(number=1, branch="pr-003")],
+-+    )
+-+    monkeypatch.setattr(
+-+        runner_module.github_client,
+-+        "post_comment",
+-+        lambda repo, number, body: None,
+-+    )
+ +
+ +    runner = _make_runner()
+-+    asyncio.run(runner.handle_idle())
+++    runner.repo_path = str(tmp_path)
+ +
+-+    assert runner.state.queue_done == 2
+-+    assert runner.state.queue_total == 3
+- 
+- 
+- def test_handle_coding_errors_when_no_pr_found(
+-diff --git a/tests/test_web_app.py b/tests/test_web_app.py
+-index 5448127..e250959 100644
+---- a/tests/test_web_app.py
+-+++ b/tests/test_web_app.py
+-@@ -154,8 +154,8 @@ def test_index_route_returns_html(
+-     assert "text/html" in response.headers["content-type"]
+-     body = response.text
+-     assert "Pipeline Orchestrator" in body
+--    assert "Repositories" in body
+-     assert 'hx-get="/partials/repo-list"' in body
+-+    assert 'id="status-bar"' in body
+- 
+- 
+- def test_api_states_returns_json(
+-@@ -188,6 +188,7 @@ def test_partial_repo_list_returns_html_fragment(
+-     assert "alpha" in body
+-     assert "beta" in body
+-     assert "IDLE" in body
+-+    assert "0 / 0 done" in body
+- 
+- 
+- def test_partial_repo_list_empty_state(
+-@@ -202,6 +203,67 @@ def test_partial_repo_list_empty_state(
+-     assert "No repositories configured" in response.text
+- 
+- 
+-+def test_partial_repo_list_renders_queue_progress(
+-+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+-+) -> None:
+-+    now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
+-+    stored = RepoState(
+-+        url="https://github.com/example/alpha.git",
+-+        name="alpha",
+-+        state=PipelineState.CODING,
+-+        current_task=QueueTask(
+-+            pr_id="PR-005",
+-+            title="Dashboard",
+-+            status=TaskStatus.DOING,
+-+        ),
+-+        queue_done=4,
+-+        queue_total=10,
+-+        last_updated=now,
+++    old_manifest = json.dumps({"files": ["QUEUE.md"]})
+++    new_manifest = json.dumps({"files": ["PR-099.md"]})
+++    key = f"upload:{runner.name}:pending"
+++    asyncio.run(runner.redis.set(key, old_manifest))
+++
+++    staging = tmp_path.parent / "uploads" / runner.name
+++    staging.mkdir(parents=True, exist_ok=True)
+++    (staging / "QUEUE.md").write_text("- PR-001")
+++    tasks_dir = tmp_path / "tasks"
+++    tasks_dir.mkdir(exist_ok=True)
+++    monkeypatch.setattr(runner_module, "Path", lambda *a: Path(*a) if len(a) != 1 or a[0] != "/data/uploads" else tmp_path.parent / "uploads")
+++
+++    # Simulate a new upload arriving after the daemon read the old manifest
+++    original_eval = runner.redis.eval
+++
+++    async def inject_new_manifest(script: str, numkeys: int, *args: Any) -> int:
+++        runner.redis.store[key] = new_manifest
+++        return await original_eval(script, numkeys, *args)
+++
+++    runner.redis.eval = inject_new_manifest  # type: ignore[assignment]
+++
+++    result = asyncio.run(runner.process_pending_uploads())
+++    assert result is True
+++    assert asyncio.run(runner.redis.get(key)) == new_manifest
 +diff --git a/tests/test_upload.py b/tests/test_upload.py
 +new file mode 100644
 +index 0000000..c938fb9
@@ -2645,14 +4108,8 @@ index 9256791..edea2be 100644
 ++    stub = _StubAioredis()
 ++    monkeypatch.setattr(web_app, "aioredis", stub)
 ++    return cfg
- +
--+    runner = _make_runner()
--+    runner._parse_base_queue = lambda: [done_task, doing_task, todo_task]  # type: ignore[method-assign]
--+    runner.handle_coding = lambda: None  # type: ignore[method-assign]
--+    asyncio.run(runner.recover_state())
- +
--+    assert runner.state.queue_done == 1
--+    assert runner.state.queue_total == 3
+++
+++
 ++@pytest.fixture
 ++def repo_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 ++    """Create a fake repo dir and point REPOS_DIR at it."""
@@ -2662,34 +4119,8 @@ index 9256791..edea2be 100644
 ++    alpha.mkdir()
 ++    monkeypatch.setattr(web_app, "REPOS_DIR", str(repos))
 ++    return alpha
- +
- +
-- def test_recover_doing_task_without_pr_rerun_coding(
--     monkeypatch: pytest.MonkeyPatch,
-- ) -> None:
--diff --git a/tests/test_runner.py b/tests/test_runner.py
--index 2a992a3..7a8f358 100644
----- a/tests/test_runner.py
--+++ b/tests/test_runner.py
--@@ -153,6 +153,8 @@ def test_handle_idle_no_tasks_leaves_state_idle(
-- 
--     assert runner.state.state == PipelineState.IDLE
--     assert runner.state.current_task is None
--+    assert runner.state.queue_done == 0
--+    assert runner.state.queue_total == 0
--     assert any("No tasks" in e["event"] for e in runner.state.history)
--     # sync_to_main must run fetch -> checkout -> reset --hard in order so
--     # that parse_queue reads QUEUE.md from the tip of origin/{branch}, not
--@@ -217,6 +219,40 @@ def test_handle_idle_picks_task_and_drives_coding(
--     assert runner.state.current_pr.number == 17
--     assert runner.state.current_task is not None
--     assert runner.state.current_task.pr_id == "PR-042"
--+    assert runner.state.queue_done == 0
--+    assert runner.state.queue_total == 1
--+
--+
--+def test_handle_idle_sets_queue_counters_with_mixed_statuses(
--+    monkeypatch: pytest.MonkeyPatch,
+++
+++
 ++@pytest.fixture
 ++def uploads_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 ++    """Create and point UPLOADS_DIR at a temp directory."""
@@ -2709,32 +4140,12 @@ index 9256791..edea2be 100644
 ++
 ++def _bad_file() -> tuple[str, tuple[str, bytes, str]]:
 ++    return ("files", ("README.md", b"# Readme\n", "text/markdown"))
-++
+ +
+-+    class _StubClientWithQueue:
 ++
 ++def test_upload_nonexistent_repo(
 ++    one_repo_config: Path, monkeypatch: pytest.MonkeyPatch
- +) -> None:
--+    _patch_subprocess(monkeypatch)
--+    tasks = [
--+        QueueTask(pr_id="PR-001", title="Done1", status=TaskStatus.DONE, branch="pr-001"),
--+        QueueTask(pr_id="PR-002", title="Done2", status=TaskStatus.DONE, branch="pr-002"),
--+        QueueTask(pr_id="PR-003", title="Todo", status=TaskStatus.TODO, branch="pr-003"),
--+    ]
--+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: tasks)
--+    monkeypatch.setattr(runner_module, "get_next_task", lambda t: tasks[2])
--+    monkeypatch.setattr(
--+        runner_module.claude_cli, "run_planned_pr", lambda path: (0, "ok", "")
--+    )
--+    monkeypatch.setattr(
--+        runner_module.github_client,
--+        "get_open_prs",
--+        lambda repo: [PRInfo(number=1, branch="pr-003")],
--+    )
--+    monkeypatch.setattr(
--+        runner_module.github_client,
--+        "post_comment",
--+        lambda repo, number, body: None,
--+    )
+++) -> None:
 ++    with TestClient(app) as client:
 ++        resp = client.post(
 ++            "/repos/ghost/upload-tasks",
@@ -2742,67 +4153,17 @@ index 9256791..edea2be 100644
 ++        )
 ++    assert resp.status_code == 404
 ++    assert "not found" in resp.text
- +
--+    runner = _make_runner()
--+    asyncio.run(runner.handle_idle())
- +
--+    assert runner.state.queue_done == 2
--+    assert runner.state.queue_total == 3
-- 
-- 
-- def test_handle_coding_errors_when_no_pr_found(
--diff --git a/tests/test_web_app.py b/tests/test_web_app.py
--index 5448127..e250959 100644
----- a/tests/test_web_app.py
--+++ b/tests/test_web_app.py
--@@ -154,8 +154,8 @@ def test_index_route_returns_html(
--     assert "text/html" in response.headers["content-type"]
--     body = response.text
--     assert "Pipeline Orchestrator" in body
---    assert "Repositories" in body
--     assert 'hx-get="/partials/repo-list"' in body
--+    assert 'id="status-bar"' in body
-- 
-- 
-- def test_api_states_returns_json(
--@@ -188,6 +188,7 @@ def test_partial_repo_list_returns_html_fragment(
--     assert "alpha" in body
--     assert "beta" in body
--     assert "IDLE" in body
--+    assert "0 / 0 done" in body
-- 
-- 
-- def test_partial_repo_list_empty_state(
--@@ -202,6 +203,67 @@ def test_partial_repo_list_empty_state(
--     assert "No repositories configured" in response.text
-- 
-- 
--+def test_partial_repo_list_renders_queue_progress(
--+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+++
+++
 ++def test_upload_repo_not_cloned(
 ++    one_repo_config: Path,
 ++    tmp_path: Path,
 ++    monkeypatch: pytest.MonkeyPatch,
- +) -> None:
--+    now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
--+    stored = RepoState(
--+        url="https://github.com/example/alpha.git",
--+        name="alpha",
--+        state=PipelineState.CODING,
--+        current_task=QueueTask(
--+            pr_id="PR-005",
--+            title="Dashboard",
--+            status=TaskStatus.DOING,
--+        ),
--+        queue_done=4,
--+        queue_total=10,
--+        last_updated=now,
--+    )
+++) -> None:
 ++    empty_repos = tmp_path / "empty_repos"
 ++    empty_repos.mkdir()
 ++    monkeypatch.setattr(web_app, "REPOS_DIR", str(empty_repos))
- +
--+    class _StubClientWithQueue:
+++
 ++    with TestClient(app) as client:
 ++        resp = client.post(
 ++            "/repos/alpha/upload-tasks",
@@ -2848,12 +4209,12 @@ index 9256791..edea2be 100644
 ++        )
 ++    assert resp.status_code == 503
 ++    assert "no state recorded" in resp.text
-++
  +
 -+    assert response.status_code == 200
 -+    body = response.text
 -+    assert "4 / 10 done" in body
 -+    assert "PR-005" in body
+++
 ++def test_upload_without_queue_md(
 ++    one_repo_config: Path,
 ++    repo_dir: Path,
@@ -2899,6 +4260,12 @@ index 9256791..edea2be 100644
 ++
 ++    assert resp.status_code == 200
 ++    assert "queued" in resp.text.lower()
+++
+++    staging = uploads_dir / "alpha"
+++    assert (staging / "QUEUE.md").exists()
+++    assert (staging / "PR-001.md").exists()
+++    assert (staging / "QUEUE.md").read_bytes() == b"# Task Queue\n"
+++
  +
 -+    assert response.status_code == 200
 -+    body = response.text
@@ -2906,12 +4273,6 @@ index 9256791..edea2be 100644
 -+    assert "Done today" in body
 -+    assert "Active" in body
 -+    assert "Alerts" in body
-++    staging = uploads_dir / "alpha"
-++    assert (staging / "QUEUE.md").exists()
-++    assert (staging / "PR-001.md").exists()
-++    assert (staging / "QUEUE.md").read_bytes() == b"# Task Queue\n"
-++
-++
 ++def test_upload_writes_redis_manifest(
 ++    one_repo_config: Path,
 ++    repo_dir: Path,
@@ -2919,7 +4280,7 @@ index 9256791..edea2be 100644
 ++    monkeypatch: pytest.MonkeyPatch,
 ++) -> None:
 ++    redis_sets: dict[str, str] = {}
- +
+++
 ++    class _TrackingRedis:
 ++        async def get(self, key: str) -> str | None:
 ++            if key.startswith("pipeline:"):
@@ -2934,7 +4295,7 @@ index 9256791..edea2be 100644
 ++    monkeypatch.setattr(web_app, "aioredis", type("R", (), {
 ++        "from_url": staticmethod(lambda *a, **kw: _TrackingRedis()),
 ++    })())
-++
+ +
 ++    with TestClient(app) as client:
 ++        resp = client.post(
 ++            "/repos/alpha/upload-tasks",
@@ -2982,7 +4343,7 @@ index 83f1b7b..bca44b8 100644
      user: "1000:1000"
      ports:
 diff --git a/src/daemon/runner.py b/src/daemon/runner.py
-index 0512264..38434f5 100644
+index 0512264..08b76f2 100644
 --- a/src/daemon/runner.py
 +++ b/src/daemon/runner.py
 @@ -10,7 +10,9 @@ never persisted across cycles.
@@ -2995,7 +4356,7 @@ index 0512264..38434f5 100644
  import subprocess
  from datetime import datetime, timezone
  from pathlib import Path
-@@ -743,6 +745,107 @@ class PipelineRunner:
+@@ -743,6 +745,108 @@ class PipelineRunner:
  
          await self.publish_state()
  
@@ -3036,7 +4397,7 @@ index 0512264..38434f5 100644
 +            raw = await self.redis.get(key)
 +        except Exception:
 +            logger.warning("%s: Redis error checking pending uploads", self.name)
-+            return False
++            return None
 +        if not raw:
 +            return False
 +
@@ -3096,14 +4457,15 @@ index 0512264..38434f5 100644
 +                pass
 +            return None
 +
-+        await self._delete_upload_if_unchanged(key, raw)
-+        shutil.rmtree(str(staging_dir), ignore_errors=True)
++        deleted = await self._delete_upload_if_unchanged(key, raw)
++        if deleted:
++            shutil.rmtree(str(staging_dir), ignore_errors=True)
 +        return True
 +
      async def handle_idle(self) -> None:
          """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
          # sync_to_main is only safe in IDLE state: it runs git reset --hard
-@@ -756,6 +859,19 @@ class PipelineRunner:
+@@ -756,6 +860,19 @@ class PipelineRunner:
              self.log_event(f"sync_to_main failed: {exc}")
              return
  
@@ -3393,7 +4755,7 @@ index a950c9f..4c3ea81 100644
  - Branch: pr-024-upload-tasks
  - Depends on: PR-023
 diff --git a/tests/test_runner.py b/tests/test_runner.py
-index 7a8f358..61596d5 100644
+index 7a8f358..d59179a 100644
 --- a/tests/test_runner.py
 +++ b/tests/test_runner.py
 @@ -3,8 +3,10 @@
@@ -3439,7 +4801,7 @@ index 7a8f358..61596d5 100644
  
  
  class _FakeCompletedProcess:
-@@ -1639,3 +1663,71 @@ def test_handle_idle_open_pr_check_survives_github_failure(
+@@ -1639,3 +1663,87 @@ def test_handle_idle_open_pr_check_survives_github_failure(
      assert runner.state.state == PipelineState.IDLE
      assert runner.state.current_pr is None
      assert any("open PR check failed" in e["event"] for e in runner.state.history)
@@ -3511,6 +4873,22 @@ index 7a8f358..61596d5 100644
 +    result = asyncio.run(runner.process_pending_uploads())
 +    assert result is True
 +    assert asyncio.run(runner.redis.get(key)) == new_manifest
++    assert staging.is_dir(), "staging dir must survive when CAS delete skips newer manifest"
++
++
++def test_process_pending_uploads_redis_error_blocks_dispatch(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Redis read error must return None so handle_idle skips task dispatch."""
++    runner = _make_runner()
++
++    async def broken_get(key: str) -> bytes:
++        raise ConnectionError("redis gone")
++
++    runner.redis.get = broken_get  # type: ignore[assignment]
++
++    result = asyncio.run(runner.process_pending_uploads())
++    assert result is None
 diff --git a/tests/test_upload.py b/tests/test_upload.py
 new file mode 100644
 index 0000000..c938fb9
