@@ -90,11 +90,7 @@ def get_open_prs(repo: str) -> list[PRInfo]:
                 number=number,
                 branch=entry.get("headRefName", ""),
                 ci_status=_ci_status_from_rollup(entry.get("statusCheckRollup")),
-                review_status=get_pr_review_status(
-                    repo,
-                    number,
-                    pr_author=(entry.get("author") or {}).get("login", ""),
-                ),
+                review_status=get_pr_review_status(repo, number),
                 push_count=len(entry.get("commits") or []),
                 url=entry.get("url", ""),
                 last_activity=_parse_iso(entry.get("updatedAt")),
@@ -103,71 +99,58 @@ def get_open_prs(repo: str) -> list[PRInfo]:
     return prs
 
 
-def get_pr_review_status(
-    repo: str, pr_number: int, pr_author: str = ""
-) -> ReviewStatus:
-    """Derive a Codex review status from PR issue comments, review comments, and reactions."""
-    issue_comments = _gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
-    review_comments = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments") or []
+def get_pr_review_status(repo: str, pr_number: int) -> ReviewStatus:
+    """Derive a Codex review status from PR issue comments, review comments, and reactions.
 
-    # Find the most recent anchor comment (PR author's "@codex review" trigger).
-    # Only accept anchors written by the PR author to avoid false matches from
-    # other users quoting the trigger text.  Using the latest anchor (not the
-    # first author comment) prevents stale approvals from earlier review rounds.
-    anchor_endpoint = None
-    anchor_created_at: str = ""
-    for c in reversed(issue_comments):
-        author = (c.get("user") or {}).get("login", "")
-        if pr_author and author != pr_author:
-            continue
-        if "@codex review" in (c.get("body") or "").lower():
-            cid = c.get("id")
-            if cid is not None:
-                anchor_endpoint = f"repos/{repo}/issues/comments/{cid}/reactions"
-                anchor_created_at = c.get("created_at") or ""
+    Logic:
+    1. Find the first issue comment not posted by the Codex bot.
+    2. Check reactions on that comment from Codex: +1 → APPROVED, eyes → EYES.
+    3. If neither reaction, scan all Codex comments (issue + review) for P1/P2
+       → CHANGES_REQUESTED.
+    4. Otherwise → PENDING.
+    """
+    try:
+        issue_comments = _gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
+    except Exception:
+        issue_comments = []
+    try:
+        review_comments = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments") or []
+    except Exception:
+        review_comments = []
+
+    # Step 1: first issue comment not from the Codex bot.
+    first_comment = None
+    for c in issue_comments:
+        user = (c.get("user") or {}).get("login", "")
+        if "codex" not in user.lower():
+            first_comment = c
             break
-    if anchor_endpoint is None:
-        for c in reversed(review_comments):
-            author = (c.get("user") or {}).get("login", "")
-            if pr_author and author != pr_author:
-                continue
-            if "@codex review" in (c.get("body") or "").lower():
-                cid = c.get("id")
-                if cid is not None:
-                    anchor_endpoint = f"repos/{repo}/pulls/comments/{cid}/reactions"
-                    anchor_created_at = c.get("created_at") or ""
-                break
 
-    # Check reactions on the anchor comment for approval signal.
-    # Only count reactions from Codex accounts to avoid false positives.
-    if anchor_endpoint is not None:
-        try:
-            reactions = _gh_api_paginated(anchor_endpoint)
-            if reactions:
-                codex_contents = {
-                    r.get("content")
-                    for r in reactions
-                    if isinstance(r, dict)
-                    and "codex" in ((r.get("user") or {}).get("login", "")).lower()
-                }
-                if "+1" in codex_contents:
-                    return ReviewStatus.APPROVED
-                if "eyes" in codex_contents:
-                    return ReviewStatus.EYES
-        except Exception:
-            pass
+    # Step 2: check Codex reactions on that comment.
+    if first_comment is not None:
+        cid = first_comment.get("id")
+        if cid is not None:
+            try:
+                reactions = _gh_api_paginated(
+                    f"repos/{repo}/issues/comments/{cid}/reactions"
+                )
+                if reactions:
+                    codex_contents = {
+                        r.get("content")
+                        for r in reactions
+                        if isinstance(r, dict)
+                        and "codex"
+                        in ((r.get("user") or {}).get("login", "")).lower()
+                    }
+                    if "+1" in codex_contents:
+                        return ReviewStatus.APPROVED
+                    if "eyes" in codex_contents:
+                        return ReviewStatus.EYES
+            except Exception:
+                pass
 
-    # Only consider Codex comments posted after the latest anchor so that
-    # stale feedback from a previous review round cannot affect the result.
-    def _after_anchor(c: dict) -> bool:
-        if not anchor_created_at:
-            return True
-        return (c.get("created_at") or "") > anchor_created_at
-
-    # Check P1/P2 in Codex comments across both issue and review comments.
-    for comment in reversed(issue_comments + review_comments):
-        if not _after_anchor(comment):
-            continue
+    # Step 3: P1/P2 in any Codex comment body → CHANGES_REQUESTED.
+    for comment in issue_comments + review_comments:
         user = (comment.get("user") or {}).get("login", "") or ""
         if "codex" not in user.lower():
             continue

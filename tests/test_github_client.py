@@ -87,15 +87,13 @@ def test_run_gh_returns_raw_string_when_not_json(
     assert run_gh(["auth", "status"]) == "ok"
 
 
-def test_get_pr_review_status_paginates_and_slurps_gh_api_calls(
+def test_get_pr_review_status_approved_via_first_comment_reaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Both the comments and reactions lookups must use --paginate --slurp.
+    """Codex +1 reaction on the first non-codex issue comment → APPROVED.
 
-    Without --slurp, multi-page responses are written as several JSON
-    documents back-to-back, which json.loads cannot parse — so the function
-    would silently return PENDING. The fake mimics --slurp's behavior:
-    pages are wrapped in an outer array.
+    All gh api calls must use --paginate --slurp so multi-page responses
+    are parseable as a single JSON document.
     """
     import json as _json
 
@@ -105,7 +103,7 @@ def test_get_pr_review_status_paginates_and_slurps_gh_api_calls(
         invocations.append(cmd)
         path = cmd[-1]
         if "issues" in path and path.endswith("/comments"):
-            # Issue comments: one is the anchor with "@codex review"
+            # First non-codex comment is the PR author's trigger
             pages = [
                 [{"id": 10, "user": {"login": "user"}, "body": "@codex review"}],
                 [{"id": 20, "user": {"login": "chatgpt-codex-bot"}, "body": "LGTM"}],
@@ -120,25 +118,65 @@ def test_get_pr_review_status_paginates_and_slurps_gh_api_calls(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert get_pr_review_status("owner/name", 42, pr_author="user") == ReviewStatus.APPROVED
+    assert get_pr_review_status("owner/name", 42) == ReviewStatus.APPROVED
 
-    # 2 comment fetches (issue + review) + 1 reaction fetch on anchor
+    # 2 comment fetches (issue + review) + 1 reaction fetch
     assert len(invocations) == 3
     for cmd in invocations:
         assert "--paginate" in cmd, f"missing --paginate in {cmd}"
         assert "--slurp" in cmd, f"missing --slurp in {cmd}"
 
 
-def test_get_pr_review_status_pending_when_no_codex_comment(
+def test_get_pr_review_status_pending_when_no_codex_reaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A PR with no Codex bot comments should resolve to PENDING."""
+    """A PR with a human comment but no Codex reaction should resolve to PENDING."""
     import json as _json
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(
             stdout=_json.dumps([[{"id": 1, "user": {"login": "human"}, "body": "hi"}]])
         )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert get_pr_review_status("owner/name", 42) == ReviewStatus.PENDING
+
+
+def test_get_pr_review_status_changes_requested_on_p1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Codex comment containing P1 → CHANGES_REQUESTED."""
+    import json as _json
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = cmd[-1]
+        if "issues" in path and path.endswith("/comments"):
+            pages = [
+                [{"id": 10, "user": {"login": "user"}, "body": "please review"}],
+                [{"id": 20, "user": {"login": "chatgpt-codex-bot"}, "body": "P1: fix this"}],
+            ]
+        elif "pulls" in path and path.endswith("/comments"):
+            pages = []
+        elif path.endswith("/reactions"):
+            # No codex reaction on the first comment
+            pages = []
+        else:
+            pages = []
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert get_pr_review_status("owner/name", 42) == ReviewStatus.CHANGES_REQUESTED
+
+
+def test_get_pr_review_status_handles_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """404 errors from gh api should be caught, resulting in PENDING."""
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(stderr="HTTP 404", returncode=1)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
