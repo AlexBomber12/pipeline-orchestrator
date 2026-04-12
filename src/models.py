@@ -55,6 +55,11 @@ class PRInfo(BaseModel):
     push_count: int = 0
     url: str = ""
     last_activity: datetime | None = None
+    # True when the PR head is on a forked repository instead of
+    # ``origin``. The daemon's auto-commit safety net cannot push to a
+    # fork (no credentials, different remote), so it must refuse
+    # rather than silently publish to the wrong branch on origin.
+    is_cross_repository: bool = False
 
 
 class RepoState(BaseModel):

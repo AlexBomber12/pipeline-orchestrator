@@ -258,6 +258,7 @@ def test_handle_idle_sets_queue_counters_with_mixed_statuses(
 def test_handle_coding_errors_when_no_pr_found(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.claude_cli,
         "run_planned_pr",
@@ -284,6 +285,7 @@ def test_handle_coding_rejects_unmatched_branch(
 ) -> None:
     """When no open PR matches current_task.branch, fail fast instead of
     attaching to an unrelated newest open PR."""
+    _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.claude_cli,
         "run_planned_pr",
@@ -314,6 +316,7 @@ def test_handle_coding_posts_codex_review_after_pr_found(
     newly-opened PR so Codex kicks off a review for every iteration instead
     of relying on GitHub-side Automatic Reviews (which we want configured
     for PR creation only, to avoid duplicate reviews)."""
+    _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.claude_cli,
         "run_planned_pr",
@@ -355,6 +358,7 @@ def test_handle_coding_survives_post_comment_failure(
     the runner stays in ``WATCH`` and logs a warning. Codex may still
     auto-trigger on push, and a transient ``gh`` hiccup must not flip an
     otherwise healthy pipeline to ``ERROR``."""
+    _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.claude_cli,
         "run_planned_pr",
@@ -394,6 +398,7 @@ def test_handle_fix_posts_codex_review_after_push(
 ) -> None:
     """PR-019: after a successful fix push, ``handle_fix`` must post
     ``@codex review`` so Codex reviews the freshly-pushed iteration."""
+    _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.claude_cli, "fix_review", lambda path: (0, "", "")
     )
@@ -434,6 +439,7 @@ def test_handle_fix_errors_when_post_comment_fails(
     gh failure (e.g. by manually posting ``@codex review``) instead of
     trapping the daemon in a silent fix/push loop.
     """
+    _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.claude_cli, "fix_review", lambda path: (0, "", "")
     )
@@ -460,9 +466,65 @@ def test_handle_fix_errors_when_post_comment_fails(
     )
 
 
+def test_handle_fix_skips_auto_commit_on_cross_repo_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P1 (round 5): for fork-based PRs, the daemon's clone only
+    knows about ``origin`` (the base repo) — the PR head lives on the
+    contributor's fork. Pushing ``origin/<branch>:<branch>`` would
+    create or update an unrelated branch on the base repo without ever
+    touching the PR, while the runner proceeds to WATCH as if the fix
+    landed. Skipping the auto-commit safety net on cross-repo PRs
+    leaves the dirty tree to surface through preflight next cycle
+    instead of silently diverging.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        # Dirty tree — would normally trigger the auto-commit path.
+        if cmd[:2] == ["git", "status"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout=" M src/foo.py\n", returncode=0
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        runner_module.claude_cli, "fix_review", lambda path: (0, "", "")
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=88,
+        branch="contributor:feature-x",
+        is_cross_repository=True,
+    )
+    asyncio.run(runner.handle_fix())
+
+    # Runner still transitions to WATCH, but no auto-commit subprocess
+    # calls happened — crucially, no git push.
+    assert runner.state.state == PipelineState.WATCH
+    assert not any(cmd[:2] == ["git", "status"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "add"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "commit"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
+    assert any(
+        "cross-repo" in e["event"] and "#88" in e["event"]
+        for e in runner.state.history
+    )
+
+
 def test_handle_coding_errors_when_task_has_no_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    calls = _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.claude_cli,
         "run_planned_pr",
@@ -483,6 +545,15 @@ def test_handle_coding_errors_when_task_has_no_branch(
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.current_pr is None
     assert "no branch" in (runner.state.error_message or "").lower()
+    # Codex P1: the malformed-task error path must bail BEFORE
+    # ``_commit_and_push_dirty`` runs, otherwise a dirty tree could be
+    # committed + pushed to whatever branch HEAD happens to be on
+    # before the runner realises it cannot identify the target PR.
+    assert not any(cmd[:2] == ["git", "status"] for cmd in calls)
+    assert not any(cmd[:1] == ["scripts/ci.sh"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "add"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "commit"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
 
 
 def test_handle_watch_approved_and_green_merges(
@@ -558,6 +629,7 @@ def test_handle_watch_green_but_auto_merge_disabled_stays_watching(
 def test_handle_watch_changes_requested_triggers_fix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _patch_subprocess(monkeypatch)
     pr = PRInfo(
         number=5,
         branch="pr-001",
@@ -590,6 +662,7 @@ def test_handle_watch_changes_requested_triggers_fix(
 def test_handle_watch_ci_failure_triggers_fix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _patch_subprocess(monkeypatch)
     pr = PRInfo(
         number=5,
         branch="pr-001",
@@ -1639,3 +1712,302 @@ def test_handle_idle_open_pr_check_survives_github_failure(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is None
     assert any("open PR check failed" in e["event"] for e in runner.state.history)
+
+
+# ------------------------------------------------------------------
+# _commit_and_push_dirty: catch Claude CLI runs that exit 0 while
+# leaving uncommitted edits in the working tree. Without this safety
+# net, the next cycle's preflight flips the runner to ERROR with
+# "working tree dirty" and requires operator intervention.
+# ------------------------------------------------------------------
+
+
+def test_commit_and_push_dirty_commits_when_dirty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        if cmd[:2] == ["git", "status"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout=" M src/foo.py\n", returncode=0
+            )
+        if cmd[:3] == ["git", "rev-parse", "--abbrev-ref"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout="pr-001\n", returncode=0
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    result = runner._commit_and_push_dirty(
+        "PR-001: auto-commit after Claude CLI",
+        expected_branch="pr-001",
+    )
+
+    assert result is True
+    assert runner.state.state != PipelineState.ERROR
+    commands = [cmd[:3] for cmd in calls]
+    assert ["git", "status", "--porcelain"] in commands
+    assert ["git", "rev-parse", "--abbrev-ref"] in commands
+    assert ["scripts/ci.sh"] in [cmd[:1] for cmd in calls]
+    assert ["git", "add", "-A"] in commands
+    assert any(cmd[:2] == ["git", "commit"] for cmd in calls)
+    # Push must target the explicit branch, not ``HEAD``, so a
+    # pre-push hook that re-points HEAD mid-operation cannot divert
+    # the push onto the base branch.
+    push_cmd = next(cmd for cmd in calls if cmd[:2] == ["git", "push"])
+    assert push_cmd == ["git", "push", "origin", "pr-001:pr-001"]
+    # Commit message was threaded through.
+    commit_cmd = next(cmd for cmd in calls if cmd[:2] == ["git", "commit"])
+    assert "PR-001: auto-commit after Claude CLI" in commit_cmd
+    assert any(
+        "auto-committed and pushed" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_commit_and_push_dirty_skips_when_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        # Clean working tree.
+        return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    result = runner._commit_and_push_dirty(
+        "should not be committed", expected_branch="pr-001"
+    )
+
+    assert result is False
+    assert runner.state.state != PipelineState.ERROR
+    # Only ``git status --porcelain`` ran; no rev-parse, no ci.sh, no push.
+    assert calls == [["git", "status", "--porcelain"]]
+
+
+def test_commit_and_push_dirty_errors_on_ci_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        if cmd[:2] == ["git", "status"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout=" M src/foo.py\n", returncode=0
+            )
+        if cmd[:3] == ["git", "rev-parse", "--abbrev-ref"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout="pr-001\n", returncode=0
+            )
+        if cmd[:1] == ["scripts/ci.sh"]:
+            raise subprocess.CalledProcessError(
+                1, cmd, stderr="pytest failed"
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    result = runner._commit_and_push_dirty(
+        "should not push broken code", expected_branch="pr-001"
+    )
+
+    assert result is False
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "CI failed on auto-commit"
+    # ci.sh failed -> no git add / commit / push.
+    assert not any(cmd[:2] == ["git", "add"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "commit"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
+    assert any(
+        "CI failed on auto-commit" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_commit_and_push_dirty_errors_when_ci_script_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P2: ``scripts/ci.sh`` may be missing or non-executable
+    in the dirty tree being auto-committed (Claude CLI deleted it,
+    permissions got mangled, etc.). ``subprocess.run`` raises
+    ``FileNotFoundError`` / ``PermissionError`` — both subclasses of
+    ``OSError`` — rather than ``CalledProcessError``. Without the
+    ``OSError`` catch, the exception escapes ``_commit_and_push_dirty``
+    and bypasses the structured ERROR-state translation the callers
+    rely on.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        if cmd[:2] == ["git", "status"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout=" M src/foo.py\n", returncode=0
+            )
+        if cmd[:3] == ["git", "rev-parse", "--abbrev-ref"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout="pr-001\n", returncode=0
+            )
+        if cmd[:1] == ["scripts/ci.sh"]:
+            raise FileNotFoundError(
+                2, "No such file or directory", "scripts/ci.sh"
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    result = runner._commit_and_push_dirty(
+        "should not push", expected_branch="pr-001"
+    )
+
+    assert result is False
+    assert runner.state.state == PipelineState.ERROR
+    assert "ci.sh could not run" in (runner.state.error_message or "")
+    # Missing/broken ci.sh -> no git add/commit/push.
+    assert not any(cmd[:2] == ["git", "add"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "commit"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
+
+
+def test_commit_and_push_dirty_gives_ci_script_generous_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P2 (round 3): ``scripts/ci.sh`` runs the user repo's full
+    test suite and 120s is too tight for moderate-sized projects. A
+    real suite exceeding 2 minutes would raise ``TimeoutExpired`` and
+    flip the runner to ERROR even when the code is valid, defeating
+    the purpose of the auto-commit safety net.
+
+    Git probes (``status``, ``rev-parse``, ``add``, ``commit``,
+    ``push``) stay at 120s because they should return in milliseconds
+    on a healthy repo; only ``scripts/ci.sh`` gets the large budget.
+    """
+    ci_timeouts: list[float | int | None] = []
+    git_timeouts: list[float | int | None] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        timeout = kwargs.get("timeout")
+        if cmd[:1] == ["scripts/ci.sh"]:
+            ci_timeouts.append(timeout)
+        elif cmd[:1] == ["git"]:
+            git_timeouts.append(timeout)
+        if cmd[:2] == ["git", "status"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout=" M src/foo.py\n", returncode=0
+            )
+        if cmd[:3] == ["git", "rev-parse", "--abbrev-ref"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout="pr-001\n", returncode=0
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    result = runner._commit_and_push_dirty(
+        "auto-commit", expected_branch="pr-001"
+    )
+
+    assert result is True
+    assert len(ci_timeouts) == 1
+    # Realistic CI suites routinely run longer than 2 minutes. Pin to
+    # the module constant so a future regression that drops back to
+    # 120s fails loudly here.
+    assert ci_timeouts[0] == runner_module._CI_SCRIPT_TIMEOUT_SEC
+    assert ci_timeouts[0] >= 600, (
+        "ci.sh timeout must be generous enough for moderate test suites"
+    )
+    # Git probes keep their quick 120s cap — they should return in
+    # milliseconds, so there is no reason to bump them.
+    assert all(t == 120 for t in git_timeouts)
+
+
+def test_commit_and_push_dirty_refuses_base_branch_as_expected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P1 (round 4): a malformed queue entry with ``Branch:``
+    set to the configured base branch (``main`` in this repo config)
+    would otherwise pass every downstream check — HEAD is on ``main``
+    after ``sync_to_main``, ``expected_branch`` equals current branch,
+    so the method would happily commit + push directly to the base
+    branch, bypassing every PR/review gate. The hard guard refuses
+    before any git or ci.sh work runs, so no subprocess at all is
+    issued when the caller supplied the base branch.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()  # default repo branch is "main"
+    result = runner._commit_and_push_dirty(
+        "should not touch the base branch", expected_branch="main"
+    )
+
+    assert result is False
+    assert runner.state.state == PipelineState.ERROR
+    assert "base branch" in (runner.state.error_message or "")
+    assert "'main'" in (runner.state.error_message or "")
+    # Guard fires before any subprocess call — no git status, no
+    # rev-parse, no ci.sh, no add/commit/push.
+    assert calls == []
+
+
+def test_commit_and_push_dirty_errors_when_head_on_wrong_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P1 (round 2): ``_commit_and_push_dirty`` must refuse to
+    commit or push when HEAD is not on the expected PR branch.
+
+    The dangerous case is a Claude CLI run that exits 0 without
+    creating the feature branch: ``handle_idle.sync_to_main`` has just
+    hard-synced the working tree to ``main``, so HEAD is still on the
+    base branch. Without the guard, ``_commit_and_push_dirty`` would
+    commit uncommitted edits directly onto ``main`` and push them
+    upstream, bypassing every PR/review gate in the pipeline.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        if cmd[:2] == ["git", "status"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout=" M src/foo.py\n", returncode=0
+            )
+        if cmd[:3] == ["git", "rev-parse", "--abbrev-ref"]:
+            # HEAD still on the base branch — Claude CLI exited 0 but
+            # never switched branches.
+            return _FakeCompletedProcess(
+                args=cmd, stdout="main\n", returncode=0
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    result = runner._commit_and_push_dirty(
+        "should not push to main", expected_branch="pr-001"
+    )
+
+    assert result is False
+    assert runner.state.state == PipelineState.ERROR
+    assert "'main'" in (runner.state.error_message or "")
+    assert "'pr-001'" in (runner.state.error_message or "")
+    # Wrong-branch guard fired before ci.sh, add, commit, or push.
+    assert not any(cmd[:1] == ["scripts/ci.sh"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "add"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "commit"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)

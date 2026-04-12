@@ -41,6 +41,16 @@ _TRANSIENT_STATES = {
 
 _HISTORY_LIMIT = 100
 
+# Timeout for ``scripts/ci.sh`` on the auto-commit path. Git probes
+# stay at 120s (they should return in milliseconds on a healthy repo),
+# but the CI gate runs the user repo's full test suite and 120s is
+# too tight for moderate-sized projects — a real test suite exceeding
+# the cap would flip the runner to ERROR even when the code is valid,
+# reintroducing the operator intervention this safety net is meant to
+# eliminate. 30 minutes accommodates realistic CI runs without
+# abandoning the upper bound entirely.
+_CI_SCRIPT_TIMEOUT_SEC = 1800
+
 
 def repo_owner_from_url(url: str) -> str:
     """Return ``owner/repo`` for a GitHub URL."""
@@ -679,6 +689,180 @@ class PipelineRunner:
             return False
         return True
 
+    def _commit_and_push_dirty(self, message: str, expected_branch: str) -> bool:
+        """Commit and push any uncommitted changes left in the working tree.
+
+        Claude CLI runs (``run_planned_pr``, ``fix_review``) are supposed
+        to commit and push their own work, but occasionally exit 0 while
+        leaving edits uncommitted. Without this safety net, the next
+        cycle's ``preflight`` flips the runner to ERROR with "working
+        tree dirty" and operator intervention is needed. Running
+        ``scripts/ci.sh`` before committing ensures we never push broken
+        code as part of the auto-commit path.
+
+        ``expected_branch`` is the branch HEAD must be on for the push
+        to be safe. ``handle_idle`` hard-syncs to ``main`` before
+        handing off to CODING, so a Claude CLI run that exits 0 without
+        switching branches would otherwise cause this method to commit
+        straight onto ``main`` and push it upstream — bypassing every
+        PR / review gate in the pipeline. Validating HEAD against the
+        caller's expected branch catches that class of failure before
+        any write hits the repo.
+
+        Returns ``True`` after a successful commit + push, ``False``
+        when the tree is already clean (nothing to do) or when an error
+        has been translated into ``ERROR`` state for the caller to bail
+        on.
+        """
+        # Hard guard: a malformed queue entry with ``Branch:`` set to
+        # the configured base branch (e.g. ``Branch: main``) would pass
+        # the HEAD-equals-expected-branch check below — HEAD is on
+        # ``main`` after ``sync_to_main``, and expected_branch is also
+        # ``main`` — letting the method commit + push to the base
+        # branch directly, bypassing every PR/review gate. Refuse
+        # unconditionally before any git/ci.sh work runs.
+        if expected_branch == self.repo_config.branch:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = (
+                f"auto-commit aborted: refusing to push to base branch "
+                f"{expected_branch!r}"
+            )
+            self.log_event(self.state.error_message)
+            return False
+
+        try:
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=True,
+                cwd=self.repo_path,
+            )
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ) as exc:
+            # ``OSError`` covers ``FileNotFoundError`` (cwd missing, git
+            # binary missing) and ``PermissionError``. Without it those
+            # escape as unhandled exceptions and bypass the structured
+            # ERROR-state translation the caller relies on.
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = f"auto-commit git status failed: {exc}"
+            self.log_event(self.state.error_message)
+            return False
+
+        if not status.stdout.strip():
+            return False
+
+        try:
+            head = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=True,
+                cwd=self.repo_path,
+            )
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ) as exc:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = (
+                f"auto-commit git rev-parse failed: {exc}"
+            )
+            self.log_event(self.state.error_message)
+            return False
+
+        current_branch = head.stdout.strip()
+        if current_branch != expected_branch:
+            # Refuse to commit/push when HEAD is on the wrong branch.
+            # The most dangerous instance is HEAD still on ``main``
+            # from ``sync_to_main`` because Claude CLI exited 0 without
+            # creating the feature branch; pushing that would publish
+            # uncommitted local edits straight to the base branch.
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = (
+                f"auto-commit aborted: HEAD on {current_branch!r}, "
+                f"expected {expected_branch!r}"
+            )
+            self.log_event(self.state.error_message)
+            return False
+
+        try:
+            subprocess.run(
+                ["scripts/ci.sh"],
+                capture_output=True,
+                text=True,
+                timeout=_CI_SCRIPT_TIMEOUT_SEC,
+                check=True,
+                cwd=self.repo_path,
+            )
+        except subprocess.CalledProcessError:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = "CI failed on auto-commit"
+            self.log_event("CI failed on auto-commit")
+            return False
+        except subprocess.TimeoutExpired as exc:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = f"auto-commit ci.sh timed out: {exc}"
+            self.log_event(self.state.error_message)
+            return False
+        except OSError as exc:
+            # ``scripts/ci.sh`` missing or non-executable in the dirty
+            # tree we are about to auto-commit. Distinct from
+            # ``CalledProcessError`` (script ran and exited non-zero) —
+            # the script never executed, so the "CI failed" phrasing
+            # would be misleading.
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = f"auto-commit ci.sh could not run: {exc}"
+            self.log_event(self.state.error_message)
+            return False
+
+        try:
+            subprocess.run(
+                ["git", "add", "-A"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=True,
+                cwd=self.repo_path,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", message],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=True,
+                cwd=self.repo_path,
+            )
+            subprocess.run(
+                # Push the validated branch by name rather than ``HEAD``
+                # so a pre-push hook that re-points HEAD mid-operation
+                # still cannot divert the push onto the base branch.
+                ["git", "push", "origin", f"{expected_branch}:{expected_branch}"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=True,
+                cwd=self.repo_path,
+            )
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ) as exc:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = f"auto-commit git operation failed: {exc}"
+            self.log_event(self.state.error_message)
+            return False
+
+        self.log_event(f"auto-committed and pushed: {message}")
+        return True
+
     async def run_cycle(self) -> None:
         """Advance the state machine by one step."""
         try:
@@ -804,14 +988,13 @@ class PipelineRunner:
             self.log_event(f"claude CLI failed: {self.state.error_message}")
             return
 
-        try:
-            prs = github_client.get_open_prs(self.owner_repo)
-        except Exception as exc:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = f"get_open_prs failed: {exc}"
-            self.log_event(str(exc))
-            return
-
+        # Validate the task-branch invariant BEFORE auto-committing. A
+        # malformed queue entry with no ``Branch:`` field is a hard
+        # error: without it we cannot identify the PR that was just
+        # opened and we must not publish a speculative commit/push on
+        # whatever branch HEAD happens to point at. Bail first, let
+        # ``_commit_and_push_dirty`` run only once we know which PR we
+        # will attach the push to.
         target_branch = (
             self.state.current_task.branch if self.state.current_task else None
         )
@@ -821,6 +1004,21 @@ class PipelineRunner:
                 "Current task has no branch; cannot identify PR"
             )
             self.log_event(self.state.error_message)
+            return
+
+        commit_message = (
+            f"{self.state.current_task.pr_id}: auto-commit after Claude CLI"
+        )
+        self._commit_and_push_dirty(commit_message, expected_branch=target_branch)
+        if self.state.state == PipelineState.ERROR:
+            return
+
+        try:
+            prs = github_client.get_open_prs(self.owner_repo)
+        except Exception as exc:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = f"get_open_prs failed: {exc}"
+            self.log_event(str(exc))
             return
 
         # Match strictly by branch. Falling back to the newest open PR would
@@ -930,6 +1128,39 @@ class PipelineRunner:
             self.state.error_message = stderr.strip() or f"claude exit {code}"
             self.log_event(f"fix_review failed: {self.state.error_message}")
             return
+
+        # Only auto-commit when we know the PR branch to validate HEAD
+        # against. ``current_pr`` is set by handle_watch before routing
+        # into FIX, so the None case is defensive — skip the auto-commit
+        # safety net rather than push to an unknown branch.
+        #
+        # Fork PRs (``is_cross_repository``) are also skipped: the PR
+        # head lives on the contributor's fork, but the daemon's clone
+        # only knows about ``origin`` (the base repo). Pushing there
+        # would create or update an unrelated branch on ``origin``
+        # without ever touching the PR, and the runner would then
+        # proceed to WATCH as if the fix landed. Letting the dirty
+        # tree surface through the next preflight cycle surfaces the
+        # real mismatch to operators instead of silently diverging.
+        if (
+            self.state.current_pr is not None
+            and self.state.current_pr.branch
+            and not self.state.current_pr.is_cross_repository
+        ):
+            self._commit_and_push_dirty(
+                "fix: auto-commit after review",
+                expected_branch=self.state.current_pr.branch,
+            )
+            if self.state.state == PipelineState.ERROR:
+                return
+        elif (
+            self.state.current_pr is not None
+            and self.state.current_pr.is_cross_repository
+        ):
+            self.log_event(
+                f"Skipping auto-commit for cross-repo PR "
+                f"#{self.state.current_pr.number} (fork head)"
+            )
 
         if self.state.current_pr is not None:
             self.state.current_pr.push_count += 1
