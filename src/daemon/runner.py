@@ -679,6 +679,94 @@ class PipelineRunner:
             return False
         return True
 
+    def _commit_and_push_dirty(self, message: str) -> bool:
+        """Commit and push any uncommitted changes left in the working tree.
+
+        Claude CLI runs (``run_planned_pr``, ``fix_review``) are supposed
+        to commit and push their own work, but occasionally exit 0 while
+        leaving edits uncommitted. Without this safety net, the next
+        cycle's ``preflight`` flips the runner to ERROR with "working
+        tree dirty" and operator intervention is needed. Running
+        ``scripts/ci.sh`` before committing ensures we never push broken
+        code as part of the auto-commit path.
+
+        Returns ``True`` after a successful commit + push, ``False``
+        when the tree is already clean (nothing to do) or when an error
+        has been translated into ``ERROR`` state for the caller to bail
+        on.
+        """
+        try:
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=True,
+                cwd=self.repo_path,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = f"auto-commit git status failed: {exc}"
+            self.log_event(self.state.error_message)
+            return False
+
+        if not status.stdout.strip():
+            return False
+
+        try:
+            subprocess.run(
+                ["scripts/ci.sh"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=True,
+                cwd=self.repo_path,
+            )
+        except subprocess.CalledProcessError:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = "CI failed on auto-commit"
+            self.log_event("CI failed on auto-commit")
+            return False
+        except subprocess.TimeoutExpired as exc:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = f"auto-commit ci.sh timed out: {exc}"
+            self.log_event(self.state.error_message)
+            return False
+
+        try:
+            subprocess.run(
+                ["git", "add", "-A"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=True,
+                cwd=self.repo_path,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", message],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=True,
+                cwd=self.repo_path,
+            )
+            subprocess.run(
+                ["git", "push", "origin", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=True,
+                cwd=self.repo_path,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = f"auto-commit git operation failed: {exc}"
+            self.log_event(self.state.error_message)
+            return False
+
+        self.log_event(f"auto-committed and pushed: {message}")
+        return True
+
     async def run_cycle(self) -> None:
         """Advance the state machine by one step."""
         try:
@@ -802,6 +890,15 @@ class PipelineRunner:
             self.state.state = PipelineState.ERROR
             self.state.error_message = stderr.strip() or f"claude exit {code}"
             self.log_event(f"claude CLI failed: {self.state.error_message}")
+            return
+
+        commit_message = (
+            f"{self.state.current_task.pr_id}: auto-commit after Claude CLI"
+            if self.state.current_task is not None
+            else "auto-commit after Claude CLI"
+        )
+        self._commit_and_push_dirty(commit_message)
+        if self.state.state == PipelineState.ERROR:
             return
 
         try:
@@ -929,6 +1026,10 @@ class PipelineRunner:
             self.state.state = PipelineState.ERROR
             self.state.error_message = stderr.strip() or f"claude exit {code}"
             self.log_event(f"fix_review failed: {self.state.error_message}")
+            return
+
+        self._commit_and_push_dirty("fix: auto-commit after review")
+        if self.state.state == PipelineState.ERROR:
             return
 
         if self.state.current_pr is not None:
