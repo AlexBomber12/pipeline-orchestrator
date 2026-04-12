@@ -1877,6 +1877,40 @@ def test_commit_and_push_dirty_gives_ci_script_generous_timeout(
     assert all(t == 120 for t in git_timeouts)
 
 
+def test_commit_and_push_dirty_refuses_base_branch_as_expected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P1 (round 4): a malformed queue entry with ``Branch:``
+    set to the configured base branch (``main`` in this repo config)
+    would otherwise pass every downstream check — HEAD is on ``main``
+    after ``sync_to_main``, ``expected_branch`` equals current branch,
+    so the method would happily commit + push directly to the base
+    branch, bypassing every PR/review gate. The hard guard refuses
+    before any git or ci.sh work runs, so no subprocess at all is
+    issued when the caller supplied the base branch.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()  # default repo branch is "main"
+    result = runner._commit_and_push_dirty(
+        "should not touch the base branch", expected_branch="main"
+    )
+
+    assert result is False
+    assert runner.state.state == PipelineState.ERROR
+    assert "base branch" in (runner.state.error_message or "")
+    assert "'main'" in (runner.state.error_message or "")
+    # Guard fires before any subprocess call — no git status, no
+    # rev-parse, no ci.sh, no add/commit/push.
+    assert calls == []
+
+
 def test_commit_and_push_dirty_errors_when_head_on_wrong_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

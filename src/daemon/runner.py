@@ -714,6 +714,22 @@ class PipelineRunner:
         has been translated into ``ERROR`` state for the caller to bail
         on.
         """
+        # Hard guard: a malformed queue entry with ``Branch:`` set to
+        # the configured base branch (e.g. ``Branch: main``) would pass
+        # the HEAD-equals-expected-branch check below — HEAD is on
+        # ``main`` after ``sync_to_main``, and expected_branch is also
+        # ``main`` — letting the method commit + push to the base
+        # branch directly, bypassing every PR/review gate. Refuse
+        # unconditionally before any git/ci.sh work runs.
+        if expected_branch == self.repo_config.branch:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = (
+                f"auto-commit aborted: refusing to push to base branch "
+                f"{expected_branch!r}"
+            )
+            self.log_event(self.state.error_message)
+            return False
+
         try:
             status = subprocess.run(
                 ["git", "status", "--porcelain"],
