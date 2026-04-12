@@ -3,30 +3,10 @@
 {% block title %}Dashboard - Pipeline Orchestrator{% endblock %}
 
 {% block content %}
-<div hx-get="/partials/alerts"
-     hx-trigger="every 10s"
-     hx-swap="innerHTML">
-    {% include "components/alerts_panel.html" %}
+<div hx-get="/partials/repo-list" hx-trigger="every 10s" hx-swap="innerHTML" id="repo-grid">
+    {% include "components/repo_cards.html" %}
 </div>
-
-<div class="mb-6"
-     hx-get="/partials/stats"
-     hx-trigger="every 10s"
-     hx-swap="innerHTML">
-    {% include "components/stats_cards.html" %}
-</div>
-
-<div class="grid gap-6 lg:grid-cols-3">
-    <div class="lg:col-span-2"
-         hx-get="/partials/repo-list"
-         hx-trigger="every 10s"
-         hx-swap="innerHTML">
-        {% include "components/repo_list.html" %}
-    </div>
-    <div hx-get="/partials/activity-feed"
-         hx-trigger="every 10s"
-         hx-swap="innerHTML">
-        {% include "components/activity_feed.html" %}
-    </div>
+<div hx-get="/partials/stats" hx-trigger="every 10s" hx-swap="innerHTML" id="status-bar" style="margin-top: 14px;">
+    {% include "components/status_bar.html" %}
 </div>
 {% endblock %}

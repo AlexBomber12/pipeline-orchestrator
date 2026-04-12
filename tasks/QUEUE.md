@@ -132,7 +132,7 @@
 - Depends on: PR-021
 
 ## PR-023: Index page redesign - zero scroll repo cards
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-023.md
 - Branch: pr-023-index-redesign
 - Depends on: PR-022

@@ -12,9 +12,6 @@
 ./Dockerfile
 ./LICENSE
 ./README.md
-./artifacts/ci.log
-./artifacts/pr.patch
-./artifacts/structure.txt
 ./config.yml
 ./docker-compose.yml
 ./pyproject.toml
@@ -39,6 +36,7 @@
 ./src/web/templates/components/activity_feed.html
 ./src/web/templates/components/alerts_panel.html
 ./src/web/templates/components/event_log.html
+./src/web/templates/components/repo_cards.html
 ./src/web/templates/components/repo_list.html
 ./src/web/templates/components/repo_summary.html
 ./src/web/templates/components/settings_auth.html
@@ -49,6 +47,7 @@
 ./src/web/templates/components/settings_repo_list.html
 ./src/web/templates/components/settings_repo_list_response.html
 ./src/web/templates/components/stats_cards.html
+./src/web/templates/components/status_bar.html
 ./src/web/templates/index.html
 ./src/web/templates/repo.html
 ./src/web/templates/settings.html

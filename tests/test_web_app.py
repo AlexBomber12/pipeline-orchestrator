@@ -154,8 +154,8 @@ def test_index_route_returns_html(
     assert "text/html" in response.headers["content-type"]
     body = response.text
     assert "Pipeline Orchestrator" in body
-    assert "Repositories" in body
     assert 'hx-get="/partials/repo-list"' in body
+    assert 'id="status-bar"' in body
 
 
 def test_api_states_returns_json(
@@ -188,6 +188,7 @@ def test_partial_repo_list_returns_html_fragment(
     assert "alpha" in body
     assert "beta" in body
     assert "IDLE" in body
+    assert "0 / 0 done" in body
 
 
 def test_partial_repo_list_empty_state(
@@ -200,6 +201,67 @@ def test_partial_repo_list_empty_state(
 
     assert response.status_code == 200
     assert "No repositories configured" in response.text
+
+
+def test_partial_repo_list_renders_queue_progress(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="alpha",
+        state=PipelineState.CODING,
+        current_task=QueueTask(
+            pr_id="PR-005",
+            title="Dashboard",
+            status=TaskStatus.DOING,
+        ),
+        queue_done=4,
+        queue_total=10,
+        last_updated=now,
+    )
+
+    class _StubClientWithQueue:
+        async def get(self, key: str) -> str | None:
+            if key == "pipeline:alpha":
+                return stored.model_dump_json()
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
+    class _StubAioredisWithQueue:
+        @staticmethod
+        def from_url(
+            url: str, decode_responses: bool = True
+        ) -> _StubClientWithQueue:
+            return _StubClientWithQueue()
+
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredisWithQueue())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo-list")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "4 / 10 done" in body
+    assert "PR-005" in body
+
+
+def test_partial_stats_renders_status_bar(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/stats")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "Repos" in body
+    assert "Done today" in body
+    assert "Active" in body
+    assert "Alerts" in body
 
 
 def test_get_repo_state_unknown_repo_returns_idle_default(
