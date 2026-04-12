@@ -31,7 +31,7 @@
     </p>
 </div>
 {% else %}
-<div id="repo-grid" class="grid gap-4 md:grid-cols-2">
+<div class="grid gap-4 md:grid-cols-2">
     {% for repo in repos %}
     {% set style = state_styles.get(repo.state.value, state_styles['IDLE']) %}
     {% set is_error = repo.state.value == 'ERROR' %}
@@ -51,7 +51,7 @@
                 {% endif %}
                 <form hx-post="/repos/{{ repo.name }}/upload-tasks"
                       hx-encoding="multipart/form-data"
-                      hx-target="#repo-grid"
+                      hx-target="closest #repo-grid"
                       hx-swap="innerHTML">
                     <input type="file" name="files" multiple accept=".md"
                            onchange="this.form.requestSubmit()"

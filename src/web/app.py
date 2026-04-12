@@ -1117,7 +1117,8 @@ def _render_upload_error(
         status_code=status_code,
     )
     if repo_name:
-        response.headers["HX-Retarget"] = f"#upload-error-{repo_name}"
+        css_name = _re.sub(r"([.#\[\]:>+~(){}|^$*!])", r"\\\1", repo_name)
+        response.headers["HX-Retarget"] = f"#upload-error-{css_name}"
         response.headers["HX-Reswap"] = "innerHTML"
     return response
 
