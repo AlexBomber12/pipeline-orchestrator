@@ -3,6 +3,7 @@
 ./.pytest_cache/.gitignore
 ./.pytest_cache/CACHEDIR.TAG
 ./.pytest_cache/README.md
+./.pytest_cache/v/cache/lastfailed
 ./.pytest_cache/v/cache/nodeids
 ./.ruff_cache/.gitignore
 ./.ruff_cache/0.11.8/6033410362127721513
@@ -11,11 +12,15 @@
 ./Dockerfile
 ./LICENSE
 ./README.md
+./artifacts/ci.log
+./artifacts/pr.patch
+./artifacts/structure.txt
 ./config.yml
 ./docker-compose.yml
 ./pyproject.toml
 ./requirements.txt
 ./scripts/ci.sh
+./scripts/entrypoint.sh
 ./scripts/make-review-artifacts.sh
 ./src/__init__.py
 ./src/claude_cli.py

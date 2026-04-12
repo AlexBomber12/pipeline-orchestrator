@@ -126,7 +126,7 @@
 - Depends on: PR-020
 
 ## PR-022: IDLE open PR visibility
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-022.md
 - Branch: pr-022-idle-pr
 - Depends on: PR-021
