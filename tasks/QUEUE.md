@@ -114,13 +114,13 @@
 - Depends on: PR-013
 
 ## PR-020: Stability fixes and cleanup
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-020.md
 - Branch: pr-020-stability
 - Depends on: PR-019
 
 ## PR-021: Daemon startup hardening
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-021.md
 - Branch: pr-021-daemon-hardening
 - Depends on: PR-020

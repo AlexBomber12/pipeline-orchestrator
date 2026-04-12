@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import subprocess
 from typing import Any
 
 import redis.asyncio as aioredis
@@ -45,6 +46,42 @@ DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 #: which is frequent enough for settings-page edits to take effect without
 #: thrashing the filesystem each poll.
 CONFIG_RELOAD_EVERY_CYCLES = 5
+
+
+def _setup_git_auth() -> None:
+    """Run ``gh auth setup-git`` so git clone/push works automatically."""
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "setup-git"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            logger.info("gh auth setup-git succeeded")
+        else:
+            logger.warning(
+                "gh auth setup-git exited %d: %s",
+                result.returncode,
+                result.stderr.strip(),
+            )
+    except subprocess.TimeoutExpired:
+        logger.warning("gh auth setup-git timed out after 30s")
+    except Exception:
+        logger.warning("gh auth setup-git failed", exc_info=True)
+
+
+def _validate_auth() -> dict[str, bool]:
+    """Check whether ``claude`` and ``gh`` CLIs are authenticated."""
+    checks: dict[str, bool] = {}
+    for name, cmd in [("claude", ["claude", "--version"]), ("gh", ["gh", "auth", "status"])]:
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=True)
+            checks[name] = True
+        except Exception:
+            checks[name] = False
+    logger.info("Auth status: %s", checks)
+    return checks
 
 
 def _build_runner(
@@ -111,6 +148,17 @@ def _configs_differ(a: AppConfig, b: AppConfig) -> bool:
 
 async def main() -> None:
     """Initialize runners and drive the poll loop forever."""
+    gh_dir = os.environ.get("GH_CONFIG_DIR")
+    if gh_dir:
+        os.environ["GH_CONFIG_HOME"] = gh_dir
+
+    _setup_git_auth()
+    auth = _validate_auth()
+    if not auth.get("claude") and not auth.get("gh"):
+        logger.error(
+            "No auth configured. Run: docker compose run --rm daemon bash"
+        )
+
     config = load_config()
     redis_url = os.environ.get("REDIS_URL", DEFAULT_REDIS_URL)
     redis_client = aioredis.from_url(redis_url, decode_responses=True)

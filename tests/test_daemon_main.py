@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -61,6 +63,10 @@ def _patch_main(
         lambda url, decode_responses: _FakeRedisClient(),
     )
     monkeypatch.setattr(main_module, "PipelineRunner", runner_cls)
+    monkeypatch.setattr(main_module, "_setup_git_auth", lambda: None)
+    monkeypatch.setattr(
+        main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
+    )
 
     sleep_calls: list[float] = []
 
@@ -186,6 +192,10 @@ def test_main_reload_detects_new_repository(
         lambda url, decode_responses: _FakeRedisClient(),
     )
     monkeypatch.setattr(main_module, "PipelineRunner", _FakeRunner)
+    monkeypatch.setattr(main_module, "_setup_git_auth", lambda: None)
+    monkeypatch.setattr(
+        main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
+    )
     # Reload on every second cycle so the test doesn't need long loops.
     monkeypatch.setattr(main_module, "CONFIG_RELOAD_EVERY_CYCLES", 2)
 
@@ -246,6 +256,10 @@ def test_main_reload_drops_removed_repository(
         lambda url, decode_responses: _FakeRedisClient(),
     )
     monkeypatch.setattr(main_module, "PipelineRunner", _FakeRunner)
+    monkeypatch.setattr(main_module, "_setup_git_auth", lambda: None)
+    monkeypatch.setattr(
+        main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
+    )
     monkeypatch.setattr(main_module, "CONFIG_RELOAD_EVERY_CYCLES", 2)
 
     sleep_calls: list[float] = []
@@ -297,3 +311,104 @@ def test_main_continues_when_one_runner_raises(
     assert beta.cycles == 1, "second runner must still execute after first raises"
     errors = [rec for rec in caplog.records if rec.levelno == logging.ERROR]
     assert any("alpha" in rec.getMessage() for rec in errors)
+
+
+# ---------- _setup_git_auth tests ----------
+
+
+def test_setup_git_auth_calls_subprocess() -> None:
+    """_setup_git_auth must invoke 'gh auth setup-git'."""
+    with patch.object(main_module.subprocess, "run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["gh", "auth", "setup-git"], returncode=0, stdout="", stderr=""
+        )
+        main_module._setup_git_auth()
+
+    mock_run.assert_called_once()
+    args = mock_run.call_args
+    assert args[0][0] == ["gh", "auth", "setup-git"]
+    assert args[1]["timeout"] == 30
+
+
+def test_setup_git_auth_does_not_crash_on_error() -> None:
+    """_setup_git_auth must not raise on CalledProcessError."""
+    with patch.object(main_module.subprocess, "run") as mock_run:
+        mock_run.side_effect = subprocess.CalledProcessError(1, "gh")
+        # Must not raise
+        main_module._setup_git_auth()
+
+
+def test_setup_git_auth_handles_timeout() -> None:
+    """_setup_git_auth must not raise on TimeoutExpired."""
+    with patch.object(main_module.subprocess, "run") as mock_run:
+        mock_run.side_effect = subprocess.TimeoutExpired("gh", 30)
+        main_module._setup_git_auth()
+
+
+# ---------- _validate_auth tests ----------
+
+
+def test_validate_auth_returns_true_when_both_succeed() -> None:
+    with patch.object(main_module.subprocess, "run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        result = main_module._validate_auth()
+
+    assert result == {"claude": True, "gh": True}
+
+
+def test_validate_auth_returns_false_on_failure() -> None:
+    def failing_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.CalledProcessError(1, cmd[0])
+
+    with patch.object(main_module.subprocess, "run", side_effect=failing_run):
+        result = main_module._validate_auth()
+
+    assert result == {"claude": False, "gh": False}
+
+
+def test_validate_auth_mixed_results() -> None:
+    def selective_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if cmd[0] == "claude":
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+        raise subprocess.CalledProcessError(1, cmd[0])
+
+    with patch.object(main_module.subprocess, "run", side_effect=selective_run):
+        result = main_module._validate_auth()
+
+    assert result == {"claude": True, "gh": False}
+
+
+# ---------- main() calls startup functions ----------
+
+
+def test_main_calls_setup_git_auth_before_runners(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """main() must call _setup_git_auth before creating runners."""
+    call_order: list[str] = []
+
+    original_setup = main_module._setup_git_auth
+
+    def tracking_setup() -> None:
+        call_order.append("setup_git_auth")
+
+    def tracking_validate() -> dict[str, bool]:
+        call_order.append("validate_auth")
+        return {"claude": True, "gh": True}
+
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    _patch_main(monkeypatch, config)
+    # Override the _patch_main stubs with tracking versions
+    monkeypatch.setattr(main_module, "_setup_git_auth", tracking_setup)
+    monkeypatch.setattr(main_module, "_validate_auth", tracking_validate)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    assert call_order.index("setup_git_auth") < call_order.index("validate_auth")
+    assert len(_FakeRunner.instances) == 1
