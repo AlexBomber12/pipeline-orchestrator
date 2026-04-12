@@ -469,7 +469,7 @@ def test_handle_fix_errors_when_post_comment_fails(
 def test_handle_coding_errors_when_task_has_no_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_subprocess(monkeypatch)
+    calls = _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.claude_cli,
         "run_planned_pr",
@@ -490,6 +490,15 @@ def test_handle_coding_errors_when_task_has_no_branch(
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.current_pr is None
     assert "no branch" in (runner.state.error_message or "").lower()
+    # Codex P1: the malformed-task error path must bail BEFORE
+    # ``_commit_and_push_dirty`` runs, otherwise a dirty tree could be
+    # committed + pushed to whatever branch HEAD happens to be on
+    # before the runner realises it cannot identify the target PR.
+    assert not any(cmd[:2] == ["git", "status"] for cmd in calls)
+    assert not any(cmd[:1] == ["scripts/ci.sh"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "add"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "commit"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
 
 
 def test_handle_watch_approved_and_green_merges(
@@ -1747,3 +1756,43 @@ def test_commit_and_push_dirty_errors_on_ci_failure(
         "CI failed on auto-commit" in e["event"]
         for e in runner.state.history
     )
+
+
+def test_commit_and_push_dirty_errors_when_ci_script_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P2: ``scripts/ci.sh`` may be missing or non-executable
+    in the dirty tree being auto-committed (Claude CLI deleted it,
+    permissions got mangled, etc.). ``subprocess.run`` raises
+    ``FileNotFoundError`` / ``PermissionError`` — both subclasses of
+    ``OSError`` — rather than ``CalledProcessError``. Without the
+    ``OSError`` catch, the exception escapes ``_commit_and_push_dirty``
+    and bypasses the structured ERROR-state translation the callers
+    rely on.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        if cmd[:2] == ["git", "status"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout=" M src/foo.py\n", returncode=0
+            )
+        if cmd[:1] == ["scripts/ci.sh"]:
+            raise FileNotFoundError(
+                2, "No such file or directory", "scripts/ci.sh"
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    result = runner._commit_and_push_dirty("should not push")
+
+    assert result is False
+    assert runner.state.state == PipelineState.ERROR
+    assert "ci.sh could not run" in (runner.state.error_message or "")
+    # Missing/broken ci.sh -> no git add/commit/push.
+    assert not any(cmd[:2] == ["git", "add"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "commit"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)

@@ -704,7 +704,15 @@ class PipelineRunner:
                 check=True,
                 cwd=self.repo_path,
             )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ) as exc:
+            # ``OSError`` covers ``FileNotFoundError`` (cwd missing, git
+            # binary missing) and ``PermissionError``. Without it those
+            # escape as unhandled exceptions and bypass the structured
+            # ERROR-state translation the caller relies on.
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"auto-commit git status failed: {exc}"
             self.log_event(self.state.error_message)
@@ -730,6 +738,16 @@ class PipelineRunner:
         except subprocess.TimeoutExpired as exc:
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"auto-commit ci.sh timed out: {exc}"
+            self.log_event(self.state.error_message)
+            return False
+        except OSError as exc:
+            # ``scripts/ci.sh`` missing or non-executable in the dirty
+            # tree we are about to auto-commit. Distinct from
+            # ``CalledProcessError`` (script ran and exited non-zero) —
+            # the script never executed, so the "CI failed" phrasing
+            # would be misleading.
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = f"auto-commit ci.sh could not run: {exc}"
             self.log_event(self.state.error_message)
             return False
 
@@ -758,7 +776,11 @@ class PipelineRunner:
                 check=True,
                 cwd=self.repo_path,
             )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ) as exc:
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"auto-commit git operation failed: {exc}"
             self.log_event(self.state.error_message)
@@ -892,10 +914,26 @@ class PipelineRunner:
             self.log_event(f"claude CLI failed: {self.state.error_message}")
             return
 
+        # Validate the task-branch invariant BEFORE auto-committing. A
+        # malformed queue entry with no ``Branch:`` field is a hard
+        # error: without it we cannot identify the PR that was just
+        # opened and we must not publish a speculative commit/push on
+        # whatever branch HEAD happens to point at. Bail first, let
+        # ``_commit_and_push_dirty`` run only once we know which PR we
+        # will attach the push to.
+        target_branch = (
+            self.state.current_task.branch if self.state.current_task else None
+        )
+        if not target_branch:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = (
+                "Current task has no branch; cannot identify PR"
+            )
+            self.log_event(self.state.error_message)
+            return
+
         commit_message = (
             f"{self.state.current_task.pr_id}: auto-commit after Claude CLI"
-            if self.state.current_task is not None
-            else "auto-commit after Claude CLI"
         )
         self._commit_and_push_dirty(commit_message)
         if self.state.state == PipelineState.ERROR:
@@ -907,17 +945,6 @@ class PipelineRunner:
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"get_open_prs failed: {exc}"
             self.log_event(str(exc))
-            return
-
-        target_branch = (
-            self.state.current_task.branch if self.state.current_task else None
-        )
-        if not target_branch:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = (
-                "Current task has no branch; cannot identify PR"
-            )
-            self.log_event(self.state.error_message)
             return
 
         # Match strictly by branch. Falling back to the newest open PR would
