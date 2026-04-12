@@ -51,7 +51,7 @@
                 {% endif %}
                 <form hx-post="/repos/{{ repo.name }}/upload-tasks"
                       hx-encoding="multipart/form-data"
-                      hx-target="#repo-grid"
+                      hx-target="#upload-error-{{ repo.name }}"
                       hx-swap="innerHTML">
                     <input type="file" name="files" multiple accept=".md"
                            onchange="this.form.requestSubmit()"
