@@ -100,27 +100,38 @@ def get_open_prs(repo: str) -> list[PRInfo]:
 
 
 def get_pr_review_status(repo: str, pr_number: int) -> ReviewStatus:
-    """Derive a Codex review status from PR issue comments and their reactions."""
+    """Derive a Codex review status from PR issue comments, review comments, and reactions."""
     comments = _gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments")
     if comments is None:
-        return ReviewStatus.PENDING
+        comments = []
 
-    for comment in reversed(comments):
+    review_comments = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments")
+    if review_comments is None:
+        review_comments = []
+
+    all_comments = comments + review_comments
+
+    for comment in reversed(all_comments):
         user = (comment.get("user") or {}).get("login", "") or ""
         if "codex" not in user.lower():
             continue
 
         comment_id = comment.get("id")
         if comment_id is not None:
-            reactions = _gh_api_paginated(
-                f"repos/{repo}/issues/comments/{comment_id}/reactions"
-            )
-            if reactions is not None:
-                contents = {r.get("content") for r in reactions if isinstance(r, dict)}
-                if "+1" in contents:
-                    return ReviewStatus.APPROVED
-                if "eyes" in contents:
-                    return ReviewStatus.EYES
+            for endpoint in [
+                f"repos/{repo}/issues/comments/{comment_id}/reactions",
+                f"repos/{repo}/pulls/comments/{comment_id}/reactions",
+            ]:
+                try:
+                    reactions = _gh_api_paginated(endpoint)
+                except Exception:
+                    continue
+                if reactions is not None:
+                    contents = {r.get("content") for r in reactions if isinstance(r, dict)}
+                    if "+1" in contents:
+                        return ReviewStatus.APPROVED
+                    if "eyes" in contents:
+                        return ReviewStatus.EYES
 
         body = comment.get("body") or ""
         if "P1" in body or "P2" in body:
