@@ -118,13 +118,13 @@ def get_pr_review_status(
     try:
         issue_comments = _gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
     except RuntimeError as exc:
-        if "404" not in str(exc):
+        if "HTTP 404" not in str(exc):
             raise
         issue_comments = []
     try:
         review_comments = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments") or []
     except RuntimeError as exc:
-        if "404" not in str(exc):
+        if "HTTP 404" not in str(exc):
             raise
         review_comments = []
 
@@ -159,7 +159,7 @@ def get_pr_review_status(
                     if "eyes" in codex_contents:
                         return ReviewStatus.EYES
             except RuntimeError as exc:
-                if "404" not in str(exc):
+                if "HTTP 404" not in str(exc):
                     raise
 
     # Step 3: P1/P2 in Codex comments after the anchor → CHANGES_REQUESTED.
