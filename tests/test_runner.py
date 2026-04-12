@@ -153,6 +153,8 @@ def test_handle_idle_no_tasks_leaves_state_idle(
 
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
+    assert runner.state.queue_done == 0
+    assert runner.state.queue_total == 0
     assert any("No tasks" in e["event"] for e in runner.state.history)
     # sync_to_main must run fetch -> checkout -> reset --hard in order so
     # that parse_queue reads QUEUE.md from the tip of origin/{branch}, not
@@ -217,6 +219,40 @@ def test_handle_idle_picks_task_and_drives_coding(
     assert runner.state.current_pr.number == 17
     assert runner.state.current_task is not None
     assert runner.state.current_task.pr_id == "PR-042"
+    assert runner.state.queue_done == 0
+    assert runner.state.queue_total == 1
+
+
+def test_handle_idle_sets_queue_counters_with_mixed_statuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    tasks = [
+        QueueTask(pr_id="PR-001", title="Done1", status=TaskStatus.DONE, branch="pr-001"),
+        QueueTask(pr_id="PR-002", title="Done2", status=TaskStatus.DONE, branch="pr-002"),
+        QueueTask(pr_id="PR-003", title="Todo", status=TaskStatus.TODO, branch="pr-003"),
+    ]
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: tasks)
+    monkeypatch.setattr(runner_module, "get_next_task", lambda t: tasks[2])
+    monkeypatch.setattr(
+        runner_module.claude_cli, "run_planned_pr", lambda path: (0, "ok", "")
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [PRInfo(number=1, branch="pr-003")],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+
+    runner = _make_runner()
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.queue_done == 2
+    assert runner.state.queue_total == 3
 
 
 def test_handle_coding_errors_when_no_pr_found(

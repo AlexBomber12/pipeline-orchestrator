@@ -552,6 +552,11 @@ class PipelineRunner:
             )
             return False
 
+        self.state.queue_done = sum(
+            1 for t in tasks if t.status == TaskStatus.DONE
+        )
+        self.state.queue_total = len(tasks)
+
         doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
 
         try:
@@ -753,6 +758,10 @@ class PipelineRunner:
 
         queue_path = str(Path(self.repo_path) / "tasks" / "QUEUE.md")
         tasks = parse_queue(queue_path)
+        self.state.queue_done = sum(
+            1 for t in tasks if t.status == TaskStatus.DONE
+        )
+        self.state.queue_total = len(tasks)
         task = get_next_task(tasks)
         if task is None:
             self.log_event("No tasks available")

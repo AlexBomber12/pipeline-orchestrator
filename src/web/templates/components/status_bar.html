@@ -1,0 +1,30 @@
+{# Compact bottom status bar for the index page. #}
+<div class="rounded-lg border border-white/5 bg-surface-2 p-3">
+    <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2">
+        <div class="flex items-center gap-6 text-sm">
+            <div>
+                <span class="font-mono font-semibold text-white">{{ stats.repos }}</span>
+                <span class="text-gray-500 text-xs uppercase tracking-wide ml-1">Repos</span>
+            </div>
+            <div>
+                <span class="font-mono font-semibold text-white">{{ stats.done_today }}</span>
+                <span class="text-gray-500 text-xs uppercase tracking-wide ml-1">Done today</span>
+            </div>
+            <div>
+                <span class="font-mono font-semibold text-white">{{ stats.active }}</span>
+                <span class="text-gray-500 text-xs uppercase tracking-wide ml-1">Active</span>
+            </div>
+            <div>
+                <span class="font-mono font-semibold {% if stats.alerts > 0 %}text-fail{% else %}text-white{% endif %}">{{ stats.alerts }}</span>
+                <span class="{% if stats.alerts > 0 %}text-fail/80{% else %}text-gray-500{% endif %} text-xs uppercase tracking-wide ml-1">Alerts</span>
+            </div>
+        </div>
+        {% if latest_alert %}
+        <div class="text-xs text-gray-500 truncate max-w-md">
+            <span class="text-gray-400">{{ latest_alert.repo_name }}</span>
+            {{ latest_alert.error_message|default(latest_alert.kind, true)|truncate(60) }}
+            <span class="text-gray-600">- {{ latest_alert.duration_text }}</span>
+        </div>
+        {% endif %}
+    </div>
+</div>

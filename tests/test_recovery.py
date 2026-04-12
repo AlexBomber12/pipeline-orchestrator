@@ -109,11 +109,45 @@ def test_recover_doing_task_with_matching_pr_recovers_to_watch(
     assert runner.state.current_task.pr_id == "PR-042"
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.number == 17
+    assert runner.state.queue_done == 0
+    assert runner.state.queue_total == 1
     assert coding_called is False
     assert any(
         "Recovered: DOING task PR-042" in e["event"] and "WATCH PR #17" in e["event"]
         for e in runner.state.history
     )
+
+
+def test_recover_state_sets_queue_counters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """recover_state must populate queue_done and queue_total."""
+    done_task = QueueTask(
+        pr_id="PR-001", title="Done", status=TaskStatus.DONE,
+        branch="pr-001-done",
+    )
+    doing_task = _doing_task()
+    todo_task = QueueTask(
+        pr_id="PR-043", title="Todo", status=TaskStatus.TODO,
+        branch="pr-043-todo",
+    )
+    matching_pr = PRInfo(
+        number=17,
+        branch="pr-042-inflight",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: [matching_pr]
+    )
+
+    runner = _make_runner()
+    runner._parse_base_queue = lambda: [done_task, doing_task, todo_task]  # type: ignore[method-assign]
+    runner.handle_coding = lambda: None  # type: ignore[method-assign]
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.queue_done == 1
+    assert runner.state.queue_total == 3
 
 
 def test_recover_doing_task_without_pr_rerun_coding(

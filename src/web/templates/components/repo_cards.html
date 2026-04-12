@@ -1,0 +1,106 @@
+{% set state_styles = {
+    'IDLE':      {'dot': 'bg-gray-500',  'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30',  'pulse': false},
+    'PREFLIGHT': {'dot': 'bg-gray-500',  'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30',  'pulse': false},
+    'CODING':    {'dot': 'bg-accent',    'badge': 'bg-accent/10 text-accent border-accent/30',         'pulse': true},
+    'WATCH':     {'dot': 'bg-warn',      'badge': 'bg-warn/10 text-warn border-warn/30',               'pulse': true},
+    'FIX':       {'dot': 'bg-warn',      'badge': 'bg-warn/10 text-warn border-warn/30',               'pulse': true},
+    'MERGE':     {'dot': 'bg-ok',        'badge': 'bg-ok/10 text-ok border-ok/30',                     'pulse': false},
+    'HUNG':      {'dot': 'bg-hung',      'badge': 'bg-hung/10 text-hung border-hung/30',               'pulse': false},
+    'ERROR':     {'dot': 'bg-fail',      'badge': 'bg-fail/10 text-fail border-fail/30',               'pulse': false},
+} %}
+
+{% set ci_styles = {
+    'PENDING': {'dot': 'bg-warn', 'pulse': true, 'label': 'CI pending'},
+    'SUCCESS': {'dot': 'bg-ok',   'pulse': false, 'label': 'CI passed'},
+    'FAILURE': {'dot': 'bg-fail', 'pulse': false, 'label': 'CI failed'},
+} %}
+
+{% set review_emojis = {
+    'PENDING':           '',
+    'EYES':              '👀',
+    'APPROVED':          '👍',
+    'CHANGES_REQUESTED': '✏️',
+} %}
+
+{% if not repos %}
+<div class="rounded-lg border border-white/5 bg-surface-2 p-8 text-center">
+    <p class="text-gray-300 font-medium mb-1">No repositories configured</p>
+    <p class="text-gray-500 text-sm">
+        Add entries under <code class="text-accent">repositories:</code> in
+        <code class="text-accent">config.yml</code> to get started.
+    </p>
+</div>
+{% else %}
+<div class="grid gap-4 md:grid-cols-2">
+    {% for repo in repos %}
+    {% set style = state_styles.get(repo.state.value, state_styles['IDLE']) %}
+    {% set is_error = repo.state.value == 'ERROR' %}
+    <div class="rounded-lg border bg-surface-2 p-4 {{ 'border-l-2 border-l-fail border-white/5' if is_error else 'border-white/5' }}">
+        {# Header row #}
+        <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center gap-2 min-w-0">
+                <span class="w-2.5 h-2.5 rounded-full {{ style.dot }} {% if style.pulse %}pulse-dot{% endif %} shrink-0"></span>
+                <a href="/repo/{{ repo.name }}" class="font-mono text-sm text-white truncate hover:text-accent transition-colors">{{ repo.name }}</a>
+                <span class="text-xs font-medium px-2 py-0.5 rounded border {{ style.badge }}">
+                    {{ repo.state.value }}
+                </span>
+            </div>
+            <div class="flex items-center gap-2 shrink-0">
+                {% if repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done %}
+                <span class="text-xs font-medium px-2 py-0.5 rounded border border-accent/30 text-accent">Start</span>
+                {% endif %}
+            </div>
+        </div>
+
+        {% if is_error and repo.error_message %}
+        {# Error variant: show error instead of normal body #}
+        <div class="px-2 py-1.5 rounded bg-fail/10 border border-fail/20 text-fail text-xs truncate"
+             title="{{ repo.error_message }}">
+            {{ repo.error_message }}
+        </div>
+        {% else %}
+        {# Body: 2-column grid #}
+        <div class="grid grid-cols-2 gap-4 text-xs mb-2">
+            <div>
+                <div class="text-gray-500 mb-1">Sprint progress</div>
+                <div class="text-gray-300 mb-1">{{ repo.queue_done }} / {{ repo.queue_total }} done</div>
+                <div class="h-1 bg-surface-3 rounded-full overflow-hidden">
+                    {% if repo.queue_total > 0 %}
+                    <div class="h-full bg-ok rounded-full" style="width: {{ (repo.queue_done / repo.queue_total * 100)|round(1) }}%"></div>
+                    {% endif %}
+                </div>
+            </div>
+            <div>
+                <div class="text-gray-500 mb-1">Current task</div>
+                {% if repo.current_task %}
+                <div class="font-mono text-gray-300 truncate" title="{{ repo.current_task.title }}">{{ repo.current_task.pr_id }} {{ repo.current_task.title }}</div>
+                {% else %}
+                <div class="text-gray-600 italic">No tasks</div>
+                {% endif %}
+            </div>
+        </div>
+
+        {# PR row #}
+        {% if repo.current_pr %}
+        {% set ci = ci_styles.get(repo.current_pr.ci_status.value, ci_styles['PENDING']) %}
+        {% set review_emoji = review_emojis.get(repo.current_pr.review_status.value, '') %}
+        <div class="flex items-center gap-2 text-xs text-gray-400 mt-2 pt-2 border-t border-white/5">
+            <a href="{{ repo.current_pr.url }}" class="font-mono text-gray-300 hover:text-accent">#{{ repo.current_pr.number }}</a>
+            <span class="w-2 h-2 rounded-full {{ ci.dot }} {% if ci.pulse %}pulse-dot{% endif %}"></span>
+            <span>{{ ci.label }}</span>
+            {% if review_emoji %}
+            <span>{{ review_emoji }}</span>
+            {% endif %}
+            {% if repo.current_pr.push_count > 1 %}
+            <span class="text-gray-500">iter {{ repo.current_pr.push_count }}</span>
+            {% endif %}
+        </div>
+        {% if repo.state.value == 'CODING' %}
+        <div class="text-xs text-accent/70 italic mt-1">Claude is coding...</div>
+        {% endif %}
+        {% endif %}
+        {% endif %}
+    </div>
+    {% endfor %}
+</div>
+{% endif %}

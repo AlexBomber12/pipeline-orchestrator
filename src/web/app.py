@@ -521,8 +521,8 @@ async def index(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
     states = await get_all_repo_states(redis_client)
     stats = _compute_stats(states)
-    feed = _build_activity_feed(states)
     alerts = _build_alerts(states)
+    latest_alert = alerts[0] if alerts else None
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -530,8 +530,7 @@ async def index(request: Request) -> HTMLResponse:
             "title": "Dashboard",
             "repos": states,
             "stats": stats,
-            "feed": feed,
-            "alerts": alerts,
+            "latest_alert": latest_alert,
         },
     )
 
@@ -556,7 +555,7 @@ async def partial_repo_list(request: Request) -> HTMLResponse:
     states = await get_all_repo_states(redis_client)
     return templates.TemplateResponse(
         request,
-        "components/repo_list.html",
+        "components/repo_cards.html",
         {"repos": states},
     )
 
@@ -566,10 +565,12 @@ async def partial_stats(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
     states = await get_all_repo_states(redis_client)
     stats = _compute_stats(states)
+    alerts = _build_alerts(states)
+    latest_alert = alerts[0] if alerts else None
     return templates.TemplateResponse(
         request,
-        "components/stats_cards.html",
-        {"stats": stats},
+        "components/status_bar.html",
+        {"stats": stats, "latest_alert": latest_alert},
     )
 
 

@@ -496,10 +496,8 @@ def test_index_route_shows_stats_and_activity_blocks(
     assert response.status_code == 200
     body = response.text
     assert 'hx-get="/partials/stats"' in body
-    assert 'hx-get="/partials/activity-feed"' in body
     assert 'hx-get="/partials/repo-list"' in body
     assert "Done today" in body
-    assert "Activity" in body
 
 
 def test_partial_repo_events_filters_by_query(

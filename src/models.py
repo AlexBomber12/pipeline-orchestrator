@@ -67,4 +67,6 @@ class RepoState(BaseModel):
     last_updated: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+    queue_done: int = 0
+    queue_total: int = 0
     history: list[dict] = Field(default_factory=list)
