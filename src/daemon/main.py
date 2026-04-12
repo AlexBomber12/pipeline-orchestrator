@@ -193,6 +193,8 @@ async def main() -> None:
                     _sync_runners(runners, config, redis_client)
 
         for runner in list(runners.values()):
+            if not runner.repo_config.active:
+                continue
             try:
                 await runner.run_cycle()
             except Exception:
