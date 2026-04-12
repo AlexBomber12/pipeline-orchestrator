@@ -2064,7 +2064,7 @@ def test_process_pending_uploads_preserves_upload_on_git_failure(
     monkeypatch.setattr(runner_module, "Path", lambda *a: Path(*a) if len(a) != 1 or a[0] != "/data/uploads" else tmp_path.parent / "uploads")
 
     result = asyncio.run(runner.process_pending_uploads())
-    assert result is False
+    assert result is None
     assert asyncio.run(runner.redis.get(key)) == manifest
     assert staging.is_dir()
 

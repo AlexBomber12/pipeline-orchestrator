@@ -954,11 +954,12 @@ return 0
                 pass
             return False
 
-    async def process_pending_uploads(self) -> bool:
+    async def process_pending_uploads(self) -> bool | None:
         """Commit and push any files staged by the web upload endpoint.
 
-        Returns True if an upload was processed (caller should re-sync
-        before continuing with task selection).
+        Returns ``True`` if an upload was pushed, ``False`` if there was
+        nothing pending, or ``None`` if a pending upload failed (caller
+        should skip task dispatch so it retries next cycle).
         """
         key = f"upload:{self.name}:pending"
         try:
@@ -1015,7 +1016,15 @@ return 0
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
             logger.error("%s: upload git operations failed: %s", self.name, exc)
             self.log_event(f"Upload push failed: {exc}")
-            return False
+            try:
+                subprocess.run(
+                    ["git", "reset", "--hard", f"origin/{branch}"],
+                    cwd=self.repo_path,
+                    capture_output=True, text=True, timeout=30, check=False,
+                )
+            except Exception:
+                pass
+            return None
 
         await self._delete_upload_if_unchanged(key, raw)
         shutil.rmtree(str(staging_dir), ignore_errors=True)
@@ -1034,7 +1043,11 @@ return 0
             self.log_event(f"sync_to_main failed: {exc}")
             return
 
-        if await self.process_pending_uploads():
+        upload_result = await self.process_pending_uploads()
+        if upload_result is None:
+            self.log_event("Pending upload failed; skipping task dispatch to retry next cycle")
+            return
+        if upload_result:
             try:
                 self.sync_to_main()
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
