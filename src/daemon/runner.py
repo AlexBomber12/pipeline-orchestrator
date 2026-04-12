@@ -1133,9 +1133,19 @@ class PipelineRunner:
         # against. ``current_pr`` is set by handle_watch before routing
         # into FIX, so the None case is defensive — skip the auto-commit
         # safety net rather than push to an unknown branch.
+        #
+        # Fork PRs (``is_cross_repository``) are also skipped: the PR
+        # head lives on the contributor's fork, but the daemon's clone
+        # only knows about ``origin`` (the base repo). Pushing there
+        # would create or update an unrelated branch on ``origin``
+        # without ever touching the PR, and the runner would then
+        # proceed to WATCH as if the fix landed. Letting the dirty
+        # tree surface through the next preflight cycle surfaces the
+        # real mismatch to operators instead of silently diverging.
         if (
             self.state.current_pr is not None
             and self.state.current_pr.branch
+            and not self.state.current_pr.is_cross_repository
         ):
             self._commit_and_push_dirty(
                 "fix: auto-commit after review",
@@ -1143,6 +1153,14 @@ class PipelineRunner:
             )
             if self.state.state == PipelineState.ERROR:
                 return
+        elif (
+            self.state.current_pr is not None
+            and self.state.current_pr.is_cross_repository
+        ):
+            self.log_event(
+                f"Skipping auto-commit for cross-repo PR "
+                f"#{self.state.current_pr.number} (fork head)"
+            )
 
         if self.state.current_pr is not None:
             self.state.current_pr.push_count += 1

@@ -73,7 +73,7 @@ def get_open_prs(repo: str) -> list[PRInfo]:
             "--state",
             "open",
             "--json",
-            "number,headRefName,statusCheckRollup,url,updatedAt,commits,author",
+            "number,headRefName,statusCheckRollup,url,updatedAt,commits,author,isCrossRepository",
         ],
         repo=repo,
     )
@@ -98,6 +98,7 @@ def get_open_prs(repo: str) -> list[PRInfo]:
                 push_count=len(entry.get("commits") or []),
                 url=entry.get("url", ""),
                 last_activity=_parse_iso(entry.get("updatedAt")),
+                is_cross_repository=bool(entry.get("isCrossRepository", False)),
             )
         )
     return prs

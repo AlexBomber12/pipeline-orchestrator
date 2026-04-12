@@ -466,6 +466,61 @@ def test_handle_fix_errors_when_post_comment_fails(
     )
 
 
+def test_handle_fix_skips_auto_commit_on_cross_repo_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P1 (round 5): for fork-based PRs, the daemon's clone only
+    knows about ``origin`` (the base repo) — the PR head lives on the
+    contributor's fork. Pushing ``origin/<branch>:<branch>`` would
+    create or update an unrelated branch on the base repo without ever
+    touching the PR, while the runner proceeds to WATCH as if the fix
+    landed. Skipping the auto-commit safety net on cross-repo PRs
+    leaves the dirty tree to surface through preflight next cycle
+    instead of silently diverging.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        # Dirty tree — would normally trigger the auto-commit path.
+        if cmd[:2] == ["git", "status"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout=" M src/foo.py\n", returncode=0
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        runner_module.claude_cli, "fix_review", lambda path: (0, "", "")
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=88,
+        branch="contributor:feature-x",
+        is_cross_repository=True,
+    )
+    asyncio.run(runner.handle_fix())
+
+    # Runner still transitions to WATCH, but no auto-commit subprocess
+    # calls happened — crucially, no git push.
+    assert runner.state.state == PipelineState.WATCH
+    assert not any(cmd[:2] == ["git", "status"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "add"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "commit"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
+    assert any(
+        "cross-repo" in e["event"] and "#88" in e["event"]
+        for e in runner.state.history
+    )
+
+
 def test_handle_coding_errors_when_task_has_no_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
