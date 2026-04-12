@@ -61,7 +61,7 @@ def run_planned_pr(repo_path: str) -> tuple[int, str, str]:
 
 def fix_review(repo_path: str) -> tuple[int, str, str]:
     """Trigger a ``FIX REVIEW`` run in ``repo_path``."""
-    return run_claude("FIX REVIEW", repo_path, timeout=600)
+    return run_claude("FIX REVIEW", repo_path, timeout=1800)
 
 
 def diagnose_error(repo_path: str, context: str) -> tuple[int, str, str]:
