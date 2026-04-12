@@ -138,7 +138,7 @@
 - Depends on: PR-022
 
 ## PR-024: Upload tasks and git push from dashboard
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-024.md
 - Branch: pr-024-upload-tasks
 - Depends on: PR-023

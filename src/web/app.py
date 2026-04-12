@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 import redis.asyncio as aioredis
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
@@ -34,6 +34,7 @@ from src.utils import repo_name_from_url
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 CONFIG_PATH = "config.yml"
+REPOS_DIR = "/data/repos"
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
@@ -1069,3 +1070,214 @@ async def put_settings_repo(
     except OSError as exc:
         return _render_config_write_error(request, exc)
     return _render_settings_repo_list(request)
+
+
+# ---------------------------------------------------------------------------
+# Upload tasks
+# ---------------------------------------------------------------------------
+
+_UPLOAD_MAX_TOTAL_BYTES = 1_000_000  # 1 MB
+_ALLOWED_TASK_PATTERN = r"^(QUEUE\.md|PR-[A-Za-z0-9._-]+\.md)$"
+UPLOADS_DIR = "/data/uploads"
+
+import json as _json  # noqa: E402 — kept near usage
+import re as _re  # noqa: E402 — kept near usage
+import shutil  # noqa: E402 — kept near usage
+import uuid as _uuid  # noqa: E402 — kept near usage
+
+_upload_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_upload_lock(repo_name: str) -> asyncio.Lock:
+    if repo_name not in _upload_locks:
+        _upload_locks[repo_name] = asyncio.Lock()
+    return _upload_locks[repo_name]
+
+
+def _render_upload_error(
+    request: Request, message: str, status_code: int, repo_name: str = ""
+) -> HTMLResponse:
+    response = templates.TemplateResponse(
+        request,
+        "components/upload_error.html",
+        {"message": message},
+        status_code=status_code,
+    )
+    if repo_name:
+        css_name = _re.sub(r"([.#\[\]:>+~(){}|^$*!])", r"\\\1", repo_name)
+        response.headers["HX-Retarget"] = f"#upload-error-{css_name}"
+        response.headers["HX-Reswap"] = "innerHTML"
+    return response
+
+
+def _render_upload_success(
+    request: Request, message: str, repo_name: str
+) -> HTMLResponse:
+    response = templates.TemplateResponse(
+        request,
+        "components/upload_success.html",
+        {"message": message},
+    )
+    css_name = _re.sub(r"([.#\[\]:>+~(){}|^$*!])", r"\\\1", repo_name)
+    response.headers["HX-Retarget"] = f"#upload-error-{css_name}"
+    response.headers["HX-Reswap"] = "innerHTML"
+    return response
+
+
+@app.post("/repos/{name}/upload-tasks", response_class=HTMLResponse)
+async def upload_tasks(
+    request: Request, name: str, files: list[UploadFile] = []
+) -> HTMLResponse:
+    cfg = load_config(CONFIG_PATH)
+    found = False
+    for repo in cfg.repositories:
+        if repo_name_from_url(repo.url) == name:
+            found = True
+            break
+
+    if not found:
+        return _render_upload_error(request, f"Repository '{name}' not found", 404, repo_name=name)
+
+    repo_path = f"{REPOS_DIR}/{name}"
+    if not Path(repo_path).is_dir():
+        return _render_upload_error(
+            request, f"Repository '{name}' is not cloned", 422, repo_name=name
+        )
+
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return _render_upload_error(
+            request,
+            "Cannot verify repo state (Redis unavailable). Upload blocked.",
+            503,
+            repo_name=name,
+        )
+    try:
+        raw = await redis_client.get(f"pipeline:{name}")
+    except Exception:
+        return _render_upload_error(
+            request,
+            "Cannot verify repo state (Redis error). Upload blocked.",
+            503,
+            repo_name=name,
+        )
+    if raw:
+        try:
+            repo_state = RepoState.model_validate_json(raw)
+        except Exception:
+            return _render_upload_error(
+                request,
+                "Cannot verify repo state (corrupt data). Upload blocked.",
+                503,
+                repo_name=name,
+            )
+    else:
+        return _render_upload_error(
+            request,
+            "Cannot verify repo state (no state recorded). Upload blocked.",
+            503,
+            repo_name=name,
+        )
+    if repo_state.state != PipelineState.IDLE:
+        return _render_upload_error(
+            request,
+            f"Cannot upload while repo is {repo_state.state.value}. Wait until IDLE.",
+            422,
+            repo_name=name,
+        )
+
+    if not files:
+        return _render_upload_error(request, "No files uploaded", 422, repo_name=name)
+
+    # Validate file names and sizes (stream chunks to enforce limit early)
+    has_queue = False
+    total_size = 0
+    file_contents: list[tuple[str, bytes]] = []
+    _CHUNK = 64 * 1024
+    for f in files:
+        fname = f.filename or ""
+        if not _re.match(_ALLOWED_TASK_PATTERN, fname):
+            return _render_upload_error(
+                request,
+                f"Invalid file name: '{fname}'. Only QUEUE.md and PR-*.md allowed.",
+                422,
+                repo_name=name,
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = await f.read(_CHUNK)
+            if not chunk:
+                break
+            total_size += len(chunk)
+            if total_size > _UPLOAD_MAX_TOTAL_BYTES:
+                return _render_upload_error(
+                    request, "Total upload size exceeds 1 MB", 422, repo_name=name
+                )
+            chunks.append(chunk)
+        content = b"".join(chunks)
+        file_contents.append((fname, content))
+        if fname == "QUEUE.md":
+            has_queue = True
+
+    if not has_queue:
+        return _render_upload_error(
+            request, "QUEUE.md is required in the upload", 422, repo_name=name
+        )
+
+    # Stage files to /data/uploads/{repo}/ and enqueue for daemon processing.
+    # Git write operations are handled by the daemon to preserve the
+    # dashboard's read-only contract with the repository working trees.
+    lock = _get_upload_lock(name)
+    async with lock:
+        submission_id = _uuid.uuid4().hex[:12]
+        staging_dir = Path(UPLOADS_DIR) / name / submission_id
+        await asyncio.to_thread(staging_dir.mkdir, parents=True, exist_ok=True)
+
+        for fname, content in file_contents:
+            await asyncio.to_thread((staging_dir / fname).write_bytes, content)
+
+        new_files = [fn for fn, _ in file_contents]
+        pending_key = f"upload:{name}:pending"
+        try:
+            existing_raw = await redis_client.get(pending_key)
+        except Exception:
+            existing_raw = None
+
+        if existing_raw:
+            try:
+                existing = _json.loads(existing_raw)
+                old_staging = Path(existing["staging_dir"])
+                for old_fn in existing.get("files", []):
+                    if old_fn not in new_files and (old_staging / old_fn).is_file():
+                        await asyncio.to_thread(
+                            shutil.copy2,
+                            str(old_staging / old_fn),
+                            str(staging_dir / old_fn),
+                        )
+                        new_files.append(old_fn)
+            except Exception:
+                pass
+
+        manifest = {
+            "repo": name,
+            "files": new_files,
+            "staging_dir": str(staging_dir),
+        }
+        try:
+            await redis_client.set(
+                pending_key,
+                _json.dumps(manifest),
+            )
+        except Exception:
+            return _render_upload_error(
+                request,
+                "Failed to enqueue upload (Redis error).",
+                503,
+                repo_name=name,
+            )
+
+    return _render_upload_success(
+        request,
+        "Tasks queued. The daemon will commit and push on its next cycle.",
+        repo_name=name,
+    )

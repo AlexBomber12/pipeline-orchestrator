@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -27,9 +29,31 @@ class _FakeRedis:
 
     def __init__(self) -> None:
         self.writes: list[tuple[str, str]] = []
+        self.store: dict[str, str] = {}
+        self.deleted: list[str] = []
 
     async def set(self, key: str, value: str) -> None:
         self.writes.append((key, value))
+        self.store[key] = value
+
+    async def get(self, key: str) -> str | None:
+        return self.store.get(key)
+
+    async def delete(self, key: str) -> int:
+        self.deleted.append(key)
+        if key in self.store:
+            del self.store[key]
+            return 1
+        return 0
+
+    async def eval(self, script: str, numkeys: int, *args: Any) -> int:
+        key = args[0]
+        expected = args[1]
+        current = self.store.get(key)
+        if current == expected:
+            del self.store[key]
+            return 1
+        return 0
 
 
 class _FakeCompletedProcess:
@@ -2011,3 +2035,86 @@ def test_commit_and_push_dirty_errors_when_head_on_wrong_branch(
     assert not any(cmd[:2] == ["git", "add"] for cmd in calls)
     assert not any(cmd[:2] == ["git", "commit"] for cmd in calls)
     assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
+
+
+def test_process_pending_uploads_preserves_upload_on_git_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """On transient git failure, Redis key and staging dir must survive for retry."""
+
+    def failing_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "rev-list"]:
+            return _FakeCompletedProcess(args=cmd, stdout="0\n", returncode=0)
+        if cmd[:2] == ["git", "add"]:
+            raise subprocess.CalledProcessError(1, cmd, stderr="git error")
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", failing_run)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+
+    staging = tmp_path.parent / "uploads" / runner.name / "abc123"
+    staging.mkdir(parents=True)
+    (staging / "QUEUE.md").write_text("- PR-001")
+
+    manifest = json.dumps({"files": ["QUEUE.md"], "staging_dir": str(staging)})
+    key = f"upload:{runner.name}:pending"
+    asyncio.run(runner.redis.set(key, manifest))
+
+    result = asyncio.run(runner.process_pending_uploads())
+    assert result is None
+    assert asyncio.run(runner.redis.get(key)) == manifest
+    assert staging.is_dir()
+
+
+def test_process_pending_uploads_cas_delete_skips_newer_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """After a successful push, a newer manifest must not be deleted."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+
+    staging = tmp_path.parent / "uploads" / runner.name / "old123"
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "QUEUE.md").write_text("- PR-001")
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(exist_ok=True)
+
+    old_manifest = json.dumps({"files": ["QUEUE.md"], "staging_dir": str(staging)})
+    new_manifest = json.dumps({"files": ["PR-099.md"]})
+    key = f"upload:{runner.name}:pending"
+    asyncio.run(runner.redis.set(key, old_manifest))
+
+    # Simulate a new upload arriving after the daemon read the old manifest
+    original_eval = runner.redis.eval
+
+    async def inject_new_manifest(script: str, numkeys: int, *args: Any) -> int:
+        runner.redis.store[key] = new_manifest
+        return await original_eval(script, numkeys, *args)
+
+    runner.redis.eval = inject_new_manifest  # type: ignore[assignment]
+
+    result = asyncio.run(runner.process_pending_uploads())
+    assert result is None, "newer upload pending must block dispatch"
+    assert asyncio.run(runner.redis.get(key)) == new_manifest
+    assert staging.is_dir(), "staging dir must survive when CAS delete skips newer manifest"
+
+
+def test_process_pending_uploads_redis_error_blocks_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Redis read error must return None so handle_idle skips task dispatch."""
+    runner = _make_runner()
+
+    async def broken_get(key: str) -> bytes:
+        raise ConnectionError("redis gone")
+
+    runner.redis.get = broken_get  # type: ignore[assignment]
+
+    result = asyncio.run(runner.process_pending_uploads())
+    assert result is None
