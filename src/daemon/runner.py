@@ -1029,7 +1029,10 @@ return 0
         deleted = await self._delete_upload_if_unchanged(key, raw)
         if deleted:
             shutil.rmtree(str(staging_dir), ignore_errors=True)
-        return True
+            return True
+
+        self.log_event("Newer upload pending; blocking dispatch to process it next cycle")
+        return None
 
     async def handle_idle(self) -> None:
         """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""

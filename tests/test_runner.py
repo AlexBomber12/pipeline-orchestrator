@@ -2100,7 +2100,7 @@ def test_process_pending_uploads_cas_delete_skips_newer_manifest(
     runner.redis.eval = inject_new_manifest  # type: ignore[assignment]
 
     result = asyncio.run(runner.process_pending_uploads())
-    assert result is True
+    assert result is None, "newer upload pending must block dispatch"
     assert asyncio.run(runner.redis.get(key)) == new_manifest
     assert staging.is_dir(), "staging dir must survive when CAS delete skips newer manifest"
 
