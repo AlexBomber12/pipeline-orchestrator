@@ -181,18 +181,6 @@ def get_pr_review_status(
         if "P1" in body or "P2" in body:
             return ReviewStatus.CHANGES_REQUESTED
 
-    # Detect APPROVED when latest Codex issue comment says no major issues.
-    for comment in reversed(issue_comments):
-        if not _after_anchor(comment):
-            continue
-        user = (comment.get("user") or {}).get("login", "") or ""
-        if "codex" not in user.lower():
-            continue
-        body_lower = (comment.get("body") or "").lower()
-        if "didn't find any major issues" in body_lower or "no major issues" in body_lower:
-            return ReviewStatus.APPROVED
-        break
-
     return ReviewStatus.PENDING
 
 
