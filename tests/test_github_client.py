@@ -272,3 +272,17 @@ def test_get_pr_review_status_handles_404(
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert get_pr_review_status("owner/name", 42) == ReviewStatus.PENDING
+
+
+def test_get_pr_review_status_propagates_non_404_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-404 errors (auth, rate-limit, network) must propagate."""
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(stderr="HTTP 403 rate limit exceeded", returncode=1)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="403"):
+        get_pr_review_status("owner/name", 42)
