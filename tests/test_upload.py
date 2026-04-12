@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -12,20 +13,30 @@ from src.web.app import app
 
 
 class _StubAioredisClient:
+    def __init__(self) -> None:
+        self._store: dict[str, str] = {}
+
     async def get(self, key: str) -> str | None:
+        if key in self._store:
+            return self._store[key]
         if key.startswith("pipeline:"):
             name = key.split(":", 1)[1]
             return f'{{"url":"","name":"{name}","state":"IDLE"}}'
         return None
+
+    async def set(self, key: str, value: str, **kwargs: object) -> None:
+        self._store[key] = value
 
     async def aclose(self) -> None:
         return None
 
 
 class _StubAioredis:
-    @staticmethod
-    def from_url(url: str, decode_responses: bool = True) -> _StubAioredisClient:
-        return _StubAioredisClient()
+    def __init__(self) -> None:
+        self.client = _StubAioredisClient()
+
+    def from_url(self, url: str, decode_responses: bool = True) -> _StubAioredisClient:
+        return self.client
 
 
 @pytest.fixture
@@ -37,7 +48,8 @@ def one_repo_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    stub = _StubAioredis()
+    monkeypatch.setattr(web_app, "aioredis", stub)
     return cfg
 
 
@@ -50,6 +62,15 @@ def repo_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     alpha.mkdir()
     monkeypatch.setattr(web_app, "REPOS_DIR", str(repos))
     return alpha
+
+
+@pytest.fixture
+def uploads_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Create and point UPLOADS_DIR at a temp directory."""
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    monkeypatch.setattr(web_app, "UPLOADS_DIR", str(uploads))
+    return uploads
 
 
 def _queue_file() -> tuple[str, tuple[str, bytes, str]]:
@@ -81,7 +102,6 @@ def test_upload_repo_not_cloned(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Point REPOS_DIR to a dir that has no "alpha" sub-dir
     empty_repos = tmp_path / "empty_repos"
     empty_repos.mkdir()
     monkeypatch.setattr(web_app, "REPOS_DIR", str(empty_repos))
@@ -103,6 +123,8 @@ def test_upload_blocked_when_redis_key_absent(
     class _EmptyRedis:
         async def get(self, key: str) -> str | None:
             return None
+        async def set(self, key: str, value: str, **kwargs: object) -> None:
+            pass
         async def aclose(self) -> None:
             return None
 
@@ -122,6 +144,7 @@ def test_upload_blocked_when_redis_key_absent(
 def test_upload_without_queue_md(
     one_repo_config: Path,
     repo_dir: Path,
+    uploads_dir: Path,
 ) -> None:
     with TestClient(app) as client:
         resp = client.post(
@@ -135,6 +158,7 @@ def test_upload_without_queue_md(
 def test_upload_invalid_filename(
     one_repo_config: Path,
     repo_dir: Path,
+    uploads_dir: Path,
 ) -> None:
     with TestClient(app) as client:
         resp = client.post(
@@ -145,18 +169,11 @@ def test_upload_invalid_filename(
     assert "Invalid file name" in resp.text
 
 
-def test_upload_success_calls_git(
+def test_upload_stages_files_and_sets_redis_key(
     one_repo_config: Path,
     repo_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    uploads_dir: Path,
 ) -> None:
-    git_calls: list[tuple[str, ...]] = []
-
-    async def fake_git_run(repo_path: str, *args: str, timeout: int = 30) -> None:
-        git_calls.append(args)
-
-    monkeypatch.setattr("src.web.app._git_run", fake_git_run)
-
     with TestClient(app) as client:
         resp = client.post(
             "/repos/alpha/upload-tasks",
@@ -164,29 +181,45 @@ def test_upload_success_calls_git(
         )
 
     assert resp.status_code == 200
-    assert git_calls[0][0] == "checkout"
-    assert git_calls[1][0] == "pull"
-    assert git_calls[2][0] == "add"
-    assert git_calls[3][0] == "commit"
-    assert git_calls[4][0] == "push"
+    assert "queued" in resp.text.lower()
+
+    staging = uploads_dir / "alpha"
+    assert (staging / "QUEUE.md").exists()
+    assert (staging / "PR-001.md").exists()
+    assert (staging / "QUEUE.md").read_bytes() == b"# Task Queue\n"
 
 
-def test_upload_writes_files_to_tasks_dir(
+def test_upload_writes_redis_manifest(
     one_repo_config: Path,
     repo_dir: Path,
+    uploads_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def _noop(*a, **kw): pass
-    monkeypatch.setattr("src.web.app._git_run", _noop)
+    redis_sets: dict[str, str] = {}
+
+    class _TrackingRedis:
+        async def get(self, key: str) -> str | None:
+            if key.startswith("pipeline:"):
+                name = key.split(":", 1)[1]
+                return f'{{"url":"","name":"{name}","state":"IDLE"}}'
+            return None
+        async def set(self, key: str, value: str, **kwargs: object) -> None:
+            redis_sets[key] = value
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(web_app, "aioredis", type("R", (), {
+        "from_url": staticmethod(lambda *a, **kw: _TrackingRedis()),
+    })())
 
     with TestClient(app) as client:
         resp = client.post(
             "/repos/alpha/upload-tasks",
-            files=[_queue_file(), _pr_file("PR-001.md")],
+            files=[_queue_file(), _pr_file("PR-002.md")],
         )
 
     assert resp.status_code == 200
-    tasks_dir = repo_dir / "tasks"
-    assert (tasks_dir / "QUEUE.md").exists()
-    assert (tasks_dir / "PR-001.md").exists()
-    assert (tasks_dir / "QUEUE.md").read_text() == "# Task Queue\n"
+    assert "upload:alpha:pending" in redis_sets
+    manifest = json.loads(redis_sets["upload:alpha:pending"])
+    assert manifest["repo"] == "alpha"
+    assert set(manifest["files"]) == {"QUEUE.md", "PR-002.md"}

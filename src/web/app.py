@@ -1078,32 +1078,18 @@ async def put_settings_repo(
 
 _UPLOAD_MAX_TOTAL_BYTES = 1_000_000  # 1 MB
 _ALLOWED_TASK_PATTERN = r"^(QUEUE\.md|PR-[A-Za-z0-9._-]+\.md)$"
+UPLOADS_DIR = "/data/uploads"
 
+import json as _json  # noqa: E402 — kept near usage
 import re as _re  # noqa: E402 — kept near usage
 
-
-def _git_run_sync(
-    repo_path: str, *args: str, timeout: int = 30
-) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        ["git", *args],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
-    if result.returncode != 0:
-        parts = [s for s in (result.stderr.strip(), result.stdout.strip()) if s]
-        msg = "\n".join(parts) or f"git {args[0]} failed"
-        raise RuntimeError(msg)
-    return result
+_upload_locks: dict[str, asyncio.Lock] = {}
 
 
-async def _git_run(
-    repo_path: str, *args: str, timeout: int = 30
-) -> subprocess.CompletedProcess[str]:
-    return await asyncio.to_thread(_git_run_sync, repo_path, *args, timeout=timeout)
+def _get_upload_lock(repo_name: str) -> asyncio.Lock:
+    if repo_name not in _upload_locks:
+        _upload_locks[repo_name] = asyncio.Lock()
+    return _upload_locks[repo_name]
 
 
 def _render_upload_error(
@@ -1119,6 +1105,20 @@ def _render_upload_error(
         css_name = _re.sub(r"([.#\[\]:>+~(){}|^$*!])", r"\\\1", repo_name)
         response.headers["HX-Retarget"] = f"#upload-error-{css_name}"
         response.headers["HX-Reswap"] = "innerHTML"
+    return response
+
+
+def _render_upload_success(
+    request: Request, message: str, repo_name: str
+) -> HTMLResponse:
+    response = templates.TemplateResponse(
+        request,
+        "components/upload_success.html",
+        {"message": message},
+    )
+    css_name = _re.sub(r"([.#\[\]:>+~(){}|^$*!])", r"\\\1", repo_name)
+    response.headers["HX-Retarget"] = f"#upload-error-{css_name}"
+    response.headers["HX-Reswap"] = "innerHTML"
     return response
 
 
@@ -1222,43 +1222,33 @@ async def upload_tasks(
             request, "QUEUE.md is required in the upload", 422, repo_name=name
         )
 
-    # Determine branch from config
-    branch = "main"
-    for repo in cfg.repositories:
-        if repo_name_from_url(repo.url) == name:
-            branch = repo.branch
-            break
-
-    # Git operations and file writes (run in thread pool to avoid blocking)
-    try:
-        await _git_run(repo_path, "checkout", branch)
-        await _git_run(repo_path, "pull", "origin", branch)
-
-        tasks_dir = Path(repo_path) / "tasks"
-        tasks_dir.mkdir(exist_ok=True)
+    # Stage files to /data/uploads/{repo}/ and enqueue for daemon processing.
+    # Git write operations are handled by the daemon to preserve the
+    # dashboard's read-only contract with the repository working trees.
+    lock = _get_upload_lock(name)
+    async with lock:
+        staging_dir = Path(UPLOADS_DIR) / name
+        await asyncio.to_thread(staging_dir.mkdir, parents=True, exist_ok=True)
 
         for fname, content in file_contents:
-            (tasks_dir / fname).write_bytes(content)
+            await asyncio.to_thread((staging_dir / fname).write_bytes, content)
 
-        await _git_run(repo_path, "add", *(f"tasks/{fname}" for fname, _ in file_contents))
+        manifest = {"repo": name, "files": [fn for fn, _ in file_contents]}
         try:
-            await _git_run(
-                repo_path,
-                "commit",
-                "-m",
-                "chore: upload sprint tasks via dashboard",
+            await redis_client.set(
+                f"upload:{name}:pending",
+                _json.dumps(manifest),
             )
-        except RuntimeError as commit_exc:
-            if "nothing to commit" not in str(commit_exc):
-                raise
-        await _git_run(repo_path, "push", "origin", branch)
-    except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
-        return _render_upload_error(request, f"Git operation failed: {exc}", 422, repo_name=name)
+        except Exception:
+            return _render_upload_error(
+                request,
+                "Failed to enqueue upload (Redis error).",
+                503,
+                repo_name=name,
+            )
 
-    # Return refreshed repo cards
-    states = await get_all_repo_states(redis_client)
-    return templates.TemplateResponse(
+    return _render_upload_success(
         request,
-        "components/repo_cards.html",
-        {"repos": states},
+        "Tasks queued. The daemon will commit and push on its next cycle.",
+        repo_name=name,
     )

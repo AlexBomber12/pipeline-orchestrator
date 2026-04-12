@@ -10,7 +10,9 @@ never persisted across cycles.
 
 from __future__ import annotations
 
+import json
 import logging
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -927,6 +929,75 @@ class PipelineRunner:
 
         await self.publish_state()
 
+    async def process_pending_uploads(self) -> bool:
+        """Commit and push any files staged by the web upload endpoint.
+
+        Returns True if an upload was processed (caller should re-sync
+        before continuing with task selection).
+        """
+        key = f"upload:{self.name}:pending"
+        try:
+            raw = await self.redis.get(key)
+        except Exception:
+            logger.warning("%s: Redis error checking pending uploads", self.name)
+            return False
+        if not raw:
+            return False
+
+        try:
+            manifest = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            logger.error("%s: corrupt upload manifest, discarding", self.name)
+            await self.redis.delete(key)
+            return False
+
+        staging_dir = Path("/data/uploads") / self.name
+        filenames: list[str] = manifest.get("files", [])
+        if not filenames or not staging_dir.is_dir():
+            logger.warning("%s: upload manifest has no files or staging dir missing", self.name)
+            await self.redis.delete(key)
+            return False
+
+        branch = self.repo_config.branch
+        try:
+            tasks_dir = Path(self.repo_path) / "tasks"
+            tasks_dir.mkdir(exist_ok=True)
+            for fname in filenames:
+                src = staging_dir / fname
+                if src.is_file():
+                    shutil.copy2(str(src), str(tasks_dir / fname))
+
+            subprocess.run(
+                ["git", "add"] + [f"tasks/{fn}" for fn in filenames],
+                cwd=self.repo_path,
+                capture_output=True, text=True, timeout=30, check=True,
+            )
+            commit_result = subprocess.run(
+                ["git", "commit", "-m", "chore: upload sprint tasks via dashboard"],
+                cwd=self.repo_path,
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            if commit_result.returncode != 0:
+                combined = f"{commit_result.stderr}\n{commit_result.stdout}"
+                if "nothing to commit" not in combined:
+                    raise RuntimeError(combined.strip())
+            subprocess.run(
+                ["git", "push", "origin", branch],
+                cwd=self.repo_path,
+                capture_output=True, text=True, timeout=60, check=True,
+            )
+            self.log_event(f"Pushed uploaded task files: {filenames}")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
+            logger.error("%s: upload git operations failed: %s", self.name, exc)
+            self.log_event(f"Upload push failed: {exc}")
+            await self.redis.delete(key)
+            shutil.rmtree(str(staging_dir), ignore_errors=True)
+            return False
+
+        await self.redis.delete(key)
+        shutil.rmtree(str(staging_dir), ignore_errors=True)
+        return True
+
     async def handle_idle(self) -> None:
         """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
         # sync_to_main is only safe in IDLE state: it runs git reset --hard
@@ -939,6 +1010,15 @@ class PipelineRunner:
             self.state.error_message = f"sync_to_main failed: {exc}"
             self.log_event(f"sync_to_main failed: {exc}")
             return
+
+        if await self.process_pending_uploads():
+            try:
+                self.sync_to_main()
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = f"sync_to_main after upload failed: {exc}"
+                self.log_event(f"sync_to_main after upload failed: {exc}")
+                return
 
         queue_path = str(Path(self.repo_path) / "tasks" / "QUEUE.md")
         tasks = parse_queue(queue_path)

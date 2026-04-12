@@ -49,6 +49,7 @@
 ./src/web/templates/components/stats_cards.html
 ./src/web/templates/components/status_bar.html
 ./src/web/templates/components/upload_error.html
+./src/web/templates/components/upload_success.html
 ./src/web/templates/index.html
 ./src/web/templates/repo.html
 ./src/web/templates/settings.html
