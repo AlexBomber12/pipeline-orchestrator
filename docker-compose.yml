@@ -2,37 +2,34 @@ services:
   web:
     build: .
     command: uvicorn src.web.app:app --host 0.0.0.0 --port 8000 --reload
+    user: "1000:1000"
     ports:
       - "${WEB_PORT:-8800}:8000"
     volumes:
-      # Writable: the settings page mutates config.yml via
-      # src.config.save_config (atomic rename-into-place).
-      - ./config.yml:/app/config.yml
-      - ./data:/data
       - .:/app
+      - ./data:/data
     environment:
       REDIS_URL: redis://redis:6379/0
-      # Mirror the daemon's auth dirs so ``/api/auth-status`` probes the
-      # same credential location the daemon actually uses. Without these
-      # the dashboard reports "not authorized" even when the daemon is
-      # logged in, because the web container would fall back to its own
-      # home directory. ``src.web.app`` also reads these paths from
-      # ``config.yml`` as a belt-and-suspenders fallback.
       CLAUDE_CONFIG_DIR: /data/auth/claude
       GH_CONFIG_DIR: /data/auth/gh
+      HOME: /data/auth
+    restart: unless-stopped
     depends_on:
       - redis
 
   daemon:
     build: .
     command: python -m src.daemon.main
+    user: "1000:1000"
     volumes:
-      - ./config.yml:/app/config.yml:ro
+      - .:/app:ro
       - ./data:/data
     environment:
       REDIS_URL: redis://redis:6379/0
       CLAUDE_CONFIG_DIR: /data/auth/claude
       GH_CONFIG_DIR: /data/auth/gh
+      HOME: /data/auth
+    restart: unless-stopped
     depends_on:
       - redis
 
@@ -40,6 +37,7 @@ services:
     image: redis:7-alpine
     volumes:
       - redis_data:/data
+    restart: unless-stopped
 
 volumes:
   redis_data:

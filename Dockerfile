@@ -5,7 +5,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# System dependencies
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         git \
@@ -14,7 +13,6 @@ RUN apt-get update \
         gnupg \
     && rm -rf /var/lib/apt/lists/*
 
-# GitHub CLI from official GitHub apt repo
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         | gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
@@ -24,11 +22,15 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Node.js 22 via nodesource + Claude Code CLI
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g @anthropic-ai/claude-code
+
+RUN useradd -m -u 1000 runner \
+    && mkdir -p /data/auth /data/repos \
+    && chown -R runner:runner /data \
+    && git config --system safe.directory '*'
 
 WORKDIR /app
 
@@ -36,7 +38,9 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+RUN chown -R runner:runner /app
 
 EXPOSE 8000
 
+ENTRYPOINT ["bash", "scripts/entrypoint.sh"]
 CMD ["uvicorn", "src.web.app:app", "--host", "0.0.0.0", "--port", "8000"]
