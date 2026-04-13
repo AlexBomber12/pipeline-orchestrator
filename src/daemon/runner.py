@@ -304,9 +304,13 @@ class PipelineRunner:
         await self.redis.set(f"pipeline:{self.name}", payload)
 
     async def _save_cli_log(self, stdout: str, label: str) -> None:
+        _MAX_CLI_LOG_BYTES = 64 * 1024  # 64 KB cap per entry
         ts = datetime.now(timezone.utc).isoformat()
         key_latest = f"cli_log:{self.name}:latest"
         key_history = f"cli_log:{self.name}:{ts}"
+        if len(stdout.encode("utf-8", errors="replace")) > _MAX_CLI_LOG_BYTES:
+            stdout = stdout[-_MAX_CLI_LOG_BYTES:]
+            stdout = "[truncated]\n" + stdout
         try:
             await self.redis.set(key_latest, stdout, ex=3600)
             await self.redis.set(key_history, stdout, ex=86400)
