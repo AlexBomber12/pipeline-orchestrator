@@ -155,56 +155,56 @@
 - Branch: pr-026-tab-blink
 - Depends on: PR-023
 
-## PR-027: Subprocess helper and squash merge
+## PR-027: Revert branch pre-creation and retry PR detection
 - Status: TODO
 - Tasks file: tasks/PR-027.md
-- Branch: pr-027-subprocess-helper
+- Branch: pr-027-revert-and-retry
 - Depends on: PR-026
 
-## PR-028: QUEUE.md auto-update on merge
+## PR-028: Claude CLI stdout logging
 - Status: TODO
 - Tasks file: tasks/PR-028.md
-- Branch: pr-028-queue-auto-done
+- Branch: pr-028-stdout-logging
 - Depends on: PR-027
 
-## PR-029: Deduplicate codex review posts
+## PR-029: Fix stale review detection
 - Status: TODO
 - Tasks file: tasks/PR-029.md
-- Branch: pr-029-dedup-codex-review
-- Depends on: PR-028
+- Branch: pr-029-stale-review
+- Depends on: PR-027
 
-## PR-030: Detect and push unpushed commits
+## PR-030: QUEUE.md auto-update and squash merge
 - Status: TODO
 - Tasks file: tasks/PR-030.md
-- Branch: pr-030-unpushed-detect
+- Branch: pr-030-queue-done-squash
 - Depends on: PR-027
 
 ## PR-031: Pre-merge sync with main
 - Status: TODO
 - Tasks file: tasks/PR-031.md
 - Branch: pr-031-pre-merge-sync
-- Depends on: PR-027
+- Depends on: PR-030
 
-## PR-032: Claude CLI stdout logging
+## PR-032: Subprocess helper and error handling hardening
 - Status: TODO
 - Tasks file: tasks/PR-032.md
-- Branch: pr-032-cli-stdout-log
+- Branch: pr-032-subprocess-helper
 - Depends on: PR-027
 
-## PR-033: Model config in config.yml
+## PR-033: Dirty tree recovery and dedup codex review
 - Status: TODO
 - Tasks file: tasks/PR-033.md
-- Branch: pr-033-model-config
+- Branch: pr-033-dirty-recovery
 - Depends on: PR-032
 
-## PR-034: Event log UX overhaul
+## PR-034: Model config, pytest in container, auth check
 - Status: TODO
 - Tasks file: tasks/PR-034.md
-- Branch: pr-034-event-log-ux
-- Depends on: PR-026
+- Branch: pr-034-config-hardening
+- Depends on: PR-032
 
-## PR-035: Repo card click and dashboard polish
+## PR-035: Event log UX, card click, timestamps
 - Status: TODO
 - Tasks file: tasks/PR-035.md
-- Branch: pr-035-card-click
-- Depends on: PR-034
+- Branch: pr-035-dashboard-ux
+- Depends on: PR-028
