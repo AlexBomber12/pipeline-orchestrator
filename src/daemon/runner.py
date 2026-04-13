@@ -10,6 +10,7 @@ never persisted across cycles.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import shutil
@@ -618,10 +619,7 @@ class PipelineRunner:
                 f"Recovered: DOING task {doing.pr_id}, no PR "
                 "-> re-running CODING"
             )
-            # Recovery must not hard-reset the task branch: the crashed
-            # run may have left unpushed commits on it that we need
-            # ``_commit_and_push_dirty`` to preserve and publish.
-            await self.handle_coding(reset_branch=False)
+            await self.handle_coding()
             # Even if handle_coding left the runner in ERROR, discovery
             # itself completed and must not be retried: re-running
             # handle_coding a second time on the next cycle could create
@@ -1120,17 +1118,16 @@ return 0
         await self.publish_state()
         await self.handle_coding()
 
-    async def handle_coding(self, *, reset_branch: bool = True) -> None:
+    async def handle_coding(self) -> None:
         """Run ``PLANNED PR`` via the claude CLI and hand off to WATCH.
 
-        ``reset_branch=True`` (fresh IDLE -> CODING) force-recreates the task
-        branch from ``origin/<base>``. ``reset_branch=False`` (called from
-        ``recover_state`` after a crashed run) preserves any in-flight local
-        commits: plain checkout if the local branch already exists, else
-        fall back to creating it from ``origin/<base>``.
+        Claude owns the full git workflow per AGENTS.md: branch creation,
+        commit, push, and PR creation. The daemon must not pre-create the
+        task branch — doing so conflicts with AGENTS.md step 4 ("create
+        branch from origin/main"). After the CLI returns 0 we poll GitHub
+        for the PR; because the list API is eventually consistent, we
+        retry a few times before surfacing an ERROR.
         """
-        # Validate the task-branch invariant BEFORE invoking the CLI so we
-        # never run Claude against whatever branch HEAD happens to point at.
         target_branch = (
             self.state.current_task.branch if self.state.current_task else None
         )
@@ -1142,67 +1139,6 @@ return 0
             self.log_event(self.state.error_message)
             return
 
-        # Pick a checkout command that preserves in-flight work during
-        # recovery. When reset_branch is True we're coming from IDLE with a
-        # clean tree after sync_to_main, so a hard reset to origin/<base> is
-        # correct. When it's False, recovery is resuming an interrupted run
-        # that may still have unpushed commits on the task branch; a hard
-        # reset would orphan them.
-        checkout_cmd: list[str]
-        if reset_branch:
-            checkout_cmd = [
-                "git",
-                "checkout",
-                "-B",
-                target_branch,
-                f"origin/{self.repo_config.branch}",
-            ]
-        else:
-            try:
-                probe = subprocess.run(
-                    [
-                        "git",
-                        "rev-parse",
-                        "--verify",
-                        "--quiet",
-                        f"refs/heads/{target_branch}",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    cwd=self.repo_path,
-                )
-            except (subprocess.TimeoutExpired, OSError) as exc:
-                self.state.state = PipelineState.ERROR
-                self.state.error_message = f"failed to create branch {target_branch}"
-                self.log_event(f"{self.state.error_message}: {exc}")
-                return
-            if probe.returncode == 0:
-                checkout_cmd = ["git", "checkout", target_branch]
-            else:
-                checkout_cmd = [
-                    "git",
-                    "checkout",
-                    "-B",
-                    target_branch,
-                    f"origin/{self.repo_config.branch}",
-                ]
-
-        try:
-            subprocess.run(
-                checkout_cmd,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=True,
-                cwd=self.repo_path,
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = f"failed to create branch {target_branch}"
-            self.log_event(f"{self.state.error_message}: {exc}")
-            return
-
         code, _stdout, stderr = claude_cli.run_planned_pr(self.repo_path)
         if code != 0:
             self.state.state = PipelineState.ERROR
@@ -1210,26 +1146,27 @@ return 0
             self.log_event(f"claude CLI failed: {self.state.error_message}")
             return
 
-        commit_message = (
-            f"{self.state.current_task.pr_id}: auto-commit after Claude CLI"
-        )
-        self._commit_and_push_dirty(commit_message, expected_branch=target_branch)
-        if self.state.state == PipelineState.ERROR:
-            return
+        candidate = None
+        for attempt in range(3):
+            try:
+                prs = github_client.get_open_prs(self.owner_repo)
+            except Exception as exc:
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = f"get_open_prs failed: {exc}"
+                self.log_event(str(exc))
+                return
+            candidate = next(
+                (pr for pr in prs if pr.branch == target_branch), None
+            )
+            if candidate is not None:
+                break
+            if attempt < 2:
+                self.log_event(
+                    f"PR not found for {target_branch!r}, "
+                    f"retrying in 5s ({attempt + 1}/3)"
+                )
+                await asyncio.sleep(5)
 
-        try:
-            prs = github_client.get_open_prs(self.owner_repo)
-        except Exception as exc:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = f"get_open_prs failed: {exc}"
-            self.log_event(str(exc))
-            return
-
-        # Match strictly by branch. Falling back to the newest open PR would
-        # attach the runner to an unrelated PR if the PLANNED PR run failed
-        # to open the expected branch, which could then trigger unintended
-        # WATCH/FIX/MERGE actions on someone else's work.
-        candidate = next((pr for pr in prs if pr.branch == target_branch), None)
         if candidate is None:
             self.state.state = PipelineState.ERROR
             self.state.error_message = (
@@ -1374,39 +1311,6 @@ return 0
             self.state.error_message = stderr.strip() or f"claude exit {code}"
             self.log_event(f"fix_review failed: {self.state.error_message}")
             return
-
-        # Only auto-commit when we know the PR branch to validate HEAD
-        # against. ``current_pr`` is set by handle_watch before routing
-        # into FIX, so the None case is defensive — skip the auto-commit
-        # safety net rather than push to an unknown branch.
-        #
-        # Fork PRs (``is_cross_repository``) are also skipped: the PR
-        # head lives on the contributor's fork, but the daemon's clone
-        # only knows about ``origin`` (the base repo). Pushing there
-        # would create or update an unrelated branch on ``origin``
-        # without ever touching the PR, and the runner would then
-        # proceed to WATCH as if the fix landed. Letting the dirty
-        # tree surface through the next preflight cycle surfaces the
-        # real mismatch to operators instead of silently diverging.
-        if (
-            self.state.current_pr is not None
-            and self.state.current_pr.branch
-            and not self.state.current_pr.is_cross_repository
-        ):
-            self._commit_and_push_dirty(
-                "fix: auto-commit after review",
-                expected_branch=self.state.current_pr.branch,
-            )
-            if self.state.state == PipelineState.ERROR:
-                return
-        elif (
-            self.state.current_pr is not None
-            and self.state.current_pr.is_cross_repository
-        ):
-            self.log_event(
-                f"Skipping auto-commit for cross-repo PR "
-                f"#{self.state.current_pr.number} (fork head)"
-            )
 
         if self.state.current_pr is not None:
             self.state.current_pr.push_count += 1

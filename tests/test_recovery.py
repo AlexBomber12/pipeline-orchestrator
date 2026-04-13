@@ -159,21 +159,20 @@ def test_recover_doing_task_without_pr_rerun_coding(
         runner_module.github_client, "get_open_prs", lambda repo: []
     )
 
-    coding_calls: list[tuple[PipelineState, bool]] = []
+    coding_calls: list[PipelineState] = []
 
-    async def fake_coding(*, reset_branch: bool = True) -> None:
+    async def fake_coding() -> None:
         # Capture the state at the moment handle_coding was invoked so the
         # test can prove recover_state transitioned to CODING before
-        # calling. Recovery must pass reset_branch=False so any unpushed
-        # commits from the crashed run survive to _commit_and_push_dirty.
-        coding_calls.append((runner.state.state, reset_branch))
+        # calling.
+        coding_calls.append(runner.state.state)
 
     runner = _make_runner()
     runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
-    assert coding_calls == [(PipelineState.CODING, False)]
+    assert coding_calls == [PipelineState.CODING]
     assert runner.state.current_task is not None
     assert runner.state.current_task.pr_id == "PR-042"
     assert runner.state.current_pr is None

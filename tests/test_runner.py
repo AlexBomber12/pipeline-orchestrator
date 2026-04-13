@@ -303,6 +303,11 @@ def test_handle_coding_errors_when_no_pr_found(
         lambda repo: [],
     )
 
+    async def instant_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
+
     runner = _make_runner()
     runner.state.current_task = QueueTask(
         pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
@@ -330,6 +335,11 @@ def test_handle_coding_rejects_unmatched_branch(
         "get_open_prs",
         lambda repo: [unrelated],
     )
+
+    async def instant_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
 
     runner = _make_runner()
     runner.state.current_task = QueueTask(
@@ -499,27 +509,19 @@ def test_handle_fix_errors_when_post_comment_fails(
     )
 
 
-def test_handle_fix_skips_auto_commit_on_cross_repo_pr(
+def test_handle_fix_skips_checkout_on_cross_repo_pr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Codex P1 (round 5): for fork-based PRs, the daemon's clone only
-    knows about ``origin`` (the base repo) — the PR head lives on the
-    contributor's fork. Pushing ``origin/<branch>:<branch>`` would
-    create or update an unrelated branch on the base repo without ever
-    touching the PR, while the runner proceeds to WATCH as if the fix
-    landed. Skipping the auto-commit safety net on cross-repo PRs
-    leaves the dirty tree to surface through preflight next cycle
-    instead of silently diverging.
-    """
+    """For fork-based PRs, the daemon's clone only knows about
+    ``origin`` (the base repo) — the PR head lives on the contributor's
+    fork. ``git checkout`` against the fork branch would fail and trap
+    the runner in ERROR for every fork PR, so ``handle_fix`` must skip
+    the checkout entirely for cross-repo PRs. Claude owns commit/push
+    inside ``fix_review``."""
     calls: list[list[str]] = []
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         calls.append(cmd)
-        # Dirty tree — would normally trigger the auto-commit path.
-        if cmd[:2] == ["git", "status"]:
-            return _FakeCompletedProcess(
-                args=cmd, stdout=" M src/foo.py\n", returncode=0
-            )
         return _FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
@@ -541,22 +543,8 @@ def test_handle_fix_skips_auto_commit_on_cross_repo_pr(
     )
     asyncio.run(runner.handle_fix())
 
-    # Runner still transitions to WATCH, but no auto-commit subprocess
-    # calls happened — crucially, no git push.
     assert runner.state.state == PipelineState.WATCH
-    assert not any(cmd[:2] == ["git", "status"] for cmd in calls)
-    assert not any(cmd[:2] == ["git", "add"] for cmd in calls)
-    assert not any(cmd[:2] == ["git", "commit"] for cmd in calls)
-    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
-    # The pre-fix_review checkout must also skip for cross-repo PRs:
-    # the fork branch (e.g. ``contributor:feature-x``) does not exist
-    # in ``origin``, so the checkout would fail and trap the runner
-    # in ERROR for every fork PR.
     assert not any(cmd[:2] == ["git", "checkout"] for cmd in calls)
-    assert any(
-        "cross-repo" in e["event"] and "#88" in e["event"]
-        for e in runner.state.history
-    )
 
 
 def test_handle_fix_checks_out_pr_branch_before_fix_review(
@@ -695,27 +683,30 @@ def test_handle_coding_errors_when_task_has_no_branch(
     assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
 
 
-def test_handle_coding_creates_branch_before_claude(
+def test_handle_coding_retries_pr_detection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``handle_coding`` must ``git checkout -B`` the task branch from
-    ``origin/<base>`` BEFORE invoking ``claude_cli.run_planned_pr`` so Claude
-    always edits the correct feature branch and any uncommitted leftovers
-    land on that branch rather than on HEAD-of-the-moment."""
-    calls = _patch_subprocess(monkeypatch)
-    events: list[str] = []
-
-    def fake_run_planned_pr(path: str) -> tuple[int, str, str]:
-        events.append("claude")
-        return (0, "ok", "")
-
+    """GitHub's open-PR list is eventually consistent: a PR opened by
+    Claude may not appear on the first poll. ``handle_coding`` must retry
+    up to 3 times before giving up."""
+    _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli, "run_planned_pr", fake_run_planned_pr
+        runner_module.claude_cli,
+        "run_planned_pr",
+        lambda path: (0, "ok", ""),
     )
+
+    opened_pr = PRInfo(number=42, branch="pr-001")
+    call_count = {"n": 0}
+
+    def flaky_get_open_prs(repo: str) -> list[PRInfo]:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return []
+        return [opened_pr]
+
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
-        lambda repo: [PRInfo(number=7, branch="pr-042-sample")],
+        runner_module.github_client, "get_open_prs", flaky_get_open_prs
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -723,183 +714,69 @@ def test_handle_coding_creates_branch_before_claude(
         lambda repo, number, body: None,
     )
 
+    slept: list[float] = []
+
+    async def instant_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
+
     runner = _make_runner()
     runner.state.current_task = QueueTask(
-        pr_id="PR-042",
-        title="t",
-        status=TaskStatus.DOING,
-        branch="pr-042-sample",
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
     )
-
-    # Record when the checkout happens relative to the claude invocation by
-    # layering another subprocess stub on top of _patch_subprocess.
-    original_fake_run = runner_module.subprocess.run
-
-    def tracking_run(cmd: list[str], **kwargs: Any) -> Any:
-        if cmd[:3] == ["git", "checkout", "-B"]:
-            events.append("checkout")
-        return original_fake_run(cmd, **kwargs)
-
-    monkeypatch.setattr(runner_module.subprocess, "run", tracking_run)
-
     asyncio.run(runner.handle_coding())
 
-    checkout_cmds = [
-        cmd for cmd in calls if cmd[:3] == ["git", "checkout", "-B"]
-    ]
-    assert checkout_cmds, "expected git checkout -B before run_planned_pr"
-    assert checkout_cmds[0] == [
-        "git",
-        "checkout",
-        "-B",
-        "pr-042-sample",
-        "origin/main",
-    ]
-    # Checkout must precede the Claude CLI invocation.
-    assert events.index("checkout") < events.index("claude")
-
-
-def test_handle_coding_errors_when_checkout_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """If the pre-Claude ``git checkout -B`` fails, bail to ERROR and do NOT
-    invoke the Claude CLI."""
-    claude_calls: list[str] = []
-
-    def fake_run_planned_pr(path: str) -> tuple[int, str, str]:
-        claude_calls.append(path)
-        return (0, "ok", "")
-
-    monkeypatch.setattr(
-        runner_module.claude_cli, "run_planned_pr", fake_run_planned_pr
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 42
+    assert call_count["n"] == 2
+    assert slept == [5]
+    assert any(
+        "PR not found for 'pr-001'" in e["event"] and "1/3" in e["event"]
+        for e in runner.state.history
     )
 
-    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        if cmd[:3] == ["git", "checkout", "-B"]:
-            raise subprocess.CalledProcessError(1, cmd, stderr="bad ref")
-        return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
 
-    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+def test_handle_coding_errors_after_all_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After 3 consecutive empty get_open_prs results the runner must
+    flip to ERROR so operators see that Claude exited 0 without opening
+    a PR."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "run_planned_pr",
+        lambda path: (0, "ok", ""),
+    )
+    call_count = {"n": 0}
+
+    def always_empty(repo: str) -> list[PRInfo]:
+        call_count["n"] += 1
+        return []
+
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", always_empty
+    )
+
+    slept: list[float] = []
+
+    async def instant_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
 
     runner = _make_runner()
     runner.state.current_task = QueueTask(
-        pr_id="PR-042",
-        title="t",
-        status=TaskStatus.DOING,
-        branch="pr-042-sample",
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
     )
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.ERROR
-    assert "failed to create branch pr-042-sample" in (
-        runner.state.error_message or ""
-    )
-    assert claude_calls == []
-
-
-def test_handle_coding_recovery_preserves_existing_branch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Codex P1: when ``recover_state`` re-runs ``handle_coding`` after a
-    crash, the task branch may hold unpushed commits that must survive to
-    ``_commit_and_push_dirty``. Passing ``reset_branch=False`` must NOT
-    force ``-B`` against ``origin/<base>`` when the local branch already
-    exists — use a plain ``git checkout <branch>`` instead."""
-    monkeypatch.setattr(
-        runner_module.claude_cli, "run_planned_pr", lambda path: (0, "ok", "")
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
-        lambda repo: [PRInfo(number=7, branch="pr-042-sample")],
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
-        lambda repo, number, body: None,
-    )
-
-    calls: list[list[str]] = []
-
-    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        calls.append(cmd)
-        if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
-            # Local branch exists -> preserve it.
-            return _FakeCompletedProcess(args=cmd, stdout="abc\n", returncode=0)
-        if cmd[:2] == ["git", "rev-list"]:
-            return _FakeCompletedProcess(args=cmd, stdout="0\n", returncode=0)
-        return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
-
-    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
-
-    runner = _make_runner()
-    runner.state.current_task = QueueTask(
-        pr_id="PR-042",
-        title="t",
-        status=TaskStatus.DOING,
-        branch="pr-042-sample",
-    )
-
-    asyncio.run(runner.handle_coding(reset_branch=False))
-
-    # Must NOT hard-reset the branch in recovery mode.
-    assert not any(
-        cmd[:3] == ["git", "checkout", "-B"] for cmd in calls
-    ), "recovery must not -B reset the task branch"
-    # Must plain-checkout the existing branch.
-    assert ["git", "checkout", "pr-042-sample"] in calls
-
-
-def test_handle_coding_recovery_creates_branch_when_missing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Recovery fallback: when ``rev-parse --verify`` reports the local
-    branch does not exist (the crash happened before Claude created it),
-    ``handle_coding(reset_branch=False)`` must still create it from
-    ``origin/<base>`` so Claude has somewhere to commit."""
-    monkeypatch.setattr(
-        runner_module.claude_cli, "run_planned_pr", lambda path: (0, "ok", "")
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
-        lambda repo: [PRInfo(number=7, branch="pr-042-sample")],
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
-        lambda repo, number, body: None,
-    )
-
-    calls: list[list[str]] = []
-
-    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        calls.append(cmd)
-        if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
-            return _FakeCompletedProcess(args=cmd, stdout="", returncode=1)
-        if cmd[:2] == ["git", "rev-list"]:
-            return _FakeCompletedProcess(args=cmd, stdout="0\n", returncode=0)
-        return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
-
-    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
-
-    runner = _make_runner()
-    runner.state.current_task = QueueTask(
-        pr_id="PR-042",
-        title="t",
-        status=TaskStatus.DOING,
-        branch="pr-042-sample",
-    )
-
-    asyncio.run(runner.handle_coding(reset_branch=False))
-
-    assert [
-        "git",
-        "checkout",
-        "-B",
-        "pr-042-sample",
-        "origin/main",
-    ] in calls
+    assert "no PR found" in (runner.state.error_message or "")
+    assert call_count["n"] == 3
+    assert slept == [5, 5]
 
 
 def test_handle_watch_approved_and_green_merges(
