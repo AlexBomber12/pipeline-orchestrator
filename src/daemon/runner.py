@@ -80,6 +80,19 @@ def repo_owner_from_url(url: str) -> str:
 _FETCH_MISSING_REF_NEEDLE = "couldn't find remote ref"
 
 
+def _git(
+    repo_path: str, *args: str, timeout: int = 30, check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=check,
+        cwd=repo_path,
+    )
+
+
 def _base_branch_ahead_of_origin(repo_path: str, branch: str) -> bool:
     """Return ``True`` if ``refs/heads/{branch}`` has commits not yet
     on ``refs/remotes/origin/{branch}``.
