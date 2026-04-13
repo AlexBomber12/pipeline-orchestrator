@@ -73,7 +73,7 @@ def get_open_prs(repo: str) -> list[PRInfo]:
             "--state",
             "open",
             "--json",
-            "number,headRefName,statusCheckRollup,url,updatedAt,commits,author,isCrossRepository",
+            "number,headRefName,headRefOid,statusCheckRollup,url,updatedAt,commits,author,isCrossRepository",
         ],
         repo=repo,
     )
@@ -86,8 +86,9 @@ def get_open_prs(repo: str) -> list[PRInfo]:
         if not number:
             continue
         commits = entry.get("commits") or []
-        last_push_at = None
-        if commits:
+        head_sha = entry.get("headRefOid", "")
+        last_push_at = _get_head_commit_date(repo, head_sha) if head_sha else None
+        if last_push_at is None and commits:
             last_commit = commits[-1]
             committed = last_commit.get("committedDate") or last_commit.get("authoredDate")
             if committed:
@@ -261,6 +262,18 @@ def _gh_api_paginated(path: str) -> list[dict] | None:
         elif isinstance(page, dict):
             items.append(page)
     return items
+
+
+def _get_head_commit_date(repo: str, sha: str) -> datetime | None:
+    """Fetch the committer date of a specific commit by SHA."""
+    try:
+        data = run_gh(["api", f"repos/{repo}/git/commits/{sha}"])
+    except RuntimeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    committer = data.get("committer") or {}
+    return _parse_iso(committer.get("date"))
 
 
 def _ci_status_from_rollup(rollup: object) -> CIStatus:
