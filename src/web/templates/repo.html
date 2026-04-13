@@ -19,4 +19,14 @@
 </div>
 
 {% include "components/event_log.html" %}
+
+<details class="mt-4">
+    <summary class="text-sm text-gray-400 cursor-pointer hover:text-gray-200">
+        Claude CLI log
+    </summary>
+    <div hx-get="/partials/repo/{{ repo.name }}/cli-log"
+         hx-trigger="revealed, every 30s"
+         hx-swap="innerHTML">
+    </div>
+</details>
 {% endblock %}

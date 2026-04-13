@@ -437,3 +437,46 @@ def test_partial_repo_detail_renders_redis_payload(
     # Event log lives on /partials/repo/{name}/events now, so history
     # entries are no longer rendered by the summary partial.
     assert "claude started" not in body
+
+
+def test_cli_log_route_returns_log(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    empty_config.write_text(
+        "repositories:\n  - url: https://github.com/x/testrepo\n",
+        encoding="utf-8",
+    )
+
+    class _CliLogClient:
+        async def get(self, key: str) -> str | None:
+            if key == "cli_log:testrepo:latest":
+                return "line1\nline2"
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
+    class _CliLogAioredis:
+        @staticmethod
+        def from_url(url: str, decode_responses: bool = True) -> _CliLogClient:
+            return _CliLogClient()
+
+    monkeypatch.setattr(web_app, "aioredis", _CliLogAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo/testrepo/cli-log")
+    assert response.status_code == 200
+    assert "line1" in response.text
+    assert "line2" in response.text
+    assert "<pre" in response.text
+
+
+def test_cli_log_route_returns_empty(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo/testrepo/cli-log")
+    assert response.status_code == 200
+    assert "No CLI log available" in response.text

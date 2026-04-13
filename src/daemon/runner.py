@@ -303,6 +303,26 @@ class PipelineRunner:
             payload = self.state.model_dump_json()
         await self.redis.set(f"pipeline:{self.name}", payload)
 
+    async def _save_cli_log(self, stdout: str, label: str) -> None:
+        _MAX_CLI_LOG_BYTES = 64 * 1024  # 64 KB cap per entry
+        ts = datetime.now(timezone.utc).isoformat()
+        key_latest = f"cli_log:{self.name}:latest"
+        key_history = f"cli_log:{self.name}:{ts}"
+        marker = "[truncated]\n"
+        raw = stdout.encode("utf-8", errors="replace")
+        if len(raw) > _MAX_CLI_LOG_BYTES:
+            tail_budget = _MAX_CLI_LOG_BYTES - len(marker.encode("utf-8"))
+            raw = raw[-tail_budget:]
+            stdout = marker + raw.decode("utf-8", errors="replace")
+        try:
+            await self.redis.set(key_latest, stdout, ex=3600)
+            await self.redis.set(key_history, stdout, ex=86400)
+        except Exception:
+            logger.warning("Failed to save CLI log for %s", self.name)
+        if stdout.strip():
+            first_lines = stdout.strip()[:200]
+            self.log_event(f"{label}: {first_lines}")
+
     def log_event(self, event: str) -> None:
         """Append an event to ``state.history`` (capped) and log it."""
         entry = {
@@ -1234,7 +1254,8 @@ return 0
             self.log_event(self.state.error_message)
             return
 
-        code, _stdout, stderr = claude_cli.run_planned_pr(self.repo_path)
+        code, stdout, stderr = claude_cli.run_planned_pr(self.repo_path)
+        await self._save_cli_log(stdout, "PLANNED PR output")
         if code != 0:
             self.state.state = PipelineState.ERROR
             self.state.error_message = stderr.strip() or f"claude exit {code}"
@@ -1400,7 +1421,8 @@ return 0
                 self.log_event(self.state.error_message)
                 return
 
-        code, _stdout, stderr = claude_cli.fix_review(self.repo_path)
+        code, stdout, stderr = claude_cli.fix_review(self.repo_path)
+        await self._save_cli_log(stdout, "FIX REVIEW output")
         if code != 0:
             self.state.state = PipelineState.ERROR
             self.state.error_message = stderr.strip() or f"claude exit {code}"
