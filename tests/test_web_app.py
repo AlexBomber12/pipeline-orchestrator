@@ -442,6 +442,11 @@ def test_partial_repo_detail_renders_redis_payload(
 def test_cli_log_route_returns_log(
     empty_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    empty_config.write_text(
+        "repositories:\n  - url: https://github.com/x/testrepo\n",
+        encoding="utf-8",
+    )
+
     class _CliLogClient:
         async def get(self, key: str) -> str | None:
             if key == "cli_log:testrepo:latest":

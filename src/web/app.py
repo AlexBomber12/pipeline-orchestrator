@@ -666,6 +666,11 @@ async def partial_repo_events(
 @app.get("/partials/repo/{name}/cli-log", response_class=HTMLResponse)
 async def repo_cli_log(request: Request, name: str) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
+    cfg = load_config(CONFIG_PATH)
+    if not any(repo_name_from_url(r.url) == name for r in cfg.repositories):
+        return HTMLResponse(
+            '<p class="text-sm text-gray-500 italic">No CLI log available.</p>'
+        )
     log_text = ""
     if redis_client is not None:
         try:
