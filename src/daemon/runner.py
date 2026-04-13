@@ -35,6 +35,19 @@ from src.utils import repo_name_from_url
 
 logger = logging.getLogger(__name__)
 
+
+def _git(
+    repo_path: str, *args: str, timeout: int = 30, check: bool = True
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=check,
+        cwd=repo_path,
+    )
+
 _TRANSIENT_STATES = {
     PipelineState.CODING,
     PipelineState.FIX,
@@ -92,38 +105,20 @@ def _base_branch_ahead_of_origin(repo_path: str, branch: str) -> bool:
     stale data from ``origin/{branch}:tasks/QUEUE.md``.
     """
     try:
-        local = subprocess.run(
-            [
-                "git",
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                f"refs/heads/{branch}",
-            ],
-            capture_output=True,
-            text=True,
-            cwd=repo_path,
+        local = _git(
+            repo_path,
+            "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}",
             check=False,
-            timeout=30,
         )
         if local.returncode != 0:
             # No local base branch yet. The ordinary scaffold retry
             # path will create it (either via checkout or
             # symbolic-ref), so treat this as "needs retry" too.
             return True
-        remote = subprocess.run(
-            [
-                "git",
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                f"refs/remotes/origin/{branch}",
-            ],
-            capture_output=True,
-            text=True,
-            cwd=repo_path,
+        remote = _git(
+            repo_path,
+            "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}",
             check=False,
-            timeout=30,
         )
         if remote.returncode != 0:
             # Remote ref missing after a "successful" fetch is
@@ -131,18 +126,11 @@ def _base_branch_ahead_of_origin(repo_path: str, branch: str) -> bool:
             # ensure_repo_cloned usually catches this before we get
             # here. Err on the side of retry.
             return True
-        ahead = subprocess.run(
-            [
-                "git",
-                "rev-list",
-                "--count",
-                f"refs/remotes/origin/{branch}..refs/heads/{branch}",
-            ],
-            capture_output=True,
-            text=True,
-            cwd=repo_path,
+        ahead = _git(
+            repo_path,
+            "rev-list", "--count",
+            f"refs/remotes/origin/{branch}..refs/heads/{branch}",
             check=False,
-            timeout=30,
         )
     except subprocess.TimeoutExpired as exc:
         logger.warning(
@@ -189,14 +177,7 @@ def _working_tree_dirty(repo_path: str) -> bool:
     problem that scaffold_repo's own error handling will surface.
     """
     try:
-        result = subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True,
-            text=True,
-            cwd=repo_path,
-            check=True,
-            timeout=30,
-        )
+        result = _git(repo_path, "status", "--porcelain")
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return False
     return bool(result.stdout.strip())
@@ -338,13 +319,10 @@ class PipelineRunner:
         else:
             fetch_missing_ref = False
             try:
-                subprocess.run(
-                    ["git", "fetch", "origin", self.repo_config.branch],
-                    capture_output=True,
-                    text=True,
+                _git(
+                    self.repo_path,
+                    "fetch", "origin", self.repo_config.branch,
                     timeout=60,
-                    check=True,
-                    cwd=self.repo_path,
                 )
             except subprocess.CalledProcessError as exc:
                 detail = (exc.stderr or exc.stdout or "").strip()
@@ -460,42 +438,14 @@ class PipelineRunner:
         caller can translate it into ERROR state with appropriate context.
         """
         branch = self.repo_config.branch
-        subprocess.run(
-            ["git", "fetch", "origin", branch],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=True,
-            cwd=self.repo_path,
-        )
-        subprocess.run(
-            ["git", "checkout", branch],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
-            cwd=self.repo_path,
-        )
-        subprocess.run(
-            ["git", "reset", "--hard", f"origin/{branch}"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
-            cwd=self.repo_path,
-        )
+        _git(self.repo_path, "fetch", "origin", branch, timeout=60)
+        _git(self.repo_path, "checkout", branch)
+        _git(self.repo_path, "reset", "--hard", f"origin/{branch}")
         # ``git reset --hard`` only discards tracked-file changes; untracked
         # files (e.g. artifacts left by a crashed Claude run) survive and
         # would poison the next preflight as a dirty tree. ``git clean -fd``
         # removes them so the working copy truly matches origin/{branch}.
-        subprocess.run(
-            ["git", "clean", "-fd"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
-            cwd=self.repo_path,
-        )
+        _git(self.repo_path, "clean", "-fd")
 
     def _parse_base_queue(self) -> list[QueueTask] | None:
         """Return QUEUE.md parsed from ``origin/{branch}``, or ``None``.
@@ -522,13 +472,9 @@ class PipelineRunner:
         """
         branch = self.repo_config.branch
         try:
-            result = subprocess.run(
-                ["git", "show", f"origin/{branch}:tasks/QUEUE.md"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=True,
-                cwd=self.repo_path,
+            result = _git(
+                self.repo_path,
+                "show", f"origin/{branch}:tasks/QUEUE.md",
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return None
@@ -690,14 +636,7 @@ class PipelineRunner:
     def preflight(self) -> bool:
         """Return ``True`` iff the working tree is clean."""
         try:
-            result = subprocess.run(
-                ["git", "status", "--porcelain"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=True,
-                cwd=self.repo_path,
-            )
+            result = _git(self.repo_path, "status", "--porcelain")
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"preflight failed: {exc}"
@@ -754,13 +693,8 @@ class PipelineRunner:
             return False
 
         try:
-            status = subprocess.run(
-                ["git", "status", "--porcelain"],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=True,
-                cwd=self.repo_path,
+            status = _git(
+                self.repo_path, "status", "--porcelain", timeout=120,
             )
         except (
             subprocess.CalledProcessError,
@@ -780,13 +714,9 @@ class PipelineRunner:
             return False
 
         try:
-            head = subprocess.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                capture_output=True,
-                text=True,
+            head = _git(
+                self.repo_path, "rev-parse", "--abbrev-ref", "HEAD",
                 timeout=120,
-                check=True,
-                cwd=self.repo_path,
             )
         except (
             subprocess.CalledProcessError,
@@ -846,32 +776,12 @@ class PipelineRunner:
             return False
 
         try:
-            subprocess.run(
-                ["git", "add", "-A"],
-                capture_output=True,
-                text=True,
+            _git(self.repo_path, "add", "-A", timeout=120)
+            _git(self.repo_path, "commit", "-m", message, timeout=120)
+            _git(
+                self.repo_path,
+                "push", "origin", f"{expected_branch}:{expected_branch}",
                 timeout=120,
-                check=True,
-                cwd=self.repo_path,
-            )
-            subprocess.run(
-                ["git", "commit", "-m", message],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=True,
-                cwd=self.repo_path,
-            )
-            subprocess.run(
-                # Push the validated branch by name rather than ``HEAD``
-                # so a pre-push hook that re-points HEAD mid-operation
-                # still cannot divert the push onto the base branch.
-                ["git", "push", "origin", f"{expected_branch}:{expected_branch}"],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=True,
-                cwd=self.repo_path,
             )
         except (
             subprocess.CalledProcessError,
@@ -1014,34 +924,25 @@ return 0
                 if src.is_file():
                     shutil.copy2(str(src), str(tasks_dir / fname))
 
-            subprocess.run(
-                ["git", "add"] + [f"tasks/{fn}" for fn in filenames],
-                cwd=self.repo_path,
-                capture_output=True, text=True, timeout=30, check=True,
-            )
-            commit_result = subprocess.run(
-                ["git", "commit", "-m", "chore: upload sprint tasks via dashboard"],
-                cwd=self.repo_path,
-                capture_output=True, text=True, timeout=30, check=False,
+            _git(self.repo_path, "add", *[f"tasks/{fn}" for fn in filenames])
+            commit_result = _git(
+                self.repo_path,
+                "commit", "-m", "chore: upload sprint tasks via dashboard",
+                check=False,
             )
             if commit_result.returncode != 0:
                 combined = f"{commit_result.stderr}\n{commit_result.stdout}"
                 if "nothing to commit" not in combined:
                     raise RuntimeError(combined.strip())
-            subprocess.run(
-                ["git", "push", "origin", branch],
-                cwd=self.repo_path,
-                capture_output=True, text=True, timeout=60, check=True,
-            )
+            _git(self.repo_path, "push", "origin", branch, timeout=60)
             self.log_event(f"Pushed uploaded task files: {filenames}")
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
             logger.error("%s: upload git operations failed: %s", self.name, exc)
             self.log_event(f"Upload push failed: {exc}")
             try:
-                subprocess.run(
-                    ["git", "reset", "--hard", f"origin/{branch}"],
-                    cwd=self.repo_path,
-                    capture_output=True, text=True, timeout=30, check=False,
+                _git(
+                    self.repo_path, "reset", "--hard", f"origin/{branch}",
+                    check=False,
                 )
             except Exception:
                 pass
@@ -1148,29 +1049,19 @@ return 0
         # correct. When it's False, recovery is resuming an interrupted run
         # that may still have unpushed commits on the task branch; a hard
         # reset would orphan them.
-        checkout_cmd: list[str]
+        checkout_args: tuple[str, ...]
         if reset_branch:
-            checkout_cmd = [
-                "git",
-                "checkout",
-                "-B",
-                target_branch,
+            checkout_args = (
+                "checkout", "-B", target_branch,
                 f"origin/{self.repo_config.branch}",
-            ]
+            )
         else:
             try:
-                probe = subprocess.run(
-                    [
-                        "git",
-                        "rev-parse",
-                        "--verify",
-                        "--quiet",
-                        f"refs/heads/{target_branch}",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    cwd=self.repo_path,
+                probe = _git(
+                    self.repo_path,
+                    "rev-parse", "--verify", "--quiet",
+                    f"refs/heads/{target_branch}",
+                    timeout=10, check=False,
                 )
             except (subprocess.TimeoutExpired, OSError) as exc:
                 self.state.state = PipelineState.ERROR
@@ -1178,25 +1069,15 @@ return 0
                 self.log_event(f"{self.state.error_message}: {exc}")
                 return
             if probe.returncode == 0:
-                checkout_cmd = ["git", "checkout", target_branch]
+                checkout_args = ("checkout", target_branch)
             else:
-                checkout_cmd = [
-                    "git",
-                    "checkout",
-                    "-B",
-                    target_branch,
+                checkout_args = (
+                    "checkout", "-B", target_branch,
                     f"origin/{self.repo_config.branch}",
-                ]
+                )
 
         try:
-            subprocess.run(
-                checkout_cmd,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=True,
-                cwd=self.repo_path,
-            )
+            _git(self.repo_path, *checkout_args)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"failed to create branch {target_branch}"
@@ -1341,14 +1222,7 @@ return 0
             and not self.state.current_pr.is_cross_repository
         ):
             try:
-                subprocess.run(
-                    ["git", "checkout", self.state.current_pr.branch],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    check=True,
-                    cwd=self.repo_path,
-                )
+                _git(self.repo_path, "checkout", self.state.current_pr.branch)
             except (
                 subprocess.CalledProcessError,
                 subprocess.TimeoutExpired,

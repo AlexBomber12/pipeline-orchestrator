@@ -201,8 +201,8 @@ def get_pr_review_status(
 
 
 def merge_pr(repo: str, pr_number: int) -> None:
-    """Merge a PR using ``gh pr merge --merge --delete-branch``."""
-    run_gh(["pr", "merge", str(pr_number), "--merge", "--delete-branch"], repo=repo)
+    """Merge a PR using ``gh pr merge --squash --delete-branch``."""
+    run_gh(["pr", "merge", str(pr_number), "--squash", "--delete-branch"], repo=repo)
 
 
 def post_comment(repo: str, pr_number: int, body: str) -> None:
