@@ -138,7 +138,9 @@ def get_pr_review_status(
             if "+1" in codex_contents:
                 if head_sha:
                     reviewed_sha = _get_latest_codex_reviewed_sha(repo, pr_number)
-                    if reviewed_sha and (head_sha.startswith(reviewed_sha) or reviewed_sha.startswith(head_sha)):
+                    if reviewed_sha and not head_sha.startswith(reviewed_sha) and not reviewed_sha.startswith(head_sha):
+                        pass  # stale: reviewed a different commit
+                    else:
                         body_approved = True
                 else:
                     body_approved = True
