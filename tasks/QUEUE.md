@@ -150,7 +150,7 @@
 - Depends on: PR-024
 
 ## PR-026: Tab title blink on alert
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-026.md
 - Branch: pr-026-tab-blink
 - Depends on: PR-023

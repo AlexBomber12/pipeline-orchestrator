@@ -18,6 +18,8 @@
         });
     </script>
 
+    <link rel="icon" id="favicon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%2312121a'/><text x='16' y='21' text-anchor='middle' font-family='monospace' font-size='12' font-weight='bold' fill='%2322d3ee'>PO</text></svg>">
+
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link
@@ -108,6 +110,61 @@
             }
             tick();
             setInterval(tick, 1000);
+        })();
+    </script>
+
+    <script>
+        (function() {
+            const originalTitle = document.title;
+            let blinking = false;
+            let blinkInterval = null;
+
+            const normalFavicon = `data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="%2312121a"/><text x="16" y="21" text-anchor="middle" font-family="monospace" font-size="12" font-weight="bold" fill="%2322d3ee">PO</text></svg>`;
+            const alertFavicon = `data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="%2312121a"/><text x="16" y="21" text-anchor="middle" font-family="monospace" font-size="12" font-weight="bold" fill="%2322d3ee">PO</text><circle cx="26" cy="6" r="5" fill="%23f87171"/></svg>`;
+
+            function setFavicon(href) {
+                const link = document.getElementById('favicon');
+                if (link) link.href = href;
+            }
+
+            function checkAlerts() {
+                fetch('/api/states')
+                    .then(r => r.json())
+                    .then(states => {
+                        const hasAlert = states.some(s =>
+                            s.state === 'ERROR' || s.state === 'HUNG'
+                        );
+                        if (hasAlert && !blinking) {
+                            startBlink();
+                        } else if (!hasAlert && blinking) {
+                            stopBlink();
+                        }
+                    })
+                    .catch(() => {});
+            }
+
+            function startBlink() {
+                blinking = true;
+                setFavicon(alertFavicon);
+                let show = true;
+                blinkInterval = setInterval(() => {
+                    document.title = show ? 'ALERT - Pipeline Orchestrator' : originalTitle;
+                    show = !show;
+                }, 1500);
+            }
+
+            function stopBlink() {
+                blinking = false;
+                if (blinkInterval) {
+                    clearInterval(blinkInterval);
+                    blinkInterval = null;
+                }
+                document.title = originalTitle;
+                setFavicon(normalFavicon);
+            }
+
+            setInterval(checkAlerts, 10000);
+            checkAlerts();
         })();
     </script>
 </body>
