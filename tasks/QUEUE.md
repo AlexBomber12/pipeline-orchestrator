@@ -154,3 +154,57 @@
 - Tasks file: tasks/PR-026.md
 - Branch: pr-026-tab-blink
 - Depends on: PR-023
+
+## PR-027: Subprocess helper and squash merge
+- Status: TODO
+- Tasks file: tasks/PR-027.md
+- Branch: pr-027-subprocess-helper
+- Depends on: PR-026
+
+## PR-028: QUEUE.md auto-update on merge
+- Status: TODO
+- Tasks file: tasks/PR-028.md
+- Branch: pr-028-queue-auto-done
+- Depends on: PR-027
+
+## PR-029: Deduplicate codex review posts
+- Status: TODO
+- Tasks file: tasks/PR-029.md
+- Branch: pr-029-dedup-codex-review
+- Depends on: PR-028
+
+## PR-030: Detect and push unpushed commits
+- Status: TODO
+- Tasks file: tasks/PR-030.md
+- Branch: pr-030-unpushed-detect
+- Depends on: PR-027
+
+## PR-031: Pre-merge sync with main
+- Status: TODO
+- Tasks file: tasks/PR-031.md
+- Branch: pr-031-pre-merge-sync
+- Depends on: PR-027
+
+## PR-032: Claude CLI stdout logging
+- Status: TODO
+- Tasks file: tasks/PR-032.md
+- Branch: pr-032-cli-stdout-log
+- Depends on: PR-027
+
+## PR-033: Model config in config.yml
+- Status: TODO
+- Tasks file: tasks/PR-033.md
+- Branch: pr-033-model-config
+- Depends on: PR-032
+
+## PR-034: Event log UX overhaul
+- Status: TODO
+- Tasks file: tasks/PR-034.md
+- Branch: pr-034-event-log-ux
+- Depends on: PR-026
+
+## PR-035: Repo card click and dashboard polish
+- Status: TODO
+- Tasks file: tasks/PR-035.md
+- Branch: pr-035-card-click
+- Depends on: PR-034
