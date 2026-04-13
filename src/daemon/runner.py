@@ -618,7 +618,10 @@ class PipelineRunner:
                 f"Recovered: DOING task {doing.pr_id}, no PR "
                 "-> re-running CODING"
             )
-            await self.handle_coding()
+            # Recovery must not hard-reset the task branch: the crashed
+            # run may have left unpushed commits on it that we need
+            # ``_commit_and_push_dirty`` to preserve and publish.
+            await self.handle_coding(reset_branch=False)
             # Even if handle_coding left the runner in ERROR, discovery
             # itself completed and must not be retried: re-running
             # handle_coding a second time on the next cycle could create
@@ -1117,8 +1120,15 @@ return 0
         await self.publish_state()
         await self.handle_coding()
 
-    async def handle_coding(self) -> None:
-        """Run ``PLANNED PR`` via the claude CLI and hand off to WATCH."""
+    async def handle_coding(self, *, reset_branch: bool = True) -> None:
+        """Run ``PLANNED PR`` via the claude CLI and hand off to WATCH.
+
+        ``reset_branch=True`` (fresh IDLE -> CODING) force-recreates the task
+        branch from ``origin/<base>``. ``reset_branch=False`` (called from
+        ``recover_state`` after a crashed run) preserves any in-flight local
+        commits: plain checkout if the local branch already exists, else
+        fall back to creating it from ``origin/<base>``.
+        """
         # Validate the task-branch invariant BEFORE invoking the CLI so we
         # never run Claude against whatever branch HEAD happens to point at.
         target_branch = (
@@ -1132,18 +1142,55 @@ return 0
             self.log_event(self.state.error_message)
             return
 
-        # Create/reset the feature branch from origin/<base> so Claude always
-        # edits on the correct branch and _commit_and_push_dirty can capture
-        # any uncommitted work it leaves behind.
-        try:
-            subprocess.run(
-                [
+        # Pick a checkout command that preserves in-flight work during
+        # recovery. When reset_branch is True we're coming from IDLE with a
+        # clean tree after sync_to_main, so a hard reset to origin/<base> is
+        # correct. When it's False, recovery is resuming an interrupted run
+        # that may still have unpushed commits on the task branch; a hard
+        # reset would orphan them.
+        checkout_cmd: list[str]
+        if reset_branch:
+            checkout_cmd = [
+                "git",
+                "checkout",
+                "-B",
+                target_branch,
+                f"origin/{self.repo_config.branch}",
+            ]
+        else:
+            try:
+                probe = subprocess.run(
+                    [
+                        "git",
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        f"refs/heads/{target_branch}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    cwd=self.repo_path,
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = f"failed to create branch {target_branch}"
+                self.log_event(f"{self.state.error_message}: {exc}")
+                return
+            if probe.returncode == 0:
+                checkout_cmd = ["git", "checkout", target_branch]
+            else:
+                checkout_cmd = [
                     "git",
                     "checkout",
                     "-B",
                     target_branch,
                     f"origin/{self.repo_config.branch}",
-                ],
+                ]
+
+        try:
+            subprocess.run(
+                checkout_cmd,
                 capture_output=True,
                 text=True,
                 timeout=30,

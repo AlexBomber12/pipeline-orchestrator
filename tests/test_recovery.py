@@ -159,19 +159,21 @@ def test_recover_doing_task_without_pr_rerun_coding(
         runner_module.github_client, "get_open_prs", lambda repo: []
     )
 
-    coding_calls: list[PipelineState] = []
+    coding_calls: list[tuple[PipelineState, bool]] = []
 
-    async def fake_coding() -> None:
+    async def fake_coding(*, reset_branch: bool = True) -> None:
         # Capture the state at the moment handle_coding was invoked so the
-        # test can prove recover_state transitioned to CODING before calling.
-        coding_calls.append(runner.state.state)
+        # test can prove recover_state transitioned to CODING before
+        # calling. Recovery must pass reset_branch=False so any unpushed
+        # commits from the crashed run survive to _commit_and_push_dirty.
+        coding_calls.append((runner.state.state, reset_branch))
 
     runner = _make_runner()
     runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
-    assert coding_calls == [PipelineState.CODING]
+    assert coding_calls == [(PipelineState.CODING, False)]
     assert runner.state.current_task is not None
     assert runner.state.current_task.pr_id == "PR-042"
     assert runner.state.current_pr is None
@@ -686,7 +688,7 @@ def test_run_cycle_coding_failure_during_recovery_is_not_retried(
 
     coding_calls: list[int] = []
 
-    async def failing_coding() -> None:
+    async def failing_coding(*, reset_branch: bool = True) -> None:
         coding_calls.append(1)
         runner.state.state = PipelineState.ERROR
         runner.state.error_message = "claude CLI crashed"
