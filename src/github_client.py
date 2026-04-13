@@ -73,7 +73,7 @@ def get_open_prs(repo: str) -> list[PRInfo]:
             "--state",
             "open",
             "--json",
-            "number,headRefName,statusCheckRollup,url,updatedAt,commits,author,isCrossRepository",
+            "number,headRefName,headRefOid,statusCheckRollup,url,updatedAt,commits,author,isCrossRepository",
         ],
         repo=repo,
     )
@@ -85,6 +85,8 @@ def get_open_prs(repo: str) -> list[PRInfo]:
         number = int(entry.get("number", 0))
         if not number:
             continue
+        commits = entry.get("commits") or []
+        head_sha = entry.get("headRefOid", "")
         prs.append(
             PRInfo(
                 number=number,
@@ -94,8 +96,9 @@ def get_open_prs(repo: str) -> list[PRInfo]:
                     repo,
                     number,
                     pr_author=(entry.get("author") or {}).get("login", ""),
+                    head_sha=head_sha,
                 ),
-                push_count=len(entry.get("commits") or []),
+                push_count=len(commits),
                 url=entry.get("url", ""),
                 last_activity=_parse_iso(entry.get("updatedAt")),
                 is_cross_repository=bool(entry.get("isCrossRepository", False)),
@@ -105,7 +108,10 @@ def get_open_prs(repo: str) -> list[PRInfo]:
 
 
 def get_pr_review_status(
-    repo: str, pr_number: int, pr_author: str = ""
+    repo: str,
+    pr_number: int,
+    pr_author: str = "",
+    head_sha: str = "",
 ) -> ReviewStatus:
     """Derive a Codex review status from PR issue comments, review comments, and reactions.
 
@@ -116,23 +122,29 @@ def get_pr_review_status(
        the anchor for P1/P2 → CHANGES_REQUESTED.
     4. Otherwise → PENDING.
     """
-    # Check for Codex reactions on the PR body (issue-level reactions).
-    # Codex bot (chatgpt-codex-connector) puts +1 on the PR body itself,
-    # not on comments, so check this first.
+    body_approved = False
     try:
         issue_reactions = _gh_api_paginated(
             f"repos/{repo}/issues/{pr_number}/reactions"
         )
         if issue_reactions:
-            codex_contents = {
-                r.get("content")
+            codex_reactions = [
+                r
                 for r in issue_reactions
                 if isinstance(r, dict)
                 and "codex" in ((r.get("user") or {}).get("login", "")).lower()
-            }
+            ]
+            codex_contents = {r.get("content") for r in codex_reactions}
             if "+1" in codex_contents:
-                return ReviewStatus.APPROVED
-            if "eyes" in codex_contents:
+                if head_sha:
+                    reviewed_sha = _get_latest_codex_reviewed_sha(repo, pr_number)
+                    if reviewed_sha and not head_sha.startswith(reviewed_sha) and not reviewed_sha.startswith(head_sha):
+                        pass  # stale: reviewed a different commit
+                    else:
+                        body_approved = True
+                else:
+                    body_approved = True
+            if not body_approved and "eyes" in codex_contents:
                 return ReviewStatus.EYES
     except RuntimeError as exc:
         if "HTTP 404" not in str(exc):
@@ -162,6 +174,7 @@ def get_pr_review_status(
             break
 
     # Step 2: check Codex reactions on the anchor comment.
+    anchor_approved = False
     if anchor is not None:
         cid = anchor.get("id")
         if cid is not None:
@@ -178,8 +191,8 @@ def get_pr_review_status(
                         in ((r.get("user") or {}).get("login", "")).lower()
                     }
                     if "+1" in codex_contents:
-                        return ReviewStatus.APPROVED
-                    if "eyes" in codex_contents:
+                        anchor_approved = True
+                    elif "eyes" in codex_contents:
                         return ReviewStatus.EYES
             except RuntimeError as exc:
                 if "HTTP 404" not in str(exc):
@@ -196,6 +209,9 @@ def get_pr_review_status(
         body = comment.get("body") or ""
         if "P1" in body or "P2" in body:
             return ReviewStatus.CHANGES_REQUESTED
+
+    if anchor_approved or body_approved:
+        return ReviewStatus.APPROVED
 
     return ReviewStatus.PENDING
 
@@ -231,6 +247,26 @@ def _gh_api_paginated(path: str) -> list[dict] | None:
         elif isinstance(page, dict):
             items.append(page)
     return items
+
+
+def _get_latest_codex_reviewed_sha(repo: str, pr_number: int) -> str:
+    """Return the commit SHA from the most recent Codex review, or empty string."""
+    try:
+        reviews = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/reviews")
+    except RuntimeError as exc:
+        if "HTTP 404" not in str(exc):
+            raise
+        return ""
+    if not reviews:
+        return ""
+    for review in reversed(reviews):
+        user = (review.get("user") or {}).get("login", "") or ""
+        if "codex" not in user.lower():
+            continue
+        sha = review.get("commit_id") or ""
+        if sha:
+            return sha
+    return ""
 
 
 def _ci_status_from_rollup(rollup: object) -> CIStatus:

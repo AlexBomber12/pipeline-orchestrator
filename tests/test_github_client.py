@@ -117,8 +117,6 @@ def test_get_pr_review_status_approved_via_pr_body_reaction(
         == ReviewStatus.APPROVED
     )
 
-    # Should return early after checking issue reactions — no comment fetches needed.
-    assert len(invocations) == 1
     assert "issues/42/reactions" in invocations[0][-1]
 
 
@@ -419,3 +417,117 @@ def test_get_pr_review_status_propagates_error_on_pr_404(
 
     with pytest.raises(RuntimeError, match="403"):
         get_pr_review_status("owner/name", 404)
+
+
+def test_stale_approval_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    """+1 reaction but Codex reviewed a different commit → PENDING."""
+    import json as _json
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = cmd[-1]
+        if path.endswith("/issues/42/reactions"):
+            pages = [
+                [
+                    {
+                        "content": "+1",
+                        "user": {"login": "chatgpt-codex-connector"},
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ]
+            ]
+        elif path.endswith("/pulls/42/reviews"):
+            pages = [
+                [
+                    {
+                        "user": {"login": "chatgpt-codex-connector"},
+                        "commit_id": "aaaaaa1111",
+                    }
+                ]
+            ]
+        elif "issues" in path and path.endswith("/comments"):
+            pages = []
+        elif "pulls" in path and path.endswith("/comments"):
+            pages = []
+        else:
+            pages = []
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222")
+        == ReviewStatus.PENDING
+    )
+
+
+def test_fresh_approval_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """+1 reaction and Codex reviewed the current HEAD → APPROVED."""
+    import json as _json
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = cmd[-1]
+        if path.endswith("/issues/42/reactions"):
+            pages = [
+                [
+                    {
+                        "content": "+1",
+                        "user": {"login": "chatgpt-codex-connector"},
+                        "created_at": "2026-01-03T00:00:00Z",
+                    }
+                ]
+            ]
+        elif path.endswith("/pulls/42/reviews"):
+            pages = [
+                [
+                    {
+                        "user": {"login": "chatgpt-codex-connector"},
+                        "commit_id": "aabbcc112233",
+                    }
+                ]
+            ]
+        elif "issues" in path and path.endswith("/comments"):
+            pages = []
+        elif "pulls" in path and path.endswith("/comments"):
+            pages = []
+        else:
+            pages = []
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status("owner/name", 42, pr_author="author", head_sha="aabbcc112233")
+        == ReviewStatus.APPROVED
+    )
+
+
+def test_approval_without_head_sha(monkeypatch: pytest.MonkeyPatch) -> None:
+    """+1 reaction with no head_sha → APPROVED (backward compatible)."""
+    import json as _json
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = cmd[-1]
+        if path.endswith("/issues/42/reactions"):
+            pages = [
+                [
+                    {
+                        "content": "+1",
+                        "user": {"login": "chatgpt-codex-connector"},
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ]
+            ]
+        elif "issues" in path and path.endswith("/comments"):
+            pages = []
+        elif "pulls" in path and path.endswith("/comments"):
+            pages = []
+        else:
+            pages = []
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status("owner/name", 42, pr_author="author")
+        == ReviewStatus.APPROVED
+    )
