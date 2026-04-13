@@ -1119,20 +1119,8 @@ return 0
 
     async def handle_coding(self) -> None:
         """Run ``PLANNED PR`` via the claude CLI and hand off to WATCH."""
-        code, _stdout, stderr = claude_cli.run_planned_pr(self.repo_path)
-        if code != 0:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = stderr.strip() or f"claude exit {code}"
-            self.log_event(f"claude CLI failed: {self.state.error_message}")
-            return
-
-        # Validate the task-branch invariant BEFORE auto-committing. A
-        # malformed queue entry with no ``Branch:`` field is a hard
-        # error: without it we cannot identify the PR that was just
-        # opened and we must not publish a speculative commit/push on
-        # whatever branch HEAD happens to point at. Bail first, let
-        # ``_commit_and_push_dirty`` run only once we know which PR we
-        # will attach the push to.
+        # Validate the task-branch invariant BEFORE invoking the CLI so we
+        # never run Claude against whatever branch HEAD happens to point at.
         target_branch = (
             self.state.current_task.branch if self.state.current_task else None
         )
@@ -1142,6 +1130,37 @@ return 0
                 "Current task has no branch; cannot identify PR"
             )
             self.log_event(self.state.error_message)
+            return
+
+        # Create/reset the feature branch from origin/<base> so Claude always
+        # edits on the correct branch and _commit_and_push_dirty can capture
+        # any uncommitted work it leaves behind.
+        try:
+            subprocess.run(
+                [
+                    "git",
+                    "checkout",
+                    "-B",
+                    target_branch,
+                    f"origin/{self.repo_config.branch}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+                cwd=self.repo_path,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = f"failed to create branch {target_branch}"
+            self.log_event(f"{self.state.error_message}: {exc}")
+            return
+
+        code, _stdout, stderr = claude_cli.run_planned_pr(self.repo_path)
+        if code != 0:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = stderr.strip() or f"claude exit {code}"
+            self.log_event(f"claude CLI failed: {self.state.error_message}")
             return
 
         commit_message = (
