@@ -117,8 +117,6 @@ def test_get_pr_review_status_approved_via_pr_body_reaction(
         == ReviewStatus.APPROVED
     )
 
-    # Should return early after checking issue reactions — no comment fetches needed.
-    assert len(invocations) == 1
     assert "issues/42/reactions" in invocations[0][-1]
 
 

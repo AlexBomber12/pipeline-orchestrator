@@ -122,6 +122,7 @@ def get_pr_review_status(
        the anchor for P1/P2 → CHANGES_REQUESTED.
     4. Otherwise → PENDING.
     """
+    body_approved = False
     try:
         issue_reactions = _gh_api_paginated(
             f"repos/{repo}/issues/{pr_number}/reactions"
@@ -140,10 +141,10 @@ def get_pr_review_status(
                     if reviewed_sha and not head_sha.startswith(reviewed_sha) and not reviewed_sha.startswith(head_sha):
                         pass  # stale: reviewed a different commit
                     else:
-                        return ReviewStatus.APPROVED
+                        body_approved = True
                 else:
-                    return ReviewStatus.APPROVED
-            if "eyes" in codex_contents:
+                    body_approved = True
+            if not body_approved and "eyes" in codex_contents:
                 return ReviewStatus.EYES
     except RuntimeError as exc:
         if "HTTP 404" not in str(exc):
@@ -173,6 +174,7 @@ def get_pr_review_status(
             break
 
     # Step 2: check Codex reactions on the anchor comment.
+    anchor_approved = False
     if anchor is not None:
         cid = anchor.get("id")
         if cid is not None:
@@ -189,8 +191,8 @@ def get_pr_review_status(
                         in ((r.get("user") or {}).get("login", "")).lower()
                     }
                     if "+1" in codex_contents:
-                        return ReviewStatus.APPROVED
-                    if "eyes" in codex_contents:
+                        anchor_approved = True
+                    elif "eyes" in codex_contents:
                         return ReviewStatus.EYES
             except RuntimeError as exc:
                 if "HTTP 404" not in str(exc):
@@ -207,6 +209,9 @@ def get_pr_review_status(
         body = comment.get("body") or ""
         if "P1" in body or "P2" in body:
             return ReviewStatus.CHANGES_REQUESTED
+
+    if anchor_approved or body_approved:
+        return ReviewStatus.APPROVED
 
     return ReviewStatus.PENDING
 
