@@ -168,7 +168,7 @@
 - Depends on: PR-027
 
 ## PR-029: Fix stale review detection
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-029.md
 - Branch: pr-029-stale-review
 - Depends on: PR-027

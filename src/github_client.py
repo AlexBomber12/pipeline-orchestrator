@@ -85,6 +85,13 @@ def get_open_prs(repo: str) -> list[PRInfo]:
         number = int(entry.get("number", 0))
         if not number:
             continue
+        commits = entry.get("commits") or []
+        last_push_at = None
+        if commits:
+            last_commit = commits[-1]
+            committed = last_commit.get("committedDate") or last_commit.get("authoredDate")
+            if committed:
+                last_push_at = _parse_iso(committed)
         prs.append(
             PRInfo(
                 number=number,
@@ -94,8 +101,9 @@ def get_open_prs(repo: str) -> list[PRInfo]:
                     repo,
                     number,
                     pr_author=(entry.get("author") or {}).get("login", ""),
+                    last_push_at=last_push_at,
                 ),
-                push_count=len(entry.get("commits") or []),
+                push_count=len(commits),
                 url=entry.get("url", ""),
                 last_activity=_parse_iso(entry.get("updatedAt")),
                 is_cross_repository=bool(entry.get("isCrossRepository", False)),
@@ -105,7 +113,10 @@ def get_open_prs(repo: str) -> list[PRInfo]:
 
 
 def get_pr_review_status(
-    repo: str, pr_number: int, pr_author: str = ""
+    repo: str,
+    pr_number: int,
+    pr_author: str = "",
+    last_push_at: datetime | None = None,
 ) -> ReviewStatus:
     """Derive a Codex review status from PR issue comments, review comments, and reactions.
 
@@ -124,14 +135,29 @@ def get_pr_review_status(
             f"repos/{repo}/issues/{pr_number}/reactions"
         )
         if issue_reactions:
-            codex_contents = {
-                r.get("content")
+            codex_reactions = [
+                r
                 for r in issue_reactions
                 if isinstance(r, dict)
                 and "codex" in ((r.get("user") or {}).get("login", "")).lower()
-            }
+            ]
+            codex_contents = {r.get("content") for r in codex_reactions}
             if "+1" in codex_contents:
-                return ReviewStatus.APPROVED
+                if last_push_at is not None:
+                    plus_one = next(
+                        (r for r in codex_reactions if r.get("content") == "+1"),
+                        None,
+                    )
+                    if plus_one:
+                        reaction_time = _parse_iso(plus_one.get("created_at"))
+                        if reaction_time and reaction_time < last_push_at:
+                            pass  # stale, fall through
+                        else:
+                            return ReviewStatus.APPROVED
+                    else:
+                        return ReviewStatus.APPROVED
+                else:
+                    return ReviewStatus.APPROVED
             if "eyes" in codex_contents:
                 return ReviewStatus.EYES
     except RuntimeError as exc:

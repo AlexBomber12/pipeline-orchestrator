@@ -419,3 +419,103 @@ def test_get_pr_review_status_propagates_error_on_pr_404(
 
     with pytest.raises(RuntimeError, match="403"):
         get_pr_review_status("owner/name", 404)
+
+
+def test_stale_approval_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    """+1 reaction older than last push → PENDING (stale approval)."""
+    import json as _json
+    from datetime import datetime, timezone
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = cmd[-1]
+        if path.endswith("/issues/42/reactions"):
+            pages = [
+                [
+                    {
+                        "content": "+1",
+                        "user": {"login": "chatgpt-codex-connector"},
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ]
+            ]
+        elif "issues" in path and path.endswith("/comments"):
+            pages = []
+        elif "pulls" in path and path.endswith("/comments"):
+            pages = []
+        else:
+            pages = []
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    last_push = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    assert (
+        get_pr_review_status("owner/name", 42, pr_author="author", last_push_at=last_push)
+        == ReviewStatus.PENDING
+    )
+
+
+def test_fresh_approval_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """+1 reaction newer than last push → APPROVED."""
+    import json as _json
+    from datetime import datetime, timezone
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = cmd[-1]
+        if path.endswith("/issues/42/reactions"):
+            pages = [
+                [
+                    {
+                        "content": "+1",
+                        "user": {"login": "chatgpt-codex-connector"},
+                        "created_at": "2026-01-03T00:00:00Z",
+                    }
+                ]
+            ]
+        elif "issues" in path and path.endswith("/comments"):
+            pages = []
+        elif "pulls" in path and path.endswith("/comments"):
+            pages = []
+        else:
+            pages = []
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    last_push = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    assert (
+        get_pr_review_status("owner/name", 42, pr_author="author", last_push_at=last_push)
+        == ReviewStatus.APPROVED
+    )
+
+
+def test_approval_without_push_date(monkeypatch: pytest.MonkeyPatch) -> None:
+    """+1 reaction with no last_push_at → APPROVED (backward compatible)."""
+    import json as _json
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = cmd[-1]
+        if path.endswith("/issues/42/reactions"):
+            pages = [
+                [
+                    {
+                        "content": "+1",
+                        "user": {"login": "chatgpt-codex-connector"},
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ]
+            ]
+        elif "issues" in path and path.endswith("/comments"):
+            pages = []
+        elif "pulls" in path and path.endswith("/comments"):
+            pages = []
+        else:
+            pages = []
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status("owner/name", 42, pr_author="author")
+        == ReviewStatus.APPROVED
+    )
