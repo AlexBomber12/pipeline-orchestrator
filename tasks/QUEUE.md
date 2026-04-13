@@ -174,7 +174,7 @@
 - Depends on: PR-027
 
 ## PR-030: QUEUE.md auto-update and squash merge
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-030.md
 - Branch: pr-030-queue-done-squash
 - Depends on: PR-027

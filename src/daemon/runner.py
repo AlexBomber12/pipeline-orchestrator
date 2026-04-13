@@ -1472,10 +1472,72 @@ return 0
             self.log_event(str(exc))
             return
 
+        try:
+            self._mark_queue_done()
+        except Exception as exc:
+            self.log_event(f"Warning: QUEUE.md update failed: {exc}")
+
         self.state.current_pr = None
         self.state.current_task = None
         self.state.state = PipelineState.IDLE
         self.log_event(f"Merged PR #{number} -> IDLE")
+
+    def _mark_queue_done(self) -> None:
+        """Sync the base branch and mark the current PR DONE in QUEUE.md.
+
+        Best-effort cleanup after a successful merge: the PR is already
+        merged, so any failure here is logged as a warning by the caller
+        and must not flip the runner to ERROR.
+        """
+        if self.state.current_task is None:
+            return
+        pr_id = self.state.current_task.pr_id
+        branch = self.repo_config.branch
+
+        subprocess.run(
+            ["git", "fetch", "origin", branch],
+            capture_output=True, text=True, timeout=30,
+            check=True, cwd=self.repo_path,
+        )
+        subprocess.run(
+            ["git", "checkout", branch],
+            capture_output=True, text=True, timeout=30,
+            check=True, cwd=self.repo_path,
+        )
+        subprocess.run(
+            ["git", "reset", "--hard", f"origin/{branch}"],
+            capture_output=True, text=True, timeout=30,
+            check=True, cwd=self.repo_path,
+        )
+
+        queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
+        if not queue_path.exists():
+            return
+        content = queue_path.read_text()
+
+        import re
+        pattern = rf"(## {re.escape(pr_id)}:.*?\n- Status: )(?:TODO|DOING)"
+        updated = re.sub(pattern, r"\1DONE", content, count=1)
+        if updated == content:
+            return
+
+        queue_path.write_text(updated)
+        subprocess.run(
+            ["git", "add", "tasks/QUEUE.md"],
+            capture_output=True, text=True, timeout=30,
+            check=True, cwd=self.repo_path,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", f"{pr_id}: mark DONE"],
+            capture_output=True, text=True, timeout=30,
+            check=True, cwd=self.repo_path,
+        )
+        subprocess.run(
+            ["git", "push", "origin", branch],
+            capture_output=True, text=True, timeout=30,
+            check=True, cwd=self.repo_path,
+        )
+        self.log_event(f"Marked {pr_id} DONE in QUEUE.md")
 
     def _post_codex_review(self, pr_number: int) -> bool:
         """Post ``@codex review`` on ``pr_number``.

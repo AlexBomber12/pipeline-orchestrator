@@ -1202,6 +1202,78 @@ def test_handle_merge_failure_sets_error(monkeypatch: pytest.MonkeyPatch) -> Non
     assert "merge conflict" in (runner.state.error_message or "")
 
 
+def test_handle_merge_marks_queue_done(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        runner_module.github_client, "merge_pr", lambda repo, num: None
+    )
+
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "QUEUE.md"
+    queue_path.write_text(
+        "## PR-001: first\n- Status: DOING\n\n"
+        "## PR-002: second\n- Status: TODO\n"
+    )
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="first", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.IDLE
+    updated = queue_path.read_text()
+    assert "## PR-001: first\n- Status: DONE" in updated
+    assert "## PR-002: second\n- Status: TODO" in updated
+    assert any(cmd[:3] == ["git", "push", "origin"] for cmd in calls)
+
+
+def test_handle_merge_tolerates_queue_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        runner_module.github_client, "merge_pr", lambda repo, num: None
+    )
+
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "QUEUE.md"
+    queue_path.write_text("## PR-001: first\n- Status: DOING\n")
+
+    def fail_push(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:3] == ["git", "push", "origin"]:
+            raise subprocess.CalledProcessError(1, cmd, stderr="push failed")
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fail_push)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="first", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+    assert runner.state.current_task is None
+
+
 def test_handle_error_skip_clears_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         runner_module.claude_cli,
