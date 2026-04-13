@@ -730,6 +730,17 @@ class PipelineRunner:
         (no commits to push, auth hiccup, etc.), log and return so the
         caller can still proceed with recovery.
         """
+        # Mirror the hard guard in ``_commit_and_push_dirty``: a malformed
+        # QUEUE.md entry with ``Branch: main`` would otherwise cause this
+        # method to push straight to the base branch during recovery,
+        # bypassing every PR/review gate.
+        if branch == self.repo_config.branch:
+            self.log_event(
+                f"Refusing to preserve crashed-run commits on base "
+                f"branch {branch!r}"
+            )
+            return
+
         try:
             probe = subprocess.run(
                 [

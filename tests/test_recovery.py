@@ -290,6 +290,58 @@ def test_recover_preserve_tolerates_missing_local_branch(
     assert runner.state.current_task.pr_id == "PR-042"
 
 
+def test_recover_preserve_refuses_base_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P1: a malformed QUEUE.md entry with ``Branch: main`` must
+    not cause recovery to push directly to the base branch, bypassing
+    the PR/review gate. ``_preserve_crashed_run_commits`` must refuse
+    the push and leave the branch alone for handle_coding to fail on."""
+    task = QueueTask(
+        pr_id="PR-042",
+        title="malformed",
+        status=TaskStatus.DOING,
+        branch="main",  # Same as the repo's base branch.
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: []
+    )
+
+    pushes: list[list[str]] = []
+    probes: list[list[str]] = []
+
+    async def fake_coding() -> None:
+        return None
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
+            probes.append(cmd)
+        if cmd[:2] == ["git", "push"]:
+            pushes.append(cmd)
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
+    runner.handle_coding = fake_coding  # type: ignore[method-assign]
+    asyncio.run(runner.recover_state())
+
+    # No push to the base branch, and we never even probed for the
+    # local ref — the guard must short-circuit before any subprocess.
+    assert pushes == []
+    assert probes == []
+    assert any(
+        "Refusing to preserve crashed-run commits on base branch 'main'"
+        in e["event"]
+        for e in runner.state.history
+    )
+
+
 def test_recover_preserve_tolerates_push_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
