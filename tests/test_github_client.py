@@ -442,7 +442,7 @@ def test_stale_approval_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
                 [
                     {
                         "user": {"login": "chatgpt-codex-connector"},
-                        "body": "**Reviewed commit:** `aaaaaa1111`",
+                        "commit_id": "aaaaaa1111",
                     }
                 ]
             ]
@@ -483,7 +483,7 @@ def test_fresh_approval_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
                 [
                     {
                         "user": {"login": "chatgpt-codex-connector"},
-                        "body": "**Reviewed commit:** `aabbcc1122`",
+                        "commit_id": "aabbcc112233",
                     }
                 ]
             ]

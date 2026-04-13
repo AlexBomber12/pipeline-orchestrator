@@ -244,9 +244,6 @@ def _gh_api_paginated(path: str) -> list[dict] | None:
     return items
 
 
-_REVIEWED_COMMIT_RE = re.compile(r"\*\*Reviewed commit:\*\*\s*`([0-9a-f]+)`")
-
-
 def _get_latest_codex_reviewed_sha(repo: str, pr_number: int) -> str:
     """Return the commit SHA from the most recent Codex review, or empty string."""
     try:
@@ -259,10 +256,9 @@ def _get_latest_codex_reviewed_sha(repo: str, pr_number: int) -> str:
         user = (review.get("user") or {}).get("login", "") or ""
         if "codex" not in user.lower():
             continue
-        body = review.get("body") or ""
-        m = _REVIEWED_COMMIT_RE.search(body)
-        if m:
-            return m.group(1)
+        sha = review.get("commit_id") or ""
+        if sha:
+            return sha
     return ""
 
 
