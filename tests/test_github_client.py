@@ -422,9 +422,8 @@ def test_get_pr_review_status_propagates_error_on_pr_404(
 
 
 def test_stale_approval_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
-    """+1 reaction older than last push → PENDING (stale approval)."""
+    """+1 reaction but Codex reviewed a different commit → PENDING."""
     import json as _json
-    from datetime import datetime, timezone
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         path = cmd[-1]
@@ -438,37 +437,12 @@ def test_stale_approval_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
                     }
                 ]
             ]
-        elif "issues" in path and path.endswith("/comments"):
-            pages = []
-        elif "pulls" in path and path.endswith("/comments"):
-            pages = []
-        else:
-            pages = []
-        return _FakeCompletedProcess(stdout=_json.dumps(pages))
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    last_push = datetime(2026, 1, 2, tzinfo=timezone.utc)
-    assert (
-        get_pr_review_status("owner/name", 42, pr_author="author", last_push_at=last_push)
-        == ReviewStatus.PENDING
-    )
-
-
-def test_fresh_approval_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
-    """+1 reaction newer than last push → APPROVED."""
-    import json as _json
-    from datetime import datetime, timezone
-
-    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        path = cmd[-1]
-        if path.endswith("/issues/42/reactions"):
+        elif path.endswith("/pulls/42/reviews"):
             pages = [
                 [
                     {
-                        "content": "+1",
                         "user": {"login": "chatgpt-codex-connector"},
-                        "created_at": "2026-01-03T00:00:00Z",
+                        "body": "**Reviewed commit:** `aaaaaa1111`",
                     }
                 ]
             ]
@@ -482,15 +456,55 @@ def test_fresh_approval_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    last_push = datetime(2026, 1, 2, tzinfo=timezone.utc)
     assert (
-        get_pr_review_status("owner/name", 42, pr_author="author", last_push_at=last_push)
+        get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222")
+        == ReviewStatus.PENDING
+    )
+
+
+def test_fresh_approval_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """+1 reaction and Codex reviewed the current HEAD → APPROVED."""
+    import json as _json
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = cmd[-1]
+        if path.endswith("/issues/42/reactions"):
+            pages = [
+                [
+                    {
+                        "content": "+1",
+                        "user": {"login": "chatgpt-codex-connector"},
+                        "created_at": "2026-01-03T00:00:00Z",
+                    }
+                ]
+            ]
+        elif path.endswith("/pulls/42/reviews"):
+            pages = [
+                [
+                    {
+                        "user": {"login": "chatgpt-codex-connector"},
+                        "body": "**Reviewed commit:** `aabbcc1122`",
+                    }
+                ]
+            ]
+        elif "issues" in path and path.endswith("/comments"):
+            pages = []
+        elif "pulls" in path and path.endswith("/comments"):
+            pages = []
+        else:
+            pages = []
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status("owner/name", 42, pr_author="author", head_sha="aabbcc112233")
         == ReviewStatus.APPROVED
     )
 
 
-def test_approval_without_push_date(monkeypatch: pytest.MonkeyPatch) -> None:
-    """+1 reaction with no last_push_at → APPROVED (backward compatible)."""
+def test_approval_without_head_sha(monkeypatch: pytest.MonkeyPatch) -> None:
+    """+1 reaction with no head_sha → APPROVED (backward compatible)."""
     import json as _json
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:

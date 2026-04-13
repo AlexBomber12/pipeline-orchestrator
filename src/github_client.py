@@ -87,12 +87,6 @@ def get_open_prs(repo: str) -> list[PRInfo]:
             continue
         commits = entry.get("commits") or []
         head_sha = entry.get("headRefOid", "")
-        last_push_at = _get_head_commit_date(repo, head_sha) if head_sha else None
-        if last_push_at is None and commits:
-            last_commit = commits[-1]
-            committed = last_commit.get("committedDate") or last_commit.get("authoredDate")
-            if committed:
-                last_push_at = _parse_iso(committed)
         prs.append(
             PRInfo(
                 number=number,
@@ -102,7 +96,7 @@ def get_open_prs(repo: str) -> list[PRInfo]:
                     repo,
                     number,
                     pr_author=(entry.get("author") or {}).get("login", ""),
-                    last_push_at=last_push_at,
+                    head_sha=head_sha,
                 ),
                 push_count=len(commits),
                 url=entry.get("url", ""),
@@ -117,7 +111,7 @@ def get_pr_review_status(
     repo: str,
     pr_number: int,
     pr_author: str = "",
-    last_push_at: datetime | None = None,
+    head_sha: str = "",
 ) -> ReviewStatus:
     """Derive a Codex review status from PR issue comments, review comments, and reactions.
 
@@ -128,9 +122,6 @@ def get_pr_review_status(
        the anchor for P1/P2 → CHANGES_REQUESTED.
     4. Otherwise → PENDING.
     """
-    # Check for Codex reactions on the PR body (issue-level reactions).
-    # Codex bot (chatgpt-codex-connector) puts +1 on the PR body itself,
-    # not on comments, so check this first.
     try:
         issue_reactions = _gh_api_paginated(
             f"repos/{repo}/issues/{pr_number}/reactions"
@@ -144,21 +135,10 @@ def get_pr_review_status(
             ]
             codex_contents = {r.get("content") for r in codex_reactions}
             if "+1" in codex_contents:
-                if last_push_at is not None:
-                    plus_ones = [
-                        r for r in codex_reactions if r.get("content") == "+1"
-                    ]
-                    plus_one = max(
-                        plus_ones,
-                        key=lambda r: r.get("created_at", ""),
-                        default=None,
-                    )
-                    if plus_one:
-                        reaction_time = _parse_iso(plus_one.get("created_at"))
-                        if reaction_time and reaction_time < last_push_at:
-                            pass  # stale, fall through
-                        else:
-                            return ReviewStatus.APPROVED
+                if head_sha:
+                    reviewed_sha = _get_latest_codex_reviewed_sha(repo, pr_number)
+                    if reviewed_sha and not head_sha.startswith(reviewed_sha) and not reviewed_sha.startswith(head_sha):
+                        pass  # stale: reviewed a different commit
                     else:
                         return ReviewStatus.APPROVED
                 else:
@@ -264,16 +244,26 @@ def _gh_api_paginated(path: str) -> list[dict] | None:
     return items
 
 
-def _get_head_commit_date(repo: str, sha: str) -> datetime | None:
-    """Fetch the committer date of a specific commit by SHA."""
+_REVIEWED_COMMIT_RE = re.compile(r"\*\*Reviewed commit:\*\*\s*`([0-9a-f]+)`")
+
+
+def _get_latest_codex_reviewed_sha(repo: str, pr_number: int) -> str:
+    """Return the commit SHA from the most recent Codex review, or empty string."""
     try:
-        data = run_gh(["api", f"repos/{repo}/git/commits/{sha}"])
+        reviews = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/reviews")
     except RuntimeError:
-        return None
-    if not isinstance(data, dict):
-        return None
-    committer = data.get("committer") or {}
-    return _parse_iso(committer.get("date"))
+        return ""
+    if not reviews:
+        return ""
+    for review in reversed(reviews):
+        user = (review.get("user") or {}).get("login", "") or ""
+        if "codex" not in user.lower():
+            continue
+        body = review.get("body") or ""
+        m = _REVIEWED_COMMIT_RE.search(body)
+        if m:
+            return m.group(1)
+    return ""
 
 
 def _ci_status_from_rollup(rollup: object) -> CIStatus:
