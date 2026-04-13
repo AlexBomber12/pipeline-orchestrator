@@ -248,7 +248,9 @@ def _get_latest_codex_reviewed_sha(repo: str, pr_number: int) -> str:
     """Return the commit SHA from the most recent Codex review, or empty string."""
     try:
         reviews = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/reviews")
-    except RuntimeError:
+    except RuntimeError as exc:
+        if "HTTP 404" not in str(exc):
+            raise
         return ""
     if not reviews:
         return ""
