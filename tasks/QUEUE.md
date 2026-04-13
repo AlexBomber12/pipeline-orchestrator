@@ -144,7 +144,7 @@
 - Depends on: PR-023
 
 ## PR-025: Start stop controls per repo
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-025.md
 - Branch: pr-025-start-stop
 - Depends on: PR-024
