@@ -308,9 +308,12 @@ class PipelineRunner:
         ts = datetime.now(timezone.utc).isoformat()
         key_latest = f"cli_log:{self.name}:latest"
         key_history = f"cli_log:{self.name}:{ts}"
-        if len(stdout.encode("utf-8", errors="replace")) > _MAX_CLI_LOG_BYTES:
-            stdout = stdout[-_MAX_CLI_LOG_BYTES:]
-            stdout = "[truncated]\n" + stdout
+        marker = "[truncated]\n"
+        raw = stdout.encode("utf-8", errors="replace")
+        if len(raw) > _MAX_CLI_LOG_BYTES:
+            tail_budget = _MAX_CLI_LOG_BYTES - len(marker.encode("utf-8"))
+            raw = raw[-tail_budget:]
+            stdout = marker + raw.decode("utf-8", errors="replace")
         try:
             await self.redis.set(key_latest, stdout, ex=3600)
             await self.redis.set(key_history, stdout, ex=86400)
