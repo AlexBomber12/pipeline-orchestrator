@@ -173,7 +173,7 @@ def test_recover_doing_task_without_pr_rerun_coding(
     # Stub out the preserve helper so this test focuses on the
     # state-transition contract. A dedicated test below covers its
     # ordering relative to handle_coding.
-    runner._preserve_crashed_run_commits = lambda branch: None  # type: ignore[method-assign]
+    runner._preserve_crashed_run_commits = lambda branch: True  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
     assert coding_calls == [PipelineState.CODING]
@@ -296,7 +296,8 @@ def test_recover_preserve_refuses_base_branch(
     """Codex P1: a malformed QUEUE.md entry with ``Branch: main`` must
     not cause recovery to push directly to the base branch, bypassing
     the PR/review gate. ``_preserve_crashed_run_commits`` must refuse
-    the push and leave the branch alone for handle_coding to fail on."""
+    and recover_state must flip to ERROR rather than running CODING
+    against a base-branch task entry."""
     task = QueueTask(
         pr_id="PR-042",
         title="malformed",
@@ -309,9 +310,10 @@ def test_recover_preserve_refuses_base_branch(
 
     pushes: list[list[str]] = []
     probes: list[list[str]] = []
+    coding_ran: list[bool] = []
 
     async def fake_coding() -> None:
-        return None
+        coding_ran.append(True)
 
     def fake_run(cmd: list[str], **kwargs: Any) -> Any:
         if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
@@ -335,6 +337,11 @@ def test_recover_preserve_refuses_base_branch(
     # local ref — the guard must short-circuit before any subprocess.
     assert pushes == []
     assert probes == []
+    assert coding_ran == [], "handle_coding must not run after refusal"
+    assert runner.state.state == PipelineState.ERROR
+    assert "could not preserve crashed-run commits on 'main'" in (
+        runner.state.error_message or ""
+    )
     assert any(
         "Refusing to preserve crashed-run commits on base branch 'main'"
         in e["event"]
@@ -342,12 +349,13 @@ def test_recover_preserve_refuses_base_branch(
     )
 
 
-def test_recover_preserve_tolerates_push_failure(
+def test_recover_aborts_when_preserve_push_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failing push must be logged but not abort recovery — Claude may
-    still open the PR from scratch, and the local commits remain
-    recoverable from reflog if needed."""
+    """Codex P1: a failed preserve push leaves crashed-run commits only
+    on local. ``recover_state`` must NOT proceed to handle_coding (which
+    would let Claude reset the branch from origin/main and orphan the
+    work). Stop in ERROR so an operator can intervene."""
     task = _doing_task()
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo: []
@@ -382,10 +390,13 @@ def test_recover_preserve_tolerates_push_failure(
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
-    # Recovery still proceeded to handle_coding despite the push failure.
-    assert coding_ran == [True]
+    assert coding_ran == [], "handle_coding must not run after preserve fail"
+    assert runner.state.state == PipelineState.ERROR
+    assert "could not preserve crashed-run commits on 'pr-042-inflight'" in (
+        runner.state.error_message or ""
+    )
     assert any(
-        "Warning: could not preserve unpushed commits on pr-042-inflight"
+        "Failed to preserve unpushed commits on pr-042-inflight"
         in e["event"]
         for e in runner.state.history
     )
@@ -895,7 +906,7 @@ def test_run_cycle_coding_failure_during_recovery_is_not_retried(
 
     coding_calls: list[int] = []
 
-    async def failing_coding(*, reset_branch: bool = True) -> None:
+    async def failing_coding() -> None:
         coding_calls.append(1)
         runner.state.state = PipelineState.ERROR
         runner.state.error_message = "claude CLI crashed"
@@ -903,6 +914,7 @@ def test_run_cycle_coding_failure_during_recovery_is_not_retried(
     runner = _make_runner()
     runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
     runner.handle_coding = failing_coding  # type: ignore[method-assign]
+    runner._preserve_crashed_run_commits = lambda branch: True  # type: ignore[method-assign]
 
     result = asyncio.run(runner.recover_state())
 

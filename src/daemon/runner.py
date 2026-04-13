@@ -623,9 +623,20 @@ class PipelineRunner:
             # (per AGENTS.md), which would orphan any unpushed local
             # commits from the crashed run. Push them to origin first so
             # the work is durable — even if Claude then resets the local
-            # ref, the commits remain reachable on origin.
-            if doing.branch:
-                self._preserve_crashed_run_commits(doing.branch)
+            # ref, the commits remain reachable on origin. If the
+            # preserve step refuses or fails, stop in ERROR rather than
+            # let handle_coding orphan potential crash commits.
+            if doing.branch and not self._preserve_crashed_run_commits(
+                doing.branch
+            ):
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = (
+                    f"recover_state: could not preserve crashed-run "
+                    f"commits on {doing.branch!r}; refusing to re-run "
+                    "CODING"
+                )
+                self.log_event(self.state.error_message)
+                return True
             await self.handle_coding()
             # Even if handle_coding left the runner in ERROR, discovery
             # itself completed and must not be retried: re-running
@@ -717,7 +728,7 @@ class PipelineRunner:
             return False
         return True
 
-    def _preserve_crashed_run_commits(self, branch: str) -> None:
+    def _preserve_crashed_run_commits(self, branch: str) -> bool:
         """Push any unpushed commits on ``branch`` to origin.
 
         Called from ``recover_state`` before re-running ``handle_coding``
@@ -726,9 +737,12 @@ class PipelineRunner:
         them first preserves the work on origin so nothing is lost even
         if Claude later resets the local branch.
 
-        Non-fatal: if the local branch does not exist or the push fails
-        (no commits to push, auth hiccup, etc.), log and return so the
-        caller can still proceed with recovery.
+        Returns ``True`` when it is safe for the caller to proceed with
+        re-running CODING (no local branch to preserve, or push
+        succeeded). Returns ``False`` when the caller MUST NOT proceed:
+        the task targets the base branch (malformed QUEUE.md entry that
+        would let Claude reset ``main``) or the preserve push failed in
+        a way that may have left commits orphan-only on local.
         """
         # Mirror the hard guard in ``_commit_and_push_dirty``: a malformed
         # QUEUE.md entry with ``Branch: main`` would otherwise cause this
@@ -739,7 +753,7 @@ class PipelineRunner:
                 f"Refusing to preserve crashed-run commits on base "
                 f"branch {branch!r}"
             )
-            return
+            return False
 
         try:
             probe = subprocess.run(
@@ -756,12 +770,18 @@ class PipelineRunner:
                 cwd=self.repo_path,
             )
         except (subprocess.TimeoutExpired, OSError) as exc:
+            # The probe itself failed (git binary missing, repo locked,
+            # etc.). We cannot tell whether the local branch holds
+            # unpushed commits, so refuse to proceed rather than risk
+            # Claude orphaning crash commits.
             self.log_event(
-                f"Warning: could not probe local branch {branch}: {exc}"
+                f"Could not probe local branch {branch}: {exc}"
             )
-            return
+            return False
         if probe.returncode != 0:
-            return
+            # Local branch does not exist — the crash happened before
+            # Claude's first commit, so there is nothing to preserve.
+            return True
 
         try:
             subprocess.run(
@@ -778,12 +798,12 @@ class PipelineRunner:
             OSError,
         ) as exc:
             self.log_event(
-                f"Warning: could not preserve unpushed commits on "
-                f"{branch}: {exc}"
+                f"Failed to preserve unpushed commits on {branch}: {exc}"
             )
-            return
+            return False
 
         self.log_event(f"Preserved crashed-run commits on {branch}")
+        return True
 
     def _commit_and_push_dirty(self, message: str, expected_branch: str) -> bool:
         """Commit and push any uncommitted changes left in the working tree.
