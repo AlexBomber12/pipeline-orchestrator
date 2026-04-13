@@ -764,6 +764,7 @@ def test_sync_to_main_runs_fetch_checkout_reset_in_order(
         ["git", "fetch", "origin", "main"],
         ["git", "checkout", "main"],
         ["git", "reset", "--hard", "origin/main"],
+        ["git", "clean", "-fd"],
     ]
 
 

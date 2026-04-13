@@ -478,6 +478,18 @@ class PipelineRunner:
             check=True,
             cwd=self.repo_path,
         )
+        # ``git reset --hard`` only discards tracked-file changes; untracked
+        # files (e.g. artifacts left by a crashed Claude run) survive and
+        # would poison the next preflight as a dirty tree. ``git clean -fd``
+        # removes them so the working copy truly matches origin/{branch}.
+        subprocess.run(
+            ["git", "clean", "-fd"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+            cwd=self.repo_path,
+        )
 
     def _parse_base_queue(self) -> list[QueueTask] | None:
         """Return QUEUE.md parsed from ``origin/{branch}``, or ``None``.
@@ -1241,6 +1253,48 @@ return 0
         self.state.state = PipelineState.FIX
         self.log_event("entering FIX")
         await self.publish_state()
+
+        # ``sync_to_main`` left the repo on the base branch. Claude must run
+        # against the PR's HEAD, so check out the PR branch before invoking
+        # ``fix_review``; otherwise Claude would patch base and the auto-commit
+        # safety net would refuse to push (or worse, push to the base branch).
+        #
+        # Cross-repo (fork) PRs are skipped: the head branch lives on the
+        # contributor's fork, not the daemon's ``origin``, so ``git checkout``
+        # would fail with a pathspec error and trap the runner in ERROR for
+        # every fork PR. The auto-commit block below already skips push for
+        # the same reason — keep the two guards aligned.
+        if (
+            self.state.current_pr is not None
+            and not self.state.current_pr.is_cross_repository
+        ):
+            try:
+                subprocess.run(
+                    ["git", "checkout", self.state.current_pr.branch],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=True,
+                    cwd=self.repo_path,
+                )
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+            ) as exc:
+                # Cover non-zero exit (CalledProcessError), I/O stalls or lock
+                # contention exceeding 30s (TimeoutExpired), and missing git
+                # binary / unreadable cwd (OSError). Without these, the bare
+                # exception escapes run_cycle and the runner never publishes
+                # a clear FIX-stage ERROR.
+                stderr = getattr(exc, "stderr", "") or ""
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = (
+                    f"git checkout {self.state.current_pr.branch} failed: "
+                    f"{stderr.strip() or exc}"
+                )
+                self.log_event(self.state.error_message)
+                return
 
         code, _stdout, stderr = claude_cli.fix_review(self.repo_path)
         if code != 0:

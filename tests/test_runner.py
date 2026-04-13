@@ -194,6 +194,15 @@ def test_handle_idle_no_tasks_leaves_state_idle(
     assert fetch_idx < checkout_idx < reset_idx
     # No git pull anywhere: sync_to_main replaced it with reset --hard.
     assert not any(cmd[:2] == ["git", "pull"] for cmd in calls)
+    # ``git reset --hard`` only removes tracked-file edits; untracked
+    # files left by a crashed prior cycle would otherwise survive into
+    # the next preflight as a dirty tree. ``git clean -fd`` after the
+    # reset guarantees the working copy matches origin/{branch}.
+    clean_idx = next(
+        i for i, cmd in enumerate(commands) if cmd[:2] == ["git", "clean"]
+    )
+    assert reset_idx < clean_idx
+    assert ["git", "clean", "-fd"] in calls
 
 
 def test_handle_idle_picks_task_and_drives_coding(
@@ -539,10 +548,116 @@ def test_handle_fix_skips_auto_commit_on_cross_repo_pr(
     assert not any(cmd[:2] == ["git", "add"] for cmd in calls)
     assert not any(cmd[:2] == ["git", "commit"] for cmd in calls)
     assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
+    # The pre-fix_review checkout must also skip for cross-repo PRs:
+    # the fork branch (e.g. ``contributor:feature-x``) does not exist
+    # in ``origin``, so the checkout would fail and trap the runner
+    # in ERROR for every fork PR.
+    assert not any(cmd[:2] == ["git", "checkout"] for cmd in calls)
     assert any(
         "cross-repo" in e["event"] and "#88" in e["event"]
         for e in runner.state.history
     )
+
+
+def test_handle_fix_checks_out_pr_branch_before_fix_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``sync_to_main`` leaves the repo on the base branch. Before invoking
+    Claude's fix_review, ``handle_fix`` must check out the PR branch so the
+    patch lands on the PR's HEAD instead of the base branch.
+    """
+    calls = _patch_subprocess(monkeypatch)
+    fix_called_at: list[int] = []
+
+    def fake_fix(path: str) -> tuple[int, str, str]:
+        fix_called_at.append(len(calls))
+        return (0, "", "")
+
+    monkeypatch.setattr(runner_module.claude_cli, "fix_review", fake_fix)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=42, branch="pr-042-fix")
+    asyncio.run(runner.handle_fix())
+
+    checkout_calls = [
+        i for i, cmd in enumerate(calls)
+        if cmd[:2] == ["git", "checkout"] and "pr-042-fix" in cmd
+    ]
+    assert checkout_calls, "expected git checkout pr-042-fix before fix_review"
+    assert fix_called_at, "fix_review must have been invoked"
+    assert checkout_calls[0] < fix_called_at[0]
+    assert runner.state.state == PipelineState.WATCH
+
+
+def test_handle_fix_errors_when_pr_branch_checkout_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the PR branch checkout before fix_review fails, the runner must
+    transition to ERROR rather than letting Claude patch the base branch.
+    """
+    fix_calls: list[str] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "checkout"] and "pr-042-fix" in cmd:
+            raise subprocess.CalledProcessError(
+                1, cmd, stderr="error: pathspec 'pr-042-fix' did not match"
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "fix_review",
+        lambda path: (fix_calls.append(path), (0, "", ""))[1],
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=42, branch="pr-042-fix")
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "pr-042-fix" in (runner.state.error_message or "")
+    assert fix_calls == [], "fix_review must not run when checkout fails"
+
+
+def test_handle_fix_errors_when_pr_branch_checkout_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P2: the checkout has ``timeout=30`` so a stalled git lock or
+    slow I/O can raise ``TimeoutExpired``. The except clause must catch it
+    too (alongside ``OSError``), otherwise the exception escapes the daemon
+    loop without setting ``PipelineState.ERROR`` and the state machine
+    drifts on the next cycle.
+    """
+    fix_calls: list[str] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "checkout"] and "pr-042-fix" in cmd:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=30)
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "fix_review",
+        lambda path: (fix_calls.append(path), (0, "", ""))[1],
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=42, branch="pr-042-fix")
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "pr-042-fix" in (runner.state.error_message or "")
+    assert fix_calls == [], "fix_review must not run when checkout times out"
 
 
 def test_handle_coding_errors_when_task_has_no_branch(
