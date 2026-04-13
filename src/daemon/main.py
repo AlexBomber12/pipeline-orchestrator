@@ -193,6 +193,16 @@ async def main() -> None:
                     _sync_runners(runners, config, redis_client)
 
         for runner in list(runners.values()):
+            if not runner.repo_config.active:
+                try:
+                    await runner.publish_state()
+                except Exception:
+                    logger.error(
+                        "publish paused state failed for %s",
+                        runner.name,
+                        exc_info=True,
+                    )
+                continue
             try:
                 await runner.run_cycle()
             except Exception:

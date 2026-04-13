@@ -74,4 +74,5 @@ class RepoState(BaseModel):
     )
     queue_done: int = 0
     queue_total: int = 0
+    active: bool = True
     history: list[dict] = Field(default_factory=list)
