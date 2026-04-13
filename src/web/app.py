@@ -663,6 +663,30 @@ async def partial_repo_events(
     )
 
 
+@app.get("/partials/repo/{name}/cli-log", response_class=HTMLResponse)
+async def repo_cli_log(request: Request, name: str) -> HTMLResponse:
+    redis_client = getattr(request.app.state, "redis", None)
+    log_text = ""
+    if redis_client is not None:
+        try:
+            raw = await redis_client.get(f"cli_log:{name}:latest")
+            if raw is not None:
+                log_text = raw if isinstance(raw, str) else raw.decode()
+        except Exception:
+            log_text = ""
+    if not log_text:
+        return HTMLResponse(
+            '<p class="text-sm text-gray-500 italic">No CLI log available.</p>'
+        )
+    import html as html_mod
+
+    escaped = html_mod.escape(log_text)
+    return HTMLResponse(
+        f'<pre class="bg-black text-green-400 font-mono text-xs p-4'
+        f' overflow-auto max-h-96 rounded">{escaped}</pre>'
+    )
+
+
 def _render_settings_repo_list(request: Request) -> HTMLResponse:
     """Render the settings repo list for a successful mutation response.
 

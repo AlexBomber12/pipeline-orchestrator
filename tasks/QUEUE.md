@@ -162,7 +162,7 @@
 - Depends on: PR-026
 
 ## PR-028: Claude CLI stdout logging
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-028.md
 - Branch: pr-028-stdout-logging
 - Depends on: PR-027

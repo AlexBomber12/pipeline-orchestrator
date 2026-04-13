@@ -9,6 +9,7 @@
 ./.ruff_cache/0.11.8/6033410362127721513
 ./.ruff_cache/CACHEDIR.TAG
 ./AGENTS.md
+./CLAUDE.md
 ./Dockerfile
 ./LICENSE
 ./README.md
@@ -79,6 +80,15 @@
 ./tasks/PR-024.md
 ./tasks/PR-025.md
 ./tasks/PR-026.md
+./tasks/PR-027.md
+./tasks/PR-028.md
+./tasks/PR-029.md
+./tasks/PR-030.md
+./tasks/PR-031.md
+./tasks/PR-032.md
+./tasks/PR-033.md
+./tasks/PR-034.md
+./tasks/PR-035.md
 ./tasks/QUEUE.md
 ./templates/AGENTS.md
 ./templates/QUEUE.md

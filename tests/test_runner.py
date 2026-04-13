@@ -32,7 +32,7 @@ class _FakeRedis:
         self.store: dict[str, str] = {}
         self.deleted: list[str] = []
 
-    async def set(self, key: str, value: str) -> None:
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
         self.writes.append((key, value))
         self.store[key] = value
 
@@ -2317,3 +2317,63 @@ def test_process_pending_uploads_redis_error_blocks_dispatch(
 
     result = asyncio.run(runner.process_pending_uploads())
     assert result is None
+
+
+def test_handle_coding_saves_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """handle_coding must save CLI stdout to Redis via _save_cli_log."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "run_planned_pr",
+        lambda path: (0, "hello from claude", ""),
+    )
+    pr = PRInfo(number=42, branch="pr-001")
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
+    )
+    asyncio.run(runner.handle_coding())
+
+    redis_keys = [k for k, _v in runner.redis.writes]
+    assert any(k == f"cli_log:{runner.name}:latest" for k in redis_keys)
+    stored = runner.redis.store.get(f"cli_log:{runner.name}:latest")
+    assert stored == "hello from claude"
+
+
+def test_handle_fix_saves_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """handle_fix must save CLI stdout to Redis via _save_cli_log."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "fix_review",
+        lambda path: (0, "fix output here", ""),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=10, branch="pr-001")
+    asyncio.run(runner.handle_fix())
+
+    redis_keys = [k for k, _v in runner.redis.writes]
+    assert any(k == f"cli_log:{runner.name}:latest" for k in redis_keys)
+    stored = runner.redis.store.get(f"cli_log:{runner.name}:latest")
+    assert stored == "fix output here"
