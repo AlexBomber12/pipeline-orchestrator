@@ -618,7 +618,10 @@ class PipelineRunner:
                 f"Recovered: DOING task {doing.pr_id}, no PR "
                 "-> re-running CODING"
             )
-            await self.handle_coding()
+            # Recovery must not hard-reset the task branch: the crashed
+            # run may have left unpushed commits on it that we need
+            # ``_commit_and_push_dirty`` to preserve and publish.
+            await self.handle_coding(reset_branch=False)
             # Even if handle_coding left the runner in ERROR, discovery
             # itself completed and must not be retried: re-running
             # handle_coding a second time on the next cycle could create
@@ -1117,22 +1120,17 @@ return 0
         await self.publish_state()
         await self.handle_coding()
 
-    async def handle_coding(self) -> None:
-        """Run ``PLANNED PR`` via the claude CLI and hand off to WATCH."""
-        code, _stdout, stderr = claude_cli.run_planned_pr(self.repo_path)
-        if code != 0:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = stderr.strip() or f"claude exit {code}"
-            self.log_event(f"claude CLI failed: {self.state.error_message}")
-            return
+    async def handle_coding(self, *, reset_branch: bool = True) -> None:
+        """Run ``PLANNED PR`` via the claude CLI and hand off to WATCH.
 
-        # Validate the task-branch invariant BEFORE auto-committing. A
-        # malformed queue entry with no ``Branch:`` field is a hard
-        # error: without it we cannot identify the PR that was just
-        # opened and we must not publish a speculative commit/push on
-        # whatever branch HEAD happens to point at. Bail first, let
-        # ``_commit_and_push_dirty`` run only once we know which PR we
-        # will attach the push to.
+        ``reset_branch=True`` (fresh IDLE -> CODING) force-recreates the task
+        branch from ``origin/<base>``. ``reset_branch=False`` (called from
+        ``recover_state`` after a crashed run) preserves any in-flight local
+        commits: plain checkout if the local branch already exists, else
+        fall back to creating it from ``origin/<base>``.
+        """
+        # Validate the task-branch invariant BEFORE invoking the CLI so we
+        # never run Claude against whatever branch HEAD happens to point at.
         target_branch = (
             self.state.current_task.branch if self.state.current_task else None
         )
@@ -1142,6 +1140,74 @@ return 0
                 "Current task has no branch; cannot identify PR"
             )
             self.log_event(self.state.error_message)
+            return
+
+        # Pick a checkout command that preserves in-flight work during
+        # recovery. When reset_branch is True we're coming from IDLE with a
+        # clean tree after sync_to_main, so a hard reset to origin/<base> is
+        # correct. When it's False, recovery is resuming an interrupted run
+        # that may still have unpushed commits on the task branch; a hard
+        # reset would orphan them.
+        checkout_cmd: list[str]
+        if reset_branch:
+            checkout_cmd = [
+                "git",
+                "checkout",
+                "-B",
+                target_branch,
+                f"origin/{self.repo_config.branch}",
+            ]
+        else:
+            try:
+                probe = subprocess.run(
+                    [
+                        "git",
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        f"refs/heads/{target_branch}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    cwd=self.repo_path,
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = f"failed to create branch {target_branch}"
+                self.log_event(f"{self.state.error_message}: {exc}")
+                return
+            if probe.returncode == 0:
+                checkout_cmd = ["git", "checkout", target_branch]
+            else:
+                checkout_cmd = [
+                    "git",
+                    "checkout",
+                    "-B",
+                    target_branch,
+                    f"origin/{self.repo_config.branch}",
+                ]
+
+        try:
+            subprocess.run(
+                checkout_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+                cwd=self.repo_path,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = f"failed to create branch {target_branch}"
+            self.log_event(f"{self.state.error_message}: {exc}")
+            return
+
+        code, _stdout, stderr = claude_cli.run_planned_pr(self.repo_path)
+        if code != 0:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = stderr.strip() or f"claude exit {code}"
+            self.log_event(f"claude CLI failed: {self.state.error_message}")
             return
 
         commit_message = (
