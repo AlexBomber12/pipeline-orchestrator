@@ -619,6 +619,13 @@ class PipelineRunner:
                 f"Recovered: DOING task {doing.pr_id}, no PR "
                 "-> re-running CODING"
             )
+            # Claude's PLANNED PR flow creates the branch from origin/main
+            # (per AGENTS.md), which would orphan any unpushed local
+            # commits from the crashed run. Push them to origin first so
+            # the work is durable — even if Claude then resets the local
+            # ref, the commits remain reachable on origin.
+            if doing.branch:
+                self._preserve_crashed_run_commits(doing.branch)
             await self.handle_coding()
             # Even if handle_coding left the runner in ERROR, discovery
             # itself completed and must not be retried: re-running
@@ -709,6 +716,63 @@ class PipelineRunner:
             self.log_event("preflight: dirty working tree")
             return False
         return True
+
+    def _preserve_crashed_run_commits(self, branch: str) -> None:
+        """Push any unpushed commits on ``branch`` to origin.
+
+        Called from ``recover_state`` before re-running ``handle_coding``
+        after a crash. Claude's PLANNED PR flow creates the branch from
+        ``origin/main``, which would orphan local-only commits. Pushing
+        them first preserves the work on origin so nothing is lost even
+        if Claude later resets the local branch.
+
+        Non-fatal: if the local branch does not exist or the push fails
+        (no commits to push, auth hiccup, etc.), log and return so the
+        caller can still proceed with recovery.
+        """
+        try:
+            probe = subprocess.run(
+                [
+                    "git",
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{branch}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                cwd=self.repo_path,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            self.log_event(
+                f"Warning: could not probe local branch {branch}: {exc}"
+            )
+            return
+        if probe.returncode != 0:
+            return
+
+        try:
+            subprocess.run(
+                ["git", "push", "origin", f"{branch}:{branch}"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=True,
+                cwd=self.repo_path,
+            )
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ) as exc:
+            self.log_event(
+                f"Warning: could not preserve unpushed commits on "
+                f"{branch}: {exc}"
+            )
+            return
+
+        self.log_event(f"Preserved crashed-run commits on {branch}")
 
     def _commit_and_push_dirty(self, message: str, expected_branch: str) -> bool:
         """Commit and push any uncommitted changes left in the working tree.
