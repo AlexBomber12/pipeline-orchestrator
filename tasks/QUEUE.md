@@ -156,7 +156,7 @@
 - Depends on: PR-023
 
 ## PR-027: Revert branch pre-creation and retry PR detection
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-027.md
 - Branch: pr-027-revert-and-retry
 - Depends on: PR-026

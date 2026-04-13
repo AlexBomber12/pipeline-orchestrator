@@ -159,27 +159,245 @@ def test_recover_doing_task_without_pr_rerun_coding(
         runner_module.github_client, "get_open_prs", lambda repo: []
     )
 
-    coding_calls: list[tuple[PipelineState, bool]] = []
+    coding_calls: list[PipelineState] = []
 
-    async def fake_coding(*, reset_branch: bool = True) -> None:
+    async def fake_coding() -> None:
         # Capture the state at the moment handle_coding was invoked so the
         # test can prove recover_state transitioned to CODING before
-        # calling. Recovery must pass reset_branch=False so any unpushed
-        # commits from the crashed run survive to _commit_and_push_dirty.
-        coding_calls.append((runner.state.state, reset_branch))
+        # calling.
+        coding_calls.append(runner.state.state)
 
     runner = _make_runner()
     runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
+    # Stub out the preserve helper so this test focuses on the
+    # state-transition contract. A dedicated test below covers its
+    # ordering relative to handle_coding.
+    runner._preserve_crashed_run_commits = lambda branch: True  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
-    assert coding_calls == [(PipelineState.CODING, False)]
+    assert coding_calls == [PipelineState.CODING]
     assert runner.state.current_task is not None
     assert runner.state.current_task.pr_id == "PR-042"
     assert runner.state.current_pr is None
     assert any(
         "Recovered: DOING task PR-042" in e["event"]
         and "re-running CODING" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_recover_preserves_crashed_run_commits_before_coding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P1: Claude's PLANNED PR flow recreates the task branch from
+    ``origin/main``, which would orphan unpushed local commits from a
+    crashed run. ``recover_state`` must push the local task branch before
+    handing off to ``handle_coding`` so the work is durable on origin.
+    """
+    task = _doing_task()
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: []
+    )
+
+    events: list[str] = []
+
+    async def fake_coding() -> None:
+        events.append("coding")
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
+            events.append("probe")
+            # Local branch exists.
+            class R:
+                returncode = 0
+                stdout = "abc\n"
+                stderr = ""
+            return R()
+        if cmd[:2] == ["git", "push"]:
+            events.append(f"push:{cmd[-1]}")
+            class R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return R()
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
+    runner.handle_coding = fake_coding  # type: ignore[method-assign]
+    asyncio.run(runner.recover_state())
+
+    # Preserve push must happen before handle_coding re-runs CODING.
+    push_idx = next(i for i, e in enumerate(events) if e.startswith("push:"))
+    coding_idx = events.index("coding")
+    assert push_idx < coding_idx
+    # Must push the exact task branch.
+    assert "push:pr-042-inflight:pr-042-inflight" in events
+    assert any(
+        "Preserved crashed-run commits on pr-042-inflight" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_recover_preserve_tolerates_missing_local_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the crashed run never created the local branch (crash before
+    Claude's first commit), ``_preserve_crashed_run_commits`` must be a
+    no-op rather than failing recovery."""
+    task = _doing_task()
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: []
+    )
+
+    pushes: list[list[str]] = []
+
+    async def fake_coding() -> None:
+        return None
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
+            class R:
+                returncode = 1
+                stdout = ""
+                stderr = ""
+            return R()
+        if cmd[:2] == ["git", "push"]:
+            pushes.append(cmd)
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
+    runner.handle_coding = fake_coding  # type: ignore[method-assign]
+    asyncio.run(runner.recover_state())
+
+    # No push when local branch doesn't exist.
+    assert pushes == []
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == "PR-042"
+
+
+def test_recover_preserve_refuses_base_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P1: a malformed QUEUE.md entry with ``Branch: main`` must
+    not cause recovery to push directly to the base branch, bypassing
+    the PR/review gate. ``_preserve_crashed_run_commits`` must refuse
+    and recover_state must flip to ERROR rather than running CODING
+    against a base-branch task entry."""
+    task = QueueTask(
+        pr_id="PR-042",
+        title="malformed",
+        status=TaskStatus.DOING,
+        branch="main",  # Same as the repo's base branch.
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: []
+    )
+
+    pushes: list[list[str]] = []
+    probes: list[list[str]] = []
+    coding_ran: list[bool] = []
+
+    async def fake_coding() -> None:
+        coding_ran.append(True)
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
+            probes.append(cmd)
+        if cmd[:2] == ["git", "push"]:
+            pushes.append(cmd)
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
+    runner.handle_coding = fake_coding  # type: ignore[method-assign]
+    asyncio.run(runner.recover_state())
+
+    # No push to the base branch, and we never even probed for the
+    # local ref — the guard must short-circuit before any subprocess.
+    assert pushes == []
+    assert probes == []
+    assert coding_ran == [], "handle_coding must not run after refusal"
+    assert runner.state.state == PipelineState.ERROR
+    assert "could not preserve crashed-run commits on 'main'" in (
+        runner.state.error_message or ""
+    )
+    assert any(
+        "Refusing to preserve crashed-run commits on base branch 'main'"
+        in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_recover_aborts_when_preserve_push_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P1: a failed preserve push leaves crashed-run commits only
+    on local. ``recover_state`` must NOT proceed to handle_coding (which
+    would let Claude reset the branch from origin/main and orphan the
+    work). Stop in ERROR so an operator can intervene."""
+    task = _doing_task()
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo: []
+    )
+
+    coding_ran: list[bool] = []
+
+    async def fake_coding() -> None:
+        coding_ran.append(True)
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
+            class R:
+                returncode = 0
+                stdout = "abc\n"
+                stderr = ""
+            return R()
+        if cmd[:2] == ["git", "push"]:
+            raise subprocess.CalledProcessError(
+                1, cmd, stderr="auth transient"
+            )
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
+    runner.handle_coding = fake_coding  # type: ignore[method-assign]
+    asyncio.run(runner.recover_state())
+
+    assert coding_ran == [], "handle_coding must not run after preserve fail"
+    assert runner.state.state == PipelineState.ERROR
+    assert "could not preserve crashed-run commits on 'pr-042-inflight'" in (
+        runner.state.error_message or ""
+    )
+    assert any(
+        "Failed to preserve unpushed commits on pr-042-inflight"
+        in e["event"]
         for e in runner.state.history
     )
 
@@ -688,7 +906,7 @@ def test_run_cycle_coding_failure_during_recovery_is_not_retried(
 
     coding_calls: list[int] = []
 
-    async def failing_coding(*, reset_branch: bool = True) -> None:
+    async def failing_coding() -> None:
         coding_calls.append(1)
         runner.state.state = PipelineState.ERROR
         runner.state.error_message = "claude CLI crashed"
@@ -696,6 +914,7 @@ def test_run_cycle_coding_failure_during_recovery_is_not_retried(
     runner = _make_runner()
     runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
     runner.handle_coding = failing_coding  # type: ignore[method-assign]
+    runner._preserve_crashed_run_commits = lambda branch: True  # type: ignore[method-assign]
 
     result = asyncio.run(runner.recover_state())
 
