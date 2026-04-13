@@ -144,9 +144,13 @@ def get_pr_review_status(
             codex_contents = {r.get("content") for r in codex_reactions}
             if "+1" in codex_contents:
                 if last_push_at is not None:
-                    plus_one = next(
-                        (r for r in codex_reactions if r.get("content") == "+1"),
-                        None,
+                    plus_ones = [
+                        r for r in codex_reactions if r.get("content") == "+1"
+                    ]
+                    plus_one = max(
+                        plus_ones,
+                        key=lambda r: r.get("created_at", ""),
+                        default=None,
                     )
                     if plus_one:
                         reaction_time = _parse_iso(plus_one.get("created_at"))
