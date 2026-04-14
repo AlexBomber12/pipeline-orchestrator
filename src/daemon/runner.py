@@ -15,7 +15,6 @@ import json
 import logging
 import shutil
 import subprocess
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -59,18 +58,6 @@ _HISTORY_LIMIT = 100
 # eliminate. 30 minutes accommodates realistic CI runs without
 # abandoning the upper bound entirely.
 _CI_SCRIPT_TIMEOUT_SEC = 1800
-
-# How long ``_mark_queue_done`` blocks waiting for the queue-sync
-# remediation PR to actually merge. Auto-merge returns before the
-# merge happens when branch-protection checks are still pending, so
-# the runner must confirm completion before clearing state; otherwise
-# the next IDLE cycle reads QUEUE.md from origin/base (not yet
-# updated) and re-picks the merged task. Sized to match
-# ``_CI_SCRIPT_TIMEOUT_SEC`` so a repo whose required checks legitimately
-# take close to 30 minutes does not flip to ERROR for a merge that
-# would otherwise land shortly after.
-_QUEUE_SYNC_MERGE_POLL_INTERVAL_SEC = 5
-_QUEUE_SYNC_MERGE_TIMEOUT_SEC = 1800
 
 
 def repo_owner_from_url(url: str) -> str:
@@ -1188,6 +1175,14 @@ return 0
 
     async def handle_idle(self) -> None:
         """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
+        # A queue-sync remediation PR may still be unmerged from a prior
+        # cycle. Resolve it before picking a new task so the daemon does
+        # not re-run a task whose DONE status has not yet landed on
+        # ``origin/{base}``.
+        if self.state.pending_queue_sync_branch is not None:
+            if not self._resolve_pending_queue_sync():
+                return
+
         # sync_to_main is only safe in IDLE state: it runs git reset --hard
         # on the base branch, which would destroy any in-flight Claude work
         # on a feature branch. We are IDLE here, so that's fine.
@@ -1493,14 +1488,11 @@ return 0
         try:
             self._mark_queue_done()
         except Exception as exc:
-            # The original PR is already merged, but the queue-sync
-            # remediation PR did not confirm a successful merge within
-            # the timeout (or its own merge was rejected/closed).
-            # Clearing state to IDLE here would let the next cycle
-            # read QUEUE.md from origin/base before the sync lands and
-            # re-pick the just-merged task. Flip to ERROR so the
-            # operator (or handle_error escalation) resolves the
-            # remediation before the runner dispatches more work.
+            # Opening the remediation PR failed before auto-merge even
+            # had a chance to complete. Parking the task in ERROR so
+            # the operator resolves the remediation is preferable to
+            # clearing state and risking re-pick of the merged task on
+            # the next cycle.
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"queue-sync failed: {exc}"
             self.log_event(f"queue-sync failed: {exc}")
@@ -1513,7 +1505,8 @@ return 0
 
     def _mark_queue_done(self) -> None:
         """Open a remediation PR flipping the merged task's QUEUE.md
-        status to ``DONE``.
+        status to ``DONE`` and record it in ``pending_queue_sync_branch``
+        for asynchronous resolution.
 
         The runner elsewhere (``_commit_and_push_dirty``,
         ``_preserve_crashed_run_commits``) refuses to push directly to
@@ -1521,11 +1514,13 @@ return 0
         dedicated ``queue-done-{pr_id}`` branch + PR + squash auto-merge
         keeps that invariant and works under branch protection.
 
-        Best-effort cleanup after a successful merge: the original PR
-        is already merged, so any failure here is logged as a warning
-        by the caller and must not flip the runner to ERROR. On
-        failure, the working tree is reset and the base branch is
-        checked out so the next cycle's preflight starts clean.
+        This method does not block waiting for the remediation PR to
+        merge. ``handle_idle`` polls ``pending_queue_sync_branch`` each
+        cycle via ``_resolve_pending_queue_sync`` and defers task
+        selection until the queue-sync PR lands (or closes/times out).
+        Waiting here synchronously would stall every other repo's cycle
+        on one repo's branch-protection checks, so the wait is
+        distributed across cycles instead.
         """
         if self.state.current_task is None:
             return
@@ -1599,7 +1594,6 @@ return 0
                  "--squash", "--delete-branch", "--auto"],
                 repo=self.owner_repo,
             )
-            self._wait_for_queue_sync_merge(remediation_branch)
         except Exception:
             # Reset the tree and return to base so a partial
             # write/commit/push cannot poison the next preflight. Use
@@ -1622,43 +1616,68 @@ return 0
             capture_output=True, text=True, timeout=30,
             check=True, cwd=self.repo_path,
         )
+        self.state.pending_queue_sync_branch = remediation_branch
         self.log_event(
-            f"Queue-done PR merged for {pr_id} "
-            f"(branch {remediation_branch})"
+            f"Opened queue-done PR for {pr_id} "
+            f"(branch {remediation_branch}); awaiting auto-merge"
         )
 
-    def _wait_for_queue_sync_merge(self, head: str) -> None:
-        """Block until the queue-sync PR ``head`` merges, or raise.
+    def _resolve_pending_queue_sync(self) -> bool:
+        """Poll the outstanding queue-sync PR and gate IDLE dispatch.
 
-        ``gh pr merge --auto`` enables auto-merge and returns immediately
-        when required checks are still pending. The next IDLE cycle
-        would read ``tasks/QUEUE.md`` from ``origin/{base}`` before the
-        queue-sync PR lands and re-pick the same task. Polling
-        ``gh pr view`` closes that race by confirming the merge
-        synchronously before the caller clears state.
+        Returns ``True`` when the remediation is resolved (merged, or
+        no-longer pending for any reason) and the caller should proceed
+        with normal IDLE logic. Returns ``False`` when the PR is still
+        open — the runner stays IDLE without selecting a new task so
+        the merged task does not get re-picked while ``origin/{base}``
+        has not yet received the DONE update.
+
+        Runs once per cycle so a slow branch-protection check in one
+        repo does not block the daemon's sequential loop across other
+        repos.
         """
-        deadline = time.monotonic() + _QUEUE_SYNC_MERGE_TIMEOUT_SEC
-        while time.monotonic() < deadline:
+        branch = self.state.pending_queue_sync_branch
+        if branch is None:
+            return True
+
+        try:
             result = github_client.run_gh(
-                ["pr", "view", head, "--json", "state,mergedAt"],
+                ["pr", "view", branch, "--json", "state,mergedAt"],
                 repo=self.owner_repo,
             )
-            state = ""
-            merged_at = None
-            if isinstance(result, dict):
-                state = str(result.get("state") or "").upper()
-                merged_at = result.get("mergedAt")
-            if state == "MERGED" or merged_at:
-                return
-            if state == "CLOSED":
-                raise RuntimeError(
-                    f"queue-sync PR {head} closed without merging"
-                )
-            time.sleep(_QUEUE_SYNC_MERGE_POLL_INTERVAL_SEC)
-        raise TimeoutError(
-            f"queue-sync PR {head} not merged within "
-            f"{_QUEUE_SYNC_MERGE_TIMEOUT_SEC}s"
-        )
+        except Exception as exc:
+            self.log_event(
+                f"queue-sync PR {branch} view failed: {exc}"
+            )
+            return False
+
+        state = ""
+        merged_at = None
+        if isinstance(result, dict):
+            state = str(result.get("state") or "").upper()
+            merged_at = result.get("mergedAt")
+
+        if state == "MERGED" or merged_at:
+            self.state.pending_queue_sync_branch = None
+            self.log_event(f"Queue-sync PR merged ({branch})")
+            return True
+
+        if state == "CLOSED":
+            # Closed without merging (e.g. operator declined). Clear
+            # the marker so the runner is not permanently blocked;
+            # log and flip to ERROR so the operator notices before any
+            # duplicate work happens.
+            self.state.pending_queue_sync_branch = None
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = (
+                f"queue-sync PR {branch} closed without merging"
+            )
+            self.log_event(self.state.error_message)
+            return False
+
+        # OPEN / auto-merge waiting on checks. Stay IDLE; next cycle
+        # re-checks.
+        return False
 
     def _post_codex_review(self, pr_number: int) -> bool:
         """Post ``@codex review`` on ``pr_number``.
