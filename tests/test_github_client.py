@@ -7,7 +7,12 @@ from typing import Any
 
 import pytest
 
-from src.github_client import get_pr_review_status, get_repo_full_name, run_gh
+from src.github_client import (
+    get_pr_review_status,
+    get_repo_full_name,
+    merge_pr,
+    run_gh,
+)
 from src.models import ReviewStatus
 
 
@@ -531,3 +536,26 @@ def test_approval_without_head_sha(monkeypatch: pytest.MonkeyPatch) -> None:
         get_pr_review_status("owner/name", 42, pr_author="author")
         == ReviewStatus.APPROVED
     )
+
+
+def test_merge_pr_uses_squash(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured["cmd"] = cmd
+        return _FakeCompletedProcess(stdout="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    merge_pr("owner/name", 42)
+
+    assert captured["cmd"] == [
+        "gh",
+        "pr",
+        "merge",
+        "42",
+        "--squash",
+        "--delete-branch",
+        "-R",
+        "owner/name",
+    ]

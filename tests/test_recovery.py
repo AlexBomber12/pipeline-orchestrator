@@ -1121,3 +1121,45 @@ def test_recover_state_queue_read_failure_sets_error_and_returns_false(
     assert "read QUEUE.md" in (runner.state.error_message or "")
     assert "origin/main" in (runner.state.error_message or "")
     assert gh_calls == [], "must bail before probing GitHub"
+
+
+def test_recover_rebuilds_pending_queue_sync_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An open `queue-done-*` PR indicates a post-merge remediation
+    opened by a prior process. The in-memory marker is lost on daemon
+    restart, so recover_state must rebuild it from open PRs to keep
+    handle_idle gated until the remediation lands — otherwise the
+    just-merged task can be re-picked before origin QUEUE.md is
+    updated."""
+    queue_sync_pr = PRInfo(number=201, branch="queue-done-pr-001")
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [queue_sync_pr],
+    )
+
+    runner = _make_runner()
+    runner._parse_base_queue = lambda: []  # type: ignore[method-assign]
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
+
+
+def test_recover_ignores_non_queue_done_prs_for_sync_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Open PRs on regular task branches must not be interpreted as
+    queue-sync remediations."""
+    task_pr = PRInfo(number=5, branch="pr-050-queued")
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [task_pr],
+    )
+
+    runner = _make_runner()
+    runner._parse_base_queue = lambda: []  # type: ignore[method-assign]
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.pending_queue_sync_branch is None
