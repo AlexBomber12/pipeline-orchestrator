@@ -8,8 +8,11 @@ from typing import Any
 import pytest
 
 from src.github_client import (
+    get_pr_author,
+    get_pr_head_commit_iso,
     get_pr_review_status,
     get_repo_full_name,
+    has_recent_codex_review_request,
     merge_pr,
     run_gh,
 )
@@ -559,3 +562,225 @@ def test_merge_pr_uses_squash(monkeypatch: pytest.MonkeyPatch) -> None:
         "-R",
         "owner/name",
     ]
+
+
+def _iso_utc_now_minus(seconds: int) -> str:
+    from datetime import datetime, timedelta, timezone as _tz
+
+    return (
+        datetime.now(_tz.utc) - timedelta(seconds=seconds)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_has_recent_codex_review_request_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PR-author ``@codex review`` comment within the window counts
+    as a recent request — the caller must skip posting another one."""
+    import json as _json
+
+    pages = [
+        [
+            {
+                "user": {"login": "author"},
+                "body": "@codex review",
+                "created_at": _iso_utc_now_minus(60),
+            }
+        ]
+    ]
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        has_recent_codex_review_request(
+            "owner/name", 42, pr_author="author", within_minutes=5
+        )
+        is True
+    )
+
+
+def test_has_recent_codex_review_request_false_too_old(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A matching comment older than ``within_minutes`` must not count."""
+    import json as _json
+
+    pages = [
+        [
+            {
+                "user": {"login": "author"},
+                "body": "@codex review",
+                "created_at": _iso_utc_now_minus(10 * 60),
+            }
+        ]
+    ]
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        has_recent_codex_review_request(
+            "owner/name", 42, pr_author="author", within_minutes=5
+        )
+        is False
+    )
+
+
+def test_has_recent_codex_review_request_false_no_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When no PR-author ``@codex review`` comment exists at all the
+    helper returns False so the daemon posts the trigger itself."""
+    import json as _json
+
+    pages = [
+        [
+            {
+                "user": {"login": "someone-else"},
+                "body": "@codex review",
+                "created_at": _iso_utc_now_minus(60),
+            },
+            {
+                "user": {"login": "author"},
+                "body": "looks good",
+                "created_at": _iso_utc_now_minus(60),
+            },
+        ]
+    ]
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        has_recent_codex_review_request(
+            "owner/name", 42, pr_author="author", within_minutes=5
+        )
+        is False
+    )
+
+
+def test_get_pr_author_returns_login(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``get_pr_author`` must read the login from PR metadata, not from
+    the daemon's ``gh`` identity, so dedup works when Claude CLI ran
+    under a different auth context than the daemon."""
+    captured: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured.append(cmd)
+        return _FakeCompletedProcess(stdout='"claude-cli-bot"')
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert get_pr_author("owner/name", 42) == "claude-cli-bot"
+    assert captured, "gh must be invoked"
+    assert any("repos/owner/name/pulls/42" in arg for arg in captured[0])
+
+
+def test_get_pr_author_returns_empty_on_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``gh api`` failure must not crash the caller — the dedup path
+    simply skips when no author can be resolved."""
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(
+            stdout="", stderr="not found", returncode=1
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert get_pr_author("owner/name", 42) == ""
+
+
+def test_has_recent_codex_review_request_respects_after_iso(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Comments created at or before ``after_iso`` must not count as
+    duplicates. This is what lets the daemon re-request a review for a
+    new commit even when its own prior trigger for an earlier commit is
+    still within the time window and shares the PR author login."""
+    import json as _json
+
+    pages = [
+        [
+            {
+                "user": {"login": "same-user"},
+                "body": "@codex review",
+                "created_at": _iso_utc_now_minus(60),
+            }
+        ]
+    ]
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    from datetime import datetime, timedelta, timezone as _tz
+
+    just_now = (
+        datetime.now(_tz.utc) - timedelta(seconds=10)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    assert (
+        has_recent_codex_review_request(
+            "owner/name",
+            42,
+            pr_author="same-user",
+            within_minutes=5,
+            after_iso=just_now,
+        )
+        is False
+    )
+
+
+def test_get_pr_head_commit_iso_returns_committer_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Should fetch ``.head.sha`` then ``.commit.committer.date`` and
+    return the ISO timestamp unchanged."""
+    invocations: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        invocations.append(cmd)
+        path = next(
+            (arg for arg in cmd if arg.startswith("repos/")), ""
+        )
+        if path.endswith("/pulls/42"):
+            return _FakeCompletedProcess(stdout="abc1234")
+        if path.startswith("repos/owner/name/commits/"):
+            return _FakeCompletedProcess(stdout="2026-04-14T13:37:00Z")
+        return _FakeCompletedProcess(stdout="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_head_commit_iso("owner/name", 42)
+        == "2026-04-14T13:37:00Z"
+    )
+    assert any("repos/owner/name/pulls/42" in a for a in invocations[0])
+    assert any(
+        "repos/owner/name/commits/abc1234" in a for a in invocations[1]
+    )
+
+
+def test_get_pr_head_commit_iso_returns_empty_on_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Errors from either lookup must not propagate — the caller
+    treats "" as "no constraint" and the dedup filter degrades
+    gracefully to pure time-window matching."""
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(
+            stdout="", stderr="boom", returncode=1
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert get_pr_head_commit_iso("owner/name", 42) == ""

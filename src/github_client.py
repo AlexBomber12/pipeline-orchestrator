@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 
 from src.models import CIStatus, PRInfo, ReviewStatus
 
@@ -224,6 +224,123 @@ def merge_pr(repo: str, pr_number: int) -> None:
 def post_comment(repo: str, pr_number: int, body: str) -> None:
     """Post a comment on a PR via ``gh pr comment``."""
     run_gh(["pr", "comment", str(pr_number), "--body", body], repo=repo)
+
+
+def get_pr_author(repo: str, pr_number: int) -> str:
+    """Return the GitHub login of the PR's author, or "" on failure.
+
+    Read directly from PR metadata rather than the daemon's ``gh``
+    identity: Claude CLI may run under a different authentication
+    context than the daemon, so ``gh api user`` is not a reliable
+    proxy for "who opened this PR" and using it would cause
+    ``has_recent_codex_review_request`` to miss the trigger that the
+    real author already posted.
+    """
+    try:
+        raw = run_gh(
+            [
+                "api",
+                f"repos/{repo}/pulls/{pr_number}",
+                "--jq",
+                ".user.login",
+            ]
+        )
+    except RuntimeError:
+        return ""
+    if isinstance(raw, str):
+        return raw.strip()
+    return ""
+
+
+def get_pr_head_commit_iso(repo: str, pr_number: int) -> str:
+    """Return the ISO-8601 committer date of the PR's head commit, or "".
+
+    Used by the dedup gate on ``_post_codex_review`` to tell
+    "Claude already triggered a review for THIS commit" apart from
+    "the daemon posted a trigger for an earlier commit". Without a
+    commit-time threshold, the daemon's own post from a prior cycle
+    would be seen as a duplicate on the next fix push when the PR
+    author and daemon share a gh identity, suppressing the fresh
+    review anchor that the new commit needs.
+    """
+    try:
+        raw_sha = run_gh(
+            [
+                "api",
+                f"repos/{repo}/pulls/{pr_number}",
+                "--jq",
+                ".head.sha",
+            ]
+        )
+    except RuntimeError:
+        return ""
+    sha = raw_sha.strip() if isinstance(raw_sha, str) else ""
+    if not sha:
+        return ""
+    try:
+        raw_date = run_gh(
+            [
+                "api",
+                f"repos/{repo}/commits/{sha}",
+                "--jq",
+                ".commit.committer.date",
+            ]
+        )
+    except RuntimeError:
+        return ""
+    return raw_date.strip() if isinstance(raw_date, str) else ""
+
+
+def has_recent_codex_review_request(
+    repo: str,
+    pr_number: int,
+    pr_author: str,
+    within_minutes: int = 5,
+    after_iso: str | None = None,
+) -> bool:
+    """Return ``True`` iff ``pr_author`` recently posted ``@codex review``.
+
+    The daemon posts ``@codex review`` after every coding/fix cycle, but
+    Claude may also post one itself from the AGENTS.md runbook. Without
+    this guard both trigger comments land back-to-back and Codex starts
+    two redundant reviews. The caller checks this before posting and
+    skips when a qualifying trigger already exists within
+    ``within_minutes``.
+
+    ``after_iso`` optionally restricts matches to comments created
+    strictly after the given ISO-8601 timestamp. Callers pass the
+    PR's current head-commit time so a trigger posted for an earlier
+    commit does not suppress the fresh anchor the new commit needs —
+    this is what keeps the dedup safe when the daemon and PR author
+    share a gh identity.
+    """
+    try:
+        comments = _gh_api_paginated(
+            f"repos/{repo}/issues/{pr_number}/comments"
+        ) or []
+    except RuntimeError as exc:
+        if "HTTP 404" in str(exc):
+            return False
+        raise
+    now = datetime.now(timezone.utc)
+    cutoff = within_minutes * 60
+    for c in reversed(comments):
+        author = (c.get("user") or {}).get("login", "")
+        if author != pr_author:
+            continue
+        if "@codex review" not in (c.get("body") or "").lower():
+            continue
+        created_raw = c.get("created_at") or ""
+        if after_iso and (not created_raw or created_raw <= after_iso):
+            continue
+        created = _parse_iso(created_raw)
+        if created is None:
+            continue
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if (now - created).total_seconds() < cutoff:
+            return True
+    return False
 
 
 def _gh_api_paginated(path: str) -> list[dict] | None:

@@ -192,7 +192,7 @@
 - Depends on: PR-027
 
 ## PR-033: Dirty tree recovery and dedup codex review
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-033.md
 - Branch: pr-033-dirty-recovery
 - Depends on: PR-032
