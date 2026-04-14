@@ -263,7 +263,7 @@ def test_handle_idle_picks_task_and_drives_coding(
 
     claude_calls: list[str] = []
 
-    def fake_run_planned_pr(path: str) -> tuple[int, str, str]:
+    def fake_run_planned_pr(path: str, model: str | None = None) -> tuple[int, str, str]:
         claude_calls.append(path)
         return (0, "ok", "")
 
@@ -311,7 +311,7 @@ def test_handle_idle_sets_queue_counters_with_mixed_statuses(
     monkeypatch.setattr(runner_module, "parse_queue", lambda path: tasks)
     monkeypatch.setattr(runner_module, "get_next_task", lambda t: tasks[2])
     monkeypatch.setattr(
-        runner_module.claude_cli, "run_planned_pr", lambda path: (0, "ok", "")
+        runner_module.claude_cli, "run_planned_pr", lambda path, model=None: (0, "ok", "")
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -338,7 +338,7 @@ def test_handle_coding_errors_when_no_pr_found(
     monkeypatch.setattr(
         runner_module.claude_cli,
         "run_planned_pr",
-        lambda path: (0, "ok", ""),
+        lambda path, model=None: (0, "ok", ""),
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -370,7 +370,7 @@ def test_handle_coding_rejects_unmatched_branch(
     monkeypatch.setattr(
         runner_module.claude_cli,
         "run_planned_pr",
-        lambda path: (0, "ok", ""),
+        lambda path, model=None: (0, "ok", ""),
     )
     unrelated = PRInfo(number=99, branch="other-branch")
     monkeypatch.setattr(
@@ -406,7 +406,7 @@ def test_handle_coding_posts_codex_review_after_pr_found(
     monkeypatch.setattr(
         runner_module.claude_cli,
         "run_planned_pr",
-        lambda path: (0, "ok", ""),
+        lambda path, model=None: (0, "ok", ""),
     )
     opened_pr = PRInfo(number=42, branch="pr-019")
     monkeypatch.setattr(
@@ -448,7 +448,7 @@ def test_handle_coding_survives_post_comment_failure(
     monkeypatch.setattr(
         runner_module.claude_cli,
         "run_planned_pr",
-        lambda path: (0, "ok", ""),
+        lambda path, model=None: (0, "ok", ""),
     )
     opened_pr = PRInfo(number=42, branch="pr-019")
     monkeypatch.setattr(
@@ -486,7 +486,7 @@ def test_handle_fix_posts_codex_review_after_push(
     ``@codex review`` so Codex reviews the freshly-pushed iteration."""
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli, "fix_review", lambda path: (0, "", "")
+        runner_module.claude_cli, "fix_review", lambda path, model=None: (0, "", "")
     )
     posted: list[tuple[str, int, str]] = []
 
@@ -527,7 +527,7 @@ def test_handle_fix_errors_when_post_comment_fails(
     """
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli, "fix_review", lambda path: (0, "", "")
+        runner_module.claude_cli, "fix_review", lambda path, model=None: (0, "", "")
     )
 
     def boom(repo: str, number: int, body: str) -> None:
@@ -569,7 +569,7 @@ def test_handle_fix_skips_checkout_on_cross_repo_pr(
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     monkeypatch.setattr(
-        runner_module.claude_cli, "fix_review", lambda path: (0, "", "")
+        runner_module.claude_cli, "fix_review", lambda path, model=None: (0, "", "")
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -600,7 +600,7 @@ def test_handle_fix_checks_out_pr_branch_before_fix_review(
     calls = _patch_subprocess(monkeypatch)
     fix_called_at: list[int] = []
 
-    def fake_fix(path: str) -> tuple[int, str, str]:
+    def fake_fix(path: str, model: str | None = None) -> tuple[int, str, str]:
         fix_called_at.append(len(calls))
         return (0, "", "")
 
@@ -698,7 +698,7 @@ def test_handle_coding_errors_when_task_has_no_branch(
     monkeypatch.setattr(
         runner_module.claude_cli,
         "run_planned_pr",
-        lambda path: (0, "ok", ""),
+        lambda path, model=None: (0, "ok", ""),
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -736,7 +736,7 @@ def test_handle_coding_retries_pr_detection(
     monkeypatch.setattr(
         runner_module.claude_cli,
         "run_planned_pr",
-        lambda path: (0, "ok", ""),
+        lambda path, model=None: (0, "ok", ""),
     )
 
     opened_pr = PRInfo(number=42, branch="pr-001")
@@ -791,7 +791,7 @@ def test_handle_coding_errors_after_all_retries(
     monkeypatch.setattr(
         runner_module.claude_cli,
         "run_planned_pr",
-        lambda path: (0, "ok", ""),
+        lambda path, model=None: (0, "ok", ""),
     )
     call_count = {"n": 0}
 
@@ -910,7 +910,7 @@ def test_handle_watch_changes_requested_triggers_fix(
         runner_module.github_client, "get_open_prs", lambda repo: [pr]
     )
     monkeypatch.setattr(
-        runner_module.claude_cli, "fix_review", lambda path: (0, "", "")
+        runner_module.claude_cli, "fix_review", lambda path, model=None: (0, "", "")
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -943,7 +943,7 @@ def test_handle_watch_ci_failure_triggers_fix(
         runner_module.github_client, "get_open_prs", lambda repo: [pr]
     )
     monkeypatch.setattr(
-        runner_module.claude_cli, "fix_review", lambda path: (0, "", "")
+        runner_module.claude_cli, "fix_review", lambda path, model=None: (0, "", "")
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -1423,7 +1423,7 @@ def test_handle_merge_resolves_conflict(
     claude_calls: list[tuple[str, str]] = []
 
     def fake_claude(
-        prompt: str, cwd: str, timeout: int = 600
+        prompt: str, cwd: str, timeout: int = 600, model: str | None = None
     ) -> tuple[int, str, str]:
         claude_calls.append((prompt, cwd))
         return (0, "", "")
@@ -1582,7 +1582,7 @@ def test_handle_merge_aborts_on_unresolvable_conflict(
     monkeypatch.setattr(
         runner_module.claude_cli,
         "run_claude",
-        lambda prompt, cwd, timeout=600: (1, "", "claude failed"),
+        lambda prompt, cwd, timeout=600, model=None: (1, "", "claude failed"),
     )
 
     merge_pr_calls: list[tuple[str, int]] = []
@@ -2035,7 +2035,7 @@ def test_handle_error_skip_clears_state(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(
         runner_module.claude_cli,
         "diagnose_error",
-        lambda path, ctx: (0, "SKIP", ""),
+        lambda path, ctx, model=None: (0, "SKIP", ""),
     )
 
     runner = _make_runner()
@@ -2055,7 +2055,7 @@ def test_handle_error_escalate_keeps_error(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(
         runner_module.claude_cli,
         "diagnose_error",
-        lambda path, ctx: (0, "ESCALATE: human help", ""),
+        lambda path, ctx, model=None: (0, "ESCALATE: human help", ""),
     )
 
     runner = _make_runner()
@@ -3156,7 +3156,7 @@ def test_handle_coding_saves_stdout(
     monkeypatch.setattr(
         runner_module.claude_cli,
         "run_planned_pr",
-        lambda path: (0, "hello from claude", ""),
+        lambda path, model=None: (0, "hello from claude", ""),
     )
     pr = PRInfo(number=42, branch="pr-001")
     monkeypatch.setattr(
@@ -3190,7 +3190,7 @@ def test_handle_fix_saves_stdout(
     monkeypatch.setattr(
         runner_module.claude_cli,
         "fix_review",
-        lambda path: (0, "fix output here", ""),
+        lambda path, model=None: (0, "fix output here", ""),
     )
     monkeypatch.setattr(
         runner_module.github_client,

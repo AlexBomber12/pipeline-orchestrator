@@ -24,6 +24,7 @@ _DAEMON_FIELDS = {
     "review_timeout_min",
     "hung_fallback_codex_review",
     "error_handler_use_ai",
+    "claude_model",
 }
 
 
@@ -47,6 +48,7 @@ class DaemonConfig(BaseModel):
     review_timeout_min: int = 60
     hung_fallback_codex_review: bool = True
     error_handler_use_ai: bool = True
+    claude_model: str = "opus"
 
 
 class WebConfig(BaseModel):

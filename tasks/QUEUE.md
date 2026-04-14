@@ -198,7 +198,7 @@
 - Depends on: PR-032
 
 ## PR-034: Model config, pytest in container, auth check
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-034.md
 - Branch: pr-034-config-hardening
 - Depends on: PR-032
