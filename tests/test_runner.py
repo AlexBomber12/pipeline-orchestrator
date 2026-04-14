@@ -782,6 +782,7 @@ def test_handle_coding_errors_after_all_retries(
 def test_handle_watch_approved_and_green_merges(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _patch_subprocess(monkeypatch)
     pr = PRInfo(
         number=5,
         branch="pr-001",
@@ -1173,6 +1174,7 @@ def test_handle_hung_without_fallback_returns_to_idle(
 
 
 def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.github_client, "merge_pr", lambda repo, num: None
     )
@@ -1194,6 +1196,8 @@ def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_handle_merge_failure_sets_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_subprocess(monkeypatch)
+
     def boom(repo: str, num: int) -> None:
         raise RuntimeError("merge conflict")
 
@@ -1206,6 +1210,153 @@ def test_handle_merge_failure_sets_error(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert runner.state.state == PipelineState.ERROR
     assert "merge conflict" in (runner.state.error_message or "")
+
+
+def test_handle_merge_syncs_with_main(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Before calling merge_pr, handle_merge fetches, merges origin/<base>
+    into the PR branch, then pushes — so gh pr merge sees a mergeable
+    branch even after micro-PRs land on main mid-FIX."""
+    git_calls: list[list[str]] = []
+
+    def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append(cmd)
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+
+    merge_pr_calls: list[tuple[str, int]] = []
+
+    def fake_merge_pr(repo: str, num: int) -> None:
+        merge_pr_calls.append((repo, num))
+
+    monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge_pr)
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert merge_pr_calls == [(runner.owner_repo, 5)]
+
+    merge_idx = next(
+        i for i, cmd in enumerate(git_calls)
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd
+    )
+    push_idx = next(
+        i for i, cmd in enumerate(git_calls)
+        if cmd[:2] == ["git", "push"] and "pr-001" in cmd
+    )
+    assert merge_idx < push_idx, (
+        "git merge origin/main must happen before git push"
+    )
+
+
+def test_handle_merge_resolves_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When git merge origin/<base> reports a conflict, handle_merge
+    asks Claude to resolve it. On success the merge proceeds normally."""
+    def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return _FakeCompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout="CONFLICT (content): merge conflict in foo",
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+
+    claude_calls: list[tuple[str, str]] = []
+
+    def fake_claude(
+        prompt: str, cwd: str, timeout: int = 600
+    ) -> tuple[int, str, str]:
+        claude_calls.append((prompt, cwd))
+        return (0, "", "")
+
+    monkeypatch.setattr(runner_module.claude_cli, "run_claude", fake_claude)
+
+    merge_pr_calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "merge_pr",
+        lambda repo, num: merge_pr_calls.append((repo, num)),
+    )
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert claude_calls, "Claude must be invoked on merge conflict"
+    assert merge_pr_calls == [(runner.owner_repo, 5)]
+
+
+def test_handle_merge_aborts_on_unresolvable_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When Claude fails to resolve the conflict, handle_merge aborts
+    the merge, sets ERROR, and does not call github_client.merge_pr."""
+    git_calls: list[list[str]] = []
+
+    def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append(cmd)
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return _FakeCompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout="CONFLICT (content): merge conflict in foo",
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "run_claude",
+        lambda prompt, cwd, timeout=600: (1, "", "claude failed"),
+    )
+
+    merge_pr_calls: list[tuple[str, int]] = []
+
+    def fake_merge_pr(repo: str, num: int) -> None:
+        merge_pr_calls.append((repo, num))
+
+    monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge_pr)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "Merge conflict resolution failed" in (
+        runner.state.error_message or ""
+    )
+    assert not merge_pr_calls, "merge_pr must not be called on abort"
+    abort_cmds = [
+        cmd for cmd in git_calls
+        if cmd[:3] == ["git", "merge", "--abort"]
+    ]
+    assert abort_cmds, "git merge --abort must be invoked"
 
 
 def test_handle_merge_opens_queue_done_pr_without_waiting(
@@ -1263,7 +1414,10 @@ def test_handle_merge_opens_queue_done_pr_without_waiting(
     assert "## PR-001: first\n- Status: DONE" in updated
     assert "## PR-002: second\n- Status: TODO" in updated
 
-    push_cmds = [cmd for cmd in git_calls if cmd[:2] == ["git", "push"]]
+    push_cmds = [
+        cmd for cmd in git_calls
+        if cmd[:2] == ["git", "push"] and any("queue-done" in a for a in cmd)
+    ]
     assert push_cmds and all("queue-done-pr-001" in cmd for cmd in push_cmds)
     assert all("main" not in cmd for cmd in push_cmds), (
         "queue sync must not push to the base branch"
@@ -1357,7 +1511,10 @@ def test_handle_merge_stays_idle_when_queue_sync_setup_fails(
     queue_path.write_text("## PR-001: first\n- Status: DOING\n")
 
     def fail_push(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        if cmd[:2] == ["git", "push"]:
+        if (
+            cmd[:2] == ["git", "push"]
+            and any("queue-done" in a for a in cmd)
+        ):
             raise subprocess.CalledProcessError(1, cmd, stderr="push failed")
         return _FakeCompletedProcess(args=cmd, returncode=0)
 
