@@ -291,8 +291,27 @@ class PipelineRunner:
         old_path = Path(f"/data/repos/{old_basename}")
         new_path = Path(self.repo_path)
         if old_basename != self.name and old_path.exists() and not new_path.exists():
-            shutil.move(str(old_path), str(new_path))
-            logger.info("Migrated clone path %s -> %s", old_path, new_path)
+            try:
+                result = subprocess.run(
+                    ["git", "-C", str(old_path), "remote", "get-url", "origin"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                old_origin = result.stdout.strip().rstrip("/")
+                expected = repo_config.url.rstrip("/")
+                if old_origin.removesuffix(".git") != expected.removesuffix(".git"):
+                    logger.warning(
+                        "Legacy clone %s has origin %s, expected %s — skipping migration",
+                        old_path,
+                        old_origin,
+                        expected,
+                    )
+                else:
+                    shutil.move(str(old_path), str(new_path))
+                    logger.info("Migrated clone path %s -> %s", old_path, new_path)
+            except Exception:
+                logger.warning("Could not verify origin for %s — skipping migration", old_path)
         self._old_basename = old_basename
         self.state = RepoState(
             url=repo_config.url,
