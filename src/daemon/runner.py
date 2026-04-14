@@ -1513,64 +1513,85 @@ return 0
         number = self.state.current_pr.number
         pr_branch = self.state.current_pr.branch
         base = self.repo_config.branch
-        try:
-            subprocess.run(
-                ["git", "fetch", "origin", base],
-                capture_output=True, text=True, timeout=60,
-                check=True, cwd=self.repo_path,
-            )
-            subprocess.run(
-                ["git", "checkout", pr_branch],
-                capture_output=True, text=True, timeout=30,
-                check=True, cwd=self.repo_path,
-            )
-            merge_result = subprocess.run(
-                ["git", "merge", f"origin/{base}", "--no-edit"],
-                capture_output=True, text=True, timeout=60,
-                check=False, cwd=self.repo_path,
-            )
-            if merge_result.returncode != 0:
-                if "CONFLICT" in (merge_result.stdout + merge_result.stderr):
-                    self.log_event("Merge conflict with main, resolving...")
-                    code, _stdout, _stderr = claude_cli.run_claude(
-                        "Resolve all merge conflicts in the working tree. "
-                        "Keep both sides where possible. "
-                        "Run scripts/ci.sh to verify.",
-                        self.repo_path,
-                        timeout=300,
-                    )
-                    if code != 0:
-                        subprocess.run(
-                            ["git", "merge", "--abort"],
-                            capture_output=True, text=True, timeout=30,
-                            check=False, cwd=self.repo_path,
+        # Cross-repo (fork) PRs: the head branch lives on the
+        # contributor's fork and is not writable via ``origin``, so
+        # local fetch/checkout/push of ``pr_branch`` would fail. Skip
+        # the sync and rely on ``gh pr merge`` (which handles forks)
+        # below. Mirrors the cross-repo guard in ``handle_fix``.
+        if not self.state.current_pr.is_cross_repository:
+            try:
+                # Fetch both base and the PR head. Without the head
+                # refresh, a stale local ``pr_branch`` (e.g. after
+                # daemon restart + ``recover_state`` resuming WATCH)
+                # causes a non-fast-forward on push and blocks merge
+                # even when the remote PR is otherwise mergeable.
+                subprocess.run(
+                    ["git", "fetch", "origin", base, pr_branch],
+                    capture_output=True, text=True, timeout=60,
+                    check=True, cwd=self.repo_path,
+                )
+                subprocess.run(
+                    ["git", "checkout", pr_branch],
+                    capture_output=True, text=True, timeout=30,
+                    check=True, cwd=self.repo_path,
+                )
+                subprocess.run(
+                    ["git", "reset", "--hard", f"origin/{pr_branch}"],
+                    capture_output=True, text=True, timeout=30,
+                    check=True, cwd=self.repo_path,
+                )
+                merge_result = subprocess.run(
+                    ["git", "merge", f"origin/{base}", "--no-edit"],
+                    capture_output=True, text=True, timeout=60,
+                    check=False, cwd=self.repo_path,
+                )
+                if merge_result.returncode != 0:
+                    if "CONFLICT" in (
+                        merge_result.stdout + merge_result.stderr
+                    ):
+                        self.log_event(
+                            "Merge conflict with main, resolving..."
                         )
+                        code, _stdout, _stderr = claude_cli.run_claude(
+                            "Resolve all merge conflicts in the working "
+                            "tree. Keep both sides where possible. "
+                            "Run scripts/ci.sh to verify.",
+                            self.repo_path,
+                            timeout=300,
+                        )
+                        if code != 0:
+                            subprocess.run(
+                                ["git", "merge", "--abort"],
+                                capture_output=True, text=True,
+                                timeout=30, check=False,
+                                cwd=self.repo_path,
+                            )
+                            self.state.state = PipelineState.ERROR
+                            self.state.error_message = (
+                                "Merge conflict resolution failed"
+                            )
+                            self.log_event(self.state.error_message)
+                            return
+                    else:
                         self.state.state = PipelineState.ERROR
                         self.state.error_message = (
-                            "Merge conflict resolution failed"
+                            f"git merge origin/{base} failed: "
+                            f"{merge_result.stderr.strip()}"
                         )
                         self.log_event(self.state.error_message)
                         return
-                else:
-                    self.state.state = PipelineState.ERROR
-                    self.state.error_message = (
-                        f"git merge origin/{base} failed: "
-                        f"{merge_result.stderr.strip()}"
-                    )
-                    self.log_event(self.state.error_message)
-                    return
 
-            subprocess.run(
-                ["git", "push", "origin", pr_branch],
-                capture_output=True, text=True, timeout=60,
-                check=True, cwd=self.repo_path,
-            )
-        except (subprocess.CalledProcessError,
-                subprocess.TimeoutExpired, OSError) as exc:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = f"Pre-merge sync failed: {exc}"
-            self.log_event(self.state.error_message)
-            return
+                subprocess.run(
+                    ["git", "push", "origin", pr_branch],
+                    capture_output=True, text=True, timeout=60,
+                    check=True, cwd=self.repo_path,
+                )
+            except (subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired, OSError) as exc:
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = f"Pre-merge sync failed: {exc}"
+                self.log_event(self.state.error_message)
+                return
 
         self.log_event(f"Merging PR #{number}")
         try:

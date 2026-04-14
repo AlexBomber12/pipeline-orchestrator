@@ -1307,6 +1307,101 @@ def test_handle_merge_resolves_conflict(
     assert merge_pr_calls == [(runner.owner_repo, 5)]
 
 
+def test_handle_merge_skips_sync_for_cross_repo_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fork-based PRs: the head branch is on the contributor's fork,
+    not origin. Any local push of the head branch would fail. Skip the
+    pre-merge sync entirely and defer to gh pr merge."""
+    git_calls: list[list[str]] = []
+
+    def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append(cmd)
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+
+    merge_pr_calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "merge_pr",
+        lambda repo, num: merge_pr_calls.append((repo, num)),
+    )
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=5, branch="pr-001", is_cross_repository=True
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert merge_pr_calls == [(runner.owner_repo, 5)]
+    assert not any(
+        cmd[:2] == ["git", "push"] and "pr-001" in cmd for cmd in git_calls
+    ), "cross-repo PRs must not push the head branch to origin"
+    assert not any(
+        cmd[:2] == ["git", "merge"] and "origin/main" in cmd
+        for cmd in git_calls
+    ), "cross-repo PRs must not merge base locally"
+
+
+def test_handle_merge_refreshes_pr_head_before_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a daemon restart, the local PR branch may lag behind
+    origin (recover_state resumes WATCH with a stale checkout). The
+    sync must fetch origin/<pr_branch> and reset the local branch to
+    it, or the subsequent push will be rejected as non-fast-forward."""
+    git_calls: list[list[str]] = []
+
+    def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append(cmd)
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+    monkeypatch.setattr(
+        runner_module.github_client, "merge_pr", lambda repo, num: None
+    )
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_merge())
+
+    fetch_cmds = [cmd for cmd in git_calls if cmd[:3] == ["git", "fetch",
+                                                          "origin"]]
+    assert fetch_cmds and any("pr-001" in cmd for cmd in fetch_cmds), (
+        "must fetch origin/<pr_branch> before local merge"
+    )
+    reset_cmds = [
+        cmd for cmd in git_calls
+        if cmd[:3] == ["git", "reset", "--hard"] and "origin/pr-001" in cmd
+    ]
+    assert reset_cmds, "must reset local PR branch to origin/<pr_branch>"
+
+    reset_idx = git_calls.index(reset_cmds[0])
+    merge_idx = next(
+        i for i, cmd in enumerate(git_calls)
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd
+    )
+    assert reset_idx < merge_idx, (
+        "reset to origin/<pr_branch> must happen before merging base"
+    )
+
+
 def test_handle_merge_aborts_on_unresolvable_conflict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
