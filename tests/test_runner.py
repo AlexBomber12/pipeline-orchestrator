@@ -853,7 +853,7 @@ def test_handle_watch_approved_and_green_merges(
 
     monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge)
     monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: True
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
     )
 
     runner = _make_runner()
@@ -1232,7 +1232,7 @@ def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None
         runner_module.github_client, "merge_pr", lambda repo, num: None
     )
     monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: True
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
     )
 
     runner = _make_runner()
@@ -1248,15 +1248,24 @@ def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None
     assert runner.state.current_task is None
 
 
-def test_handle_merge_errors_on_queue_sync_failure(
+def test_handle_merge_queue_sync_failure_still_goes_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """When _mark_queue_done raises, handle_merge catches the exception
+    and still transitions to IDLE. The pending_queue_sync_branch marker
+    (set eagerly inside _mark_queue_done) gates handle_idle from
+    re-dispatching the same task."""
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.github_client, "merge_pr", lambda repo, num: None
     )
+
+    def _failing_mark(self: Any) -> None:
+        self.state.pending_queue_sync_branch = "queue-done-pr-001"
+        raise RuntimeError("push rejected")
+
     monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: False
+        runner_module.PipelineRunner, "_mark_queue_done", _failing_mark
     )
 
     runner = _make_runner()
@@ -1267,8 +1276,8 @@ def test_handle_merge_errors_on_queue_sync_failure(
     )
     asyncio.run(runner.handle_merge())
 
-    assert runner.state.state == PipelineState.ERROR
-    assert "QUEUE.md sync failed" in (runner.state.error_message or "")
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
 
 
 def test_mark_queue_done_direct_push(
@@ -1311,21 +1320,30 @@ def test_mark_queue_done_direct_push(
     )
 
 
-def test_mark_queue_done_tolerates_push_failure(
+def test_mark_queue_done_falls_back_to_pr_on_push_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Push failure is logged as a warning, not raised."""
+    """When direct push to base is rejected, _mark_queue_done falls
+    back to a remediation PR and sets pending_queue_sync_branch."""
     queue_dir = tmp_path / "tasks"
     queue_dir.mkdir()
     queue_path = queue_dir / "QUEUE.md"
     queue_path.write_text("## PR-001: first\n- Status: DOING\n")
 
-    def fail_push(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        if cmd[:2] == ["git", "push"]:
-            raise subprocess.CalledProcessError(1, cmd, stderr="push failed")
+    def fail_base_push(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "push"] and "main" in cmd:
+            return _FakeCompletedProcess(
+                args=cmd, returncode=1, stderr="push rejected"
+            )
         return _FakeCompletedProcess(args=cmd, returncode=0)
 
-    monkeypatch.setattr(runner_module.subprocess, "run", fail_push)
+    monkeypatch.setattr(runner_module.subprocess, "run", fail_base_push)
+
+    gh_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        runner_module.github_client, "run_gh",
+        lambda cmd, **kw: gh_calls.append(cmd),
+    )
 
     runner = _make_runner()
     runner.repo_path = str(tmp_path)
@@ -1334,7 +1352,8 @@ def test_mark_queue_done_tolerates_push_failure(
     )
 
     runner._mark_queue_done()
-    assert runner.state.state != PipelineState.ERROR
+    assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
+    assert any("pr" in c and "create" in c for c in gh_calls)
 
 
 def test_handle_merge_failure_sets_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1377,7 +1396,7 @@ def test_handle_merge_syncs_with_main(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge_pr)
     monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: True
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
     )
 
     runner = _make_runner()
@@ -1580,7 +1599,7 @@ def test_handle_merge_skips_sync_for_cross_repo_pr(
         lambda repo, num: merge_pr_calls.append((repo, num)),
     )
     monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: True
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
     )
 
     runner = _make_runner()
@@ -1627,7 +1646,7 @@ def test_handle_merge_refreshes_pr_head_before_merge(
         lambda repo, num, body: None,
     )
     monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: True
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
     )
 
     runner = _make_runner()
