@@ -1706,6 +1706,11 @@ return 0
             raise
 
         _git(self.repo_path, "checkout", base, check=False)
+        _git(
+            self.repo_path,
+            "reset", "--hard", f"origin/{base}",
+            check=False,
+        )
         self.log_event(
             f"Opened queue-done PR for {pr_id} "
             f"(branch {remediation_branch}); awaiting auto-merge"
