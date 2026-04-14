@@ -1278,6 +1278,67 @@ def test_handle_merge_opens_queue_done_pr_without_waiting(
     )
 
 
+def test_mark_queue_done_marker_set_before_first_git_op(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A git fetch/checkout/reset failure before QUEUE.md is even read
+    must still leave ``pending_queue_sync_branch`` set so the next
+    IDLE cycle cannot re-pick the just-merged task."""
+    def fail_fetch(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:3] == ["git", "fetch", "origin"]:
+            raise subprocess.CalledProcessError(1, cmd, stderr="fetch failed")
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fail_fetch)
+    monkeypatch.setattr(
+        runner_module.github_client, "run_gh",
+        lambda *a, **k: "",
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="first", status=TaskStatus.DOING
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        runner._mark_queue_done()
+
+    assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
+    assert runner.state.pending_queue_sync_started_at is not None
+
+
+def test_mark_queue_done_clears_marker_when_queue_already_done(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No remediation is needed when QUEUE.md already has the task
+    marked DONE — the marker must be cleared so handle_idle does not
+    pointlessly gate future cycles."""
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "QUEUE.md"
+    queue_path.write_text("## PR-001: first\n- Status: DONE\n")
+
+    monkeypatch.setattr(
+        runner_module.subprocess, "run",
+        lambda cmd, **kw: _FakeCompletedProcess(args=cmd, returncode=0),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "run_gh",
+        lambda *a, **k: "",
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="first", status=TaskStatus.DOING
+    )
+
+    runner._mark_queue_done()
+    assert runner.state.pending_queue_sync_branch is None
+    assert runner.state.pending_queue_sync_started_at is None
+
+
 def test_handle_merge_stays_idle_when_queue_sync_setup_fails(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -1561,45 +1561,58 @@ return 0
         pr_id = self.state.current_task.pr_id
         base = self.repo_config.branch
 
-        subprocess.run(
-            ["git", "fetch", "origin", base],
-            capture_output=True, text=True, timeout=30,
-            check=True, cwd=self.repo_path,
-        )
-        subprocess.run(
-            ["git", "checkout", base],
-            capture_output=True, text=True, timeout=30,
-            check=True, cwd=self.repo_path,
-        )
-        subprocess.run(
-            ["git", "reset", "--hard", f"origin/{base}"],
-            capture_output=True, text=True, timeout=30,
-            check=True, cwd=self.repo_path,
-        )
-
-        queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
-        if not queue_path.exists():
-            return
-        content = queue_path.read_text()
-
-        updated = mark_task_done(content, pr_id)
-        if updated is None or updated == content:
-            return
-
         import re as _re
         slug = _re.sub(r"[^a-z0-9-]", "-", pr_id.lower())
         remediation_branch = f"queue-done-{slug}"
 
-        # Set the marker before any remote operation so that a partial
-        # failure (e.g. push rejected, pr create errored) still leaves
-        # the runner gated by ``_resolve_pending_queue_sync`` instead
-        # of silently racing with the next IDLE cycle. The resolution
-        # loop handles the "branch/PR missing" case by returning False
-        # each cycle until the deadline escalates to ERROR.
+        # Set the marker before ANY git or GitHub operation so an
+        # early failure (git fetch timeout, checkout/reset error,
+        # push rejected, pr create errored, ...) still leaves the
+        # runner gated by ``_resolve_pending_queue_sync`` instead of
+        # silently racing with the next IDLE cycle. The resolution
+        # loop handles the "branch/PR missing" case by returning
+        # False each cycle until the deadline escalates to ERROR. It
+        # is only cleared below once we have confirmed that no
+        # remediation is actually required (QUEUE.md already DONE or
+        # missing entirely).
         self.state.pending_queue_sync_branch = remediation_branch
         self.state.pending_queue_sync_started_at = datetime.now(timezone.utc)
 
         try:
+            subprocess.run(
+                ["git", "fetch", "origin", base],
+                capture_output=True, text=True, timeout=30,
+                check=True, cwd=self.repo_path,
+            )
+            subprocess.run(
+                ["git", "checkout", base],
+                capture_output=True, text=True, timeout=30,
+                check=True, cwd=self.repo_path,
+            )
+            subprocess.run(
+                ["git", "reset", "--hard", f"origin/{base}"],
+                capture_output=True, text=True, timeout=30,
+                check=True, cwd=self.repo_path,
+            )
+
+            queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
+            if not queue_path.exists():
+                # No QUEUE.md on base — nothing to remediate. Safe to
+                # clear the marker because we definitively observed
+                # the queue file's absence.
+                self.state.pending_queue_sync_branch = None
+                self.state.pending_queue_sync_started_at = None
+                return
+            content = queue_path.read_text()
+
+            updated = mark_task_done(content, pr_id)
+            if updated is None or updated == content:
+                # Task is already DONE (or has no rewritable status
+                # line) on base. Clear the marker.
+                self.state.pending_queue_sync_branch = None
+                self.state.pending_queue_sync_started_at = None
+                return
+
             subprocess.run(
                 ["git", "checkout", "-B", remediation_branch],
                 capture_output=True, text=True, timeout=30,
