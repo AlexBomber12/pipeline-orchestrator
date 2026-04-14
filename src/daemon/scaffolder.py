@@ -93,6 +93,10 @@ def ensure_claude_md(repo_path: str, branch: str) -> bool:
         _run_git(
             repo_path, "symbolic-ref", "HEAD", f"refs/heads/{branch}"
         )
+    _run_git(repo_path, "reset", "--hard", f"origin/{branch}")
+    claude = repo / "CLAUDE.md"
+    if claude.exists():
+        return False
     _copy_template("CLAUDE.md", claude)
     try:
         _run_git(repo_path, "add", "CLAUDE.md")
