@@ -63,6 +63,54 @@ def _run_git(
     )
 
 
+def ensure_claude_md(repo_path: str, branch: str) -> bool:
+    """Create ``CLAUDE.md`` from the template if it is missing on disk.
+
+    This is a lightweight backfill for repos that were scaffolded before
+    ``CLAUDE.md`` existed. The file is staged, committed, and pushed to
+    ``branch`` so the worktree stays clean for preflight checks.
+
+    Returns ``True`` if the file was created, ``False`` otherwise.
+    """
+    repo = Path(repo_path)
+    if not repo.exists():
+        return False
+    claude = repo / "CLAUDE.md"
+    if claude.exists():
+        return False
+    try:
+        _run_git(
+            repo_path, "cat-file", "-e", f"origin/{branch}:CLAUDE.md"
+        )
+        return False
+    except subprocess.CalledProcessError:
+        pass
+    try:
+        _run_git(repo_path, "checkout", branch)
+    except subprocess.CalledProcessError:
+        if not _head_is_unborn(repo_path):
+            raise
+        _run_git(
+            repo_path, "symbolic-ref", "HEAD", f"refs/heads/{branch}"
+        )
+    _run_git(repo_path, "reset", "--hard", f"origin/{branch}")
+    claude = repo / "CLAUDE.md"
+    if claude.exists():
+        return False
+    _copy_template("CLAUDE.md", claude)
+    try:
+        _run_git(repo_path, "add", "CLAUDE.md")
+        _run_git(repo_path, "commit", "-m", "chore: backfill CLAUDE.md")
+        _run_git(
+            repo_path, "push", "origin", branch, timeout=_PUSH_GIT_TIMEOUT
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        logger.warning("ensure_claude_md push failed (branch protection?): %s", exc)
+        _run_git(repo_path, "reset", "--hard", f"origin/{branch}")
+        return False
+    return True
+
+
 def _head_is_unborn(repo_path: str) -> bool:
     """Return ``True`` if ``repo_path`` has no commits on any branch.
 
@@ -212,6 +260,9 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
     if not agents.exists() and not claude.exists():
         _copy_template("AGENTS.md", agents)
         created.append("AGENTS.md")
+    if not claude.exists():
+        _copy_template("CLAUDE.md", claude)
+        created.append("CLAUDE.md")
 
     tasks_dir = repo / "tasks"
     if not tasks_dir.exists():
