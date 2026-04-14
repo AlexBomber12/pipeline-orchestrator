@@ -3692,3 +3692,108 @@ def test_recover_state_rehydrates_last_push_at(
     assert runner.state.state == PipelineState.WATCH
     assert runner._last_push_at is not None
     assert runner._last_push_at.isoformat() == "2026-04-10T12:00:00+00:00"
+
+
+def test_rehydrate_replaces_last_push_at_on_different_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Switching from PR A's timestamp to PR B must unconditionally
+    replace — the 'only update if newer' gate is safe only within one
+    PR. A newer-timestamp leak from the previous PR would make legit
+    feedback on the new PR look stale."""
+    head_iso = "2026-04-10T12:00:00Z"
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_head_commit_iso",
+        lambda repo, number: head_iso,
+    )
+    runner = _make_runner()
+    # Simulate a stale last_push_at from a previously-tracked PR (newer
+    # timestamp than the new PR's head commit).
+    runner._last_push_at = datetime(2026, 4, 20, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 999
+
+    runner._rehydrate_last_push_at(PRInfo(number=42, branch="pr-new"))
+
+    assert runner._last_push_at_pr_number == 42
+    assert runner._last_push_at is not None
+    assert runner._last_push_at.isoformat() == "2026-04-10T12:00:00+00:00"
+
+
+def test_handle_watch_falls_through_for_fork_with_ci_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CI failure on a fork PR must NOT call handle_fix (which would no-op
+    and create a skip loop). It must fall through to the waiting/timeout
+    logic so the PR can escalate to HUNG."""
+    past = datetime.now(timezone.utc) - timedelta(hours=2)
+    pr = PRInfo(
+        number=88,
+        branch="fork:feature",
+        ci_status=CIStatus.FAILURE,
+        review_status=ReviewStatus.PENDING,
+        last_activity=past,
+        is_cross_repository=True,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_head_commit_iso",
+        lambda repo, number: "",
+    )
+    fix_called: list[bool] = []
+
+    async def fake_fix() -> None:
+        fix_called.append(True)
+
+    runner = _make_runner(review_timeout_min=30)
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.handle_fix = fake_fix  # type: ignore[assignment]
+    asyncio.run(runner.handle_watch())
+
+    assert fix_called == []
+    assert runner.state.state == PipelineState.HUNG
+
+
+def test_handle_watch_falls_through_for_fork_with_changes_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CHANGES_REQUESTED on a fork PR must also fall through to timeout
+    instead of being routed into handle_fix (even with fresh feedback)."""
+    past = datetime.now(timezone.utc) - timedelta(hours=2)
+    pr = PRInfo(
+        number=88,
+        branch="fork:feature",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=past,
+        is_cross_repository=True,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_head_commit_iso",
+        lambda repo, number: "",
+    )
+    fix_called: list[bool] = []
+
+    async def fake_fix() -> None:
+        fix_called.append(True)
+
+    runner = _make_runner(review_timeout_min=30)
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.handle_fix = fake_fix  # type: ignore[assignment]
+    asyncio.run(runner.handle_watch())
+
+    assert fix_called == []
+    assert runner.state.state == PipelineState.HUNG

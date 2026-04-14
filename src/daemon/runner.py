@@ -331,6 +331,15 @@ class PipelineRunner:
         # time Codex posts, masking whether Codex feedback is fresher
         # than our last push).
         self._last_push_at: datetime | None = None
+        # PR number the ``_last_push_at`` timestamp belongs to. Without
+        # this, a stale timestamp from a prior PR leaks into freshness
+        # checks on a newly-tracked PR — e.g. finishing PR-A and then
+        # recovering an older PR-B. Any mismatch forces
+        # ``_rehydrate_last_push_at`` to unconditionally replace both
+        # fields with the new PR's baseline, instead of keeping the
+        # newer-but-wrong timestamp under the "only update if newer"
+        # gate.
+        self._last_push_at_pr_number: int | None = None
 
     async def publish_state(self) -> None:
         """Serialize ``self.state`` and write it to Redis."""
@@ -1307,10 +1316,23 @@ return 0
                     "awaiting manual merge"
                 )
             return
-        if ci == CIStatus.FAILURE:
+        # Fork (cross-repo) PRs can't be fixed locally — the head branch
+        # lives on the contributor's remote. Routing them into handle_fix
+        # (which would no-op and return to WATCH) creates a poll-rate skip
+        # loop that never reaches the timeout/HUNG escalation below. Fall
+        # through to the waiting logic instead so fork PRs eventually flip
+        # to HUNG and surface for operator action.
+        if found.is_cross_repository:
+            if ci == CIStatus.FAILURE or review == ReviewStatus.CHANGES_REQUESTED:
+                self.log_event(
+                    f"PR #{found.number} fork PR cannot be auto-fixed "
+                    f"(review={review.value}, ci={ci.value}); "
+                    "waiting for review timeout"
+                )
+        elif ci == CIStatus.FAILURE:
             await self.handle_fix()
             return
-        if review == ReviewStatus.CHANGES_REQUESTED:
+        elif review == ReviewStatus.CHANGES_REQUESTED:
             if self._has_new_codex_feedback_since_last_push():
                 await self.handle_fix()
                 return
@@ -1426,6 +1448,7 @@ return 0
         push_time = datetime.now(timezone.utc)
         self._last_push_at = push_time
         if self.state.current_pr is not None:
+            self._last_push_at_pr_number = self.state.current_pr.number
             self.state.current_pr.push_count += 1
             self.state.current_pr.last_activity = push_time
             iteration = self.state.current_pr.push_count
@@ -1937,6 +1960,15 @@ return 0
             return
         if head_time.tzinfo is None:
             head_time = head_time.replace(tzinfo=timezone.utc)
+        # Different PR: unconditionally replace. The "only update if
+        # newer" rule below is only safe when both timestamps belong
+        # to the same PR — otherwise a stale last_push_at from a
+        # previously-tracked PR would leak into the new PR's
+        # freshness check and silently skip legitimate feedback.
+        if self._last_push_at_pr_number != pr.number:
+            self._last_push_at = head_time
+            self._last_push_at_pr_number = pr.number
+            return
         if self._last_push_at is None or head_time > self._last_push_at:
             self._last_push_at = head_time
 
