@@ -507,6 +507,7 @@ class PipelineRunner:
             except (
                 subprocess.CalledProcessError,
                 subprocess.TimeoutExpired,
+                OSError,
             ) as exc:
                 raise RuntimeError(
                     f"CLAUDE.md backfill failed: {exc}"
