@@ -137,9 +137,18 @@ def get_pr_review_status(
             codex_contents = {r.get("content") for r in codex_reactions}
             if "+1" in codex_contents:
                 if head_sha:
-                    reviewed_sha = _get_latest_codex_reviewed_sha(repo, pr_number)
-                    if reviewed_sha and not head_sha.startswith(reviewed_sha) and not reviewed_sha.startswith(head_sha):
-                        pass  # stale: reviewed a different commit
+                    plus_one = _find_codex_plus_one_reaction(issue_reactions)
+                    if plus_one:
+                        reaction_time = _parse_iso(plus_one.get("created_at"))
+                        head_commit_time = _get_commit_time(repo, head_sha)
+                        if (
+                            reaction_time
+                            and head_commit_time
+                            and reaction_time > head_commit_time
+                        ):
+                            body_approved = True
+                        elif not head_commit_time:
+                            body_approved = True
                     else:
                         body_approved = True
                 else:
@@ -366,24 +375,31 @@ def _gh_api_paginated(path: str) -> list[dict] | None:
     return items
 
 
-def _get_latest_codex_reviewed_sha(repo: str, pr_number: int) -> str:
-    """Return the commit SHA from the most recent Codex review, or empty string."""
-    try:
-        reviews = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/reviews")
-    except RuntimeError as exc:
-        if "HTTP 404" not in str(exc):
-            raise
-        return ""
-    if not reviews:
-        return ""
-    for review in reversed(reviews):
-        user = (review.get("user") or {}).get("login", "") or ""
-        if "codex" not in user.lower():
+def _find_codex_plus_one_reaction(reactions: list[dict]) -> dict | None:
+    """Return the most recent +1 reaction from a Codex user, or None."""
+    best: dict | None = None
+    for r in reactions:
+        if not isinstance(r, dict):
             continue
-        sha = review.get("commit_id") or ""
-        if sha:
-            return sha
-    return ""
+        login = ((r.get("user") or {}).get("login", "")).lower()
+        if "codex" not in login:
+            continue
+        if r.get("content") != "+1":
+            continue
+        if best is None or (r.get("created_at") or "") > (best.get("created_at") or ""):
+            best = r
+    return best
+
+
+def _get_commit_time(repo: str, sha: str) -> datetime | None:
+    """Return the committer date of a commit, or None on failure."""
+    try:
+        raw = run_gh(
+            ["api", f"repos/{repo}/commits/{sha}", "--jq", ".commit.committer.date"]
+        )
+    except RuntimeError:
+        return None
+    return _parse_iso(raw.strip() if isinstance(raw, str) else "")
 
 
 def _ci_status_from_rollup(rollup: object) -> CIStatus:

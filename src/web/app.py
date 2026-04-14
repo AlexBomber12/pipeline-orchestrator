@@ -736,6 +736,8 @@ async def put_settings_daemon(
     review_timeout_min: str | None = Form(None),
     hung_fallback_codex_review: str | None = Form(None),
     error_handler_use_ai: str | None = Form(None),
+    planned_pr_timeout_sec: str | None = Form(None),
+    fix_review_timeout_sec: str | None = Form(None),
 ) -> HTMLResponse:
     """Update daemon settings.
 
@@ -766,6 +768,20 @@ async def put_settings_daemon(
         if error_handler_use_ai is not None and error_handler_use_ai != "":
             updates["error_handler_use_ai"] = _coerce_bool(
                 error_handler_use_ai, "error_handler_use_ai"
+            )
+        if (
+            planned_pr_timeout_sec is not None
+            and planned_pr_timeout_sec != ""
+        ):
+            updates["planned_pr_timeout_sec"] = _coerce_int(
+                planned_pr_timeout_sec, "planned_pr_timeout_sec", min_value=1
+            )
+        if (
+            fix_review_timeout_sec is not None
+            and fix_review_timeout_sec != ""
+        ):
+            updates["fix_review_timeout_sec"] = _coerce_int(
+                fix_review_timeout_sec, "fix_review_timeout_sec", min_value=1
             )
     except ValueError as exc:
         return _render_settings_daemon_error(request, str(exc), 422)

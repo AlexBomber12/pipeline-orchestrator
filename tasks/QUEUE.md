@@ -216,7 +216,7 @@
 - Depends on: PR-035
 
 ## PR-041: Smart error handling and stderr logging
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-041.md
 - Branch: pr-041-smart-errors
 - Depends on: PR-036

@@ -318,6 +318,11 @@ class PipelineRunner:
         # no longer requires operator intervention. Reset to 0 on any
         # clean preflight or after a successful auto-reset.
         self._consecutive_dirty_cycles = 0
+        # Consecutive AI-diagnosis attempts in ``handle_error``. Capped
+        # so a persistent ERROR cannot spin forever on infrastructure
+        # the CLI cannot classify. Reset on any transition out of
+        # ERROR (IDLE/FIX verdicts, successful recovery).
+        self._error_diagnose_count = 0
 
     async def publish_state(self) -> None:
         """Serialize ``self.state`` and write it to Redis."""
@@ -331,24 +336,25 @@ class PipelineRunner:
             payload = self.state.model_dump_json()
         await self.redis.set(f"pipeline:{self.name}", payload)
 
-    async def _save_cli_log(self, stdout: str, label: str) -> None:
+    async def _save_cli_log(self, stdout: str, stderr: str, label: str) -> None:
         _MAX_CLI_LOG_BYTES = 64 * 1024  # 64 KB cap per entry
         ts = datetime.now(timezone.utc).isoformat()
         key_latest = f"cli_log:{self.name}:latest"
         key_history = f"cli_log:{self.name}:{ts}"
         marker = "[truncated]\n"
-        raw = stdout.encode("utf-8", errors="replace")
+        combined = f"=== STDOUT ===\n{stdout}\n\n=== STDERR ===\n{stderr}"
+        raw = combined.encode("utf-8", errors="replace")
         if len(raw) > _MAX_CLI_LOG_BYTES:
             tail_budget = _MAX_CLI_LOG_BYTES - len(marker.encode("utf-8"))
             raw = raw[-tail_budget:]
-            stdout = marker + raw.decode("utf-8", errors="replace")
+            combined = marker + raw.decode("utf-8", errors="replace")
         try:
-            await self.redis.set(key_latest, stdout, ex=3600)
-            await self.redis.set(key_history, stdout, ex=86400)
+            await self.redis.set(key_latest, combined, ex=3600)
+            await self.redis.set(key_history, combined, ex=86400)
         except Exception:
             logger.warning("Failed to save CLI log for %s", self.name)
-        if stdout.strip():
-            first_lines = stdout.strip()[:200]
+        if combined.strip():
+            first_lines = combined.strip()[:200]
             self.log_event(f"{label}: {first_lines}")
 
     def log_event(self, event: str) -> None:
@@ -761,6 +767,7 @@ class PipelineRunner:
         self.state.error_message = None
         self.state.current_task = None
         self.state.current_pr = None
+        self._error_diagnose_count = 0
 
         if prs:
             self.log_event(
@@ -1091,6 +1098,7 @@ return 0
 
     async def handle_idle(self) -> None:
         """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
+        self._error_diagnose_count = 0
         # A queue-sync remediation PR may still be unmerged from a prior
         # cycle. Resolve it before picking a new task so the daemon does
         # not re-run a task whose DONE status has not yet landed on
@@ -1196,9 +1204,11 @@ return 0
             return
 
         code, stdout, stderr = claude_cli.run_planned_pr(
-            self.repo_path, model=self.app_config.daemon.claude_model
+            self.repo_path,
+            model=self.app_config.daemon.claude_model,
+            timeout=self.app_config.daemon.planned_pr_timeout_sec,
         )
-        await self._save_cli_log(stdout, "PLANNED PR output")
+        await self._save_cli_log(stdout, stderr, "PLANNED PR output")
         if code != 0:
             self.state.state = PipelineState.ERROR
             self.state.error_message = stderr.strip() or f"claude exit {code}"
@@ -1279,8 +1289,17 @@ return 0
                     "awaiting manual merge"
                 )
             return
-        if review == ReviewStatus.CHANGES_REQUESTED or ci == CIStatus.FAILURE:
+        if ci == CIStatus.FAILURE:
             await self.handle_fix()
+            return
+        if review == ReviewStatus.CHANGES_REQUESTED:
+            if self._has_new_codex_feedback_since_last_push():
+                await self.handle_fix()
+            else:
+                self.log_event(
+                    f"PR #{found.number} CHANGES_REQUESTED but no new "
+                    "Codex feedback since last push; waiting for fresh review"
+                )
             return
 
         # Any remaining combination is a waiting state that should still be
@@ -1318,6 +1337,16 @@ return 0
 
     async def handle_fix(self) -> None:
         """Run ``FIX REVIEW`` via the claude CLI and return to WATCH."""
+        if (
+            self.state.current_pr is not None
+            and self.state.current_pr.is_cross_repository
+        ):
+            self.log_event(
+                f"Skipping FIX for cross-repo PR #{self.state.current_pr.number}"
+            )
+            self.state.state = PipelineState.WATCH
+            return
+
         self.state.state = PipelineState.FIX
         self.log_event("entering FIX")
         await self.publish_state()
@@ -1362,9 +1391,11 @@ return 0
                 return
 
         code, stdout, stderr = claude_cli.fix_review(
-            self.repo_path, model=self.app_config.daemon.claude_model
+            self.repo_path,
+            model=self.app_config.daemon.claude_model,
+            timeout=self.app_config.daemon.fix_review_timeout_sec,
         )
-        await self._save_cli_log(stdout, "FIX REVIEW output")
+        await self._save_cli_log(stdout, stderr, "FIX REVIEW output")
         if code != 0:
             self.state.state = PipelineState.ERROR
             self.state.error_message = stderr.strip() or f"claude exit {code}"
@@ -1850,9 +1881,61 @@ return 0
         self.state.current_task = None
         self.state.state = PipelineState.IDLE
 
+    def _has_new_codex_feedback_since_last_push(self) -> bool:
+        """Return True iff Codex posted new P1/P2 feedback after the last push.
+
+        Used by ``handle_watch`` to suppress FIX loops that would fire on
+        stale ``CHANGES_REQUESTED`` signals from a review that predates the
+        most recent fix push. Compares comment ``created_at`` against
+        ``current_pr.last_activity`` (updated on each push).
+        """
+        if self.state.current_pr is None:
+            return False
+        last_activity = self.state.current_pr.last_activity
+        if last_activity is None:
+            return True
+        if last_activity.tzinfo is None:
+            last_activity = last_activity.replace(tzinfo=timezone.utc)
+        try:
+            comments = github_client._gh_api_paginated(
+                f"repos/{self.owner_repo}/issues/"
+                f"{self.state.current_pr.number}/comments"
+            ) or []
+            review_comments = github_client._gh_api_paginated(
+                f"repos/{self.owner_repo}/pulls/"
+                f"{self.state.current_pr.number}/comments"
+            ) or []
+        except Exception:
+            return True
+        for c in reversed(comments + review_comments):
+            user = (c.get("user") or {}).get("login", "")
+            if "codex" not in user.lower():
+                continue
+            body = c.get("body") or ""
+            if "P1" not in body and "P2" not in body:
+                continue
+            created = github_client._parse_iso(c.get("created_at"))
+            if created is None:
+                continue
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if created > last_activity:
+                return True
+        return False
+
     async def handle_error(self, error_context: str | None = None) -> None:
         """Ask the claude CLI whether to FIX, SKIP, or ESCALATE the error."""
         context = error_context or self.state.error_message or "Unknown error"
+        lowered = context.lower()
+        if any(kw in lowered for kw in ("rate limit", "timeout", "429")):
+            self.log_event("Skipping AI diagnosis for rate-limit/timeout error")
+            return
+        self._error_diagnose_count += 1
+        if self._error_diagnose_count > 3:
+            self.log_event(
+                "diagnose_error: max attempts (3) reached, staying ERROR"
+            )
+            return
         code, stdout, stderr = claude_cli.diagnose_error(
             self.repo_path, context, model=self.app_config.daemon.claude_model
         )
@@ -1868,10 +1951,12 @@ return 0
             self.state.current_pr = None
             self.state.error_message = None
             self.state.state = PipelineState.IDLE
+            self._error_diagnose_count = 0
             self.log_event("diagnose_error: SKIP -> IDLE")
         elif verdict == "FIX":
             self.state.error_message = None
             self.state.state = PipelineState.IDLE
+            self._error_diagnose_count = 0
             summary = stdout.strip().splitlines()[-1] if stdout.strip() else ""
             self.log_event(f"diagnose_error: FIX -> IDLE ({summary[:80]})")
         else:  # ESCALATE
