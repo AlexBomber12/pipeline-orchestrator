@@ -1,5 +1,622 @@
+diff --git a/artifacts/ci.log b/artifacts/ci.log
+index dcf1801..63f3a38 100644
+--- a/artifacts/ci.log
++++ b/artifacts/ci.log
+@@ -6,10 +6,10 @@ The event loop scope for asynchronous fixtures will default to the fixture cachi
+ 
+   warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
+ ........................................................................ [ 20%]
+-........................................................................ [ 40%]
++........................................................................ [ 41%]
+ ........................................................................ [ 61%]
+-........................................................................ [ 81%]
+-.................................................................        [100%]
+-353 passed in 0.92s
++........................................................................ [ 82%]
++...............................................................          [100%]
++351 passed in 0.89s
+ ==> ci.sh OK
+ ci.sh exit code: 0
+diff --git a/artifacts/pr.patch b/artifacts/pr.patch
+index e69de29..1073603 100644
+--- a/artifacts/pr.patch
++++ b/artifacts/pr.patch
+@@ -0,0 +1,581 @@
++diff --git a/src/web/app.py b/src/web/app.py
++index 4fab686..0be38c0 100644
++--- a/src/web/app.py
+++++ b/src/web/app.py
++@@ -144,10 +144,6 @@ _ACTIVITY_FEED_LIMIT = 50
++ # never float its legacy history above genuinely new entries from other
++ # repos during a mixed-format upgrade window.
++ _FEED_UNKNOWN_TIME = datetime.min.replace(tzinfo=timezone.utc)
++-_EVENT_FILTERS = ("all", "errors", "state")
++-_EVENT_ERROR_STATES = frozenset(
++-    {PipelineState.ERROR.value, PipelineState.HUNG.value}
++-)
++ _REPO_BADGE_PALETTE = (
++     "bg-accent/15 text-accent border-accent/30",
++     "bg-ok/15 text-ok border-ok/30",
++@@ -459,47 +455,6 @@ def _compute_stats(states: list[RepoState]) -> dict[str, Any]:
++     }
++ 
++ 
++-def _filter_history(
++-    history: list[dict[str, Any]], filter_name: str
++-) -> list[dict[str, Any]]:
++-    """Return ``history`` filtered by ``filter_name`` for the repo event log.
++-
++-    * ``all`` - unchanged.
++-    * ``errors`` - only entries whose ``state`` is ``ERROR`` or ``HUNG``.
++-    * ``state`` - only entries that represent a state transition, i.e.
++-      the first entry and any entry whose state differs from the previous
++-      entry's state. This collapses long runs of same-state "progress"
++-      events (e.g. repeated ``Fix pushed, iteration #N`` lines in FIX)
++-      while still surfacing every distinct state change.
++-
++-    Any other value is treated as ``all`` to keep the HTMX handler
++-    forgiving of URL tampering.
++-    """
++-    if filter_name == "errors":
++-        return [
++-            entry
++-            for entry in history
++-            if str(entry.get("state", "")) in _EVENT_ERROR_STATES
++-        ]
++-    if filter_name == "state":
++-        filtered: list[dict[str, Any]] = []
++-        previous: str | None = None
++-        for entry in history:
++-            current = str(entry.get("state", ""))
++-            if current != previous:
++-                filtered.append(entry)
++-                previous = current
++-        return filtered
++-    return list(history)
++-
++-
++-def _normalize_event_filter(value: str | None) -> str:
++-    """Coerce a raw ``filter=`` query value to a known filter name."""
++-    if value in _EVENT_FILTERS:
++-        return value
++-    return "all"
++-
++-
++ @asynccontextmanager
++ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
++     redis_url = os.environ.get("REDIS_URL", DEFAULT_REDIS_URL)
++@@ -609,8 +564,7 @@ async def repo_detail(request: Request, name: str) -> HTMLResponse:
++         {
++             "title": name,
++             "repo": state,
++-            "events": _filter_history(list(state.history), "all"),
++-            "event_filter": "all",
+++            "events": list(state.history),
++         },
++     )
++ 
++@@ -620,10 +574,9 @@ async def partial_repo_detail(request: Request, name: str) -> HTMLResponse:
++     """Return ONLY the repo summary cards for the 5s HTMX poll.
++ 
++     Deliberately does not include the event log: the log self-polls via
++-    ``/partials/repo/{name}/events`` so the user's chosen filter tab
++-    survives across summary refreshes (an earlier revision rendered the
++-    full detail here with ``event_filter="all"`` baked in, which silently
++-    reset the tab mid-review on every tick).
+++    ``/partials/repo/{name}/events`` so its scroll position survives
+++    across summary refreshes (innerHTML swaps on the polling container
+++    would otherwise wipe the log and reset its scroll on every tick).
++     """
++     redis_client = getattr(request.app.state, "redis", None)
++     state = await get_repo_state(name, redis_client)
++@@ -638,27 +591,22 @@ async def partial_repo_detail(request: Request, name: str) -> HTMLResponse:
++     "/partials/repo/{name}/events",
++     response_class=HTMLResponse,
++ )
++-async def partial_repo_events(
++-    request: Request, name: str, filter: str | None = None
++-) -> HTMLResponse:
++-    """Return the repo event-log fragment filtered to ``filter``.
+++async def partial_repo_events(request: Request, name: str) -> HTMLResponse:
+++    """Return the list fragment swapped into the event log's scroll wrapper.
++ 
++-    Used by the filter tabs on the repo detail page. ``filter`` defaults
++-    to ``all`` when the query parameter is missing or unknown so an HTMX
++-    request without a filter value (or a tampered one) still lands on a
++-    valid view instead of 4xx-ing mid-page.
+++    The wrapper polls this endpoint every 5s with ``hx-swap="innerHTML"``,
+++    so the response is just the ``<ul>`` of entries (or the empty-state
+++    paragraph) — not the surrounding ``<section>`` — which keeps the
+++    wrapper itself mounted and its scrollTop intact across ticks.
++     """
++     redis_client = getattr(request.app.state, "redis", None)
++     state = await get_repo_state(name, redis_client)
++-    filter_name = _normalize_event_filter(filter)
++-    events = _filter_history(list(state.history), filter_name)
++     return templates.TemplateResponse(
++         request,
++-        "components/event_log.html",
+++        "components/event_list.html",
++         {
++             "repo": state,
++-            "events": events,
++-            "event_filter": filter_name,
+++            "events": list(state.history),
++         },
++     )
++ 
++diff --git a/src/web/templates/base.html b/src/web/templates/base.html
++index d6ff017..a55612f 100644
++--- a/src/web/templates/base.html
+++++ b/src/web/templates/base.html
++@@ -113,6 +113,24 @@
++         })();
++     </script>
++ 
+++    <script>
+++        function formatTimestamps() {
+++            document.querySelectorAll('[data-ts]').forEach(el => {
+++                const ts = el.dataset.ts;
+++                if (!ts) return;
+++                const dt = new Date(ts);
+++                if (isNaN(dt)) return;
+++                const diffMin = (Date.now() - dt.getTime()) / 60000;
+++                if (diffMin < 1) el.textContent = 'just now';
+++                else if (diffMin < 60) el.textContent = Math.round(diffMin) + ' min ago';
+++                else if (diffMin < 1440) el.textContent = Math.round(diffMin / 60) + 'h ago';
+++                else el.textContent = dt.toLocaleDateString([], {month: 'short', day: 'numeric'});
+++            });
+++        }
+++        document.addEventListener('DOMContentLoaded', formatTimestamps);
+++        document.body.addEventListener('htmx:afterSwap', formatTimestamps);
+++    </script>
+++
++     <script>
++         (function() {
++             const originalTitle = document.title;
++diff --git a/src/web/templates/components/event_list.html b/src/web/templates/components/event_list.html
++new file mode 100644
++index 0000000..58afeda
++--- /dev/null
+++++ b/src/web/templates/components/event_list.html
++@@ -0,0 +1,29 @@
+++{% set state_styles = {
+++    'IDLE':      {'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30'},
+++    'PREFLIGHT': {'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30'},
+++    'CODING':    {'badge': 'bg-accent/10 text-accent border-accent/30'},
+++    'WATCH':     {'badge': 'bg-warn/10 text-warn border-warn/30'},
+++    'FIX':       {'badge': 'bg-warn/10 text-warn border-warn/30'},
+++    'MERGE':     {'badge': 'bg-ok/10 text-ok border-ok/30'},
+++    'HUNG':      {'badge': 'bg-hung/10 text-hung border-hung/30'},
+++    'ERROR':     {'badge': 'bg-fail/10 text-fail border-fail/30'},
+++} %}
+++{% if events %}
+++<ul class="divide-y divide-white/5 font-mono text-xs">
+++    {% for entry in events|reverse %}
+++    {% set entry_state = entry.get('state', 'IDLE') %}
+++    {% set entry_style = state_styles.get(entry_state, state_styles['IDLE']) %}
+++    <li class="flex items-center gap-3 py-2">
+++        <span class="text-gray-500 shrink-0" data-ts="{{ entry.get('time', '') }}">
+++            {{ entry.get('time', '--:--:--') }}
+++        </span>
+++        <span class="text-[10px] font-medium px-1.5 py-0.5 rounded border {{ entry_style.badge }} shrink-0">
+++            {{ entry_state }}
+++        </span>
+++        <span class="text-gray-300 truncate">{{ entry.get('event', '') }}</span>
+++    </li>
+++    {% endfor %}
+++</ul>
+++{% else %}
+++<p class="text-gray-600 italic text-sm">No events yet</p>
+++{% endif %}
++diff --git a/src/web/templates/components/event_log.html b/src/web/templates/components/event_log.html
++index 28f064a..09ebed1 100644
++--- a/src/web/templates/components/event_log.html
+++++ b/src/web/templates/components/event_log.html
++@@ -1,61 +1,21 @@
++-{% set state_styles = {
++-    'IDLE':      {'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30'},
++-    'PREFLIGHT': {'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30'},
++-    'CODING':    {'badge': 'bg-accent/10 text-accent border-accent/30'},
++-    'WATCH':     {'badge': 'bg-warn/10 text-warn border-warn/30'},
++-    'FIX':       {'badge': 'bg-warn/10 text-warn border-warn/30'},
++-    'MERGE':     {'badge': 'bg-ok/10 text-ok border-ok/30'},
++-    'HUNG':      {'badge': 'bg-hung/10 text-hung border-hung/30'},
++-    'ERROR':     {'badge': 'bg-fail/10 text-fail border-fail/30'},
++-} %}
++-{% set filters = [
++-    ('all',    'All'),
++-    ('errors', 'Errors'),
++-    ('state',  'State changes'),
++-] %}
++-{# The section self-polls every 5s via hx-swap="outerHTML". Its hx-vals
++-   carries the currently-active filter so that the periodic poll keeps
++-   whichever filter the user clicked last — without this, the 5s poll
++-   from repo.html re-rendered the whole detail with event_filter="all"
++-   and silently reset the tab selection mid-review. #}
++-<section id="repo-event-log"
++-         class="rounded-lg border border-white/5 bg-surface-2 p-5"
++-         hx-get="/partials/repo/{{ repo.name }}/events"
++-         hx-trigger="every 5s"
++-         hx-swap="outerHTML"
++-         hx-vals='{"filter": "{{ event_filter }}"}'>
++-    <div class="flex flex-wrap items-center gap-3 mb-3">
+++{# Top-level event log rendered on the full repo detail page.
+++
+++   The wrapper div below is the swap target for the 5s poll of
+++   /partials/repo/{name}/events. Its innerHTML is replaced with the
+++   rendered event_list.html fragment, so the wrapper itself (and its
+++   scroll position) is preserved across ticks. #}
+++<section id="repo-event-log" class="rounded-lg border border-white/5 bg-surface-2 p-5">
+++    <div class="flex items-center gap-3 mb-3">
++         <h3 class="text-sm font-semibold text-gray-300">Event log</h3>
++         <span class="font-mono text-xs text-gray-500">{{ events|length }} events</span>
++-        <div class="ml-auto flex items-center gap-1">
++-            {% for slug, label in filters %}
++-            {% set active = (slug == event_filter) %}
++-            <button type="button"
++-                    hx-get="/partials/repo/{{ repo.name }}/events?filter={{ slug }}"
++-                    hx-target="#repo-event-log"
++-                    hx-swap="outerHTML"
++-                    class="text-[10px] font-medium px-2 py-1 rounded border transition-colors
++-                           {% if active %}bg-accent/10 text-accent border-accent/30{% else %}bg-surface-3 text-gray-400 border-white/5 hover:text-gray-200 hover:border-white/10{% endif %}">
++-                {{ label }}
++-            </button>
++-            {% endfor %}
++-        </div>
++     </div>
++-    {% if events %}
++-    <ul class="max-h-96 overflow-y-auto divide-y divide-white/5 font-mono text-xs">
++-        {% for entry in events|reverse %}
++-        {% set entry_state = entry.get('state', 'IDLE') %}
++-        {% set entry_style = state_styles.get(entry_state, state_styles['IDLE']) %}
++-        <li class="flex items-center gap-3 py-2">
++-            <span class="text-gray-500 shrink-0">{{ entry.get('time', '--:--:--') }}</span>
++-            <span class="text-[10px] font-medium px-1.5 py-0.5 rounded border {{ entry_style.badge }} shrink-0">
++-                {{ entry_state }}
++-            </span>
++-            <span class="text-gray-300 truncate">{{ entry.get('event', '') }}</span>
++-        </li>
++-        {% endfor %}
++-    </ul>
++-    {% else %}
++-    <p class="text-gray-600 italic text-sm">No events yet</p>
++-    {% endif %}
+++    <div id="event-list-wrapper-{{ repo.name }}"
+++         class="max-h-96 overflow-y-auto"
+++         hx-get="/partials/repo/{{ repo.name }}/events"
+++         hx-trigger="every 5s"
+++         hx-swap="innerHTML"
+++         hx-on::before-swap="this._scrollPos = this.scrollTop"
+++         hx-on::after-swap="this.scrollTop = this._scrollPos">
+++        {% include "components/event_list.html" %}
+++    </div>
++ </section>
++diff --git a/src/web/templates/components/repo_cards.html b/src/web/templates/components/repo_cards.html
++index 4cd93b7..0372e40 100644
++--- a/src/web/templates/components/repo_cards.html
+++++ b/src/web/templates/components/repo_cards.html
++@@ -35,7 +35,8 @@
++     {% for repo in repos %}
++     {% set style = state_styles.get(repo.state.value, state_styles['IDLE']) %}
++     {% set is_error = repo.state.value == 'ERROR' %}
++-    <div class="rounded-lg border bg-surface-2 p-4 {{ 'border-l-2 border-l-fail border-white/5' if is_error else 'border-white/5' }}">
+++    <div class="rounded-lg border bg-surface-2 p-4 cursor-pointer hover:border-white/10 transition-colors {{ 'border-l-2 border-l-fail border-white/5' if is_error else 'border-white/5' }}"
+++         onclick="if(!event.target.closest('label,input,button,a')){window.location='/repo/{{ repo.name }}'}">
++         {# Header row #}
++         <div class="flex items-center justify-between mb-3">
++             <div class="flex items-center gap-2 min-w-0">
++diff --git a/src/web/templates/components/repo_summary.html b/src/web/templates/components/repo_summary.html
++index bc654ea..a758986 100644
++--- a/src/web/templates/components/repo_summary.html
+++++ b/src/web/templates/components/repo_summary.html
++@@ -33,7 +33,7 @@
++         {{ repo.state.value }}
++     </span>
++     <span class="ml-auto font-mono text-xs text-gray-500">
++-        updated {{ repo.last_updated.strftime('%Y-%m-%d %H:%M:%S') }}
+++        updated <span data-ts="{{ repo.last_updated.isoformat() if repo.last_updated else '' }}">{{ repo.last_updated.strftime('%Y-%m-%d %H:%M:%S') }}</span>
++     </span>
++ </header>
++ 
++diff --git a/tasks/QUEUE.md b/tasks/QUEUE.md
++index 5970085..021d141 100644
++--- a/tasks/QUEUE.md
+++++ b/tasks/QUEUE.md
++@@ -204,7 +204,7 @@
++ - Depends on: PR-032
++ 
++ ## PR-035: Event log UX, card click, timestamps
++-- Status: TODO
+++- Status: DONE
++ - Tasks file: tasks/PR-035.md
++ - Branch: pr-035-dashboard-ux
++ - Depends on: PR-028
++diff --git a/tests/test_observability.py b/tests/test_observability.py
++index 067c82c..9400628 100644
++--- a/tests/test_observability.py
+++++ b/tests/test_observability.py
++@@ -25,7 +25,6 @@ from src.web import app as web_app
++ from src.web.app import (
++     _build_activity_feed,
++     _compute_stats,
++-    _filter_history,
++     _parse_history_time,
++     _repo_badge_style,
++     app,
++@@ -295,40 +294,6 @@ def test_build_activity_feed_caps_at_fifty() -> None:
++     assert feed[0]["event"] == "event 79"
++ 
++ 
++-def test_filter_history_errors_only_keeps_error_and_hung() -> None:
++-    history = [
++-        {"time": "09:00:00", "state": "CODING", "event": "coding"},
++-        {"time": "09:01:00", "state": "ERROR", "event": "boom"},
++-        {"time": "09:02:00", "state": "IDLE", "event": "recovered"},
++-        {"time": "09:03:00", "state": "HUNG", "event": "stuck"},
++-    ]
++-    out = _filter_history(history, "errors")
++-    assert [e["event"] for e in out] == ["boom", "stuck"]
++-
++-
++-def test_filter_history_state_changes_collapses_runs() -> None:
++-    history = [
++-        {"time": "09:00:00", "state": "CODING", "event": "coding 1"},
++-        {"time": "09:00:05", "state": "CODING", "event": "coding 2"},
++-        {"time": "09:01:00", "state": "WATCH", "event": "watching"},
++-        {"time": "09:02:00", "state": "FIX", "event": "fix 1"},
++-        {"time": "09:02:30", "state": "FIX", "event": "fix 2"},
++-        {"time": "09:03:00", "state": "MERGE", "event": "merging"},
++-    ]
++-    out = _filter_history(history, "state")
++-    assert [e["event"] for e in out] == [
++-        "coding 1",
++-        "watching",
++-        "fix 1",
++-        "merging",
++-    ]
++-
++-
++-def test_filter_history_unknown_returns_all() -> None:
++-    history = [{"time": "09:00:00", "state": "CODING", "event": "x"}]
++-    assert _filter_history(history, "nonsense") == history
++-
++-
++ # ---- HTTP handlers --------------------------------------------------------
++ 
++ 
++@@ -500,54 +465,15 @@ def test_index_route_shows_stats_and_activity_blocks(
++     assert "Done today" in body
++ 
++ 
++-def test_partial_repo_events_filters_by_query(
++-    observability_config: Path,
++-) -> None:
++-    now = datetime.now(timezone.utc)
++-    alpha = RepoState(
++-        url="https://github.com/example/alpha.git",
++-        name="alpha",
++-        state=PipelineState.ERROR,
++-        last_updated=now,
++-        history=[
++-            {
++-                "time": _iso(now - timedelta(minutes=3)),
++-                "state": "CODING",
++-                "event": "started coding",
++-            },
++-            {
++-                "time": _iso(now - timedelta(minutes=2)),
++-                "state": "ERROR",
++-                "event": "claude CLI failed",
++-            },
++-        ],
++-    )
++-    fake = _FakeRedis({"pipeline:alpha": alpha.model_dump_json()})
++-
++-    with TestClient(app) as client:
++-        client.app.state.redis = fake
++-        response = client.get(
++-            "/partials/repo/alpha/events", params={"filter": "errors"}
++-        )
++-
++-    assert response.status_code == 200
++-    body = response.text
++-    assert "claude CLI failed" in body
++-    assert "started coding" not in body
++-    # tabs render in the fragment so the user can switch filters
++-    assert 'filter=all' in body
++-    assert 'filter=state' in body
++-
++-
++ def test_partial_repo_detail_returns_summary_only(
++     observability_config: Path,
++ ) -> None:
++     """Summary poll must NOT include the event log.
++ 
++-    The event log self-polls via /partials/repo/{name}/events so the
++-    user's selected filter tab survives across summary refreshes;
++-    bundling the event log back into the summary partial would silently
++-    reset the filter to ``all`` on every 5s tick.
+++    The event log self-polls via /partials/repo/{name}/events so its
+++    scrollTop survives across summary refreshes; bundling the event
+++    log back into the summary partial would wipe the wrapper on every
+++    5s tick and reset the user's scroll position.
++     """
++     now = datetime.now(timezone.utc)
++     alpha = RepoState(
++@@ -576,46 +502,6 @@ def test_partial_repo_detail_returns_summary_only(
++     assert "started coding" not in body
++ 
++ 
++-def test_partial_repo_events_response_preserves_selected_filter(
++-    observability_config: Path,
++-) -> None:
++-    """The /events fragment must bake the active filter into hx-vals.
++-
++-    Without this, the event log's own 5s poll would fire with no filter
++-    value, silently falling back to ``all`` on the server and reverting
++-    the user's ``errors`` or ``state changes`` selection mid-review.
++-    """
++-    now = datetime.now(timezone.utc)
++-    alpha = RepoState(
++-        url="https://github.com/example/alpha.git",
++-        name="alpha",
++-        state=PipelineState.ERROR,
++-        last_updated=now,
++-        history=[
++-            {
++-                "time": _iso(now),
++-                "state": "ERROR",
++-                "event": "boom",
++-            },
++-        ],
++-    )
++-    fake = _FakeRedis({"pipeline:alpha": alpha.model_dump_json()})
++-
++-    with TestClient(app) as client:
++-        client.app.state.redis = fake
++-        response = client.get(
++-            "/partials/repo/alpha/events", params={"filter": "errors"}
++-        )
++-
++-    assert response.status_code == 200
++-    body = response.text
++-    assert 'id="repo-event-log"' in body
++-    assert 'hx-trigger="every 5s"' in body
++-    # the active filter round-trips through hx-vals so the next poll
++-    # continues to request the filtered view instead of resetting
++-    assert 'hx-vals=\'{"filter": "errors"}\'' in body
++-
++-
++ def test_repo_full_page_mounts_event_log_outside_polling_container(
++     observability_config: Path,
++ ) -> None:
++@@ -676,9 +562,16 @@ def test_repo_full_page_mounts_event_log_outside_polling_container(
++     assert "started coding" in body
++ 
++ 
++-def test_partial_repo_events_default_filter_is_all(
+++def test_partial_repo_events_returns_list_fragment(
++     observability_config: Path,
++ ) -> None:
+++    """`/partials/repo/{name}/events` returns only the list fragment.
+++
+++    The scroll wrapper on the full page swaps this response into its
+++    ``innerHTML`` every 5s, so it MUST NOT re-emit the surrounding
+++    ``<section id="repo-event-log">`` — that would nest a new wrapper
+++    inside the existing one and break the scroll-preservation hooks.
+++    """
++     now = datetime.now(timezone.utc)
++     alpha = RepoState(
++         url="https://github.com/example/alpha.git",
++@@ -701,9 +594,8 @@ def test_partial_repo_events_default_filter_is_all(
++ 
++     assert response.status_code == 200
++     body = response.text
++-    assert "Event log" in body
++-    assert "1 events" in body
++-    assert 'hx-vals=\'{"filter": "all"}\'' in body
++-    # filter tabs render so users can switch modes
++-    assert "filter=errors" in body
++-    assert "filter=state" in body
+++    assert "started coding" in body
+++    assert '<ul' in body
+++    # Response is the inner list only — no outer section wrapper.
+++    assert 'id="repo-event-log"' not in body
+++    assert "Event log" not in body
++diff --git a/tests/test_web_app.py b/tests/test_web_app.py
++index d1cf0af..b980eed 100644
++--- a/tests/test_web_app.py
+++++ b/tests/test_web_app.py
++@@ -480,3 +480,74 @@ def test_cli_log_route_returns_empty(
++         response = client.get("/partials/repo/testrepo/cli-log")
++     assert response.status_code == 200
++     assert "No CLI log available" in response.text
+++
+++
+++def test_event_log_has_data_ts(
+++    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+++) -> None:
+++    """Event-log rows must carry ``data-ts`` so the base.html
+++    ``formatTimestamps`` script can rewrite the raw ISO value into a
+++    local "5 min ago" style label after the HTMX swap settles."""
+++    header_ts = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
+++    entry_ts = "2026-04-10T11:55:00+00:00"
+++    stored = RepoState(
+++        url="https://github.com/example/alpha.git",
+++        name="alpha",
+++        state=PipelineState.CODING,
+++        last_updated=header_ts,
+++        history=[
+++            {"time": entry_ts, "state": "CODING", "event": "hello"},
+++        ],
+++    )
+++    fake = _FakeRedis({"pipeline:alpha": stored.model_dump_json()})
+++
+++    with TestClient(app) as client:
+++        client.app.state.redis = fake
+++        response = client.get("/repo/alpha")
+++
+++    assert response.status_code == 200
+++    body = response.text
+++    assert f'data-ts="{entry_ts}"' in body
+++
+++
+++def test_repo_card_has_onclick(
+++    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+++) -> None:
+++    """Repo cards on the dashboard must navigate to the detail page on
+++    click — except when the click originates inside an interactive
+++    element (``label``/``input``/``button``/``a``), which keeps the
+++    Upload tasks button and nested anchors working as before."""
+++    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+++
+++    with TestClient(app) as client:
+++        response = client.get("/partials/repo-list")
+++
+++    assert response.status_code == 200
+++    body = response.text
+++    assert "window.location='/repo/alpha'" in body
+++    assert "window.location='/repo/beta'" in body
+++    assert "event.target.closest('label,input,button,a')" in body
+++
+++
+++def test_updated_header_has_data_ts(
+++    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+++) -> None:
+++    """The repo detail ``updated <ts>`` header must expose ``data-ts``
+++    so the client-side formatter can replace the raw UTC string with a
+++    relative local-time label."""
+++    now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
+++    stored = RepoState(
+++        url="https://github.com/example/alpha.git",
+++        name="alpha",
+++        state=PipelineState.CODING,
+++        last_updated=now,
+++    )
+++    fake = _FakeRedis({"pipeline:alpha": stored.model_dump_json()})
+++
+++    with TestClient(app) as client:
+++        client.app.state.redis = fake
+++        response = client.get("/repo/alpha")
+++
+++    assert response.status_code == 200
+++    body = response.text
+++    assert f'data-ts="{now.isoformat()}"' in body
+diff --git a/artifacts/structure.txt b/artifacts/structure.txt
+index f4e70c8..60779c0 100644
+--- a/artifacts/structure.txt
++++ b/artifacts/structure.txt
+@@ -41,6 +41,7 @@
+ ./src/web/templates/base.html
+ ./src/web/templates/components/activity_feed.html
+ ./src/web/templates/components/alerts_panel.html
++./src/web/templates/components/event_list.html
+ ./src/web/templates/components/event_log.html
+ ./src/web/templates/components/repo_cards.html
+ ./src/web/templates/components/repo_list.html
 diff --git a/src/web/app.py b/src/web/app.py
-index 4fab686..0be38c0 100644
+index 4fab686..0c21fa7 100644
 --- a/src/web/app.py
 +++ b/src/web/app.py
 @@ -144,10 +144,6 @@ _ACTIVITY_FEED_LIMIT = 50
@@ -85,7 +702,7 @@ index 4fab686..0be38c0 100644
      """
      redis_client = getattr(request.app.state, "redis", None)
      state = await get_repo_state(name, redis_client)
-@@ -638,27 +591,22 @@ async def partial_repo_detail(request: Request, name: str) -> HTMLResponse:
+@@ -638,27 +591,27 @@ async def partial_repo_detail(request: Request, name: str) -> HTMLResponse:
      "/partials/repo/{name}/events",
      response_class=HTMLResponse,
  )
@@ -118,6 +735,11 @@ index 4fab686..0be38c0 100644
 -            "events": events,
 -            "event_filter": filter_name,
 +            "events": list(state.history),
++            # ``oob=True`` switches the template into "poll response" mode:
++            # it emits an hx-swap-oob count span so the header's
++            # "N events" label refreshes with the list instead of going
++            # stale at the initial page load's value.
++            "oob": True,
          },
      )
  
@@ -152,10 +774,10 @@ index d6ff017..a55612f 100644
              const originalTitle = document.title;
 diff --git a/src/web/templates/components/event_list.html b/src/web/templates/components/event_list.html
 new file mode 100644
-index 0000000..58afeda
+index 0000000..63e15bf
 --- /dev/null
 +++ b/src/web/templates/components/event_list.html
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,38 @@
 +{% set state_styles = {
 +    'IDLE':      {'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30'},
 +    'PREFLIGHT': {'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30'},
@@ -166,6 +788,15 @@ index 0000000..58afeda
 +    'HUNG':      {'badge': 'bg-hung/10 text-hung border-hung/30'},
 +    'ERROR':     {'badge': 'bg-fail/10 text-fail border-fail/30'},
 +} %}
++{# When served from /partials/repo/{name}/events (oob=True), emit the
++   count span as an hx-swap-oob target so HTMX refreshes the header's
++   "N events" label alongside the list innerHTML swap. Rendered inline
++   on the full-page include (oob falsy) this block is skipped so we
++   don't duplicate the ID already present in event_log.html. #}
++{% if oob | default(False) %}
++<span id="event-log-count-{{ repo.name }}" hx-swap-oob="true"
++      class="font-mono text-xs text-gray-500">{{ events|length }} events</span>
++{% endif %}
 +{% if events %}
 +<ul class="divide-y divide-white/5 font-mono text-xs">
 +    {% for entry in events|reverse %}
@@ -186,10 +817,10 @@ index 0000000..58afeda
 +<p class="text-gray-600 italic text-sm">No events yet</p>
 +{% endif %}
 diff --git a/src/web/templates/components/event_log.html b/src/web/templates/components/event_log.html
-index 28f064a..09ebed1 100644
+index 28f064a..66c3d97 100644
 --- a/src/web/templates/components/event_log.html
 +++ b/src/web/templates/components/event_log.html
-@@ -1,61 +1,21 @@
+@@ -1,61 +1,26 @@
 -{% set state_styles = {
 -    'IDLE':      {'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30'},
 -    'PREFLIGHT': {'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30'},
@@ -212,11 +843,6 @@ index 28f064a..09ebed1 100644
 -   and silently reset the tab selection mid-review. #}
 -<section id="repo-event-log"
 -         class="rounded-lg border border-white/5 bg-surface-2 p-5"
--         hx-get="/partials/repo/{{ repo.name }}/events"
--         hx-trigger="every 5s"
--         hx-swap="outerHTML"
--         hx-vals='{"filter": "{{ event_filter }}"}'>
--    <div class="flex flex-wrap items-center gap-3 mb-3">
 +{# Top-level event log rendered on the full repo detail page.
 +
 +   The wrapper div below is the swap target for the 5s poll of
@@ -225,8 +851,23 @@ index 28f064a..09ebed1 100644
 +   scroll position) is preserved across ticks. #}
 +<section id="repo-event-log" class="rounded-lg border border-white/5 bg-surface-2 p-5">
 +    <div class="flex items-center gap-3 mb-3">
-         <h3 class="text-sm font-semibold text-gray-300">Event log</h3>
-         <span class="font-mono text-xs text-gray-500">{{ events|length }} events</span>
++        <h3 class="text-sm font-semibold text-gray-300">Event log</h3>
++        {# ID matches the hx-swap-oob="true" span emitted by
++           event_list.html when served from /partials/repo/{name}/events
++           so the 5s poll refreshes the count alongside the list
++           instead of leaving the initial render's value stale. #}
++        <span id="event-log-count-{{ repo.name }}"
++              class="font-mono text-xs text-gray-500">{{ events|length }} events</span>
++    </div>
++    <div id="event-list-wrapper-{{ repo.name }}"
++         class="max-h-96 overflow-y-auto"
+          hx-get="/partials/repo/{{ repo.name }}/events"
+          hx-trigger="every 5s"
+-         hx-swap="outerHTML"
+-         hx-vals='{"filter": "{{ event_filter }}"}'>
+-    <div class="flex flex-wrap items-center gap-3 mb-3">
+-        <h3 class="text-sm font-semibold text-gray-300">Event log</h3>
+-        <span class="font-mono text-xs text-gray-500">{{ events|length }} events</span>
 -        <div class="ml-auto flex items-center gap-1">
 -            {% for slug, label in filters %}
 -            {% set active = (slug == event_filter) %}
@@ -240,6 +881,10 @@ index 28f064a..09ebed1 100644
 -            </button>
 -            {% endfor %}
 -        </div>
++         hx-swap="innerHTML"
++         hx-on::before-swap="this._scrollPos = this.scrollTop"
++         hx-on::after-swap="this.scrollTop = this._scrollPos">
++        {% include "components/event_list.html" %}
      </div>
 -    {% if events %}
 -    <ul class="max-h-96 overflow-y-auto divide-y divide-white/5 font-mono text-xs">
@@ -258,15 +903,6 @@ index 28f064a..09ebed1 100644
 -    {% else %}
 -    <p class="text-gray-600 italic text-sm">No events yet</p>
 -    {% endif %}
-+    <div id="event-list-wrapper-{{ repo.name }}"
-+         class="max-h-96 overflow-y-auto"
-+         hx-get="/partials/repo/{{ repo.name }}/events"
-+         hx-trigger="every 5s"
-+         hx-swap="innerHTML"
-+         hx-on::before-swap="this._scrollPos = this.scrollTop"
-+         hx-on::after-swap="this.scrollTop = this._scrollPos">
-+        {% include "components/event_list.html" %}
-+    </div>
  </section>
 diff --git a/src/web/templates/components/repo_cards.html b/src/web/templates/components/repo_cards.html
 index 4cd93b7..0372e40 100644
@@ -309,7 +945,7 @@ index 5970085..021d141 100644
  - Branch: pr-035-dashboard-ux
  - Depends on: PR-028
 diff --git a/tests/test_observability.py b/tests/test_observability.py
-index 067c82c..9400628 100644
+index 067c82c..660e20c 100644
 --- a/tests/test_observability.py
 +++ b/tests/test_observability.py
 @@ -25,7 +25,6 @@ from src.web import app as web_app
@@ -485,21 +1121,61 @@ index 067c82c..9400628 100644
      now = datetime.now(timezone.utc)
      alpha = RepoState(
          url="https://github.com/example/alpha.git",
-@@ -701,9 +594,8 @@ def test_partial_repo_events_default_filter_is_all(
+@@ -701,9 +594,49 @@ def test_partial_repo_events_default_filter_is_all(
  
      assert response.status_code == 200
      body = response.text
 -    assert "Event log" in body
--    assert "1 events" in body
--    assert 'hx-vals=\'{"filter": "all"}\'' in body
--    # filter tabs render so users can switch modes
--    assert "filter=errors" in body
--    assert "filter=state" in body
 +    assert "started coding" in body
 +    assert '<ul' in body
 +    # Response is the inner list only — no outer section wrapper.
 +    assert 'id="repo-event-log"' not in body
 +    assert "Event log" not in body
++    # And it emits an out-of-band count span so the header's "N events"
++    # label refreshes with the list instead of staying at the initial
++    # page-load value (Codex P2 on PR #43).
++    assert 'id="event-log-count-alpha"' in body
++    assert 'hx-swap-oob="true"' in body
+     assert "1 events" in body
+-    assert 'hx-vals=\'{"filter": "all"}\'' in body
+-    # filter tabs render so users can switch modes
+-    assert "filter=errors" in body
+-    assert "filter=state" in body
++
++
++def test_repo_full_page_marks_count_span_for_oob_target(
++    observability_config: Path,
++) -> None:
++    """Full-page render must expose the count span's ID so the 5s
++    poll's out-of-band swap has a target to replace. The initial
++    render itself must NOT carry ``hx-swap-oob`` — that's only valid
++    on the fragment response."""
++    now = datetime.now(timezone.utc)
++    alpha = RepoState(
++        url="https://github.com/example/alpha.git",
++        name="alpha",
++        state=PipelineState.CODING,
++        last_updated=now,
++        history=[
++            {"time": _iso(now), "state": "CODING", "event": "started"},
++        ],
++    )
++    fake = _FakeRedis({"pipeline:alpha": alpha.model_dump_json()})
++
++    with TestClient(app) as client:
++        client.app.state.redis = fake
++        response = client.get("/repo/alpha")
++
++    assert response.status_code == 200
++    body = response.text
++    assert 'id="event-log-count-alpha"' in body
++    header_start = body.index('id="event-log-count-alpha"')
++    wrapper_start = body.index('id="event-list-wrapper-alpha"')
++    # Only one count span on the initial render — oob variant belongs
++    # strictly to the polled fragment. A stray oob attribute on the
++    # static page would confuse HTMX on the first hydration.
++    assert body.count('id="event-log-count-alpha"') == 1
++    assert header_start < wrapper_start
 diff --git a/tests/test_web_app.py b/tests/test_web_app.py
 index d1cf0af..b980eed 100644
 --- a/tests/test_web_app.py
