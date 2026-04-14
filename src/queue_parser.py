@@ -113,7 +113,11 @@ def mark_task_done(content: str, pr_id: str) -> str | None:
     ``parse_queue_text``: finds the task by its ``## {pr_id}:`` header
     and updates the first ``- status:`` field inside that section,
     regardless of where it sits relative to ``Branch``/``Depends on``/
-    ``Tasks file`` lines.
+    ``Tasks file`` lines. Any non-``DONE`` status token is treated as
+    updatable so malformed values (e.g. ``TODO,`` with a stray comma)
+    that ``parse_queue_text`` silently coerces to ``TODO`` at selection
+    time are also cleared, preventing the daemon from re-picking a task
+    just because its queue entry is syntactically odd.
     """
     lines = content.splitlines(keepends=True)
     in_target = False
@@ -130,7 +134,7 @@ def mark_task_done(content: str, pr_id: str) -> str | None:
             continue
         match = _STATUS_LINE_RE.match(stripped)
         if match:
-            if match.group(2).strip().upper() in {"TODO", "DOING"}:
+            if match.group(2).strip().upper() != "DONE":
                 target_i = i
             break
 
@@ -147,7 +151,7 @@ def mark_task_done(content: str, pr_id: str) -> str | None:
     body = raw[: len(raw) - len(ending)]
     match = _STATUS_LINE_RE.match(body)
     assert match is not None
-    lines[target_i] = f"{match.group(1)}DONE{match.group(3)}{ending}"
+    lines[target_i] = f"{match.group(1)}DONE{ending}"
     return "".join(lines)
 
 

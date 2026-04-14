@@ -219,6 +219,25 @@ def test_mark_task_done_returns_none_when_already_done() -> None:
     assert mark_task_done(content, "PR-001") is None
 
 
+def test_mark_task_done_clears_malformed_status() -> None:
+    """parse_queue_text coerces unknown status values to TODO at
+    selection time, so mark_task_done must also clear them — otherwise
+    a merged task with a malformed status silently stays selectable."""
+    content = "## PR-001: first\n- Status: TODO,\n"
+    updated = mark_task_done(content, "PR-001")
+    assert updated is not None
+    assert "- Status: DONE" in updated
+    assert "TODO," not in updated
+
+
+def test_mark_task_done_clears_arbitrary_non_done_status() -> None:
+    content = "## PR-001: first\n- Status: WORKING\n"
+    updated = mark_task_done(content, "PR-001")
+    assert updated is not None
+    assert "- Status: DONE" in updated
+    assert "WORKING" not in updated
+
+
 def test_mark_task_done_returns_none_when_task_missing() -> None:
     content = "## PR-001: first\n- Status: DOING\n"
     assert mark_task_done(content, "PR-999") is None

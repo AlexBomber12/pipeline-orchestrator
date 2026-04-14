@@ -1233,11 +1233,14 @@ def test_handle_merge_opens_queue_done_pr(
         args: list[str],
         repo: str | None = None,
         timeout: int = 30,
-    ) -> str:
+    ) -> Any:
         gh_calls.append(args)
+        if args[:2] == ["pr", "view"]:
+            return {"state": "MERGED", "mergedAt": "2026-04-14T00:00:00Z"}
         return ""
 
     monkeypatch.setattr(runner_module.github_client, "run_gh", fake_gh)
+    monkeypatch.setattr(runner_module.time, "sleep", lambda *_: None)
 
     runner = _make_runner()
     runner.repo_path = str(tmp_path)
@@ -1269,6 +1272,9 @@ def test_handle_merge_opens_queue_done_pr(
     assert "--squash" in merge_args
     assert "--auto" in merge_args
     assert "--delete-branch" in merge_args
+    assert any(args[:2] == ["pr", "view"] for args in gh_calls), (
+        "daemon must confirm queue-sync PR actually merged"
+    )
 
 
 def test_handle_merge_tolerates_queue_failure(
@@ -1294,10 +1300,13 @@ def test_handle_merge_tolerates_queue_failure(
         args: list[str],
         repo: str | None = None,
         timeout: int = 30,
-    ) -> str:
+    ) -> Any:
+        if args[:2] == ["pr", "view"]:
+            return {"state": "MERGED", "mergedAt": "2026-04-14T00:00:00Z"}
         return ""
 
     monkeypatch.setattr(runner_module.github_client, "run_gh", noop_gh)
+    monkeypatch.setattr(runner_module.time, "sleep", lambda *_: None)
 
     runner = _make_runner()
     runner.repo_path = str(tmp_path)
@@ -1311,6 +1320,82 @@ def test_handle_merge_tolerates_queue_failure(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is None
     assert runner.state.current_task is None
+
+
+def test_mark_queue_done_raises_if_pr_not_merged_before_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If the queue-sync PR never reaches MERGED, daemon must raise so
+    handle_merge logs the warning rather than clearing state while the
+    next IDLE cycle could re-pick the task."""
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "QUEUE.md"
+    queue_path.write_text("## PR-001: first\n- Status: DOING\n")
+
+    def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+
+    def pending_gh(
+        args: list[str],
+        repo: str | None = None,
+        timeout: int = 30,
+    ) -> Any:
+        if args[:2] == ["pr", "view"]:
+            return {"state": "OPEN", "mergedAt": None}
+        return ""
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", pending_gh)
+    monkeypatch.setattr(runner_module.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(
+        runner_module, "_QUEUE_SYNC_MERGE_TIMEOUT_SEC", 0
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="first", status=TaskStatus.DOING
+    )
+
+    with pytest.raises(TimeoutError):
+        runner._mark_queue_done()
+
+
+def test_mark_queue_done_raises_if_pr_closed_unmerged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "QUEUE.md"
+    queue_path.write_text("## PR-001: first\n- Status: DOING\n")
+
+    def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+
+    def closed_gh(
+        args: list[str],
+        repo: str | None = None,
+        timeout: int = 30,
+    ) -> Any:
+        if args[:2] == ["pr", "view"]:
+            return {"state": "CLOSED", "mergedAt": None}
+        return ""
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", closed_gh)
+    monkeypatch.setattr(runner_module.time, "sleep", lambda *_: None)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="first", status=TaskStatus.DOING
+    )
+
+    with pytest.raises(RuntimeError, match="closed without merging"):
+        runner._mark_queue_done()
 
 
 def test_mark_queue_done_resets_tree_on_commit_failure(

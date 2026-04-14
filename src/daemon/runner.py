@@ -15,6 +15,7 @@ import json
 import logging
 import shutil
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -58,6 +59,15 @@ _HISTORY_LIMIT = 100
 # eliminate. 30 minutes accommodates realistic CI runs without
 # abandoning the upper bound entirely.
 _CI_SCRIPT_TIMEOUT_SEC = 1800
+
+# How long ``_mark_queue_done`` blocks waiting for the queue-sync
+# remediation PR to actually merge. Auto-merge returns before the
+# merge happens when branch-protection checks are still pending, so
+# the runner must confirm completion before clearing state; otherwise
+# the next IDLE cycle reads QUEUE.md from origin/base (not yet
+# updated) and re-picks the merged task.
+_QUEUE_SYNC_MERGE_POLL_INTERVAL_SEC = 5
+_QUEUE_SYNC_MERGE_TIMEOUT_SEC = 180
 
 
 def repo_owner_from_url(url: str) -> str:
@@ -1575,6 +1585,7 @@ return 0
                  "--squash", "--delete-branch", "--auto"],
                 repo=self.owner_repo,
             )
+            self._wait_for_queue_sync_merge(remediation_branch)
         except Exception:
             # Reset the tree and return to base so a partial
             # write/commit/push cannot poison the next preflight. Use
@@ -1598,8 +1609,41 @@ return 0
             check=True, cwd=self.repo_path,
         )
         self.log_event(
-            f"Opened queue-done PR for {pr_id} "
+            f"Queue-done PR merged for {pr_id} "
             f"(branch {remediation_branch})"
+        )
+
+    def _wait_for_queue_sync_merge(self, head: str) -> None:
+        """Block until the queue-sync PR ``head`` merges, or raise.
+
+        ``gh pr merge --auto`` enables auto-merge and returns immediately
+        when required checks are still pending. The next IDLE cycle
+        would read ``tasks/QUEUE.md`` from ``origin/{base}`` before the
+        queue-sync PR lands and re-pick the same task. Polling
+        ``gh pr view`` closes that race by confirming the merge
+        synchronously before the caller clears state.
+        """
+        deadline = time.monotonic() + _QUEUE_SYNC_MERGE_TIMEOUT_SEC
+        while time.monotonic() < deadline:
+            result = github_client.run_gh(
+                ["pr", "view", head, "--json", "state,mergedAt"],
+                repo=self.owner_repo,
+            )
+            state = ""
+            merged_at = None
+            if isinstance(result, dict):
+                state = str(result.get("state") or "").upper()
+                merged_at = result.get("mergedAt")
+            if state == "MERGED" or merged_at:
+                return
+            if state == "CLOSED":
+                raise RuntimeError(
+                    f"queue-sync PR {head} closed without merging"
+                )
+            time.sleep(_QUEUE_SYNC_MERGE_POLL_INTERVAL_SEC)
+        raise TimeoutError(
+            f"queue-sync PR {head} not merged within "
+            f"{_QUEUE_SYNC_MERGE_TIMEOUT_SEC}s"
         )
 
     def _post_codex_review(self, pr_number: int) -> bool:
