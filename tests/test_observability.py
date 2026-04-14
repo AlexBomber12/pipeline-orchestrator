@@ -25,7 +25,6 @@ from src.web import app as web_app
 from src.web.app import (
     _build_activity_feed,
     _compute_stats,
-    _filter_history,
     _parse_history_time,
     _repo_badge_style,
     app,
@@ -295,40 +294,6 @@ def test_build_activity_feed_caps_at_fifty() -> None:
     assert feed[0]["event"] == "event 79"
 
 
-def test_filter_history_errors_only_keeps_error_and_hung() -> None:
-    history = [
-        {"time": "09:00:00", "state": "CODING", "event": "coding"},
-        {"time": "09:01:00", "state": "ERROR", "event": "boom"},
-        {"time": "09:02:00", "state": "IDLE", "event": "recovered"},
-        {"time": "09:03:00", "state": "HUNG", "event": "stuck"},
-    ]
-    out = _filter_history(history, "errors")
-    assert [e["event"] for e in out] == ["boom", "stuck"]
-
-
-def test_filter_history_state_changes_collapses_runs() -> None:
-    history = [
-        {"time": "09:00:00", "state": "CODING", "event": "coding 1"},
-        {"time": "09:00:05", "state": "CODING", "event": "coding 2"},
-        {"time": "09:01:00", "state": "WATCH", "event": "watching"},
-        {"time": "09:02:00", "state": "FIX", "event": "fix 1"},
-        {"time": "09:02:30", "state": "FIX", "event": "fix 2"},
-        {"time": "09:03:00", "state": "MERGE", "event": "merging"},
-    ]
-    out = _filter_history(history, "state")
-    assert [e["event"] for e in out] == [
-        "coding 1",
-        "watching",
-        "fix 1",
-        "merging",
-    ]
-
-
-def test_filter_history_unknown_returns_all() -> None:
-    history = [{"time": "09:00:00", "state": "CODING", "event": "x"}]
-    assert _filter_history(history, "nonsense") == history
-
-
 # ---- HTTP handlers --------------------------------------------------------
 
 
@@ -500,54 +465,15 @@ def test_index_route_shows_stats_and_activity_blocks(
     assert "Done today" in body
 
 
-def test_partial_repo_events_filters_by_query(
-    observability_config: Path,
-) -> None:
-    now = datetime.now(timezone.utc)
-    alpha = RepoState(
-        url="https://github.com/example/alpha.git",
-        name="alpha",
-        state=PipelineState.ERROR,
-        last_updated=now,
-        history=[
-            {
-                "time": _iso(now - timedelta(minutes=3)),
-                "state": "CODING",
-                "event": "started coding",
-            },
-            {
-                "time": _iso(now - timedelta(minutes=2)),
-                "state": "ERROR",
-                "event": "claude CLI failed",
-            },
-        ],
-    )
-    fake = _FakeRedis({"pipeline:alpha": alpha.model_dump_json()})
-
-    with TestClient(app) as client:
-        client.app.state.redis = fake
-        response = client.get(
-            "/partials/repo/alpha/events", params={"filter": "errors"}
-        )
-
-    assert response.status_code == 200
-    body = response.text
-    assert "claude CLI failed" in body
-    assert "started coding" not in body
-    # tabs render in the fragment so the user can switch filters
-    assert 'filter=all' in body
-    assert 'filter=state' in body
-
-
 def test_partial_repo_detail_returns_summary_only(
     observability_config: Path,
 ) -> None:
     """Summary poll must NOT include the event log.
 
-    The event log self-polls via /partials/repo/{name}/events so the
-    user's selected filter tab survives across summary refreshes;
-    bundling the event log back into the summary partial would silently
-    reset the filter to ``all`` on every 5s tick.
+    The event log self-polls via /partials/repo/{name}/events so its
+    scrollTop survives across summary refreshes; bundling the event
+    log back into the summary partial would wipe the wrapper on every
+    5s tick and reset the user's scroll position.
     """
     now = datetime.now(timezone.utc)
     alpha = RepoState(
@@ -574,46 +500,6 @@ def test_partial_repo_detail_returns_summary_only(
     assert "Current Task" in body
     assert "Event log" not in body
     assert "started coding" not in body
-
-
-def test_partial_repo_events_response_preserves_selected_filter(
-    observability_config: Path,
-) -> None:
-    """The /events fragment must bake the active filter into hx-vals.
-
-    Without this, the event log's own 5s poll would fire with no filter
-    value, silently falling back to ``all`` on the server and reverting
-    the user's ``errors`` or ``state changes`` selection mid-review.
-    """
-    now = datetime.now(timezone.utc)
-    alpha = RepoState(
-        url="https://github.com/example/alpha.git",
-        name="alpha",
-        state=PipelineState.ERROR,
-        last_updated=now,
-        history=[
-            {
-                "time": _iso(now),
-                "state": "ERROR",
-                "event": "boom",
-            },
-        ],
-    )
-    fake = _FakeRedis({"pipeline:alpha": alpha.model_dump_json()})
-
-    with TestClient(app) as client:
-        client.app.state.redis = fake
-        response = client.get(
-            "/partials/repo/alpha/events", params={"filter": "errors"}
-        )
-
-    assert response.status_code == 200
-    body = response.text
-    assert 'id="repo-event-log"' in body
-    assert 'hx-trigger="every 5s"' in body
-    # the active filter round-trips through hx-vals so the next poll
-    # continues to request the filtered view instead of resetting
-    assert 'hx-vals=\'{"filter": "errors"}\'' in body
 
 
 def test_repo_full_page_mounts_event_log_outside_polling_container(
@@ -676,9 +562,16 @@ def test_repo_full_page_mounts_event_log_outside_polling_container(
     assert "started coding" in body
 
 
-def test_partial_repo_events_default_filter_is_all(
+def test_partial_repo_events_returns_list_fragment(
     observability_config: Path,
 ) -> None:
+    """`/partials/repo/{name}/events` returns only the list fragment.
+
+    The scroll wrapper on the full page swaps this response into its
+    ``innerHTML`` every 5s, so it MUST NOT re-emit the surrounding
+    ``<section id="repo-event-log">`` — that would nest a new wrapper
+    inside the existing one and break the scroll-preservation hooks.
+    """
     now = datetime.now(timezone.utc)
     alpha = RepoState(
         url="https://github.com/example/alpha.git",
@@ -701,9 +594,49 @@ def test_partial_repo_events_default_filter_is_all(
 
     assert response.status_code == 200
     body = response.text
-    assert "Event log" in body
+    assert "started coding" in body
+    assert '<ul' in body
+    # Response is the inner list only — no outer section wrapper.
+    assert 'id="repo-event-log"' not in body
+    assert "Event log" not in body
+    # And it emits an out-of-band count span so the header's "N events"
+    # label refreshes with the list instead of staying at the initial
+    # page-load value (Codex P2 on PR #43).
+    assert 'id="event-log-count-alpha"' in body
+    assert 'hx-swap-oob="true"' in body
     assert "1 events" in body
-    assert 'hx-vals=\'{"filter": "all"}\'' in body
-    # filter tabs render so users can switch modes
-    assert "filter=errors" in body
-    assert "filter=state" in body
+
+
+def test_repo_full_page_marks_count_span_for_oob_target(
+    observability_config: Path,
+) -> None:
+    """Full-page render must expose the count span's ID so the 5s
+    poll's out-of-band swap has a target to replace. The initial
+    render itself must NOT carry ``hx-swap-oob`` — that's only valid
+    on the fragment response."""
+    now = datetime.now(timezone.utc)
+    alpha = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="alpha",
+        state=PipelineState.CODING,
+        last_updated=now,
+        history=[
+            {"time": _iso(now), "state": "CODING", "event": "started"},
+        ],
+    )
+    fake = _FakeRedis({"pipeline:alpha": alpha.model_dump_json()})
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.get("/repo/alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'id="event-log-count-alpha"' in body
+    header_start = body.index('id="event-log-count-alpha"')
+    wrapper_start = body.index('id="event-list-wrapper-alpha"')
+    # Only one count span on the initial render — oob variant belongs
+    # strictly to the polled fragment. A stray oob attribute on the
+    # static page would confuse HTMX on the first hydration.
+    assert body.count('id="event-log-count-alpha"') == 1
+    assert header_start < wrapper_start

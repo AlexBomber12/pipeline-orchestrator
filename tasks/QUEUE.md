@@ -204,7 +204,7 @@
 - Depends on: PR-032
 
 ## PR-035: Event log UX, card click, timestamps
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-035.md
 - Branch: pr-035-dashboard-ux
 - Depends on: PR-028

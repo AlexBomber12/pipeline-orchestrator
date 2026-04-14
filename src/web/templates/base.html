@@ -114,6 +114,24 @@
     </script>
 
     <script>
+        function formatTimestamps() {
+            document.querySelectorAll('[data-ts]').forEach(el => {
+                const ts = el.dataset.ts;
+                if (!ts) return;
+                const dt = new Date(ts);
+                if (isNaN(dt)) return;
+                const diffMin = (Date.now() - dt.getTime()) / 60000;
+                if (diffMin < 1) el.textContent = 'just now';
+                else if (diffMin < 60) el.textContent = Math.round(diffMin) + ' min ago';
+                else if (diffMin < 1440) el.textContent = Math.round(diffMin / 60) + 'h ago';
+                else el.textContent = dt.toLocaleDateString([], {month: 'short', day: 'numeric'});
+            });
+        }
+        document.addEventListener('DOMContentLoaded', formatTimestamps);
+        document.body.addEventListener('htmx:afterSwap', formatTimestamps);
+    </script>
+
+    <script>
         (function() {
             const originalTitle = document.title;
             let blinking = false;
