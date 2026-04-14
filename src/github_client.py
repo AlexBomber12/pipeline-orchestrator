@@ -166,10 +166,16 @@ def get_pr_review_status(
                                 )
                             ):
                                 threshold = latest_review_time
+                            # Inclusive comparison: GitHub timestamps
+                            # are second-granular, so a +1 posted in
+                            # the same second as the head commit (or
+                            # latest review) must still count as
+                            # approving the current push — a strict
+                            # ``>`` would mark that valid case stale.
                             if (
                                 reaction_time
                                 and threshold
-                                and reaction_time > threshold
+                                and reaction_time >= threshold
                             ):
                                 body_approved = True
                             elif not threshold:

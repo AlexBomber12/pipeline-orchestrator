@@ -936,3 +936,39 @@ def test_body_plus_one_approved_when_codex_review_on_head(
         )
         == ReviewStatus.APPROVED
     )
+
+
+def test_body_plus_one_same_second_as_head_approves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """+1 reaction created in the SAME second as the head commit's
+    committer date must count as fresh. GitHub timestamps are
+    second-granular, so a strict ``>`` would mark the valid case stale."""
+    import json as _json
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if _is_commits_path(cmd):
+            return _FakeCompletedProcess(stdout="2026-01-02T12:34:56Z")
+        path = cmd[-1]
+        if path.endswith("/issues/42/reactions"):
+            pages = [
+                [
+                    {
+                        "content": "+1",
+                        "user": {"login": "chatgpt-codex-connector"},
+                        "created_at": "2026-01-02T12:34:56Z",
+                    }
+                ]
+            ]
+        else:
+            pages = []
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="abc"
+        )
+        == ReviewStatus.APPROVED
+    )

@@ -1962,18 +1962,24 @@ return 0
         except Exception:
             head_iso = ""
         head_time = github_client._parse_iso(head_iso) if head_iso else None
-        if head_time is None:
-            return
-        if head_time.tzinfo is None:
+        if head_time is not None and head_time.tzinfo is None:
             head_time = head_time.replace(tzinfo=timezone.utc)
         # Different PR: unconditionally replace. The "only update if
         # newer" rule below is only safe when both timestamps belong
         # to the same PR — otherwise a stale last_push_at from a
         # previously-tracked PR would leak into the new PR's
         # freshness check and silently skip legitimate feedback.
+        # When the fetch fails on a switch we clear rather than keep
+        # the previous PR's value: a None baseline lets the next
+        # handle_watch cycle retry the rehydrate and, in the
+        # meantime, ``_has_new_codex_feedback_since_last_push``
+        # returns True so one fix attempt runs (and then
+        # handle_fix's own push sets a proper baseline).
         if self._last_push_at_pr_number != pr.number:
             self._last_push_at = head_time
             self._last_push_at_pr_number = pr.number
+            return
+        if head_time is None:
             return
         if self._last_push_at is None or head_time > self._last_push_at:
             self._last_push_at = head_time

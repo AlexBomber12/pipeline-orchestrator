@@ -3261,6 +3261,7 @@ def test_handle_watch_skips_fix_no_new_feedback(
 
     runner = _make_runner()
     runner._last_push_at = last_push
+    runner._last_push_at_pr_number = pr.number
     runner.state.current_pr = pr
     runner.state.state = PipelineState.WATCH
     runner.handle_fix = fake_fix  # type: ignore[assignment]
@@ -3317,6 +3318,7 @@ def test_handle_watch_triggers_fix_new_feedback(
 
     runner = _make_runner()
     runner._last_push_at = last_push
+    runner._last_push_at_pr_number = pr.number
     runner.state.current_pr = pr
     runner.state.state = PipelineState.WATCH
     runner.handle_fix = fake_fix  # type: ignore[assignment]
@@ -3542,6 +3544,7 @@ def test_handle_watch_stale_feedback_still_times_out(
 
     runner = _make_runner(review_timeout_min=30)
     runner._last_push_at = last_push
+    runner._last_push_at_pr_number = pr.number
     runner.state.current_pr = pr
     runner.state.state = PipelineState.WATCH
     runner.handle_fix = fake_fix  # type: ignore[assignment]
@@ -3836,3 +3839,26 @@ def test_handle_watch_rehydrates_on_pr_number_mismatch(
     assert runner._last_push_at_pr_number == 55
     assert runner._last_push_at is not None
     assert runner._last_push_at.isoformat() == "2026-04-14T18:00:00+00:00"
+
+
+def test_rehydrate_clears_stale_on_mismatch_when_fetch_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a PR-number mismatch with a failing commit-time fetch, the
+    previous PR's stale timestamp must be cleared rather than carried
+    over. Next cycle's handle_watch retries the rehydrate; in the
+    meantime the None baseline lets _has_new_codex_feedback_since_last_push
+    return True so one fix attempt can run."""
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_head_commit_iso",
+        lambda repo, number: "",
+    )
+    runner = _make_runner()
+    runner._last_push_at = datetime(2026, 4, 20, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 999
+
+    runner._rehydrate_last_push_at(PRInfo(number=42, branch="pr-new"))
+
+    assert runner._last_push_at is None
+    assert runner._last_push_at_pr_number == 42
