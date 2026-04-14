@@ -27,6 +27,7 @@ from src.daemon import scaffolder
 from src.models import (
     CIStatus,
     PipelineState,
+    PRInfo,
     QueueTask,
     RepoState,
     ReviewStatus,
@@ -689,6 +690,7 @@ class PipelineRunner:
             if matching is not None:
                 self.state.current_pr = matching
                 self.state.state = PipelineState.WATCH
+                self._rehydrate_last_push_at(matching)
                 self.log_event(
                     f"Recovered: DOING task {doing.pr_id} "
                     f"-> WATCH PR #{matching.number}"
@@ -755,6 +757,7 @@ class PipelineRunner:
             self.state.current_pr = matched_pr
             self.state.current_task = matched_task
             self.state.state = PipelineState.WATCH
+            self._rehydrate_last_push_at(matched_pr)
             self.log_event(
                 f"Recovered: {matched_task.status.value} task "
                 f"{matched_task.pr_id} -> WATCH PR #{matched_pr.number}"
@@ -1253,6 +1256,7 @@ return 0
 
         self.state.current_pr = candidate
         self.state.state = PipelineState.WATCH
+        self._rehydrate_last_push_at(candidate)
         self.log_event(f"Opened PR #{candidate.number} -> WATCH")
         self._post_codex_review(candidate.number)
 
@@ -1892,6 +1896,37 @@ return 0
         self.state.current_pr = None
         self.state.current_task = None
         self.state.state = PipelineState.IDLE
+
+    def _rehydrate_last_push_at(self, pr: PRInfo) -> None:
+        """Seed ``_last_push_at`` from the PR's head commit's committer
+        date when we don't already have a fresher in-memory value.
+
+        Needed on daemon restart (``__init__`` resets
+        ``_last_push_at`` to ``None``) and when ``handle_coding`` hands
+        off to WATCH on a freshly-created PR: without this rehydrate,
+        ``_has_new_codex_feedback_since_last_push`` would hit its
+        ``None`` default and return ``True`` on every cycle, triggering
+        ``handle_fix`` on pre-restart Codex feedback (reintroducing
+        the stale-fix loop this guard is meant to block).
+        """
+        try:
+            head_iso = github_client.get_pr_head_commit_iso(
+                self.owner_repo, pr.number
+            )
+        except Exception:
+            head_iso = ""
+        head_time = github_client._parse_iso(head_iso) if head_iso else None
+        if head_time is None:
+            # Fall back to PR's last activity — less precise than the
+            # commit committer date but still better than leaving
+            # ``_last_push_at`` unset and defaulting to "always new".
+            head_time = pr.last_activity
+        if head_time is None:
+            return
+        if head_time.tzinfo is None:
+            head_time = head_time.replace(tzinfo=timezone.utc)
+        if self._last_push_at is None or head_time > self._last_push_at:
+            self._last_push_at = head_time
 
     def _has_new_codex_feedback_since_last_push(self) -> bool:
         """Return True iff Codex posted new P1/P2 feedback after the last push.

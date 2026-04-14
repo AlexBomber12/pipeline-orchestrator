@@ -3578,3 +3578,82 @@ def test_handle_fix_records_last_push_at(
 
     assert runner._last_push_at is not None
     assert before <= runner._last_push_at <= after
+
+
+def test_rehydrate_last_push_at_from_head_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restart recovery must seed ``_last_push_at`` from the head commit
+    committer date so the stale-feedback guard does not immediately
+    trigger FIX on the first post-restart cycle."""
+    head_iso = "2026-04-14T20:00:00Z"
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_head_commit_iso",
+        lambda repo, number: head_iso,
+    )
+    runner = _make_runner()
+    assert runner._last_push_at is None
+    pr = PRInfo(number=99, branch="pr-001")
+    runner._rehydrate_last_push_at(pr)
+    assert runner._last_push_at is not None
+    assert runner._last_push_at.isoformat() == "2026-04-14T20:00:00+00:00"
+
+
+def test_rehydrate_last_push_at_falls_back_to_last_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the head commit time can't be fetched, fall back to the PR's
+    last_activity so _has_new_codex_feedback_since_last_push at least
+    has some non-None baseline."""
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_head_commit_iso",
+        lambda repo, number: "",
+    )
+    fallback = datetime(2026, 4, 1, 10, 0, tzinfo=timezone.utc)
+    pr = PRInfo(number=99, branch="pr-001", last_activity=fallback)
+    runner = _make_runner()
+    runner._rehydrate_last_push_at(pr)
+    assert runner._last_push_at == fallback
+
+
+def test_recover_state_rehydrates_last_push_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """recover_state must rehydrate _last_push_at when matching to an
+    in-flight DOING task's open PR so the first post-restart handle_watch
+    does not falsely fire handle_fix on pre-restart Codex feedback."""
+    queue_text = (
+        "## PR-001: t\n"
+        "- Status: DOING\n"
+        "- Tasks file: tasks/PR-001.md\n"
+        "- Branch: pr-001\n"
+    )
+
+    def fake_git(repo_path: str, *args: str, **kw: Any) -> Any:
+        if args[0] == "show":
+            return _FakeCompletedProcess(
+                args=["git", "show"], stdout=queue_text, returncode=0
+            )
+        return _FakeCompletedProcess(args=list(args), returncode=0)
+
+    monkeypatch.setattr(runner_module, "_git", fake_git)
+    head_iso = "2026-04-10T12:00:00Z"
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_head_commit_iso",
+        lambda repo, number: head_iso,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [PRInfo(number=7, branch="pr-001")],
+    )
+
+    runner = _make_runner()
+    assert runner._last_push_at is None
+    asyncio.run(runner.recover_state())
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._last_push_at is not None
+    assert runner._last_push_at.isoformat() == "2026-04-10T12:00:00+00:00"
