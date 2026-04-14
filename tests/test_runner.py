@@ -3797,3 +3797,42 @@ def test_handle_watch_falls_through_for_fork_with_changes_requested(
 
     assert fix_called == []
     assert runner.state.state == PipelineState.HUNG
+
+
+def test_handle_watch_rehydrates_on_pr_number_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If handle_watch is tracking a different PR than the last-push
+    number, rehydrate must fire even when _last_push_at is non-None —
+    otherwise a transient rehydrate failure on the prior PR switch
+    would keep the stale previous-PR timestamp forever."""
+    head_iso = "2026-04-14T18:00:00Z"
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_head_commit_iso",
+        lambda repo, number: head_iso,
+    )
+    pr = PRInfo(
+        number=55,
+        branch="pr-new",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=datetime.now(timezone.utc),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [pr],
+    )
+
+    runner = _make_runner()
+    # Stale last_push_at from a previously-tracked PR (different number).
+    runner._last_push_at = datetime(2026, 4, 20, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 999
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    asyncio.run(runner.handle_watch())
+
+    assert runner._last_push_at_pr_number == 55
+    assert runner._last_push_at is not None
+    assert runner._last_push_at.isoformat() == "2026-04-14T18:00:00+00:00"

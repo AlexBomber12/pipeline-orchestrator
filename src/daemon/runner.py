@@ -1298,8 +1298,14 @@ return 0
         # failure during ``recover_state`` doesn't permanently leave
         # ``_last_push_at`` unset (which would default
         # ``_has_new_codex_feedback_since_last_push`` to True and
-        # stale-fix loop forever).
-        if self._last_push_at is None:
+        # stale-fix loop forever). Also retry on PR-number mismatch:
+        # a PR switch whose first rehydrate attempt failed transiently
+        # would otherwise keep the previous PR's timestamp indefinitely
+        # here, silently skipping legitimate feedback on the new PR.
+        if (
+            self._last_push_at is None
+            or self._last_push_at_pr_number != found.number
+        ):
             self._rehydrate_last_push_at(found)
 
         ci = found.ci_status
