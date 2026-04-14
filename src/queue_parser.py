@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 
 from src.models import QueueTask, TaskStatus
+
+logger = logging.getLogger(__name__)
 
 _HEADER_RE = re.compile(r"^##\s+(PR-[A-Za-z0-9_.-]+):\s*(.+?)\s*$")
 _FIELD_RE = re.compile(r"^-\s*([A-Za-z ]+?)\s*:\s*(.*?)\s*$")
@@ -64,9 +67,15 @@ def parse_queue_text(text: str) -> list[QueueTask]:
         value = field_match.group(2).strip()
 
         if key == "status":
-            try:
-                current["status"] = TaskStatus(value.upper())
-            except ValueError:
+            raw_status = value.upper()
+            if raw_status in {s.value for s in TaskStatus}:
+                current["status"] = TaskStatus(raw_status)
+            else:
+                logger.warning(
+                    "Unknown status %r for %s, treating as TODO",
+                    raw_status,
+                    current["pr_id"],
+                )
                 current["status"] = TaskStatus.TODO
         elif key == "tasks file":
             current["task_file"] = value or None

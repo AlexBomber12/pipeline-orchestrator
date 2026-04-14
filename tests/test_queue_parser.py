@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+
+import pytest
 
 from src.models import TaskStatus
 from src.queue_parser import get_next_task, mark_task_done, parse_queue
@@ -310,3 +313,26 @@ def test_mark_task_done_stops_at_next_header() -> None:
         "- Status: TODO\n"
     )
     assert mark_task_done(content, "PR-001") is None
+
+
+def test_unknown_status_defaults_to_todo_with_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Unknown status values silently coerced to TODO masks queue
+    authoring bugs. Emit a warning so operators see malformed entries
+    instead of the runner quietly treating them as selectable."""
+    content = (
+        "## PR-050: weird status\n"
+        "- Status: INVALID\n"
+        "- Tasks file: tasks/PR-050.md\n"
+        "- Branch: pr-050-weird\n"
+    )
+    with caplog.at_level(logging.WARNING, logger="src.queue_parser"):
+        tasks = parse_queue(_write_queue(tmp_path, content))
+
+    assert len(tasks) == 1
+    assert tasks[0].status == TaskStatus.TODO
+    assert any(
+        "Unknown status" in rec.message and "PR-050" in rec.message
+        for rec in caplog.records
+    )

@@ -166,6 +166,37 @@ def test_preflight_sets_error_when_git_fails(
     assert runner.state.state == PipelineState.ERROR
 
 
+def test_preflight_handles_oserror(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Missing git binary or cwd raises ``OSError`` from subprocess.run.
+    Without catching it, the exception escapes to daemon.main's generic
+    handler and the runner state stays stale; preflight must translate
+    it into ERROR state.
+    """
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        raise FileNotFoundError("git: not found")
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    runner = _make_runner()
+
+    assert runner.preflight() is False
+    assert runner.state.state == PipelineState.ERROR
+    assert "preflight failed" in (runner.state.error_message or "")
+
+
+def test_sync_to_main_handles_oserror(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``sync_to_main`` translates ``OSError`` to ``RuntimeError`` so
+    the caller's structured error-state translation covers missing git
+    binary / cwd instead of letting the exception escape unhandled."""
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        raise FileNotFoundError("git: not found")
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    runner = _make_runner()
+
+    with pytest.raises(RuntimeError, match="sync_to_main OS error"):
+        runner.sync_to_main()
+
+
 def test_log_event_caps_history_at_100(monkeypatch: pytest.MonkeyPatch) -> None:
     runner = _make_runner()
 
