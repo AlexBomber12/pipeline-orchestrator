@@ -623,6 +623,24 @@ class PipelineRunner:
             self.log_event(f"recover_state failed: {exc}")
             return False
 
+        # Rebuild ``pending_queue_sync_branch`` from any open
+        # ``queue-done-*`` PR on the remote. The marker lives on
+        # ``RepoState``, which is re-created empty at startup, so
+        # without this step a daemon restart between ``_mark_queue_done``
+        # opening the remediation PR and that PR merging would skip
+        # ``_resolve_pending_queue_sync`` in ``handle_idle`` and let
+        # the just-merged task be re-picked before ``origin/{base}``
+        # has the DONE update.
+        pending_sync = next(
+            (p for p in prs if (p.branch or "").startswith("queue-done-")),
+            None,
+        )
+        if pending_sync is not None:
+            self.state.pending_queue_sync_branch = pending_sync.branch
+            self.log_event(
+                f"Recovered pending queue-sync branch: {pending_sync.branch}"
+            )
+
         if doing is not None:
             self.state.current_task = doing
             matching = (
