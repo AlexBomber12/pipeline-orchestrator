@@ -1383,6 +1383,82 @@ def test_resolve_pending_queue_sync_flips_error_on_closed(
     assert "closed without merging" in (runner.state.error_message or "")
 
 
+def test_resolve_pending_queue_sync_escalates_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the remediation PR stays OPEN past _QUEUE_SYNC_MAX_WAIT_SEC,
+    the runner must escalate to ERROR — otherwise a permanently-stuck
+    PR starves the repo out of the dispatch loop."""
+
+    def fake_gh(args: list[str], repo: str | None = None, timeout: int = 30) -> Any:
+        if args[:2] == ["pr", "view"]:
+            return {"state": "OPEN", "mergedAt": None}
+        return ""
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_gh)
+    monkeypatch.setattr(runner_module, "_QUEUE_SYNC_MAX_WAIT_SEC", 0)
+
+    runner = _make_runner()
+    runner.state.pending_queue_sync_branch = "queue-done-pr-001"
+    runner.state.pending_queue_sync_started_at = datetime.now(
+        timezone.utc
+    ) - timedelta(seconds=10)
+
+    assert runner._resolve_pending_queue_sync() is False
+    assert runner.state.pending_queue_sync_branch is None
+    assert runner.state.state == PipelineState.ERROR
+    assert "still open after" in (runner.state.error_message or "")
+
+
+def test_mark_queue_done_falls_back_to_immediate_merge_when_auto_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """gh pr merge --auto is rejected when auto-merge is disabled on
+    the repo. The queue-sync path must fall back to an immediate
+    merge instead of flipping handle_merge to ERROR for an otherwise
+    successful original-PR merge."""
+    monkeypatch.setattr(
+        runner_module.github_client, "merge_pr", lambda repo, num: None
+    )
+
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "QUEUE.md"
+    queue_path.write_text("## PR-001: first\n- Status: DOING\n")
+
+    def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+
+    gh_calls: list[list[str]] = []
+
+    def fake_gh(args: list[str], repo: str | None = None, timeout: int = 30) -> Any:
+        gh_calls.append(args)
+        if args[:2] == ["pr", "merge"] and "--auto" in args:
+            raise RuntimeError("auto-merge is not allowed for this repository")
+        return ""
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_gh)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="first", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
+    merge_calls = [args for args in gh_calls if args[:2] == ["pr", "merge"]]
+    assert any("--auto" in args for args in merge_calls)
+    assert any("--auto" not in args for args in merge_calls), (
+        "must fall back to a non-auto merge attempt"
+    )
+
+
 def test_mark_queue_done_resets_tree_on_commit_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
