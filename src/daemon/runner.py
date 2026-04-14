@@ -320,6 +320,8 @@ class PipelineRunner:
                     text=True,
                     timeout=5,
                 )
+                if result.returncode != 0:
+                    raise RuntimeError(f"git remote get-url failed: {result.stderr}")
                 current_origin = result.stdout.strip().rstrip("/")
                 expected = repo_config.url.rstrip("/")
                 if current_origin.removesuffix(".git") != expected.removesuffix(".git"):
