@@ -3,6 +3,7 @@
 ./artifacts/pr.patch
 ./artifacts/structure.txt
 ./CLAUDE.md
+./.claude/scheduled_tasks.lock
 ./.claude/settings.local.json
 ./config.yml
 ./docker-compose.yml
