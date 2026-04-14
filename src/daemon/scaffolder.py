@@ -212,7 +212,6 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
     if not agents.exists() and not claude.exists():
         _copy_template("AGENTS.md", agents)
         created.append("AGENTS.md")
-    if not claude.exists():
         _copy_template("CLAUDE.md", claude)
         created.append("CLAUDE.md")
 
