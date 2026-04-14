@@ -110,6 +110,18 @@ def _patch_subprocess(
             return _FakeCompletedProcess(
                 args=cmd, stdout="0\n", returncode=0
             )
+        # ``git merge origin/<ref>`` defaults to the up-to-date no-op
+        # so handle_merge proceeds straight to ``gh pr merge``. Tests
+        # that exercise the sync-push / conflict paths install their
+        # own fake_run to override this.
+        if (
+            cmd[:2] == ["git", "merge"]
+            and len(cmd) > 2
+            and cmd[2].startswith("origin/")
+        ):
+            return _FakeCompletedProcess(
+                args=cmd, stdout="Already up to date.\n", returncode=0
+            )
         return _FakeCompletedProcess(
             args=cmd, stdout=stdout, returncode=returncode
         )
@@ -1213,13 +1225,17 @@ def test_handle_merge_failure_sets_error(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_handle_merge_syncs_with_main(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Before calling merge_pr, handle_merge fetches, merges origin/<base>
-    into the PR branch, then pushes — so gh pr merge sees a mergeable
-    branch even after micro-PRs land on main mid-FIX."""
+    """Before calling merge_pr, handle_merge fetches and merges
+    origin/<base> into the PR branch. When the branch is already
+    up-to-date, the sync is a no-op and merge_pr runs immediately."""
     git_calls: list[list[str]] = []
 
     def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         git_calls.append(cmd)
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return _FakeCompletedProcess(
+                args=cmd, stdout="Already up to date.\n", returncode=0
+            )
         return _FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
@@ -1249,21 +1265,75 @@ def test_handle_merge_syncs_with_main(monkeypatch: pytest.MonkeyPatch) -> None:
         i for i, cmd in enumerate(git_calls)
         if cmd[:2] == ["git", "merge"] and "origin/main" in cmd
     )
-    push_idx = next(
-        i for i, cmd in enumerate(git_calls)
-        if cmd[:2] == ["git", "push"] and "pr-001" in cmd
+    merge_pr_call_idx = len(git_calls)  # merge_pr ran after all git calls
+    assert merge_idx < merge_pr_call_idx
+    # No push because the merge was a no-op.
+    assert not any(
+        cmd[:2] == ["git", "push"] and "pr-001" in cmd for cmd in git_calls
     )
-    assert merge_idx < push_idx, (
-        "git merge origin/main must happen before git push"
+
+
+def test_handle_merge_returns_to_watch_after_sync_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the sync produces a new commit and push succeeds, the
+    merged commit invalidates previously observed gate state (branch
+    protection may require up-to-date checks or dismiss approvals on
+    new commits). Return to WATCH so the next cycle re-verifies gates
+    against the refreshed HEAD instead of calling merge_pr with stale
+    results."""
+    git_calls: list[list[str]] = []
+
+    def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append(cmd)
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return _FakeCompletedProcess(
+                args=cmd,
+                stdout="Merge made by the 'ort' strategy.\n",
+                returncode=0,
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+
+    merge_pr_calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "merge_pr",
+        lambda repo, num: merge_pr_calls.append((repo, num)),
     )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_pr = pr
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is pr
+    assert not merge_pr_calls, (
+        "merge_pr must not run with stale gate results after sync push"
+    )
+    assert any(
+        cmd[:2] == ["git", "push"] and "pr-001" in cmd for cmd in git_calls
+    ), "sync must push the merged PR branch"
 
 
 def test_handle_merge_resolves_conflict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When git merge origin/<base> reports a conflict, handle_merge
-    asks Claude to resolve it. On success the merge proceeds normally."""
+    asks Claude to resolve it. On success the merged HEAD is pushed
+    and the runner returns to WATCH so the next cycle re-verifies
+    gates — merge_pr is not called in the same cycle because the new
+    commit invalidates previously observed CI/review state."""
+    git_calls: list[list[str]] = []
+
     def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append(cmd)
         if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
             return _FakeCompletedProcess(
                 args=cmd,
@@ -1290,9 +1360,6 @@ def test_handle_merge_resolves_conflict(
         "merge_pr",
         lambda repo, num: merge_pr_calls.append((repo, num)),
     )
-    monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
-    )
 
     runner = _make_runner()
     runner.state.state = PipelineState.WATCH
@@ -1302,9 +1369,14 @@ def test_handle_merge_resolves_conflict(
     )
     asyncio.run(runner.handle_merge())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.WATCH
     assert claude_calls, "Claude must be invoked on merge conflict"
-    assert merge_pr_calls == [(runner.owner_repo, 5)]
+    assert not merge_pr_calls, (
+        "merge_pr must not run with stale gate results after sync push"
+    )
+    assert any(
+        cmd[:2] == ["git", "push"] and "pr-001" in cmd for cmd in git_calls
+    ), "conflict-resolved HEAD must be pushed to origin"
 
 
 def test_handle_merge_skips_sync_for_cross_repo_pr(
@@ -1477,6 +1549,10 @@ def test_handle_merge_opens_queue_done_pr_without_waiting(
 
     def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         git_calls.append(cmd)
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return _FakeCompletedProcess(
+                args=cmd, stdout="Already up to date.\n", returncode=0
+            )
         return _FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
@@ -1611,6 +1687,10 @@ def test_handle_merge_stays_idle_when_queue_sync_setup_fails(
             and any("queue-done" in a for a in cmd)
         ):
             raise subprocess.CalledProcessError(1, cmd, stderr="push failed")
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return _FakeCompletedProcess(
+                args=cmd, stdout="Already up to date.\n", returncode=0
+            )
         return _FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fail_push)
@@ -1790,6 +1870,10 @@ def test_mark_queue_done_falls_back_to_immediate_merge_when_auto_rejected(
     queue_path.write_text("## PR-001: first\n- Status: DOING\n")
 
     def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return _FakeCompletedProcess(
+                args=cmd, stdout="Already up to date.\n", returncode=0
+            )
         return _FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_git)

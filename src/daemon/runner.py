@@ -1545,6 +1545,7 @@ return 0
                     capture_output=True, text=True, timeout=60,
                     check=False, cwd=self.repo_path,
                 )
+                sync_produced_commit = False
                 if merge_result.returncode != 0:
                     if "CONFLICT" in (
                         merge_result.stdout + merge_result.stderr
@@ -1572,6 +1573,7 @@ return 0
                             )
                             self.log_event(self.state.error_message)
                             return
+                        sync_produced_commit = True
                     else:
                         self.state.state = PipelineState.ERROR
                         self.state.error_message = (
@@ -1580,12 +1582,31 @@ return 0
                         )
                         self.log_event(self.state.error_message)
                         return
+                else:
+                    sync_produced_commit = (
+                        "Already up to date" not in merge_result.stdout
+                    )
 
-                subprocess.run(
-                    ["git", "push", "origin", pr_branch],
-                    capture_output=True, text=True, timeout=60,
-                    check=True, cwd=self.repo_path,
-                )
+                if sync_produced_commit:
+                    subprocess.run(
+                        ["git", "push", "origin", pr_branch],
+                        capture_output=True, text=True, timeout=60,
+                        check=True, cwd=self.repo_path,
+                    )
+                    # The new commit invalidates any previously observed
+                    # green/approved gate state (branch protection may
+                    # require up-to-date checks or dismiss approvals on
+                    # new commits). Return to WATCH so the next cycle
+                    # re-verifies gates against the refreshed HEAD
+                    # instead of attempting an immediate merge that
+                    # would fail and drop the runner into ERROR.
+                    self.state.state = PipelineState.WATCH
+                    self.log_event(
+                        f"Pre-merge sync pushed new commits to PR "
+                        f"#{number}; returning to WATCH to re-verify "
+                        "gates"
+                    )
+                    return
             except (subprocess.CalledProcessError,
                     subprocess.TimeoutExpired, OSError) as exc:
                 self.state.state = PipelineState.ERROR
