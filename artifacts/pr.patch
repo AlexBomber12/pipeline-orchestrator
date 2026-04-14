@@ -1,5 +1,5 @@
 diff --git a/src/daemon/runner.py b/src/daemon/runner.py
-index 23736f6..4bec96c 100644
+index 23736f6..13ebf53 100644
 --- a/src/daemon/runner.py
 +++ b/src/daemon/runner.py
 @@ -39,7 +39,7 @@ from src.queue_parser import (
@@ -11,7 +11,7 @@ index 23736f6..4bec96c 100644
  
  logger = logging.getLogger(__name__)
  
-@@ -281,9 +281,60 @@ class PipelineRunner:
+@@ -281,9 +281,64 @@ class PipelineRunner:
          self.repo_config = repo_config
          self.app_config = app_config
          self.redis = redis_client
@@ -68,12 +68,16 @@ index 23736f6..4bec96c 100644
 +                    )
 +                    shutil.rmtree(new_path)
 +            except Exception:
-+                logger.warning("Could not verify origin for %s", new_path)
++                logger.warning(
++                    "Could not verify origin for %s — removing invalid clone",
++                    new_path,
++                )
++                shutil.rmtree(new_path, ignore_errors=True)
 +        self._old_basename = old_basename
          self.state = RepoState(
              url=repo_config.url,
              name=self.name,
-@@ -348,6 +399,18 @@ class PipelineRunner:
+@@ -348,6 +403,22 @@ class PipelineRunner:
          else:
              payload = self.state.model_dump_json()
          await self.redis.set(f"pipeline:{self.name}", payload)
@@ -87,6 +91,10 @@ index 23736f6..4bec96c 100644
 +                    expected = self.repo_config.url.rstrip("/").removesuffix(".git")
 +                    if old_url == expected:
 +                        await self.redis.delete(old_key)
++                old_upload = f"upload:{self._old_basename}:pending"
++                new_upload = f"upload:{self.name}:pending"
++                if await self.redis.exists(old_upload) and not await self.redis.exists(new_upload):
++                    await self.redis.rename(old_upload, new_upload)
 +            except Exception:
 +                pass
  

@@ -333,7 +333,11 @@ class PipelineRunner:
                     )
                     shutil.rmtree(new_path)
             except Exception:
-                logger.warning("Could not verify origin for %s", new_path)
+                logger.warning(
+                    "Could not verify origin for %s — removing invalid clone",
+                    new_path,
+                )
+                shutil.rmtree(new_path, ignore_errors=True)
         self._old_basename = old_basename
         self.state = RepoState(
             url=repo_config.url,
@@ -409,6 +413,10 @@ class PipelineRunner:
                     expected = self.repo_config.url.rstrip("/").removesuffix(".git")
                     if old_url == expected:
                         await self.redis.delete(old_key)
+                old_upload = f"upload:{self._old_basename}:pending"
+                new_upload = f"upload:{self.name}:pending"
+                if await self.redis.exists(old_upload) and not await self.redis.exists(new_upload):
+                    await self.redis.rename(old_upload, new_upload)
             except Exception:
                 pass
 
