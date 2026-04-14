@@ -298,14 +298,13 @@ class PipelineRunner:
                     text=True,
                     timeout=5,
                 )
-                old_origin = result.stdout.strip().rstrip("/")
-                expected = repo_config.url.rstrip("/")
-                if old_origin.removesuffix(".git") != expected.removesuffix(".git"):
+                old_origin = result.stdout.strip()
+                if repo_slug_from_url(old_origin) != self.name:
                     logger.warning(
                         "Legacy clone %s has origin %s, expected %s — skipping migration",
                         old_path,
                         old_origin,
-                        expected,
+                        repo_config.url,
                     )
                 else:
                     shutil.move(str(old_path), str(new_path))
@@ -322,14 +321,13 @@ class PipelineRunner:
                 )
                 if result.returncode != 0:
                     raise RuntimeError(f"git remote get-url failed: {result.stderr}")
-                current_origin = result.stdout.strip().rstrip("/")
-                expected = repo_config.url.rstrip("/")
-                if current_origin.removesuffix(".git") != expected.removesuffix(".git"):
+                current_origin = result.stdout.strip()
+                if repo_slug_from_url(current_origin) != self.name:
                     logger.warning(
                         "Clone %s has origin %s, expected %s — removing stale clone",
                         new_path,
                         current_origin,
-                        expected,
+                        repo_config.url,
                     )
                     shutil.rmtree(new_path)
             except Exception:
@@ -409,9 +407,8 @@ class PipelineRunner:
                 old_data = await self.redis.get(old_key)
                 if old_data:
                     old_state = json.loads(old_data)
-                    old_url = old_state.get("url", "").rstrip("/").removesuffix(".git")
-                    expected = self.repo_config.url.rstrip("/").removesuffix(".git")
-                    if old_url == expected:
+                    old_url = old_state.get("url", "")
+                    if repo_slug_from_url(old_url) == self.name:
                         await self.redis.delete(old_key)
                 old_upload = f"upload:{self._old_basename}:pending"
                 new_upload = f"upload:{self.name}:pending"
