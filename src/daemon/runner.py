@@ -31,7 +31,12 @@ from src.models import (
     ReviewStatus,
     TaskStatus,
 )
-from src.queue_parser import get_next_task, parse_queue, parse_queue_text
+from src.queue_parser import (
+    get_next_task,
+    mark_task_done,
+    parse_queue,
+    parse_queue_text,
+)
 from src.utils import repo_name_from_url
 
 logger = logging.getLogger(__name__)
@@ -1515,10 +1520,8 @@ return 0
             return
         content = queue_path.read_text()
 
-        import re
-        pattern = rf"(## {re.escape(pr_id)}:.*?\n- Status: )(?:TODO|DOING)"
-        updated = re.sub(pattern, r"\1DONE", content, count=1)
-        if updated == content:
+        updated = mark_task_done(content, pr_id)
+        if updated is None or updated == content:
             return
 
         try:

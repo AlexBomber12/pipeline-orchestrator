@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from src.models import TaskStatus
-from src.queue_parser import get_next_task, parse_queue
+from src.queue_parser import get_next_task, mark_task_done, parse_queue
 
 SAMPLE_QUEUE = """## PR-001: Bootstrap
 - Status: DONE
@@ -164,3 +164,74 @@ def test_parse_real_queue_file() -> None:
     by_id = {task.pr_id: task for task in tasks}
     assert by_id["PR-003"].depends_on == ["PR-002"]
     assert by_id["PR-003"].branch == "pr-003-queue-parser"
+
+
+def test_mark_task_done_standard_layout() -> None:
+    content = (
+        "## PR-001: first\n"
+        "- Status: DOING\n"
+        "- Tasks file: tasks/PR-001.md\n"
+    )
+    updated = mark_task_done(content, "PR-001")
+    assert updated is not None
+    assert "- Status: DONE\n" in updated
+    assert "DOING" not in updated
+
+
+def test_mark_task_done_ignores_other_tasks() -> None:
+    content = (
+        "## PR-001: first\n- Status: DOING\n\n"
+        "## PR-002: second\n- Status: TODO\n"
+    )
+    updated = mark_task_done(content, "PR-001")
+    assert updated is not None
+    assert "## PR-001: first\n- Status: DONE\n" in updated
+    assert "## PR-002: second\n- Status: TODO\n" in updated
+
+
+def test_mark_task_done_handles_flexible_field_order() -> None:
+    """Status line can come after Branch/Depends on/Tasks file."""
+    content = (
+        "## PR-030: swap layout\n"
+        "- Branch: pr-030-swap\n"
+        "- Tasks file: tasks/PR-030.md\n"
+        "- Depends on: PR-029\n"
+        "- Status: TODO\n"
+    )
+    updated = mark_task_done(content, "PR-030")
+    assert updated is not None
+    assert "- Status: DONE\n" in updated
+    # Other fields untouched
+    assert "- Branch: pr-030-swap\n" in updated
+    assert "- Depends on: PR-029\n" in updated
+
+
+def test_mark_task_done_case_insensitive_key_and_value() -> None:
+    content = "## PR-001: first\n-  status:  doing\n"
+    updated = mark_task_done(content, "PR-001")
+    assert updated is not None
+    # Prefix (including extra spacing) preserved, value replaced with DONE.
+    assert "-  status:  DONE" in updated
+
+
+def test_mark_task_done_returns_none_when_already_done() -> None:
+    content = "## PR-001: first\n- Status: DONE\n"
+    assert mark_task_done(content, "PR-001") is None
+
+
+def test_mark_task_done_returns_none_when_task_missing() -> None:
+    content = "## PR-001: first\n- Status: DOING\n"
+    assert mark_task_done(content, "PR-999") is None
+
+
+def test_mark_task_done_stops_at_next_header() -> None:
+    """Do not cross into a sibling task's section when the target has
+    no status line in its own section."""
+    content = (
+        "## PR-001: first\n"
+        "- Branch: pr-001\n"
+        "\n"
+        "## PR-002: second\n"
+        "- Status: TODO\n"
+    )
+    assert mark_task_done(content, "PR-001") is None

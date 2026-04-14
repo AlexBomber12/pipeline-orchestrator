@@ -9,6 +9,9 @@ from src.models import QueueTask, TaskStatus
 
 _HEADER_RE = re.compile(r"^##\s+(PR-[A-Za-z0-9_.-]+):\s*(.+?)\s*$")
 _FIELD_RE = re.compile(r"^-\s*([A-Za-z ]+?)\s*:\s*(.*?)\s*$")
+_STATUS_LINE_RE = re.compile(
+    r"^(-\s*status\s*:\s*)(\S+)(.*)$", re.IGNORECASE
+)
 
 
 def parse_queue(queue_path: str) -> list[QueueTask]:
@@ -100,6 +103,52 @@ def get_next_task(tasks: list[QueueTask]) -> QueueTask | None:
             return task
 
     return None
+
+
+def mark_task_done(content: str, pr_id: str) -> str | None:
+    """Return ``content`` with ``pr_id``'s status flipped to ``DONE``.
+
+    Returns ``None`` when the task is absent, already ``DONE``, or has no
+    status line. Matches the same flexible field ordering/case/spacing as
+    ``parse_queue_text``: finds the task by its ``## {pr_id}:`` header
+    and updates the first ``- status:`` field inside that section,
+    regardless of where it sits relative to ``Branch``/``Depends on``/
+    ``Tasks file`` lines.
+    """
+    lines = content.splitlines(keepends=True)
+    in_target = False
+    target_i: int | None = None
+    for i, raw in enumerate(lines):
+        stripped = raw.rstrip("\r\n")
+        header = _HEADER_RE.match(stripped)
+        if header:
+            if in_target:
+                break
+            in_target = header.group(1) == pr_id
+            continue
+        if not in_target:
+            continue
+        match = _STATUS_LINE_RE.match(stripped)
+        if match:
+            if match.group(2).strip().upper() in {"TODO", "DOING"}:
+                target_i = i
+            break
+
+    if target_i is None:
+        return None
+
+    raw = lines[target_i]
+    if raw.endswith("\r\n"):
+        ending = "\r\n"
+    elif raw.endswith("\n"):
+        ending = "\n"
+    else:
+        ending = ""
+    body = raw[: len(raw) - len(ending)]
+    match = _STATUS_LINE_RE.match(body)
+    assert match is not None
+    lines[target_i] = f"{match.group(1)}DONE{match.group(3)}{ending}"
+    return "".join(lines)
 
 
 def _build_task(data: dict) -> QueueTask:
