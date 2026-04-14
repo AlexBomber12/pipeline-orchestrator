@@ -105,8 +105,9 @@ def ensure_claude_md(repo_path: str, branch: str) -> bool:
             repo_path, "push", "origin", branch, timeout=_PUSH_GIT_TIMEOUT
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        logger.warning("ensure_claude_md commit/push failed: %s", exc)
-        raise
+        logger.warning("ensure_claude_md push failed (branch protection?): %s", exc)
+        _run_git(repo_path, "reset", "--hard", f"origin/{branch}")
+        return False
     return True
 
 
