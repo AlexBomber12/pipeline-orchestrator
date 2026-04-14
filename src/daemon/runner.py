@@ -498,7 +498,7 @@ class PipelineRunner:
                     "recover_state and preflight run first"
                 )
 
-        if self._scaffolded:
+        if self._scaffolded and not _working_tree_dirty(self.repo_path):
             try:
                 if scaffolder.ensure_claude_md(
                     self.repo_path, self.repo_config.branch
