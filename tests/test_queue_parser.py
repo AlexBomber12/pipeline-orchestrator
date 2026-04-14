@@ -238,6 +238,32 @@ def test_mark_task_done_clears_arbitrary_non_done_status() -> None:
     assert "WORKING" not in updated
 
 
+def test_mark_task_done_rewrites_every_status_line_in_section() -> None:
+    """parse_queue_text walks every field line so later `- Status:` lines
+    override earlier ones. If a malformed section has DONE followed by
+    TODO, the parser selects the task; mark_task_done must flip both
+    lines so no stale status remains selectable."""
+    content = (
+        "## PR-001: first\n"
+        "- Status: DONE\n"
+        "- Status: TODO\n"
+    )
+    updated = mark_task_done(content, "PR-001")
+    assert updated is not None
+    # Both status lines must now read DONE.
+    assert updated.count("- Status: DONE\n") == 2
+    assert "TODO" not in updated
+
+
+def test_mark_task_done_returns_none_when_every_status_already_done() -> None:
+    content = (
+        "## PR-001: first\n"
+        "- Status: DONE\n"
+        "- Status: DONE\n"
+    )
+    assert mark_task_done(content, "PR-001") is None
+
+
 def test_mark_task_done_returns_none_when_task_missing() -> None:
     content = "## PR-001: first\n- Status: DOING\n"
     assert mark_task_done(content, "PR-999") is None

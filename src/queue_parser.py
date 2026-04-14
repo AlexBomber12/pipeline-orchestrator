@@ -108,20 +108,25 @@ def get_next_task(tasks: list[QueueTask]) -> QueueTask | None:
 def mark_task_done(content: str, pr_id: str) -> str | None:
     """Return ``content`` with ``pr_id``'s status flipped to ``DONE``.
 
-    Returns ``None`` when the task is absent, already ``DONE``, or has no
-    status line. Matches the same flexible field ordering/case/spacing as
-    ``parse_queue_text``: finds the task by its ``## {pr_id}:`` header
-    and updates the first ``- status:`` field inside that section,
-    regardless of where it sits relative to ``Branch``/``Depends on``/
-    ``Tasks file`` lines. Any non-``DONE`` status token is treated as
-    updatable so malformed values (e.g. ``TODO,`` with a stray comma)
-    that ``parse_queue_text`` silently coerces to ``TODO`` at selection
-    time are also cleared, preventing the daemon from re-picking a task
-    just because its queue entry is syntactically odd.
+    Returns ``None`` when the task is absent, already ``DONE`` in every
+    status line, or has no status line at all. Matches the same flexible
+    field ordering/case/spacing as ``parse_queue_text``: finds the task
+    by its ``## {pr_id}:`` header and rewrites every ``- status:`` line
+    within that section to ``DONE``.
+
+    Whole-section sweep rather than first-match so behaviour mirrors
+    ``parse_queue_text``, which walks every field line and lets later
+    ``- Status:`` entries overwrite earlier ones — if a malformed
+    section contains duplicates (e.g. ``DONE`` followed by ``TODO``)
+    the parser would still consider the task selectable, so the
+    remediation path must flip every occurrence. Non-``DONE`` tokens
+    (including malformed values like ``TODO,``) are also updated, so
+    entries that parser-fallback treats as ``TODO`` cannot silently
+    remain selectable.
     """
     lines = content.splitlines(keepends=True)
     in_target = False
-    target_i: int | None = None
+    status_indices: list[int] = []
     for i, raw in enumerate(lines):
         stripped = raw.rstrip("\r\n")
         header = _HEADER_RE.match(stripped)
@@ -132,26 +137,33 @@ def mark_task_done(content: str, pr_id: str) -> str | None:
             continue
         if not in_target:
             continue
-        match = _STATUS_LINE_RE.match(stripped)
-        if match:
-            if match.group(2).strip().upper() != "DONE":
-                target_i = i
-            break
+        if _STATUS_LINE_RE.match(stripped):
+            status_indices.append(i)
 
-    if target_i is None:
+    if not status_indices:
         return None
 
-    raw = lines[target_i]
-    if raw.endswith("\r\n"):
-        ending = "\r\n"
-    elif raw.endswith("\n"):
-        ending = "\n"
-    else:
-        ending = ""
-    body = raw[: len(raw) - len(ending)]
-    match = _STATUS_LINE_RE.match(body)
-    assert match is not None
-    lines[target_i] = f"{match.group(1)}DONE{ending}"
+    def _value_upper(idx: int) -> str:
+        body = lines[idx].rstrip("\r\n")
+        match = _STATUS_LINE_RE.match(body)
+        assert match is not None
+        return match.group(2).strip().upper()
+
+    if all(_value_upper(i) == "DONE" for i in status_indices):
+        return None
+
+    for i in status_indices:
+        raw = lines[i]
+        if raw.endswith("\r\n"):
+            ending = "\r\n"
+        elif raw.endswith("\n"):
+            ending = "\n"
+        else:
+            ending = ""
+        body = raw[: len(raw) - len(ending)]
+        match = _STATUS_LINE_RE.match(body)
+        assert match is not None
+        lines[i] = f"{match.group(1)}DONE{ending}"
     return "".join(lines)
 
 

@@ -1490,7 +1490,18 @@ return 0
         try:
             self._mark_queue_done()
         except Exception as exc:
-            self.log_event(f"Warning: QUEUE.md update failed: {exc}")
+            # The original PR is already merged, but the queue-sync
+            # remediation PR did not confirm a successful merge within
+            # the timeout (or its own merge was rejected/closed).
+            # Clearing state to IDLE here would let the next cycle
+            # read QUEUE.md from origin/base before the sync lands and
+            # re-pick the just-merged task. Flip to ERROR so the
+            # operator (or handle_error escalation) resolves the
+            # remediation before the runner dispatches more work.
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = f"queue-sync failed: {exc}"
+            self.log_event(f"queue-sync failed: {exc}")
+            return
 
         self.state.current_pr = None
         self.state.current_task = None

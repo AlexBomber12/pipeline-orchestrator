@@ -798,6 +798,9 @@ def test_handle_watch_approved_and_green_merges(
         merged.append((repo, number))
 
     monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge)
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
 
     runner = _make_runner()
     runner.state.state = PipelineState.WATCH
@@ -1173,6 +1176,9 @@ def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(
         runner_module.github_client, "merge_pr", lambda repo, num: None
     )
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
 
     runner = _make_runner()
     runner.state.state = PipelineState.WATCH
@@ -1277,9 +1283,13 @@ def test_handle_merge_opens_queue_done_pr(
     )
 
 
-def test_handle_merge_tolerates_queue_failure(
+def test_handle_merge_flips_error_on_queue_sync_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """If the queue-sync remediation PR does not merge, daemon must
+    flip to ERROR rather than clearing state to IDLE — otherwise the
+    next cycle reads QUEUE.md before the sync lands and re-picks the
+    merged task."""
     monkeypatch.setattr(
         runner_module.github_client, "merge_pr", lambda repo, num: None
     )
@@ -1317,9 +1327,11 @@ def test_handle_merge_tolerates_queue_failure(
     )
     asyncio.run(runner.handle_merge())
 
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.current_pr is None
-    assert runner.state.current_task is None
+    assert runner.state.state == PipelineState.ERROR
+    assert "queue-sync" in (runner.state.error_message or "")
+    assert runner.state.current_task is not None, (
+        "current_task must not be cleared while remediation is unresolved"
+    )
 
 
 def test_mark_queue_done_raises_if_pr_not_merged_before_timeout(
