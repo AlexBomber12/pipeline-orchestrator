@@ -10,5 +10,5 @@ The event loop scope for asynchronous fixtures will default to the fixture cachi
 ........................................................................ [ 71%]
 ........................................................................ [ 95%]
 ..............                                                           [100%]
-302 passed in 0.85s
+302 passed in 0.84s
 ==> ci.sh OK
