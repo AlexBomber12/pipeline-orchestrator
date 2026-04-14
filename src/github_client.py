@@ -226,6 +226,32 @@ def post_comment(repo: str, pr_number: int, body: str) -> None:
     run_gh(["pr", "comment", str(pr_number), "--body", body], repo=repo)
 
 
+def get_pr_author(repo: str, pr_number: int) -> str:
+    """Return the GitHub login of the PR's author, or "" on failure.
+
+    Read directly from PR metadata rather than the daemon's ``gh``
+    identity: Claude CLI may run under a different authentication
+    context than the daemon, so ``gh api user`` is not a reliable
+    proxy for "who opened this PR" and using it would cause
+    ``has_recent_codex_review_request`` to miss the trigger that the
+    real author already posted.
+    """
+    try:
+        raw = run_gh(
+            [
+                "api",
+                f"repos/{repo}/pulls/{pr_number}",
+                "--jq",
+                ".user.login",
+            ]
+        )
+    except RuntimeError:
+        return ""
+    if isinstance(raw, str):
+        return raw.strip()
+    return ""
+
+
 def has_recent_codex_review_request(
     repo: str,
     pr_number: int,

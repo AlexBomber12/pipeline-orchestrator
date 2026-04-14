@@ -794,10 +794,13 @@ class PipelineRunner:
 
         Called by ``preflight`` once the consecutive-dirty counter
         crosses ``_DIRTY_CYCLES_BEFORE_AUTO_RESET``. On success the
-        runner is returned to IDLE with the dirty counter cleared so
-        the next cycle can pick up work normally. On failure the
-        counter is left untouched and the caller falls through to the
-        usual ERROR path.
+        runner resumes the state it was in before the dirty-tree
+        stall: WATCH when an open PR was being tracked, IDLE
+        otherwise. Dropping back to IDLE unconditionally would make
+        the next cycle re-pick the still-TODO task from
+        ``origin/{base}:tasks/QUEUE.md`` and open a duplicate PR.
+        On failure the counter is left untouched and the caller
+        falls through to the usual ERROR path.
         """
         branch = self.repo_config.branch
         try:
@@ -812,9 +815,13 @@ class PipelineRunner:
             self.log_event(f"Auto-recovery failed: {exc}")
             return False
         self._consecutive_dirty_cycles = 0
-        self.state.state = PipelineState.IDLE
+        if self.state.current_pr is not None:
+            resumed = PipelineState.WATCH
+        else:
+            resumed = PipelineState.IDLE
+        self.state.state = resumed
         self.state.error_message = None
-        self.log_event("Auto-recovered from dirty tree -> IDLE")
+        self.log_event(f"Auto-recovered from dirty tree -> {resumed.value}")
         return True
 
     def _preserve_crashed_run_commits(self, branch: str) -> bool:
@@ -1883,21 +1890,6 @@ return 0
         )
         self.log_event(self.state.error_message)
 
-    def _get_pr_author(self) -> str:
-        """Return the GitHub login used to author PRs from this daemon.
-
-        Resolves from the ``gh`` auth context via ``gh api user`` and
-        falls back to ``AlexBomber12`` when that lookup fails so the
-        dedup check in ``_post_codex_review`` still has a non-empty
-        author to match against.
-        """
-        try:
-            raw = github_client.run_gh(["api", "user", "--jq", ".login"])
-        except Exception:
-            return "AlexBomber12"
-        login = raw if isinstance(raw, str) else ""
-        return login.strip() or "AlexBomber12"
-
     def _post_codex_review(self, pr_number: int) -> bool:
         """Post ``@codex review`` on ``pr_number``.
 
@@ -1922,10 +1914,13 @@ return 0
         still fires on the creation event itself.
         """
         try:
-            if github_client.has_recent_codex_review_request(
+            pr_author = github_client.get_pr_author(
+                self.owner_repo, pr_number
+            )
+            if pr_author and github_client.has_recent_codex_review_request(
                 self.owner_repo,
                 pr_number,
-                pr_author=self._get_pr_author(),
+                pr_author=pr_author,
                 within_minutes=5,
             ):
                 self.log_event(

@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from src.github_client import (
+    get_pr_author,
     get_pr_review_status,
     get_repo_full_name,
     has_recent_codex_review_request,
@@ -662,3 +663,35 @@ def test_has_recent_codex_review_request_false_no_comment(
         )
         is False
     )
+
+
+def test_get_pr_author_returns_login(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``get_pr_author`` must read the login from PR metadata, not from
+    the daemon's ``gh`` identity, so dedup works when Claude CLI ran
+    under a different auth context than the daemon."""
+    captured: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured.append(cmd)
+        return _FakeCompletedProcess(stdout='"claude-cli-bot"')
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert get_pr_author("owner/name", 42) == "claude-cli-bot"
+    assert captured, "gh must be invoked"
+    assert any("repos/owner/name/pulls/42" in arg for arg in captured[0])
+
+
+def test_get_pr_author_returns_empty_on_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``gh api`` failure must not crash the caller — the dedup path
+    simply skips when no author can be resolved."""
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(
+            stdout="", stderr="not found", returncode=1
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert get_pr_author("owner/name", 42) == ""

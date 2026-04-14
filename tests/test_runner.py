@@ -3250,6 +3250,41 @@ def test_dirty_tree_auto_recovery_after_3_cycles(
     )
 
 
+def test_dirty_tree_auto_recovery_preserves_watch_with_open_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When auto-recovery fires while a PR is being tracked, the runner
+    must resume WATCH, not IDLE. Dropping to IDLE lets the next cycle
+    re-pick the still-TODO task from origin/main's QUEUE.md and open a
+    duplicate PR — exactly the churn this safety net is meant to
+    avoid."""
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:3] == ["git", "status", "--porcelain"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout=" M src/foo.py\n", returncode=0
+            )
+        return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=99, branch="pr-099-wip")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-099", title="wip", status=TaskStatus.DOING, branch="pr-099-wip"
+    )
+
+    runner.preflight()
+    runner.preflight()
+    assert runner.preflight() is True
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 99
+    assert runner.state.current_task is not None
+    assert any(
+        "auto-recovered from dirty tree -> watch" in e["event"].lower()
+        for e in runner.state.history
+    )
+
+
 def test_dirty_tree_counter_resets_on_clean(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3304,6 +3339,11 @@ def test_post_codex_review_skips_duplicate(
     from starting two redundant reviews back-to-back."""
     monkeypatch.setattr(
         runner_module.github_client,
+        "get_pr_author",
+        lambda repo, number: "claude-bot",
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
         "has_recent_codex_review_request",
         lambda *a, **kw: True,
     )
@@ -3330,6 +3370,11 @@ def test_post_codex_review_posts_when_no_duplicate(
     review`` exactly once."""
     monkeypatch.setattr(
         runner_module.github_client,
+        "get_pr_author",
+        lambda repo, number: "claude-bot",
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
         "has_recent_codex_review_request",
         lambda *a, **kw: False,
     )
@@ -3343,3 +3388,41 @@ def test_post_codex_review_posts_when_no_duplicate(
 
     assert runner._post_codex_review(42) is True
     assert posted == [(runner.owner_repo, 42, "@codex review")]
+
+
+def test_post_codex_review_uses_pr_author_not_gh_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dedup filter must match against the actual PR author from PR
+    metadata, not the daemon's gh identity. Claude CLI may run under a
+    different auth context than the daemon; if the daemon's gh user is
+    passed instead, ``has_recent_codex_review_request`` misses Claude's
+    trigger comment and a duplicate @codex review gets posted anyway."""
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_author",
+        lambda repo, number: "claude-cli-bot",
+    )
+
+    def fake_has_recent(
+        repo: str, pr_number: int, pr_author: str, within_minutes: int = 5
+    ) -> bool:
+        captured["pr_author"] = pr_author
+        return True
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "has_recent_codex_review_request",
+        fake_has_recent,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = _make_runner()
+    assert runner._post_codex_review(7) is True
+    assert captured["pr_author"] == "claude-cli-bot"
