@@ -28,10 +28,17 @@ def test_load_config_missing_file_returns_defaults(tmp_path: Path) -> None:
     assert cfg.daemon.review_timeout_min == 60
     assert cfg.daemon.hung_fallback_codex_review is True
     assert cfg.daemon.error_handler_use_ai is True
+    assert cfg.daemon.claude_model == "opus"
     assert cfg.web.host == "0.0.0.0"
     assert cfg.web.port == 8000
     assert cfg.auth.claude_config_dir == "/data/auth/claude"
     assert cfg.auth.gh_config_dir == "/data/auth/gh"
+
+
+def test_daemon_config_claude_model_default() -> None:
+    from src.config import DaemonConfig
+
+    assert DaemonConfig().claude_model == "opus"
 
 
 def test_load_config_valid_yaml(tmp_path: Path) -> None:

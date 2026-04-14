@@ -74,7 +74,10 @@ def _setup_git_auth() -> None:
 def _validate_auth() -> dict[str, bool]:
     """Check whether ``claude`` and ``gh`` CLIs are authenticated."""
     checks: dict[str, bool] = {}
-    for name, cmd in [("claude", ["claude", "--version"]), ("gh", ["gh", "auth", "status"])]:
+    for name, cmd in [
+        ("claude", ["claude", "auth", "status"]),
+        ("gh", ["gh", "auth", "status"]),
+    ]:
         try:
             subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=True)
             checks[name] = True

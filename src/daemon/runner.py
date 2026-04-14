@@ -1332,7 +1332,9 @@ return 0
             self.log_event(self.state.error_message)
             return
 
-        code, stdout, stderr = claude_cli.run_planned_pr(self.repo_path)
+        code, stdout, stderr = claude_cli.run_planned_pr(
+            self.repo_path, model=self.app_config.daemon.claude_model
+        )
         await self._save_cli_log(stdout, "PLANNED PR output")
         if code != 0:
             self.state.state = PipelineState.ERROR
@@ -1496,7 +1498,9 @@ return 0
                 self.log_event(self.state.error_message)
                 return
 
-        code, stdout, stderr = claude_cli.fix_review(self.repo_path)
+        code, stdout, stderr = claude_cli.fix_review(
+            self.repo_path, model=self.app_config.daemon.claude_model
+        )
         await self._save_cli_log(stdout, "FIX REVIEW output")
         if code != 0:
             self.state.state = PipelineState.ERROR
@@ -1581,6 +1585,7 @@ return 0
                             "Run scripts/ci.sh to verify.",
                             self.repo_path,
                             timeout=300,
+                            model=self.app_config.daemon.claude_model,
                         )
                         if code != 0:
                             _git(
@@ -1987,7 +1992,9 @@ return 0
     async def handle_error(self, error_context: str | None = None) -> None:
         """Ask the claude CLI whether to FIX, SKIP, or ESCALATE the error."""
         context = error_context or self.state.error_message or "Unknown error"
-        code, stdout, stderr = claude_cli.diagnose_error(self.repo_path, context)
+        code, stdout, stderr = claude_cli.diagnose_error(
+            self.repo_path, context, model=self.app_config.daemon.claude_model
+        )
         if code != 0:
             self.log_event(
                 f"diagnose_error CLI failed: {stderr.strip() or f'exit {code}'}"

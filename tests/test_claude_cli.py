@@ -106,6 +106,43 @@ def test_run_claude_file_not_found_without_filename(
     assert run_claude("prompt", "/tmp") == (-1, "", "claude CLI not found")
 
 
+def test_run_claude_with_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured["cmd"] = cmd
+        return _FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    run_claude("do a thing", "/tmp", model="opus")
+
+    assert captured["cmd"] == [
+        "claude",
+        "--print",
+        "--dangerously-skip-permissions",
+        "--model",
+        "opus",
+        "do a thing",
+    ]
+
+
+def test_run_claude_without_model_has_no_model_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured["cmd"] = cmd
+        return _FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    run_claude("do a thing", "/tmp")
+
+    assert "--model" not in captured["cmd"]
+
+
 def test_run_planned_pr_uses_planned_pr_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
 
@@ -121,6 +158,52 @@ def test_run_planned_pr_uses_planned_pr_prompt(monkeypatch: pytest.MonkeyPatch) 
     assert captured["cmd"][-1] == "PLANNED PR"
     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
     assert captured["kwargs"]["timeout"] == 900
+
+
+def test_run_planned_pr_forwards_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured["cmd"] = cmd
+        return _FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    run_planned_pr("/data/repos/demo", model="sonnet")
+
+    assert "--model" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("--model") + 1] == "sonnet"
+    assert captured["cmd"][-1] == "PLANNED PR"
+
+
+def test_fix_review_forwards_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured["cmd"] = cmd
+        return _FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    fix_review("/data/repos/demo", model="opus")
+
+    assert "--model" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("--model") + 1] == "opus"
+
+
+def test_diagnose_error_forwards_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured["cmd"] = cmd
+        return _FakeCompletedProcess(stdout="FIX", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    diagnose_error("/data/repos/demo", "boom", model="opus")
+
+    assert "--model" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("--model") + 1] == "opus"
 
 
 def test_fix_review_uses_fix_review_prompt(monkeypatch: pytest.MonkeyPatch) -> None:

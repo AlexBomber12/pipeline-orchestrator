@@ -8,6 +8,7 @@ daemon:
   review_timeout_min: 60
   hung_fallback_codex_review: true
   error_handler_use_ai: true
+  claude_model: opus
 web:
   host: 0.0.0.0
   port: 8000
