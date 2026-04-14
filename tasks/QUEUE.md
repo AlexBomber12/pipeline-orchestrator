@@ -208,3 +208,51 @@
 - Tasks file: tasks/PR-035.md
 - Branch: pr-035-dashboard-ux
 - Depends on: PR-028
+
+## PR-036: Dead code cleanup and CLAUDE.md fix
+- Status: TODO
+- Tasks file: tasks/PR-036.md
+- Branch: pr-036-dead-code-cleanup
+- Depends on: PR-035
+
+## PR-037: Simplify queue-done and fix tech debt
+- Status: TODO
+- Tasks file: tasks/PR-037.md
+- Branch: pr-037-simplify-queue-done
+- Depends on: PR-036
+
+## PR-038: Canonical repo identity
+- Status: TODO
+- Tasks file: tasks/PR-038.md
+- Branch: pr-038-repo-identity
+- Depends on: PR-036
+
+## PR-039: Honest dashboard states
+- Status: TODO
+- Tasks file: tasks/PR-039.md
+- Branch: pr-039-honest-states
+- Depends on: PR-038
+
+## PR-040: Rate limit auto-pause
+- Status: TODO
+- Tasks file: tasks/PR-040.md
+- Branch: pr-040-rate-limit
+- Depends on: PR-036
+
+## PR-041: Smart error handling and stderr logging
+- Status: TODO
+- Tasks file: tasks/PR-041.md
+- Branch: pr-041-smart-errors
+- Depends on: PR-040
+
+## PR-042: Async Claude CLI and per-repo scheduling
+- Status: TODO
+- Tasks file: tasks/PR-042.md
+- Branch: pr-042-async-cli
+- Depends on: PR-038
+
+## PR-043: GitHub API optimization
+- Status: TODO
+- Tasks file: tasks/PR-043.md
+- Branch: pr-043-gh-api-optimize
+- Depends on: PR-042
