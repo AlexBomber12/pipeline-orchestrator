@@ -1600,12 +1600,28 @@ return 0
                     # re-verifies gates against the refreshed HEAD
                     # instead of attempting an immediate merge that
                     # would fail and drop the runner into ERROR.
+                    #
+                    # Post ``@codex review`` before the transition so
+                    # the refreshed HEAD gets a fresh review pass —
+                    # without it, ``get_pr_review_status`` still
+                    # reports the prior anchor ``+1`` as APPROVED and
+                    # the next cycle could merge on stale approval.
+                    # Mirror ``handle_fix`` and treat a post failure
+                    # as fatal to avoid a silent fix/push loop.
                     self.state.state = PipelineState.WATCH
                     self.log_event(
                         f"Pre-merge sync pushed new commits to PR "
                         f"#{number}; returning to WATCH to re-verify "
                         "gates"
                     )
+                    if not self._post_codex_review(number):
+                        self.state.state = PipelineState.ERROR
+                        self.state.error_message = (
+                            f"Failed to post @codex review on PR "
+                            f"#{number} after pre-merge sync push; "
+                            "manual review trigger required to avoid "
+                            "merging on stale approval"
+                        )
                     return
             except (subprocess.CalledProcessError,
                     subprocess.TimeoutExpired, OSError) as exc:

@@ -1303,6 +1303,13 @@ def test_handle_merge_returns_to_watch_after_sync_push(
         lambda repo, num: merge_pr_calls.append((repo, num)),
     )
 
+    post_calls: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, num, body: post_calls.append((repo, num, body)),
+    )
+
     runner = _make_runner()
     runner.state.state = PipelineState.WATCH
     pr = PRInfo(number=5, branch="pr-001")
@@ -1320,6 +1327,44 @@ def test_handle_merge_returns_to_watch_after_sync_push(
     assert any(
         cmd[:2] == ["git", "push"] and "pr-001" in cmd for cmd in git_calls
     ), "sync must push the merged PR branch"
+    assert post_calls == [(runner.owner_repo, 5, "@codex review")], (
+        "must re-request Codex review on the refreshed HEAD"
+    )
+
+
+def test_handle_merge_errors_when_codex_post_fails_after_sync_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failing to post @codex review after a sync push must flip the
+    runner into ERROR: without a fresh review trigger on the new
+    HEAD, the prior anchor +1 keeps the PR APPROVED and a subsequent
+    handle_watch cycle would merge on stale approval."""
+    def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return _FakeCompletedProcess(
+                args=cmd,
+                stdout="Merge made by the 'ort' strategy.\n",
+                returncode=0,
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("gh api failure")
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", boom)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "stale approval" in (runner.state.error_message or "")
 
 
 def test_handle_merge_resolves_conflict(
@@ -1359,6 +1404,11 @@ def test_handle_merge_resolves_conflict(
         runner_module.github_client,
         "merge_pr",
         lambda repo, num: merge_pr_calls.append((repo, num)),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, num, body: None,
     )
 
     runner = _make_runner()
@@ -1440,6 +1490,11 @@ def test_handle_merge_refreshes_pr_head_before_merge(
     monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
     monkeypatch.setattr(
         runner_module.github_client, "merge_pr", lambda repo, num: None
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, num, body: None,
     )
     monkeypatch.setattr(
         runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
