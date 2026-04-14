@@ -68,6 +68,12 @@ _CI_SCRIPT_TIMEOUT_SEC = 1800
 # slow repos without false escalations.
 _QUEUE_SYNC_MAX_WAIT_SEC = 3600
 
+# After this many consecutive cycles of a dirty working tree,
+# ``preflight`` hard-resets the repo to ``origin/{branch}`` and
+# returns IDLE instead of ERROR. Without this safety net a single
+# interrupted Claude run can leave the runner stuck in ERROR forever.
+_DIRTY_CYCLES_BEFORE_AUTO_RESET = 3
+
 
 def repo_owner_from_url(url: str) -> str:
     """Return ``owner/repo`` for a GitHub URL."""
@@ -304,6 +310,13 @@ class PipelineRunner:
         # a stranded commit from a prior cycle and re-pushes it; once
         # fully sync'd it is a cheap no-op.
         self._scaffolded = _repo_looks_scaffolded(self.repo_path)
+        # Consecutive cycles preflight has observed a dirty working
+        # tree. Used to trigger auto-recovery at
+        # ``_DIRTY_CYCLES_BEFORE_AUTO_RESET`` so a stuck ERROR state
+        # (e.g. Claude CLI crash mid-edit leaving uncommitted files)
+        # no longer requires operator intervention. Reset to 0 on any
+        # clean preflight or after a successful auto-reset.
+        self._consecutive_dirty_cycles = 0
 
     async def publish_state(self) -> None:
         """Serialize ``self.state`` and write it to Redis."""
@@ -761,10 +774,47 @@ class PipelineRunner:
 
         dirty = result.stdout.strip()
         if dirty:
+            self._consecutive_dirty_cycles += 1
+            if self._consecutive_dirty_cycles >= _DIRTY_CYCLES_BEFORE_AUTO_RESET:
+                self.log_event(
+                    f"Dirty tree persisted {self._consecutive_dirty_cycles} "
+                    "cycles, auto-resetting to recover"
+                )
+                if self._auto_reset_dirty_tree():
+                    return True
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"working tree dirty: {dirty}"
             self.log_event("preflight: dirty working tree")
             return False
+        self._consecutive_dirty_cycles = 0
+        return True
+
+    def _auto_reset_dirty_tree(self) -> bool:
+        """Hard-reset the working tree to ``origin/{branch}``.
+
+        Called by ``preflight`` once the consecutive-dirty counter
+        crosses ``_DIRTY_CYCLES_BEFORE_AUTO_RESET``. On success the
+        runner is returned to IDLE with the dirty counter cleared so
+        the next cycle can pick up work normally. On failure the
+        counter is left untouched and the caller falls through to the
+        usual ERROR path.
+        """
+        branch = self.repo_config.branch
+        try:
+            _git(self.repo_path, "checkout", branch, check=False)
+            _git(self.repo_path, "reset", "--hard", f"origin/{branch}")
+            _git(self.repo_path, "clean", "-fd")
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ) as exc:
+            self.log_event(f"Auto-recovery failed: {exc}")
+            return False
+        self._consecutive_dirty_cycles = 0
+        self.state.state = PipelineState.IDLE
+        self.state.error_message = None
+        self.log_event("Auto-recovered from dirty tree -> IDLE")
         return True
 
     def _preserve_crashed_run_commits(self, branch: str) -> bool:
@@ -1833,6 +1883,21 @@ return 0
         )
         self.log_event(self.state.error_message)
 
+    def _get_pr_author(self) -> str:
+        """Return the GitHub login used to author PRs from this daemon.
+
+        Resolves from the ``gh`` auth context via ``gh api user`` and
+        falls back to ``AlexBomber12`` when that lookup fails so the
+        dedup check in ``_post_codex_review`` still has a non-empty
+        author to match against.
+        """
+        try:
+            raw = github_client.run_gh(["api", "user", "--jq", ".login"])
+        except Exception:
+            return "AlexBomber12"
+        login = raw if isinstance(raw, str) else ""
+        return login.strip() or "AlexBomber12"
+
     def _post_codex_review(self, pr_number: int) -> bool:
         """Post ``@codex review`` on ``pr_number``.
 
@@ -1841,6 +1906,11 @@ return 0
         iteration instead of relying on the GitHub-side Automatic
         Reviews trigger (which we want configured for PR creation only
         to avoid duplicate reviews).
+
+        Skips posting when the PR author already has a recent
+        ``@codex review`` comment — Claude's PLANNED PR runbook posts
+        that trigger itself and an immediate daemon-side repost would
+        queue a duplicate Codex review.
 
         Returns ``True`` on success and ``False`` on a logged failure.
         The caller decides whether a failure is fatal: after a fix
@@ -1851,6 +1921,22 @@ return 0
         creation it can stay a warning because Codex Automatic Reviews
         still fires on the creation event itself.
         """
+        try:
+            if github_client.has_recent_codex_review_request(
+                self.owner_repo,
+                pr_number,
+                pr_author=self._get_pr_author(),
+                within_minutes=5,
+            ):
+                self.log_event(
+                    f"Skipping duplicate @codex review on PR #{pr_number}"
+                )
+                return True
+        except Exception as exc:
+            self.log_event(
+                f"Dedup check failed on PR #{pr_number}: {exc}"
+            )
+
         try:
             github_client.post_comment(
                 self.owner_repo, pr_number, "@codex review"

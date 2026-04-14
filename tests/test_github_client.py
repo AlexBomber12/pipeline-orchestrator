@@ -10,6 +10,7 @@ import pytest
 from src.github_client import (
     get_pr_review_status,
     get_repo_full_name,
+    has_recent_codex_review_request,
     merge_pr,
     run_gh,
 )
@@ -559,3 +560,105 @@ def test_merge_pr_uses_squash(monkeypatch: pytest.MonkeyPatch) -> None:
         "-R",
         "owner/name",
     ]
+
+
+def _iso_utc_now_minus(seconds: int) -> str:
+    from datetime import datetime, timedelta, timezone as _tz
+
+    return (
+        datetime.now(_tz.utc) - timedelta(seconds=seconds)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_has_recent_codex_review_request_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PR-author ``@codex review`` comment within the window counts
+    as a recent request — the caller must skip posting another one."""
+    import json as _json
+
+    pages = [
+        [
+            {
+                "user": {"login": "author"},
+                "body": "@codex review",
+                "created_at": _iso_utc_now_minus(60),
+            }
+        ]
+    ]
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        has_recent_codex_review_request(
+            "owner/name", 42, pr_author="author", within_minutes=5
+        )
+        is True
+    )
+
+
+def test_has_recent_codex_review_request_false_too_old(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A matching comment older than ``within_minutes`` must not count."""
+    import json as _json
+
+    pages = [
+        [
+            {
+                "user": {"login": "author"},
+                "body": "@codex review",
+                "created_at": _iso_utc_now_minus(10 * 60),
+            }
+        ]
+    ]
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        has_recent_codex_review_request(
+            "owner/name", 42, pr_author="author", within_minutes=5
+        )
+        is False
+    )
+
+
+def test_has_recent_codex_review_request_false_no_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When no PR-author ``@codex review`` comment exists at all the
+    helper returns False so the daemon posts the trigger itself."""
+    import json as _json
+
+    pages = [
+        [
+            {
+                "user": {"login": "someone-else"},
+                "body": "@codex review",
+                "created_at": _iso_utc_now_minus(60),
+            },
+            {
+                "user": {"login": "author"},
+                "body": "looks good",
+                "created_at": _iso_utc_now_minus(60),
+            },
+        ]
+    ]
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        has_recent_codex_review_request(
+            "owner/name", 42, pr_author="author", within_minutes=5
+        )
+        is False
+    )

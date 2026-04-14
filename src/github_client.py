@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 
 from src.models import CIStatus, PRInfo, ReviewStatus
 
@@ -224,6 +224,47 @@ def merge_pr(repo: str, pr_number: int) -> None:
 def post_comment(repo: str, pr_number: int, body: str) -> None:
     """Post a comment on a PR via ``gh pr comment``."""
     run_gh(["pr", "comment", str(pr_number), "--body", body], repo=repo)
+
+
+def has_recent_codex_review_request(
+    repo: str,
+    pr_number: int,
+    pr_author: str,
+    within_minutes: int = 5,
+) -> bool:
+    """Return ``True`` iff ``pr_author`` recently posted ``@codex review``.
+
+    The daemon posts ``@codex review`` after every coding/fix cycle, but
+    Claude may also post one itself from the AGENTS.md runbook. Without
+    this guard both trigger comments land back-to-back and Codex starts
+    two redundant reviews. The caller checks this before posting and
+    skips when a qualifying trigger already exists within
+    ``within_minutes``.
+    """
+    try:
+        comments = _gh_api_paginated(
+            f"repos/{repo}/issues/{pr_number}/comments"
+        ) or []
+    except RuntimeError as exc:
+        if "HTTP 404" in str(exc):
+            return False
+        raise
+    now = datetime.now(timezone.utc)
+    cutoff = within_minutes * 60
+    for c in reversed(comments):
+        author = (c.get("user") or {}).get("login", "")
+        if author != pr_author:
+            continue
+        if "@codex review" not in (c.get("body") or "").lower():
+            continue
+        created = _parse_iso(c.get("created_at"))
+        if created is None:
+            continue
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if (now - created).total_seconds() < cutoff:
+            return True
+    return False
 
 
 def _gh_api_paginated(path: str) -> list[dict] | None:

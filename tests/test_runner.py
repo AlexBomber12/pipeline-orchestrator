@@ -3206,3 +3206,140 @@ def test_handle_fix_saves_stdout(
     assert any(k == f"cli_log:{runner.name}:latest" for k in redis_keys)
     stored = runner.redis.store.get(f"cli_log:{runner.name}:latest")
     assert stored == "fix output here"
+
+
+def test_dirty_tree_auto_recovery_after_3_cycles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After three consecutive dirty preflights the runner hard-resets
+    to ``origin/{branch}`` and returns to IDLE instead of staying stuck
+    in ERROR requiring manual intervention."""
+    commands: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        commands.append(cmd)
+        if cmd[:3] == ["git", "status", "--porcelain"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout=" M src/foo.py\n", returncode=0
+            )
+        return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    runner = _make_runner()
+
+    assert runner.preflight() is False
+    assert runner._consecutive_dirty_cycles == 1
+    assert runner.state.state == PipelineState.ERROR
+
+    assert runner.preflight() is False
+    assert runner._consecutive_dirty_cycles == 2
+    assert runner.state.state == PipelineState.ERROR
+
+    assert runner.preflight() is True
+    assert runner._consecutive_dirty_cycles == 0
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None
+    assert any(
+        cmd[:2] == ["git", "reset"] and "--hard" in cmd
+        for cmd in commands
+    )
+    assert any(cmd[:3] == ["git", "clean", "-fd"] for cmd in commands)
+    assert any(
+        "Auto-recovered from dirty tree" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_dirty_tree_counter_resets_on_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dirty-cycle counter must return to zero after any clean
+    preflight so a transient glitch does not push a later cycle over
+    the auto-reset threshold."""
+    _patch_subprocess(monkeypatch, stdout=" M foo.py")
+    runner = _make_runner()
+    assert runner.preflight() is False
+    assert runner._consecutive_dirty_cycles == 1
+
+    _patch_subprocess(monkeypatch, stdout="")
+    assert runner.preflight() is True
+    assert runner._consecutive_dirty_cycles == 0
+
+
+def test_dirty_tree_auto_recovery_failure_stays_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the auto-reset git commands themselves fail, preflight must
+    leave the runner in ERROR so the operator still sees the issue
+    rather than silently declaring the tree clean."""
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:3] == ["git", "status", "--porcelain"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout=" M src/foo.py\n", returncode=0
+            )
+        if cmd[:2] == ["git", "reset"]:
+            raise subprocess.CalledProcessError(
+                1, cmd, stderr="reset refused"
+            )
+        return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    runner = _make_runner()
+
+    runner.preflight()
+    runner.preflight()
+    assert runner.preflight() is False
+    assert runner.state.state == PipelineState.ERROR
+    assert any(
+        "Auto-recovery failed" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_post_codex_review_skips_duplicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``has_recent_codex_review_request`` returns True the daemon
+    must not post another ``@codex review`` comment, preventing Codex
+    from starting two redundant reviews back-to-back."""
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "has_recent_codex_review_request",
+        lambda *a, **kw: True,
+    )
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    runner = _make_runner()
+
+    assert runner._post_codex_review(42) is True
+    assert posted == []
+    assert any(
+        "Skipping duplicate @codex review on PR #42" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_post_codex_review_posts_when_no_duplicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no recent duplicate the daemon still posts ``@codex
+    review`` exactly once."""
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "has_recent_codex_review_request",
+        lambda *a, **kw: False,
+    )
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    runner = _make_runner()
+
+    assert runner._post_codex_review(42) is True
+    assert posted == [(runner.owner_repo, 42, "@codex review")]
