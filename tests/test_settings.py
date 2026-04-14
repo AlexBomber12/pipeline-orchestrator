@@ -46,8 +46,7 @@ def one_repo_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "  - url: https://github.com/example/alpha.git\n"
         "    branch: main\n"
         "    auto_merge: true\n"
-        "    review_timeout_min: 60\n"
-        "    poll_interval_sec: 60\n",
+        "    review_timeout_min: 60\n",
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
@@ -173,7 +172,6 @@ def test_put_repo_updates_branch(one_repo_config: Path) -> None:
     # Other fields untouched.
     assert cfg.repositories[0].auto_merge is True
     assert cfg.repositories[0].review_timeout_min == 60
-    assert cfg.repositories[0].poll_interval_sec == 60
 
 
 def test_put_repo_updates_multiple_fields(one_repo_config: Path) -> None:
@@ -184,7 +182,6 @@ def test_put_repo_updates_multiple_fields(one_repo_config: Path) -> None:
             data={
                 "auto_merge": "false",
                 "review_timeout_min": "120",
-                "poll_interval_sec": "30",
             },
         )
 
@@ -192,36 +189,14 @@ def test_put_repo_updates_multiple_fields(one_repo_config: Path) -> None:
     cfg = load_config(str(one_repo_config))
     assert cfg.repositories[0].auto_merge is False
     assert cfg.repositories[0].review_timeout_min == 120
-    assert cfg.repositories[0].poll_interval_sec == 30
-    # Branch untouched.
     assert cfg.repositories[0].branch == "main"
 
 
-def test_put_repo_empty_numeric_inputs_return_200_html(
+def test_put_repo_empty_review_timeout_clears_override(
     one_repo_config: Path,
 ) -> None:
-    """Cleared number inputs must not trip FastAPI's request parser, and
-    each cleared numeric has the right per-field semantic.
-
-    Regression for a PR-015 P1 bug where declaring the fields as
-    ``int | None = Form(None)`` caused FastAPI to reject the request
-    during parsing with a raw JSON 422; combined with
-    ``htmx:beforeSwap`` forcing 422 swaps, HTMX would replace
-    ``#settings-repo-list`` with the JSON payload and wedge the UI until
-    a full reload.
-
-    On top of that PR-015 invariant, PR-016 adds a per-field semantic:
-
-    * ``review_timeout_min=""`` must clear the per-repo override so the
-      runner falls back to ``daemon.review_timeout_min``. This is the
-      only way an upgraded deployment (whose existing ``config.yml``
-      still has explicit ``review_timeout_min: 60`` for every repo) can
-      opt a pre-existing row into the new daemon default through the
-      Settings UI without hand-editing the YAML file.
-    * ``poll_interval_sec=""`` stays a no-op because there is no
-      daemon-level fallback for the per-repo value today; clearing it
-      would be meaningless.
-    """
+    """Cleared review_timeout_min must clear the per-repo override so the
+    runner falls back to ``daemon.review_timeout_min``."""
     with TestClient(app) as client:
         response = client.put(
             "/settings/repos",
@@ -229,7 +204,6 @@ def test_put_repo_empty_numeric_inputs_return_200_html(
             data={
                 "branch": "develop",
                 "review_timeout_min": "",
-                "poll_interval_sec": "",
             },
         )
 
@@ -237,10 +211,7 @@ def test_put_repo_empty_numeric_inputs_return_200_html(
     assert "text/html" in response.headers["content-type"]
     cfg = load_config(str(one_repo_config))
     assert cfg.repositories[0].branch == "develop"
-    # review_timeout_min cleared to None → runner inherits daemon
-    # default. poll_interval_sec still no-op, preserved at 60.
     assert cfg.repositories[0].review_timeout_min is None
-    assert cfg.repositories[0].poll_interval_sec == 60
 
 
 def test_put_repo_clear_review_timeout_override_lets_daemon_default_apply(
@@ -326,26 +297,6 @@ def test_put_repo_non_positive_review_timeout_returns_422(
     # Config untouched across both attempts.
     cfg = load_config(str(one_repo_config))
     assert cfg.repositories[0].review_timeout_min == 60
-
-
-def test_put_repo_non_positive_poll_interval_returns_422(
-    one_repo_config: Path,
-) -> None:
-    """``poll_interval_sec`` must also stay >= 1 server-side."""
-    with TestClient(app) as client:
-        for bad in ("0", "-30"):
-            response = client.put(
-                "/settings/repos",
-                params={"url": "https://github.com/example/alpha.git"},
-                data={"poll_interval_sec": bad},
-            )
-            assert response.status_code == 422, bad
-            assert "text/html" in response.headers["content-type"]
-            assert "poll_interval_sec" in response.text
-            assert "at least 1" in response.text
-
-    cfg = load_config(str(one_repo_config))
-    assert cfg.repositories[0].poll_interval_sec == 60
 
 
 def test_put_repo_invalid_bool_returns_422_html(

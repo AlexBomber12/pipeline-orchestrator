@@ -1009,7 +1009,6 @@ async def put_settings_repo(
     branch: str | None = Form(None),
     auto_merge: str | None = Form(None),
     review_timeout_min: str | None = Form(None),
-    poll_interval_sec: str | None = Form(None),
 ) -> HTMLResponse:
     """Update a repository by its full URL.
 
@@ -1030,9 +1029,8 @@ async def put_settings_repo(
       the only way for an upgraded deployment (whose existing
       ``config.yml`` still has explicit per-repo values) to opt a repo
       into the daemon-level default after PR-016.
-    * Empty string on any other field: no-op. ``poll_interval_sec`` has
-      no daemon-level fallback, so clearing it to ``None`` would be
-      meaningless; ``branch`` / ``auto_merge`` are required values.
+    * Empty string on any other field: no-op. ``branch`` / ``auto_merge``
+      are required values.
     """
     updates: dict[str, object | None] = {}
     if branch is not None and branch != "":
@@ -1040,11 +1038,6 @@ async def put_settings_repo(
     try:
         if auto_merge is not None and auto_merge != "":
             updates["auto_merge"] = _coerce_bool(auto_merge, "auto_merge")
-        # Both numerics must stay strictly positive when set. The HTML
-        # ``min="1"`` is client-side only, and the daemon's hung-detection
-        # treats any PR with ``elapsed_min >= review_timeout_min`` as
-        # hung, so a persisted zero or negative value would flag every PR
-        # on that repo as hung the moment it's created.
         if review_timeout_min is not None:
             if review_timeout_min == "":
                 updates["review_timeout_min"] = None
@@ -1052,10 +1045,6 @@ async def put_settings_repo(
                 updates["review_timeout_min"] = _coerce_int(
                     review_timeout_min, "review_timeout_min", min_value=1
                 )
-        if poll_interval_sec is not None and poll_interval_sec != "":
-            updates["poll_interval_sec"] = _coerce_int(
-                poll_interval_sec, "poll_interval_sec", min_value=1
-            )
     except ValueError as exc:
         return _render_settings_error(request, str(exc), 422)
 

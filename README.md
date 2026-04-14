@@ -10,8 +10,9 @@ Three components share a single `/data` runtime root:
 - **daemon** — stateless pipeline state machine. Reads `tasks/QUEUE.md` and the
   GitHub API on every tick and decides what to do next. Recoverable from a cold
   restart because no state lives in process memory.
-- **web** — read-only FastAPI dashboard (Jinja2 + HTMX). Renders the current
-  state of repositories and PRs. Holds zero AI logic and zero tokens.
+- **web** — FastAPI dashboard (Jinja2 + HTMX). Renders the current state of
+  repositories and PRs. Provides settings UI for managing repos and daemon
+  configuration, and supports uploading task files and pushing them to repos.
 - **redis** — bridge that lets the dashboard observe daemon state without
   reaching into its internals.
 
@@ -36,22 +37,29 @@ docker compose exec daemon claude login
 
 The dashboard is then available at http://localhost:8000.
 
+Each connected repository must have a `CLAUDE.md` file that includes
+`Read and follow AGENTS.md in this repository.` so the Claude Code agent
+picks up the pipeline's conventions.
+
 ## Configuration
 
-`config.yml` lives at the project root and is mounted read-only into both the
+`config.yml` lives at the project root and is mounted into both the
 `web` and `daemon` containers. Minimal example with one repository:
 
 ```yaml
 repositories:
-  - name: my-repo
-    owner: my-org
-    url: https://github.com/my-org/my-repo.git
+  - url: https://github.com/my-org/my-repo.git
+    branch: main
+    auto_merge: true
 
 daemon:
   poll_interval_sec: 60
   review_timeout_min: 60
   hung_fallback_codex_review: true
   error_handler_use_ai: true
+  claude_model: opus
+  fix_review_timeout_sec: 3600
+  planned_pr_timeout_sec: 900
 
 web:
   host: 0.0.0.0

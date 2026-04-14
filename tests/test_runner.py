@@ -1239,13 +1239,79 @@ def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
+        pr_id="PR-001", title="t", status=TaskStatus.DOING,
     )
     asyncio.run(runner.handle_merge())
 
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is None
     assert runner.state.current_task is None
+
+
+def test_mark_queue_done_direct_push(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """After merge, _mark_queue_done pushes the DONE update directly to
+    the base branch instead of opening a remediation PR."""
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "QUEUE.md"
+    queue_path.write_text(
+        "## PR-001: first\n- Status: DOING\n\n"
+        "## PR-002: second\n- Status: TODO\n"
+    )
+
+    git_calls: list[list[str]] = []
+
+    def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append(cmd)
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="first", status=TaskStatus.DOING
+    )
+
+    runner._mark_queue_done()
+
+    updated = queue_path.read_text()
+    assert "## PR-001: first\n- Status: DONE" in updated
+    assert "## PR-002: second\n- Status: TODO" in updated
+
+    push_cmds = [cmd for cmd in git_calls if cmd[:2] == ["git", "push"]]
+    assert push_cmds
+    assert any("main" in cmd for cmd in push_cmds), (
+        "must push directly to the base branch"
+    )
+
+
+def test_mark_queue_done_tolerates_push_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Push failure is logged as a warning, not raised."""
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "QUEUE.md"
+    queue_path.write_text("## PR-001: first\n- Status: DOING\n")
+
+    def fail_push(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "push"]:
+            raise subprocess.CalledProcessError(1, cmd, stderr="push failed")
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fail_push)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="first", status=TaskStatus.DOING
+    )
+
+    runner._mark_queue_done()
+    assert runner.state.state != PipelineState.ERROR
 
 
 def test_handle_merge_failure_sets_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1620,425 +1686,6 @@ def test_handle_merge_aborts_on_unresolvable_conflict(
         if cmd[:3] == ["git", "merge", "--abort"]
     ]
     assert abort_cmds, "git merge --abort must be invoked"
-
-
-def test_handle_merge_opens_queue_done_pr_without_waiting(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """After merge, daemon opens the remediation PR and records it in
-    pending_queue_sync_branch without blocking waiting for it to
-    merge. The wait is distributed across later IDLE cycles so one
-    repo's slow checks do not stall the daemon's sequential loop."""
-    monkeypatch.setattr(
-        runner_module.github_client, "merge_pr", lambda repo, num: None
-    )
-
-    queue_dir = tmp_path / "tasks"
-    queue_dir.mkdir()
-    queue_path = queue_dir / "QUEUE.md"
-    queue_path.write_text(
-        "## PR-001: first\n- Status: DOING\n\n"
-        "## PR-002: second\n- Status: TODO\n"
-    )
-
-    git_calls: list[list[str]] = []
-
-    def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        git_calls.append(cmd)
-        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
-            return _FakeCompletedProcess(
-                args=cmd, stdout="Already up to date.\n", returncode=0
-            )
-        return _FakeCompletedProcess(args=cmd, returncode=0)
-
-    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
-
-    gh_calls: list[list[str]] = []
-
-    def fake_gh(
-        args: list[str],
-        repo: str | None = None,
-        timeout: int = 30,
-    ) -> Any:
-        gh_calls.append(args)
-        return ""
-
-    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_gh)
-
-    runner = _make_runner()
-    runner.repo_path = str(tmp_path)
-    runner.state.state = PipelineState.WATCH
-    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="first", status=TaskStatus.DOING
-    )
-    asyncio.run(runner.handle_merge())
-
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
-
-    updated = queue_path.read_text()
-    assert "## PR-001: first\n- Status: DONE" in updated
-    assert "## PR-002: second\n- Status: TODO" in updated
-
-    push_cmds = [
-        cmd for cmd in git_calls
-        if cmd[:2] == ["git", "push"] and any("queue-done" in a for a in cmd)
-    ]
-    assert push_cmds and all("queue-done-pr-001" in cmd for cmd in push_cmds)
-    assert all("main" not in cmd for cmd in push_cmds), (
-        "queue sync must not push to the base branch"
-    )
-
-    merge_args = next(args for args in gh_calls if args[:2] == ["pr", "merge"])
-    assert "--squash" in merge_args
-    assert "--auto" in merge_args
-    assert "--delete-branch" in merge_args
-    assert not any(args[:2] == ["pr", "view"] for args in gh_calls), (
-        "handle_merge must not synchronously poll for merge completion"
-    )
-
-
-def test_mark_queue_done_marker_set_before_first_git_op(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A git fetch/checkout/reset failure before QUEUE.md is even read
-    must still leave ``pending_queue_sync_branch`` set so the next
-    IDLE cycle cannot re-pick the just-merged task."""
-    def fail_fetch(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        if cmd[:3] == ["git", "fetch", "origin"]:
-            raise subprocess.CalledProcessError(1, cmd, stderr="fetch failed")
-        return _FakeCompletedProcess(args=cmd, returncode=0)
-
-    monkeypatch.setattr(runner_module.subprocess, "run", fail_fetch)
-    monkeypatch.setattr(
-        runner_module.github_client, "run_gh",
-        lambda *a, **k: "",
-    )
-
-    runner = _make_runner()
-    runner.repo_path = str(tmp_path)
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="first", status=TaskStatus.DOING
-    )
-
-    with pytest.raises(subprocess.CalledProcessError):
-        runner._mark_queue_done()
-
-    assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
-    assert runner.state.pending_queue_sync_started_at is not None
-
-
-def test_mark_queue_done_clears_marker_when_queue_already_done(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """No remediation is needed when QUEUE.md already has the task
-    marked DONE — the marker must be cleared so handle_idle does not
-    pointlessly gate future cycles."""
-    queue_dir = tmp_path / "tasks"
-    queue_dir.mkdir()
-    queue_path = queue_dir / "QUEUE.md"
-    queue_path.write_text("## PR-001: first\n- Status: DONE\n")
-
-    monkeypatch.setattr(
-        runner_module.subprocess, "run",
-        lambda cmd, **kw: _FakeCompletedProcess(args=cmd, returncode=0),
-    )
-    monkeypatch.setattr(
-        runner_module.github_client, "run_gh",
-        lambda *a, **k: "",
-    )
-
-    runner = _make_runner()
-    runner.repo_path = str(tmp_path)
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="first", status=TaskStatus.DOING
-    )
-
-    runner._mark_queue_done()
-    assert runner.state.pending_queue_sync_branch is None
-    assert runner.state.pending_queue_sync_started_at is None
-
-
-def test_handle_merge_stays_idle_when_queue_sync_setup_fails(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A transient git/GitHub failure during queue-sync must not halt
-    the merge flow (the original PR is already merged). Daemon
-    proceeds to IDLE, but the marker is set eagerly so handle_idle
-    gates new task dispatch until the remediation is resolved or the
-    deadline escalates to ERROR."""
-    monkeypatch.setattr(
-        runner_module.github_client, "merge_pr", lambda repo, num: None
-    )
-
-    queue_dir = tmp_path / "tasks"
-    queue_dir.mkdir()
-    queue_path = queue_dir / "QUEUE.md"
-    queue_path.write_text("## PR-001: first\n- Status: DOING\n")
-
-    def fail_push(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        if (
-            cmd[:2] == ["git", "push"]
-            and any("queue-done" in a for a in cmd)
-        ):
-            raise subprocess.CalledProcessError(1, cmd, stderr="push failed")
-        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
-            return _FakeCompletedProcess(
-                args=cmd, stdout="Already up to date.\n", returncode=0
-            )
-        return _FakeCompletedProcess(args=cmd, returncode=0)
-
-    monkeypatch.setattr(runner_module.subprocess, "run", fail_push)
-
-    def noop_gh(
-        args: list[str],
-        repo: str | None = None,
-        timeout: int = 30,
-    ) -> Any:
-        return ""
-
-    monkeypatch.setattr(runner_module.github_client, "run_gh", noop_gh)
-
-    runner = _make_runner()
-    runner.repo_path = str(tmp_path)
-    runner.state.state = PipelineState.WATCH
-    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="first", status=TaskStatus.DOING
-    )
-    asyncio.run(runner.handle_merge())
-
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.pending_queue_sync_branch == "queue-done-pr-001", (
-        "marker must be set eagerly so handle_idle still gates against re-pick"
-    )
-
-
-def test_resolve_pending_queue_sync_no_op_when_none() -> None:
-    runner = _make_runner()
-    runner.state.pending_queue_sync_branch = None
-    assert runner._resolve_pending_queue_sync() is True
-
-
-def test_resolve_pending_queue_sync_clears_on_merged(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fake_gh(args: list[str], repo: str | None = None, timeout: int = 30) -> Any:
-        if args[:2] == ["pr", "view"]:
-            return {"state": "MERGED", "mergedAt": "2026-04-14T00:00:00Z"}
-        return ""
-
-    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_gh)
-
-    runner = _make_runner()
-    runner.state.pending_queue_sync_branch = "queue-done-pr-001"
-    assert runner._resolve_pending_queue_sync() is True
-    assert runner.state.pending_queue_sync_branch is None
-
-
-def test_resolve_pending_queue_sync_blocks_while_open(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fake_gh(args: list[str], repo: str | None = None, timeout: int = 30) -> Any:
-        if args[:2] == ["pr", "view"]:
-            return {"state": "OPEN", "mergedAt": None}
-        return ""
-
-    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_gh)
-
-    runner = _make_runner()
-    runner.state.pending_queue_sync_branch = "queue-done-pr-001"
-    assert runner._resolve_pending_queue_sync() is False
-    assert runner.state.pending_queue_sync_branch == "queue-done-pr-001", (
-        "branch marker must persist while PR remains open"
-    )
-
-
-def test_resolve_pending_queue_sync_flips_error_on_closed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fake_gh(args: list[str], repo: str | None = None, timeout: int = 30) -> Any:
-        if args[:2] == ["pr", "view"]:
-            return {"state": "CLOSED", "mergedAt": None}
-        return ""
-
-    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_gh)
-
-    runner = _make_runner()
-    runner.state.pending_queue_sync_branch = "queue-done-pr-001"
-    assert runner._resolve_pending_queue_sync() is False
-    assert runner.state.pending_queue_sync_branch is None
-    assert runner.state.state == PipelineState.ERROR
-    assert "closed without merging" in (runner.state.error_message or "")
-
-
-def test_resolve_pending_queue_sync_escalates_after_deadline_on_view_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """If ``gh pr view`` keeps failing (persistent auth/API error,
-    deleted branch, etc.), the deadline check must still fire so the
-    repo is not stranded IDLE-pending forever."""
-
-    def fake_gh(args: list[str], repo: str | None = None, timeout: int = 30) -> Any:
-        if args[:2] == ["pr", "view"]:
-            raise RuntimeError("HTTP 500")
-        return ""
-
-    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_gh)
-    monkeypatch.setattr(runner_module, "_QUEUE_SYNC_MAX_WAIT_SEC", 0)
-
-    runner = _make_runner()
-    runner.state.pending_queue_sync_branch = "queue-done-pr-001"
-    runner.state.pending_queue_sync_started_at = datetime.now(
-        timezone.utc
-    ) - timedelta(seconds=10)
-
-    assert runner._resolve_pending_queue_sync() is False
-    assert runner.state.pending_queue_sync_branch is None
-    assert runner.state.state == PipelineState.ERROR
-    assert "unresolved after" in (runner.state.error_message or "")
-
-
-def test_resolve_pending_queue_sync_view_error_under_deadline_keeps_marker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A transient view error with plenty of time left on the deadline
-    should just keep polling — do not drop the marker or escalate."""
-
-    def fake_gh(args: list[str], repo: str | None = None, timeout: int = 30) -> Any:
-        if args[:2] == ["pr", "view"]:
-            raise RuntimeError("transient")
-        return ""
-
-    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_gh)
-
-    runner = _make_runner()
-    runner.state.pending_queue_sync_branch = "queue-done-pr-001"
-    runner.state.pending_queue_sync_started_at = datetime.now(timezone.utc)
-
-    assert runner._resolve_pending_queue_sync() is False
-    assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
-    assert runner.state.state != PipelineState.ERROR
-
-
-def test_resolve_pending_queue_sync_escalates_after_deadline(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """If the remediation PR stays OPEN past _QUEUE_SYNC_MAX_WAIT_SEC,
-    the runner must escalate to ERROR — otherwise a permanently-stuck
-    PR starves the repo out of the dispatch loop."""
-
-    def fake_gh(args: list[str], repo: str | None = None, timeout: int = 30) -> Any:
-        if args[:2] == ["pr", "view"]:
-            return {"state": "OPEN", "mergedAt": None}
-        return ""
-
-    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_gh)
-    monkeypatch.setattr(runner_module, "_QUEUE_SYNC_MAX_WAIT_SEC", 0)
-
-    runner = _make_runner()
-    runner.state.pending_queue_sync_branch = "queue-done-pr-001"
-    runner.state.pending_queue_sync_started_at = datetime.now(
-        timezone.utc
-    ) - timedelta(seconds=10)
-
-    assert runner._resolve_pending_queue_sync() is False
-    assert runner.state.pending_queue_sync_branch is None
-    assert runner.state.state == PipelineState.ERROR
-    assert "unresolved after" in (runner.state.error_message or "")
-
-
-def test_mark_queue_done_falls_back_to_immediate_merge_when_auto_rejected(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """gh pr merge --auto is rejected when auto-merge is disabled on
-    the repo. The queue-sync path must fall back to an immediate
-    merge instead of flipping handle_merge to ERROR for an otherwise
-    successful original-PR merge."""
-    monkeypatch.setattr(
-        runner_module.github_client, "merge_pr", lambda repo, num: None
-    )
-
-    queue_dir = tmp_path / "tasks"
-    queue_dir.mkdir()
-    queue_path = queue_dir / "QUEUE.md"
-    queue_path.write_text("## PR-001: first\n- Status: DOING\n")
-
-    def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
-            return _FakeCompletedProcess(
-                args=cmd, stdout="Already up to date.\n", returncode=0
-            )
-        return _FakeCompletedProcess(args=cmd, returncode=0)
-
-    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
-
-    gh_calls: list[list[str]] = []
-
-    def fake_gh(args: list[str], repo: str | None = None, timeout: int = 30) -> Any:
-        gh_calls.append(args)
-        if args[:2] == ["pr", "merge"] and "--auto" in args:
-            raise RuntimeError("auto-merge is not allowed for this repository")
-        return ""
-
-    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_gh)
-
-    runner = _make_runner()
-    runner.repo_path = str(tmp_path)
-    runner.state.state = PipelineState.WATCH
-    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="first", status=TaskStatus.DOING
-    )
-    asyncio.run(runner.handle_merge())
-
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
-    merge_calls = [args for args in gh_calls if args[:2] == ["pr", "merge"]]
-    assert any("--auto" in args for args in merge_calls)
-    assert any("--auto" not in args for args in merge_calls), (
-        "must fall back to a non-auto merge attempt"
-    )
-
-
-def test_mark_queue_done_resets_tree_on_commit_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Commit/push failure must `git reset --hard` and checkout base so
-    the next preflight starts clean instead of flipping to ERROR."""
-    queue_dir = tmp_path / "tasks"
-    queue_dir.mkdir()
-    queue_path = queue_dir / "QUEUE.md"
-    queue_path.write_text("## PR-001: first\n- Status: DOING\n")
-
-    calls: list[list[str]] = []
-
-    def fail_commit(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        calls.append(cmd)
-        if cmd[:2] == ["git", "commit"]:
-            raise subprocess.CalledProcessError(1, cmd, stderr="hook failed")
-        return _FakeCompletedProcess(args=cmd, returncode=0)
-
-    monkeypatch.setattr(runner_module.subprocess, "run", fail_commit)
-
-    runner = _make_runner()
-    runner.repo_path = str(tmp_path)
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="first", status=TaskStatus.DOING
-    )
-
-    with pytest.raises(subprocess.CalledProcessError):
-        runner._mark_queue_done()
-
-    commit_idx = calls.index(["git", "commit", "-m", "PR-001: mark DONE"])
-    post_commit = calls[commit_idx + 1:]
-    assert any(
-        cmd[:2] == ["git", "reset"] and "--hard" in cmd for cmd in post_commit
-    ), "expected git reset --hard after commit failure"
-    assert any(
-        cmd == ["git", "checkout", "main"] for cmd in post_commit
-    ), "expected checkout of base branch after commit failure"
 
 
 def test_handle_error_skip_clears_state(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -76,17 +76,3 @@ class RepoState(BaseModel):
     queue_total: int = 0
     active: bool = True
     history: list[dict] = Field(default_factory=list)
-    # Branch name of an outstanding queue-sync remediation PR opened by
-    # ``_mark_queue_done``. When set, ``handle_idle`` blocks new task
-    # selection until the PR merges (or closes/times out), so a merged
-    # task whose DONE status has not landed on ``origin/{base}`` yet
-    # cannot be re-picked. The daemon polls this across cycles instead
-    # of waiting synchronously inside ``handle_merge`` so one repo's
-    # slow branch-protection checks do not stall other repos.
-    pending_queue_sync_branch: str | None = None
-    # UTC timestamp when ``pending_queue_sync_branch`` was set. Bounds
-    # how long the runner will wait for the remediation PR to land
-    # before escalating to ERROR, so a permanently-open queue-sync PR
-    # (e.g. failed checks, stuck review) cannot starve this repo out
-    # of the dispatch loop indefinitely.
-    pending_queue_sync_started_at: datetime | None = None

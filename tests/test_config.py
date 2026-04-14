@@ -48,7 +48,6 @@ repositories:
     branch: develop
     auto_merge: false
     review_timeout_min: 30
-    poll_interval_sec: 15
 
 daemon:
   poll_interval_sec: 90
@@ -75,7 +74,6 @@ auth:
     assert repo.branch == "develop"
     assert repo.auto_merge is False
     assert repo.review_timeout_min == 30
-    assert repo.poll_interval_sec == 15
 
     assert cfg.daemon.poll_interval_sec == 90
     assert cfg.daemon.review_timeout_min == 45
@@ -101,7 +99,6 @@ def test_repo_config_defaults() -> None:
     # UI without a custom timeout inherits whatever PR-016's daemon
     # control is set to.
     assert repo.review_timeout_min is None
-    assert repo.poll_interval_sec == 60
 
 
 def test_normalize_repo_url_strips_git_and_slash() -> None:
@@ -131,7 +128,6 @@ def test_save_config_round_trip(tmp_path: Path) -> None:
                 branch="dev",
                 auto_merge=False,
                 review_timeout_min=30,
-                poll_interval_sec=15,
             ),
         ],
     )
