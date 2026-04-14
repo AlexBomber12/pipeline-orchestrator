@@ -1,7 +1,4 @@
 ./AGENTS.md
-./artifacts/ci.log
-./artifacts/pr.patch
-./artifacts/structure.txt
 ./CLAUDE.md
 ./.claude/scheduled_tasks.lock
 ./.claude/settings.local.json
