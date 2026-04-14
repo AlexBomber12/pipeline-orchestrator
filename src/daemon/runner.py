@@ -1521,22 +1521,37 @@ return 0
         if updated == content:
             return
 
-        queue_path.write_text(updated)
-        subprocess.run(
-            ["git", "add", "tasks/QUEUE.md"],
-            capture_output=True, text=True, timeout=30,
-            check=True, cwd=self.repo_path,
-        )
-        subprocess.run(
-            ["git", "commit", "-m", f"{pr_id}: mark DONE"],
-            capture_output=True, text=True, timeout=30,
-            check=True, cwd=self.repo_path,
-        )
-        subprocess.run(
-            ["git", "push", "origin", branch],
-            capture_output=True, text=True, timeout=30,
-            check=True, cwd=self.repo_path,
-        )
+        try:
+            queue_path.write_text(updated)
+            subprocess.run(
+                ["git", "add", "tasks/QUEUE.md"],
+                capture_output=True, text=True, timeout=30,
+                check=True, cwd=self.repo_path,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", f"{pr_id}: mark DONE"],
+                capture_output=True, text=True, timeout=30,
+                check=True, cwd=self.repo_path,
+            )
+            subprocess.run(
+                ["git", "push", "origin", branch],
+                capture_output=True, text=True, timeout=30,
+                check=True, cwd=self.repo_path,
+            )
+        except Exception:
+            # The caller treats any failure here as a warning, but a
+            # partial write/add/commit can leave the working tree dirty
+            # or staged. Preflight on the next cycle would then flip the
+            # runner to ERROR despite this path being non-fatal. Reset
+            # hard to origin so the tree is clean regardless of which
+            # step failed; swallow reset errors so the original cause is
+            # what the caller logs.
+            subprocess.run(
+                ["git", "reset", "--hard", f"origin/{branch}"],
+                capture_output=True, text=True, timeout=30,
+                check=False, cwd=self.repo_path,
+            )
+            raise
         self.log_event(f"Marked {pr_id} DONE in QUEUE.md")
 
     def _post_codex_review(self, pr_number: int) -> bool:

@@ -1274,6 +1274,42 @@ def test_handle_merge_tolerates_queue_failure(
     assert runner.state.current_task is None
 
 
+def test_mark_queue_done_resets_tree_on_commit_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Commit/push failure must trigger `git reset --hard` so the next
+    preflight cycle sees a clean tree instead of flipping to ERROR."""
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "QUEUE.md"
+    queue_path.write_text("## PR-001: first\n- Status: DOING\n")
+
+    calls: list[list[str]] = []
+
+    def fail_commit(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        if cmd[:2] == ["git", "commit"]:
+            raise subprocess.CalledProcessError(1, cmd, stderr="hook failed")
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fail_commit)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="first", status=TaskStatus.DOING
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        runner._mark_queue_done()
+
+    reset_after_commit = [
+        cmd for cmd in calls[calls.index(["git", "commit", "-m", "PR-001: mark DONE"]) + 1:]
+        if cmd[:2] == ["git", "reset"] and "--hard" in cmd
+    ]
+    assert reset_after_commit, "expected git reset --hard after commit failure"
+
+
 def test_handle_error_skip_clears_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         runner_module.claude_cli,
