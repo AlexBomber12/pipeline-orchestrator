@@ -1285,6 +1285,13 @@ return 0
             return
 
         self.state.current_pr = found
+        # Retry rehydrate every cycle so a transient commit-time fetch
+        # failure during ``recover_state`` doesn't permanently leave
+        # ``_last_push_at`` unset (which would default
+        # ``_has_new_codex_feedback_since_last_push`` to True and
+        # stale-fix loop forever).
+        if self._last_push_at is None:
+            self._rehydrate_last_push_at(found)
 
         ci = found.ci_status
         review = found.review_status
@@ -1906,8 +1913,18 @@ return 0
         off to WATCH on a freshly-created PR: without this rehydrate,
         ``_has_new_codex_feedback_since_last_push`` would hit its
         ``None`` default and return ``True`` on every cycle, triggering
-        ``handle_fix`` on pre-restart Codex feedback (reintroducing
-        the stale-fix loop this guard is meant to block).
+        ``handle_fix`` on pre-restart Codex feedback.
+
+        Falling back to ``pr.last_activity`` here is intentionally
+        avoided: ``last_activity`` comes from GitHub's ``updatedAt``,
+        which advances whenever Codex posts a comment, so a transient
+        commit-time fetch failure plus a pending Codex P1/P2 post
+        would seed the baseline to the feedback timestamp and make
+        the next ``_has_new_codex_feedback_since_last_push`` return
+        False, silently skipping the fix. When the fetch fails we
+        leave ``_last_push_at`` unset; ``handle_watch`` calls this
+        helper each cycle so the rehydrate retries naturally on the
+        next poll instead of latching a wrong value.
         """
         try:
             head_iso = github_client.get_pr_head_commit_iso(
@@ -1916,11 +1933,6 @@ return 0
         except Exception:
             head_iso = ""
         head_time = github_client._parse_iso(head_iso) if head_iso else None
-        if head_time is None:
-            # Fall back to PR's last activity — less precise than the
-            # commit committer date but still better than leaving
-            # ``_last_push_at`` unset and defaulting to "always new".
-            head_time = pr.last_activity
         if head_time is None:
             return
         if head_time.tzinfo is None:

@@ -3600,12 +3600,14 @@ def test_rehydrate_last_push_at_from_head_commit(
     assert runner._last_push_at.isoformat() == "2026-04-14T20:00:00+00:00"
 
 
-def test_rehydrate_last_push_at_falls_back_to_last_activity(
+def test_rehydrate_last_push_at_no_fallback_to_last_activity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When the head commit time can't be fetched, fall back to the PR's
-    last_activity so _has_new_codex_feedback_since_last_push at least
-    has some non-None baseline."""
+    """When the head commit time can't be fetched, DO NOT fall back to
+    pr.last_activity. That value is GitHub's ``updatedAt`` which advances
+    on Codex comments, so using it could seed _last_push_at to AFTER a
+    pending P1/P2 comment and silently skip the fix. Leaving it None
+    lets handle_watch retry the rehydrate next cycle."""
     monkeypatch.setattr(
         runner_module.github_client,
         "get_pr_head_commit_iso",
@@ -3615,7 +3617,40 @@ def test_rehydrate_last_push_at_falls_back_to_last_activity(
     pr = PRInfo(number=99, branch="pr-001", last_activity=fallback)
     runner = _make_runner()
     runner._rehydrate_last_push_at(pr)
-    assert runner._last_push_at == fallback
+    assert runner._last_push_at is None
+
+
+def test_handle_watch_retries_rehydrate_last_push_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If recover_state's rehydrate failed (e.g. transient API hiccup),
+    handle_watch must retry so a stuck-None last_push_at doesn't stale-fix
+    loop forever."""
+    pr = PRInfo(
+        number=42,
+        branch="pr-001",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=datetime.now(timezone.utc),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_head_commit_iso",
+        lambda repo, number: "2026-04-14T18:00:00Z",
+    )
+
+    runner = _make_runner()
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    assert runner._last_push_at is None
+    asyncio.run(runner.handle_watch())
+    assert runner._last_push_at is not None
+    assert runner._last_push_at.isoformat() == "2026-04-14T18:00:00+00:00"
 
 
 def test_recover_state_rehydrates_last_push_at(
