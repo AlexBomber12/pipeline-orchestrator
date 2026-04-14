@@ -180,7 +180,7 @@
 - Depends on: PR-027
 
 ## PR-031: Pre-merge sync with main
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-031.md
 - Branch: pr-031-pre-merge-sync
 - Depends on: PR-030
