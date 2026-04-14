@@ -63,13 +63,12 @@ def _run_git(
     )
 
 
-def ensure_claude_md(repo_path: str) -> bool:
+def ensure_claude_md(repo_path: str, branch: str) -> bool:
     """Create ``CLAUDE.md`` from the template if it is missing on disk.
 
     This is a lightweight backfill for repos that were scaffolded before
-    ``CLAUDE.md`` existed. Unlike ``scaffold_repo`` it does NOT commit or
-    push — the file is created on disk only and will be picked up by the
-    next coding cycle's commit.
+    ``CLAUDE.md`` existed. The file is staged, committed, and pushed to
+    ``branch`` so the worktree stays clean for preflight checks.
 
     Returns ``True`` if the file was created, ``False`` otherwise.
     """
@@ -80,6 +79,15 @@ def ensure_claude_md(repo_path: str) -> bool:
     if claude.exists():
         return False
     _copy_template("CLAUDE.md", claude)
+    try:
+        _run_git(repo_path, "add", "CLAUDE.md")
+        _run_git(repo_path, "commit", "-m", "chore: backfill CLAUDE.md")
+        _run_git(
+            repo_path, "push", "origin", branch, timeout=_PUSH_GIT_TIMEOUT
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        logger.warning("ensure_claude_md commit/push failed: %s", exc)
+        raise
     return True
 
 
