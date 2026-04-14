@@ -498,10 +498,19 @@ class PipelineRunner:
                     "recover_state and preflight run first"
                 )
 
-        if self._scaffolded and scaffolder.ensure_claude_md(
-            self.repo_path, self.repo_config.branch
-        ):
-            self.log_event("backfilled CLAUDE.md for legacy repo")
+        if self._scaffolded:
+            try:
+                if scaffolder.ensure_claude_md(
+                    self.repo_path, self.repo_config.branch
+                ):
+                    self.log_event("backfilled CLAUDE.md for legacy repo")
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+            ) as exc:
+                raise RuntimeError(
+                    f"CLAUDE.md backfill failed: {exc}"
+                ) from exc
 
     def sync_to_main(self) -> None:
         """Hard-sync the working tree to ``origin/{branch}``.
