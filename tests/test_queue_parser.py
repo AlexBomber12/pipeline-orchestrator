@@ -276,6 +276,24 @@ def test_mark_task_done_rewrites_decorated_done_value() -> None:
     assert "# merged" not in updated
 
 
+def test_mark_task_done_rewrites_blank_status_line() -> None:
+    """parse_queue_text falls back to TODO for a blank `- Status:` line,
+    so the task is still selectable. mark_task_done must match and
+    rewrite those lines too, not only lines with a non-whitespace
+    token after the colon."""
+    content = "## PR-001: first\n- Status:\n"
+    updated = mark_task_done(content, "PR-001")
+    assert updated is not None
+    assert "DONE" in updated
+
+
+def test_mark_task_done_rewrites_whitespace_only_status_line() -> None:
+    content = "## PR-001: first\n- Status:   \n"
+    updated = mark_task_done(content, "PR-001")
+    assert updated is not None
+    assert "DONE" in updated
+
+
 def test_mark_task_done_returns_none_when_task_missing() -> None:
     content = "## PR-001: first\n- Status: DOING\n"
     assert mark_task_done(content, "PR-999") is None

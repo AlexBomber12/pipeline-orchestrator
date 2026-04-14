@@ -10,7 +10,7 @@ from src.models import QueueTask, TaskStatus
 _HEADER_RE = re.compile(r"^##\s+(PR-[A-Za-z0-9_.-]+):\s*(.+?)\s*$")
 _FIELD_RE = re.compile(r"^-\s*([A-Za-z ]+?)\s*:\s*(.*?)\s*$")
 _STATUS_LINE_RE = re.compile(
-    r"^(-\s*status\s*:\s*)(\S+)(.*)$", re.IGNORECASE
+    r"^(-\s*status\s*:\s*)(\S*)(.*)$", re.IGNORECASE
 )
 
 

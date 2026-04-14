@@ -65,9 +65,12 @@ _CI_SCRIPT_TIMEOUT_SEC = 1800
 # merge happens when branch-protection checks are still pending, so
 # the runner must confirm completion before clearing state; otherwise
 # the next IDLE cycle reads QUEUE.md from origin/base (not yet
-# updated) and re-picks the merged task.
+# updated) and re-picks the merged task. Sized to match
+# ``_CI_SCRIPT_TIMEOUT_SEC`` so a repo whose required checks legitimately
+# take close to 30 minutes does not flip to ERROR for a merge that
+# would otherwise land shortly after.
 _QUEUE_SYNC_MERGE_POLL_INTERVAL_SEC = 5
-_QUEUE_SYNC_MERGE_TIMEOUT_SEC = 180
+_QUEUE_SYNC_MERGE_TIMEOUT_SEC = 1800
 
 
 def repo_owner_from_url(url: str) -> str:
