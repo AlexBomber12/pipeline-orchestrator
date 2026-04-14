@@ -1278,12 +1278,14 @@ def test_handle_merge_opens_queue_done_pr_without_waiting(
     )
 
 
-def test_handle_merge_flips_error_on_queue_sync_open_failure(
+def test_handle_merge_stays_idle_when_queue_sync_setup_fails(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """If opening the remediation PR fails outright, daemon flips to
-    ERROR rather than clearing state and risking re-pick of the
-    merged task."""
+    """A transient git/GitHub failure during queue-sync must not halt
+    the merge flow (the original PR is already merged). Daemon
+    proceeds to IDLE, but the marker is set eagerly so handle_idle
+    gates new task dispatch until the remediation is resolved or the
+    deadline escalates to ERROR."""
     monkeypatch.setattr(
         runner_module.github_client, "merge_pr", lambda repo, num: None
     )
@@ -1318,10 +1320,9 @@ def test_handle_merge_flips_error_on_queue_sync_open_failure(
     )
     asyncio.run(runner.handle_merge())
 
-    assert runner.state.state == PipelineState.ERROR
-    assert "queue-sync" in (runner.state.error_message or "")
-    assert runner.state.current_task is not None, (
-        "current_task must not be cleared while remediation is unresolved"
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.pending_queue_sync_branch == "queue-done-pr-001", (
+        "marker must be set eagerly so handle_idle still gates against re-pick"
     )
 
 
@@ -1383,6 +1384,55 @@ def test_resolve_pending_queue_sync_flips_error_on_closed(
     assert "closed without merging" in (runner.state.error_message or "")
 
 
+def test_resolve_pending_queue_sync_escalates_after_deadline_on_view_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If ``gh pr view`` keeps failing (persistent auth/API error,
+    deleted branch, etc.), the deadline check must still fire so the
+    repo is not stranded IDLE-pending forever."""
+
+    def fake_gh(args: list[str], repo: str | None = None, timeout: int = 30) -> Any:
+        if args[:2] == ["pr", "view"]:
+            raise RuntimeError("HTTP 500")
+        return ""
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_gh)
+    monkeypatch.setattr(runner_module, "_QUEUE_SYNC_MAX_WAIT_SEC", 0)
+
+    runner = _make_runner()
+    runner.state.pending_queue_sync_branch = "queue-done-pr-001"
+    runner.state.pending_queue_sync_started_at = datetime.now(
+        timezone.utc
+    ) - timedelta(seconds=10)
+
+    assert runner._resolve_pending_queue_sync() is False
+    assert runner.state.pending_queue_sync_branch is None
+    assert runner.state.state == PipelineState.ERROR
+    assert "unresolved after" in (runner.state.error_message or "")
+
+
+def test_resolve_pending_queue_sync_view_error_under_deadline_keeps_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient view error with plenty of time left on the deadline
+    should just keep polling — do not drop the marker or escalate."""
+
+    def fake_gh(args: list[str], repo: str | None = None, timeout: int = 30) -> Any:
+        if args[:2] == ["pr", "view"]:
+            raise RuntimeError("transient")
+        return ""
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_gh)
+
+    runner = _make_runner()
+    runner.state.pending_queue_sync_branch = "queue-done-pr-001"
+    runner.state.pending_queue_sync_started_at = datetime.now(timezone.utc)
+
+    assert runner._resolve_pending_queue_sync() is False
+    assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
+    assert runner.state.state != PipelineState.ERROR
+
+
 def test_resolve_pending_queue_sync_escalates_after_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1407,7 +1457,7 @@ def test_resolve_pending_queue_sync_escalates_after_deadline(
     assert runner._resolve_pending_queue_sync() is False
     assert runner.state.pending_queue_sync_branch is None
     assert runner.state.state == PipelineState.ERROR
-    assert "still open after" in (runner.state.error_message or "")
+    assert "unresolved after" in (runner.state.error_message or "")
 
 
 def test_mark_queue_done_falls_back_to_immediate_merge_when_auto_rejected(

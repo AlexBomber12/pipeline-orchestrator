@@ -1523,15 +1523,14 @@ return 0
         try:
             self._mark_queue_done()
         except Exception as exc:
-            # Opening the remediation PR failed before auto-merge even
-            # had a chance to complete. Parking the task in ERROR so
-            # the operator resolves the remediation is preferable to
-            # clearing state and risking re-pick of the merged task on
-            # the next cycle.
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = f"queue-sync failed: {exc}"
-            self.log_event(f"queue-sync failed: {exc}")
-            return
+            # Best-effort cleanup: the original PR has already merged,
+            # so a transient git/GitHub failure here must not block
+            # normal dispatch. ``_mark_queue_done`` sets
+            # ``pending_queue_sync_branch`` eagerly (before push/PR),
+            # so ``handle_idle`` will still gate against re-picking
+            # the merged task; persistent polling failures escalate
+            # via the ``_QUEUE_SYNC_MAX_WAIT_SEC`` deadline.
+            self.log_event(f"Warning: queue-sync step failed: {exc}")
 
         self.state.current_pr = None
         self.state.current_task = None
@@ -1590,6 +1589,15 @@ return 0
         import re as _re
         slug = _re.sub(r"[^a-z0-9-]", "-", pr_id.lower())
         remediation_branch = f"queue-done-{slug}"
+
+        # Set the marker before any remote operation so that a partial
+        # failure (e.g. push rejected, pr create errored) still leaves
+        # the runner gated by ``_resolve_pending_queue_sync`` instead
+        # of silently racing with the next IDLE cycle. The resolution
+        # loop handles the "branch/PR missing" case by returning False
+        # each cycle until the deadline escalates to ERROR.
+        self.state.pending_queue_sync_branch = remediation_branch
+        self.state.pending_queue_sync_started_at = datetime.now(timezone.utc)
 
         try:
             subprocess.run(
@@ -1675,8 +1683,6 @@ return 0
             capture_output=True, text=True, timeout=30,
             check=True, cwd=self.repo_path,
         )
-        self.state.pending_queue_sync_branch = remediation_branch
-        self.state.pending_queue_sync_started_at = datetime.now(timezone.utc)
         self.log_event(
             f"Opened queue-done PR for {pr_id} "
             f"(branch {remediation_branch}); awaiting auto-merge"
@@ -1709,6 +1715,11 @@ return 0
             self.log_event(
                 f"queue-sync PR {branch} view failed: {exc}"
             )
+            # Persistent polling failures (auth, API outage, deleted
+            # branch, ...) must still honour the deadline so the repo
+            # is not starved indefinitely when the runner cannot even
+            # read the PR's state.
+            self._escalate_queue_sync_if_expired(branch)
             return False
 
         state = ""
@@ -1742,23 +1753,30 @@ return 0
         # without a deadline a stuck remediation PR (failed checks,
         # missing required approval) would keep the runner from ever
         # selecting new tasks for this repo, starving the queue.
-        started = self.state.pending_queue_sync_started_at
-        if started is not None:
-            elapsed = (
-                datetime.now(timezone.utc) - started
-            ).total_seconds()
-            if elapsed > _QUEUE_SYNC_MAX_WAIT_SEC:
-                self.state.pending_queue_sync_branch = None
-                self.state.pending_queue_sync_started_at = None
-                self.state.state = PipelineState.ERROR
-                self.state.error_message = (
-                    f"queue-sync PR {branch} still open after "
-                    f"{int(elapsed)}s (max {_QUEUE_SYNC_MAX_WAIT_SEC}s)"
-                )
-                self.log_event(self.state.error_message)
-                return False
-
+        self._escalate_queue_sync_if_expired(branch)
         return False
+
+    def _escalate_queue_sync_if_expired(self, branch: str) -> None:
+        """Flip to ERROR when the queue-sync deadline has elapsed.
+
+        Applied both when the PR is still OPEN and when polling the
+        PR fails outright, so a persistently-unreadable remediation
+        PR cannot keep this repo IDLE-pending forever.
+        """
+        started = self.state.pending_queue_sync_started_at
+        if started is None:
+            return
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        if elapsed <= _QUEUE_SYNC_MAX_WAIT_SEC:
+            return
+        self.state.pending_queue_sync_branch = None
+        self.state.pending_queue_sync_started_at = None
+        self.state.state = PipelineState.ERROR
+        self.state.error_message = (
+            f"queue-sync PR {branch} unresolved after "
+            f"{int(elapsed)}s (max {_QUEUE_SYNC_MAX_WAIT_SEC}s)"
+        )
+        self.log_event(self.state.error_message)
 
     def _post_codex_review(self, pr_number: int) -> bool:
         """Post ``@codex review`` on ``pr_number``.
