@@ -1202,9 +1202,11 @@ def test_handle_merge_failure_sets_error(monkeypatch: pytest.MonkeyPatch) -> Non
     assert "merge conflict" in (runner.state.error_message or "")
 
 
-def test_handle_merge_marks_queue_done(
+def test_handle_merge_opens_queue_done_pr(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """After merge, daemon opens a remediation PR on a dedicated branch
+    (never pushes the queue fix straight to the base branch)."""
     monkeypatch.setattr(
         runner_module.github_client, "merge_pr", lambda repo, num: None
     )
@@ -1217,13 +1219,25 @@ def test_handle_merge_marks_queue_done(
         "## PR-002: second\n- Status: TODO\n"
     )
 
-    calls: list[list[str]] = []
+    git_calls: list[list[str]] = []
 
-    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        calls.append(cmd)
+    def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append(cmd)
         return _FakeCompletedProcess(args=cmd, returncode=0)
 
-    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+
+    gh_calls: list[list[str]] = []
+
+    def fake_gh(
+        args: list[str],
+        repo: str | None = None,
+        timeout: int = 30,
+    ) -> str:
+        gh_calls.append(args)
+        return ""
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_gh)
 
     runner = _make_runner()
     runner.repo_path = str(tmp_path)
@@ -1235,10 +1249,26 @@ def test_handle_merge_marks_queue_done(
     asyncio.run(runner.handle_merge())
 
     assert runner.state.state == PipelineState.IDLE
+
     updated = queue_path.read_text()
     assert "## PR-001: first\n- Status: DONE" in updated
     assert "## PR-002: second\n- Status: TODO" in updated
-    assert any(cmd[:3] == ["git", "push", "origin"] for cmd in calls)
+
+    assert any(
+        cmd[:3] == ["git", "checkout", "-B"] and cmd[3] == "queue-done-pr-001"
+        for cmd in git_calls
+    )
+    push_cmds = [cmd for cmd in git_calls if cmd[:2] == ["git", "push"]]
+    assert push_cmds and all("queue-done-pr-001" in cmd for cmd in push_cmds)
+    assert all("main" not in cmd for cmd in push_cmds), (
+        "queue sync must not push to the base branch"
+    )
+
+    assert any(args[:2] == ["pr", "create"] for args in gh_calls)
+    merge_args = next(args for args in gh_calls if args[:2] == ["pr", "merge"])
+    assert "--squash" in merge_args
+    assert "--auto" in merge_args
+    assert "--delete-branch" in merge_args
 
 
 def test_handle_merge_tolerates_queue_failure(
@@ -1254,11 +1284,20 @@ def test_handle_merge_tolerates_queue_failure(
     queue_path.write_text("## PR-001: first\n- Status: DOING\n")
 
     def fail_push(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        if cmd[:3] == ["git", "push", "origin"]:
+        if cmd[:2] == ["git", "push"]:
             raise subprocess.CalledProcessError(1, cmd, stderr="push failed")
         return _FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fail_push)
+
+    def noop_gh(
+        args: list[str],
+        repo: str | None = None,
+        timeout: int = 30,
+    ) -> str:
+        return ""
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", noop_gh)
 
     runner = _make_runner()
     runner.repo_path = str(tmp_path)
@@ -1277,8 +1316,8 @@ def test_handle_merge_tolerates_queue_failure(
 def test_mark_queue_done_resets_tree_on_commit_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Commit/push failure must trigger `git reset --hard` so the next
-    preflight cycle sees a clean tree instead of flipping to ERROR."""
+    """Commit/push failure must `git reset --hard` and checkout base so
+    the next preflight starts clean instead of flipping to ERROR."""
     queue_dir = tmp_path / "tasks"
     queue_dir.mkdir()
     queue_path = queue_dir / "QUEUE.md"
@@ -1303,11 +1342,14 @@ def test_mark_queue_done_resets_tree_on_commit_failure(
     with pytest.raises(subprocess.CalledProcessError):
         runner._mark_queue_done()
 
-    reset_after_commit = [
-        cmd for cmd in calls[calls.index(["git", "commit", "-m", "PR-001: mark DONE"]) + 1:]
-        if cmd[:2] == ["git", "reset"] and "--hard" in cmd
-    ]
-    assert reset_after_commit, "expected git reset --hard after commit failure"
+    commit_idx = calls.index(["git", "commit", "-m", "PR-001: mark DONE"])
+    post_commit = calls[commit_idx + 1:]
+    assert any(
+        cmd[:2] == ["git", "reset"] and "--hard" in cmd for cmd in post_commit
+    ), "expected git reset --hard after commit failure"
+    assert any(
+        cmd == ["git", "checkout", "main"] for cmd in post_commit
+    ), "expected checkout of base branch after commit failure"
 
 
 def test_handle_error_skip_clears_state(monkeypatch: pytest.MonkeyPatch) -> None:
