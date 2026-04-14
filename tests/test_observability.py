@@ -599,3 +599,44 @@ def test_partial_repo_events_returns_list_fragment(
     # Response is the inner list only — no outer section wrapper.
     assert 'id="repo-event-log"' not in body
     assert "Event log" not in body
+    # And it emits an out-of-band count span so the header's "N events"
+    # label refreshes with the list instead of staying at the initial
+    # page-load value (Codex P2 on PR #43).
+    assert 'id="event-log-count-alpha"' in body
+    assert 'hx-swap-oob="true"' in body
+    assert "1 events" in body
+
+
+def test_repo_full_page_marks_count_span_for_oob_target(
+    observability_config: Path,
+) -> None:
+    """Full-page render must expose the count span's ID so the 5s
+    poll's out-of-band swap has a target to replace. The initial
+    render itself must NOT carry ``hx-swap-oob`` — that's only valid
+    on the fragment response."""
+    now = datetime.now(timezone.utc)
+    alpha = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="alpha",
+        state=PipelineState.CODING,
+        last_updated=now,
+        history=[
+            {"time": _iso(now), "state": "CODING", "event": "started"},
+        ],
+    )
+    fake = _FakeRedis({"pipeline:alpha": alpha.model_dump_json()})
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.get("/repo/alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'id="event-log-count-alpha"' in body
+    header_start = body.index('id="event-log-count-alpha"')
+    wrapper_start = body.index('id="event-list-wrapper-alpha"')
+    # Only one count span on the initial render — oob variant belongs
+    # strictly to the polled fragment. A stray oob attribute on the
+    # static page would confuse HTMX on the first hydration.
+    assert body.count('id="event-log-count-alpha"') == 1
+    assert header_start < wrapper_start

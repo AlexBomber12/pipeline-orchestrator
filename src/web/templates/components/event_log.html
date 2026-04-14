@@ -7,7 +7,12 @@
 <section id="repo-event-log" class="rounded-lg border border-white/5 bg-surface-2 p-5">
     <div class="flex items-center gap-3 mb-3">
         <h3 class="text-sm font-semibold text-gray-300">Event log</h3>
-        <span class="font-mono text-xs text-gray-500">{{ events|length }} events</span>
+        {# ID matches the hx-swap-oob="true" span emitted by
+           event_list.html when served from /partials/repo/{name}/events
+           so the 5s poll refreshes the count alongside the list
+           instead of leaving the initial render's value stale. #}
+        <span id="event-log-count-{{ repo.name }}"
+              class="font-mono text-xs text-gray-500">{{ events|length }} events</span>
     </div>
     <div id="event-list-wrapper-{{ repo.name }}"
          class="max-h-96 overflow-y-auto"

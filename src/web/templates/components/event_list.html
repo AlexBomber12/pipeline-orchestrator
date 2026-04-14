@@ -8,6 +8,15 @@
     'HUNG':      {'badge': 'bg-hung/10 text-hung border-hung/30'},
     'ERROR':     {'badge': 'bg-fail/10 text-fail border-fail/30'},
 } %}
+{# When served from /partials/repo/{name}/events (oob=True), emit the
+   count span as an hx-swap-oob target so HTMX refreshes the header's
+   "N events" label alongside the list innerHTML swap. Rendered inline
+   on the full-page include (oob falsy) this block is skipped so we
+   don't duplicate the ID already present in event_log.html. #}
+{% if oob | default(False) %}
+<span id="event-log-count-{{ repo.name }}" hx-swap-oob="true"
+      class="font-mono text-xs text-gray-500">{{ events|length }} events</span>
+{% endif %}
 {% if events %}
 <ul class="divide-y divide-white/5 font-mono text-xs">
     {% for entry in events|reverse %}

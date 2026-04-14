@@ -607,6 +607,11 @@ async def partial_repo_events(request: Request, name: str) -> HTMLResponse:
         {
             "repo": state,
             "events": list(state.history),
+            # ``oob=True`` switches the template into "poll response" mode:
+            # it emits an hx-swap-oob count span so the header's
+            # "N events" label refreshes with the list instead of going
+            # stale at the initial page load's value.
+            "oob": True,
         },
     )
 
