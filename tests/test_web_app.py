@@ -480,3 +480,74 @@ def test_cli_log_route_returns_empty(
         response = client.get("/partials/repo/testrepo/cli-log")
     assert response.status_code == 200
     assert "No CLI log available" in response.text
+
+
+def test_event_log_has_data_ts(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Event-log rows must carry ``data-ts`` so the base.html
+    ``formatTimestamps`` script can rewrite the raw ISO value into a
+    local "5 min ago" style label after the HTMX swap settles."""
+    header_ts = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
+    entry_ts = "2026-04-10T11:55:00+00:00"
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="alpha",
+        state=PipelineState.CODING,
+        last_updated=header_ts,
+        history=[
+            {"time": entry_ts, "state": "CODING", "event": "hello"},
+        ],
+    )
+    fake = _FakeRedis({"pipeline:alpha": stored.model_dump_json()})
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.get("/repo/alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    assert f'data-ts="{entry_ts}"' in body
+
+
+def test_repo_card_has_onclick(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repo cards on the dashboard must navigate to the detail page on
+    click — except when the click originates inside an interactive
+    element (``label``/``input``/``button``/``a``), which keeps the
+    Upload tasks button and nested anchors working as before."""
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo-list")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "window.location='/repo/alpha'" in body
+    assert "window.location='/repo/beta'" in body
+    assert "event.target.closest('label,input,button,a')" in body
+
+
+def test_updated_header_has_data_ts(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The repo detail ``updated <ts>`` header must expose ``data-ts``
+    so the client-side formatter can replace the raw UTC string with a
+    relative local-time label."""
+    now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="alpha",
+        state=PipelineState.CODING,
+        last_updated=now,
+    )
+    fake = _FakeRedis({"pipeline:alpha": stored.model_dump_json()})
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.get("/repo/alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    assert f'data-ts="{now.isoformat()}"' in body

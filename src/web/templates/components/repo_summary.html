@@ -33,7 +33,7 @@
         {{ repo.state.value }}
     </span>
     <span class="ml-auto font-mono text-xs text-gray-500">
-        updated {{ repo.last_updated.strftime('%Y-%m-%d %H:%M:%S') }}
+        updated <span data-ts="{{ repo.last_updated.isoformat() if repo.last_updated else '' }}">{{ repo.last_updated.strftime('%Y-%m-%d %H:%M:%S') }}</span>
     </span>
 </header>
 

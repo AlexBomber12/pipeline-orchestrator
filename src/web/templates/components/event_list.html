@@ -1,0 +1,29 @@
+{% set state_styles = {
+    'IDLE':      {'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30'},
+    'PREFLIGHT': {'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30'},
+    'CODING':    {'badge': 'bg-accent/10 text-accent border-accent/30'},
+    'WATCH':     {'badge': 'bg-warn/10 text-warn border-warn/30'},
+    'FIX':       {'badge': 'bg-warn/10 text-warn border-warn/30'},
+    'MERGE':     {'badge': 'bg-ok/10 text-ok border-ok/30'},
+    'HUNG':      {'badge': 'bg-hung/10 text-hung border-hung/30'},
+    'ERROR':     {'badge': 'bg-fail/10 text-fail border-fail/30'},
+} %}
+{% if events %}
+<ul class="divide-y divide-white/5 font-mono text-xs">
+    {% for entry in events|reverse %}
+    {% set entry_state = entry.get('state', 'IDLE') %}
+    {% set entry_style = state_styles.get(entry_state, state_styles['IDLE']) %}
+    <li class="flex items-center gap-3 py-2">
+        <span class="text-gray-500 shrink-0" data-ts="{{ entry.get('time', '') }}">
+            {{ entry.get('time', '--:--:--') }}
+        </span>
+        <span class="text-[10px] font-medium px-1.5 py-0.5 rounded border {{ entry_style.badge }} shrink-0">
+            {{ entry_state }}
+        </span>
+        <span class="text-gray-300 truncate">{{ entry.get('event', '') }}</span>
+    </li>
+    {% endfor %}
+</ul>
+{% else %}
+<p class="text-gray-600 italic text-sm">No events yet</p>
+{% endif %}

@@ -144,10 +144,6 @@ _ACTIVITY_FEED_LIMIT = 50
 # never float its legacy history above genuinely new entries from other
 # repos during a mixed-format upgrade window.
 _FEED_UNKNOWN_TIME = datetime.min.replace(tzinfo=timezone.utc)
-_EVENT_FILTERS = ("all", "errors", "state")
-_EVENT_ERROR_STATES = frozenset(
-    {PipelineState.ERROR.value, PipelineState.HUNG.value}
-)
 _REPO_BADGE_PALETTE = (
     "bg-accent/15 text-accent border-accent/30",
     "bg-ok/15 text-ok border-ok/30",
@@ -459,47 +455,6 @@ def _compute_stats(states: list[RepoState]) -> dict[str, Any]:
     }
 
 
-def _filter_history(
-    history: list[dict[str, Any]], filter_name: str
-) -> list[dict[str, Any]]:
-    """Return ``history`` filtered by ``filter_name`` for the repo event log.
-
-    * ``all`` - unchanged.
-    * ``errors`` - only entries whose ``state`` is ``ERROR`` or ``HUNG``.
-    * ``state`` - only entries that represent a state transition, i.e.
-      the first entry and any entry whose state differs from the previous
-      entry's state. This collapses long runs of same-state "progress"
-      events (e.g. repeated ``Fix pushed, iteration #N`` lines in FIX)
-      while still surfacing every distinct state change.
-
-    Any other value is treated as ``all`` to keep the HTMX handler
-    forgiving of URL tampering.
-    """
-    if filter_name == "errors":
-        return [
-            entry
-            for entry in history
-            if str(entry.get("state", "")) in _EVENT_ERROR_STATES
-        ]
-    if filter_name == "state":
-        filtered: list[dict[str, Any]] = []
-        previous: str | None = None
-        for entry in history:
-            current = str(entry.get("state", ""))
-            if current != previous:
-                filtered.append(entry)
-                previous = current
-        return filtered
-    return list(history)
-
-
-def _normalize_event_filter(value: str | None) -> str:
-    """Coerce a raw ``filter=`` query value to a known filter name."""
-    if value in _EVENT_FILTERS:
-        return value
-    return "all"
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     redis_url = os.environ.get("REDIS_URL", DEFAULT_REDIS_URL)
@@ -609,8 +564,7 @@ async def repo_detail(request: Request, name: str) -> HTMLResponse:
         {
             "title": name,
             "repo": state,
-            "events": _filter_history(list(state.history), "all"),
-            "event_filter": "all",
+            "events": list(state.history),
         },
     )
 
@@ -620,10 +574,9 @@ async def partial_repo_detail(request: Request, name: str) -> HTMLResponse:
     """Return ONLY the repo summary cards for the 5s HTMX poll.
 
     Deliberately does not include the event log: the log self-polls via
-    ``/partials/repo/{name}/events`` so the user's chosen filter tab
-    survives across summary refreshes (an earlier revision rendered the
-    full detail here with ``event_filter="all"`` baked in, which silently
-    reset the tab mid-review on every tick).
+    ``/partials/repo/{name}/events`` so its scroll position survives
+    across summary refreshes (innerHTML swaps on the polling container
+    would otherwise wipe the log and reset its scroll on every tick).
     """
     redis_client = getattr(request.app.state, "redis", None)
     state = await get_repo_state(name, redis_client)
@@ -638,27 +591,22 @@ async def partial_repo_detail(request: Request, name: str) -> HTMLResponse:
     "/partials/repo/{name}/events",
     response_class=HTMLResponse,
 )
-async def partial_repo_events(
-    request: Request, name: str, filter: str | None = None
-) -> HTMLResponse:
-    """Return the repo event-log fragment filtered to ``filter``.
+async def partial_repo_events(request: Request, name: str) -> HTMLResponse:
+    """Return the list fragment swapped into the event log's scroll wrapper.
 
-    Used by the filter tabs on the repo detail page. ``filter`` defaults
-    to ``all`` when the query parameter is missing or unknown so an HTMX
-    request without a filter value (or a tampered one) still lands on a
-    valid view instead of 4xx-ing mid-page.
+    The wrapper polls this endpoint every 5s with ``hx-swap="innerHTML"``,
+    so the response is just the ``<ul>`` of entries (or the empty-state
+    paragraph) — not the surrounding ``<section>`` — which keeps the
+    wrapper itself mounted and its scrollTop intact across ticks.
     """
     redis_client = getattr(request.app.state, "redis", None)
     state = await get_repo_state(name, redis_client)
-    filter_name = _normalize_event_filter(filter)
-    events = _filter_history(list(state.history), filter_name)
     return templates.TemplateResponse(
         request,
-        "components/event_log.html",
+        "components/event_list.html",
         {
             "repo": state,
-            "events": events,
-            "event_filter": filter_name,
+            "events": list(state.history),
         },
     )
 
