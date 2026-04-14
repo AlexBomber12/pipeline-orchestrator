@@ -63,11 +63,7 @@ _CI_SCRIPT_TIMEOUT_SEC = 1800
 
 # Upper bound on how long an open queue-sync remediation PR may sit
 # unresolved before ``_resolve_pending_queue_sync`` escalates to
-# ERROR. Without this bound, a permanently-open queue-sync PR (stuck
-# checks, stuck review, etc.) would keep ``handle_idle`` from ever
-# selecting a new task again for this repo, starving the queue.
-# Sized generously enough to absorb normal review + CI cycles on
-# slow repos without false escalations.
+# ERROR.
 _QUEUE_SYNC_MAX_WAIT_SEC = 3600
 
 # After this many consecutive cycles of a dirty working tree,
@@ -663,24 +659,12 @@ class PipelineRunner:
             self.log_event(f"recover_state failed: {exc}")
             return False
 
-        # Rebuild ``pending_queue_sync_branch`` from any open
-        # ``queue-done-*`` PR on the remote. The marker lives on
-        # ``RepoState``, which is re-created empty at startup, so
-        # without this step a daemon restart between ``_mark_queue_done``
-        # opening the remediation PR and that PR merging would skip
-        # ``_resolve_pending_queue_sync`` in ``handle_idle`` and let
-        # the just-merged task be re-picked before ``origin/{base}``
-        # has the DONE update.
         pending_sync = next(
             (p for p in prs if (p.branch or "").startswith("queue-done-")),
             None,
         )
         if pending_sync is not None:
             self.state.pending_queue_sync_branch = pending_sync.branch
-            # Prefer the PR's original creation time so restart does
-            # not silently reset the wait window; fall back to "now"
-            # when the PRInfo payload did not carry an activity
-            # timestamp.
             self.state.pending_queue_sync_started_at = (
                 pending_sync.last_activity
                 or datetime.now(timezone.utc)
@@ -1118,10 +1102,6 @@ return 0
     async def handle_idle(self) -> None:
         """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
         self._error_diagnose_count = 0
-        # A queue-sync remediation PR may still be unmerged from a prior
-        # cycle. Resolve it before picking a new task so the daemon does
-        # not re-run a task whose DONE status has not yet landed on
-        # ``origin/{base}``.
         if self.state.pending_queue_sync_branch is not None:
             if not self._resolve_pending_queue_sync():
                 return
@@ -1614,13 +1594,6 @@ return 0
         try:
             self._mark_queue_done()
         except Exception as exc:
-            # Best-effort cleanup: the original PR has already merged,
-            # so a transient git/GitHub failure here must not block
-            # normal dispatch. ``_mark_queue_done`` sets
-            # ``pending_queue_sync_branch`` eagerly (before push/PR),
-            # so ``handle_idle`` will still gate against re-picking
-            # the merged task; persistent polling failures escalate
-            # via the ``_QUEUE_SYNC_MAX_WAIT_SEC`` deadline.
             self.log_event(f"Warning: queue-sync step failed: {exc}")
 
         self.state.current_pr = None
@@ -1629,22 +1602,13 @@ return 0
         self.log_event(f"Merged PR #{number} -> IDLE")
 
     def _mark_queue_done(self) -> None:
-        """Open a remediation PR flipping the merged task's QUEUE.md
-        status to ``DONE`` and record it in ``pending_queue_sync_branch``
-        for asynchronous resolution.
+        """Mark the merged task DONE in QUEUE.md.
 
-        The runner elsewhere (``_preserve_crashed_run_commits``)
-        refuses to push directly to the base branch. Routing the queue-sync change through a
-        dedicated ``queue-done-{pr_id}`` branch + PR + squash auto-merge
-        keeps that invariant and works under branch protection.
-
-        This method does not block waiting for the remediation PR to
-        merge. ``handle_idle`` polls ``pending_queue_sync_branch`` each
-        cycle via ``_resolve_pending_queue_sync`` and defers task
-        selection until the queue-sync PR lands (or closes/times out).
-        Waiting here synchronously would stall every other repo's cycle
-        on one repo's branch-protection checks, so the wait is
-        distributed across cycles instead.
+        Tries a direct push to the base branch first. If that fails
+        (e.g. branch protection), falls back to a remediation PR on a
+        ``queue-done-{pr_id}`` branch with auto-merge. Sets
+        ``pending_queue_sync_branch`` eagerly so ``handle_idle`` gates
+        dispatch until the update lands on base.
         """
         if self.state.current_task is None:
             return
@@ -1654,16 +1618,6 @@ return 0
         slug = re.sub(r"[^a-z0-9-]", "-", pr_id.lower())
         remediation_branch = f"queue-done-{slug}"
 
-        # Set the marker before ANY git or GitHub operation so an
-        # early failure (git fetch timeout, checkout/reset error,
-        # push rejected, pr create errored, ...) still leaves the
-        # runner gated by ``_resolve_pending_queue_sync`` instead of
-        # silently racing with the next IDLE cycle. The resolution
-        # loop handles the "branch/PR missing" case by returning
-        # False each cycle until the deadline escalates to ERROR. It
-        # is only cleared below once we have confirmed that no
-        # remediation is actually required (QUEUE.md already DONE or
-        # missing entirely).
         self.state.pending_queue_sync_branch = remediation_branch
         self.state.pending_queue_sync_started_at = datetime.now(timezone.utc)
 
@@ -1674,9 +1628,6 @@ return 0
 
             queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
             if not queue_path.exists():
-                # No QUEUE.md on base — nothing to remediate. Safe to
-                # clear the marker because we definitively observed
-                # the queue file's absence.
                 self.state.pending_queue_sync_branch = None
                 self.state.pending_queue_sync_started_at = None
                 return
@@ -1684,16 +1635,30 @@ return 0
 
             updated = mark_task_done(content, pr_id)
             if updated is None or updated == content:
-                # Task is already DONE (or has no rewritable status
-                # line) on base. Clear the marker.
                 self.state.pending_queue_sync_branch = None
                 self.state.pending_queue_sync_started_at = None
                 return
 
-            _git(self.repo_path, "checkout", "-B", remediation_branch)
             queue_path.write_text(updated)
             _git(self.repo_path, "add", "tasks/QUEUE.md")
             _git(self.repo_path, "commit", "-m", f"{pr_id}: mark DONE")
+
+            push_result = _git(
+                self.repo_path, "push", "origin", base,
+                timeout=60, check=False,
+            )
+            if push_result.returncode == 0:
+                self.state.pending_queue_sync_branch = None
+                self.state.pending_queue_sync_started_at = None
+                self.log_event(f"Marked {pr_id} DONE in QUEUE.md")
+                _git(self.repo_path, "checkout", base, check=False)
+                return
+
+            self.log_event(
+                f"Direct push to {base} rejected; "
+                "falling back to remediation PR"
+            )
+            _git(self.repo_path, "checkout", "-B", remediation_branch)
             _git(
                 self.repo_path,
                 "push", "--force-with-lease", "-u",
@@ -1716,12 +1681,6 @@ return 0
                     repo=self.owner_repo,
                 )
             except Exception as auto_exc:
-                # ``--auto`` is rejected in repos where GitHub auto-merge
-                # is disabled at the repo level. Fall back to an
-                # immediate merge; if that also fails (checks pending,
-                # required review, etc.), leave the PR open and let
-                # ``_resolve_pending_queue_sync`` gate the runner until
-                # operator intervention or checks clear.
                 self.log_event(
                     f"queue-sync --auto rejected ({auto_exc}); "
                     "attempting immediate merge"
@@ -1732,17 +1691,12 @@ return 0
                          "--squash", "--delete-branch"],
                         repo=self.owner_repo,
                     )
-                except Exception as merge_exc:
+                except Exception:
                     self.log_event(
-                        f"queue-sync immediate merge also failed "
-                        f"({merge_exc}); PR left open for later "
-                        "resolution"
+                        "queue-sync immediate merge also failed; "
+                        "PR left open for later resolution"
                     )
         except Exception:
-            # Reset the tree and return to base so a partial
-            # write/commit/push cannot poison the next preflight. Use
-            # check=False so reset/checkout errors do not mask the
-            # original failure that the caller logs.
             _git(
                 self.repo_path,
                 "reset", "--hard", f"origin/{base}",
@@ -1751,7 +1705,12 @@ return 0
             _git(self.repo_path, "checkout", base, check=False)
             raise
 
-        _git(self.repo_path, "checkout", base)
+        _git(self.repo_path, "checkout", base, check=False)
+        _git(
+            self.repo_path,
+            "reset", "--hard", f"origin/{base}",
+            check=False,
+        )
         self.log_event(
             f"Opened queue-done PR for {pr_id} "
             f"(branch {remediation_branch}); awaiting auto-merge"
@@ -1760,16 +1719,7 @@ return 0
     def _resolve_pending_queue_sync(self) -> bool:
         """Poll the outstanding queue-sync PR and gate IDLE dispatch.
 
-        Returns ``True`` when the remediation is resolved (merged, or
-        no-longer pending for any reason) and the caller should proceed
-        with normal IDLE logic. Returns ``False`` when the PR is still
-        open — the runner stays IDLE without selecting a new task so
-        the merged task does not get re-picked while ``origin/{base}``
-        has not yet received the DONE update.
-
-        Runs once per cycle so a slow branch-protection check in one
-        repo does not block the daemon's sequential loop across other
-        repos.
+        Returns True when resolved, False when still pending.
         """
         branch = self.state.pending_queue_sync_branch
         if branch is None:
@@ -1781,13 +1731,7 @@ return 0
                 repo=self.owner_repo,
             )
         except Exception as exc:
-            self.log_event(
-                f"queue-sync PR {branch} view failed: {exc}"
-            )
-            # Persistent polling failures (auth, API outage, deleted
-            # branch, ...) must still honour the deadline so the repo
-            # is not starved indefinitely when the runner cannot even
-            # read the PR's state.
+            self.log_event(f"queue-sync PR {branch} view failed: {exc}")
             self._escalate_queue_sync_if_expired(branch)
             return False
 
@@ -1804,10 +1748,6 @@ return 0
             return True
 
         if state == "CLOSED":
-            # Closed without merging (e.g. operator declined). Clear
-            # the marker so the runner is not permanently blocked;
-            # log and flip to ERROR so the operator notices before any
-            # duplicate work happens.
             self.state.pending_queue_sync_branch = None
             self.state.pending_queue_sync_started_at = None
             self.state.state = PipelineState.ERROR
@@ -1817,21 +1757,10 @@ return 0
             self.log_event(self.state.error_message)
             return False
 
-        # OPEN / auto-merge waiting on checks. Escalate to ERROR if
-        # the PR has been pending past ``_QUEUE_SYNC_MAX_WAIT_SEC``;
-        # without a deadline a stuck remediation PR (failed checks,
-        # missing required approval) would keep the runner from ever
-        # selecting new tasks for this repo, starving the queue.
         self._escalate_queue_sync_if_expired(branch)
         return False
 
     def _escalate_queue_sync_if_expired(self, branch: str) -> None:
-        """Flip to ERROR when the queue-sync deadline has elapsed.
-
-        Applied both when the PR is still OPEN and when polling the
-        PR fails outright, so a persistently-unreadable remediation
-        PR cannot keep this repo IDLE-pending forever.
-        """
         started = self.state.pending_queue_sync_started_at
         if started is None:
             return

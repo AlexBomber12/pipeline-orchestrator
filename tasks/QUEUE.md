@@ -222,7 +222,7 @@
 - Depends on: PR-036
 
 ## PR-037: Simplify queue-done and fix tech debt
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-037.md
 - Branch: pr-037-simplify-queue-done
 - Depends on: PR-041

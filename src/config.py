@@ -15,7 +15,6 @@ _REPO_FIELDS = {
     "branch",
     "auto_merge",
     "review_timeout_min",
-    "poll_interval_sec",
     "active",
 }
 
@@ -41,7 +40,6 @@ class RepoConfig(BaseModel):
     # control actually steers every repo that has not opted into a
     # custom value.
     review_timeout_min: int | None = None
-    poll_interval_sec: int = 60
     active: bool = True
 
 
@@ -200,8 +198,8 @@ def update_repository(
 
     existing = config.repositories[idx]
     # model_copy(update=...) does NOT re-run validators in Pydantic v2, so
-    # rebuild via model_validate to reject malformed patches (e.g. non-int
-    # poll_interval_sec) before writing anything to disk.
+    # rebuild via model_validate to reject malformed patches before writing
+    # anything to disk.
     merged = RepoConfig.model_validate({**existing.model_dump(), **updates})
     config.repositories[idx] = merged
     save_config(config, path)
