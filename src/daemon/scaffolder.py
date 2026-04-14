@@ -78,6 +78,14 @@ def ensure_claude_md(repo_path: str, branch: str) -> bool:
     claude = repo / "CLAUDE.md"
     if claude.exists():
         return False
+    try:
+        _run_git(repo_path, "checkout", branch)
+    except subprocess.CalledProcessError:
+        if not _head_is_unborn(repo_path):
+            raise
+        _run_git(
+            repo_path, "symbolic-ref", "HEAD", f"refs/heads/{branch}"
+        )
     _copy_template("CLAUDE.md", claude)
     try:
         _run_git(repo_path, "add", "CLAUDE.md")
