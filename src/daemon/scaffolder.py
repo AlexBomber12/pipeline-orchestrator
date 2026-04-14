@@ -75,6 +75,16 @@ def ensure_claude_md(repo_path: str, branch: str) -> bool:
     repo = Path(repo_path)
     if not repo.exists():
         return False
+    claude = repo / "CLAUDE.md"
+    if claude.exists():
+        return False
+    try:
+        _run_git(
+            repo_path, "cat-file", "-e", f"origin/{branch}:CLAUDE.md"
+        )
+        return False
+    except subprocess.CalledProcessError:
+        pass
     try:
         _run_git(repo_path, "checkout", branch)
     except subprocess.CalledProcessError:
@@ -83,9 +93,6 @@ def ensure_claude_md(repo_path: str, branch: str) -> bool:
         _run_git(
             repo_path, "symbolic-ref", "HEAD", f"refs/heads/{branch}"
         )
-    claude = repo / "CLAUDE.md"
-    if claude.exists():
-        return False
     _copy_template("CLAUDE.md", claude)
     try:
         _run_git(repo_path, "add", "CLAUDE.md")
