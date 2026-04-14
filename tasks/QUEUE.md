@@ -186,7 +186,7 @@
 - Depends on: PR-030
 
 ## PR-032: Subprocess helper and error handling hardening
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-032.md
 - Branch: pr-032-subprocess-helper
 - Depends on: PR-027
