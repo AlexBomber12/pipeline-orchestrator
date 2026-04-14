@@ -228,6 +228,7 @@ def test_scaffold_repo_skips_commit_when_fully_provisioned(
     """
     repo = _init_empty_repo(tmp_path)
     (repo / "AGENTS.md").write_text("# AGENTS\n")
+    (repo / "CLAUDE.md").write_text("Read and follow AGENTS.md in this repository.\n")
     (repo / "tasks").mkdir()
     (repo / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
     (repo / "scripts").mkdir()
@@ -264,6 +265,7 @@ def test_scaffold_repo_skips_git_when_only_artifacts_dir_missing(
     """
     repo = _init_empty_repo(tmp_path)
     (repo / "AGENTS.md").write_text("# AGENTS\n")
+    (repo / "CLAUDE.md").write_text("Read and follow AGENTS.md in this repository.\n")
     (repo / "tasks").mkdir()
     (repo / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
     (repo / "scripts").mkdir()
@@ -595,6 +597,7 @@ def test_scaffold_repo_retries_stranded_push_with_no_new_commit(
     # Fully provision the repo locally — this is what the filesystem
     # looks like after a successful local commit whose push timed out.
     (repo / "AGENTS.md").write_text("# AGENTS\n")
+    (repo / "CLAUDE.md").write_text("Read and follow AGENTS.md in this repository.\n")
     (repo / "tasks").mkdir()
     (repo / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
     (repo / "scripts").mkdir()

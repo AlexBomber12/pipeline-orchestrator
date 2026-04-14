@@ -210,7 +210,7 @@
 - Depends on: PR-028
 
 ## PR-036: Dead code cleanup and CLAUDE.md fix
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-036.md
 - Branch: pr-036-dead-code-cleanup
 - Depends on: PR-035
