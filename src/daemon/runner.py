@@ -312,6 +312,26 @@ class PipelineRunner:
                     logger.info("Migrated clone path %s -> %s", old_path, new_path)
             except Exception:
                 logger.warning("Could not verify origin for %s — skipping migration", old_path)
+        if new_path.exists():
+            try:
+                result = subprocess.run(
+                    ["git", "-C", str(new_path), "remote", "get-url", "origin"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                current_origin = result.stdout.strip().rstrip("/")
+                expected = repo_config.url.rstrip("/")
+                if current_origin.removesuffix(".git") != expected.removesuffix(".git"):
+                    logger.warning(
+                        "Clone %s has origin %s, expected %s — removing stale clone",
+                        new_path,
+                        current_origin,
+                        expected,
+                    )
+                    shutil.rmtree(new_path)
+            except Exception:
+                logger.warning("Could not verify origin for %s", new_path)
         self._old_basename = old_basename
         self.state = RepoState(
             url=repo_config.url,
@@ -379,7 +399,14 @@ class PipelineRunner:
         await self.redis.set(f"pipeline:{self.name}", payload)
         if self._old_basename != self.name:
             try:
-                await self.redis.delete(f"pipeline:{self._old_basename}")
+                old_key = f"pipeline:{self._old_basename}"
+                old_data = await self.redis.get(old_key)
+                if old_data:
+                    old_state = json.loads(old_data)
+                    old_url = old_state.get("url", "").rstrip("/").removesuffix(".git")
+                    expected = self.repo_config.url.rstrip("/").removesuffix(".git")
+                    if old_url == expected:
+                        await self.redis.delete(old_key)
             except Exception:
                 pass
 
