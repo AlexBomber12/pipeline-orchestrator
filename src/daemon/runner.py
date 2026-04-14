@@ -405,15 +405,18 @@ class PipelineRunner:
             try:
                 old_key = f"pipeline:{self._old_basename}"
                 old_data = await self.redis.get(old_key)
+                owns_old_key = False
                 if old_data:
                     old_state = json.loads(old_data)
                     old_url = old_state.get("url", "")
                     if repo_slug_from_url(old_url) == self.name:
                         await self.redis.delete(old_key)
-                old_upload = f"upload:{self._old_basename}:pending"
-                new_upload = f"upload:{self.name}:pending"
-                if await self.redis.exists(old_upload) and not await self.redis.exists(new_upload):
-                    await self.redis.rename(old_upload, new_upload)
+                        owns_old_key = True
+                if owns_old_key:
+                    old_upload = f"upload:{self._old_basename}:pending"
+                    new_upload = f"upload:{self.name}:pending"
+                    if await self.redis.exists(old_upload) and not await self.redis.exists(new_upload):
+                        await self.redis.rename(old_upload, new_upload)
             except Exception:
                 pass
 
