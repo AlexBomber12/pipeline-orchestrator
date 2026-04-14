@@ -1569,16 +1569,29 @@ return 0
             self.log_event(str(exc))
             return
 
-        self._mark_queue_done()
+        if not self._mark_queue_done():
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = (
+                f"PR #{number} merged but QUEUE.md sync failed; "
+                "manual queue update required to avoid duplicate dispatch"
+            )
+            self.log_event(self.state.error_message)
+            return
 
         self.state.current_pr = None
         self.state.current_task = None
         self.state.state = PipelineState.IDLE
         self.log_event(f"Merged PR #{number} -> IDLE")
 
-    def _mark_queue_done(self) -> None:
+    def _mark_queue_done(self) -> bool:
+        """Mark current task DONE in QUEUE.md and push to base.
+
+        Returns True on success or when there is nothing to update.
+        Returns False when the push (or any other step) fails, so the
+        caller can avoid moving to IDLE with a stale queue.
+        """
         if self.state.current_task is None:
-            return
+            return True
         pr_id = self.state.current_task.pr_id
         base = self.repo_config.branch
         try:
@@ -1587,24 +1600,26 @@ return 0
             _git(self.repo_path, "reset", "--hard", f"origin/{base}")
             queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
             if not queue_path.exists():
-                return
+                return True
             content = queue_path.read_text()
             updated = mark_task_done(content, pr_id)
             if updated is None or updated == content:
-                return
+                return True
             queue_path.write_text(updated)
             _git(self.repo_path, "add", "tasks/QUEUE.md")
             _git(self.repo_path, "commit", "-m", f"{pr_id}: mark DONE")
             _git(self.repo_path, "push", "origin", base, timeout=60)
             self.log_event(f"Marked {pr_id} DONE in QUEUE.md")
+            return True
         except Exception as exc:
-            self.log_event(f"Warning: QUEUE.md update failed: {exc}")
+            self.log_event(f"QUEUE.md sync failed: {exc}")
             _git(
                 self.repo_path,
                 "reset", "--hard", f"origin/{base}",
                 check=False,
             )
             _git(self.repo_path, "checkout", base, check=False)
+            return False
 
     def _post_codex_review(self, pr_number: int) -> bool:
         """Post ``@codex review`` on ``pr_number``.

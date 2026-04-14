@@ -853,7 +853,7 @@ def test_handle_watch_approved_and_green_merges(
 
     monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge)
     monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: True
     )
 
     runner = _make_runner()
@@ -1232,7 +1232,7 @@ def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None
         runner_module.github_client, "merge_pr", lambda repo, num: None
     )
     monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: True
     )
 
     runner = _make_runner()
@@ -1246,6 +1246,29 @@ def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is None
     assert runner.state.current_task is None
+
+
+def test_handle_merge_errors_on_queue_sync_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.github_client, "merge_pr", lambda repo, num: None
+    )
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: False
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING,
+    )
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "QUEUE.md sync failed" in (runner.state.error_message or "")
 
 
 def test_mark_queue_done_direct_push(
@@ -1354,7 +1377,7 @@ def test_handle_merge_syncs_with_main(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge_pr)
     monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: True
     )
 
     runner = _make_runner()
@@ -1557,7 +1580,7 @@ def test_handle_merge_skips_sync_for_cross_repo_pr(
         lambda repo, num: merge_pr_calls.append((repo, num)),
     )
     monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: True
     )
 
     runner = _make_runner()
@@ -1604,7 +1627,7 @@ def test_handle_merge_refreshes_pr_head_before_merge(
         lambda repo, num, body: None,
     )
     monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: True
     )
 
     runner = _make_runner()
