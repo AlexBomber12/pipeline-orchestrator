@@ -498,6 +498,9 @@ class PipelineRunner:
                     "recover_state and preflight run first"
                 )
 
+        if self._scaffolded and scaffolder.ensure_claude_md(self.repo_path):
+            self.log_event("backfilled CLAUDE.md for legacy repo")
+
     def sync_to_main(self) -> None:
         """Hard-sync the working tree to ``origin/{branch}``.
 

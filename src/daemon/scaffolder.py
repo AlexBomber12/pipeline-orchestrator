@@ -63,6 +63,26 @@ def _run_git(
     )
 
 
+def ensure_claude_md(repo_path: str) -> bool:
+    """Create ``CLAUDE.md`` from the template if it is missing on disk.
+
+    This is a lightweight backfill for repos that were scaffolded before
+    ``CLAUDE.md`` existed. Unlike ``scaffold_repo`` it does NOT commit or
+    push — the file is created on disk only and will be picked up by the
+    next coding cycle's commit.
+
+    Returns ``True`` if the file was created, ``False`` otherwise.
+    """
+    repo = Path(repo_path)
+    if not repo.exists():
+        return False
+    claude = repo / "CLAUDE.md"
+    if claude.exists():
+        return False
+    _copy_template("CLAUDE.md", claude)
+    return True
+
+
 def _head_is_unborn(repo_path: str) -> bool:
     """Return ``True`` if ``repo_path`` has no commits on any branch.
 
