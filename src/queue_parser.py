@@ -147,7 +147,12 @@ def mark_task_done(content: str, pr_id: str) -> str | None:
         body = lines[idx].rstrip("\r\n")
         match = _STATUS_LINE_RE.match(body)
         assert match is not None
-        return match.group(2).strip().upper()
+        # parse_queue_text reads the whole value after the colon and
+        # falls back to TODO when it does not match a TaskStatus member,
+        # so a line like `- Status: DONE # merged` is selectable. Join
+        # groups(2)+(3) here so the "already DONE" check sees the full
+        # value and rewrites decorated tokens instead of skipping them.
+        return (match.group(2) + match.group(3)).strip().upper()
 
     if all(_value_upper(i) == "DONE" for i in status_indices):
         return None

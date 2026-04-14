@@ -264,6 +264,18 @@ def test_mark_task_done_returns_none_when_every_status_already_done() -> None:
     assert mark_task_done(content, "PR-001") is None
 
 
+def test_mark_task_done_rewrites_decorated_done_value() -> None:
+    """parse_queue_text reads the full value and falls back to TODO
+    when the token is not a TaskStatus member (e.g. "DONE # merged"
+    becomes TODO at selection time). mark_task_done must not treat
+    those decorated values as already DONE."""
+    content = "## PR-001: first\n- Status: DONE # merged\n"
+    updated = mark_task_done(content, "PR-001")
+    assert updated is not None
+    assert "- Status: DONE\n" in updated
+    assert "# merged" not in updated
+
+
 def test_mark_task_done_returns_none_when_task_missing() -> None:
     content = "## PR-001: first\n- Status: DOING\n"
     assert mark_task_done(content, "PR-999") is None
