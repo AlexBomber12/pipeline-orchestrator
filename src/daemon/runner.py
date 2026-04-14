@@ -253,7 +253,6 @@ def _repo_looks_scaffolded(repo_path: str) -> bool:
     if not path.exists():
         return False
     has_agents = (path / "AGENTS.md").exists() or (path / "CLAUDE.md").exists()
-    has_claude_md = (path / "CLAUDE.md").exists()
     has_queue = (path / "tasks" / "QUEUE.md").exists()
     has_ci = (path / "scripts" / "ci.sh").exists()
     has_review_artifacts = (
@@ -266,7 +265,6 @@ def _repo_looks_scaffolded(repo_path: str) -> bool:
     )
     return (
         has_agents
-        and has_claude_md
         and has_queue
         and has_ci
         and has_review_artifacts

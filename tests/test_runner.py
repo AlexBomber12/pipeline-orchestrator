@@ -2441,14 +2441,10 @@ def test_repo_looks_scaffolded_rejects_partial_provisioning(
     (base / ".gitignore").write_text("node_modules/\n*.pyc\n")
     assert runner_module._repo_looks_scaffolded(str(base)) is False
 
-    # Finally append artifacts/ — still missing CLAUDE.md.
+    # Finally append artifacts/ — now fully scaffolded.
     (base / ".gitignore").write_text(
         "node_modules/\n*.pyc\nartifacts/\n"
     )
-    assert runner_module._repo_looks_scaffolded(str(base)) is False
-
-    # Add CLAUDE.md — now fully scaffolded.
-    (base / "CLAUDE.md").write_text("Read and follow AGENTS.md in this repository.\n")
     assert runner_module._repo_looks_scaffolded(str(base)) is True
 
 
