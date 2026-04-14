@@ -141,14 +141,39 @@ def get_pr_review_status(
                     if plus_one:
                         reaction_time = _parse_iso(plus_one.get("created_at"))
                         head_commit_time = _get_commit_time(repo, head_sha)
-                        if (
-                            reaction_time
-                            and head_commit_time
-                            and reaction_time > head_commit_time
-                        ):
+                        # Also gather the most recent Codex formal review's
+                        # (commit_id, submitted_at). A force-push that moves
+                        # head back to an older commit would make
+                        # ``head_commit_time`` (committer.date) older than
+                        # ``reaction_time`` again, so the committer-date
+                        # check alone can silently approve stale state.
+                        # Raising the threshold to the later of the head
+                        # commit time and the last Codex review submission
+                        # closes that gap; when the latest formal review is
+                        # ON the current head we accept unconditionally.
+                        latest_sha, latest_review_time = (
+                            _get_latest_codex_review_info(repo, pr_number)
+                        )
+                        if latest_sha and latest_sha == head_sha:
                             body_approved = True
-                        elif not head_commit_time:
-                            body_approved = True
+                        else:
+                            threshold = head_commit_time
+                            if (
+                                latest_review_time is not None
+                                and (
+                                    threshold is None
+                                    or latest_review_time > threshold
+                                )
+                            ):
+                                threshold = latest_review_time
+                            if (
+                                reaction_time
+                                and threshold
+                                and reaction_time > threshold
+                            ):
+                                body_approved = True
+                            elif not threshold:
+                                body_approved = True
                     else:
                         body_approved = True
                 else:
@@ -400,6 +425,45 @@ def _get_commit_time(repo: str, sha: str) -> datetime | None:
     except RuntimeError:
         return None
     return _parse_iso(raw.strip() if isinstance(raw, str) else "")
+
+
+def _get_latest_codex_review_info(
+    repo: str, pr_number: int
+) -> tuple[str, datetime | None]:
+    """Return ``(commit_id, submitted_at)`` of the most recent Codex
+    formal review, or ``("", None)`` if no such review exists.
+
+    Used alongside the head-commit-time check so a force-push that moves
+    HEAD to an older commit cannot silently reinstate a stale ``+1``:
+    the latest review submission time is always at least as new as the
+    moment the previous head was current, so requiring the reaction to
+    beat that threshold too catches the force-push case.
+    """
+    try:
+        reviews = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/reviews")
+    except RuntimeError as exc:
+        if "HTTP 404" not in str(exc):
+            raise
+        return "", None
+    if not reviews:
+        return "", None
+    best_sha = ""
+    best_time: datetime | None = None
+    best_raw = ""
+    for review in reviews:
+        user = (review.get("user") or {}).get("login", "") or ""
+        if "codex" not in user.lower():
+            continue
+        submitted_raw = review.get("submitted_at") or ""
+        if best_time is not None and submitted_raw <= best_raw:
+            continue
+        parsed = _parse_iso(submitted_raw)
+        if parsed is None:
+            continue
+        best_sha = review.get("commit_id") or ""
+        best_time = parsed
+        best_raw = submitted_raw
+    return best_sha, best_time
 
 
 def _ci_status_from_rollup(rollup: object) -> CIStatus:

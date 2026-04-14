@@ -3260,6 +3260,7 @@ def test_handle_watch_skips_fix_no_new_feedback(
         fix_called.append(True)
 
     runner = _make_runner()
+    runner._last_push_at = last_push
     runner.state.current_pr = pr
     runner.state.state = PipelineState.WATCH
     runner.handle_fix = fake_fix  # type: ignore[assignment]
@@ -3315,6 +3316,7 @@ def test_handle_watch_triggers_fix_new_feedback(
         fix_called.append(True)
 
     runner = _make_runner()
+    runner._last_push_at = last_push
     runner.state.current_pr = pr
     runner.state.state = PipelineState.WATCH
     runner.handle_fix = fake_fix  # type: ignore[assignment]
@@ -3507,3 +3509,72 @@ def test_handle_fix_uses_configured_timeout(
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     asyncio.run(runner.handle_fix())
     assert captured.get("timeout") == 2468
+
+
+def test_handle_watch_stale_feedback_still_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CHANGES_REQUESTED + no new feedback must still escalate to HUNG when
+    the review timeout has elapsed. Early-returning here would pin the
+    runner in WATCH forever for a sticky historical CHANGES_REQUESTED."""
+    last_push = datetime.now(timezone.utc) - timedelta(hours=2)
+    pr = PRInfo(
+        number=42,
+        branch="pr-001",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=last_push,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [],
+    )
+    fix_called: list[bool] = []
+
+    async def fake_fix() -> None:
+        fix_called.append(True)
+
+    runner = _make_runner(review_timeout_min=30)
+    runner._last_push_at = last_push
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.handle_fix = fake_fix  # type: ignore[assignment]
+    asyncio.run(runner.handle_watch())
+
+    assert fix_called == []
+    assert runner.state.state == PipelineState.HUNG
+
+
+def test_handle_fix_records_last_push_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """handle_fix must set ``_last_push_at`` so the next handle_watch can
+    compare Codex feedback against our actual push time, not GitHub's
+    ``updatedAt`` (which advances every time Codex posts)."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "fix_review",
+        lambda path, model=None, timeout=None: (0, "", ""),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=7, branch="pr-001")
+    before = datetime.now(timezone.utc)
+    asyncio.run(runner.handle_fix())
+    after = datetime.now(timezone.utc)
+
+    assert runner._last_push_at is not None
+    assert before <= runner._last_push_at <= after

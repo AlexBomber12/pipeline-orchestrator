@@ -323,6 +323,13 @@ class PipelineRunner:
         # the CLI cannot classify. Reset on any transition out of
         # ERROR (IDLE/FIX verdicts, successful recovery).
         self._error_diagnose_count = 0
+        # Timestamp of the most recent fix push from this runner.
+        # Used by ``_has_new_codex_feedback_since_last_push`` so the
+        # guard is not tricked by ``current_pr.last_activity`` being
+        # overwritten with GitHub's ``updatedAt`` (which advances every
+        # time Codex posts, masking whether Codex feedback is fresher
+        # than our last push).
+        self._last_push_at: datetime | None = None
 
     async def publish_state(self) -> None:
         """Serialize ``self.state`` and write it to Redis."""
@@ -1295,12 +1302,15 @@ return 0
         if review == ReviewStatus.CHANGES_REQUESTED:
             if self._has_new_codex_feedback_since_last_push():
                 await self.handle_fix()
-            else:
-                self.log_event(
-                    f"PR #{found.number} CHANGES_REQUESTED but no new "
-                    "Codex feedback since last push; waiting for fresh review"
-                )
-            return
+                return
+            # No new feedback since last push. Don't trigger FIX, but
+            # fall through to the timeout check below so a truly stuck
+            # CHANGES_REQUESTED state still escalates to HUNG instead of
+            # pinning the runner in WATCH indefinitely.
+            self.log_event(
+                f"PR #{found.number} CHANGES_REQUESTED but no new "
+                "Codex feedback since last push; waiting for fresh review"
+            )
 
         # Any remaining combination is a waiting state that should still be
         # subject to the review timeout. This explicitly includes
@@ -1402,9 +1412,11 @@ return 0
             self.log_event(f"fix_review failed: {self.state.error_message}")
             return
 
+        push_time = datetime.now(timezone.utc)
+        self._last_push_at = push_time
         if self.state.current_pr is not None:
             self.state.current_pr.push_count += 1
-            self.state.current_pr.last_activity = datetime.now(timezone.utc)
+            self.state.current_pr.last_activity = push_time
             iteration = self.state.current_pr.push_count
         else:
             iteration = 0
@@ -1887,11 +1899,15 @@ return 0
         Used by ``handle_watch`` to suppress FIX loops that would fire on
         stale ``CHANGES_REQUESTED`` signals from a review that predates the
         most recent fix push. Compares comment ``created_at`` against
-        ``current_pr.last_activity`` (updated on each push).
+        ``self._last_push_at`` — NOT ``current_pr.last_activity``, which
+        ``handle_watch`` overwrites with GitHub's ``updatedAt`` on every
+        cycle (and that value advances past the push whenever Codex posts,
+        making the comparison always false for the fresh feedback that
+        triggered the CHANGES_REQUESTED signal in the first place).
         """
         if self.state.current_pr is None:
             return False
-        last_activity = self.state.current_pr.last_activity
+        last_activity = self._last_push_at
         if last_activity is None:
             return True
         if last_activity.tzinfo is None:
