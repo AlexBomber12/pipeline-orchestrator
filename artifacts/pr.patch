@@ -1,36 +1,851 @@
 diff --git a/artifacts/ci.log b/artifacts/ci.log
-index 0d9d690..a550708 100644
+index 0d9d690..71cda2e 100644
 --- a/artifacts/ci.log
 +++ b/artifacts/ci.log
-@@ -6,10 +6,10 @@ The event loop scope for asynchronous fixtures will default to the fixture cachi
+@@ -5,11 +5,11 @@ All checks passed!
+ The event loop scope for asynchronous fixtures will default to the fixture caching scope. Future versions of pytest-asyncio will default the loop scope for asynchronous fixtures to function scope. Set the default fixture loop scope explicitly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "module", "package", "session"
  
    warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
- ........................................................................ [ 21%]
+-........................................................................ [ 21%]
 -........................................................................ [ 43%]
 -........................................................................ [ 65%]
 -........................................................................ [ 87%]
 -...........................................                              [100%]
 -331 passed in 0.87s
-+........................................................................ [ 42%]
-+........................................................................ [ 63%]
-+........................................................................ [ 84%]
-+...................................................                      [100%]
-+339 passed in 1.83s
++........................................................................ [ 20%]
++........................................................................ [ 41%]
++........................................................................ [ 62%]
++........................................................................ [ 83%]
++.......................................................                  [100%]
++343 passed in 0.88s
  ==> ci.sh OK
  ci.sh exit code: 0
 diff --git a/artifacts/pr.patch b/artifacts/pr.patch
-index ca127b9..e69de29 100644
+index ca127b9..d778a60 100644
 --- a/artifacts/pr.patch
 +++ b/artifacts/pr.patch
-@@ -1,778 +0,0 @@
--diff --git a/src/daemon/runner.py b/src/daemon/runner.py
+@@ -1,778 +1,1276 @@
++diff --git a/artifacts/ci.log b/artifacts/ci.log
++index 0d9d690..a550708 100644
++--- a/artifacts/ci.log
+++++ b/artifacts/ci.log
++@@ -6,10 +6,10 @@ The event loop scope for asynchronous fixtures will default to the fixture cachi
++ 
++   warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
++ ........................................................................ [ 21%]
++-........................................................................ [ 43%]
++-........................................................................ [ 65%]
++-........................................................................ [ 87%]
++-...........................................                              [100%]
++-331 passed in 0.87s
+++........................................................................ [ 42%]
+++........................................................................ [ 63%]
+++........................................................................ [ 84%]
+++...................................................                      [100%]
+++339 passed in 1.83s
++ ==> ci.sh OK
++ ci.sh exit code: 0
++diff --git a/artifacts/pr.patch b/artifacts/pr.patch
++index ca127b9..e69de29 100644
++--- a/artifacts/pr.patch
+++++ b/artifacts/pr.patch
++@@ -1,778 +0,0 @@
++-diff --git a/src/daemon/runner.py b/src/daemon/runner.py
++-index 54a6641..9cf95d3 100644
++---- a/src/daemon/runner.py
++-+++ b/src/daemon/runner.py
++-@@ -82,6 +82,31 @@ def repo_owner_from_url(url: str) -> str:
++- _FETCH_MISSING_REF_NEEDLE = "couldn't find remote ref"
++- 
++- 
++-+def _git(
++-+    repo_path: str,
++-+    *args: str,
++-+    timeout: int = 30,
++-+    check: bool = True,
++-+) -> subprocess.CompletedProcess[str]:
++-+    """Run ``git <args>`` in ``repo_path`` with the runner's standard flags.
++-+
++-+    Centralises the capture_output/text/timeout/cwd shape repeated across
++-+    every git invocation in this module so call-sites stay readable and
++-+    a single place owns the defaults. ``OSError`` (missing git binary,
++-+    missing cwd, permission errors) is intentionally not caught here —
++-+    callers that cannot tolerate it must translate it to their own
++-+    structured error state.
++-+    """
++-+    return subprocess.run(
++-+        ["git", *args],
++-+        capture_output=True,
++-+        text=True,
++-+        timeout=timeout,
++-+        check=check,
++-+        cwd=repo_path,
++-+    )
++-+
++-+
++- def _base_branch_ahead_of_origin(repo_path: str, branch: str) -> bool:
++-     """Return ``True`` if ``refs/heads/{branch}`` has commits not yet
++-     on ``refs/remotes/origin/{branch}``.
++-@@ -107,38 +132,26 @@ def _base_branch_ahead_of_origin(repo_path: str, branch: str) -> bool:
++-     stale data from ``origin/{branch}:tasks/QUEUE.md``.
++-     """
++-     try:
++--        local = subprocess.run(
++--            [
++--                "git",
++--                "rev-parse",
++--                "--verify",
++--                "--quiet",
++--                f"refs/heads/{branch}",
++--            ],
++--            capture_output=True,
++--            text=True,
++--            cwd=repo_path,
++-+        local = _git(
++-+            repo_path,
++-+            "rev-parse",
++-+            "--verify",
++-+            "--quiet",
++-+            f"refs/heads/{branch}",
++-             check=False,
++--            timeout=30,
++-         )
++-         if local.returncode != 0:
++-             # No local base branch yet. The ordinary scaffold retry
++-             # path will create it (either via checkout or
++-             # symbolic-ref), so treat this as "needs retry" too.
++-             return True
++--        remote = subprocess.run(
++--            [
++--                "git",
++--                "rev-parse",
++--                "--verify",
++--                "--quiet",
++--                f"refs/remotes/origin/{branch}",
++--            ],
++--            capture_output=True,
++--            text=True,
++--            cwd=repo_path,
++-+        remote = _git(
++-+            repo_path,
++-+            "rev-parse",
++-+            "--verify",
++-+            "--quiet",
++-+            f"refs/remotes/origin/{branch}",
++-             check=False,
++--            timeout=30,
++-         )
++-         if remote.returncode != 0:
++-             # Remote ref missing after a "successful" fetch is
++-@@ -146,18 +159,12 @@ def _base_branch_ahead_of_origin(repo_path: str, branch: str) -> bool:
++-             # ensure_repo_cloned usually catches this before we get
++-             # here. Err on the side of retry.
++-             return True
++--        ahead = subprocess.run(
++--            [
++--                "git",
++--                "rev-list",
++--                "--count",
++--                f"refs/remotes/origin/{branch}..refs/heads/{branch}",
++--            ],
++--            capture_output=True,
++--            text=True,
++--            cwd=repo_path,
++-+        ahead = _git(
++-+            repo_path,
++-+            "rev-list",
++-+            "--count",
++-+            f"refs/remotes/origin/{branch}..refs/heads/{branch}",
++-             check=False,
++--            timeout=30,
++-         )
++-     except subprocess.TimeoutExpired as exc:
++-         logger.warning(
++-@@ -204,14 +211,7 @@ def _working_tree_dirty(repo_path: str) -> bool:
++-     problem that scaffold_repo's own error handling will surface.
++-     """
++-     try:
++--        result = subprocess.run(
++--            ["git", "status", "--porcelain"],
++--            capture_output=True,
++--            text=True,
++--            cwd=repo_path,
++--            check=True,
++--            timeout=30,
++--        )
++-+        result = _git(repo_path, "status", "--porcelain")
++-     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
++-         return False
++-     return bool(result.stdout.strip())
++-@@ -357,6 +357,9 @@ class PipelineRunner:
++-         """
++-         path = Path(self.repo_path)
++-         if not path.exists():
++-+            # ``git clone`` runs before ``self.repo_path`` exists, so it
++-+            # cannot use ``_git`` (which sets ``cwd=repo_path`` and would
++-+            # fail with ``FileNotFoundError`` before git is even invoked).
++-             try:
++-                 subprocess.run(
++-                     ["git", "clone", self.repo_config.url, self.repo_path],
++-@@ -373,13 +376,12 @@ class PipelineRunner:
++-         else:
++-             fetch_missing_ref = False
++-             try:
++--                subprocess.run(
++--                    ["git", "fetch", "origin", self.repo_config.branch],
++--                    capture_output=True,
++--                    text=True,
++-+                _git(
++-+                    self.repo_path,
++-+                    "fetch",
++-+                    "origin",
++-+                    self.repo_config.branch,
++-                     timeout=60,
++--                    check=True,
++--                    cwd=self.repo_path,
++-                 )
++-             except subprocess.CalledProcessError as exc:
++-                 detail = (exc.stderr or exc.stdout or "").strip()
++-@@ -493,44 +495,24 @@ class PipelineRunner:
++- 
++-         Raises the underlying ``subprocess`` exception on failure so the
++-         caller can translate it into ERROR state with appropriate context.
++-+        ``OSError`` (missing git binary, missing cwd) is translated to
++-+        ``RuntimeError`` so it cannot escape to ``daemon.main``'s generic
++-+        handler without the runner's state being updated to ERROR by the
++-+        caller.
++-         """
++-         branch = self.repo_config.branch
++--        subprocess.run(
++--            ["git", "fetch", "origin", branch],
++--            capture_output=True,
++--            text=True,
++--            timeout=60,
++--            check=True,
++--            cwd=self.repo_path,
++--        )
++--        subprocess.run(
++--            ["git", "checkout", branch],
++--            capture_output=True,
++--            text=True,
++--            timeout=30,
++--            check=True,
++--            cwd=self.repo_path,
++--        )
++--        subprocess.run(
++--            ["git", "reset", "--hard", f"origin/{branch}"],
++--            capture_output=True,
++--            text=True,
++--            timeout=30,
++--            check=True,
++--            cwd=self.repo_path,
++--        )
++--        # ``git reset --hard`` only discards tracked-file changes; untracked
++--        # files (e.g. artifacts left by a crashed Claude run) survive and
++--        # would poison the next preflight as a dirty tree. ``git clean -fd``
++--        # removes them so the working copy truly matches origin/{branch}.
++--        subprocess.run(
++--            ["git", "clean", "-fd"],
++--            capture_output=True,
++--            text=True,
++--            timeout=30,
++--            check=True,
++--            cwd=self.repo_path,
++--        )
++-+        try:
++-+            _git(self.repo_path, "fetch", "origin", branch, timeout=60)
++-+            _git(self.repo_path, "checkout", branch)
++-+            _git(self.repo_path, "reset", "--hard", f"origin/{branch}")
++-+            # ``git reset --hard`` only discards tracked-file changes;
++-+            # untracked files (e.g. artifacts left by a crashed Claude
++-+            # run) survive and would poison the next preflight as a
++-+            # dirty tree. ``git clean -fd`` after the reset guarantees
++-+            # the working copy truly matches origin/{branch}.
++-+            _git(self.repo_path, "clean", "-fd")
++-+        except OSError as exc:
++-+            raise RuntimeError(f"sync_to_main OS error: {exc}") from exc
++- 
++-     def _parse_base_queue(self) -> list[QueueTask] | None:
++-         """Return QUEUE.md parsed from ``origin/{branch}``, or ``None``.
++-@@ -557,13 +539,10 @@ class PipelineRunner:
++-         """
++-         branch = self.repo_config.branch
++-         try:
++--            result = subprocess.run(
++--                ["git", "show", f"origin/{branch}:tasks/QUEUE.md"],
++--                capture_output=True,
++--                text=True,
++--                timeout=30,
++--                check=True,
++--                cwd=self.repo_path,
++-+            result = _git(
++-+                self.repo_path,
++-+                "show",
++-+                f"origin/{branch}:tasks/QUEUE.md",
++-             )
++-         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
++-             return None
++-@@ -766,15 +745,15 @@ class PipelineRunner:
++-     def preflight(self) -> bool:
++-         """Return ``True`` iff the working tree is clean."""
++-         try:
++--            result = subprocess.run(
++--                ["git", "status", "--porcelain"],
++--                capture_output=True,
++--                text=True,
++--                timeout=30,
++--                check=True,
++--                cwd=self.repo_path,
++--            )
++--        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
++-+            result = _git(self.repo_path, "status", "--porcelain")
++-+        except (
++-+            subprocess.CalledProcessError,
++-+            subprocess.TimeoutExpired,
++-+            OSError,
++-+        ) as exc:
++-+            # ``OSError`` (missing git binary, missing cwd, permission
++-+            # errors) otherwise escapes to daemon.main's generic
++-+            # handler and leaves the runner state stale.
++-             self.state.state = PipelineState.ERROR
++-             self.state.error_message = f"preflight failed: {exc}"
++-             self.log_event(f"preflight failed: {exc}")
++-@@ -816,18 +795,14 @@ class PipelineRunner:
++-             return False
++- 
++-         try:
++--            probe = subprocess.run(
++--                [
++--                    "git",
++--                    "rev-parse",
++--                    "--verify",
++--                    "--quiet",
++--                    f"refs/heads/{branch}",
++--                ],
++--                capture_output=True,
++--                text=True,
++-+            probe = _git(
++-+                self.repo_path,
++-+                "rev-parse",
++-+                "--verify",
++-+                "--quiet",
++-+                f"refs/heads/{branch}",
++-                 timeout=10,
++--                cwd=self.repo_path,
++-+                check=False,
++-             )
++-         except (subprocess.TimeoutExpired, OSError) as exc:
++-             # The probe itself failed (git binary missing, repo locked,
++-@@ -844,13 +819,12 @@ class PipelineRunner:
++-             return True
++- 
++-         try:
++--            subprocess.run(
++--                ["git", "push", "origin", f"{branch}:{branch}"],
++--                capture_output=True,
++--                text=True,
++-+            _git(
++-+                self.repo_path,
++-+                "push",
++-+                "origin",
++-+                f"{branch}:{branch}",
++-                 timeout=120,
++--                check=True,
++--                cwd=self.repo_path,
++-             )
++-         except (
++-             subprocess.CalledProcessError,
++-@@ -907,13 +881,8 @@ class PipelineRunner:
++-             return False
++- 
++-         try:
++--            status = subprocess.run(
++--                ["git", "status", "--porcelain"],
++--                capture_output=True,
++--                text=True,
++--                timeout=120,
++--                check=True,
++--                cwd=self.repo_path,
++-+            status = _git(
++-+                self.repo_path, "status", "--porcelain", timeout=120
++-             )
++-         except (
++-             subprocess.CalledProcessError,
++-@@ -933,13 +902,12 @@ class PipelineRunner:
++-             return False
++- 
++-         try:
++--            head = subprocess.run(
++--                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
++--                capture_output=True,
++--                text=True,
++-+            head = _git(
++-+                self.repo_path,
++-+                "rev-parse",
++-+                "--abbrev-ref",
++-+                "HEAD",
++-                 timeout=120,
++--                check=True,
++--                cwd=self.repo_path,
++-             )
++-         except (
++-             subprocess.CalledProcessError,
++-@@ -999,32 +967,17 @@ class PipelineRunner:
++-             return False
++- 
++-         try:
++--            subprocess.run(
++--                ["git", "add", "-A"],
++--                capture_output=True,
++--                text=True,
++--                timeout=120,
++--                check=True,
++--                cwd=self.repo_path,
++--            )
++--            subprocess.run(
++--                ["git", "commit", "-m", message],
++--                capture_output=True,
++--                text=True,
++--                timeout=120,
++--                check=True,
++--                cwd=self.repo_path,
++--            )
++--            subprocess.run(
++--                # Push the validated branch by name rather than ``HEAD``
++--                # so a pre-push hook that re-points HEAD mid-operation
++--                # still cannot divert the push onto the base branch.
++--                ["git", "push", "origin", f"{expected_branch}:{expected_branch}"],
++--                capture_output=True,
++--                text=True,
++-+            _git(self.repo_path, "add", "-A", timeout=120)
++-+            _git(self.repo_path, "commit", "-m", message, timeout=120)
++-+            # Push the validated branch by name rather than ``HEAD`` so
++-+            # a pre-push hook that re-points HEAD mid-operation still
++-+            # cannot divert the push onto the base branch.
++-+            _git(
++-+                self.repo_path,
++-+                "push",
++-+                "origin",
++-+                f"{expected_branch}:{expected_branch}",
++-                 timeout=120,
++--                check=True,
++--                cwd=self.repo_path,
++-             )
++-         except (
++-             subprocess.CalledProcessError,
++-@@ -1167,34 +1120,34 @@ return 0
++-                 if src.is_file():
++-                     shutil.copy2(str(src), str(tasks_dir / fname))
++- 
++--            subprocess.run(
++--                ["git", "add"] + [f"tasks/{fn}" for fn in filenames],
++--                cwd=self.repo_path,
++--                capture_output=True, text=True, timeout=30, check=True,
++-+            _git(
++-+                self.repo_path,
++-+                "add",
++-+                *[f"tasks/{fn}" for fn in filenames],
++-             )
++--            commit_result = subprocess.run(
++--                ["git", "commit", "-m", "chore: upload sprint tasks via dashboard"],
++--                cwd=self.repo_path,
++--                capture_output=True, text=True, timeout=30, check=False,
++-+            commit_result = _git(
++-+                self.repo_path,
++-+                "commit",
++-+                "-m",
++-+                "chore: upload sprint tasks via dashboard",
++-+                check=False,
++-             )
++-             if commit_result.returncode != 0:
++-                 combined = f"{commit_result.stderr}\n{commit_result.stdout}"
++-                 if "nothing to commit" not in combined:
++-                     raise RuntimeError(combined.strip())
++--            subprocess.run(
++--                ["git", "push", "origin", branch],
++--                cwd=self.repo_path,
++--                capture_output=True, text=True, timeout=60, check=True,
++--            )
++-+            _git(self.repo_path, "push", "origin", branch, timeout=60)
++-             self.log_event(f"Pushed uploaded task files: {filenames}")
++-         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
++-             logger.error("%s: upload git operations failed: %s", self.name, exc)
++-             self.log_event(f"Upload push failed: {exc}")
++-             try:
++--                subprocess.run(
++--                    ["git", "reset", "--hard", f"origin/{branch}"],
++--                    cwd=self.repo_path,
++--                    capture_output=True, text=True, timeout=30, check=False,
++-+                _git(
++-+                    self.repo_path,
++-+                    "reset",
++-+                    "--hard",
++-+                    f"origin/{branch}",
++-+                    check=False,
++-                 )
++-             except Exception:
++-                 pass
++-@@ -1223,7 +1176,15 @@ return 0
++-         # on a feature branch. We are IDLE here, so that's fine.
++-         try:
++-             self.sync_to_main()
++--        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
++-+        except (
++-+            subprocess.CalledProcessError,
++-+            subprocess.TimeoutExpired,
++-+            RuntimeError,
++-+        ) as exc:
++-+            # ``RuntimeError`` covers the translated ``OSError`` path
++-+            # from ``sync_to_main`` (missing git binary, missing cwd).
++-+            # Without it that exception would escape to daemon.main's
++-+            # generic handler and leave the runner state stale.
++-             self.state.state = PipelineState.ERROR
++-             self.state.error_message = f"sync_to_main failed: {exc}"
++-             self.log_event(f"sync_to_main failed: {exc}")
++-@@ -1236,7 +1197,11 @@ return 0
++-         if upload_result:
++-             try:
++-                 self.sync_to_main()
++--            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
++-+            except (
++-+                subprocess.CalledProcessError,
++-+                subprocess.TimeoutExpired,
++-+                RuntimeError,
++-+            ) as exc:
++-                 self.state.state = PipelineState.ERROR
++-                 self.state.error_message = f"sync_to_main after upload failed: {exc}"
++-                 self.log_event(f"sync_to_main after upload failed: {exc}")
++-@@ -1442,13 +1407,10 @@ return 0
++-             and not self.state.current_pr.is_cross_repository
++-         ):
++-             try:
++--                subprocess.run(
++--                    ["git", "checkout", self.state.current_pr.branch],
++--                    capture_output=True,
++--                    text=True,
++--                    timeout=30,
++--                    check=True,
++--                    cwd=self.repo_path,
++-+                _git(
++-+                    self.repo_path,
++-+                    "checkout",
++-+                    self.state.current_pr.branch,
++-                 )
++-             except (
++-                 subprocess.CalledProcessError,
++-@@ -1525,25 +1487,20 @@ return 0
++-                 # daemon restart + ``recover_state`` resuming WATCH)
++-                 # causes a non-fast-forward on push and blocks merge
++-                 # even when the remote PR is otherwise mergeable.
++--                subprocess.run(
++--                    ["git", "fetch", "origin", base, pr_branch],
++--                    capture_output=True, text=True, timeout=60,
++--                    check=True, cwd=self.repo_path,
++--                )
++--                subprocess.run(
++--                    ["git", "checkout", pr_branch],
++--                    capture_output=True, text=True, timeout=30,
++--                    check=True, cwd=self.repo_path,
++-+                _git(
++-+                    self.repo_path,
++-+                    "fetch", "origin", base, pr_branch,
++-+                    timeout=60,
++-                 )
++--                subprocess.run(
++--                    ["git", "reset", "--hard", f"origin/{pr_branch}"],
++--                    capture_output=True, text=True, timeout=30,
++--                    check=True, cwd=self.repo_path,
++-+                _git(self.repo_path, "checkout", pr_branch)
++-+                _git(
++-+                    self.repo_path,
++-+                    "reset", "--hard", f"origin/{pr_branch}",
++-                 )
++--                merge_result = subprocess.run(
++--                    ["git", "merge", f"origin/{base}", "--no-edit"],
++--                    capture_output=True, text=True, timeout=60,
++--                    check=False, cwd=self.repo_path,
++-+                merge_result = _git(
++-+                    self.repo_path,
++-+                    "merge", f"origin/{base}", "--no-edit",
++-+                    timeout=60, check=False,
++-                 )
++-                 sync_produced_commit = False
++-                 if merge_result.returncode != 0:
++-@@ -1561,11 +1518,10 @@ return 0
++-                             timeout=300,
++-                         )
++-                         if code != 0:
++--                            subprocess.run(
++--                                ["git", "merge", "--abort"],
++--                                capture_output=True, text=True,
++--                                timeout=30, check=False,
++--                                cwd=self.repo_path,
++-+                            _git(
++-+                                self.repo_path,
++-+                                "merge", "--abort",
++-+                                check=False,
++-                             )
++-                             self.state.state = PipelineState.ERROR
++-                             self.state.error_message = (
++-@@ -1588,10 +1544,10 @@ return 0
++-                     )
++- 
++-                 if sync_produced_commit:
++--                    subprocess.run(
++--                        ["git", "push", "origin", pr_branch],
++--                        capture_output=True, text=True, timeout=60,
++--                        check=True, cwd=self.repo_path,
++-+                    _git(
++-+                        self.repo_path,
++-+                        "push", "origin", pr_branch,
++-+                        timeout=60,
++-                     )
++-                     # The new commit invalidates any previously observed
++-                     # green/approved gate state (branch protection may
++-@@ -1698,21 +1654,9 @@ return 0
++-         self.state.pending_queue_sync_started_at = datetime.now(timezone.utc)
++- 
++-         try:
++--            subprocess.run(
++--                ["git", "fetch", "origin", base],
++--                capture_output=True, text=True, timeout=30,
++--                check=True, cwd=self.repo_path,
++--            )
++--            subprocess.run(
++--                ["git", "checkout", base],
++--                capture_output=True, text=True, timeout=30,
++--                check=True, cwd=self.repo_path,
++--            )
++--            subprocess.run(
++--                ["git", "reset", "--hard", f"origin/{base}"],
++--                capture_output=True, text=True, timeout=30,
++--                check=True, cwd=self.repo_path,
++--            )
++-+            _git(self.repo_path, "fetch", "origin", base)
++-+            _git(self.repo_path, "checkout", base)
++-+            _git(self.repo_path, "reset", "--hard", f"origin/{base}")
++- 
++-             queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
++-             if not queue_path.exists():
++-@@ -1732,27 +1676,14 @@ return 0
++-                 self.state.pending_queue_sync_started_at = None
++-                 return
++- 
++--            subprocess.run(
++--                ["git", "checkout", "-B", remediation_branch],
++--                capture_output=True, text=True, timeout=30,
++--                check=True, cwd=self.repo_path,
++--            )
++-+            _git(self.repo_path, "checkout", "-B", remediation_branch)
++-             queue_path.write_text(updated)
++--            subprocess.run(
++--                ["git", "add", "tasks/QUEUE.md"],
++--                capture_output=True, text=True, timeout=30,
++--                check=True, cwd=self.repo_path,
++--            )
++--            subprocess.run(
++--                ["git", "commit", "-m", f"{pr_id}: mark DONE"],
++--                capture_output=True, text=True, timeout=30,
++--                check=True, cwd=self.repo_path,
++--            )
++--            subprocess.run(
++--                ["git", "push", "--force-with-lease", "-u",
++--                 "origin", remediation_branch],
++--                capture_output=True, text=True, timeout=30,
++--                check=True, cwd=self.repo_path,
++-+            _git(self.repo_path, "add", "tasks/QUEUE.md")
++-+            _git(self.repo_path, "commit", "-m", f"{pr_id}: mark DONE")
++-+            _git(
++-+                self.repo_path,
++-+                "push", "--force-with-lease", "-u",
++-+                "origin", remediation_branch,
++-             )
++-             github_client.run_gh(
++-                 ["pr", "create",
++-@@ -1798,23 +1729,15 @@ return 0
++-             # write/commit/push cannot poison the next preflight. Use
++-             # check=False so reset/checkout errors do not mask the
++-             # original failure that the caller logs.
++--            subprocess.run(
++--                ["git", "reset", "--hard", f"origin/{base}"],
++--                capture_output=True, text=True, timeout=30,
++--                check=False, cwd=self.repo_path,
++--            )
++--            subprocess.run(
++--                ["git", "checkout", base],
++--                capture_output=True, text=True, timeout=30,
++--                check=False, cwd=self.repo_path,
++-+            _git(
++-+                self.repo_path,
++-+                "reset", "--hard", f"origin/{base}",
++-+                check=False,
++-             )
++-+            _git(self.repo_path, "checkout", base, check=False)
++-             raise
++- 
++--        subprocess.run(
++--            ["git", "checkout", base],
++--            capture_output=True, text=True, timeout=30,
++--            check=True, cwd=self.repo_path,
++--        )
++-+        _git(self.repo_path, "checkout", base)
++-         self.log_event(
++-             f"Opened queue-done PR for {pr_id} "
++-             f"(branch {remediation_branch}); awaiting auto-merge"
++-diff --git a/src/queue_parser.py b/src/queue_parser.py
++-index dd975af..477aa13 100644
++---- a/src/queue_parser.py
++-+++ b/src/queue_parser.py
++-@@ -2,11 +2,14 @@
++- 
++- from __future__ import annotations
++- 
++-+import logging
++- import re
++- from pathlib import Path
++- 
++- from src.models import QueueTask, TaskStatus
++- 
++-+logger = logging.getLogger(__name__)
++-+
++- _HEADER_RE = re.compile(r"^##\s+(PR-[A-Za-z0-9_.-]+):\s*(.+?)\s*$")
++- _FIELD_RE = re.compile(r"^-\s*([A-Za-z ]+?)\s*:\s*(.*?)\s*$")
++- _STATUS_LINE_RE = re.compile(
++-@@ -64,9 +67,15 @@ def parse_queue_text(text: str) -> list[QueueTask]:
++-         value = field_match.group(2).strip()
++- 
++-         if key == "status":
++--            try:
++--                current["status"] = TaskStatus(value.upper())
++--            except ValueError:
++-+            raw_status = value.upper()
++-+            if raw_status in {s.value for s in TaskStatus}:
++-+                current["status"] = TaskStatus(raw_status)
++-+            else:
++-+                logger.warning(
++-+                    "Unknown status %r for %s, treating as TODO",
++-+                    raw_status,
++-+                    current["pr_id"],
++-+                )
++-                 current["status"] = TaskStatus.TODO
++-         elif key == "tasks file":
++-             current["task_file"] = value or None
++-diff --git a/tasks/QUEUE.md b/tasks/QUEUE.md
++-index dbe9649..3480888 100644
++---- a/tasks/QUEUE.md
++-+++ b/tasks/QUEUE.md
++-@@ -186,7 +186,7 @@
++- - Depends on: PR-030
++- 
++- ## PR-032: Subprocess helper and error handling hardening
++--- Status: TODO
++-+- Status: DONE
++- - Tasks file: tasks/PR-032.md
++- - Branch: pr-032-subprocess-helper
++- - Depends on: PR-027
++-diff --git a/tests/test_queue_parser.py b/tests/test_queue_parser.py
++-index eb1ffb5..b145cdb 100644
++---- a/tests/test_queue_parser.py
++-+++ b/tests/test_queue_parser.py
++-@@ -2,8 +2,11 @@
++- 
++- from __future__ import annotations
++- 
++-+import logging
++- from pathlib import Path
++- 
++-+import pytest
++-+
++- from src.models import TaskStatus
++- from src.queue_parser import get_next_task, mark_task_done, parse_queue
++- 
++-@@ -310,3 +313,26 @@ def test_mark_task_done_stops_at_next_header() -> None:
++-         "- Status: TODO\n"
++-     )
++-     assert mark_task_done(content, "PR-001") is None
++-+
++-+
++-+def test_unknown_status_defaults_to_todo_with_warning(
++-+    tmp_path: Path, caplog: pytest.LogCaptureFixture
++-+) -> None:
++-+    """Unknown status values silently coerced to TODO masks queue
++-+    authoring bugs. Emit a warning so operators see malformed entries
++-+    instead of the runner quietly treating them as selectable."""
++-+    content = (
++-+        "## PR-050: weird status\n"
++-+        "- Status: INVALID\n"
++-+        "- Tasks file: tasks/PR-050.md\n"
++-+        "- Branch: pr-050-weird\n"
++-+    )
++-+    with caplog.at_level(logging.WARNING, logger="src.queue_parser"):
++-+        tasks = parse_queue(_write_queue(tmp_path, content))
++-+
++-+    assert len(tasks) == 1
++-+    assert tasks[0].status == TaskStatus.TODO
++-+    assert any(
++-+        "Unknown status" in rec.message and "PR-050" in rec.message
++-+        for rec in caplog.records
++-+    )
++-diff --git a/tests/test_runner.py b/tests/test_runner.py
++-index 02cf807..5d62b44 100644
++---- a/tests/test_runner.py
++-+++ b/tests/test_runner.py
++-@@ -166,6 +166,37 @@ def test_preflight_sets_error_when_git_fails(
++-     assert runner.state.state == PipelineState.ERROR
++- 
++- 
++-+def test_preflight_handles_oserror(monkeypatch: pytest.MonkeyPatch) -> None:
++-+    """Missing git binary or cwd raises ``OSError`` from subprocess.run.
++-+    Without catching it, the exception escapes to daemon.main's generic
++-+    handler and the runner state stays stale; preflight must translate
++-+    it into ERROR state.
++-+    """
++-+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
++-+        raise FileNotFoundError("git: not found")
++-+
++-+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
++-+    runner = _make_runner()
++-+
++-+    assert runner.preflight() is False
++-+    assert runner.state.state == PipelineState.ERROR
++-+    assert "preflight failed" in (runner.state.error_message or "")
++-+
++-+
++-+def test_sync_to_main_handles_oserror(monkeypatch: pytest.MonkeyPatch) -> None:
++-+    """``sync_to_main`` translates ``OSError`` to ``RuntimeError`` so
++-+    the caller's structured error-state translation covers missing git
++-+    binary / cwd instead of letting the exception escape unhandled."""
++-+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
++-+        raise FileNotFoundError("git: not found")
++-+
++-+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
++-+    runner = _make_runner()
++-+
++-+    with pytest.raises(RuntimeError, match="sync_to_main OS error"):
++-+        runner.sync_to_main()
++-+
++-+
++- def test_log_event_caps_history_at_100(monkeypatch: pytest.MonkeyPatch) -> None:
++-     runner = _make_runner()
++- 
+ diff --git a/src/daemon/runner.py b/src/daemon/runner.py
 -index 54a6641..9cf95d3 100644
----- a/src/daemon/runner.py
--+++ b/src/daemon/runner.py
++index 9cf95d3..448e917 100644
+ --- a/src/daemon/runner.py
+ +++ b/src/daemon/runner.py
 -@@ -82,6 +82,31 @@ def repo_owner_from_url(url: str) -> str:
 - _FETCH_MISSING_REF_NEEDLE = "couldn't find remote ref"
-- 
-- 
++@@ -68,6 +68,12 @@ _CI_SCRIPT_TIMEOUT_SEC = 1800
++ # slow repos without false escalations.
++ _QUEUE_SYNC_MAX_WAIT_SEC = 3600
+  
+++# After this many consecutive cycles of a dirty working tree,
+++# ``preflight`` hard-resets the repo to ``origin/{branch}`` and
+++# returns IDLE instead of ERROR. Without this safety net a single
+++# interrupted Claude run can leave the runner stuck in ERROR forever.
+++_DIRTY_CYCLES_BEFORE_AUTO_RESET = 3
+++
+  
 -+def _git(
 -+    repo_path: str,
 -+    *args: str,
@@ -54,8 +869,44 @@ index ca127b9..e69de29 100644
 -+        check=check,
 -+        cwd=repo_path,
 -+    )
--+
--+
++ def repo_owner_from_url(url: str) -> str:
++     """Return ``owner/repo`` for a GitHub URL."""
++@@ -304,6 +310,13 @@ class PipelineRunner:
++         # a stranded commit from a prior cycle and re-pushes it; once
++         # fully sync'd it is a cheap no-op.
++         self._scaffolded = _repo_looks_scaffolded(self.repo_path)
+++        # Consecutive cycles preflight has observed a dirty working
+++        # tree. Used to trigger auto-recovery at
+++        # ``_DIRTY_CYCLES_BEFORE_AUTO_RESET`` so a stuck ERROR state
+++        # (e.g. Claude CLI crash mid-edit leaving uncommitted files)
+++        # no longer requires operator intervention. Reset to 0 on any
+++        # clean preflight or after a successful auto-reset.
+++        self._consecutive_dirty_cycles = 0
++ 
++     async def publish_state(self) -> None:
++         """Serialize ``self.state`` and write it to Redis."""
++@@ -761,10 +774,47 @@ class PipelineRunner:
++ 
++         dirty = result.stdout.strip()
++         if dirty:
+++            self._consecutive_dirty_cycles += 1
+++            if self._consecutive_dirty_cycles >= _DIRTY_CYCLES_BEFORE_AUTO_RESET:
+++                self.log_event(
+++                    f"Dirty tree persisted {self._consecutive_dirty_cycles} "
+++                    "cycles, auto-resetting to recover"
+++                )
+++                if self._auto_reset_dirty_tree():
+++                    return True
++             self.state.state = PipelineState.ERROR
++             self.state.error_message = f"working tree dirty: {dirty}"
++             self.log_event("preflight: dirty working tree")
++             return False
+++        self._consecutive_dirty_cycles = 0
+++        return True
+ +
+++    def _auto_reset_dirty_tree(self) -> bool:
+++        """Hard-reset the working tree to ``origin/{branch}``.
+ +
 - def _base_branch_ahead_of_origin(repo_path: str, branch: str) -> bool:
 -     """Return ``True`` if ``refs/heads/{branch}`` has commits not yet
 -     on ``refs/remotes/origin/{branch}``.
@@ -225,16 +1076,25 @@ index ca127b9..e69de29 100644
 --            check=True,
 --            cwd=self.repo_path,
 --        )
--+        try:
+++        Called by ``preflight`` once the consecutive-dirty counter
+++        crosses ``_DIRTY_CYCLES_BEFORE_AUTO_RESET``. On success the
+++        runner is returned to IDLE with the dirty counter cleared so
+++        the next cycle can pick up work normally. On failure the
+++        counter is left untouched and the caller falls through to the
+++        usual ERROR path.
+++        """
+++        branch = self.repo_config.branch
+ +        try:
 -+            _git(self.repo_path, "fetch", "origin", branch, timeout=60)
 -+            _git(self.repo_path, "checkout", branch)
--+            _git(self.repo_path, "reset", "--hard", f"origin/{branch}")
+++            _git(self.repo_path, "checkout", branch, check=False)
+ +            _git(self.repo_path, "reset", "--hard", f"origin/{branch}")
 -+            # ``git reset --hard`` only discards tracked-file changes;
 -+            # untracked files (e.g. artifacts left by a crashed Claude
 -+            # run) survive and would poison the next preflight as a
 -+            # dirty tree. ``git clean -fd`` after the reset guarantees
 -+            # the working copy truly matches origin/{branch}.
--+            _git(self.repo_path, "clean", "-fd")
+ +            _git(self.repo_path, "clean", "-fd")
 -+        except OSError as exc:
 -+            raise RuntimeError(f"sync_to_main OS error: {exc}") from exc
 - 
@@ -272,11 +1132,11 @@ index ca127b9..e69de29 100644
 --            )
 --        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
 -+            result = _git(self.repo_path, "status", "--porcelain")
--+        except (
--+            subprocess.CalledProcessError,
--+            subprocess.TimeoutExpired,
--+            OSError,
--+        ) as exc:
+ +        except (
+ +            subprocess.CalledProcessError,
+ +            subprocess.TimeoutExpired,
+ +            OSError,
+ +        ) as exc:
 -+            # ``OSError`` (missing git binary, missing cwd, permission
 -+            # errors) otherwise escapes to daemon.main's generic
 -+            # handler and leaves the runner state stale.
@@ -346,7 +1206,14 @@ index ca127b9..e69de29 100644
 -             subprocess.CalledProcessError,
 -@@ -933,13 +902,12 @@ class PipelineRunner:
 -             return False
-- 
+++            self.log_event(f"Auto-recovery failed: {exc}")
+++            return False
+++        self._consecutive_dirty_cycles = 0
+++        self.state.state = PipelineState.IDLE
+++        self.state.error_message = None
+++        self.log_event("Auto-recovered from dirty tree -> IDLE")
++         return True
+  
 -         try:
 --            head = subprocess.run(
 --                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
@@ -409,7 +1276,11 @@ index ca127b9..e69de29 100644
 -@@ -1167,34 +1120,34 @@ return 0
 -                 if src.is_file():
 -                     shutil.copy2(str(src), str(tasks_dir / fname))
-- 
++     def _preserve_crashed_run_commits(self, branch: str) -> bool:
++@@ -1833,6 +1883,21 @@ return 0
++         )
++         self.log_event(self.state.error_message)
+  
 --            subprocess.run(
 --                ["git", "add"] + [f"tasks/{fn}" for fn in filenames],
 --                cwd=self.repo_path,
@@ -562,7 +1433,24 @@ index ca127b9..e69de29 100644
 -                             self.state.error_message = (
 -@@ -1588,10 +1544,10 @@ return 0
 -                     )
-- 
+++    def _get_pr_author(self) -> str:
+++        """Return the GitHub login used to author PRs from this daemon.
+++
+++        Resolves from the ``gh`` auth context via ``gh api user`` and
+++        falls back to ``AlexBomber12`` when that lookup fails so the
+++        dedup check in ``_post_codex_review`` still has a non-empty
+++        author to match against.
+++        """
+++        try:
+++            raw = github_client.run_gh(["api", "user", "--jq", ".login"])
+++        except Exception:
+++            return "AlexBomber12"
+++        login = raw if isinstance(raw, str) else ""
+++        return login.strip() or "AlexBomber12"
+++
++     def _post_codex_review(self, pr_number: int) -> bool:
++         """Post ``@codex review`` on ``pr_number``.
+  
 -                 if sync_produced_commit:
 --                    subprocess.run(
 --                        ["git", "push", "origin", pr_branch],
@@ -577,8 +1465,39 @@ index ca127b9..e69de29 100644
 -                     # green/approved gate state (branch protection may
 -@@ -1698,21 +1654,9 @@ return 0
 -         self.state.pending_queue_sync_started_at = datetime.now(timezone.utc)
-- 
--         try:
++@@ -1842,6 +1907,11 @@ return 0
++         Reviews trigger (which we want configured for PR creation only
++         to avoid duplicate reviews).
+  
+++        Skips posting when the PR author already has a recent
+++        ``@codex review`` comment — Claude's PLANNED PR runbook posts
+++        that trigger itself and an immediate daemon-side repost would
+++        queue a duplicate Codex review.
+++
++         Returns ``True`` on success and ``False`` on a logged failure.
++         The caller decides whether a failure is fatal: after a fix
++         push it must be, otherwise the next ``handle_watch`` cycle
++@@ -1851,6 +1921,22 @@ return 0
++         creation it can stay a warning because Codex Automatic Reviews
++         still fires on the creation event itself.
++         """
+++        try:
+++            if github_client.has_recent_codex_review_request(
+++                self.owner_repo,
+++                pr_number,
+++                pr_author=self._get_pr_author(),
+++                within_minutes=5,
+++            ):
+++                self.log_event(
+++                    f"Skipping duplicate @codex review on PR #{pr_number}"
+++                )
+++                return True
+++        except Exception as exc:
+++            self.log_event(
+++                f"Dedup check failed on PR #{pr_number}: {exc}"
+++            )
+++
+          try:
 --            subprocess.run(
 --                ["git", "fetch", "origin", base],
 --                capture_output=True, text=True, timeout=30,
@@ -670,23 +1589,80 @@ index ca127b9..e69de29 100644
 ---- a/src/queue_parser.py
 -+++ b/src/queue_parser.py
 -@@ -2,11 +2,14 @@
-- 
++             github_client.post_comment(
++                 self.owner_repo, pr_number, "@codex review"
++diff --git a/src/github_client.py b/src/github_client.py
++index 011a2b0..e79fe04 100644
++--- a/src/github_client.py
+++++ b/src/github_client.py
++@@ -5,7 +5,7 @@ from __future__ import annotations
++ import json
++ import re
++ import subprocess
++-from datetime import datetime
+++from datetime import datetime, timezone
+  
 - from __future__ import annotations
-- 
++ from src.models import CIStatus, PRInfo, ReviewStatus
+  
 -+import logging
 - import re
 - from pathlib import Path
-- 
++@@ -226,6 +226,47 @@ def post_comment(repo: str, pr_number: int, body: str) -> None:
++     run_gh(["pr", "comment", str(pr_number), "--body", body], repo=repo)
+  
 - from src.models import QueueTask, TaskStatus
-- 
+  
 -+logger = logging.getLogger(__name__)
--+
+++def has_recent_codex_review_request(
+++    repo: str,
+++    pr_number: int,
+++    pr_author: str,
+++    within_minutes: int = 5,
+++) -> bool:
+++    """Return ``True`` iff ``pr_author`` recently posted ``@codex review``.
+ +
 - _HEADER_RE = re.compile(r"^##\s+(PR-[A-Za-z0-9_.-]+):\s*(.+?)\s*$")
 - _FIELD_RE = re.compile(r"^-\s*([A-Za-z ]+?)\s*:\s*(.*?)\s*$")
 - _STATUS_LINE_RE = re.compile(
 -@@ -64,9 +67,15 @@ def parse_queue_text(text: str) -> list[QueueTask]:
 -         value = field_match.group(2).strip()
-- 
+++    The daemon posts ``@codex review`` after every coding/fix cycle, but
+++    Claude may also post one itself from the AGENTS.md runbook. Without
+++    this guard both trigger comments land back-to-back and Codex starts
+++    two redundant reviews. The caller checks this before posting and
+++    skips when a qualifying trigger already exists within
+++    ``within_minutes``.
+++    """
+++    try:
+++        comments = _gh_api_paginated(
+++            f"repos/{repo}/issues/{pr_number}/comments"
+++        ) or []
+++    except RuntimeError as exc:
+++        if "HTTP 404" in str(exc):
+++            return False
+++        raise
+++    now = datetime.now(timezone.utc)
+++    cutoff = within_minutes * 60
+++    for c in reversed(comments):
+++        author = (c.get("user") or {}).get("login", "")
+++        if author != pr_author:
+++            continue
+++        if "@codex review" not in (c.get("body") or "").lower():
+++            continue
+++        created = _parse_iso(c.get("created_at"))
+++        if created is None:
+++            continue
+++        if created.tzinfo is None:
+++            created = created.replace(tzinfo=timezone.utc)
+++        if (now - created).total_seconds() < cutoff:
+++            return True
+++    return False
+++
+++
++ def _gh_api_paginated(path: str) -> list[dict] | None:
++     """Fetch every page of a GitHub REST endpoint that returns a JSON array.
+  
 -         if key == "status":
 --            try:
 --                current["status"] = TaskStatus(value.upper())
@@ -703,16 +1679,20 @@ index ca127b9..e69de29 100644
 -                 current["status"] = TaskStatus.TODO
 -         elif key == "tasks file":
 -             current["task_file"] = value or None
--diff --git a/tasks/QUEUE.md b/tasks/QUEUE.md
+ diff --git a/tasks/QUEUE.md b/tasks/QUEUE.md
 -index dbe9649..3480888 100644
----- a/tasks/QUEUE.md
--+++ b/tasks/QUEUE.md
++index 3480888..adf777c 100644
+ --- a/tasks/QUEUE.md
+ +++ b/tasks/QUEUE.md
 -@@ -186,7 +186,7 @@
 - - Depends on: PR-030
-- 
++@@ -192,7 +192,7 @@
++ - Depends on: PR-027
+  
 - ## PR-032: Subprocess helper and error handling hardening
---- Status: TODO
--+- Status: DONE
++ ## PR-033: Dirty tree recovery and dedup codex review
+ -- Status: TODO
+ +- Status: DONE
 - - Tasks file: tasks/PR-032.md
 - - Branch: pr-032-subprocess-helper
 - - Depends on: PR-027
@@ -728,7 +1708,26 @@ index ca127b9..e69de29 100644
 - from pathlib import Path
 - 
 -+import pytest
--+
++ - Tasks file: tasks/PR-033.md
++ - Branch: pr-033-dirty-recovery
++ - Depends on: PR-032
++diff --git a/tests/test_github_client.py b/tests/test_github_client.py
++index d11c04e..8ba7279 100644
++--- a/tests/test_github_client.py
+++++ b/tests/test_github_client.py
++@@ -10,6 +10,7 @@ import pytest
++ from src.github_client import (
++     get_pr_review_status,
++     get_repo_full_name,
+++    has_recent_codex_review_request,
++     merge_pr,
++     run_gh,
++ )
++@@ -559,3 +560,105 @@ def test_merge_pr_uses_squash(monkeypatch: pytest.MonkeyPatch) -> None:
++         "-R",
++         "owner/name",
++     ]
+ +
 - from src.models import TaskStatus
 - from src.queue_parser import get_next_task, mark_task_done, parse_queue
 - 
@@ -736,11 +1735,20 @@ index ca127b9..e69de29 100644
 -         "- Status: TODO\n"
 -     )
 -     assert mark_task_done(content, "PR-001") is None
--+
--+
+++
+++def _iso_utc_now_minus(seconds: int) -> str:
+++    from datetime import datetime, timedelta, timezone as _tz
+++
+++    return (
+++        datetime.now(_tz.utc) - timedelta(seconds=seconds)
+++    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+ +
+ +
 -+def test_unknown_status_defaults_to_todo_with_warning(
 -+    tmp_path: Path, caplog: pytest.LogCaptureFixture
--+) -> None:
+++def test_has_recent_codex_review_request_true(
+++    monkeypatch: pytest.MonkeyPatch,
+ +) -> None:
 -+    """Unknown status values silently coerced to TODO masks queue
 -+    authoring bugs. Emit a warning so operators see malformed entries
 -+    instead of the runner quietly treating them as selectable."""
@@ -749,20 +1757,107 @@ index ca127b9..e69de29 100644
 -+        "- Status: INVALID\n"
 -+        "- Tasks file: tasks/PR-050.md\n"
 -+        "- Branch: pr-050-weird\n"
--+    )
+++    """A PR-author ``@codex review`` comment within the window counts
+++    as a recent request — the caller must skip posting another one."""
+++    import json as _json
+++
+++    pages = [
+++        [
+++            {
+++                "user": {"login": "author"},
+++                "body": "@codex review",
+++                "created_at": _iso_utc_now_minus(60),
+++            }
+++        ]
+++    ]
+++
+++    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+++        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+++
+++    monkeypatch.setattr(subprocess, "run", fake_run)
+++
+++    assert (
+++        has_recent_codex_review_request(
+++            "owner/name", 42, pr_author="author", within_minutes=5
+++        )
+++        is True
+ +    )
 -+    with caplog.at_level(logging.WARNING, logger="src.queue_parser"):
 -+        tasks = parse_queue(_write_queue(tmp_path, content))
--+
+ +
 -+    assert len(tasks) == 1
 -+    assert tasks[0].status == TaskStatus.TODO
 -+    assert any(
 -+        "Unknown status" in rec.message and "PR-050" in rec.message
 -+        for rec in caplog.records
--+    )
--diff --git a/tests/test_runner.py b/tests/test_runner.py
+++
+++def test_has_recent_codex_review_request_false_too_old(
+++    monkeypatch: pytest.MonkeyPatch,
+++) -> None:
+++    """A matching comment older than ``within_minutes`` must not count."""
+++    import json as _json
+++
+++    pages = [
+++        [
+++            {
+++                "user": {"login": "author"},
+++                "body": "@codex review",
+++                "created_at": _iso_utc_now_minus(10 * 60),
+++            }
+++        ]
+++    ]
+++
+++    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+++        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+++
+++    monkeypatch.setattr(subprocess, "run", fake_run)
+++
+++    assert (
+++        has_recent_codex_review_request(
+++            "owner/name", 42, pr_author="author", within_minutes=5
+++        )
+++        is False
+++    )
+++
+++
+++def test_has_recent_codex_review_request_false_no_comment(
+++    monkeypatch: pytest.MonkeyPatch,
+++) -> None:
+++    """When no PR-author ``@codex review`` comment exists at all the
+++    helper returns False so the daemon posts the trigger itself."""
+++    import json as _json
+++
+++    pages = [
+++        [
+++            {
+++                "user": {"login": "someone-else"},
+++                "body": "@codex review",
+++                "created_at": _iso_utc_now_minus(60),
+++            },
+++            {
+++                "user": {"login": "author"},
+++                "body": "looks good",
+++                "created_at": _iso_utc_now_minus(60),
+++            },
+++        ]
+++    ]
+++
+++    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+++        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+++
+++    monkeypatch.setattr(subprocess, "run", fake_run)
+++
+++    assert (
+++        has_recent_codex_review_request(
+++            "owner/name", 42, pr_author="author", within_minutes=5
+++        )
+++        is False
+ +    )
+ diff --git a/tests/test_runner.py b/tests/test_runner.py
 -index 02cf807..5d62b44 100644
----- a/tests/test_runner.py
--+++ b/tests/test_runner.py
++index 5d62b44..32f619f 100644
+ --- a/tests/test_runner.py
+ +++ b/tests/test_runner.py
 -@@ -166,6 +166,37 @@ def test_preflight_sets_error_when_git_fails(
 -     assert runner.state.state == PipelineState.ERROR
 - 
@@ -773,36 +1868,161 @@ index ca127b9..e69de29 100644
 -+    handler and the runner state stays stale; preflight must translate
 -+    it into ERROR state.
 -+    """
--+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
++@@ -3206,3 +3206,140 @@ def test_handle_fix_saves_stdout(
++     assert any(k == f"cli_log:{runner.name}:latest" for k in redis_keys)
++     stored = runner.redis.store.get(f"cli_log:{runner.name}:latest")
++     assert stored == "fix output here"
+++
+++
+++def test_dirty_tree_auto_recovery_after_3_cycles(
+++    monkeypatch: pytest.MonkeyPatch,
+++) -> None:
+++    """After three consecutive dirty preflights the runner hard-resets
+++    to ``origin/{branch}`` and returns to IDLE instead of staying stuck
+++    in ERROR requiring manual intervention."""
+++    commands: list[list[str]] = []
+++
+ +    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
 -+        raise FileNotFoundError("git: not found")
--+
--+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
--+    runner = _make_runner()
--+
--+    assert runner.preflight() is False
--+    assert runner.state.state == PipelineState.ERROR
+++        commands.append(cmd)
+++        if cmd[:3] == ["git", "status", "--porcelain"]:
+++            return _FakeCompletedProcess(
+++                args=cmd, stdout=" M src/foo.py\n", returncode=0
+++            )
+++        return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
+ +
+ +    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+ +    runner = _make_runner()
+ +
+ +    assert runner.preflight() is False
+++    assert runner._consecutive_dirty_cycles == 1
+ +    assert runner.state.state == PipelineState.ERROR
 -+    assert "preflight failed" in (runner.state.error_message or "")
--+
--+
+ +
+++    assert runner.preflight() is False
+++    assert runner._consecutive_dirty_cycles == 2
+++    assert runner.state.state == PipelineState.ERROR
+ +
 -+def test_sync_to_main_handles_oserror(monkeypatch: pytest.MonkeyPatch) -> None:
 -+    """``sync_to_main`` translates ``OSError`` to ``RuntimeError`` so
 -+    the caller's structured error-state translation covers missing git
 -+    binary / cwd instead of letting the exception escape unhandled."""
--+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+++    assert runner.preflight() is True
+++    assert runner._consecutive_dirty_cycles == 0
+++    assert runner.state.state == PipelineState.IDLE
+++    assert runner.state.error_message is None
+++    assert any(
+++        cmd[:2] == ["git", "reset"] and "--hard" in cmd
+++        for cmd in commands
+++    )
+++    assert any(cmd[:3] == ["git", "clean", "-fd"] for cmd in commands)
+++    assert any(
+++        "Auto-recovered from dirty tree" in e["event"]
+++        for e in runner.state.history
+++    )
+++
+++
+++def test_dirty_tree_counter_resets_on_clean(
+++    monkeypatch: pytest.MonkeyPatch,
+++) -> None:
+++    """The dirty-cycle counter must return to zero after any clean
+++    preflight so a transient glitch does not push a later cycle over
+++    the auto-reset threshold."""
+++    _patch_subprocess(monkeypatch, stdout=" M foo.py")
+++    runner = _make_runner()
+++    assert runner.preflight() is False
+++    assert runner._consecutive_dirty_cycles == 1
+++
+++    _patch_subprocess(monkeypatch, stdout="")
+++    assert runner.preflight() is True
+++    assert runner._consecutive_dirty_cycles == 0
+++
+++
+++def test_dirty_tree_auto_recovery_failure_stays_error(
+++    monkeypatch: pytest.MonkeyPatch,
+++) -> None:
+++    """When the auto-reset git commands themselves fail, preflight must
+++    leave the runner in ERROR so the operator still sees the issue
+++    rather than silently declaring the tree clean."""
+ +    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
 -+        raise FileNotFoundError("git: not found")
--+
--+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
--+    runner = _make_runner()
--+
+++        if cmd[:3] == ["git", "status", "--porcelain"]:
+++            return _FakeCompletedProcess(
+++                args=cmd, stdout=" M src/foo.py\n", returncode=0
+++            )
+++        if cmd[:2] == ["git", "reset"]:
+++            raise subprocess.CalledProcessError(
+++                1, cmd, stderr="reset refused"
+++            )
+++        return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
+ +
+ +    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+ +    runner = _make_runner()
+ +
 -+    with pytest.raises(RuntimeError, match="sync_to_main OS error"):
 -+        runner.sync_to_main()
--+
--+
+++    runner.preflight()
+++    runner.preflight()
+++    assert runner.preflight() is False
+++    assert runner.state.state == PipelineState.ERROR
+++    assert any(
+++        "Auto-recovery failed" in e["event"]
+++        for e in runner.state.history
+++    )
+ +
+ +
 - def test_log_event_caps_history_at_100(monkeypatch: pytest.MonkeyPatch) -> None:
 -     runner = _make_runner()
 - 
+++def test_post_codex_review_skips_duplicate(
+++    monkeypatch: pytest.MonkeyPatch,
+++) -> None:
+++    """When ``has_recent_codex_review_request`` returns True the daemon
+++    must not post another ``@codex review`` comment, preventing Codex
+++    from starting two redundant reviews back-to-back."""
+++    monkeypatch.setattr(
+++        runner_module.github_client,
+++        "has_recent_codex_review_request",
+++        lambda *a, **kw: True,
+++    )
+++    posted: list[tuple[str, int, str]] = []
+++
+++    def fake_post(repo: str, number: int, body: str) -> None:
+++        posted.append((repo, number, body))
+++
+++    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+++    runner = _make_runner()
+++
+++    assert runner._post_codex_review(42) is True
+++    assert posted == []
+++    assert any(
+++        "Skipping duplicate @codex review on PR #42" in e["event"]
+++        for e in runner.state.history
+++    )
+++
+++
+++def test_post_codex_review_posts_when_no_duplicate(
+++    monkeypatch: pytest.MonkeyPatch,
+++) -> None:
+++    """With no recent duplicate the daemon still posts ``@codex
+++    review`` exactly once."""
+++    monkeypatch.setattr(
+++        runner_module.github_client,
+++        "has_recent_codex_review_request",
+++        lambda *a, **kw: False,
+++    )
+++    posted: list[tuple[str, int, str]] = []
+++
+++    def fake_post(repo: str, number: int, body: str) -> None:
+++        posted.append((repo, number, body))
+++
+++    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+++    runner = _make_runner()
+++
+++    assert runner._post_codex_review(42) is True
+++    assert posted == [(runner.owner_repo, 42, "@codex review")]
 diff --git a/src/daemon/runner.py b/src/daemon/runner.py
-index 9cf95d3..448e917 100644
+index 9cf95d3..462e368 100644
 --- a/src/daemon/runner.py
 +++ b/src/daemon/runner.py
 @@ -68,6 +68,12 @@ _CI_SCRIPT_TIMEOUT_SEC = 1800
@@ -832,7 +2052,7 @@ index 9cf95d3..448e917 100644
  
      async def publish_state(self) -> None:
          """Serialize ``self.state`` and write it to Redis."""
-@@ -761,10 +774,47 @@ class PipelineRunner:
+@@ -761,10 +774,54 @@ class PipelineRunner:
  
          dirty = result.stdout.strip()
          if dirty:
@@ -856,10 +2076,13 @@ index 9cf95d3..448e917 100644
 +
 +        Called by ``preflight`` once the consecutive-dirty counter
 +        crosses ``_DIRTY_CYCLES_BEFORE_AUTO_RESET``. On success the
-+        runner is returned to IDLE with the dirty counter cleared so
-+        the next cycle can pick up work normally. On failure the
-+        counter is left untouched and the caller falls through to the
-+        usual ERROR path.
++        runner resumes the state it was in before the dirty-tree
++        stall: WATCH when an open PR was being tracked, IDLE
++        otherwise. Dropping back to IDLE unconditionally would make
++        the next cycle re-pick the still-TODO task from
++        ``origin/{base}:tasks/QUEUE.md`` and open a duplicate PR.
++        On failure the counter is left untouched and the caller
++        falls through to the usual ERROR path.
 +        """
 +        branch = self.repo_config.branch
 +        try:
@@ -874,35 +2097,17 @@ index 9cf95d3..448e917 100644
 +            self.log_event(f"Auto-recovery failed: {exc}")
 +            return False
 +        self._consecutive_dirty_cycles = 0
-+        self.state.state = PipelineState.IDLE
++        if self.state.current_pr is not None:
++            resumed = PipelineState.WATCH
++        else:
++            resumed = PipelineState.IDLE
++        self.state.state = resumed
 +        self.state.error_message = None
-+        self.log_event("Auto-recovered from dirty tree -> IDLE")
++        self.log_event(f"Auto-recovered from dirty tree -> {resumed.value}")
          return True
  
      def _preserve_crashed_run_commits(self, branch: str) -> bool:
-@@ -1833,6 +1883,21 @@ return 0
-         )
-         self.log_event(self.state.error_message)
- 
-+    def _get_pr_author(self) -> str:
-+        """Return the GitHub login used to author PRs from this daemon.
-+
-+        Resolves from the ``gh`` auth context via ``gh api user`` and
-+        falls back to ``AlexBomber12`` when that lookup fails so the
-+        dedup check in ``_post_codex_review`` still has a non-empty
-+        author to match against.
-+        """
-+        try:
-+            raw = github_client.run_gh(["api", "user", "--jq", ".login"])
-+        except Exception:
-+            return "AlexBomber12"
-+        login = raw if isinstance(raw, str) else ""
-+        return login.strip() or "AlexBomber12"
-+
-     def _post_codex_review(self, pr_number: int) -> bool:
-         """Post ``@codex review`` on ``pr_number``.
- 
-@@ -1842,6 +1907,11 @@ return 0
+@@ -1842,6 +1899,11 @@ return 0
          Reviews trigger (which we want configured for PR creation only
          to avoid duplicate reviews).
  
@@ -914,15 +2119,18 @@ index 9cf95d3..448e917 100644
          Returns ``True`` on success and ``False`` on a logged failure.
          The caller decides whether a failure is fatal: after a fix
          push it must be, otherwise the next ``handle_watch`` cycle
-@@ -1851,6 +1921,22 @@ return 0
+@@ -1851,6 +1913,25 @@ return 0
          creation it can stay a warning because Codex Automatic Reviews
          still fires on the creation event itself.
          """
 +        try:
-+            if github_client.has_recent_codex_review_request(
++            pr_author = github_client.get_pr_author(
++                self.owner_repo, pr_number
++            )
++            if pr_author and github_client.has_recent_codex_review_request(
 +                self.owner_repo,
 +                pr_number,
-+                pr_author=self._get_pr_author(),
++                pr_author=pr_author,
 +                within_minutes=5,
 +            ):
 +                self.log_event(
@@ -938,7 +2146,7 @@ index 9cf95d3..448e917 100644
              github_client.post_comment(
                  self.owner_repo, pr_number, "@codex review"
 diff --git a/src/github_client.py b/src/github_client.py
-index 011a2b0..e79fe04 100644
+index 011a2b0..76b692e 100644
 --- a/src/github_client.py
 +++ b/src/github_client.py
 @@ -5,7 +5,7 @@ from __future__ import annotations
@@ -950,10 +2158,36 @@ index 011a2b0..e79fe04 100644
  
  from src.models import CIStatus, PRInfo, ReviewStatus
  
-@@ -226,6 +226,47 @@ def post_comment(repo: str, pr_number: int, body: str) -> None:
+@@ -226,6 +226,73 @@ def post_comment(repo: str, pr_number: int, body: str) -> None:
      run_gh(["pr", "comment", str(pr_number), "--body", body], repo=repo)
  
  
++def get_pr_author(repo: str, pr_number: int) -> str:
++    """Return the GitHub login of the PR's author, or "" on failure.
++
++    Read directly from PR metadata rather than the daemon's ``gh``
++    identity: Claude CLI may run under a different authentication
++    context than the daemon, so ``gh api user`` is not a reliable
++    proxy for "who opened this PR" and using it would cause
++    ``has_recent_codex_review_request`` to miss the trigger that the
++    real author already posted.
++    """
++    try:
++        raw = run_gh(
++            [
++                "api",
++                f"repos/{repo}/pulls/{pr_number}",
++                "--jq",
++                ".user.login",
++            ]
++        )
++    except RuntimeError:
++        return ""
++    if isinstance(raw, str):
++        return raw.strip()
++    return ""
++
++
 +def has_recent_codex_review_request(
 +    repo: str,
 +    pr_number: int,
@@ -1012,18 +2246,21 @@ index 3480888..adf777c 100644
  - Branch: pr-033-dirty-recovery
  - Depends on: PR-032
 diff --git a/tests/test_github_client.py b/tests/test_github_client.py
-index d11c04e..8ba7279 100644
+index d11c04e..d7c226d 100644
 --- a/tests/test_github_client.py
 +++ b/tests/test_github_client.py
-@@ -10,6 +10,7 @@ import pytest
+@@ -8,8 +8,10 @@ from typing import Any
+ import pytest
+ 
  from src.github_client import (
++    get_pr_author,
      get_pr_review_status,
      get_repo_full_name,
 +    has_recent_codex_review_request,
      merge_pr,
      run_gh,
  )
-@@ -559,3 +560,105 @@ def test_merge_pr_uses_squash(monkeypatch: pytest.MonkeyPatch) -> None:
+@@ -559,3 +561,137 @@ def test_merge_pr_uses_squash(monkeypatch: pytest.MonkeyPatch) -> None:
          "-R",
          "owner/name",
      ]
@@ -1129,11 +2366,43 @@ index d11c04e..8ba7279 100644
 +        )
 +        is False
 +    )
++
++
++def test_get_pr_author_returns_login(monkeypatch: pytest.MonkeyPatch) -> None:
++    """``get_pr_author`` must read the login from PR metadata, not from
++    the daemon's ``gh`` identity, so dedup works when Claude CLI ran
++    under a different auth context than the daemon."""
++    captured: list[list[str]] = []
++
++    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
++        captured.append(cmd)
++        return _FakeCompletedProcess(stdout='"claude-cli-bot"')
++
++    monkeypatch.setattr(subprocess, "run", fake_run)
++
++    assert get_pr_author("owner/name", 42) == "claude-cli-bot"
++    assert captured, "gh must be invoked"
++    assert any("repos/owner/name/pulls/42" in arg for arg in captured[0])
++
++
++def test_get_pr_author_returns_empty_on_error(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A ``gh api`` failure must not crash the caller — the dedup path
++    simply skips when no author can be resolved."""
++    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
++        return _FakeCompletedProcess(
++            stdout="", stderr="not found", returncode=1
++        )
++
++    monkeypatch.setattr(subprocess, "run", fake_run)
++
++    assert get_pr_author("owner/name", 42) == ""
 diff --git a/tests/test_runner.py b/tests/test_runner.py
-index 5d62b44..32f619f 100644
+index 5d62b44..403acc2 100644
 --- a/tests/test_runner.py
 +++ b/tests/test_runner.py
-@@ -3206,3 +3206,140 @@ def test_handle_fix_saves_stdout(
+@@ -3206,3 +3206,223 @@ def test_handle_fix_saves_stdout(
      assert any(k == f"cli_log:{runner.name}:latest" for k in redis_keys)
      stored = runner.redis.store.get(f"cli_log:{runner.name}:latest")
      assert stored == "fix output here"
@@ -1177,6 +2446,41 @@ index 5d62b44..32f619f 100644
 +    assert any(cmd[:3] == ["git", "clean", "-fd"] for cmd in commands)
 +    assert any(
 +        "Auto-recovered from dirty tree" in e["event"]
++        for e in runner.state.history
++    )
++
++
++def test_dirty_tree_auto_recovery_preserves_watch_with_open_pr(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """When auto-recovery fires while a PR is being tracked, the runner
++    must resume WATCH, not IDLE. Dropping to IDLE lets the next cycle
++    re-pick the still-TODO task from origin/main's QUEUE.md and open a
++    duplicate PR — exactly the churn this safety net is meant to
++    avoid."""
++    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
++        if cmd[:3] == ["git", "status", "--porcelain"]:
++            return _FakeCompletedProcess(
++                args=cmd, stdout=" M src/foo.py\n", returncode=0
++            )
++        return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
++
++    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
++    runner = _make_runner()
++    runner.state.current_pr = PRInfo(number=99, branch="pr-099-wip")
++    runner.state.current_task = QueueTask(
++        pr_id="PR-099", title="wip", status=TaskStatus.DOING, branch="pr-099-wip"
++    )
++
++    runner.preflight()
++    runner.preflight()
++    assert runner.preflight() is True
++    assert runner.state.state == PipelineState.WATCH
++    assert runner.state.current_pr is not None
++    assert runner.state.current_pr.number == 99
++    assert runner.state.current_task is not None
++    assert any(
++        "auto-recovered from dirty tree -> watch" in e["event"].lower()
 +        for e in runner.state.history
 +    )
 +
@@ -1235,6 +2539,11 @@ index 5d62b44..32f619f 100644
 +    from starting two redundant reviews back-to-back."""
 +    monkeypatch.setattr(
 +        runner_module.github_client,
++        "get_pr_author",
++        lambda repo, number: "claude-bot",
++    )
++    monkeypatch.setattr(
++        runner_module.github_client,
 +        "has_recent_codex_review_request",
 +        lambda *a, **kw: True,
 +    )
@@ -1261,6 +2570,11 @@ index 5d62b44..32f619f 100644
 +    review`` exactly once."""
 +    monkeypatch.setattr(
 +        runner_module.github_client,
++        "get_pr_author",
++        lambda repo, number: "claude-bot",
++    )
++    monkeypatch.setattr(
++        runner_module.github_client,
 +        "has_recent_codex_review_request",
 +        lambda *a, **kw: False,
 +    )
@@ -1274,3 +2588,41 @@ index 5d62b44..32f619f 100644
 +
 +    assert runner._post_codex_review(42) is True
 +    assert posted == [(runner.owner_repo, 42, "@codex review")]
++
++
++def test_post_codex_review_uses_pr_author_not_gh_identity(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """The dedup filter must match against the actual PR author from PR
++    metadata, not the daemon's gh identity. Claude CLI may run under a
++    different auth context than the daemon; if the daemon's gh user is
++    passed instead, ``has_recent_codex_review_request`` misses Claude's
++    trigger comment and a duplicate @codex review gets posted anyway."""
++    captured: dict[str, Any] = {}
++
++    monkeypatch.setattr(
++        runner_module.github_client,
++        "get_pr_author",
++        lambda repo, number: "claude-cli-bot",
++    )
++
++    def fake_has_recent(
++        repo: str, pr_number: int, pr_author: str, within_minutes: int = 5
++    ) -> bool:
++        captured["pr_author"] = pr_author
++        return True
++
++    monkeypatch.setattr(
++        runner_module.github_client,
++        "has_recent_codex_review_request",
++        fake_has_recent,
++    )
++    monkeypatch.setattr(
++        runner_module.github_client,
++        "post_comment",
++        lambda *a, **kw: None,
++    )
++
++    runner = _make_runner()
++    assert runner._post_codex_review(7) is True
++    assert captured["pr_author"] == "claude-cli-bot"

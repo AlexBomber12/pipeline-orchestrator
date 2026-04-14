@@ -804,7 +804,15 @@ class PipelineRunner:
         """
         branch = self.repo_config.branch
         try:
-            _git(self.repo_path, "checkout", branch, check=False)
+            # ``--force`` so a dirty PR-branch working tree cannot
+            # block the switch back to ``branch``. Without it a failing
+            # checkout would leave HEAD on the feature branch while the
+            # next ``git reset --hard origin/{branch}`` moves THAT
+            # feature branch's tip to ``origin/{branch}``, corrupting
+            # the tracked PR branch. Paired with ``check=True`` so any
+            # residual checkout failure aborts the reset chain instead
+            # of silently proceeding on the wrong ref.
+            _git(self.repo_path, "checkout", "--force", branch)
             _git(self.repo_path, "reset", "--hard", f"origin/{branch}")
             _git(self.repo_path, "clean", "-fd")
         except (
@@ -1917,11 +1925,15 @@ return 0
             pr_author = github_client.get_pr_author(
                 self.owner_repo, pr_number
             )
+            head_commit_iso = github_client.get_pr_head_commit_iso(
+                self.owner_repo, pr_number
+            )
             if pr_author and github_client.has_recent_codex_review_request(
                 self.owner_repo,
                 pr_number,
                 pr_author=pr_author,
                 within_minutes=5,
+                after_iso=head_commit_iso or None,
             ):
                 self.log_event(
                     f"Skipping duplicate @codex review on PR #{pr_number}"

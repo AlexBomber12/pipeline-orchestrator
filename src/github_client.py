@@ -252,11 +252,51 @@ def get_pr_author(repo: str, pr_number: int) -> str:
     return ""
 
 
+def get_pr_head_commit_iso(repo: str, pr_number: int) -> str:
+    """Return the ISO-8601 committer date of the PR's head commit, or "".
+
+    Used by the dedup gate on ``_post_codex_review`` to tell
+    "Claude already triggered a review for THIS commit" apart from
+    "the daemon posted a trigger for an earlier commit". Without a
+    commit-time threshold, the daemon's own post from a prior cycle
+    would be seen as a duplicate on the next fix push when the PR
+    author and daemon share a gh identity, suppressing the fresh
+    review anchor that the new commit needs.
+    """
+    try:
+        raw_sha = run_gh(
+            [
+                "api",
+                f"repos/{repo}/pulls/{pr_number}",
+                "--jq",
+                ".head.sha",
+            ]
+        )
+    except RuntimeError:
+        return ""
+    sha = raw_sha.strip() if isinstance(raw_sha, str) else ""
+    if not sha:
+        return ""
+    try:
+        raw_date = run_gh(
+            [
+                "api",
+                f"repos/{repo}/commits/{sha}",
+                "--jq",
+                ".commit.committer.date",
+            ]
+        )
+    except RuntimeError:
+        return ""
+    return raw_date.strip() if isinstance(raw_date, str) else ""
+
+
 def has_recent_codex_review_request(
     repo: str,
     pr_number: int,
     pr_author: str,
     within_minutes: int = 5,
+    after_iso: str | None = None,
 ) -> bool:
     """Return ``True`` iff ``pr_author`` recently posted ``@codex review``.
 
@@ -266,6 +306,13 @@ def has_recent_codex_review_request(
     two redundant reviews. The caller checks this before posting and
     skips when a qualifying trigger already exists within
     ``within_minutes``.
+
+    ``after_iso`` optionally restricts matches to comments created
+    strictly after the given ISO-8601 timestamp. Callers pass the
+    PR's current head-commit time so a trigger posted for an earlier
+    commit does not suppress the fresh anchor the new commit needs —
+    this is what keeps the dedup safe when the daemon and PR author
+    share a gh identity.
     """
     try:
         comments = _gh_api_paginated(
@@ -283,7 +330,10 @@ def has_recent_codex_review_request(
             continue
         if "@codex review" not in (c.get("body") or "").lower():
             continue
-        created = _parse_iso(c.get("created_at"))
+        created_raw = c.get("created_at") or ""
+        if after_iso and (not created_raw or created_raw <= after_iso):
+            continue
+        created = _parse_iso(created_raw)
         if created is None:
             continue
         if created.tzinfo is None:

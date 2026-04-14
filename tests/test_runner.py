@@ -3344,6 +3344,11 @@ def test_post_codex_review_skips_duplicate(
     )
     monkeypatch.setattr(
         runner_module.github_client,
+        "get_pr_head_commit_iso",
+        lambda repo, number: "2026-04-14T12:00:00Z",
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
         "has_recent_codex_review_request",
         lambda *a, **kw: True,
     )
@@ -3372,6 +3377,11 @@ def test_post_codex_review_posts_when_no_duplicate(
         runner_module.github_client,
         "get_pr_author",
         lambda repo, number: "claude-bot",
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_head_commit_iso",
+        lambda repo, number: "2026-04-14T12:00:00Z",
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -3405,11 +3415,21 @@ def test_post_codex_review_uses_pr_author_not_gh_identity(
         "get_pr_author",
         lambda repo, number: "claude-cli-bot",
     )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_head_commit_iso",
+        lambda repo, number: "2026-04-14T12:00:00Z",
+    )
 
     def fake_has_recent(
-        repo: str, pr_number: int, pr_author: str, within_minutes: int = 5
+        repo: str,
+        pr_number: int,
+        pr_author: str,
+        within_minutes: int = 5,
+        after_iso: str | None = None,
     ) -> bool:
         captured["pr_author"] = pr_author
+        captured["after_iso"] = after_iso
         return True
 
     monkeypatch.setattr(
@@ -3426,3 +3446,54 @@ def test_post_codex_review_uses_pr_author_not_gh_identity(
     runner = _make_runner()
     assert runner._post_codex_review(7) is True
     assert captured["pr_author"] == "claude-cli-bot"
+    assert captured["after_iso"] == "2026-04-14T12:00:00Z"
+
+
+def test_post_codex_review_passes_head_commit_iso_to_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dedup filter must be scoped to the current head commit so
+    the daemon's own prior trigger for an earlier commit does not
+    suppress the fresh anchor the new commit needs. Without this the
+    runner could stay in repeated FIX cycles without ever
+    re-requesting review on the new commit when the daemon and PR
+    author share a gh identity."""
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_author",
+        lambda repo, number: "same-user",
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_head_commit_iso",
+        lambda repo, number: "2026-04-14T13:37:00Z",
+    )
+
+    def fake_has_recent(
+        repo: str,
+        pr_number: int,
+        pr_author: str,
+        within_minutes: int = 5,
+        after_iso: str | None = None,
+    ) -> bool:
+        captured["after_iso"] = after_iso
+        return False
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "has_recent_codex_review_request",
+        fake_has_recent,
+    )
+    posted: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda r, n, b: posted.append((r, n, b)),
+    )
+
+    runner = _make_runner()
+    assert runner._post_codex_review(11) is True
+    assert captured["after_iso"] == "2026-04-14T13:37:00Z"
+    assert posted == [(runner.owner_repo, 11, "@codex review")]
