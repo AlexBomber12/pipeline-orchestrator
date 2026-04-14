@@ -220,7 +220,7 @@ def test_fix_review_uses_fix_review_prompt(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert captured["cmd"][-1] == "FIX REVIEW"
     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
-    assert captured["kwargs"]["timeout"] == 1800
+    assert captured["kwargs"]["timeout"] == 3600
 
 
 def test_diagnose_error_builds_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -261,3 +261,27 @@ def test_parse_diagnosis_unknown_defaults_to_escalate() -> None:
 
 def test_parse_diagnosis_empty_defaults_to_escalate() -> None:
     assert parse_diagnosis("") == "ESCALATE"
+
+
+def test_fix_review_accepts_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured["timeout"] = kwargs.get("timeout")
+        return _FakeCompletedProcess(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    fix_review("/tmp", timeout=4242)
+    assert captured["timeout"] == 4242
+
+
+def test_run_planned_pr_accepts_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured["timeout"] = kwargs.get("timeout")
+        return _FakeCompletedProcess(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    run_planned_pr("/tmp", timeout=777)
+    assert captured["timeout"] == 777

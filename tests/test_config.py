@@ -329,3 +329,27 @@ def test_update_daemon_config_validates_patch_types(tmp_path: Path) -> None:
     assert path.read_text(encoding="utf-8") == before
     reloaded = load_config(str(path))
     assert reloaded.daemon.poll_interval_sec == 45
+
+
+def test_daemon_config_fix_review_timeout_default() -> None:
+    from src.config import DaemonConfig
+
+    assert DaemonConfig().fix_review_timeout_sec == 3600
+
+
+def test_daemon_config_planned_pr_timeout_default() -> None:
+    from src.config import DaemonConfig
+
+    assert DaemonConfig().planned_pr_timeout_sec == 900
+
+
+def test_update_daemon_config_accepts_timeouts(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text("daemon: {}\n", encoding="utf-8")
+    updated = update_daemon_config(
+        path=str(cfg_path),
+        fix_review_timeout_sec=2000,
+        planned_pr_timeout_sec=1200,
+    )
+    assert updated.daemon.fix_review_timeout_sec == 2000
+    assert updated.daemon.planned_pr_timeout_sec == 1200

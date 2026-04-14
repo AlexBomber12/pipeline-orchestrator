@@ -427,11 +427,24 @@ def test_get_pr_review_status_propagates_error_on_pr_404(
         get_pr_review_status("owner/name", 404)
 
 
-def test_stale_approval_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
-    """+1 reaction but Codex reviewed a different commit → PENDING."""
+def _is_commits_path(cmd: list[str]) -> bool:
+    """Return True if ``gh api repos/.../commits/<sha> --jq ...``."""
+    for arg in cmd:
+        if "/commits/" in arg:
+            return True
+    return False
+
+
+def test_body_plus_one_before_head_commit_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """+1 reaction created BEFORE the head commit's committer date must
+    be treated as stale — the approval predates the current push."""
     import json as _json
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if _is_commits_path(cmd):
+            return _FakeCompletedProcess(stdout="2026-01-02T00:00:00Z")
         path = cmd[-1]
         if path.endswith("/issues/42/reactions"):
             pages = [
@@ -443,19 +456,6 @@ def test_stale_approval_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
                     }
                 ]
             ]
-        elif path.endswith("/pulls/42/reviews"):
-            pages = [
-                [
-                    {
-                        "user": {"login": "chatgpt-codex-connector"},
-                        "commit_id": "aaaaaa1111",
-                    }
-                ]
-            ]
-        elif "issues" in path and path.endswith("/comments"):
-            pages = []
-        elif "pulls" in path and path.endswith("/comments"):
-            pages = []
         else:
             pages = []
         return _FakeCompletedProcess(stdout=_json.dumps(pages))
@@ -463,16 +463,23 @@ def test_stale_approval_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert (
-        get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222")
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
+        )
         == ReviewStatus.PENDING
     )
 
 
-def test_fresh_approval_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
-    """+1 reaction and Codex reviewed the current HEAD → APPROVED."""
+def test_body_plus_one_after_head_commit_approves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """+1 reaction created AFTER the head commit's committer date must
+    be treated as approval of the current push."""
     import json as _json
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if _is_commits_path(cmd):
+            return _FakeCompletedProcess(stdout="2026-01-01T00:00:00Z")
         path = cmd[-1]
         if path.endswith("/issues/42/reactions"):
             pages = [
@@ -484,19 +491,6 @@ def test_fresh_approval_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
                     }
                 ]
             ]
-        elif path.endswith("/pulls/42/reviews"):
-            pages = [
-                [
-                    {
-                        "user": {"login": "chatgpt-codex-connector"},
-                        "commit_id": "aabbcc112233",
-                    }
-                ]
-            ]
-        elif "issues" in path and path.endswith("/comments"):
-            pages = []
-        elif "pulls" in path and path.endswith("/comments"):
-            pages = []
         else:
             pages = []
         return _FakeCompletedProcess(stdout=_json.dumps(pages))
@@ -504,9 +498,72 @@ def test_fresh_approval_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert (
-        get_pr_review_status("owner/name", 42, pr_author="author", head_sha="aabbcc112233")
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="aabbcc112233"
+        )
         == ReviewStatus.APPROVED
     )
+
+
+def test_body_plus_one_no_commit_time_trusts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Can't fetch commit time → trust the +1 reaction (APPROVED)."""
+    import json as _json
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if _is_commits_path(cmd):
+            # gh api failure on commits endpoint
+            return _FakeCompletedProcess(stderr="boom", returncode=1)
+        path = cmd[-1]
+        if path.endswith("/issues/42/reactions"):
+            pages = [
+                [
+                    {
+                        "content": "+1",
+                        "user": {"login": "chatgpt-codex-connector"},
+                        "created_at": "2026-01-03T00:00:00Z",
+                    }
+                ]
+            ]
+        else:
+            pages = []
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="deadbeef"
+        )
+        == ReviewStatus.APPROVED
+    )
+
+
+def test_find_codex_plus_one_picks_newest() -> None:
+    """_find_codex_plus_one_reaction must return the most recent +1."""
+    from src.github_client import _find_codex_plus_one_reaction
+
+    reactions = [
+        {
+            "content": "+1",
+            "user": {"login": "chatgpt-codex-connector"},
+            "created_at": "2026-01-01T00:00:00Z",
+        },
+        {
+            "content": "+1",
+            "user": {"login": "chatgpt-codex-connector"},
+            "created_at": "2026-01-05T00:00:00Z",
+        },
+        {
+            "content": "+1",
+            "user": {"login": "someone-else"},
+            "created_at": "2026-01-10T00:00:00Z",
+        },
+    ]
+    best = _find_codex_plus_one_reaction(reactions)
+    assert best is not None
+    assert best["created_at"] == "2026-01-05T00:00:00Z"
 
 
 def test_approval_without_head_sha(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -784,3 +841,134 @@ def test_get_pr_head_commit_iso_returns_empty_on_error(
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert get_pr_head_commit_iso("owner/name", 42) == ""
+
+
+def test_body_plus_one_stale_after_force_push_to_old_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Force-push that moves head to an older commit must NOT silently
+    reinstate an old +1 reaction. Even if reaction_time > committer.date
+    (the old commit's stale date), the last Codex review's submission
+    time is recent, so the reaction must beat THAT threshold."""
+    import json as _json
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if _is_commits_path(cmd):
+            # Force-pushed HEAD points to an ancient commit
+            return _FakeCompletedProcess(stdout="2024-01-01T00:00:00Z")
+        path = cmd[-1]
+        if path.endswith("/issues/42/reactions"):
+            pages = [
+                [
+                    {
+                        "content": "+1",
+                        "user": {"login": "chatgpt-codex-connector"},
+                        # Old reaction from a previous review cycle
+                        "created_at": "2026-01-10T00:00:00Z",
+                    }
+                ]
+            ]
+        elif path.endswith("/pulls/42/reviews"):
+            pages = [
+                [
+                    {
+                        "user": {"login": "chatgpt-codex-connector"},
+                        "commit_id": "otherSha1234",
+                        # Recent formal review (post-reaction)
+                        "submitted_at": "2026-02-15T00:00:00Z",
+                    }
+                ]
+            ]
+        else:
+            pages = []
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="oldSha5678"
+        )
+        == ReviewStatus.PENDING
+    )
+
+
+def test_body_plus_one_approved_when_codex_review_on_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A formal Codex review whose commit_id matches the current head is
+    unconditional approval — no need to compare reaction times at all."""
+    import json as _json
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if _is_commits_path(cmd):
+            return _FakeCompletedProcess(stdout="2026-01-10T00:00:00Z")
+        path = cmd[-1]
+        if path.endswith("/issues/42/reactions"):
+            pages = [
+                [
+                    {
+                        "content": "+1",
+                        "user": {"login": "chatgpt-codex-connector"},
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ]
+            ]
+        elif path.endswith("/pulls/42/reviews"):
+            pages = [
+                [
+                    {
+                        "user": {"login": "chatgpt-codex-connector"},
+                        "commit_id": "currentHead",
+                        "submitted_at": "2026-02-15T00:00:00Z",
+                    }
+                ]
+            ]
+        else:
+            pages = []
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="currentHead"
+        )
+        == ReviewStatus.APPROVED
+    )
+
+
+def test_body_plus_one_same_second_as_head_approves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """+1 reaction created in the SAME second as the head commit's
+    committer date must count as fresh. GitHub timestamps are
+    second-granular, so a strict ``>`` would mark the valid case stale."""
+    import json as _json
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if _is_commits_path(cmd):
+            return _FakeCompletedProcess(stdout="2026-01-02T12:34:56Z")
+        path = cmd[-1]
+        if path.endswith("/issues/42/reactions"):
+            pages = [
+                [
+                    {
+                        "content": "+1",
+                        "user": {"login": "chatgpt-codex-connector"},
+                        "created_at": "2026-01-02T12:34:56Z",
+                    }
+                ]
+            ]
+        else:
+            pages = []
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="abc"
+        )
+        == ReviewStatus.APPROVED
+    )

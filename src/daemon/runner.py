@@ -27,6 +27,7 @@ from src.daemon import scaffolder
 from src.models import (
     CIStatus,
     PipelineState,
+    PRInfo,
     QueueTask,
     RepoState,
     ReviewStatus,
@@ -318,6 +319,27 @@ class PipelineRunner:
         # no longer requires operator intervention. Reset to 0 on any
         # clean preflight or after a successful auto-reset.
         self._consecutive_dirty_cycles = 0
+        # Consecutive AI-diagnosis attempts in ``handle_error``. Capped
+        # so a persistent ERROR cannot spin forever on infrastructure
+        # the CLI cannot classify. Reset on any transition out of
+        # ERROR (IDLE/FIX verdicts, successful recovery).
+        self._error_diagnose_count = 0
+        # Timestamp of the most recent fix push from this runner.
+        # Used by ``_has_new_codex_feedback_since_last_push`` so the
+        # guard is not tricked by ``current_pr.last_activity`` being
+        # overwritten with GitHub's ``updatedAt`` (which advances every
+        # time Codex posts, masking whether Codex feedback is fresher
+        # than our last push).
+        self._last_push_at: datetime | None = None
+        # PR number the ``_last_push_at`` timestamp belongs to. Without
+        # this, a stale timestamp from a prior PR leaks into freshness
+        # checks on a newly-tracked PR — e.g. finishing PR-A and then
+        # recovering an older PR-B. Any mismatch forces
+        # ``_rehydrate_last_push_at`` to unconditionally replace both
+        # fields with the new PR's baseline, instead of keeping the
+        # newer-but-wrong timestamp under the "only update if newer"
+        # gate.
+        self._last_push_at_pr_number: int | None = None
 
     async def publish_state(self) -> None:
         """Serialize ``self.state`` and write it to Redis."""
@@ -331,24 +353,25 @@ class PipelineRunner:
             payload = self.state.model_dump_json()
         await self.redis.set(f"pipeline:{self.name}", payload)
 
-    async def _save_cli_log(self, stdout: str, label: str) -> None:
+    async def _save_cli_log(self, stdout: str, stderr: str, label: str) -> None:
         _MAX_CLI_LOG_BYTES = 64 * 1024  # 64 KB cap per entry
         ts = datetime.now(timezone.utc).isoformat()
         key_latest = f"cli_log:{self.name}:latest"
         key_history = f"cli_log:{self.name}:{ts}"
         marker = "[truncated]\n"
-        raw = stdout.encode("utf-8", errors="replace")
+        combined = f"=== STDOUT ===\n{stdout}\n\n=== STDERR ===\n{stderr}"
+        raw = combined.encode("utf-8", errors="replace")
         if len(raw) > _MAX_CLI_LOG_BYTES:
             tail_budget = _MAX_CLI_LOG_BYTES - len(marker.encode("utf-8"))
             raw = raw[-tail_budget:]
-            stdout = marker + raw.decode("utf-8", errors="replace")
+            combined = marker + raw.decode("utf-8", errors="replace")
         try:
-            await self.redis.set(key_latest, stdout, ex=3600)
-            await self.redis.set(key_history, stdout, ex=86400)
+            await self.redis.set(key_latest, combined, ex=3600)
+            await self.redis.set(key_history, combined, ex=86400)
         except Exception:
             logger.warning("Failed to save CLI log for %s", self.name)
-        if stdout.strip():
-            first_lines = stdout.strip()[:200]
+        if combined.strip():
+            first_lines = combined.strip()[:200]
             self.log_event(f"{label}: {first_lines}")
 
     def log_event(self, event: str) -> None:
@@ -676,6 +699,7 @@ class PipelineRunner:
             if matching is not None:
                 self.state.current_pr = matching
                 self.state.state = PipelineState.WATCH
+                self._rehydrate_last_push_at(matching)
                 self.log_event(
                     f"Recovered: DOING task {doing.pr_id} "
                     f"-> WATCH PR #{matching.number}"
@@ -742,6 +766,7 @@ class PipelineRunner:
             self.state.current_pr = matched_pr
             self.state.current_task = matched_task
             self.state.state = PipelineState.WATCH
+            self._rehydrate_last_push_at(matched_pr)
             self.log_event(
                 f"Recovered: {matched_task.status.value} task "
                 f"{matched_task.pr_id} -> WATCH PR #{matched_pr.number}"
@@ -761,6 +786,7 @@ class PipelineRunner:
         self.state.error_message = None
         self.state.current_task = None
         self.state.current_pr = None
+        self._error_diagnose_count = 0
 
         if prs:
             self.log_event(
@@ -1091,6 +1117,7 @@ return 0
 
     async def handle_idle(self) -> None:
         """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
+        self._error_diagnose_count = 0
         # A queue-sync remediation PR may still be unmerged from a prior
         # cycle. Resolve it before picking a new task so the daemon does
         # not re-run a task whose DONE status has not yet landed on
@@ -1196,9 +1223,11 @@ return 0
             return
 
         code, stdout, stderr = claude_cli.run_planned_pr(
-            self.repo_path, model=self.app_config.daemon.claude_model
+            self.repo_path,
+            model=self.app_config.daemon.claude_model,
+            timeout=self.app_config.daemon.planned_pr_timeout_sec,
         )
-        await self._save_cli_log(stdout, "PLANNED PR output")
+        await self._save_cli_log(stdout, stderr, "PLANNED PR output")
         if code != 0:
             self.state.state = PipelineState.ERROR
             self.state.error_message = stderr.strip() or f"claude exit {code}"
@@ -1236,6 +1265,7 @@ return 0
 
         self.state.current_pr = candidate
         self.state.state = PipelineState.WATCH
+        self._rehydrate_last_push_at(candidate)
         self.log_event(f"Opened PR #{candidate.number} -> WATCH")
         self._post_codex_review(candidate.number)
 
@@ -1264,6 +1294,19 @@ return 0
             return
 
         self.state.current_pr = found
+        # Retry rehydrate every cycle so a transient commit-time fetch
+        # failure during ``recover_state`` doesn't permanently leave
+        # ``_last_push_at`` unset (which would default
+        # ``_has_new_codex_feedback_since_last_push`` to True and
+        # stale-fix loop forever). Also retry on PR-number mismatch:
+        # a PR switch whose first rehydrate attempt failed transiently
+        # would otherwise keep the previous PR's timestamp indefinitely
+        # here, silently skipping legitimate feedback on the new PR.
+        if (
+            self._last_push_at is None
+            or self._last_push_at_pr_number != found.number
+        ):
+            self._rehydrate_last_push_at(found)
 
         ci = found.ci_status
         review = found.review_status
@@ -1279,9 +1322,34 @@ return 0
                     "awaiting manual merge"
                 )
             return
-        if review == ReviewStatus.CHANGES_REQUESTED or ci == CIStatus.FAILURE:
+        # Fork (cross-repo) PRs can't be fixed locally — the head branch
+        # lives on the contributor's remote. Routing them into handle_fix
+        # (which would no-op and return to WATCH) creates a poll-rate skip
+        # loop that never reaches the timeout/HUNG escalation below. Fall
+        # through to the waiting logic instead so fork PRs eventually flip
+        # to HUNG and surface for operator action.
+        if found.is_cross_repository:
+            if ci == CIStatus.FAILURE or review == ReviewStatus.CHANGES_REQUESTED:
+                self.log_event(
+                    f"PR #{found.number} fork PR cannot be auto-fixed "
+                    f"(review={review.value}, ci={ci.value}); "
+                    "waiting for review timeout"
+                )
+        elif ci == CIStatus.FAILURE:
             await self.handle_fix()
             return
+        elif review == ReviewStatus.CHANGES_REQUESTED:
+            if self._has_new_codex_feedback_since_last_push():
+                await self.handle_fix()
+                return
+            # No new feedback since last push. Don't trigger FIX, but
+            # fall through to the timeout check below so a truly stuck
+            # CHANGES_REQUESTED state still escalates to HUNG instead of
+            # pinning the runner in WATCH indefinitely.
+            self.log_event(
+                f"PR #{found.number} CHANGES_REQUESTED but no new "
+                "Codex feedback since last push; waiting for fresh review"
+            )
 
         # Any remaining combination is a waiting state that should still be
         # subject to the review timeout. This explicitly includes
@@ -1318,6 +1386,16 @@ return 0
 
     async def handle_fix(self) -> None:
         """Run ``FIX REVIEW`` via the claude CLI and return to WATCH."""
+        if (
+            self.state.current_pr is not None
+            and self.state.current_pr.is_cross_repository
+        ):
+            self.log_event(
+                f"Skipping FIX for cross-repo PR #{self.state.current_pr.number}"
+            )
+            self.state.state = PipelineState.WATCH
+            return
+
         self.state.state = PipelineState.FIX
         self.log_event("entering FIX")
         await self.publish_state()
@@ -1362,18 +1440,23 @@ return 0
                 return
 
         code, stdout, stderr = claude_cli.fix_review(
-            self.repo_path, model=self.app_config.daemon.claude_model
+            self.repo_path,
+            model=self.app_config.daemon.claude_model,
+            timeout=self.app_config.daemon.fix_review_timeout_sec,
         )
-        await self._save_cli_log(stdout, "FIX REVIEW output")
+        await self._save_cli_log(stdout, stderr, "FIX REVIEW output")
         if code != 0:
             self.state.state = PipelineState.ERROR
             self.state.error_message = stderr.strip() or f"claude exit {code}"
             self.log_event(f"fix_review failed: {self.state.error_message}")
             return
 
+        push_time = datetime.now(timezone.utc)
+        self._last_push_at = push_time
         if self.state.current_pr is not None:
+            self._last_push_at_pr_number = self.state.current_pr.number
             self.state.current_pr.push_count += 1
-            self.state.current_pr.last_activity = datetime.now(timezone.utc)
+            self.state.current_pr.last_activity = push_time
             iteration = self.state.current_pr.push_count
         else:
             iteration = 0
@@ -1850,9 +1933,116 @@ return 0
         self.state.current_task = None
         self.state.state = PipelineState.IDLE
 
+    def _rehydrate_last_push_at(self, pr: PRInfo) -> None:
+        """Seed ``_last_push_at`` from the PR's head commit's committer
+        date when we don't already have a fresher in-memory value.
+
+        Needed on daemon restart (``__init__`` resets
+        ``_last_push_at`` to ``None``) and when ``handle_coding`` hands
+        off to WATCH on a freshly-created PR: without this rehydrate,
+        ``_has_new_codex_feedback_since_last_push`` would hit its
+        ``None`` default and return ``True`` on every cycle, triggering
+        ``handle_fix`` on pre-restart Codex feedback.
+
+        Falling back to ``pr.last_activity`` here is intentionally
+        avoided: ``last_activity`` comes from GitHub's ``updatedAt``,
+        which advances whenever Codex posts a comment, so a transient
+        commit-time fetch failure plus a pending Codex P1/P2 post
+        would seed the baseline to the feedback timestamp and make
+        the next ``_has_new_codex_feedback_since_last_push`` return
+        False, silently skipping the fix. When the fetch fails we
+        leave ``_last_push_at`` unset; ``handle_watch`` calls this
+        helper each cycle so the rehydrate retries naturally on the
+        next poll instead of latching a wrong value.
+        """
+        try:
+            head_iso = github_client.get_pr_head_commit_iso(
+                self.owner_repo, pr.number
+            )
+        except Exception:
+            head_iso = ""
+        head_time = github_client._parse_iso(head_iso) if head_iso else None
+        if head_time is not None and head_time.tzinfo is None:
+            head_time = head_time.replace(tzinfo=timezone.utc)
+        # Different PR: unconditionally replace. The "only update if
+        # newer" rule below is only safe when both timestamps belong
+        # to the same PR — otherwise a stale last_push_at from a
+        # previously-tracked PR would leak into the new PR's
+        # freshness check and silently skip legitimate feedback.
+        # When the fetch fails on a switch we clear rather than keep
+        # the previous PR's value: a None baseline lets the next
+        # handle_watch cycle retry the rehydrate and, in the
+        # meantime, ``_has_new_codex_feedback_since_last_push``
+        # returns True so one fix attempt runs (and then
+        # handle_fix's own push sets a proper baseline).
+        if self._last_push_at_pr_number != pr.number:
+            self._last_push_at = head_time
+            self._last_push_at_pr_number = pr.number
+            return
+        if head_time is None:
+            return
+        if self._last_push_at is None or head_time > self._last_push_at:
+            self._last_push_at = head_time
+
+    def _has_new_codex_feedback_since_last_push(self) -> bool:
+        """Return True iff Codex posted new P1/P2 feedback after the last push.
+
+        Used by ``handle_watch`` to suppress FIX loops that would fire on
+        stale ``CHANGES_REQUESTED`` signals from a review that predates the
+        most recent fix push. Compares comment ``created_at`` against
+        ``self._last_push_at`` — NOT ``current_pr.last_activity``, which
+        ``handle_watch`` overwrites with GitHub's ``updatedAt`` on every
+        cycle (and that value advances past the push whenever Codex posts,
+        making the comparison always false for the fresh feedback that
+        triggered the CHANGES_REQUESTED signal in the first place).
+        """
+        if self.state.current_pr is None:
+            return False
+        last_activity = self._last_push_at
+        if last_activity is None:
+            return True
+        if last_activity.tzinfo is None:
+            last_activity = last_activity.replace(tzinfo=timezone.utc)
+        try:
+            comments = github_client._gh_api_paginated(
+                f"repos/{self.owner_repo}/issues/"
+                f"{self.state.current_pr.number}/comments"
+            ) or []
+            review_comments = github_client._gh_api_paginated(
+                f"repos/{self.owner_repo}/pulls/"
+                f"{self.state.current_pr.number}/comments"
+            ) or []
+        except Exception:
+            return True
+        for c in reversed(comments + review_comments):
+            user = (c.get("user") or {}).get("login", "")
+            if "codex" not in user.lower():
+                continue
+            body = c.get("body") or ""
+            if "P1" not in body and "P2" not in body:
+                continue
+            created = github_client._parse_iso(c.get("created_at"))
+            if created is None:
+                continue
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if created > last_activity:
+                return True
+        return False
+
     async def handle_error(self, error_context: str | None = None) -> None:
         """Ask the claude CLI whether to FIX, SKIP, or ESCALATE the error."""
         context = error_context or self.state.error_message or "Unknown error"
+        lowered = context.lower()
+        if any(kw in lowered for kw in ("rate limit", "timeout", "429")):
+            self.log_event("Skipping AI diagnosis for rate-limit/timeout error")
+            return
+        self._error_diagnose_count += 1
+        if self._error_diagnose_count > 3:
+            self.log_event(
+                "diagnose_error: max attempts (3) reached, staying ERROR"
+            )
+            return
         code, stdout, stderr = claude_cli.diagnose_error(
             self.repo_path, context, model=self.app_config.daemon.claude_model
         )
@@ -1868,10 +2058,12 @@ return 0
             self.state.current_pr = None
             self.state.error_message = None
             self.state.state = PipelineState.IDLE
+            self._error_diagnose_count = 0
             self.log_event("diagnose_error: SKIP -> IDLE")
         elif verdict == "FIX":
             self.state.error_message = None
             self.state.state = PipelineState.IDLE
+            self._error_diagnose_count = 0
             summary = stdout.strip().splitlines()[-1] if stdout.strip() else ""
             self.log_event(f"diagnose_error: FIX -> IDLE ({summary[:80]})")
         else:  # ESCALATE

@@ -59,17 +59,17 @@ def run_claude(
 
 
 def run_planned_pr(
-    repo_path: str, model: str | None = None
+    repo_path: str, model: str | None = None, timeout: int = 900
 ) -> tuple[int, str, str]:
     """Trigger a ``PLANNED PR`` run in ``repo_path``."""
-    return run_claude("PLANNED PR", repo_path, timeout=900, model=model)
+    return run_claude("PLANNED PR", repo_path, timeout=timeout, model=model)
 
 
 def fix_review(
-    repo_path: str, model: str | None = None
+    repo_path: str, model: str | None = None, timeout: int = 3600
 ) -> tuple[int, str, str]:
     """Trigger a ``FIX REVIEW`` run in ``repo_path``."""
-    return run_claude("FIX REVIEW", repo_path, timeout=1800, model=model)
+    return run_claude("FIX REVIEW", repo_path, timeout=timeout, model=model)
 
 
 def diagnose_error(

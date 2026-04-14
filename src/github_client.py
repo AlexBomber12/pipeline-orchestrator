@@ -137,9 +137,49 @@ def get_pr_review_status(
             codex_contents = {r.get("content") for r in codex_reactions}
             if "+1" in codex_contents:
                 if head_sha:
-                    reviewed_sha = _get_latest_codex_reviewed_sha(repo, pr_number)
-                    if reviewed_sha and not head_sha.startswith(reviewed_sha) and not reviewed_sha.startswith(head_sha):
-                        pass  # stale: reviewed a different commit
+                    plus_one = _find_codex_plus_one_reaction(issue_reactions)
+                    if plus_one:
+                        reaction_time = _parse_iso(plus_one.get("created_at"))
+                        head_commit_time = _get_commit_time(repo, head_sha)
+                        # Also gather the most recent Codex formal review's
+                        # (commit_id, submitted_at). A force-push that moves
+                        # head back to an older commit would make
+                        # ``head_commit_time`` (committer.date) older than
+                        # ``reaction_time`` again, so the committer-date
+                        # check alone can silently approve stale state.
+                        # Raising the threshold to the later of the head
+                        # commit time and the last Codex review submission
+                        # closes that gap; when the latest formal review is
+                        # ON the current head we accept unconditionally.
+                        latest_sha, latest_review_time = (
+                            _get_latest_codex_review_info(repo, pr_number)
+                        )
+                        if latest_sha and latest_sha == head_sha:
+                            body_approved = True
+                        else:
+                            threshold = head_commit_time
+                            if (
+                                latest_review_time is not None
+                                and (
+                                    threshold is None
+                                    or latest_review_time > threshold
+                                )
+                            ):
+                                threshold = latest_review_time
+                            # Inclusive comparison: GitHub timestamps
+                            # are second-granular, so a +1 posted in
+                            # the same second as the head commit (or
+                            # latest review) must still count as
+                            # approving the current push — a strict
+                            # ``>`` would mark that valid case stale.
+                            if (
+                                reaction_time
+                                and threshold
+                                and reaction_time >= threshold
+                            ):
+                                body_approved = True
+                            elif not threshold:
+                                body_approved = True
                     else:
                         body_approved = True
                 else:
@@ -366,24 +406,70 @@ def _gh_api_paginated(path: str) -> list[dict] | None:
     return items
 
 
-def _get_latest_codex_reviewed_sha(repo: str, pr_number: int) -> str:
-    """Return the commit SHA from the most recent Codex review, or empty string."""
+def _find_codex_plus_one_reaction(reactions: list[dict]) -> dict | None:
+    """Return the most recent +1 reaction from a Codex user, or None."""
+    best: dict | None = None
+    for r in reactions:
+        if not isinstance(r, dict):
+            continue
+        login = ((r.get("user") or {}).get("login", "")).lower()
+        if "codex" not in login:
+            continue
+        if r.get("content") != "+1":
+            continue
+        if best is None or (r.get("created_at") or "") > (best.get("created_at") or ""):
+            best = r
+    return best
+
+
+def _get_commit_time(repo: str, sha: str) -> datetime | None:
+    """Return the committer date of a commit, or None on failure."""
+    try:
+        raw = run_gh(
+            ["api", f"repos/{repo}/commits/{sha}", "--jq", ".commit.committer.date"]
+        )
+    except RuntimeError:
+        return None
+    return _parse_iso(raw.strip() if isinstance(raw, str) else "")
+
+
+def _get_latest_codex_review_info(
+    repo: str, pr_number: int
+) -> tuple[str, datetime | None]:
+    """Return ``(commit_id, submitted_at)`` of the most recent Codex
+    formal review, or ``("", None)`` if no such review exists.
+
+    Used alongside the head-commit-time check so a force-push that moves
+    HEAD to an older commit cannot silently reinstate a stale ``+1``:
+    the latest review submission time is always at least as new as the
+    moment the previous head was current, so requiring the reaction to
+    beat that threshold too catches the force-push case.
+    """
     try:
         reviews = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/reviews")
     except RuntimeError as exc:
         if "HTTP 404" not in str(exc):
             raise
-        return ""
+        return "", None
     if not reviews:
-        return ""
-    for review in reversed(reviews):
+        return "", None
+    best_sha = ""
+    best_time: datetime | None = None
+    best_raw = ""
+    for review in reviews:
         user = (review.get("user") or {}).get("login", "") or ""
         if "codex" not in user.lower():
             continue
-        sha = review.get("commit_id") or ""
-        if sha:
-            return sha
-    return ""
+        submitted_raw = review.get("submitted_at") or ""
+        if best_time is not None and submitted_raw <= best_raw:
+            continue
+        parsed = _parse_iso(submitted_raw)
+        if parsed is None:
+            continue
+        best_sha = review.get("commit_id") or ""
+        best_time = parsed
+        best_raw = submitted_raw
+    return best_sha, best_time
 
 
 def _ci_status_from_rollup(rollup: object) -> CIStatus:
