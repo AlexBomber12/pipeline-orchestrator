@@ -316,7 +316,7 @@ def observability_config(
 def _seed_redis(now: datetime) -> _FakeRedis:
     alpha = RepoState(
         url="https://github.com/example/alpha.git",
-        name="alpha",
+        name="example__alpha",
         state=PipelineState.CODING,
         current_task=QueueTask(
             pr_id="PR-099",
@@ -345,7 +345,7 @@ def _seed_redis(now: datetime) -> _FakeRedis:
     )
     beta = RepoState(
         url="https://github.com/example/beta.git",
-        name="beta",
+        name="example__beta",
         state=PipelineState.IDLE,
         last_updated=now,
         history=[
@@ -358,8 +358,8 @@ def _seed_redis(now: datetime) -> _FakeRedis:
     )
     return _FakeRedis(
         {
-            "pipeline:alpha": alpha.model_dump_json(),
-            "pipeline:beta": beta.model_dump_json(),
+            "pipeline:example__alpha": alpha.model_dump_json(),
+            "pipeline:example__beta": beta.model_dump_json(),
         }
     )
 
@@ -380,8 +380,8 @@ def test_partial_activity_feed_returns_html_with_events(
     assert "Merged PR #42" in body
     assert "beta idle" in body
     # cross-repo feed shows entries from both repos
-    assert "/repo/alpha" in body
-    assert "/repo/beta" in body
+    assert "/repo/example__alpha" in body
+    assert "/repo/example__beta" in body
 
 
 def test_partial_stats_returns_html_with_four_values(
@@ -437,11 +437,11 @@ def test_api_stats_counts_alerts_when_repo_is_hung(
     now = datetime.now(timezone.utc)
     hung = RepoState(
         url="https://github.com/example/alpha.git",
-        name="alpha",
+        name="example__alpha",
         state=PipelineState.HUNG,
         last_updated=now,
     )
-    fake = _FakeRedis({"pipeline:alpha": hung.model_dump_json()})
+    fake = _FakeRedis({"pipeline:example__alpha": hung.model_dump_json()})
 
     with TestClient(app) as client:
         client.app.state.redis = fake
@@ -478,7 +478,7 @@ def test_partial_repo_detail_returns_summary_only(
     now = datetime.now(timezone.utc)
     alpha = RepoState(
         url="https://github.com/example/alpha.git",
-        name="alpha",
+        name="example__alpha",
         state=PipelineState.CODING,
         last_updated=now,
         history=[
@@ -489,11 +489,11 @@ def test_partial_repo_detail_returns_summary_only(
             },
         ],
     )
-    fake = _FakeRedis({"pipeline:alpha": alpha.model_dump_json()})
+    fake = _FakeRedis({"pipeline:example__alpha": alpha.model_dump_json()})
 
     with TestClient(app) as client:
         client.app.state.redis = fake
-        response = client.get("/partials/repo/alpha")
+        response = client.get("/partials/repo/example__alpha")
 
     assert response.status_code == 200
     body = response.text
@@ -518,7 +518,7 @@ def test_repo_full_page_mounts_event_log_outside_polling_container(
     now = datetime.now(timezone.utc)
     alpha = RepoState(
         url="https://github.com/example/alpha.git",
-        name="alpha",
+        name="example__alpha",
         state=PipelineState.CODING,
         last_updated=now,
         history=[
@@ -529,15 +529,15 @@ def test_repo_full_page_mounts_event_log_outside_polling_container(
             },
         ],
     )
-    fake = _FakeRedis({"pipeline:alpha": alpha.model_dump_json()})
+    fake = _FakeRedis({"pipeline:example__alpha": alpha.model_dump_json()})
 
     with TestClient(app) as client:
         client.app.state.redis = fake
-        response = client.get("/repo/alpha")
+        response = client.get("/repo/example__alpha")
 
     assert response.status_code == 200
     body = response.text
-    poll_open = '<div hx-get="/partials/repo/alpha"'
+    poll_open = '<div hx-get="/partials/repo/example__alpha"'
     log_anchor = '<section id="repo-event-log"'
     assert poll_open in body
     assert log_anchor in body
@@ -575,7 +575,7 @@ def test_partial_repo_events_returns_list_fragment(
     now = datetime.now(timezone.utc)
     alpha = RepoState(
         url="https://github.com/example/alpha.git",
-        name="alpha",
+        name="example__alpha",
         state=PipelineState.CODING,
         last_updated=now,
         history=[
@@ -586,11 +586,11 @@ def test_partial_repo_events_returns_list_fragment(
             },
         ],
     )
-    fake = _FakeRedis({"pipeline:alpha": alpha.model_dump_json()})
+    fake = _FakeRedis({"pipeline:example__alpha": alpha.model_dump_json()})
 
     with TestClient(app) as client:
         client.app.state.redis = fake
-        response = client.get("/partials/repo/alpha/events")
+        response = client.get("/partials/repo/example__alpha/events")
 
     assert response.status_code == 200
     body = response.text
@@ -602,7 +602,7 @@ def test_partial_repo_events_returns_list_fragment(
     # And it emits an out-of-band count span so the header's "N events"
     # label refreshes with the list instead of staying at the initial
     # page-load value (Codex P2 on PR #43).
-    assert 'id="event-log-count-alpha"' in body
+    assert 'id="event-log-count-example__alpha"' in body
     assert 'hx-swap-oob="true"' in body
     assert "1 events" in body
 
@@ -617,26 +617,26 @@ def test_repo_full_page_marks_count_span_for_oob_target(
     now = datetime.now(timezone.utc)
     alpha = RepoState(
         url="https://github.com/example/alpha.git",
-        name="alpha",
+        name="example__alpha",
         state=PipelineState.CODING,
         last_updated=now,
         history=[
             {"time": _iso(now), "state": "CODING", "event": "started"},
         ],
     )
-    fake = _FakeRedis({"pipeline:alpha": alpha.model_dump_json()})
+    fake = _FakeRedis({"pipeline:example__alpha": alpha.model_dump_json()})
 
     with TestClient(app) as client:
         client.app.state.redis = fake
-        response = client.get("/repo/alpha")
+        response = client.get("/repo/example__alpha")
 
     assert response.status_code == 200
     body = response.text
-    assert 'id="event-log-count-alpha"' in body
-    header_start = body.index('id="event-log-count-alpha"')
-    wrapper_start = body.index('id="event-list-wrapper-alpha"')
+    assert 'id="event-log-count-example__alpha"' in body
+    header_start = body.index('id="event-log-count-example__alpha"')
+    wrapper_start = body.index('id="event-list-wrapper-example__alpha"')
     # Only one count span on the initial render — oob variant belongs
     # strictly to the polled fragment. A stray oob attribute on the
     # static page would confuse HTMX on the first hydration.
-    assert body.count('id="event-log-count-alpha"') == 1
+    assert body.count('id="event-log-count-example__alpha"') == 1
     assert header_start < wrapper_start

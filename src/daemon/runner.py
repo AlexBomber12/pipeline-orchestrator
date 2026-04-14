@@ -39,7 +39,7 @@ from src.queue_parser import (
     parse_queue,
     parse_queue_text,
 )
-from src.utils import repo_name_from_url
+from src.utils import repo_slug_from_url
 
 logger = logging.getLogger(__name__)
 
@@ -281,9 +281,19 @@ class PipelineRunner:
         self.repo_config = repo_config
         self.app_config = app_config
         self.redis = redis_client
-        self.name = repo_name_from_url(repo_config.url)
+        self.name = repo_slug_from_url(repo_config.url)
         self.owner_repo = repo_owner_from_url(repo_config.url)
         self.repo_path = f"/data/repos/{self.name}"
+        # Migrate clone path from old basename-only format to owner__repo.
+        old_basename = repo_config.url.rstrip("/").rsplit("/", 1)[-1]
+        if old_basename.endswith(".git"):
+            old_basename = old_basename[:-4]
+        old_path = Path(f"/data/repos/{old_basename}")
+        new_path = Path(self.repo_path)
+        if old_basename != self.name and old_path.exists() and not new_path.exists():
+            shutil.move(str(old_path), str(new_path))
+            logger.info("Migrated clone path %s -> %s", old_path, new_path)
+        self._old_basename = old_basename
         self.state = RepoState(
             url=repo_config.url,
             name=self.name,
@@ -348,6 +358,11 @@ class PipelineRunner:
         else:
             payload = self.state.model_dump_json()
         await self.redis.set(f"pipeline:{self.name}", payload)
+        if self._old_basename != self.name:
+            try:
+                await self.redis.delete(f"pipeline:{self._old_basename}")
+            except Exception:
+                pass
 
     async def _save_cli_log(self, stdout: str, stderr: str, label: str) -> None:
         _MAX_CLI_LOG_BYTES = 64 * 1024  # 64 KB cap per entry

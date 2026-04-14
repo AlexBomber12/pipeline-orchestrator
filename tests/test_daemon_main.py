@@ -32,7 +32,8 @@ class _FakeRunner:
         self.repo_config = repo_config
         self.app_config = app_config
         self.redis_client = redis_client
-        self.name = repo_config.url.rsplit("/", 1)[-1].removesuffix(".git")
+        from src.utils import repo_slug_from_url
+        self.name = repo_slug_from_url(repo_config.url)
         self.cycles = 0
         _FakeRunner.instances.append(self)
 
@@ -100,7 +101,7 @@ def test_main_creates_one_runner_per_repo(
 
     assert len(_FakeRunner.instances) == 2
     names = [r.name for r in _FakeRunner.instances]
-    assert names == ["alpha", "beta"]
+    assert names == ["octo__alpha", "octo__beta"]
     assert all(r.cycles == 1 for r in _FakeRunner.instances)
     assert ctx["sleep_calls"] == [7]
 
@@ -153,7 +154,7 @@ def test_main_skips_runner_whose_init_raises(
     # be built AND driven through run_cycle so one misconfigured entry cannot
     # take the whole daemon down at startup.
     assert len(_FakeRunner.instances) == 1
-    assert _FakeRunner.instances[0].name == "beta"
+    assert _FakeRunner.instances[0].name == "octo__beta"
     assert _FakeRunner.instances[0].cycles == 1
     errors = [rec for rec in caplog.records if rec.levelno == logging.ERROR]
     assert any(
@@ -214,10 +215,10 @@ def test_main_reload_detects_new_repository(
         asyncio.run(main_module.main())
 
     names = sorted(r.name for r in _FakeRunner.instances)
-    assert names == ["alpha", "beta"], names
+    assert names == ["octo__alpha", "octo__beta"], names
 
-    alpha = next(r for r in _FakeRunner.instances if r.name == "alpha")
-    beta = next(r for r in _FakeRunner.instances if r.name == "beta")
+    alpha = next(r for r in _FakeRunner.instances if r.name == "octo__alpha")
+    beta = next(r for r in _FakeRunner.instances if r.name == "octo__beta")
     # Alpha built at startup + ran once per loop iteration (3 total cycles).
     assert alpha.cycles == 3
     # Beta was added at cycle 2 and only runs that cycle + the third.
@@ -274,8 +275,8 @@ def test_main_reload_drops_removed_repository(
     with pytest.raises(_StopLoop):
         asyncio.run(main_module.main())
 
-    alpha = next(r for r in _FakeRunner.instances if r.name == "alpha")
-    beta = next(r for r in _FakeRunner.instances if r.name == "beta")
+    alpha = next(r for r in _FakeRunner.instances if r.name == "octo__alpha")
+    beta = next(r for r in _FakeRunner.instances if r.name == "octo__beta")
     # Beta runs on cycles 0 and 1; after reload on cycle 2 it is dropped
     # and does NOT run that cycle.
     assert beta.cycles == 2
@@ -289,7 +290,7 @@ def test_main_continues_when_one_runner_raises(
     class _FailingFirstRunner(_FakeRunner):
         async def run_cycle(self) -> None:
             self.cycles += 1
-            if self.name == "alpha":
+            if self.name == "octo__alpha":
                 raise RuntimeError("boom")
 
     config = AppConfig(
@@ -310,7 +311,7 @@ def test_main_continues_when_one_runner_raises(
     assert alpha.cycles == 1
     assert beta.cycles == 1, "second runner must still execute after first raises"
     errors = [rec for rec in caplog.records if rec.levelno == logging.ERROR]
-    assert any("alpha" in rec.getMessage() for rec in errors)
+    assert any("octo__alpha" in rec.getMessage() for rec in errors)
 
 
 # ---------- _setup_git_auth tests ----------

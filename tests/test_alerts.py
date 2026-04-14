@@ -91,7 +91,7 @@ def _hung_state(
             branch=f"pr-{pr_number}-sample",
             ci_status=CIStatus.SUCCESS,
             review_status=review_status,
-            url=f"https://github.com/example/{name}/pull/{pr_number}",
+            url=f"{url.rstrip('/').removesuffix('.git')}/pull/{pr_number}",
             last_activity=last_activity,
         ),
         last_updated=last_updated,
@@ -134,7 +134,7 @@ def test_build_alerts_skips_healthy_repos() -> None:
     now = datetime.now(timezone.utc)
     healthy = RepoState(
         url="https://github.com/example/alpha.git",
-        name="alpha",
+        name="example__alpha",
         state=PipelineState.CODING,
         last_updated=now,
     )
@@ -147,13 +147,13 @@ def test_build_alerts_sorts_error_before_hung_and_by_duration() -> None:
 
     # Longest hung first in its bucket but still below the error bucket.
     long_hung = _hung_state(
-        "alpha",
+        "example__alpha",
         "https://github.com/example/alpha.git",
         last_updated=now - timedelta(hours=2),
         last_activity=now - timedelta(hours=2),
     )
     short_hung = _hung_state(
-        "beta",
+        "example__beta",
         "https://github.com/example/beta.git",
         last_updated=now - timedelta(minutes=10),
         last_activity=now - timedelta(minutes=10),
@@ -161,13 +161,13 @@ def test_build_alerts_sorts_error_before_hung_and_by_duration() -> None:
     )
     # ERROR must sort to the top regardless of its duration.
     recent_error = _error_state(
-        "gamma",
+        "example__gamma",
         "https://github.com/example/gamma.git",
         last_updated=now - timedelta(seconds=30),
         error_message="boom",
     )
     older_error = _error_state(
-        "delta",
+        "example__delta",
         "https://github.com/example/delta.git",
         last_updated=now - timedelta(minutes=5),
         error_message="earlier boom",
@@ -180,11 +180,11 @@ def test_build_alerts_sorts_error_before_hung_and_by_duration() -> None:
     # both ERRORs come before both HUNGs
     assert kinds == ["ERROR", "ERROR", "HUNG", "HUNG"]
     # within ERROR bucket, longest duration first
-    assert alerts[0]["repo_name"] == "delta"
-    assert alerts[1]["repo_name"] == "gamma"
+    assert alerts[0]["repo_name"] == "example__delta"
+    assert alerts[1]["repo_name"] == "example__gamma"
     # within HUNG bucket, longest duration first
-    assert alerts[2]["repo_name"] == "alpha"
-    assert alerts[3]["repo_name"] == "beta"
+    assert alerts[2]["repo_name"] == "example__alpha"
+    assert alerts[3]["repo_name"] == "example__beta"
 
 
 def test_build_alerts_uses_last_activity_for_hung_duration() -> None:
@@ -200,7 +200,7 @@ def test_build_alerts_uses_last_activity_for_hung_duration() -> None:
     """
     now = datetime.now(timezone.utc)
     state = _hung_state(
-        "alpha",
+        "example__alpha",
         "https://github.com/example/alpha.git",
         last_updated=now - timedelta(seconds=5),
         last_activity=now - timedelta(minutes=45),
@@ -214,7 +214,7 @@ def test_build_alerts_falls_back_to_last_updated_when_no_pr() -> None:
     now = datetime.now(timezone.utc)
     bare = RepoState(
         url="https://github.com/example/alpha.git",
-        name="alpha",
+        name="example__alpha",
         state=PipelineState.HUNG,
         last_updated=now - timedelta(minutes=12),
     )
@@ -278,7 +278,7 @@ def test_build_alerts_error_duration_survives_publish_state_rewrite() -> None:
     error_transition = now - timedelta(minutes=47)
     stale = RepoState(
         url="https://github.com/example/alpha.git",
-        name="alpha",
+        name="example__alpha",
         state=PipelineState.ERROR,
         error_message="claude CLI exited 1",
         # last_updated just got rewritten by a publish_state tick
@@ -318,7 +318,7 @@ def test_build_alerts_hung_duration_falls_back_to_history_transition() -> None:
     hung_transition = now - timedelta(hours=1, minutes=30)
     bare = RepoState(
         url="https://github.com/example/alpha.git",
-        name="alpha",
+        name="example__alpha",
         state=PipelineState.HUNG,
         last_updated=now - timedelta(seconds=1),
         history=[
@@ -341,7 +341,7 @@ def test_build_alerts_hung_duration_falls_back_to_history_transition() -> None:
 def test_build_alerts_error_card_carries_message_and_repo_link() -> None:
     now = datetime.now(timezone.utc)
     err = _error_state(
-        "alpha",
+        "example__alpha",
         "https://github.com/example/alpha.git",
         last_updated=now - timedelta(minutes=3),
         error_message="claude CLI exited 1",
@@ -349,7 +349,7 @@ def test_build_alerts_error_card_carries_message_and_repo_link() -> None:
     [alert] = _build_alerts([err])
     assert alert["kind"] == "ERROR"
     assert alert["error_message"] == "claude CLI exited 1"
-    assert alert["repo_url"] == "/repo/alpha"
+    assert alert["repo_url"] == "/repo/example__alpha"
     assert alert["duration_text"] == "3 min"
 
 
@@ -393,12 +393,12 @@ def test_partial_alerts_empty_when_all_healthy(alerts_config: Path) -> None:
 def test_partial_alerts_renders_error_card(alerts_config: Path) -> None:
     now = datetime.now(timezone.utc)
     err = _error_state(
-        "alpha",
+        "example__alpha",
         "https://github.com/example/alpha.git",
         last_updated=now - timedelta(minutes=2),
         error_message="claude CLI exited 1",
     )
-    fake = _FakeRedis({"pipeline:alpha": err.model_dump_json()})
+    fake = _FakeRedis({"pipeline:example__alpha": err.model_dump_json()})
 
     with TestClient(app) as client:
         client.app.state.redis = fake
@@ -409,7 +409,7 @@ def test_partial_alerts_renders_error_card(alerts_config: Path) -> None:
     assert "Attention Required" in body
     assert "claude CLI exited 1" in body
     # link to repo detail page is present on the card
-    assert 'href="/repo/alpha"' in body
+    assert 'href="/repo/example__alpha"' in body
     # error cards use the fail border utility
     assert "border-fail" in body
     # count badge shows "1" (rendered inside the red rounded-full span)
@@ -422,13 +422,13 @@ def test_partial_alerts_renders_hung_card_with_pr_number(
 ) -> None:
     now = datetime.now(timezone.utc)
     hung = _hung_state(
-        "alpha",
+        "example__alpha",
         "https://github.com/example/alpha.git",
         last_updated=now,
         last_activity=now - timedelta(minutes=30),
         pr_number=123,
     )
-    fake = _FakeRedis({"pipeline:alpha": hung.model_dump_json()})
+    fake = _FakeRedis({"pipeline:example__alpha": hung.model_dump_json()})
 
     with TestClient(app) as client:
         client.app.state.redis = fake
@@ -449,21 +449,21 @@ def test_partial_alerts_renders_hung_card_with_pr_number(
 def test_partial_alerts_places_error_before_hung(alerts_config: Path) -> None:
     now = datetime.now(timezone.utc)
     err = _error_state(
-        "alpha",
+        "example__alpha",
         "https://github.com/example/alpha.git",
         last_updated=now - timedelta(seconds=30),
         error_message="boom",
     )
     hung = _hung_state(
-        "beta",
+        "example__beta",
         "https://github.com/example/beta.git",
         last_updated=now - timedelta(hours=3),
         last_activity=now - timedelta(hours=3),
     )
     fake = _FakeRedis(
         {
-            "pipeline:alpha": err.model_dump_json(),
-            "pipeline:beta": hung.model_dump_json(),
+            "pipeline:example__alpha": err.model_dump_json(),
+            "pipeline:example__beta": hung.model_dump_json(),
         }
     )
 
@@ -480,19 +480,19 @@ def test_partial_alerts_places_error_before_hung(alerts_config: Path) -> None:
 def test_alert_repo_link_points_to_repo_detail(alerts_config: Path) -> None:
     now = datetime.now(timezone.utc)
     err = _error_state(
-        "alpha",
+        "example__alpha",
         "https://github.com/example/alpha.git",
         last_updated=now,
         error_message="boom",
     )
-    fake = _FakeRedis({"pipeline:alpha": err.model_dump_json()})
+    fake = _FakeRedis({"pipeline:example__alpha": err.model_dump_json()})
 
     with TestClient(app) as client:
         client.app.state.redis = fake
         response = client.get("/partials/alerts")
 
     body = response.text
-    assert 'href="/repo/alpha"' in body
+    assert 'href="/repo/example__alpha"' in body
 
 
 def test_index_mounts_alerts_partial(alerts_config: Path) -> None:
