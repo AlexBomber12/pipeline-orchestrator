@@ -41,6 +41,7 @@
 ./src/web/templates/base.html
 ./src/web/templates/components/activity_feed.html
 ./src/web/templates/components/alerts_panel.html
+./src/web/templates/components/event_list.html
 ./src/web/templates/components/event_log.html
 ./src/web/templates/components/repo_cards.html
 ./src/web/templates/components/repo_list.html
