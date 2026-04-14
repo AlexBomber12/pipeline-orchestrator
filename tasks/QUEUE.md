@@ -215,17 +215,23 @@
 - Branch: pr-036-dead-code-cleanup
 - Depends on: PR-035
 
+## PR-041: Smart error handling and stderr logging
+- Status: TODO
+- Tasks file: tasks/PR-041.md
+- Branch: pr-041-smart-errors
+- Depends on: PR-036
+
 ## PR-037: Simplify queue-done and fix tech debt
 - Status: TODO
 - Tasks file: tasks/PR-037.md
 - Branch: pr-037-simplify-queue-done
-- Depends on: PR-036
+- Depends on: PR-041
 
 ## PR-038: Canonical repo identity
 - Status: TODO
 - Tasks file: tasks/PR-038.md
 - Branch: pr-038-repo-identity
-- Depends on: PR-036
+- Depends on: PR-041
 
 ## PR-039: Honest dashboard states
 - Status: TODO
@@ -237,13 +243,7 @@
 - Status: TODO
 - Tasks file: tasks/PR-040.md
 - Branch: pr-040-rate-limit
-- Depends on: PR-036
-
-## PR-041: Smart error handling and stderr logging
-- Status: TODO
-- Tasks file: tasks/PR-041.md
-- Branch: pr-041-smart-errors
-- Depends on: PR-040
+- Depends on: PR-041
 
 ## PR-042: Async Claude CLI and per-repo scheduling
 - Status: TODO
