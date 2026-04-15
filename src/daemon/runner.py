@@ -1950,12 +1950,11 @@ return 0
         still fires on the creation event itself.
         """
         try:
-            pr_author = github_client.get_pr_author(
+            metadata = github_client.get_pr_metadata(
                 self.owner_repo, pr_number
             )
-            head_commit_iso = github_client.get_pr_head_commit_iso(
-                self.owner_repo, pr_number
-            )
+            pr_author = metadata.get("author", "")
+            head_commit_iso = metadata.get("head_commit_date", "")
             if pr_author and github_client.has_recent_codex_review_request(
                 self.owner_repo,
                 pr_number,
@@ -2035,9 +2034,10 @@ return 0
         next poll instead of latching a wrong value.
         """
         try:
-            head_iso = github_client.get_pr_head_commit_iso(
+            metadata = github_client.get_pr_metadata(
                 self.owner_repo, pr.number
             )
+            head_iso = metadata.get("head_commit_date", "")
         except Exception:
             head_iso = ""
         head_time = github_client._parse_iso(head_iso) if head_iso else None

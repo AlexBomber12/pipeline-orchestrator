@@ -2763,13 +2763,8 @@ def test_post_codex_review_skips_duplicate(
     from starting two redundant reviews back-to-back."""
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_author",
-        lambda repo, number: "claude-bot",
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_head_commit_iso",
-        lambda repo, number: "2026-04-14T12:00:00Z",
+        "get_pr_metadata",
+        lambda repo, number: {"author": "claude-bot", "head_sha": "", "head_commit_date": "2026-04-14T12:00:00Z"},
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -2799,13 +2794,8 @@ def test_post_codex_review_posts_when_no_duplicate(
     review`` exactly once."""
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_author",
-        lambda repo, number: "claude-bot",
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_head_commit_iso",
-        lambda repo, number: "2026-04-14T12:00:00Z",
+        "get_pr_metadata",
+        lambda repo, number: {"author": "claude-bot", "head_sha": "", "head_commit_date": "2026-04-14T12:00:00Z"},
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -2836,13 +2826,8 @@ def test_post_codex_review_uses_pr_author_not_gh_identity(
 
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_author",
-        lambda repo, number: "claude-cli-bot",
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_head_commit_iso",
-        lambda repo, number: "2026-04-14T12:00:00Z",
+        "get_pr_metadata",
+        lambda repo, number: {"author": "claude-cli-bot", "head_sha": "", "head_commit_date": "2026-04-14T12:00:00Z"},
     )
 
     def fake_has_recent(
@@ -2886,13 +2871,8 @@ def test_post_codex_review_passes_head_commit_iso_to_dedup(
 
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_author",
-        lambda repo, number: "same-user",
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_head_commit_iso",
-        lambda repo, number: "2026-04-14T13:37:00Z",
+        "get_pr_metadata",
+        lambda repo, number: {"author": "same-user", "head_sha": "", "head_commit_date": "2026-04-14T13:37:00Z"},
     )
 
     def fake_has_recent(
@@ -3299,8 +3279,8 @@ def test_rehydrate_last_push_at_from_head_commit(
     head_iso = "2026-04-14T20:00:00Z"
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_head_commit_iso",
-        lambda repo, number: head_iso,
+        "get_pr_metadata",
+        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": head_iso},
     )
     runner = _make_runner()
     assert runner._last_push_at is None
@@ -3320,8 +3300,8 @@ def test_rehydrate_last_push_at_no_fallback_to_last_activity(
     lets handle_watch retry the rehydrate next cycle."""
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_head_commit_iso",
-        lambda repo, number: "",
+        "get_pr_metadata",
+        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": ""},
     )
     fallback = datetime(2026, 4, 1, 10, 0, tzinfo=timezone.utc)
     pr = PRInfo(number=99, branch="pr-001", last_activity=fallback)
@@ -3350,8 +3330,8 @@ def test_handle_watch_retries_rehydrate_last_push_at(
     )
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_head_commit_iso",
-        lambda repo, number: "2026-04-14T18:00:00Z",
+        "get_pr_metadata",
+        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": "2026-04-14T18:00:00Z"},
     )
 
     runner = _make_runner()
@@ -3387,8 +3367,8 @@ def test_recover_state_rehydrates_last_push_at(
     head_iso = "2026-04-10T12:00:00Z"
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_head_commit_iso",
-        lambda repo, number: head_iso,
+        "get_pr_metadata",
+        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": head_iso},
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -3414,8 +3394,8 @@ def test_rehydrate_replaces_last_push_at_on_different_pr(
     head_iso = "2026-04-10T12:00:00Z"
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_head_commit_iso",
-        lambda repo, number: head_iso,
+        "get_pr_metadata",
+        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": head_iso},
     )
     runner = _make_runner()
     # Simulate a stale last_push_at from a previously-tracked PR (newer
@@ -3452,8 +3432,8 @@ def test_handle_watch_falls_through_for_fork_with_ci_failure(
     )
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_head_commit_iso",
-        lambda repo, number: "",
+        "get_pr_metadata",
+        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": ""},
     )
     fix_called: list[bool] = []
 
@@ -3491,8 +3471,8 @@ def test_handle_watch_falls_through_for_fork_with_changes_requested(
     )
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_head_commit_iso",
-        lambda repo, number: "",
+        "get_pr_metadata",
+        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": ""},
     )
     fix_called: list[bool] = []
 
@@ -3519,8 +3499,8 @@ def test_handle_watch_rehydrates_on_pr_number_mismatch(
     head_iso = "2026-04-14T18:00:00Z"
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_head_commit_iso",
-        lambda repo, number: head_iso,
+        "get_pr_metadata",
+        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": head_iso},
     )
     pr = PRInfo(
         number=55,
@@ -3558,8 +3538,8 @@ def test_rehydrate_clears_stale_on_mismatch_when_fetch_fails(
     return True so one fix attempt can run."""
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_head_commit_iso",
-        lambda repo, number: "",
+        "get_pr_metadata",
+        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": ""},
     )
     runner = _make_runner()
     runner._last_push_at = datetime(2026, 4, 20, tzinfo=timezone.utc)
