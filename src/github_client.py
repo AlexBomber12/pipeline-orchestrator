@@ -488,7 +488,7 @@ def get_last_push_age_seconds(repo: str, pr_number: int) -> float | None:
             "-f", "per_page=1",
             "-f", "direction=desc",
             "--jq",
-            ".[0].timestamp",
+            ".[0].pushed_at",
         ])
         date_str = date_raw.strip() if isinstance(date_raw, str) else ""
         if not date_str:
