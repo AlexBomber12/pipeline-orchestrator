@@ -16,6 +16,9 @@ class _StubAioredisClient:
     def __init__(self) -> None:
         self._store: dict[str, str] = {}
 
+    async def ping(self) -> bool:
+        return True
+
     async def get(self, key: str) -> str | None:
         if key in self._store:
             return self._store[key]

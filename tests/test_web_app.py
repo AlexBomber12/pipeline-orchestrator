@@ -30,6 +30,9 @@ class _FakeRedis:
     def __init__(self, store: dict[str, str] | None = None) -> None:
         self.store = store or {}
 
+    async def ping(self) -> bool:
+        return True
+
     async def get(self, key: str) -> str | None:
         return self.store.get(key)
 
@@ -38,12 +41,18 @@ class _BoomRedis:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
+    async def ping(self) -> bool:
+        raise RuntimeError("redis is down")
+
     async def get(self, key: str) -> str | None:
         self.calls.append(key)
         raise RuntimeError("redis is down")
 
 
 class _StubAioredisClient:
+    async def ping(self) -> bool:
+        return True
+
     async def get(self, key: str) -> str | None:
         return None
 
@@ -138,9 +147,8 @@ def test_get_all_repo_states_falls_back_when_redis_raises(
 
     assert warning == "Redis connection lost"
     assert len(states) == 2
-    # After the first failure further Redis lookups must be skipped so an
-    # unreachable broker cannot turn each repo into another timing-out call.
-    assert boom.calls == ["pipeline:example__alpha"]
+    # Upfront ping detects the outage so no per-repo get() calls are made.
+    assert boom.calls == []
 
 
 def test_index_route_returns_html(
@@ -222,6 +230,9 @@ def test_partial_repo_list_renders_queue_progress(
     )
 
     class _StubClientWithQueue:
+        async def ping(self) -> bool:
+            return True
+
         async def get(self, key: str) -> str | None:
             if key == "pipeline:example__alpha":
                 return stored.model_dump_json()
@@ -406,6 +417,9 @@ def test_partial_repo_detail_renders_redis_payload(
     )
 
     class _StubClientWithPayload:
+        async def ping(self) -> bool:
+            return True
+
         async def get(self, key: str) -> str | None:
             if key == "pipeline:example__alpha":
                 return stored.model_dump_json()
@@ -576,6 +590,9 @@ def test_index_shows_error_on_decode_failure(
     error instead of silently falling back to IDLE."""
 
     class _BadPayloadClient:
+        async def ping(self) -> bool:
+            return True
+
         async def get(self, key: str) -> str | None:
             if key == "pipeline:example__alpha":
                 return "{not valid json!!"

@@ -316,6 +316,27 @@ index 0372e40..c141b24 100644
          {# Error variant: show error instead of normal body #}
          <div class="px-2 py-1.5 rounded bg-fail/10 border border-fail/20 text-fail text-xs truncate"
               title="{{ repo.error_message }}">
+diff --git a/src/web/templates/components/repo_summary.html b/src/web/templates/components/repo_summary.html
+index a758986..bff97f3 100644
+--- a/src/web/templates/components/repo_summary.html
++++ b/src/web/templates/components/repo_summary.html
+@@ -38,10 +38,16 @@
+ </header>
+ 
+ {% if repo.error_message %}
++{% if repo.state.value == 'PREFLIGHT' %}
++<div class="mb-6 rounded-lg border border-warn/30 bg-warn/10 px-4 py-3">
++    <p class="text-warn font-mono text-sm break-words">{{ repo.error_message }}</p>
++</div>
++{% else %}
+ <div class="mb-6 rounded-lg border border-fail/30 bg-fail/10 px-4 py-3">
+     <p class="text-fail font-mono text-sm break-words">{{ repo.error_message }}</p>
+ </div>
+ {% endif %}
++{% endif %}
+ 
+ <div class="grid gap-4 sm:grid-cols-2 mb-6">
+     <section class="rounded-lg border border-white/5 bg-surface-2 p-5">
 diff --git a/tasks/QUEUE.md b/tasks/QUEUE.md
 index db62cc6..b8dae53 100644
 --- a/tasks/QUEUE.md

@@ -126,6 +126,13 @@ async def get_all_repo_states(
     redis_available = redis_client is not None
     redis_warning: str | None = None
 
+    if redis_client is not None:
+        try:
+            await redis_client.ping()
+        except Exception:
+            redis_available = False
+            redis_warning = "Redis connection lost"
+
     for repo in cfg.repositories:
         name = repo_slug_from_url(repo.url)
         state: RepoState | None = None

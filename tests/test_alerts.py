@@ -39,11 +39,17 @@ class _FakeRedis:
     def __init__(self, store: dict[str, str] | None = None) -> None:
         self.store = store or {}
 
+    async def ping(self) -> bool:
+        return True
+
     async def get(self, key: str) -> str | None:
         return self.store.get(key)
 
 
 class _StubAioredisClient:
+    async def ping(self) -> bool:
+        return True
+
     async def get(self, key: str) -> str | None:
         return None
 
