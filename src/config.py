@@ -16,6 +16,7 @@ _REPO_FIELDS = {
     "auto_merge",
     "review_timeout_min",
     "active",
+    "poll_interval_sec",
 }
 
 _DAEMON_FIELDS = {
@@ -42,6 +43,7 @@ class RepoConfig(BaseModel):
     # custom value.
     review_timeout_min: int | None = None
     active: bool = True
+    poll_interval_sec: int = 60
 
 
 class DaemonConfig(BaseModel):

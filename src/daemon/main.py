@@ -24,6 +24,7 @@ import asyncio
 import logging
 import os
 import subprocess
+import time
 from typing import Any
 
 import redis.asyncio as aioredis
@@ -177,6 +178,7 @@ async def main() -> None:
     runners: dict[str, PipelineRunner] = {}
     _sync_runners(runners, config, redis_client)
 
+    last_run: dict[str, float] = {}
     cycle = 0
     while True:
         # Check for config changes every N cycles. We skip the check on
@@ -195,7 +197,8 @@ async def main() -> None:
                     config = new_config
                     _sync_runners(runners, config, redis_client)
 
-        for runner in list(runners.values()):
+        now = time.monotonic()
+        for key, runner in list(runners.items()):
             if not runner.repo_config.active:
                 try:
                     await runner.publish_state()
@@ -206,12 +209,22 @@ async def main() -> None:
                         exc_info=True,
                     )
                 continue
+            interval = runner.repo_config.poll_interval_sec
+            if key in last_run and now - last_run[key] < interval:
+                continue
+            last_run[key] = now
             try:
                 await runner.run_cycle()
             except Exception:
                 logger.error(
                     "run_cycle failed for %s", runner.name, exc_info=True
                 )
+
+        # Clean up last_run entries for removed runners.
+        for key in list(last_run.keys()):
+            if key not in runners:
+                del last_run[key]
+
         await asyncio.sleep(config.daemon.poll_interval_sec)
         cycle += 1
 

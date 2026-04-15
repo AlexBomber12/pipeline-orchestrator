@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import time
 from typing import Any
 from unittest.mock import patch
 
@@ -69,19 +70,28 @@ def _patch_main(
         main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
     )
 
+    clock = [0.0]
+
+    def fake_monotonic() -> float:
+        return clock[0]
+
+    monkeypatch.setattr(main_module.time, "monotonic", fake_monotonic)
+
     sleep_calls: list[float] = []
 
     async def fake_sleep(seconds: float) -> None:
         sleep_calls.append(seconds)
+        clock[0] += seconds + 1
         if len(sleep_calls) >= sleep_iterations:
             raise _StopLoop
 
     monkeypatch.setattr(main_module.asyncio, "sleep", fake_sleep)
-    return {"sleep_calls": sleep_calls}
+    return {"sleep_calls": sleep_calls, "clock": clock}
 
 
-def _repo(url: str) -> RepoConfig:
-    return RepoConfig(url=url)
+def _repo(url: str, **kwargs: Any) -> RepoConfig:
+    kwargs.setdefault("poll_interval_sec", 1)
+    return RepoConfig(url=url, **kwargs)
 
 
 def test_main_creates_one_runner_per_repo(
@@ -200,10 +210,14 @@ def test_main_reload_detects_new_repository(
     # Reload on every second cycle so the test doesn't need long loops.
     monkeypatch.setattr(main_module, "CONFIG_RELOAD_EVERY_CYCLES", 2)
 
+    clock = [0.0]
+    monkeypatch.setattr(main_module.time, "monotonic", lambda: clock[0])
+
     sleep_calls: list[float] = []
 
     async def fake_sleep(seconds: float) -> None:
         sleep_calls.append(seconds)
+        clock[0] += seconds + 1
         # Cycle 0: alpha-only. Cycle 1: (no reload yet, idx=1, 1%2 != 0).
         # Cycle 2: reload fires, beta added, run_cycle runs on both.
         if len(sleep_calls) >= 3:
@@ -263,10 +277,14 @@ def test_main_reload_drops_removed_repository(
     )
     monkeypatch.setattr(main_module, "CONFIG_RELOAD_EVERY_CYCLES", 2)
 
+    clock2 = [0.0]
+    monkeypatch.setattr(main_module.time, "monotonic", lambda: clock2[0])
+
     sleep_calls: list[float] = []
 
     async def fake_sleep(seconds: float) -> None:
         sleep_calls.append(seconds)
+        clock2[0] += seconds + 1
         if len(sleep_calls) >= 3:
             raise _StopLoop
 
@@ -428,3 +446,55 @@ def test_main_calls_setup_git_auth_before_runners(
 
     assert call_order.index("setup_git_auth") < call_order.index("validate_auth")
     assert len(_FakeRunner.instances) == 1
+
+
+def test_per_repo_poll_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repos with different poll_interval_sec are polled at different rates."""
+    fast_repo = RepoConfig(url="https://github.com/octo/fast", poll_interval_sec=10)
+    slow_repo = RepoConfig(url="https://github.com/octo/slow", poll_interval_sec=100)
+
+    config = AppConfig(
+        repositories=[fast_repo, slow_repo],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+
+    _reset_fake_runner()
+    monkeypatch.setattr(main_module, "load_config", lambda: config)
+    monkeypatch.setattr(
+        main_module.aioredis,
+        "from_url",
+        lambda url, decode_responses: _FakeRedisClient(),
+    )
+    monkeypatch.setattr(main_module, "PipelineRunner", _FakeRunner)
+    monkeypatch.setattr(main_module, "_setup_git_auth", lambda: None)
+    monkeypatch.setattr(
+        main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
+    )
+
+    clock = [0.0]
+
+    def fake_monotonic() -> float:
+        return clock[0]
+
+    monkeypatch.setattr(main_module.time, "monotonic", fake_monotonic)
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock[0] += 15
+        if len(sleep_calls) >= 3:
+            raise _StopLoop
+
+    monkeypatch.setattr(main_module.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    fast = next(r for r in _FakeRunner.instances if r.name == "octo__fast")
+    slow = next(r for r in _FakeRunner.instances if r.name == "octo__slow")
+    # clock: 0 (both run), +15 (fast runs, slow skipped), +30 (fast runs, slow skipped)
+    assert fast.cycles == 3
+    assert slow.cycles == 1
