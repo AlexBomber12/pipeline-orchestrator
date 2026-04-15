@@ -168,12 +168,18 @@ async def run_claude_async(
         stderr = stderr_bytes.decode("utf-8", errors="replace")
         code = proc.returncode or 0
     except asyncio.TimeoutError:
-        proc.kill()
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
         await proc.wait()
         logger.error("claude CLI timed out after %ss", timeout)
         return (-1, "", f"Timeout after {timeout}s")
     except asyncio.CancelledError:
-        proc.kill()
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
         await proc.wait()
         logger.error("claude CLI task cancelled, subprocess killed")
         raise

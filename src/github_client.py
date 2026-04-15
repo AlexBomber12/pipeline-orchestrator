@@ -421,6 +421,10 @@ def get_pr_metadata(repo: str, pr_number: int) -> dict:
     }
 
 
+class GitHubPollError(Exception):
+    """Raised when a GitHub API poll fails (transient)."""
+
+
 def get_branch_last_push_time(
     repo: str, pr_number: int
 ) -> float | None:
@@ -430,6 +434,9 @@ def get_branch_last_push_time(
     previously observed SHA for this ``(repo, pr_number)`` pair.
     Returns the current monotonic time when a new SHA is detected,
     or ``None`` when the SHA is unchanged (or on first call).
+
+    Raises ``GitHubPollError`` when the API call fails so callers can
+    distinguish "no push" from "could not check."
     """
     key = f"{repo}#{pr_number}"
     try:
@@ -439,8 +446,8 @@ def get_branch_last_push_time(
             "--jq",
             ".head.sha",
         ])
-    except (RuntimeError, subprocess.TimeoutExpired):
-        return None
+    except (RuntimeError, subprocess.TimeoutExpired) as exc:
+        raise GitHubPollError(str(exc)) from exc
     sha = raw.strip() if isinstance(raw, str) else ""
     if not sha:
         return None

@@ -1526,13 +1526,20 @@ return 0
     ) -> None:
         """Cancel *target* if no new push is detected within *idle_limit* seconds."""
         # Prime the SHA tracker so the first poll can detect a change.
-        github_client.get_branch_last_push_time(self.owner_repo, pr_number)
+        try:
+            github_client.get_branch_last_push_time(self.owner_repo, pr_number)
+        except github_client.GitHubPollError:
+            pass
         last_known_push = time.monotonic()
         while True:
             await asyncio.sleep(60)
-            latest_push_at = github_client.get_branch_last_push_time(
-                self.owner_repo, pr_number
-            )
+            try:
+                latest_push_at = github_client.get_branch_last_push_time(
+                    self.owner_repo, pr_number
+                )
+            except github_client.GitHubPollError:
+                self.log_event("FIX: GitHub API poll failed, skipping cycle")
+                continue
             if latest_push_at is not None and latest_push_at > last_known_push:
                 last_known_push = latest_push_at
                 self.log_event("FIX: Claude pushed, resetting idle timer")
