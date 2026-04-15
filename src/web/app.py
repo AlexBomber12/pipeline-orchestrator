@@ -518,6 +518,17 @@ async def api_stats(request: Request) -> JSONResponse:
     return JSONResponse(_compute_stats(states))
 
 
+@app.get("/partials/redis-banner", response_class=HTMLResponse)
+async def partial_redis_banner(request: Request) -> HTMLResponse:
+    redis_client = getattr(request.app.state, "redis", None)
+    _states, redis_warning = await get_all_repo_states(redis_client)
+    return templates.TemplateResponse(
+        request,
+        "components/redis_banner.html",
+        {"redis_warning": redis_warning},
+    )
+
+
 @app.get("/partials/repo-list", response_class=HTMLResponse)
 async def partial_repo_list(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)

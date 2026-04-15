@@ -38,6 +38,7 @@
 ./src/web/templates/components/alerts_panel.html
 ./src/web/templates/components/event_list.html
 ./src/web/templates/components/event_log.html
+./src/web/templates/components/redis_banner.html
 ./src/web/templates/components/repo_cards.html
 ./src/web/templates/components/repo_list.html
 ./src/web/templates/components/repo_summary.html
