@@ -40,6 +40,7 @@ def test_run_claude_success(monkeypatch: pytest.MonkeyPatch) -> None:
         "claude",
         "--print",
         "--dangerously-skip-permissions",
+        "--no-session-persistence",
         "do a thing",
     ]
     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
@@ -121,6 +122,7 @@ def test_run_claude_with_model(monkeypatch: pytest.MonkeyPatch) -> None:
         "claude",
         "--print",
         "--dangerously-skip-permissions",
+        "--no-session-persistence",
         "--model",
         "opus",
         "do a thing",
