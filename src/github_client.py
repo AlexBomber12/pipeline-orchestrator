@@ -461,6 +461,37 @@ def get_branch_last_push_time(
     return None
 
 
+def get_head_commit_age_seconds(repo: str, pr_number: int) -> float | None:
+    """Return the age in seconds of the PR head commit's committer date.
+
+    Returns ``None`` on any API or parse failure.
+    """
+    try:
+        raw = run_gh([
+            "api",
+            f"repos/{repo}/pulls/{pr_number}",
+            "--jq",
+            ".head.sha",
+        ])
+        sha = raw.strip() if isinstance(raw, str) else ""
+        if not sha:
+            return None
+        date_raw = run_gh([
+            "api",
+            f"repos/{repo}/commits/{sha}",
+            "--jq",
+            ".commit.committer.date",
+        ])
+        date_str = date_raw.strip() if isinstance(date_raw, str) else ""
+        if not date_str:
+            return None
+        commit_dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - commit_dt).total_seconds()
+        return max(0.0, age)
+    except Exception:
+        return None
+
+
 def clear_last_known_sha() -> None:
     """Reset SHA tracking state (used in tests)."""
     _last_known_sha.clear()

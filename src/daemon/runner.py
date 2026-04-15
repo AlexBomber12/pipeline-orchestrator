@@ -1538,7 +1538,19 @@ return 0
             pass
 
         poll_interval = min(60, idle_limit)
-        last_known_push = time.monotonic()
+        # Seed from actual head commit age so already-idle PRs don't get
+        # a full extra window.  Cap the backdate to leave at least one
+        # poll cycle so a fresh FIX start can observe real activity.
+        now = time.monotonic()
+        head_age = await asyncio.to_thread(
+            github_client.get_head_commit_age_seconds,
+            self.owner_repo, pr_number,
+        )
+        if head_age is not None:
+            backdate = min(head_age, idle_limit - poll_interval)
+            last_known_push = now - max(0.0, backdate)
+        else:
+            last_known_push = now
         while True:
             await asyncio.sleep(poll_interval)
             try:
