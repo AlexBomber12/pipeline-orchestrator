@@ -1539,8 +1539,8 @@ return 0
                     self.owner_repo, pr_number
                 )
             except github_client.GitHubPollError:
-                self.log_event("FIX: GitHub API poll failed, skipping cycle")
-                continue
+                self.log_event("FIX: GitHub API poll failed, preserving deadline")
+                latest_push_at = None
             if latest_push_at is not None and latest_push_at > last_known_push:
                 last_known_push = latest_push_at
                 self.log_event("FIX: Claude pushed, resetting idle timer")
