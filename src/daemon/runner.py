@@ -1274,11 +1274,12 @@ return 0
         msg = (self.state.error_message or "").lower()
         if "rate limit" not in msg and not re.search(r"\b429\b", msg):
             return False
-        if self._rate_limited_until is not None:
-            if datetime.now(timezone.utc) < self._rate_limited_until:
-                remaining = (self._rate_limited_until - datetime.now(timezone.utc)).total_seconds()
-                self.log_event(f"Rate limit pause active, resuming in {int(remaining)}s")
-                return True
+        if self._rate_limited_until is None:
+            return False
+        if datetime.now(timezone.utc) < self._rate_limited_until:
+            remaining = (self._rate_limited_until - datetime.now(timezone.utc)).total_seconds()
+            self.log_event(f"Rate limit pause active, resuming in {int(remaining)}s")
+            return True
         self._rate_limited_until = None
         self.state.error_message = None
         self._error_diagnose_count = 0
