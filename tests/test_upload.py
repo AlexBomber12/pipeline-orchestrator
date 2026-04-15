@@ -58,7 +58,7 @@ def repo_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Create a fake repo dir and point REPOS_DIR at it."""
     repos = tmp_path / "repos"
     repos.mkdir()
-    alpha = repos / "alpha"
+    alpha = repos / "example__alpha"
     alpha.mkdir()
     monkeypatch.setattr(web_app, "REPOS_DIR", str(repos))
     return alpha
@@ -108,7 +108,7 @@ def test_upload_repo_not_cloned(
 
     with TestClient(app) as client:
         resp = client.post(
-            "/repos/alpha/upload-tasks",
+            "/repos/example__alpha/upload-tasks",
             files=[_queue_file()],
         )
     assert resp.status_code == 422
@@ -134,7 +134,7 @@ def test_upload_blocked_when_redis_key_absent(
 
     with TestClient(app) as client:
         resp = client.post(
-            "/repos/alpha/upload-tasks",
+            "/repos/example__alpha/upload-tasks",
             files=[_queue_file()],
         )
     assert resp.status_code == 503
@@ -148,7 +148,7 @@ def test_upload_without_queue_md(
 ) -> None:
     with TestClient(app) as client:
         resp = client.post(
-            "/repos/alpha/upload-tasks",
+            "/repos/example__alpha/upload-tasks",
             files=[_pr_file()],
         )
     assert resp.status_code == 422
@@ -162,7 +162,7 @@ def test_upload_invalid_filename(
 ) -> None:
     with TestClient(app) as client:
         resp = client.post(
-            "/repos/alpha/upload-tasks",
+            "/repos/example__alpha/upload-tasks",
             files=[_queue_file(), _bad_file()],
         )
     assert resp.status_code == 422
@@ -176,14 +176,14 @@ def test_upload_stages_files_and_sets_redis_key(
 ) -> None:
     with TestClient(app) as client:
         resp = client.post(
-            "/repos/alpha/upload-tasks",
+            "/repos/example__alpha/upload-tasks",
             files=[_queue_file(), _pr_file()],
         )
 
     assert resp.status_code == 200
     assert "queued" in resp.text.lower()
 
-    repo_upload_dir = uploads_dir / "alpha"
+    repo_upload_dir = uploads_dir / "example__alpha"
     subdirs = list(repo_upload_dir.iterdir())
     assert len(subdirs) == 1
     staging = subdirs[0]
@@ -217,14 +217,14 @@ def test_upload_writes_redis_manifest(
 
     with TestClient(app) as client:
         resp = client.post(
-            "/repos/alpha/upload-tasks",
+            "/repos/example__alpha/upload-tasks",
             files=[_queue_file(), _pr_file("PR-002.md")],
         )
 
     assert resp.status_code == 200
-    assert "upload:alpha:pending" in redis_sets
-    manifest = json.loads(redis_sets["upload:alpha:pending"])
-    assert manifest["repo"] == "alpha"
+    assert "upload:example__alpha:pending" in redis_sets
+    manifest = json.loads(redis_sets["upload:example__alpha:pending"])
+    assert manifest["repo"] == "example__alpha"
     assert set(manifest["files"]) == {"QUEUE.md", "PR-002.md"}
     assert "staging_dir" in manifest
-    assert "/alpha/" in manifest["staging_dir"]
+    assert "/example__alpha/" in manifest["staging_dir"]

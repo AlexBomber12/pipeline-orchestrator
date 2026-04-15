@@ -85,7 +85,7 @@ def test_get_all_repo_states_no_redis_returns_idle_defaults(
 ) -> None:
     states = asyncio.run(get_all_repo_states(redis_client=None))
 
-    assert [s.name for s in states] == ["alpha", "beta"]
+    assert [s.name for s in states] == ["example__alpha", "example__beta"]
     for state in states:
         assert state.state == PipelineState.IDLE
         assert state.current_task is None
@@ -99,7 +99,7 @@ def test_get_all_repo_states_uses_redis_when_present(
     now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
     stored = RepoState(
         url="https://github.com/example/alpha.git",
-        name="alpha",
+        name="example__alpha",
         state=PipelineState.CODING,
         current_task=QueueTask(
             pr_id="PR-099",
@@ -114,7 +114,7 @@ def test_get_all_repo_states_uses_redis_when_present(
         ),
         last_updated=now,
     )
-    fake = _FakeRedis({"pipeline:alpha": stored.model_dump_json()})
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
 
     states = asyncio.run(get_all_repo_states(redis_client=fake))
 
@@ -139,7 +139,7 @@ def test_get_all_repo_states_falls_back_when_redis_raises(
         assert state.state == PipelineState.IDLE
     # After the first failure further Redis lookups must be skipped so an
     # unreachable broker cannot turn each repo into another timing-out call.
-    assert boom.calls == ["pipeline:alpha"]
+    assert boom.calls == ["pipeline:example__alpha"]
 
 
 def test_index_route_returns_html(
@@ -169,7 +169,7 @@ def test_api_states_returns_json(
     assert response.status_code == 200
     payload = response.json()
     assert isinstance(payload, list)
-    assert {p["name"] for p in payload} == {"alpha", "beta"}
+    assert {p["name"] for p in payload} == {"example__alpha", "example__beta"}
     for entry in payload:
         assert entry["state"] == "IDLE"
 
@@ -209,7 +209,7 @@ def test_partial_repo_list_renders_queue_progress(
     now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
     stored = RepoState(
         url="https://github.com/example/alpha.git",
-        name="alpha",
+        name="example__alpha",
         state=PipelineState.CODING,
         current_task=QueueTask(
             pr_id="PR-005",
@@ -223,7 +223,7 @@ def test_partial_repo_list_renders_queue_progress(
 
     class _StubClientWithQueue:
         async def get(self, key: str) -> str | None:
-            if key == "pipeline:alpha":
+            if key == "pipeline:example__alpha":
                 return stored.model_dump_json()
             return None
 
@@ -267,9 +267,9 @@ def test_partial_stats_renders_status_bar(
 def test_get_repo_state_unknown_repo_returns_idle_default(
     empty_config: Path,
 ) -> None:
-    state = asyncio.run(get_repo_state("ghost", redis_client=None))
+    state = asyncio.run(get_repo_state("example__ghost", redis_client=None))
 
-    assert state.name == "ghost"
+    assert state.name == "example__ghost"
     assert state.url == ""
     assert state.state == PipelineState.IDLE
     assert state.current_task is None
@@ -282,17 +282,17 @@ def test_get_repo_state_unknown_repo_ignores_stale_redis_key(
     """Repos missing from config must not surface stale Redis payloads."""
     stale = RepoState(
         url="https://github.com/example/ghost.git",
-        name="ghost",
+        name="example__ghost",
         state=PipelineState.CODING,
         current_task=None,
         current_pr=None,
         last_updated=datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc),
     )
-    fake = _FakeRedis({"pipeline:ghost": stale.model_dump_json()})
+    fake = _FakeRedis({"pipeline:example__ghost": stale.model_dump_json()})
 
-    state = asyncio.run(get_repo_state("ghost", redis_client=fake))
+    state = asyncio.run(get_repo_state("example__ghost", redis_client=fake))
 
-    assert state.name == "ghost"
+    assert state.name == "example__ghost"
     assert state.url == ""
     assert state.state == PipelineState.IDLE
 
@@ -301,7 +301,7 @@ def test_get_repo_state_uses_redis_payload(two_repo_config: Path) -> None:
     now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
     stored = RepoState(
         url="https://github.com/example/alpha.git",
-        name="alpha",
+        name="example__alpha",
         state=PipelineState.WATCH,
         current_task=QueueTask(
             pr_id="PR-007",
@@ -323,9 +323,9 @@ def test_get_repo_state_uses_redis_payload(two_repo_config: Path) -> None:
             {"time": "12:00:42", "state": "WATCH", "event": "watching CI"},
         ],
     )
-    fake = _FakeRedis({"pipeline:alpha": stored.model_dump_json()})
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
 
-    state = asyncio.run(get_repo_state("alpha", redis_client=fake))
+    state = asyncio.run(get_repo_state("example__alpha", redis_client=fake))
 
     assert state.state == PipelineState.WATCH
     assert state.current_pr is not None
@@ -339,7 +339,7 @@ def test_repo_detail_route_renders_full_page(
     monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
 
     with TestClient(app) as client:
-        response = client.get("/repo/alpha")
+        response = client.get("/repo/example__alpha")
 
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
@@ -347,7 +347,7 @@ def test_repo_detail_route_renders_full_page(
     assert "<!DOCTYPE" in body
     assert "alpha" in body
     assert "All repositories" in body
-    assert 'hx-get="/partials/repo/alpha"' in body
+    assert 'hx-get="/partials/repo/example__alpha"' in body
     assert 'hx-trigger="every 5s"' in body
     assert "Current Task" in body
     assert "Current PR" in body
@@ -360,7 +360,7 @@ def test_partial_repo_detail_returns_html_fragment(
     monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
 
     with TestClient(app) as client:
-        response = client.get("/partials/repo/alpha")
+        response = client.get("/partials/repo/example__alpha")
 
     assert response.status_code == 200
     body = response.text
@@ -382,7 +382,7 @@ def test_partial_repo_detail_renders_redis_payload(
     now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
     stored = RepoState(
         url="https://github.com/example/alpha.git",
-        name="alpha",
+        name="example__alpha",
         state=PipelineState.CODING,
         current_task=QueueTask(
             pr_id="PR-042",
@@ -407,7 +407,7 @@ def test_partial_repo_detail_renders_redis_payload(
 
     class _StubClientWithPayload:
         async def get(self, key: str) -> str | None:
-            if key == "pipeline:alpha":
+            if key == "pipeline:example__alpha":
                 return stored.model_dump_json()
             return None
 
@@ -424,7 +424,7 @@ def test_partial_repo_detail_renders_redis_payload(
     monkeypatch.setattr(web_app, "aioredis", _StubAioredisWithPayload())
 
     with TestClient(app) as client:
-        response = client.get("/partials/repo/alpha")
+        response = client.get("/partials/repo/example__alpha")
 
     assert response.status_code == 200
     body = response.text
@@ -449,7 +449,7 @@ def test_cli_log_route_returns_log(
 
     class _CliLogClient:
         async def get(self, key: str) -> str | None:
-            if key == "cli_log:testrepo:latest":
+            if key == "cli_log:x__testrepo:latest":
                 return "line1\nline2"
             return None
 
@@ -464,7 +464,7 @@ def test_cli_log_route_returns_log(
     monkeypatch.setattr(web_app, "aioredis", _CliLogAioredis())
 
     with TestClient(app) as client:
-        response = client.get("/partials/repo/testrepo/cli-log")
+        response = client.get("/partials/repo/x__testrepo/cli-log")
     assert response.status_code == 200
     assert "line1" in response.text
     assert "line2" in response.text
@@ -477,7 +477,7 @@ def test_cli_log_route_returns_empty(
     monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
 
     with TestClient(app) as client:
-        response = client.get("/partials/repo/testrepo/cli-log")
+        response = client.get("/partials/repo/x__testrepo/cli-log")
     assert response.status_code == 200
     assert "No CLI log available" in response.text
 
@@ -492,18 +492,18 @@ def test_event_log_has_data_ts(
     entry_ts = "2026-04-10T11:55:00+00:00"
     stored = RepoState(
         url="https://github.com/example/alpha.git",
-        name="alpha",
+        name="example__alpha",
         state=PipelineState.CODING,
         last_updated=header_ts,
         history=[
             {"time": entry_ts, "state": "CODING", "event": "hello"},
         ],
     )
-    fake = _FakeRedis({"pipeline:alpha": stored.model_dump_json()})
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
 
     with TestClient(app) as client:
         client.app.state.redis = fake
-        response = client.get("/repo/alpha")
+        response = client.get("/repo/example__alpha")
 
     assert response.status_code == 200
     body = response.text
@@ -524,8 +524,8 @@ def test_repo_card_has_onclick(
 
     assert response.status_code == 200
     body = response.text
-    assert "window.location='/repo/alpha'" in body
-    assert "window.location='/repo/beta'" in body
+    assert "window.location='/repo/example__alpha'" in body
+    assert "window.location='/repo/example__beta'" in body
     assert "event.target.closest('label,input,button,a')" in body
 
 
@@ -538,15 +538,15 @@ def test_updated_header_has_data_ts(
     now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
     stored = RepoState(
         url="https://github.com/example/alpha.git",
-        name="alpha",
+        name="example__alpha",
         state=PipelineState.CODING,
         last_updated=now,
     )
-    fake = _FakeRedis({"pipeline:alpha": stored.model_dump_json()})
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
 
     with TestClient(app) as client:
         client.app.state.redis = fake
-        response = client.get("/repo/alpha")
+        response = client.get("/repo/example__alpha")
 
     assert response.status_code == 200
     body = response.text

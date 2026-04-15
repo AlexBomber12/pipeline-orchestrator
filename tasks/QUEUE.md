@@ -228,7 +228,7 @@
 - Depends on: PR-041
 
 ## PR-038: Canonical repo identity
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-038.md
 - Branch: pr-038-repo-identity
 - Depends on: PR-041

@@ -30,7 +30,7 @@ from src.config import (
     update_repository,
 )
 from src.models import PipelineState, RepoState
-from src.utils import repo_name_from_url
+from src.utils import repo_slug_from_url
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 CONFIG_PATH = "config.yml"
@@ -71,7 +71,7 @@ async def get_repo_state(
     url = ""
     found = False
     for repo in cfg.repositories:
-        if repo_name_from_url(repo.url) == name:
+        if repo_slug_from_url(repo.url) == name:
             url = repo.url
             found = True
             break
@@ -107,7 +107,7 @@ async def get_all_repo_states(
     redis_available = redis_client is not None
 
     for repo in cfg.repositories:
-        name = repo_name_from_url(repo.url)
+        name = repo_slug_from_url(repo.url)
         state: RepoState | None = None
 
         if redis_available:
@@ -620,7 +620,7 @@ async def partial_repo_events(request: Request, name: str) -> HTMLResponse:
 async def repo_cli_log(request: Request, name: str) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
     cfg = load_config(CONFIG_PATH)
-    if not any(repo_name_from_url(r.url) == name for r in cfg.repositories):
+    if not any(repo_slug_from_url(r.url) == name for r in cfg.repositories):
         return HTMLResponse(
             '<p class="text-sm text-gray-500 italic">No CLI log available.</p>'
         )
@@ -1118,7 +1118,7 @@ async def upload_tasks(
     cfg = load_config(CONFIG_PATH)
     found = False
     for repo in cfg.repositories:
-        if repo_name_from_url(repo.url) == name:
+        if repo_slug_from_url(repo.url) == name:
             found = True
             break
 
