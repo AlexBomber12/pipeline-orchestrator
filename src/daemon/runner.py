@@ -16,6 +16,7 @@ import logging
 import re
 import shutil
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1517,6 +1518,30 @@ return 0
                 f"{elapsed_min:.0f}/{timeout_min}m)"
             )
 
+    async def _monitor_fix_idle(
+        self,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+    ) -> None:
+        """Cancel *target* if no new push is detected within *idle_limit* seconds."""
+        last_known_push = time.monotonic()
+        while True:
+            await asyncio.sleep(60)
+            latest_push_at = github_client.get_branch_last_push_time(
+                self.owner_repo, pr_number
+            )
+            if latest_push_at is not None and latest_push_at > last_known_push:
+                last_known_push = latest_push_at
+                self.log_event("FIX: Claude pushed, resetting idle timer")
+            elapsed = time.monotonic() - last_known_push
+            if elapsed > idle_limit:
+                self.log_event(
+                    f"FIX: idle timeout ({idle_limit}s since last push), killing"
+                )
+                target.cancel()
+                return
+
     async def handle_fix(self) -> None:
         """Run ``FIX REVIEW`` via the claude CLI and return to WATCH."""
         if not self._check_rate_limit():
@@ -1575,14 +1600,33 @@ return 0
                 self.log_event(self.state.error_message)
                 return
 
+        idle_limit = self.app_config.daemon.fix_idle_timeout_sec
+        pr_number = (
+            self.state.current_pr.number if self.state.current_pr else 0
+        )
+
         heartbeat = asyncio.create_task(self._publish_while_waiting("FIX"))
-        try:
-            code, stdout, stderr = await claude_cli.fix_review_async(
+        claude_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
+            claude_cli.fix_review_async(
                 self.repo_path,
                 model=self.app_config.daemon.claude_model,
-                timeout=self.app_config.daemon.fix_review_timeout_sec,
             )
+        )
+        idle_monitor = asyncio.create_task(
+            self._monitor_fix_idle(pr_number, idle_limit, claude_task)
+        )
+        try:
+            code, stdout, stderr = await claude_task
+        except asyncio.CancelledError:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = (
+                f"FIX idle timeout: no push for {idle_limit}s"
+            )
+            self.log_event(self.state.error_message)
+            await self._save_cli_log("", "", "FIX idle timeout")
+            return
         finally:
+            idle_monitor.cancel()
             heartbeat.cancel()
         await self._save_cli_log(stdout, stderr, "FIX REVIEW output")
         self._detect_rate_limit(stderr)

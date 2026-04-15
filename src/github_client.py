@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from datetime import datetime, timezone
 
 from src.models import CIStatus, PRInfo, ReviewStatus
@@ -15,6 +16,8 @@ _REPO_URL_RE = re.compile(
 
 _review_status_cache: dict[str, "ReviewStatus"] = {}
 _review_status_cache_cycle: int | None = None
+
+_last_known_sha: dict[str, str] = {}
 
 
 def _cache_key(repo: str, pr_number: int, head_sha: str) -> str:
@@ -416,6 +419,44 @@ def get_pr_metadata(repo: str, pr_number: int) -> dict:
         "head_sha": head_sha,
         "head_commit_date": head_commit_date,
     }
+
+
+def get_branch_last_push_time(
+    repo: str, pr_number: int
+) -> float | None:
+    """Return ``time.monotonic()`` if the PR's head SHA changed since last call.
+
+    Compares the current head SHA from the GitHub API against the
+    previously observed SHA for this ``(repo, pr_number)`` pair.
+    Returns the current monotonic time when a new SHA is detected,
+    or ``None`` when the SHA is unchanged (or on first call).
+    """
+    key = f"{repo}#{pr_number}"
+    try:
+        raw = run_gh([
+            "api",
+            f"repos/{repo}/pulls/{pr_number}",
+            "--jq",
+            ".head.sha",
+        ])
+    except RuntimeError:
+        return None
+    sha = raw.strip() if isinstance(raw, str) else ""
+    if not sha:
+        return None
+
+    prev = _last_known_sha.get(key)
+    _last_known_sha[key] = sha
+    if prev is None:
+        return None
+    if sha != prev:
+        return time.monotonic()
+    return None
+
+
+def clear_last_known_sha() -> None:
+    """Reset SHA tracking state (used in tests)."""
+    _last_known_sha.clear()
 
 
 def has_recent_codex_review_request(

@@ -782,7 +782,7 @@ async def put_settings_daemon(
     hung_fallback_codex_review: str | None = Form(None),
     error_handler_use_ai: str | None = Form(None),
     planned_pr_timeout_sec: str | None = Form(None),
-    fix_review_timeout_sec: str | None = Form(None),
+    fix_idle_timeout_sec: str | None = Form(None),
     rate_limit_pause_percent: str | None = Form(None),
 ) -> HTMLResponse:
     """Update daemon settings.
@@ -823,11 +823,11 @@ async def put_settings_daemon(
                 planned_pr_timeout_sec, "planned_pr_timeout_sec", min_value=1
             )
         if (
-            fix_review_timeout_sec is not None
-            and fix_review_timeout_sec != ""
+            fix_idle_timeout_sec is not None
+            and fix_idle_timeout_sec != ""
         ):
-            updates["fix_review_timeout_sec"] = _coerce_int(
-                fix_review_timeout_sec, "fix_review_timeout_sec", min_value=1
+            updates["fix_idle_timeout_sec"] = _coerce_int(
+                fix_idle_timeout_sec, "fix_idle_timeout_sec", min_value=1
             )
         if (
             rate_limit_pause_percent is not None

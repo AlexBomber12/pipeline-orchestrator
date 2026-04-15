@@ -264,7 +264,7 @@
 - Depends on: PR-042
 
 ## PR-045: FIX idle timeout based on last push
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-045.md
 - Branch: pr-045-idle-timeout
 - Depends on: PR-042
