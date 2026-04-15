@@ -1523,6 +1523,7 @@ return 0
         pr_number: int,
         idle_limit: int,
         target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
     ) -> None:
         """Cancel *target* if no new push is detected within *idle_limit* seconds."""
         # Prime the SHA tracker so the first poll can detect a change.
@@ -1538,8 +1539,9 @@ return 0
                     self.owner_repo, pr_number
                 )
             except github_client.GitHubPollError:
-                self.log_event("FIX: GitHub API poll failed, skipping cycle")
-                latest_push_at = None
+                self.log_event("FIX: GitHub API poll failed, pausing idle timer")
+                last_known_push = time.monotonic()
+                continue
             if latest_push_at is not None and latest_push_at > last_known_push:
                 last_known_push = latest_push_at
                 self.log_event("FIX: Claude pushed, resetting idle timer")
@@ -1548,6 +1550,7 @@ return 0
                 self.log_event(
                     f"FIX: idle timeout ({idle_limit}s since last push), killing"
                 )
+                idle_flag["timed_out"] = True
                 target.cancel()
                 return
 
@@ -1614,6 +1617,7 @@ return 0
             self.state.current_pr.number if self.state.current_pr else 0
         )
 
+        idle_flag: dict[str, bool] = {"timed_out": False}
         heartbeat = asyncio.create_task(self._publish_while_waiting("FIX"))
         claude_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
             claude_cli.fix_review_async(
@@ -1622,11 +1626,13 @@ return 0
             )
         )
         idle_monitor = asyncio.create_task(
-            self._monitor_fix_idle(pr_number, idle_limit, claude_task)
+            self._monitor_fix_idle(pr_number, idle_limit, claude_task, idle_flag)
         )
         try:
             code, stdout, stderr = await claude_task
         except asyncio.CancelledError:
+            if not idle_flag["timed_out"]:
+                raise
             self.state.state = PipelineState.ERROR
             self.state.error_message = (
                 f"FIX idle timeout: no push for {idle_limit}s"

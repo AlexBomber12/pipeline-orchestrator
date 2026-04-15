@@ -3183,8 +3183,10 @@ def test_fix_idle_timeout_kills_on_no_push(
         pr_number: int,
         idle_limit: int,
         target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
     ) -> None:
         await asyncio.sleep(0)
+        idle_flag["timed_out"] = True
         target.cancel()
 
     monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", fake_fix_hangs)
@@ -3258,6 +3260,7 @@ def test_fix_idle_timeout_monitor_resets_on_push(
         pr_number: int,
         idle_limit: int,
         target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
     ) -> None:
         push_detected[0] = True
         await asyncio.sleep(0)
