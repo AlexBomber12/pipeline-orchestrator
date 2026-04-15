@@ -397,3 +397,8 @@ def test_repo_poll_interval_rejects_zero() -> None:
 def test_repo_poll_interval_rejects_negative() -> None:
     with pytest.raises(ValueError, match="at least 1"):
         RepoConfig(url="https://github.com/example/repo", poll_interval_sec=-5)
+
+
+def test_repo_poll_interval_rejects_float() -> None:
+    with pytest.raises(ValueError, match="must be an integer"):
+        RepoConfig(url="https://github.com/example/repo", poll_interval_sec=1.9)

@@ -210,7 +210,8 @@ async def main() -> None:
                     )
                 continue
             now = time.monotonic()
-            interval = runner.repo_config.poll_interval_sec if runner.repo_config.poll_interval_sec is not None else 60
+            repo_poll = runner.repo_config.poll_interval_sec
+            interval = repo_poll if repo_poll is not None else config.daemon.poll_interval_sec
             if key in last_run and now - last_run[key] < interval:
                 continue
             last_run[key] = now

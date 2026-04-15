@@ -50,7 +50,8 @@ class RepoConfig(BaseModel):
     def _poll_interval_at_least_one(cls, v: Any) -> int | None:
         if v is None:
             return None
-        v = int(v)
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise ValueError("poll_interval_sec must be an integer")
         if v < 1:
             raise ValueError("poll_interval_sec must be at least 1")
         return v
