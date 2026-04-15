@@ -918,3 +918,20 @@ def test_partial_auth_status_renders_status_dots(
     assert "bg-fail" in body
     assert "1.2.3" in body
     assert "not logged in" in body
+
+
+def test_update_daemon_rate_limit(
+    empty_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(empty_config))
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"rate_limit_pause_percent": "75"},
+        )
+
+    assert response.status_code == 200
+    cfg = load_config(str(empty_config))
+    assert cfg.daemon.rate_limit_pause_percent == 75

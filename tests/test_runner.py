@@ -3551,3 +3551,139 @@ def test_rehydrate_clears_stale_on_mismatch_when_fetch_fails(
 
     assert runner._last_push_at is None
     assert runner._last_push_at_pr_number == 42
+
+
+def test_check_rate_limit_blocks_when_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_check_rate_limit returns False when _rate_limited_until is in future."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+    assert runner._check_rate_limit() is False
+    assert runner.state.rate_limited_until is not None
+
+
+def test_check_rate_limit_allows_when_expired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_check_rate_limit returns True and clears when _rate_limited_until is past."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+
+    assert runner._check_rate_limit() is True
+    assert runner.state.rate_limited_until is None
+
+
+def test_handle_coding_skips_when_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """handle_coding returns early without calling claude_cli when rate-limited."""
+    _patch_subprocess(monkeypatch)
+    cli_calls: list[str] = []
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "run_planned_pr",
+        lambda *a, **kw: (cli_calls.append("run_planned_pr"), (0, "", ""))[1],
+    )
+    runner = _make_runner()
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = QueueTask(
+        pr_id="PR-099", title="test", branch="pr-099-test", status=TaskStatus.TODO
+    )
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+    asyncio.run(runner.handle_coding())
+
+    assert cli_calls == []
+
+
+def test_handle_error_skips_diagnose_for_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """handle_error skips diagnose_error when error contains 'rate limit'."""
+    _patch_subprocess(monkeypatch)
+    cli_calls: list[str] = []
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "diagnose_error",
+        lambda *a, **kw: (cli_calls.append("diagnose"), (0, "SKIP", ""))[1],
+    )
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Claude rate limit exceeded"
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+
+
+def test_handle_error_skips_diagnose_for_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """handle_error skips diagnose_error when error contains 'timeout'."""
+    _patch_subprocess(monkeypatch)
+    cli_calls: list[str] = []
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "diagnose_error",
+        lambda *a, **kw: (cli_calls.append("diagnose"), (0, "SKIP", ""))[1],
+    )
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Timeout waiting for response"
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+
+
+def test_detect_rate_limit_sets_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_detect_rate_limit sets _rate_limited_until on rate limit signal."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    assert runner.state.rate_limited_until is None
+
+    runner._detect_rate_limit("Error: 429 Too Many Requests")
+
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limited_until > datetime.now(timezone.utc)
+    expected_pause = timedelta(minutes=27)
+    actual_pause = runner.state.rate_limited_until - datetime.now(timezone.utc)
+    assert actual_pause > expected_pause - timedelta(seconds=5)
+
+
+def test_detect_rate_limit_respects_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_detect_rate_limit triggers on usage percentage above threshold."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner.app_config.daemon.rate_limit_pause_percent = 80
+
+    runner._detect_rate_limit("Warning: 75% of rate limit capacity used")
+    assert runner.state.rate_limited_until is None
+
+    runner._detect_rate_limit("Warning: 85% of rate limit capacity used")
+    assert runner.state.rate_limited_until is not None
+
+
+def test_detect_rate_limit_fixed_pause_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_detect_rate_limit always uses a fixed 30-minute cooldown."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner.app_config.daemon.rate_limit_pause_percent = 50
+
+    runner._detect_rate_limit("Error: 429 Too Many Requests")
+
+    assert runner.state.rate_limited_until is not None
+    expected_pause = timedelta(minutes=30)
+    actual_pause = runner.state.rate_limited_until - datetime.now(timezone.utc)
+    assert actual_pause > expected_pause - timedelta(seconds=5)
+    assert actual_pause < expected_pause + timedelta(seconds=5)

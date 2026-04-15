@@ -38,6 +38,7 @@ REPOS_DIR = "/data/repos"
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+templates.env.globals["utcnow"] = lambda: datetime.now(timezone.utc)
 
 
 def _default_repo_state(
@@ -782,6 +783,7 @@ async def put_settings_daemon(
     error_handler_use_ai: str | None = Form(None),
     planned_pr_timeout_sec: str | None = Form(None),
     fix_review_timeout_sec: str | None = Form(None),
+    rate_limit_pause_percent: str | None = Form(None),
 ) -> HTMLResponse:
     """Update daemon settings.
 
@@ -826,6 +828,16 @@ async def put_settings_daemon(
         ):
             updates["fix_review_timeout_sec"] = _coerce_int(
                 fix_review_timeout_sec, "fix_review_timeout_sec", min_value=1
+            )
+        if (
+            rate_limit_pause_percent is not None
+            and rate_limit_pause_percent != ""
+        ):
+            updates["rate_limit_pause_percent"] = _coerce_int(
+                rate_limit_pause_percent,
+                "rate_limit_pause_percent",
+                min_value=50,
+                max_value=99,
             )
     except ValueError as exc:
         return _render_settings_daemon_error(request, str(exc), 422)
@@ -1036,13 +1048,20 @@ def _coerce_bool(value: str, field: str) -> bool:
     raise ValueError(f"{field} must be a boolean")
 
 
-def _coerce_int(value: str, field: str, min_value: int | None = None) -> int:
+def _coerce_int(
+    value: str,
+    field: str,
+    min_value: int | None = None,
+    max_value: int | None = None,
+) -> int:
     try:
         parsed = int(value.strip())
     except ValueError as exc:
         raise ValueError(f"{field} must be an integer") from exc
     if min_value is not None and parsed < min_value:
         raise ValueError(f"{field} must be at least {min_value}")
+    if max_value is not None and parsed > max_value:
+        raise ValueError(f"{field} must be at most {max_value}")
     return parsed
 
 

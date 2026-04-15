@@ -11,6 +11,7 @@ daemon:
   claude_model: opus
   fix_review_timeout_sec: 3600
   planned_pr_timeout_sec: 900
+  rate_limit_pause_percent: 90
 web:
   host: 0.0.0.0
   port: 8000

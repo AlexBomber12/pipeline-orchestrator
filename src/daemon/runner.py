@@ -16,7 +16,7 @@ import logging
 import re
 import shutil
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import redis.asyncio as aioredis
@@ -1059,7 +1059,9 @@ class PipelineRunner:
         elif current == PipelineState.HUNG:
             await self.handle_hung()
         elif current == PipelineState.ERROR:
-            if self.app_config.daemon.error_handler_use_ai:
+            if self._try_recover_rate_limit():
+                pass
+            elif self.app_config.daemon.error_handler_use_ai:
                 await self.handle_error()
 
         await self.publish_state()
@@ -1251,6 +1253,69 @@ return 0
         await self.publish_state()
         await self.handle_coding()
 
+    def _check_rate_limit(self) -> bool:
+        """Return True if CLI calls are allowed, False if rate-limited."""
+        if self.state.rate_limited_until is not None:
+            if datetime.now(timezone.utc) < self.state.rate_limited_until:
+                remaining = (self.state.rate_limited_until - datetime.now(timezone.utc)).total_seconds()
+                self.log_event(f"Rate limited, resuming in {int(remaining)}s")
+                return False
+            self.state.rate_limited_until = None
+            self.log_event("Rate limit window expired, resuming")
+        return True
+
+    def _try_recover_rate_limit(self) -> bool:
+        """If ERROR was caused by a rate limit, recover once the pause expires.
+
+        Returns True if recovery was attempted (caller should skip other
+        error handling), False otherwise.
+        """
+        msg = (self.state.error_message or "").lower()
+        if "rate limit" not in msg and not re.search(r"\b429\b", msg):
+            return False
+        if self.state.rate_limited_until is None:
+            return False
+        if datetime.now(timezone.utc) < self.state.rate_limited_until:
+            remaining = (self.state.rate_limited_until - datetime.now(timezone.utc)).total_seconds()
+            self.log_event(f"Rate limit pause active, resuming in {int(remaining)}s")
+            return True
+        self.state.rate_limited_until = None
+        self.state.error_message = None
+        self._error_diagnose_count = 0
+        if (
+            self.state.current_pr is not None
+            and self.state.current_task is not None
+            and self.state.current_pr.branch == self.state.current_task.branch
+        ):
+            self.state.state = PipelineState.WATCH
+            self.log_event("Rate limit expired, resuming -> WATCH")
+        else:
+            self.state.state = PipelineState.IDLE
+            self.log_event("Rate limit expired, resuming -> IDLE")
+        return True
+
+    def _detect_rate_limit(self, stderr: str) -> None:
+        """Set rate-limit pause if stderr contains rate-limit signals."""
+        threshold = self.app_config.daemon.rate_limit_pause_percent
+        lower = stderr.lower()
+        triggered = False
+        if re.search(r"\b429\b", stderr):
+            triggered = True
+        m = re.search(
+            r"(\d{1,3})%\s*(?:of\s+)?(?:your\s+)?rate\s*limit"
+            r"|rate\s*limit\s+(?:at\s+)?(\d{1,3})%",
+            lower,
+        )
+        if not triggered and m:
+            pct = int(m.group(1) or m.group(2))
+            triggered = pct >= threshold
+        if not triggered and not m and "rate limit" in lower:
+            triggered = True
+        if triggered:
+            pause_min = 30
+            self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=pause_min)
+            self.log_event(f"Rate limit detected, pausing for {pause_min} min")
+
     async def handle_coding(self) -> None:
         """Run ``PLANNED PR`` via the claude CLI and hand off to WATCH.
 
@@ -1261,6 +1326,9 @@ return 0
         for the PR; because the list API is eventually consistent, we
         retry a few times before surfacing an ERROR.
         """
+        if not self._check_rate_limit():
+            return
+
         target_branch = (
             self.state.current_task.branch if self.state.current_task else None
         )
@@ -1278,6 +1346,7 @@ return 0
             timeout=self.app_config.daemon.planned_pr_timeout_sec,
         )
         await self._save_cli_log(stdout, stderr, "PLANNED PR output")
+        self._detect_rate_limit(stderr)
         if code != 0:
             self.state.state = PipelineState.ERROR
             self.state.error_message = stderr.strip() or f"claude exit {code}"
@@ -1436,6 +1505,9 @@ return 0
 
     async def handle_fix(self) -> None:
         """Run ``FIX REVIEW`` via the claude CLI and return to WATCH."""
+        if not self._check_rate_limit():
+            return
+
         if (
             self.state.current_pr is not None
             and self.state.current_pr.is_cross_repository
@@ -1495,6 +1567,7 @@ return 0
             timeout=self.app_config.daemon.fix_review_timeout_sec,
         )
         await self._save_cli_log(stdout, stderr, "FIX REVIEW output")
+        self._detect_rate_limit(stderr)
         if code != 0:
             self.state.state = PipelineState.ERROR
             self.state.error_message = stderr.strip() or f"claude exit {code}"
@@ -1572,6 +1645,13 @@ return 0
                     if "CONFLICT" in (
                         merge_result.stdout + merge_result.stderr
                     ):
+                        if not self._check_rate_limit():
+                            _git(
+                                self.repo_path,
+                                "merge", "--abort",
+                                check=False,
+                            )
+                            return
                         self.log_event(
                             "Merge conflict with main, resolving..."
                         )
@@ -2031,9 +2111,12 @@ return 0
 
     async def handle_error(self, error_context: str | None = None) -> None:
         """Ask the claude CLI whether to FIX, SKIP, or ESCALATE the error."""
+        if not self._check_rate_limit():
+            return
+
         context = error_context or self.state.error_message or "Unknown error"
         lowered = context.lower()
-        if any(kw in lowered for kw in ("rate limit", "timeout", "429")):
+        if "rate limit" in lowered or "timeout" in lowered or re.search(r"\b429\b", lowered):
             self.log_event("Skipping AI diagnosis for rate-limit/timeout error")
             return
         self._error_diagnose_count += 1
@@ -2045,6 +2128,7 @@ return 0
         code, stdout, stderr = claude_cli.diagnose_error(
             self.repo_path, context, model=self.app_config.daemon.claude_model
         )
+        self._detect_rate_limit(stderr)
         if code != 0:
             self.log_event(
                 f"diagnose_error CLI failed: {stderr.strip() or f'exit {code}'}"

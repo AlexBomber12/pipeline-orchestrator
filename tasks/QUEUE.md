@@ -240,7 +240,7 @@
 - Depends on: PR-038
 
 ## PR-040: Rate limit auto-pause
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-040.md
 - Branch: pr-040-rate-limit
 - Depends on: PR-041

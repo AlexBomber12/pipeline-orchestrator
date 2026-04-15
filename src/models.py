@@ -78,3 +78,4 @@ class RepoState(BaseModel):
     history: list[dict] = Field(default_factory=list)
     pending_queue_sync_branch: str | None = None
     pending_queue_sync_started_at: datetime | None = None
+    rate_limited_until: datetime | None = None
