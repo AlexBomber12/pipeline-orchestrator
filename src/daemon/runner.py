@@ -1301,7 +1301,7 @@ return 0
         elif re.search(r"\b429\b", stderr) or "rate limit" in lower:
             triggered = True
         if triggered:
-            pause_min = max(1, int(30 * threshold / 100))
+            pause_min = 30
             self._rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=pause_min)
             self.log_event(f"Rate limit detected, pausing for {pause_min} min")
 

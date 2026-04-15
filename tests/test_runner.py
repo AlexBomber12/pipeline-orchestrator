@@ -3672,10 +3672,10 @@ def test_detect_rate_limit_respects_threshold(
     assert runner._rate_limited_until is not None
 
 
-def test_detect_rate_limit_scales_pause_duration(
+def test_detect_rate_limit_fixed_pause_duration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """_detect_rate_limit scales pause duration by rate_limit_pause_percent."""
+    """_detect_rate_limit always uses a fixed 30-minute cooldown."""
     _patch_subprocess(monkeypatch)
     runner = _make_runner()
     runner.app_config.daemon.rate_limit_pause_percent = 50
@@ -3683,7 +3683,7 @@ def test_detect_rate_limit_scales_pause_duration(
     runner._detect_rate_limit("Error: 429 Too Many Requests")
 
     assert runner._rate_limited_until is not None
-    expected_pause = timedelta(minutes=15)
+    expected_pause = timedelta(minutes=30)
     actual_pause = runner._rate_limited_until - datetime.now(timezone.utc)
     assert actual_pause > expected_pause - timedelta(seconds=5)
     assert actual_pause < expected_pause + timedelta(seconds=5)
