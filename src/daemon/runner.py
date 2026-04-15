@@ -1302,8 +1302,8 @@ return 0
         if re.search(r"\b429\b", stderr):
             triggered = True
         m = re.search(
-            r"(\d{1,3})%\s*(?:of\s+)?(?:rate\s*limit|capacity)"
-            r"|(?:rate\s*limit|capacity)\s+(?:at\s+)?(\d{1,3})%",
+            r"(\d{1,3})%\s*(?:of\s+)?(?:your\s+)?rate\s*limit"
+            r"|rate\s*limit\s+(?:at\s+)?(\d{1,3})%",
             lower,
         )
         if not triggered and m:
