@@ -28,6 +28,8 @@ When triggered by the pipeline orchestrator daemon (non-interactive):
 - Do not ask for confirmation or clarification.
 - If something is unclear, commit what you have and note the ambiguity in the PR description.
 - Log all decisions to stdout for the daemon to capture.
+- NEVER create, stage, or commit files in the artifacts/ directory.
+- NEVER commit .patch files to the repository.
 
 ## Codex Review gate (GitHub PR)
 
