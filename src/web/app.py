@@ -62,7 +62,9 @@ async def _get_repo_state_safe(
     try:
         raw = await redis_client.get(f"pipeline:{name}")
     except Exception:
-        return _default_repo_state(name, url), "Redis unavailable"
+        st = _default_repo_state(name, url)
+        st.error_message = "Redis unavailable — state unknown"
+        return st, "Redis unavailable"
     if raw is None:
         st = _default_repo_state(name, url)
         st.error_message = "Waiting for daemon to initialize"
