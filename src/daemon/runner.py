@@ -393,11 +393,6 @@ class PipelineRunner:
         """Serialize ``self.state`` and write it to Redis."""
         self.state.active = self.repo_config.active
         self.state.last_updated = datetime.now(timezone.utc)
-        if (
-            self.state.rate_limited_until is not None
-            and datetime.now(timezone.utc) >= self.state.rate_limited_until
-        ):
-            self.state.rate_limited_until = None
         if not self.repo_config.active:
             data = self.state.model_dump()
             data["state"] = PipelineState.IDLE.value

@@ -38,6 +38,7 @@ REPOS_DIR = "/data/repos"
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+templates.env.globals["utcnow"] = lambda: datetime.now(timezone.utc)
 
 
 def _default_repo_state(
