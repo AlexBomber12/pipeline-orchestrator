@@ -10,10 +10,10 @@ index 68102f4..24b221d 100644
  ENTRYPOINT ["bash", "scripts/entrypoint.sh"]
  CMD ["uvicorn", "src.web.app:app", "--host", "0.0.0.0", "--port", "8000"]
 diff --git a/src/web/app.py b/src/web/app.py
-index 5cbab66..9fe5c01 100644
+index 5cbab66..f0cde7e 100644
 --- a/src/web/app.py
 +++ b/src/web/app.py
-@@ -40,19 +40,44 @@ _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+@@ -40,19 +40,46 @@ _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
  templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
  
  
@@ -43,10 +43,12 @@ index 5cbab66..9fe5c01 100644
 +        raw = await redis_client.get(f"pipeline:{name}")
 +    except Exception:
 +        st = _default_repo_state(name, url)
++        st.state = PipelineState.PREFLIGHT
 +        st.error_message = "Redis unavailable — state unknown"
 +        return st, "Redis unavailable"
 +    if raw is None:
 +        st = _default_repo_state(name, url)
++        st.state = PipelineState.PREFLIGHT
 +        st.error_message = "Waiting for daemon to initialize"
 +        return st, "Awaiting daemon initialization"
 +    try:
@@ -61,7 +63,7 @@ index 5cbab66..9fe5c01 100644
  async def get_repo_state(
      name: str,
      redis_client: aioredis.Redis | None,
-@@ -77,15 +102,8 @@ async def get_repo_state(
+@@ -77,15 +104,8 @@ async def get_repo_state(
              break
  
      if found and redis_client is not None:
@@ -79,7 +81,7 @@ index 5cbab66..9fe5c01 100644
  
      return _default_repo_state(name, url)
  
-@@ -93,41 +111,38 @@ async def get_repo_state(
+@@ -93,41 +113,39 @@ async def get_repo_state(
  async def get_all_repo_states(
      redis_client: aioredis.Redis | None,
      config_path: str = CONFIG_PATH,
@@ -127,6 +129,7 @@ index 5cbab66..9fe5c01 100644
  
          if state is None:
              state = _default_repo_state(name, repo.url)
++            state.state = PipelineState.PREFLIGHT
 +            state.error_message = "Redis unavailable — state unknown"
  
          states.append(state)
@@ -136,7 +139,7 @@ index 5cbab66..9fe5c01 100644
  
  
  _MERGE_EVENT_MARKER = "Merged PR"
-@@ -475,7 +490,7 @@ app = FastAPI(title="Pipeline Orchestrator", lifespan=lifespan)
+@@ -475,7 +493,7 @@ app = FastAPI(title="Pipeline Orchestrator", lifespan=lifespan)
  @app.get("/", response_class=HTMLResponse)
  async def index(request: Request) -> HTMLResponse:
      redis_client = getattr(request.app.state, "redis", None)
@@ -145,7 +148,7 @@ index 5cbab66..9fe5c01 100644
      stats = _compute_stats(states)
      alerts = _build_alerts(states)
      latest_alert = min(alerts, key=lambda a: a["duration_seconds"]) if alerts else None
-@@ -487,6 +502,7 @@ async def index(request: Request) -> HTMLResponse:
+@@ -487,6 +505,7 @@ async def index(request: Request) -> HTMLResponse:
              "repos": states,
              "stats": stats,
              "latest_alert": latest_alert,
@@ -153,7 +156,7 @@ index 5cbab66..9fe5c01 100644
          },
      )
  
-@@ -494,32 +510,50 @@ async def index(request: Request) -> HTMLResponse:
+@@ -494,32 +513,50 @@ async def index(request: Request) -> HTMLResponse:
  @app.get("/api/states")
  async def api_states(request: Request) -> JSONResponse:
      redis_client = getattr(request.app.state, "redis", None)
@@ -209,7 +212,7 @@ index 5cbab66..9fe5c01 100644
      stats = _compute_stats(states)
      alerts = _build_alerts(states)
      latest_alert = min(alerts, key=lambda a: a["duration_seconds"]) if alerts else None
-@@ -533,7 +567,7 @@ async def partial_stats(request: Request) -> HTMLResponse:
+@@ -533,7 +570,7 @@ async def partial_stats(request: Request) -> HTMLResponse:
  @app.get("/partials/activity-feed", response_class=HTMLResponse)
  async def partial_activity_feed(request: Request) -> HTMLResponse:
      redis_client = getattr(request.app.state, "redis", None)
@@ -218,7 +221,7 @@ index 5cbab66..9fe5c01 100644
      feed = _build_activity_feed(states)
      return templates.TemplateResponse(
          request,
-@@ -545,7 +579,7 @@ async def partial_activity_feed(request: Request) -> HTMLResponse:
+@@ -545,7 +582,7 @@ async def partial_activity_feed(request: Request) -> HTMLResponse:
  @app.get("/partials/alerts", response_class=HTMLResponse)
  async def partial_alerts(request: Request) -> HTMLResponse:
      redis_client = getattr(request.app.state, "redis", None)
@@ -353,7 +356,7 @@ index 440ce3e..0e14b5d 100644
      with patch.object(main_module.subprocess, "run") as mock_run:
          mock_run.return_value = subprocess.CompletedProcess(
 diff --git a/tests/test_web_app.py b/tests/test_web_app.py
-index f23ce4e..2fdfa9e 100644
+index f23ce4e..a3bf7d1 100644
 --- a/tests/test_web_app.py
 +++ b/tests/test_web_app.py
 @@ -83,14 +83,15 @@ def two_repo_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -366,7 +369,8 @@ index f23ce4e..2fdfa9e 100644
 +    assert warning is None
      assert [s.name for s in states] == ["example__alpha", "example__beta"]
      for state in states:
-         assert state.state == PipelineState.IDLE
+-        assert state.state == PipelineState.IDLE
++        assert state.state == PipelineState.PREFLIGHT
          assert state.current_task is None
          assert state.current_pr is None
 -        assert state.error_message is None
@@ -388,9 +392,10 @@ index f23ce4e..2fdfa9e 100644
      assert states[0].current_pr is not None
      assert states[0].current_pr.number == 42
 -    # second repo has no redis entry -> idle default
-+    # second repo has no redis entry -> awaiting initialization
-     assert states[1].state == PipelineState.IDLE
+-    assert states[1].state == PipelineState.IDLE
 -    assert states[1].current_task is None
++    # second repo has no redis entry -> awaiting initialization
++    assert states[1].state == PipelineState.PREFLIGHT
 +    assert states[1].error_message == "Waiting for daemon to initialize"
  
  
@@ -408,6 +413,15 @@ index f23ce4e..2fdfa9e 100644
      # After the first failure further Redis lookups must be skipped so an
      # unreachable broker cannot turn each repo into another timing-out call.
      assert boom.calls == ["pipeline:example__alpha"]
+@@ -171,7 +172,7 @@ def test_api_states_returns_json(
+     assert isinstance(payload, list)
+     assert {p["name"] for p in payload} == {"example__alpha", "example__beta"}
+     for entry in payload:
+-        assert entry["state"] == "IDLE"
++        assert entry["state"] == "PREFLIGHT"
+ 
+ 
+ def test_partial_repo_list_returns_html_fragment(
 @@ -187,8 +188,7 @@ def test_partial_repo_list_returns_html_fragment(
      assert "<!DOCTYPE" not in body  # fragment, not full document
      assert "alpha" in body
@@ -418,6 +432,15 @@ index f23ce4e..2fdfa9e 100644
  
  
  def test_partial_repo_list_empty_state(
+@@ -366,7 +366,7 @@ def test_partial_repo_detail_returns_html_fragment(
+     body = response.text
+     assert "<!DOCTYPE" not in body  # fragment, not full document
+     assert "alpha" in body
+-    assert "IDLE" in body
++    assert "PREFLIGHT" in body
+     assert "Current Task" in body
+     assert "Current PR" in body
+     # Event log has been split out of /partials/repo/{name} — it now
 @@ -551,3 +551,52 @@ def test_updated_header_has_data_ts(
      assert response.status_code == 200
      body = response.text
