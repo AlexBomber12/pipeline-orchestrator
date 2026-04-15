@@ -461,32 +461,40 @@ def get_branch_last_push_time(
     return None
 
 
-def get_head_commit_age_seconds(repo: str, pr_number: int) -> float | None:
-    """Return the age in seconds of the PR head commit's committer date.
+def get_last_push_age_seconds(repo: str, pr_number: int) -> float | None:
+    """Return seconds since the last push to the PR branch.
+
+    Uses the GitHub repository activity API to find the most recent push
+    event on the PR's head ref, which reflects the actual push timestamp
+    (not the commit's committer date).
 
     Returns ``None`` on any API or parse failure.
     """
     try:
-        raw = run_gh([
+        branch_raw = run_gh([
             "api",
             f"repos/{repo}/pulls/{pr_number}",
             "--jq",
-            ".head.sha",
+            ".head.ref",
         ])
-        sha = raw.strip() if isinstance(raw, str) else ""
-        if not sha:
+        branch = branch_raw.strip() if isinstance(branch_raw, str) else ""
+        if not branch:
             return None
         date_raw = run_gh([
             "api",
-            f"repos/{repo}/commits/{sha}",
+            f"repos/{repo}/activity",
+            "-f", f"ref=refs/heads/{branch}",
+            "-f", "activity_type=push",
+            "-f", "per_page=1",
+            "-f", "direction=desc",
             "--jq",
-            ".commit.committer.date",
+            ".[0].timestamp",
         ])
         date_str = date_raw.strip() if isinstance(date_raw, str) else ""
         if not date_str:
             return None
-        commit_dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-        age = (datetime.now(timezone.utc) - commit_dt).total_seconds()
+        push_dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - push_dt).total_seconds()
         return max(0.0, age)
     except Exception:
         return None
