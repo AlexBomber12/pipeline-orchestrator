@@ -386,4 +386,4 @@ def test_update_daemon_config_rate_limit(tmp_path: Path) -> None:
 
 def test_repo_poll_interval_default() -> None:
     repo = RepoConfig(url="https://github.com/example/repo")
-    assert repo.poll_interval_sec == 60
+    assert repo.poll_interval_sec is None

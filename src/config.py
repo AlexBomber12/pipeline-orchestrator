@@ -43,7 +43,7 @@ class RepoConfig(BaseModel):
     # custom value.
     review_timeout_min: int | None = None
     active: bool = True
-    poll_interval_sec: int = 60
+    poll_interval_sec: int | None = None
 
 
 class DaemonConfig(BaseModel):
