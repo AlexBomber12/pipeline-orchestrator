@@ -452,6 +452,13 @@ class PipelineRunner:
             self.state.history = self.state.history[-_HISTORY_LIMIT:]
         logger.info("[%s] %s", self.name, event)
 
+    async def _publish_while_waiting(self, label: str) -> None:
+        """Publish state every 30s while a long-running CLI call is active."""
+        while True:
+            await asyncio.sleep(30)
+            self.log_event(f"{label}...")
+            await self.publish_state()
+
     async def ensure_repo_cloned(self) -> None:
         """Clone the repo if missing, otherwise fetch ``origin/{branch}``.
 
@@ -1340,11 +1347,15 @@ return 0
             self.log_event(self.state.error_message)
             return
 
-        code, stdout, stderr = await claude_cli.run_planned_pr_async(
-            self.repo_path,
-            model=self.app_config.daemon.claude_model,
-            timeout=self.app_config.daemon.planned_pr_timeout_sec,
-        )
+        heartbeat = asyncio.create_task(self._publish_while_waiting("CODING"))
+        try:
+            code, stdout, stderr = await claude_cli.run_planned_pr_async(
+                self.repo_path,
+                model=self.app_config.daemon.claude_model,
+                timeout=self.app_config.daemon.planned_pr_timeout_sec,
+            )
+        finally:
+            heartbeat.cancel()
         await self._save_cli_log(stdout, stderr, "PLANNED PR output")
         self._detect_rate_limit(stderr)
         if code != 0:
@@ -1561,11 +1572,15 @@ return 0
                 self.log_event(self.state.error_message)
                 return
 
-        code, stdout, stderr = await claude_cli.fix_review_async(
-            self.repo_path,
-            model=self.app_config.daemon.claude_model,
-            timeout=self.app_config.daemon.fix_review_timeout_sec,
-        )
+        heartbeat = asyncio.create_task(self._publish_while_waiting("FIX"))
+        try:
+            code, stdout, stderr = await claude_cli.fix_review_async(
+                self.repo_path,
+                model=self.app_config.daemon.claude_model,
+                timeout=self.app_config.daemon.fix_review_timeout_sec,
+            )
+        finally:
+            heartbeat.cancel()
         await self._save_cli_log(stdout, stderr, "FIX REVIEW output")
         self._detect_rate_limit(stderr)
         if code != 0:

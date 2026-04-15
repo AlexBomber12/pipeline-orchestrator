@@ -258,7 +258,7 @@
 - Depends on: PR-042
 
 ## PR-044: Heartbeat during Claude CLI calls
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-044.md
 - Branch: pr-044-heartbeat
 - Depends on: PR-042
