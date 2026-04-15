@@ -147,7 +147,7 @@ async def run_claude_async(
     if model:
         cmd.extend(["--model", model])
     if system_prompt_file:
-        cmd.extend(["--system-prompt-file", system_prompt_file])
+        cmd.extend(["--append-system-prompt-file", system_prompt_file])
     cmd.extend(["--max-turns", "30"])
     cmd.append(prompt)
     logger.info("running claude CLI with prompt: %s", prompt[:80])

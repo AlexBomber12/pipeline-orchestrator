@@ -347,7 +347,7 @@ async def test_run_claude_async_success(monkeypatch: pytest.MonkeyPatch) -> None
     assert cmd[0] == "claude"
     assert "--bare" in cmd
     assert "--no-session-persistence" in cmd
-    assert "--system-prompt-file" in cmd
+    assert "--append-system-prompt-file" in cmd
     assert "CLAUDE.md" in cmd
     assert "--max-turns" in cmd
     assert "30" in cmd
@@ -399,7 +399,7 @@ async def test_run_claude_async_bare_flags(monkeypatch: pytest.MonkeyPatch) -> N
     cmd = captured["cmd"]
     assert "--bare" in cmd
     assert "--no-session-persistence" in cmd
-    assert "--system-prompt-file" in cmd
+    assert "--append-system-prompt-file" in cmd
     assert "CLAUDE.md" in cmd
     assert "--max-turns" in cmd
     assert "30" in cmd
@@ -421,5 +421,5 @@ async def test_diagnose_error_async_skips_system_prompt(monkeypatch: pytest.Monk
     assert code == 0
     assert stdout == "FIX\nretry"
     cmd = captured["cmd"]
-    assert "--system-prompt-file" not in cmd
+    assert "--append-system-prompt-file" not in cmd
     assert "CLAUDE.md" not in cmd
