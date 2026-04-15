@@ -29,6 +29,7 @@ def run_claude(
         "--print",
         "--dangerously-skip-permissions",
         "--bare",
+        "--strict-mcp-config",
         "--no-session-persistence",
     ]
     if model:
