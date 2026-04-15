@@ -7,6 +7,7 @@ and ``FIX REVIEW``) plus an infrastructure-error diagnosis helper.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 
 logger = logging.getLogger(__name__)
@@ -27,12 +28,26 @@ def run_claude(
         "claude",
         "--print",
         "--dangerously-skip-permissions",
+        "--bare",
         "--no-session-persistence",
     ]
     if model:
         cmd.extend(["--model", model])
+    cmd.extend(["--system-prompt-file", "CLAUDE.md"])
+    cmd.extend(["--max-turns", "30"])
     cmd.append(prompt)
     logger.info("running claude CLI with prompt: %s", prompt[:80])
+
+    # Preserve any pre-existing NODE_OPTIONS (e.g. CA bundle, proxy flags set
+    # by the daemon environment) and append the memory cap rather than
+    # clobbering them.
+    memory_flag = "--max-old-space-size=4096"
+    existing_node_options = os.environ.get("NODE_OPTIONS", "").strip()
+    node_options = (
+        f"{existing_node_options} {memory_flag}".strip()
+        if existing_node_options
+        else memory_flag
+    )
 
     try:
         result = subprocess.run(
@@ -42,6 +57,7 @@ def run_claude(
             timeout=timeout,
             cwd=cwd,
             stdin=subprocess.DEVNULL,
+            env={**os.environ, "NODE_OPTIONS": node_options},
         )
     except subprocess.TimeoutExpired:
         logger.error("claude CLI timed out after %ss", timeout)

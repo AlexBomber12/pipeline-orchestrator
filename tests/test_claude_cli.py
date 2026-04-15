@@ -32,6 +32,7 @@ def test_run_claude_success(monkeypatch: pytest.MonkeyPatch) -> None:
         return _FakeCompletedProcess(stdout="hello", stderr="warn", returncode=0)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.delenv("NODE_OPTIONS", raising=False)
 
     result = run_claude("do a thing", "/data/repos/demo", timeout=42)
 
@@ -40,7 +41,12 @@ def test_run_claude_success(monkeypatch: pytest.MonkeyPatch) -> None:
         "claude",
         "--print",
         "--dangerously-skip-permissions",
+        "--bare",
         "--no-session-persistence",
+        "--system-prompt-file",
+        "CLAUDE.md",
+        "--max-turns",
+        "30",
         "do a thing",
     ]
     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
@@ -48,6 +54,27 @@ def test_run_claude_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured["kwargs"]["capture_output"] is True
     assert captured["kwargs"]["text"] is True
     assert captured["kwargs"]["stdin"] is subprocess.DEVNULL
+    assert captured["kwargs"]["env"]["NODE_OPTIONS"] == "--max-old-space-size=4096"
+
+
+def test_run_claude_appends_to_existing_node_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured["kwargs"] = kwargs
+        return _FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setenv("NODE_OPTIONS", "--use-openssl-ca")
+
+    run_claude("prompt", "/tmp")
+
+    assert (
+        captured["kwargs"]["env"]["NODE_OPTIONS"]
+        == "--use-openssl-ca --max-old-space-size=4096"
+    )
 
 
 def test_run_claude_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -122,9 +149,14 @@ def test_run_claude_with_model(monkeypatch: pytest.MonkeyPatch) -> None:
         "claude",
         "--print",
         "--dangerously-skip-permissions",
+        "--bare",
         "--no-session-persistence",
         "--model",
         "opus",
+        "--system-prompt-file",
+        "CLAUDE.md",
+        "--max-turns",
+        "30",
         "do a thing",
     ]
 
