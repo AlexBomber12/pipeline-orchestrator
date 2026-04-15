@@ -23,7 +23,12 @@ def run_claude(
     Returns ``(returncode, stdout, stderr)``. On timeout, missing CLI, or
     missing ``cwd``, returns ``(-1, "", <error message>)`` instead of raising.
     """
-    cmd = ["claude", "--print", "--dangerously-skip-permissions"]
+    cmd = [
+        "claude",
+        "--print",
+        "--dangerously-skip-permissions",
+        "--no-session-persistence",
+    ]
     if model:
         cmd.extend(["--model", model])
     cmd.append(prompt)
