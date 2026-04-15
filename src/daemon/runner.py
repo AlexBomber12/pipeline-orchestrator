@@ -1295,10 +1295,12 @@ return 0
         threshold = self.app_config.daemon.rate_limit_pause_percent
         lower = stderr.lower()
         triggered = False
+        if re.search(r"\b429\b", stderr):
+            triggered = True
         m = re.search(r"(\d{1,3})%\s*(?:of\s+)?(?:rate\s*limit|capacity)", lower)
-        if m:
+        if not triggered and m:
             triggered = int(m.group(1)) >= threshold
-        elif re.search(r"\b429\b", stderr) or "rate limit" in lower:
+        if not triggered and not m and "rate limit" in lower:
             triggered = True
         if triggered:
             pause_min = 30
