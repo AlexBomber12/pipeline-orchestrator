@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 _REPO_FIELDS = {
     "url",
@@ -44,6 +44,16 @@ class RepoConfig(BaseModel):
     review_timeout_min: int | None = None
     active: bool = True
     poll_interval_sec: int | None = None
+
+    @field_validator("poll_interval_sec", mode="before")
+    @classmethod
+    def _poll_interval_at_least_one(cls, v: Any) -> int | None:
+        if v is None:
+            return None
+        v = int(v)
+        if v < 1:
+            raise ValueError("poll_interval_sec must be at least 1")
+        return v
 
 
 class DaemonConfig(BaseModel):
