@@ -1527,8 +1527,10 @@ return 0
     ) -> None:
         """Cancel *target* if no new push is detected within *idle_limit* seconds."""
         # Prime the SHA tracker so the first poll can detect a change.
+        primed = False
         try:
             github_client.get_branch_last_push_time(self.owner_repo, pr_number)
+            primed = True
         except github_client.GitHubPollError:
             pass
 
@@ -1539,6 +1541,9 @@ return 0
                 latest_push_at = github_client.get_branch_last_push_time(
                     self.owner_repo, pr_number
                 )
+                if not primed:
+                    last_known_push = time.monotonic()
+                    primed = True
             except github_client.GitHubPollError:
                 self.log_event("FIX: GitHub API poll failed, preserving deadline")
                 latest_push_at = None
