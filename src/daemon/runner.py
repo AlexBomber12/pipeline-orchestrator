@@ -1547,7 +1547,8 @@ return 0
                     self.owner_repo, pr_number,
                 )
                 if not primed:
-                    last_known_push = time.monotonic()
+                    if latest_push_at is not None:
+                        last_known_push = time.monotonic()
                     primed = True
             except github_client.GitHubPollError:
                 self.log_event("FIX: GitHub API poll failed, preserving deadline")
