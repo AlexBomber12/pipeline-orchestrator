@@ -1271,7 +1271,7 @@ return 0
         m = re.search(r"(\d{1,3})%\s*(?:of\s+)?(?:rate\s*limit|capacity)", lower)
         if m:
             triggered = int(m.group(1)) >= threshold
-        elif "429" in stderr:
+        elif "429" in stderr or "rate limit" in lower:
             triggered = True
         if triggered:
             pause_min = max(1, int(30 * threshold / 100))
