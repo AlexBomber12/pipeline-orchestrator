@@ -245,7 +245,7 @@
 - Branch: pr-040-rate-limit
 - Depends on: PR-041
 
-## PR-042: Async Claude CLI and per-repo scheduling
+## PR-042: Async Claude CLI
 - Status: TODO
 - Tasks file: tasks/PR-042.md
 - Branch: pr-042-async-cli
@@ -255,4 +255,22 @@
 - Status: TODO
 - Tasks file: tasks/PR-043.md
 - Branch: pr-043-gh-api-optimize
+- Depends on: PR-042
+
+## PR-044: Heartbeat during Claude CLI calls
+- Status: TODO
+- Tasks file: tasks/PR-044.md
+- Branch: pr-044-heartbeat
+- Depends on: PR-042
+
+## PR-045: FIX idle timeout based on last push
+- Status: TODO
+- Tasks file: tasks/PR-045.md
+- Branch: pr-045-idle-timeout
+- Depends on: PR-042
+
+## PR-046: Per-repo poll interval
+- Status: TODO
+- Tasks file: tasks/PR-046.md
+- Branch: pr-046-per-repo-poll
 - Depends on: PR-042
