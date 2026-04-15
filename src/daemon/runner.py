@@ -1560,7 +1560,8 @@ return 0
                 )
                 if not primed:
                     primed = True
-                    last_known_push = time.monotonic()
+                    if latest_push_at is not None:
+                        last_known_push = time.monotonic()
             except github_client.GitHubPollError:
                 self.log_event("FIX: GitHub API poll failed, preserving deadline")
                 latest_push_at = None
