@@ -439,7 +439,7 @@ def get_branch_last_push_time(
             "--jq",
             ".head.sha",
         ])
-    except RuntimeError:
+    except (RuntimeError, subprocess.TimeoutExpired):
         return None
     sha = raw.strip() if isinstance(raw, str) else ""
     if not sha:

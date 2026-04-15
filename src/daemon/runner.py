@@ -1525,6 +1525,8 @@ return 0
         target: asyncio.Task,  # type: ignore[type-arg]
     ) -> None:
         """Cancel *target* if no new push is detected within *idle_limit* seconds."""
+        # Prime the SHA tracker so the first poll can detect a change.
+        github_client.get_branch_last_push_time(self.owner_repo, pr_number)
         last_known_push = time.monotonic()
         while True:
             await asyncio.sleep(60)
