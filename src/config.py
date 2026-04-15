@@ -84,6 +84,12 @@ def load_config(path: str = "config.yml") -> AppConfig:
     with config_path.open("r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh) or {}
 
+    daemon = raw.get("daemon")
+    if isinstance(daemon, dict):
+        legacy = daemon.pop("fix_review_timeout_sec", None)
+        if legacy is not None and "fix_idle_timeout_sec" not in daemon:
+            daemon["fix_idle_timeout_sec"] = legacy
+
     return AppConfig.model_validate(raw)
 
 
