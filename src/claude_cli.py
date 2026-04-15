@@ -133,7 +133,7 @@ def _build_node_options() -> str:
 async def run_claude_async(
     prompt: str,
     cwd: str,
-    timeout: int = 600,
+    timeout: int | None = 600,
     model: str | None = None,
     system_prompt_file: str | None = "CLAUDE.md",
 ) -> tuple[int, str, str]:
@@ -172,6 +172,11 @@ async def run_claude_async(
         await proc.wait()
         logger.error("claude CLI timed out after %ss", timeout)
         return (-1, "", f"Timeout after {timeout}s")
+    except asyncio.CancelledError:
+        proc.kill()
+        await proc.wait()
+        logger.error("claude CLI task cancelled, subprocess killed")
+        raise
     except FileNotFoundError as exc:
         missing = getattr(exc, "filename", "")
         if missing and missing != cmd[0]:
@@ -190,7 +195,7 @@ async def run_planned_pr_async(
 
 
 async def fix_review_async(
-    repo_path: str, model: str | None = None, timeout: int = 3600
+    repo_path: str, model: str | None = None, timeout: int | None = None
 ) -> tuple[int, str, str]:
     return await run_claude_async(
         "FIX REVIEW", repo_path, timeout=timeout, model=model
