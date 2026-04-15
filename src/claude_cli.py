@@ -34,6 +34,7 @@ def run_claude(
     ]
     if model:
         cmd.extend(["--model", model])
+    cmd.extend(["--system-prompt-file", "CLAUDE.md"])
     cmd.extend(["--max-turns", "30"])
     cmd.append(prompt)
     logger.info("running claude CLI with prompt: %s", prompt[:80])
