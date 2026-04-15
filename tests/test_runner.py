@@ -3760,3 +3760,122 @@ def test_handle_fix_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert async_calls, "fix_review_async must be called"
     assert not sync_calls, "sync fix_review must NOT be called"
+
+
+def test_handle_coding_publishes_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """publish_state is called during Claude CLI run via heartbeat task."""
+    _patch_subprocess(monkeypatch)
+    heartbeat_publishes: list[str] = []
+
+    original_publish = PipelineRunner.publish_state
+
+    async def counting_publish(self: Any) -> None:
+        await original_publish(self)
+
+    monkeypatch.setattr(PipelineRunner, "publish_state", counting_publish)
+
+    cli_done = None
+
+    async def slow_cli(
+        path: str, model: str | None = None, timeout: int | None = None
+    ) -> tuple[int, str, str]:
+        nonlocal cli_done
+        cli_done = asyncio.get_event_loop().create_future()
+        await cli_done
+        return (0, "ok", "")
+
+    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr_async", slow_cli)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [PRInfo(number=1, branch="pr-001")],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "post_comment", lambda *a, **kw: None
+    )
+
+    original_pww = PipelineRunner._publish_while_waiting
+
+    async def fast_heartbeat(self: Any, label: str) -> None:
+        while True:
+            await asyncio.sleep(0.01)
+            self.log_event(f"{label}...")
+            heartbeat_publishes.append(label)
+            await self.publish_state()
+
+    monkeypatch.setattr(
+        PipelineRunner, "_publish_while_waiting", fast_heartbeat
+    )
+
+    async def run() -> None:
+        runner = _make_runner()
+        runner.state.current_task = QueueTask(
+            pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
+        )
+        task = asyncio.create_task(runner.handle_coding())
+        await asyncio.sleep(0.05)
+        cli_done.set_result(None)
+        await task
+
+    asyncio.run(run())
+
+    assert len(heartbeat_publishes) >= 2, (
+        f"Expected heartbeat to publish at least twice, got {len(heartbeat_publishes)}"
+    )
+
+
+def test_handle_fix_publishes_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """publish_state is called during FIX REVIEW via heartbeat task."""
+    _patch_subprocess(monkeypatch)
+    heartbeat_publishes: list[str] = []
+
+    original_publish = PipelineRunner.publish_state
+
+    async def counting_publish(self: Any) -> None:
+        await original_publish(self)
+
+    monkeypatch.setattr(PipelineRunner, "publish_state", counting_publish)
+
+    cli_done = None
+
+    async def slow_cli(
+        path: str, model: str | None = None, timeout: int | None = None
+    ) -> tuple[int, str, str]:
+        nonlocal cli_done
+        cli_done = asyncio.get_event_loop().create_future()
+        await cli_done
+        return (0, "", "")
+
+    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", slow_cli)
+    monkeypatch.setattr(
+        runner_module.github_client, "post_comment", lambda *a, **kw: None
+    )
+
+    async def fast_heartbeat(self: Any, label: str) -> None:
+        while True:
+            await asyncio.sleep(0.01)
+            self.log_event(f"{label}...")
+            heartbeat_publishes.append(label)
+            await self.publish_state()
+
+    monkeypatch.setattr(
+        PipelineRunner, "_publish_while_waiting", fast_heartbeat
+    )
+
+    async def run() -> None:
+        runner = _make_runner()
+        runner.state.current_pr = PRInfo(number=10, branch="pr-001")
+        task = asyncio.create_task(runner.handle_fix())
+        await asyncio.sleep(0.05)
+        cli_done.set_result(None)
+        await task
+
+    asyncio.run(run())
+
+    assert len(heartbeat_publishes) >= 2, (
+        f"Expected heartbeat to publish at least twice, got {len(heartbeat_publishes)}"
+    )
