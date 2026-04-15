@@ -28,6 +28,7 @@ def run_claude(
         "claude",
         "--print",
         "--dangerously-skip-permissions",
+        "--bare",
         "--strict-mcp-config",
         "--no-session-persistence",
     ]
