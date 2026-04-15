@@ -40,17 +40,40 @@ _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
 
-def _default_repo_state(name: str, url: str) -> RepoState:
+def _default_repo_state(
+    name: str, url: str, *, error: str | None = None
+) -> RepoState:
     """Return a default ``IDLE`` state for ``name``/``url``."""
     return RepoState(
         url=url,
         name=name,
-        state=PipelineState.IDLE,
+        state=PipelineState.ERROR if error else PipelineState.IDLE,
         current_task=None,
         current_pr=None,
-        error_message=None,
+        error_message=error,
         last_updated=datetime.now(timezone.utc),
     )
+
+
+async def _get_repo_state_safe(
+    redis_client: aioredis.Redis, name: str, url: str
+) -> tuple[RepoState, str | None]:
+    """Return (state, warning). Warning is non-None when state is synthetic."""
+    try:
+        raw = await redis_client.get(f"pipeline:{name}")
+    except Exception:
+        return _default_repo_state(name, url), "Redis unavailable"
+    if raw is None:
+        st = _default_repo_state(name, url)
+        st.error_message = "Waiting for daemon to initialize"
+        return st, "Awaiting daemon initialization"
+    try:
+        return RepoState.model_validate_json(raw), None
+    except Exception:
+        return (
+            _default_repo_state(name, url, error="State decode failed"),
+            "State decode error",
+        )
 
 
 async def get_repo_state(
@@ -77,15 +100,8 @@ async def get_repo_state(
             break
 
     if found and redis_client is not None:
-        try:
-            payload = await redis_client.get(f"pipeline:{name}")
-        except Exception:
-            payload = None
-        if payload:
-            try:
-                return RepoState.model_validate_json(payload)
-            except Exception:
-                pass
+        state, _warning = await _get_repo_state_safe(redis_client, name, url)
+        return state
 
     return _default_repo_state(name, url)
 
@@ -93,41 +109,37 @@ async def get_repo_state(
 async def get_all_repo_states(
     redis_client: aioredis.Redis | None,
     config_path: str = CONFIG_PATH,
-) -> list[RepoState]:
-    """Return the list of repo states for every repo in ``config.yml``.
+) -> tuple[list[RepoState], str | None]:
+    """Return ``(states, redis_warning)`` for every repo in ``config.yml``.
 
-    For each configured repo, look up ``pipeline:{name}`` in Redis. If the
-    key is missing or Redis is unavailable, fall back to a default ``IDLE``
-    state with the current timestamp. Once a Redis read fails inside a single
-    request, further Redis lookups are skipped so an unreachable broker
-    cannot turn each configured repo into another timing-out call.
+    ``redis_warning`` is non-None when Redis is entirely unavailable; it is
+    intended for a top-level dashboard banner. Per-repo degradation (key
+    missing, decode failure) is encoded in the individual ``RepoState``
+    objects via ``error_message``.
     """
     cfg = load_config(config_path)
     states: list[RepoState] = []
     redis_available = redis_client is not None
+    redis_warning: str | None = None
 
     for repo in cfg.repositories:
         name = repo_slug_from_url(repo.url)
         state: RepoState | None = None
 
         if redis_available:
-            try:
-                payload = await redis_client.get(f"pipeline:{name}")
-            except Exception:
-                payload = None
+            state, warning = await _get_repo_state_safe(
+                redis_client, name, repo.url
+            )
+            if warning == "Redis unavailable":
                 redis_available = False
-            if payload:
-                try:
-                    state = RepoState.model_validate_json(payload)
-                except Exception:
-                    state = None
+                redis_warning = "Redis connection lost"
 
         if state is None:
             state = _default_repo_state(name, repo.url)
 
         states.append(state)
 
-    return states
+    return states, redis_warning
 
 
 _MERGE_EVENT_MARKER = "Merged PR"
@@ -475,7 +487,7 @@ app = FastAPI(title="Pipeline Orchestrator", lifespan=lifespan)
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
-    states = await get_all_repo_states(redis_client)
+    states, redis_warning = await get_all_repo_states(redis_client)
     stats = _compute_stats(states)
     alerts = _build_alerts(states)
     latest_alert = min(alerts, key=lambda a: a["duration_seconds"]) if alerts else None
@@ -487,6 +499,7 @@ async def index(request: Request) -> HTMLResponse:
             "repos": states,
             "stats": stats,
             "latest_alert": latest_alert,
+            "redis_warning": redis_warning,
         },
     )
 
@@ -494,32 +507,32 @@ async def index(request: Request) -> HTMLResponse:
 @app.get("/api/states")
 async def api_states(request: Request) -> JSONResponse:
     redis_client = getattr(request.app.state, "redis", None)
-    states = await get_all_repo_states(redis_client)
+    states, _warning = await get_all_repo_states(redis_client)
     return JSONResponse([s.model_dump(mode="json") for s in states])
 
 
 @app.get("/api/stats")
 async def api_stats(request: Request) -> JSONResponse:
     redis_client = getattr(request.app.state, "redis", None)
-    states = await get_all_repo_states(redis_client)
+    states, _warning = await get_all_repo_states(redis_client)
     return JSONResponse(_compute_stats(states))
 
 
 @app.get("/partials/repo-list", response_class=HTMLResponse)
 async def partial_repo_list(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
-    states = await get_all_repo_states(redis_client)
+    states, redis_warning = await get_all_repo_states(redis_client)
     return templates.TemplateResponse(
         request,
         "components/repo_cards.html",
-        {"repos": states},
+        {"repos": states, "redis_warning": redis_warning},
     )
 
 
 @app.get("/partials/stats", response_class=HTMLResponse)
 async def partial_stats(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
-    states = await get_all_repo_states(redis_client)
+    states, _warning = await get_all_repo_states(redis_client)
     stats = _compute_stats(states)
     alerts = _build_alerts(states)
     latest_alert = min(alerts, key=lambda a: a["duration_seconds"]) if alerts else None
@@ -533,7 +546,7 @@ async def partial_stats(request: Request) -> HTMLResponse:
 @app.get("/partials/activity-feed", response_class=HTMLResponse)
 async def partial_activity_feed(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
-    states = await get_all_repo_states(redis_client)
+    states, _warning = await get_all_repo_states(redis_client)
     feed = _build_activity_feed(states)
     return templates.TemplateResponse(
         request,
@@ -545,7 +558,7 @@ async def partial_activity_feed(request: Request) -> HTMLResponse:
 @app.get("/partials/alerts", response_class=HTMLResponse)
 async def partial_alerts(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
-    states = await get_all_repo_states(redis_client)
+    states, _warning = await get_all_repo_states(redis_client)
     alerts = _build_alerts(states)
     return templates.TemplateResponse(
         request,

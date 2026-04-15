@@ -83,8 +83,9 @@ def two_repo_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def test_get_all_repo_states_no_redis_returns_idle_defaults(
     two_repo_config: Path,
 ) -> None:
-    states = asyncio.run(get_all_repo_states(redis_client=None))
+    states, warning = asyncio.run(get_all_repo_states(redis_client=None))
 
+    assert warning is None
     assert [s.name for s in states] == ["example__alpha", "example__beta"]
     for state in states:
         assert state.state == PipelineState.IDLE
@@ -116,27 +117,27 @@ def test_get_all_repo_states_uses_redis_when_present(
     )
     fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
 
-    states = asyncio.run(get_all_repo_states(redis_client=fake))
+    states, warning = asyncio.run(get_all_repo_states(redis_client=fake))
 
+    assert warning is None
     assert states[0].state == PipelineState.CODING
     assert states[0].current_task is not None
     assert states[0].current_task.pr_id == "PR-099"
     assert states[0].current_pr is not None
     assert states[0].current_pr.number == 42
-    # second repo has no redis entry -> idle default
+    # second repo has no redis entry -> awaiting initialization
     assert states[1].state == PipelineState.IDLE
-    assert states[1].current_task is None
+    assert states[1].error_message == "Waiting for daemon to initialize"
 
 
 def test_get_all_repo_states_falls_back_when_redis_raises(
     two_repo_config: Path,
 ) -> None:
     boom = _BoomRedis()
-    states = asyncio.run(get_all_repo_states(redis_client=boom))
+    states, warning = asyncio.run(get_all_repo_states(redis_client=boom))
 
+    assert warning == "Redis connection lost"
     assert len(states) == 2
-    for state in states:
-        assert state.state == PipelineState.IDLE
     # After the first failure further Redis lookups must be skipped so an
     # unreachable broker cannot turn each repo into another timing-out call.
     assert boom.calls == ["pipeline:example__alpha"]
@@ -187,8 +188,7 @@ def test_partial_repo_list_returns_html_fragment(
     assert "<!DOCTYPE" not in body  # fragment, not full document
     assert "alpha" in body
     assert "beta" in body
-    assert "IDLE" in body
-    assert "0 / 0 done" in body
+    assert "initializing" in body
 
 
 def test_partial_repo_list_empty_state(
@@ -551,3 +551,52 @@ def test_updated_header_has_data_ts(
     assert response.status_code == 200
     body = response.text
     assert f'data-ts="{now.isoformat()}"' in body
+
+
+def test_index_shows_warning_when_redis_key_missing(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a Redis key is absent the card must show the initialization
+    warning instead of a clean IDLE state."""
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo-list")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "Waiting for daemon to initialize" in body
+    assert "initializing" in body
+
+
+def test_index_shows_error_on_decode_failure(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a Redis payload cannot be decoded the card must show a decode
+    error instead of silently falling back to IDLE."""
+
+    class _BadPayloadClient:
+        async def get(self, key: str) -> str | None:
+            if key == "pipeline:example__alpha":
+                return "{not valid json!!"
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
+    class _BadPayloadAioredis:
+        @staticmethod
+        def from_url(
+            url: str, decode_responses: bool = True
+        ) -> _BadPayloadClient:
+            return _BadPayloadClient()
+
+    monkeypatch.setattr(web_app, "aioredis", _BadPayloadAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo-list")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "State decode failed" in body
+    assert "stale" in body

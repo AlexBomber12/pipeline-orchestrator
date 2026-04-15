@@ -349,6 +349,21 @@ def test_setup_git_auth_handles_timeout() -> None:
 # ---------- _validate_auth tests ----------
 
 
+def test_validate_auth_uses_auth_status() -> None:
+    """_validate_auth must use 'claude auth status', not 'claude --version'."""
+    cmds: list[list[str]] = []
+
+    def capture_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        cmds.append(cmd)
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    with patch.object(main_module.subprocess, "run", side_effect=capture_run):
+        main_module._validate_auth()
+
+    claude_cmd = next(c for c in cmds if c[0] == "claude")
+    assert claude_cmd == ["claude", "auth", "status"]
+
+
 def test_validate_auth_returns_true_when_both_succeed() -> None:
     with patch.object(main_module.subprocess, "run") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(

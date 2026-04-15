@@ -234,7 +234,7 @@
 - Depends on: PR-041
 
 ## PR-039: Honest dashboard states
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-039.md
 - Branch: pr-039-honest-states
 - Depends on: PR-038

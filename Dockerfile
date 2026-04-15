@@ -42,5 +42,6 @@ RUN chown -R runner:runner /app
 
 EXPOSE 8000
 
+USER runner
 ENTRYPOINT ["bash", "scripts/entrypoint.sh"]
 CMD ["uvicorn", "src.web.app:app", "--host", "0.0.0.0", "--port", "8000"]

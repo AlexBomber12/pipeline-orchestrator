@@ -9,6 +9,8 @@
     'ERROR':     {'dot': 'bg-fail',      'badge': 'bg-fail/10 text-fail border-fail/30',               'pulse': false},
 } %}
 
+{% set init_messages = ['Waiting for daemon to initialize', 'State decode failed'] %}
+
 {% set ci_styles = {
     'PENDING': {'dot': 'bg-warn', 'pulse': true, 'label': 'CI pending'},
     'SUCCESS': {'dot': 'bg-ok',   'pulse': false, 'label': 'CI passed'},
@@ -33,18 +35,29 @@
 {% else %}
 <div class="grid gap-4 md:grid-cols-2">
     {% for repo in repos %}
+    {% set is_synthetic = repo.error_message in init_messages %}
     {% set style = state_styles.get(repo.state.value, state_styles['IDLE']) %}
-    {% set is_error = repo.state.value == 'ERROR' %}
-    <div class="rounded-lg border bg-surface-2 p-4 cursor-pointer hover:border-white/10 transition-colors {{ 'border-l-2 border-l-fail border-white/5' if is_error else 'border-white/5' }}"
+    {% set is_error = repo.state.value == 'ERROR' and not is_synthetic %}
+    <div class="rounded-lg border bg-surface-2 p-4 cursor-pointer hover:border-white/10 transition-colors {{ 'border-l-2 border-l-fail border-white/5' if is_error else ('border-l-2 border-l-warn border-white/5' if is_synthetic else 'border-white/5') }}"
          onclick="if(!event.target.closest('label,input,button,a')){window.location='/repo/{{ repo.name }}'}">
         {# Header row #}
         <div class="flex items-center justify-between mb-3">
             <div class="flex items-center gap-2 min-w-0">
+                {% if is_synthetic %}
+                <span class="w-2.5 h-2.5 rounded-full bg-warn pulse-dot shrink-0"></span>
+                {% else %}
                 <span class="w-2.5 h-2.5 rounded-full {{ style.dot }} {% if style.pulse %}pulse-dot{% endif %} shrink-0"></span>
+                {% endif %}
                 <a href="/repo/{{ repo.name }}" class="font-mono text-sm text-white truncate hover:text-accent transition-colors">{{ repo.name }}</a>
+                {% if is_synthetic %}
+                <span class="text-xs font-medium px-2 py-0.5 rounded border bg-warn/10 text-warn border-warn/30">
+                    {{ 'initializing' if repo.error_message == 'Waiting for daemon to initialize' else 'stale' }}
+                </span>
+                {% else %}
                 <span class="text-xs font-medium px-2 py-0.5 rounded border {{ style.badge }}">
                     {{ repo.state.value }}
                 </span>
+                {% endif %}
             </div>
             <div class="flex items-center gap-2 shrink-0">
                 {% if repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done %}
@@ -65,7 +78,13 @@
             </div>
         </div>
 
-        {% if is_error and repo.error_message %}
+        {% if is_synthetic and repo.error_message %}
+        {# Synthetic/degraded variant: show warning instead of normal body #}
+        <div class="px-2 py-1.5 rounded bg-warn/10 border border-warn/20 text-warn text-xs truncate"
+             title="{{ repo.error_message }}">
+            {{ repo.error_message }}
+        </div>
+        {% elif is_error and repo.error_message %}
         {# Error variant: show error instead of normal body #}
         <div class="px-2 py-1.5 rounded bg-fail/10 border border-fail/20 text-fail text-xs truncate"
              title="{{ repo.error_message }}">

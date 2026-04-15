@@ -94,6 +94,12 @@
         </div>
     </nav>
 
+    {% if redis_warning %}
+    <div class="bg-warn/10 border border-warn/30 text-warn text-xs text-center py-2">
+        Dashboard data may be stale: {{ redis_warning }}
+    </div>
+    {% endif %}
+
     <main class="max-w-7xl mx-auto px-6 py-8">
         {% block content %}{% endblock %}
     </main>
