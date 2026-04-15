@@ -1557,7 +1557,7 @@ return 0
                 last_known_push = latest_push_at
                 self.log_event("FIX: Claude pushed, resetting idle timer")
             elapsed = time.monotonic() - last_known_push
-            if elapsed > idle_limit:
+            if elapsed >= idle_limit:
                 self.log_event(
                     f"FIX: idle timeout ({idle_limit}s since last push), killing"
                 )
