@@ -138,6 +138,7 @@ async def get_all_repo_states(
 
         if state is None:
             state = _default_repo_state(name, repo.url)
+            state.error_message = "Redis unavailable — state unknown"
 
         states.append(state)
 

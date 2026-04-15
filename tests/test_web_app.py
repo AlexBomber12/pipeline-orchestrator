@@ -91,7 +91,7 @@ def test_get_all_repo_states_no_redis_returns_idle_defaults(
         assert state.state == PipelineState.IDLE
         assert state.current_task is None
         assert state.current_pr is None
-        assert state.error_message is None
+        assert state.error_message == "Redis unavailable — state unknown"
 
 
 def test_get_all_repo_states_uses_redis_when_present(

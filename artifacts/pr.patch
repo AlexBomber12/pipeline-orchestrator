@@ -10,7 +10,7 @@ index 68102f4..24b221d 100644
  ENTRYPOINT ["bash", "scripts/entrypoint.sh"]
  CMD ["uvicorn", "src.web.app:app", "--host", "0.0.0.0", "--port", "8000"]
 diff --git a/src/web/app.py b/src/web/app.py
-index 5cbab66..2c5cb2b 100644
+index 5cbab66..35cf52c 100644
 --- a/src/web/app.py
 +++ b/src/web/app.py
 @@ -40,19 +40,44 @@ _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
@@ -152,7 +152,7 @@ index 5cbab66..2c5cb2b 100644
          },
      )
  
-@@ -494,32 +509,43 @@ async def index(request: Request) -> HTMLResponse:
+@@ -494,32 +509,50 @@ async def index(request: Request) -> HTMLResponse:
  @app.get("/api/states")
  async def api_states(request: Request) -> JSONResponse:
      redis_client = getattr(request.app.state, "redis", None)
@@ -172,7 +172,14 @@ index 5cbab66..2c5cb2b 100644
 +@app.get("/partials/redis-banner", response_class=HTMLResponse)
 +async def partial_redis_banner(request: Request) -> HTMLResponse:
 +    redis_client = getattr(request.app.state, "redis", None)
-+    _states, redis_warning = await get_all_repo_states(redis_client)
++    redis_warning: str | None = None
++    if redis_client is None:
++        redis_warning = "Redis not configured"
++    else:
++        try:
++            await redis_client.ping()
++        except Exception:
++            redis_warning = "Redis connection lost"
 +    return templates.TemplateResponse(
 +        request,
 +        "components/redis_banner.html",
@@ -201,7 +208,7 @@ index 5cbab66..2c5cb2b 100644
      stats = _compute_stats(states)
      alerts = _build_alerts(states)
      latest_alert = min(alerts, key=lambda a: a["duration_seconds"]) if alerts else None
-@@ -533,7 +559,7 @@ async def partial_stats(request: Request) -> HTMLResponse:
+@@ -533,7 +566,7 @@ async def partial_stats(request: Request) -> HTMLResponse:
  @app.get("/partials/activity-feed", response_class=HTMLResponse)
  async def partial_activity_feed(request: Request) -> HTMLResponse:
      redis_client = getattr(request.app.state, "redis", None)
@@ -210,7 +217,7 @@ index 5cbab66..2c5cb2b 100644
      feed = _build_activity_feed(states)
      return templates.TemplateResponse(
          request,
-@@ -545,7 +571,7 @@ async def partial_activity_feed(request: Request) -> HTMLResponse:
+@@ -545,7 +578,7 @@ async def partial_activity_feed(request: Request) -> HTMLResponse:
  @app.get("/partials/alerts", response_class=HTMLResponse)
  async def partial_alerts(request: Request) -> HTMLResponse:
      redis_client = getattr(request.app.state, "redis", None)
