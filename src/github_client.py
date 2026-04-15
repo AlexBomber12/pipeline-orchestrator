@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import re
 import subprocess
-import time
 from datetime import datetime, timezone
 
 from src.models import CIStatus, PRInfo, ReviewStatus
@@ -14,8 +13,8 @@ _REPO_URL_RE = re.compile(
     r"github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"
 )
 
-_REVIEW_STATUS_CACHE_TTL = 30  # seconds
-_review_status_cache: dict[str, tuple[float, "ReviewStatus"]] = {}
+_review_status_cache: dict[str, "ReviewStatus"] = {}
+_review_status_cache_cycle: int | None = None
 
 
 def _cache_key(repo: str, pr_number: int, head_sha: str) -> str:
@@ -24,7 +23,18 @@ def _cache_key(repo: str, pr_number: int, head_sha: str) -> str:
 
 def clear_review_status_cache() -> None:
     """Clear the review status cache (used in tests)."""
+    global _review_status_cache_cycle
     _review_status_cache.clear()
+    _review_status_cache_cycle = None
+
+
+def _begin_review_cache_cycle() -> None:
+    """Start a new cache cycle, invalidating all previous entries."""
+    global _review_status_cache_cycle
+    _review_status_cache.clear()
+    if _review_status_cache_cycle is None:
+        _review_status_cache_cycle = 0
+    _review_status_cache_cycle += 1
 
 
 def run_gh(
@@ -79,6 +89,7 @@ def get_repo_full_name(url: str) -> str:
 
 def get_open_prs(repo: str) -> list[PRInfo]:
     """Return open PRs for ``repo`` (``owner/repo``) with CI and review status."""
+    _begin_review_cache_cycle()
     raw = run_gh(
         [
             "pr",
@@ -139,18 +150,12 @@ def get_pr_review_status(
         ck = _cache_key(repo, pr_number, head_sha)
         cached = _review_status_cache.get(ck)
         if cached is not None:
-            ts, status = cached
-            if time.monotonic() - ts < _REVIEW_STATUS_CACHE_TTL:
-                return status
-            del _review_status_cache[ck]
+            return cached
 
     result = _compute_review_status(repo, pr_number, pr_author, head_sha)
 
     if head_sha:
-        _review_status_cache[_cache_key(repo, pr_number, head_sha)] = (
-            time.monotonic(),
-            result,
-        )
+        _review_status_cache[_cache_key(repo, pr_number, head_sha)] = result
     return result
 
 
