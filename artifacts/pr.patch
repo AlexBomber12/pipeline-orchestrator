@@ -1,5 +1,5 @@
 diff --git a/artifacts/ci.log b/artifacts/ci.log
-index 5140d55..f1fdcc0 100644
+index 5140d55..153d7dc 100644
 --- a/artifacts/ci.log
 +++ b/artifacts/ci.log
 @@ -1,16 +1,12 @@
@@ -21,12 +21,917 @@ index 5140d55..f1fdcc0 100644
 +........................................................................ [ 74%]
 +........................................................................ [ 93%]
 +..........................                                               [100%]
-+386 passed in 11.90s
++386 passed in 12.27s
  ==> ci.sh OK
  ci.sh exit code: 0
 diff --git a/artifacts/pr.patch b/artifacts/pr.patch
 new file mode 100644
-index 0000000..e69de29
+index 0000000..383838f
+--- /dev/null
++++ b/artifacts/pr.patch
+@@ -0,0 +1,902 @@
++diff --git a/artifacts/ci.log b/artifacts/ci.log
++index 5140d55..f1fdcc0 100644
++--- a/artifacts/ci.log
+++++ b/artifacts/ci.log
++@@ -1,16 +1,12 @@
++ ==> ruff check src/
++ All checks passed!
++ ==> pytest -q
++-/home/alexey/.pyenv/versions/3.11.9/lib/python3.11/site-packages/pytest_asyncio/plugin.py:211: PytestDeprecationWarning: The configuration option "asyncio_default_fixture_loop_scope" is unset.
++-The event loop scope for asynchronous fixtures will default to the fixture caching scope. Future versions of pytest-asyncio will default the loop scope for asynchronous fixtures to function scope. Set the default fixture loop scope explicitly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "module", "package", "session"
++-
++-  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
++ ........................................................................ [ 18%]
++ ........................................................................ [ 37%]
++-........................................................................ [ 56%]
++-........................................................................ [ 75%]
++-........................................................................ [ 94%]
++-...................                                                      [100%]
++-379 passed in 8.08s
+++........................................................................ [ 55%]
+++........................................................................ [ 74%]
+++........................................................................ [ 93%]
+++..........................                                               [100%]
+++386 passed in 11.90s
++ ==> ci.sh OK
++ ci.sh exit code: 0
++diff --git a/artifacts/pr.patch b/artifacts/pr.patch
++new file mode 100644
++index 0000000..e69de29
++diff --git a/artifacts/structure.txt b/artifacts/structure.txt
++index 3cf9227..6156925 100644
++--- a/artifacts/structure.txt
+++++ b/artifacts/structure.txt
++@@ -1,29 +1,30 @@
++-./AGENTS.md
++-./CLAUDE.md
++-./.claude/settings.local.json
++-./config.yml
++-./docker-compose.yml
++-./Dockerfile
++ ./.env.example
++ ./.gitignore
++-./LICENSE
++-./pyproject.toml
++-./.pytest_cache/CACHEDIR.TAG
++ ./.pytest_cache/.gitignore
+++./.pytest_cache/CACHEDIR.TAG
++ ./.pytest_cache/README.md
++ ./.pytest_cache/v/cache/lastfailed
++ ./.pytest_cache/v/cache/nodeids
++-./.pytest_cache/v/cache/stepwise
+++./.ruff_cache/.gitignore
+++./.ruff_cache/0.11.8/13462170490147283676
+++./.ruff_cache/0.11.8/13731703795561416570
+++./.ruff_cache/0.11.8/1447241987995330562
+++./.ruff_cache/0.11.8/5081212813858740212
+++./.ruff_cache/0.11.8/6033410362127721513
+++./.ruff_cache/CACHEDIR.TAG
+++./AGENTS.md
+++./CLAUDE.md
+++./Dockerfile
+++./LICENSE
++ ./README.md
+++./config.yml
+++./docker-compose.yml
+++./pyproject.toml
++ ./requirements.txt
++-./.ruff_cache/0.12.11/4755189722719639510
++-./.ruff_cache/0.12.4/15766238244456562086
++-./.ruff_cache/0.12.4/6586069153419875992
++-./.ruff_cache/CACHEDIR.TAG
++-./.ruff_cache/.gitignore
++ ./scripts/ci.sh
++ ./scripts/entrypoint.sh
++ ./scripts/make-review-artifacts.sh
+++./src/__init__.py
++ ./src/claude_cli.py
++ ./src/config.py
++ ./src/daemon/__init__.py
++@@ -31,12 +32,11 @@
++ ./src/daemon/runner.py
++ ./src/daemon/scaffolder.py
++ ./src/github_client.py
++-./src/__init__.py
++ ./src/models.py
++ ./src/queue_parser.py
++ ./src/utils.py
++-./src/web/app.py
++ ./src/web/__init__.py
+++./src/web/app.py
++ ./src/web/templates/base.html
++ ./src/web/templates/components/activity_feed.html
++ ./src/web/templates/components/alerts_panel.html
++@@ -47,8 +47,8 @@
++ ./src/web/templates/components/repo_list.html
++ ./src/web/templates/components/repo_summary.html
++ ./src/web/templates/components/settings_auth.html
++-./src/web/templates/components/settings_daemon_error.html
++ ./src/web/templates/components/settings_daemon.html
+++./src/web/templates/components/settings_daemon_error.html
++ ./src/web/templates/components/settings_daemon_response.html
++ ./src/web/templates/components/settings_error.html
++ ./src/web/templates/components/settings_repo_list.html
++@@ -100,17 +100,17 @@
++ ./tasks/PR-039.md
++ ./tasks/PR-040.md
++ ./tasks/PR-041.md
++-./tasks/PR-041.md:Zone.Identifier
++ ./tasks/PR-042.md
++-./tasks/PR-042.md:Zone.Identifier
++ ./tasks/PR-043.md
+++./tasks/PR-044.md
+++./tasks/PR-045.md
+++./tasks/PR-046.md
++ ./tasks/QUEUE.md
++-./tasks/QUEUE.md:Zone.Identifier
++ ./templates/AGENTS.md
++-./templates/ci.sh
++ ./templates/CLAUDE.md
++-./templates/make-review-artifacts.sh
++ ./templates/QUEUE.md
+++./templates/ci.sh
+++./templates/make-review-artifacts.sh
++ ./tests/__init__.py
++ ./tests/test_alerts.py
++ ./tests/test_claude_cli.py
++diff --git a/src/claude_cli.py b/src/claude_cli.py
++index 68b4cf2..2f29395 100644
++--- a/src/claude_cli.py
+++++ b/src/claude_cli.py
++@@ -6,6 +6,7 @@ and ``FIX REVIEW``) plus an infrastructure-error diagnosis helper.
++ 
++ from __future__ import annotations
++ 
+++import asyncio
++ import logging
++ import os
++ import subprocess
++@@ -121,3 +122,86 @@ def parse_diagnosis(stdout: str) -> str:
++         if first.startswith(verdict):
++             return verdict
++     return "ESCALATE"
+++
+++
+++def _build_node_options() -> str:
+++    memory_flag = "--max-old-space-size=4096"
+++    existing = os.environ.get("NODE_OPTIONS", "").strip()
+++    return f"{existing} {memory_flag}".strip() if existing else memory_flag
+++
+++
+++async def run_claude_async(
+++    prompt: str,
+++    cwd: str,
+++    timeout: int = 600,
+++    model: str | None = None,
+++) -> tuple[int, str, str]:
+++    cmd = [
+++        "claude",
+++        "--print",
+++        "--dangerously-skip-permissions",
+++        "--bare",
+++        "--no-session-persistence",
+++    ]
+++    if model:
+++        cmd.extend(["--model", model])
+++    cmd.extend(["--system-prompt-file", "CLAUDE.md"])
+++    cmd.extend(["--max-turns", "30"])
+++    cmd.append(prompt)
+++    logger.info("running claude CLI with prompt: %s", prompt[:80])
+++    env = {**os.environ, "NODE_OPTIONS": _build_node_options()}
+++    try:
+++        proc = await asyncio.create_subprocess_exec(
+++            *cmd,
+++            stdout=asyncio.subprocess.PIPE,
+++            stderr=asyncio.subprocess.PIPE,
+++            cwd=cwd,
+++            stdin=asyncio.subprocess.DEVNULL,
+++            env=env,
+++        )
+++        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+++            proc.communicate(), timeout=timeout
+++        )
+++        stdout = stdout_bytes.decode("utf-8", errors="replace")
+++        stderr = stderr_bytes.decode("utf-8", errors="replace")
+++        code = proc.returncode or 0
+++    except asyncio.TimeoutError:
+++        proc.kill()
+++        await proc.wait()
+++        logger.error("claude CLI timed out after %ss", timeout)
+++        return (-1, "", f"Timeout after {timeout}s")
+++    except FileNotFoundError as exc:
+++        missing = getattr(exc, "filename", "")
+++        if missing and missing != cmd[0]:
+++            return (-1, "", f"cwd not found: {missing}")
+++        return (-1, "", "claude CLI not found")
+++    logger.info("claude CLI exited with code %s", code)
+++    return (code, stdout, stderr)
+++
+++
+++async def run_planned_pr_async(
+++    repo_path: str, model: str | None = None, timeout: int = 900
+++) -> tuple[int, str, str]:
+++    return await run_claude_async(
+++        "PLANNED PR", repo_path, timeout=timeout, model=model
+++    )
+++
+++
+++async def fix_review_async(
+++    repo_path: str, model: str | None = None, timeout: int = 3600
+++) -> tuple[int, str, str]:
+++    return await run_claude_async(
+++        "FIX REVIEW", repo_path, timeout=timeout, model=model
+++    )
+++
+++
+++async def diagnose_error_async(
+++    repo_path: str, context: str, model: str | None = None
+++) -> tuple[int, str, str]:
+++    prompt = (
+++        "You are the pipeline orchestrator. An infrastructure error occurred. "
+++        f"Error context: {context} "
+++        "Respond with exactly one word on the first line: FIX, SKIP, or ESCALATE. "
+++        "If FIX, include a brief action plan on subsequent lines."
+++    )
+++    return await run_claude_async(prompt, repo_path, timeout=120, model=model)
++diff --git a/src/daemon/runner.py b/src/daemon/runner.py
++index fad2752..613c942 100644
++--- a/src/daemon/runner.py
+++++ b/src/daemon/runner.py
++@@ -1340,7 +1340,7 @@ return 0
++             self.log_event(self.state.error_message)
++             return
++ 
++-        code, stdout, stderr = claude_cli.run_planned_pr(
+++        code, stdout, stderr = await claude_cli.run_planned_pr_async(
++             self.repo_path,
++             model=self.app_config.daemon.claude_model,
++             timeout=self.app_config.daemon.planned_pr_timeout_sec,
++@@ -1561,7 +1561,7 @@ return 0
++                 self.log_event(self.state.error_message)
++                 return
++ 
++-        code, stdout, stderr = claude_cli.fix_review(
+++        code, stdout, stderr = await claude_cli.fix_review_async(
++             self.repo_path,
++             model=self.app_config.daemon.claude_model,
++             timeout=self.app_config.daemon.fix_review_timeout_sec,
++@@ -2125,7 +2125,7 @@ return 0
++                 "diagnose_error: max attempts (3) reached, staying ERROR"
++             )
++             return
++-        code, stdout, stderr = claude_cli.diagnose_error(
+++        code, stdout, stderr = await claude_cli.diagnose_error_async(
++             self.repo_path, context, model=self.app_config.daemon.claude_model
++         )
++         self._detect_rate_limit(stderr)
++diff --git a/tasks/QUEUE.md b/tasks/QUEUE.md
++index 654b48d..564c991 100644
++--- a/tasks/QUEUE.md
+++++ b/tasks/QUEUE.md
++@@ -246,7 +246,7 @@
++ - Depends on: PR-041
++ 
++ ## PR-042: Async Claude CLI
++-- Status: TODO
+++- Status: DONE
++ - Tasks file: tasks/PR-042.md
++ - Branch: pr-042-async-cli
++ - Depends on: PR-038
++diff --git a/tests/test_claude_cli.py b/tests/test_claude_cli.py
++index 047a871..0b254ea 100644
++--- a/tests/test_claude_cli.py
+++++ b/tests/test_claude_cli.py
++@@ -2,17 +2,23 @@
++ 
++ from __future__ import annotations
++ 
+++import asyncio
++ import subprocess
++ from typing import Any
+++from unittest.mock import AsyncMock, MagicMock, patch
++ 
++ import pytest
++ 
++ from src.claude_cli import (
++     diagnose_error,
+++    diagnose_error_async,
++     fix_review,
+++    fix_review_async,
++     parse_diagnosis,
++     run_claude,
+++    run_claude_async,
++     run_planned_pr,
+++    run_planned_pr_async,
++ )
++ 
++ 
++@@ -41,13 +47,6 @@ def test_run_claude_success(monkeypatch: pytest.MonkeyPatch) -> None:
++         "claude",
++         "--print",
++         "--dangerously-skip-permissions",
++-        "--bare",
++-        "--strict-mcp-config",
++-        "--no-session-persistence",
++-        "--system-prompt-file",
++-        "CLAUDE.md",
++-        "--max-turns",
++-        "30",
++         "do a thing",
++     ]
++     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
++@@ -150,15 +149,8 @@ def test_run_claude_with_model(monkeypatch: pytest.MonkeyPatch) -> None:
++         "claude",
++         "--print",
++         "--dangerously-skip-permissions",
++-        "--bare",
++-        "--strict-mcp-config",
++-        "--no-session-persistence",
++         "--model",
++         "opus",
++-        "--system-prompt-file",
++-        "CLAUDE.md",
++-        "--max-turns",
++-        "30",
++         "do a thing",
++     ]
++ 
++@@ -321,3 +313,93 @@ def test_run_planned_pr_accepts_timeout(monkeypatch: pytest.MonkeyPatch) -> None
++     monkeypatch.setattr(subprocess, "run", fake_run)
++     run_planned_pr("/tmp", timeout=777)
++     assert captured["timeout"] == 777
+++
+++
+++# --- Async tests ---
+++
+++
+++def _make_fake_proc(stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0) -> MagicMock:
+++    proc = MagicMock()
+++    proc.communicate = AsyncMock(return_value=(stdout, stderr))
+++    proc.returncode = returncode
+++    proc.kill = MagicMock()
+++    proc.wait = AsyncMock()
+++    return proc
+++
+++
+++@pytest.mark.asyncio
+++async def test_run_claude_async_success(monkeypatch: pytest.MonkeyPatch) -> None:
+++    captured: dict[str, Any] = {}
+++    fake_proc = _make_fake_proc(stdout=b"hello", stderr=b"warn", returncode=0)
+++
+++    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+++        captured["cmd"] = args
+++        captured["kwargs"] = kwargs
+++        return fake_proc
+++
+++    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+++    monkeypatch.delenv("NODE_OPTIONS", raising=False)
+++
+++    result = await run_claude_async("do a thing", "/data/repos/demo", timeout=42)
+++
+++    assert result == (0, "hello", "warn")
+++    cmd = list(captured["cmd"])
+++    assert cmd[0] == "claude"
+++    assert "--bare" in cmd
+++    assert "--no-session-persistence" in cmd
+++    assert "--system-prompt-file" in cmd
+++    assert "CLAUDE.md" in cmd
+++    assert "--max-turns" in cmd
+++    assert "30" in cmd
+++    assert cmd[-1] == "do a thing"
+++    assert captured["kwargs"]["cwd"] == "/data/repos/demo"
+++
+++
+++@pytest.mark.asyncio
+++async def test_run_claude_async_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+++    fake_proc = _make_fake_proc()
+++    fake_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError)
+++
+++    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+++        return fake_proc
+++
+++    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+++
+++    result = await run_claude_async("prompt", "/tmp", timeout=5)
+++
+++    assert result == (-1, "", "Timeout after 5s")
+++    fake_proc.kill.assert_called_once()
+++
+++
+++@pytest.mark.asyncio
+++async def test_run_claude_async_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+++    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+++        raise FileNotFoundError(2, "No such file or directory", "claude")
+++
+++    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+++
+++    result = await run_claude_async("prompt", "/tmp")
+++
+++    assert result == (-1, "", "claude CLI not found")
+++
+++
+++@pytest.mark.asyncio
+++async def test_run_claude_async_bare_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+++    captured: dict[str, Any] = {}
+++    fake_proc = _make_fake_proc(returncode=0)
+++
+++    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+++        captured["cmd"] = list(args)
+++        return fake_proc
+++
+++    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+++
+++    await run_claude_async("test", "/tmp")
+++
+++    cmd = captured["cmd"]
+++    assert "--bare" in cmd
+++    assert "--no-session-persistence" in cmd
+++    assert "--system-prompt-file" in cmd
+++    assert "CLAUDE.md" in cmd
+++    assert "--max-turns" in cmd
+++    assert "30" in cmd
++diff --git a/tests/test_runner.py b/tests/test_runner.py
++index 0b9bbac..1aa2d44 100644
++--- a/tests/test_runner.py
+++++ b/tests/test_runner.py
++@@ -24,6 +24,28 @@ from src.models import (
++ )
++ 
++ 
+++def _async_cli_result(*result: object):
+++    async def _fn(*args: object, **kwargs: object) -> tuple:
+++        return result
+++    return _fn
+++
+++
+++def _async_cli_result_with_side_effect(
+++    collector: list, label: str, *result: object
+++):
+++    async def _fn(*args: object, **kwargs: object) -> tuple:
+++        collector.append(label)
+++        return result
+++    return _fn
+++
+++
+++def _async_cli_capture_path(collector: list, *result: object):
+++    async def _fn(path: str, *args: object, **kwargs: object) -> tuple:
+++        collector.append(path)
+++        return result
+++    return _fn
+++
+++
++ class _FakeRedis:
++     """Minimal async Redis double capturing ``set`` calls."""
++ 
++@@ -263,13 +285,13 @@ def test_handle_idle_picks_task_and_drives_coding(
++ 
++     claude_calls: list[str] = []
++ 
++-    def fake_run_planned_pr(
+++    async def fake_run_planned_pr(
++         path: str, model: str | None = None, timeout: int | None = None
++     ) -> tuple[int, str, str]:
++         claude_calls.append(path)
++         return (0, "ok", "")
++ 
++-    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr", fake_run_planned_pr)
+++    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr_async", fake_run_planned_pr)
++ 
++     opened_pr = PRInfo(
++         number=17,
++@@ -314,8 +336,8 @@ def test_handle_idle_sets_queue_counters_with_mixed_statuses(
++     monkeypatch.setattr(runner_module, "get_next_task", lambda t: tasks[2])
++     monkeypatch.setattr(
++         runner_module.claude_cli,
++-        "run_planned_pr",
++-        lambda path, model=None, timeout=None: (0, "ok", ""),
+++        "run_planned_pr_async",
+++        _async_cli_result(0, "ok", ""),
++     )
++     monkeypatch.setattr(
++         runner_module.github_client,
++@@ -341,8 +363,8 @@ def test_handle_coding_errors_when_no_pr_found(
++     _patch_subprocess(monkeypatch)
++     monkeypatch.setattr(
++         runner_module.claude_cli,
++-        "run_planned_pr",
++-        lambda path, model=None, timeout=None: (0, "ok", ""),
+++        "run_planned_pr_async",
+++        _async_cli_result(0, "ok", ""),
++     )
++     monkeypatch.setattr(
++         runner_module.github_client,
++@@ -373,8 +395,8 @@ def test_handle_coding_rejects_unmatched_branch(
++     _patch_subprocess(monkeypatch)
++     monkeypatch.setattr(
++         runner_module.claude_cli,
++-        "run_planned_pr",
++-        lambda path, model=None, timeout=None: (0, "ok", ""),
+++        "run_planned_pr_async",
+++        _async_cli_result(0, "ok", ""),
++     )
++     unrelated = PRInfo(number=99, branch="other-branch")
++     monkeypatch.setattr(
++@@ -409,8 +431,8 @@ def test_handle_coding_posts_codex_review_after_pr_found(
++     _patch_subprocess(monkeypatch)
++     monkeypatch.setattr(
++         runner_module.claude_cli,
++-        "run_planned_pr",
++-        lambda path, model=None, timeout=None: (0, "ok", ""),
+++        "run_planned_pr_async",
+++        _async_cli_result(0, "ok", ""),
++     )
++     opened_pr = PRInfo(number=42, branch="pr-019")
++     monkeypatch.setattr(
++@@ -451,8 +473,8 @@ def test_handle_coding_survives_post_comment_failure(
++     _patch_subprocess(monkeypatch)
++     monkeypatch.setattr(
++         runner_module.claude_cli,
++-        "run_planned_pr",
++-        lambda path, model=None, timeout=None: (0, "ok", ""),
+++        "run_planned_pr_async",
+++        _async_cli_result(0, "ok", ""),
++     )
++     opened_pr = PRInfo(number=42, branch="pr-019")
++     monkeypatch.setattr(
++@@ -490,7 +512,7 @@ def test_handle_fix_posts_codex_review_after_push(
++     ``@codex review`` so Codex reviews the freshly-pushed iteration."""
++     _patch_subprocess(monkeypatch)
++     monkeypatch.setattr(
++-        runner_module.claude_cli, "fix_review", lambda path, model=None, timeout=None: (0, "", "")
+++        runner_module.claude_cli, "fix_review_async", _async_cli_result(0, "", "")
++     )
++     posted: list[tuple[str, int, str]] = []
++ 
++@@ -531,7 +553,7 @@ def test_handle_fix_errors_when_post_comment_fails(
++     """
++     _patch_subprocess(monkeypatch)
++     monkeypatch.setattr(
++-        runner_module.claude_cli, "fix_review", lambda path, model=None, timeout=None: (0, "", "")
+++        runner_module.claude_cli, "fix_review_async", _async_cli_result(0, "", "")
++     )
++ 
++     def boom(repo: str, number: int, body: str) -> None:
++@@ -573,7 +595,7 @@ def test_handle_fix_skips_checkout_on_cross_repo_pr(
++ 
++     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
++     monkeypatch.setattr(
++-        runner_module.claude_cli, "fix_review", lambda path, model=None, timeout=None: (0, "", "")
+++        runner_module.claude_cli, "fix_review_async", _async_cli_result(0, "", "")
++     )
++     monkeypatch.setattr(
++         runner_module.github_client,
++@@ -604,13 +626,13 @@ def test_handle_fix_checks_out_pr_branch_before_fix_review(
++     calls = _patch_subprocess(monkeypatch)
++     fix_called_at: list[int] = []
++ 
++-    def fake_fix(
+++    async def fake_fix(
++         path: str, model: str | None = None, timeout: int | None = None
++     ) -> tuple[int, str, str]:
++         fix_called_at.append(len(calls))
++         return (0, "", "")
++ 
++-    monkeypatch.setattr(runner_module.claude_cli, "fix_review", fake_fix)
+++    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", fake_fix)
++     monkeypatch.setattr(
++         runner_module.github_client,
++         "post_comment",
++@@ -650,10 +672,8 @@ def test_handle_fix_errors_when_pr_branch_checkout_fails(
++     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
++     monkeypatch.setattr(
++         runner_module.claude_cli,
++-        "fix_review",
++-        lambda path, model=None, timeout=None: (
++-            fix_calls.append(path), (0, "", "")
++-        )[1],
+++        "fix_review_async",
+++        _async_cli_capture_path(fix_calls, 0, "", ""),
++     )
++ 
++     runner = _make_runner()
++@@ -685,10 +705,8 @@ def test_handle_fix_errors_when_pr_branch_checkout_times_out(
++     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
++     monkeypatch.setattr(
++         runner_module.claude_cli,
++-        "fix_review",
++-        lambda path, model=None, timeout=None: (
++-            fix_calls.append(path), (0, "", "")
++-        )[1],
+++        "fix_review_async",
+++        _async_cli_capture_path(fix_calls, 0, "", ""),
++     )
++ 
++     runner = _make_runner()
++@@ -707,8 +725,8 @@ def test_handle_coding_errors_when_task_has_no_branch(
++     calls = _patch_subprocess(monkeypatch)
++     monkeypatch.setattr(
++         runner_module.claude_cli,
++-        "run_planned_pr",
++-        lambda path, model=None, timeout=None: (0, "ok", ""),
+++        "run_planned_pr_async",
+++        _async_cli_result(0, "ok", ""),
++     )
++     monkeypatch.setattr(
++         runner_module.github_client,
++@@ -745,8 +763,8 @@ def test_handle_coding_retries_pr_detection(
++     _patch_subprocess(monkeypatch)
++     monkeypatch.setattr(
++         runner_module.claude_cli,
++-        "run_planned_pr",
++-        lambda path, model=None, timeout=None: (0, "ok", ""),
+++        "run_planned_pr_async",
+++        _async_cli_result(0, "ok", ""),
++     )
++ 
++     opened_pr = PRInfo(number=42, branch="pr-001")
++@@ -800,8 +818,8 @@ def test_handle_coding_errors_after_all_retries(
++     _patch_subprocess(monkeypatch)
++     monkeypatch.setattr(
++         runner_module.claude_cli,
++-        "run_planned_pr",
++-        lambda path, model=None, timeout=None: (0, "ok", ""),
+++        "run_planned_pr_async",
+++        _async_cli_result(0, "ok", ""),
++     )
++     call_count = {"n": 0}
++ 
++@@ -920,7 +938,7 @@ def test_handle_watch_changes_requested_triggers_fix(
++         runner_module.github_client, "get_open_prs", lambda repo: [pr]
++     )
++     monkeypatch.setattr(
++-        runner_module.claude_cli, "fix_review", lambda path, model=None, timeout=None: (0, "", "")
+++        runner_module.claude_cli, "fix_review_async", _async_cli_result(0, "", "")
++     )
++     monkeypatch.setattr(
++         runner_module.github_client,
++@@ -953,7 +971,7 @@ def test_handle_watch_ci_failure_triggers_fix(
++         runner_module.github_client, "get_open_prs", lambda repo: [pr]
++     )
++     monkeypatch.setattr(
++-        runner_module.claude_cli, "fix_review", lambda path, model=None, timeout=None: (0, "", "")
+++        runner_module.claude_cli, "fix_review_async", _async_cli_result(0, "", "")
++     )
++     monkeypatch.setattr(
++         runner_module.github_client,
++@@ -1733,8 +1751,8 @@ def test_handle_merge_aborts_on_unresolvable_conflict(
++ def test_handle_error_skip_clears_state(monkeypatch: pytest.MonkeyPatch) -> None:
++     monkeypatch.setattr(
++         runner_module.claude_cli,
++-        "diagnose_error",
++-        lambda path, ctx, model=None: (0, "SKIP", ""),
+++        "diagnose_error_async",
+++        _async_cli_result(0, "SKIP", ""),
++     )
++ 
++     runner = _make_runner()
++@@ -1753,8 +1771,8 @@ def test_handle_error_skip_clears_state(monkeypatch: pytest.MonkeyPatch) -> None
++ def test_handle_error_escalate_keeps_error(monkeypatch: pytest.MonkeyPatch) -> None:
++     monkeypatch.setattr(
++         runner_module.claude_cli,
++-        "diagnose_error",
++-        lambda path, ctx, model=None: (0, "ESCALATE: human help", ""),
+++        "diagnose_error_async",
+++        _async_cli_result(0, "ESCALATE: human help", ""),
++     )
++ 
++     runner = _make_runner()
++@@ -2557,8 +2575,8 @@ def test_handle_coding_saves_stdout(
++     _patch_subprocess(monkeypatch)
++     monkeypatch.setattr(
++         runner_module.claude_cli,
++-        "run_planned_pr",
++-        lambda path, model=None, timeout=None: (0, "hello from claude", ""),
+++        "run_planned_pr_async",
+++        _async_cli_result(0, "hello from claude", ""),
++     )
++     pr = PRInfo(number=42, branch="pr-001")
++     monkeypatch.setattr(
++@@ -2593,8 +2611,8 @@ def test_handle_fix_saves_stdout(
++     _patch_subprocess(monkeypatch)
++     monkeypatch.setattr(
++         runner_module.claude_cli,
++-        "fix_review",
++-        lambda path, model=None, timeout=None: (0, "fix output here", ""),
+++        "fix_review_async",
+++        _async_cli_result(0, "fix output here", ""),
++     )
++     monkeypatch.setattr(
++         runner_module.github_client,
++@@ -3050,11 +3068,11 @@ def test_handle_error_caps_at_3(monkeypatch: pytest.MonkeyPatch) -> None:
++     """handle_error must stop invoking diagnose_error after 3 attempts."""
++     calls: list[str] = []
++ 
++-    def fake_diag(path: str, ctx: str, model: str | None = None) -> tuple[int, str, str]:
+++    async def fake_diag(path: str, ctx: str, model: str | None = None) -> tuple[int, str, str]:
++         calls.append(ctx)
++         return (0, "ESCALATE", "")
++ 
++-    monkeypatch.setattr(runner_module.claude_cli, "diagnose_error", fake_diag)
+++    monkeypatch.setattr(runner_module.claude_cli, "diagnose_error_async", fake_diag)
++     runner = _make_runner()
++     runner.state.state = PipelineState.ERROR
++     runner.state.error_message = "generic failure"
++@@ -3070,11 +3088,11 @@ def test_handle_error_skips_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
++     """A timeout-marked error must skip the AI-diagnosis call entirely."""
++     called: list[bool] = []
++ 
++-    def fake_diag(*a: Any, **kw: Any) -> tuple[int, str, str]:
+++    async def fake_diag(*a: Any, **kw: Any) -> tuple[int, str, str]:
++         called.append(True)
++         return (0, "SKIP", "")
++ 
++-    monkeypatch.setattr(runner_module.claude_cli, "diagnose_error", fake_diag)
+++    monkeypatch.setattr(runner_module.claude_cli, "diagnose_error_async", fake_diag)
++     runner = _make_runner()
++     runner.state.state = PipelineState.ERROR
++     runner.state.error_message = "claude CLI timeout after 900s"
++@@ -3089,11 +3107,11 @@ def test_handle_error_skips_rate_limit(
++     """A rate-limit error must skip the AI-diagnosis call entirely."""
++     called: list[bool] = []
++ 
++-    def fake_diag(*a: Any, **kw: Any) -> tuple[int, str, str]:
+++    async def fake_diag(*a: Any, **kw: Any) -> tuple[int, str, str]:
++         called.append(True)
++         return (0, "SKIP", "")
++ 
++-    monkeypatch.setattr(runner_module.claude_cli, "diagnose_error", fake_diag)
+++    monkeypatch.setattr(runner_module.claude_cli, "diagnose_error_async", fake_diag)
++     runner = _make_runner()
++     runner.state.state = PipelineState.ERROR
++     runner.state.error_message = "API rate limit exceeded"
++@@ -3105,13 +3123,13 @@ def test_handle_fix_skips_fork(monkeypatch: pytest.MonkeyPatch) -> None:
++     """Cross-repo (fork) PRs must return to WATCH without running fix_review."""
++     fix_called: list[bool] = []
++ 
++-    def fake_fix(
+++    async def fake_fix(
++         path: str, model: str | None = None, timeout: int | None = None
++     ) -> tuple[int, str, str]:
++         fix_called.append(True)
++         return (0, "", "")
++ 
++-    monkeypatch.setattr(runner_module.claude_cli, "fix_review", fake_fix)
+++    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", fake_fix)
++     runner = _make_runner()
++     runner.state.state = PipelineState.WATCH
++     runner.state.current_pr = PRInfo(
++@@ -3135,13 +3153,13 @@ def test_handle_coding_uses_configured_timeout(
++     _patch_subprocess(monkeypatch)
++     captured: dict[str, Any] = {}
++ 
++-    def fake_planned(
+++    async def fake_planned(
++         path: str, model: str | None = None, timeout: int | None = None
++     ) -> tuple[int, str, str]:
++         captured["timeout"] = timeout
++         return (0, "", "")
++ 
++-    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr", fake_planned)
+++    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr_async", fake_planned)
++     monkeypatch.setattr(
++         runner_module.github_client,
++         "get_open_prs",
++@@ -3175,13 +3193,13 @@ def test_handle_fix_uses_configured_timeout(
++     _patch_subprocess(monkeypatch)
++     captured: dict[str, Any] = {}
++ 
++-    def fake_fix(
+++    async def fake_fix(
++         path: str, model: str | None = None, timeout: int | None = None
++     ) -> tuple[int, str, str]:
++         captured["timeout"] = timeout
++         return (0, "", "")
++ 
++-    monkeypatch.setattr(runner_module.claude_cli, "fix_review", fake_fix)
+++    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", fake_fix)
++     monkeypatch.setattr(
++         runner_module.github_client,
++         "post_comment",
++@@ -3252,8 +3270,8 @@ def test_handle_fix_records_last_push_at(
++     _patch_subprocess(monkeypatch)
++     monkeypatch.setattr(
++         runner_module.claude_cli,
++-        "fix_review",
++-        lambda path, model=None, timeout=None: (0, "", ""),
+++        "fix_review_async",
+++        _async_cli_result(0, "", ""),
++     )
++     monkeypatch.setattr(
++         runner_module.github_client,
++@@ -3585,8 +3603,8 @@ def test_handle_coding_skips_when_rate_limited(
++     cli_calls: list[str] = []
++     monkeypatch.setattr(
++         runner_module.claude_cli,
++-        "run_planned_pr",
++-        lambda *a, **kw: (cli_calls.append("run_planned_pr"), (0, "", ""))[1],
+++        "run_planned_pr_async",
+++        _async_cli_result_with_side_effect(cli_calls, "run_planned_pr_async", 0, "", ""),
++     )
++     runner = _make_runner()
++     runner.state.state = PipelineState.CODING
++@@ -3608,8 +3626,8 @@ def test_handle_error_skips_diagnose_for_rate_limit(
++     cli_calls: list[str] = []
++     monkeypatch.setattr(
++         runner_module.claude_cli,
++-        "diagnose_error",
++-        lambda *a, **kw: (cli_calls.append("diagnose"), (0, "SKIP", ""))[1],
+++        "diagnose_error_async",
+++        _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
++     )
++     runner = _make_runner()
++     runner.state.state = PipelineState.ERROR
++@@ -3628,8 +3646,8 @@ def test_handle_error_skips_diagnose_for_timeout(
++     cli_calls: list[str] = []
++     monkeypatch.setattr(
++         runner_module.claude_cli,
++-        "diagnose_error",
++-        lambda *a, **kw: (cli_calls.append("diagnose"), (0, "SKIP", ""))[1],
+++        "diagnose_error_async",
+++        _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
++     )
++     runner = _make_runner()
++     runner.state.state = PipelineState.ERROR
++@@ -3687,3 +3705,78 @@ def test_detect_rate_limit_fixed_pause_duration(
++     actual_pause = runner.state.rate_limited_until - datetime.now(timezone.utc)
++     assert actual_pause > expected_pause - timedelta(seconds=5)
++     assert actual_pause < expected_pause + timedelta(seconds=5)
+++
+++
+++def test_handle_coding_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:
+++    """handle_coding must call run_planned_pr_async, not the sync version."""
+++    _patch_subprocess(monkeypatch)
+++    async_calls: list[str] = []
+++    sync_calls: list[str] = []
+++
+++    async def fake_async(
+++        path: str, model: str | None = None, timeout: int | None = None
+++    ) -> tuple[int, str, str]:
+++        async_calls.append(path)
+++        return (0, "ok", "")
+++
+++    def fake_sync(
+++        path: str, model: str | None = None, timeout: int | None = None
+++    ) -> tuple[int, str, str]:
+++        sync_calls.append(path)
+++        return (0, "ok", "")
+++
+++    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr_async", fake_async)
+++    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr", fake_sync)
+++    monkeypatch.setattr(
+++        runner_module.github_client,
+++        "get_open_prs",
+++        lambda repo: [PRInfo(number=1, branch="pr-001")],
+++    )
+++    monkeypatch.setattr(
+++        runner_module.github_client,
+++        "post_comment",
+++        lambda *a, **kw: None,
+++    )
+++
+++    runner = _make_runner()
+++    runner.state.current_task = QueueTask(
+++        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
+++    )
+++    asyncio.run(runner.handle_coding())
+++
+++    assert async_calls, "run_planned_pr_async must be called"
+++    assert not sync_calls, "sync run_planned_pr must NOT be called"
+++
+++
+++def test_handle_fix_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:
+++    """handle_fix must call fix_review_async, not the sync version."""
+++    _patch_subprocess(monkeypatch)
+++    async_calls: list[str] = []
+++    sync_calls: list[str] = []
+++
+++    async def fake_async(
+++        path: str, model: str | None = None, timeout: int | None = None
+++    ) -> tuple[int, str, str]:
+++        async_calls.append(path)
+++        return (0, "", "")
+++
+++    def fake_sync(
+++        path: str, model: str | None = None, timeout: int | None = None
+++    ) -> tuple[int, str, str]:
+++        sync_calls.append(path)
+++        return (0, "", "")
+++
+++    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", fake_async)
+++    monkeypatch.setattr(runner_module.claude_cli, "fix_review", fake_sync)
+++    monkeypatch.setattr(
+++        runner_module.github_client,
+++        "post_comment",
+++        lambda *a, **kw: None,
+++    )
+++
+++    runner = _make_runner()
+++    runner.state.current_pr = PRInfo(number=10, branch="pr-001")
+++    asyncio.run(runner.handle_fix())
+++
+++    assert async_calls, "fix_review_async must be called"
+++    assert not sync_calls, "sync fix_review must NOT be called"
 diff --git a/artifacts/structure.txt b/artifacts/structure.txt
 index 3cf9227..6156925 100644
 --- a/artifacts/structure.txt
@@ -124,6 +1029,15 @@ index 3cf9227..6156925 100644
  ./tests/__init__.py
  ./tests/test_alerts.py
  ./tests/test_claude_cli.py
+diff --git a/requirements.txt b/requirements.txt
+index 617fa0b..84a8bb0 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -8,3 +8,4 @@ pyyaml==6.0.2
+ pydantic==2.11.3
+ ruff==0.11.8
+ pytest==8.3.4
++pytest-asyncio==0.25.3
 diff --git a/src/claude_cli.py b/src/claude_cli.py
 index 68b4cf2..2f29395 100644
 --- a/src/claude_cli.py

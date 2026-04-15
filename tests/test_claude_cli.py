@@ -403,3 +403,23 @@ async def test_run_claude_async_bare_flags(monkeypatch: pytest.MonkeyPatch) -> N
     assert "CLAUDE.md" in cmd
     assert "--max-turns" in cmd
     assert "30" in cmd
+
+
+@pytest.mark.asyncio
+async def test_diagnose_error_async_skips_system_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+    fake_proc = _make_fake_proc(stdout=b"FIX\nretry", returncode=0)
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        captured["cmd"] = list(args)
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    code, stdout, _ = await diagnose_error_async("/data/repos/demo", "git push failed")
+
+    assert code == 0
+    assert stdout == "FIX\nretry"
+    cmd = captured["cmd"]
+    assert "--system-prompt-file" not in cmd
+    assert "CLAUDE.md" not in cmd

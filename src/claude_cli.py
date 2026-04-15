@@ -135,6 +135,7 @@ async def run_claude_async(
     cwd: str,
     timeout: int = 600,
     model: str | None = None,
+    system_prompt_file: str | None = "CLAUDE.md",
 ) -> tuple[int, str, str]:
     cmd = [
         "claude",
@@ -145,7 +146,8 @@ async def run_claude_async(
     ]
     if model:
         cmd.extend(["--model", model])
-    cmd.extend(["--system-prompt-file", "CLAUDE.md"])
+    if system_prompt_file:
+        cmd.extend(["--system-prompt-file", system_prompt_file])
     cmd.extend(["--max-turns", "30"])
     cmd.append(prompt)
     logger.info("running claude CLI with prompt: %s", prompt[:80])
@@ -204,4 +206,6 @@ async def diagnose_error_async(
         "Respond with exactly one word on the first line: FIX, SKIP, or ESCALATE. "
         "If FIX, include a brief action plan on subsequent lines."
     )
-    return await run_claude_async(prompt, repo_path, timeout=120, model=model)
+    return await run_claude_async(
+        prompt, repo_path, timeout=120, model=model, system_prompt_file=None
+    )
