@@ -40,7 +40,12 @@ def test_run_claude_success(monkeypatch: pytest.MonkeyPatch) -> None:
         "claude",
         "--print",
         "--dangerously-skip-permissions",
+        "--bare",
         "--no-session-persistence",
+        "--system-prompt-file",
+        "CLAUDE.md",
+        "--max-turns",
+        "30",
         "do a thing",
     ]
     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
@@ -48,6 +53,7 @@ def test_run_claude_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured["kwargs"]["capture_output"] is True
     assert captured["kwargs"]["text"] is True
     assert captured["kwargs"]["stdin"] is subprocess.DEVNULL
+    assert captured["kwargs"]["env"]["NODE_OPTIONS"] == "--max-old-space-size=4096"
 
 
 def test_run_claude_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -122,9 +128,14 @@ def test_run_claude_with_model(monkeypatch: pytest.MonkeyPatch) -> None:
         "claude",
         "--print",
         "--dangerously-skip-permissions",
+        "--bare",
         "--no-session-persistence",
         "--model",
         "opus",
+        "--system-prompt-file",
+        "CLAUDE.md",
+        "--max-turns",
+        "30",
         "do a thing",
     ]
 
