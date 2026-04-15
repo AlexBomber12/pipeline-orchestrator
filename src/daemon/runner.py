@@ -1532,20 +1532,7 @@ return 0
         except github_client.GitHubPollError:
             pass
 
-        # Seed from actual head-commit date so pre-existing staleness counts.
         last_known_push = time.monotonic()
-        try:
-            meta = github_client.get_pr_metadata(self.owner_repo, pr_number)
-            date_str = meta.get("head_commit_date", "")
-            if date_str:
-                commit_dt = datetime.fromisoformat(
-                    date_str.replace("Z", "+00:00")
-                )
-                age = (datetime.now(timezone.utc) - commit_dt).total_seconds()
-                if age > 0:
-                    last_known_push = time.monotonic() - age
-        except Exception:
-            pass
         while True:
             await asyncio.sleep(60)
             try:
