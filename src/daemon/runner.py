@@ -1297,9 +1297,14 @@ return 0
         triggered = False
         if re.search(r"\b429\b", stderr):
             triggered = True
-        m = re.search(r"(\d{1,3})%\s*(?:of\s+)?(?:rate\s*limit|capacity)", lower)
+        m = re.search(
+            r"(\d{1,3})%\s*(?:of\s+)?(?:rate\s*limit|capacity)"
+            r"|(?:rate\s*limit|capacity)\s+(?:at\s+)?(\d{1,3})%",
+            lower,
+        )
         if not triggered and m:
-            triggered = int(m.group(1)) >= threshold
+            pct = int(m.group(1) or m.group(2))
+            triggered = pct >= threshold
         if not triggered and not m and "rate limit" in lower:
             triggered = True
         if triggered:
@@ -1636,6 +1641,13 @@ return 0
                     if "CONFLICT" in (
                         merge_result.stdout + merge_result.stderr
                     ):
+                        if not self._check_rate_limit():
+                            _git(
+                                self.repo_path,
+                                "merge", "--abort",
+                                check=False,
+                            )
+                            return
                         self.log_event(
                             "Merge conflict with main, resolving..."
                         )
