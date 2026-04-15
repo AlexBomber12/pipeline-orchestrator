@@ -1265,9 +1265,18 @@ return 0
 
     def _detect_rate_limit(self, stderr: str) -> None:
         """Set rate-limit pause if stderr contains rate-limit signals."""
-        if "rate limit" in stderr.lower() or "429" in stderr:
-            self._rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=30)
-            self.log_event("Rate limit detected, pausing for 30 min")
+        threshold = self.app_config.daemon.rate_limit_pause_percent
+        lower = stderr.lower()
+        triggered = False
+        m = re.search(r"(\d{1,3})%\s*(?:of\s+)?(?:rate\s*limit|capacity)", lower)
+        if m:
+            triggered = int(m.group(1)) >= threshold
+        elif "429" in stderr or "rate limit" in lower:
+            triggered = True
+        if triggered:
+            pause_min = max(1, int(30 * threshold / 100))
+            self._rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=pause_min)
+            self.log_event(f"Rate limit detected, pausing for {pause_min} min")
 
     async def handle_coding(self) -> None:
         """Run ``PLANNED PR`` via the claude CLI and hand off to WATCH.

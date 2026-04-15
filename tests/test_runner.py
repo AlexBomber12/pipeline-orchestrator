@@ -3652,3 +3652,38 @@ def test_detect_rate_limit_sets_pause(
 
     assert runner._rate_limited_until is not None
     assert runner._rate_limited_until > datetime.now(timezone.utc)
+    expected_pause = timedelta(minutes=27)
+    actual_pause = runner._rate_limited_until - datetime.now(timezone.utc)
+    assert actual_pause > expected_pause - timedelta(seconds=5)
+
+
+def test_detect_rate_limit_respects_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_detect_rate_limit triggers on usage percentage above threshold."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner.app_config.daemon.rate_limit_pause_percent = 80
+
+    runner._detect_rate_limit("Warning: 75% of rate limit capacity used")
+    assert runner._rate_limited_until is None
+
+    runner._detect_rate_limit("Warning: 85% of rate limit capacity used")
+    assert runner._rate_limited_until is not None
+
+
+def test_detect_rate_limit_scales_pause_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_detect_rate_limit scales pause duration by rate_limit_pause_percent."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner.app_config.daemon.rate_limit_pause_percent = 50
+
+    runner._detect_rate_limit("Error: 429 Too Many Requests")
+
+    assert runner._rate_limited_until is not None
+    expected_pause = timedelta(minutes=15)
+    actual_pause = runner._rate_limited_until - datetime.now(timezone.utc)
+    assert actual_pause > expected_pause - timedelta(seconds=5)
+    assert actual_pause < expected_pause + timedelta(seconds=5)
