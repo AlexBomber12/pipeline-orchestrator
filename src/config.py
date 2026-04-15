@@ -50,7 +50,7 @@ class DaemonConfig(BaseModel):
     hung_fallback_codex_review: bool = True
     error_handler_use_ai: bool = True
     claude_model: str = "opus"
-    fix_idle_timeout_sec: int = 1800
+    fix_idle_timeout_sec: int = Field(default=1800, ge=1)
     planned_pr_timeout_sec: int = 900
     rate_limit_pause_percent: int = 90
 

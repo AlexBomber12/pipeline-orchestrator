@@ -345,12 +345,8 @@ async def test_run_claude_async_success(monkeypatch: pytest.MonkeyPatch) -> None
     assert result == (0, "hello", "warn")
     cmd = list(captured["cmd"])
     assert cmd[0] == "claude"
-    assert "--bare" in cmd
-    assert "--no-session-persistence" in cmd
-    assert "--append-system-prompt-file" in cmd
-    assert "CLAUDE.md" in cmd
-    assert "--max-turns" in cmd
-    assert "30" in cmd
+    assert "--print" in cmd
+    assert "--dangerously-skip-permissions" in cmd
     assert cmd[-1] == "do a thing"
     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
 
@@ -397,12 +393,8 @@ async def test_run_claude_async_bare_flags(monkeypatch: pytest.MonkeyPatch) -> N
     await run_claude_async("test", "/tmp")
 
     cmd = captured["cmd"]
-    assert "--bare" in cmd
-    assert "--no-session-persistence" in cmd
-    assert "--append-system-prompt-file" in cmd
-    assert "CLAUDE.md" in cmd
-    assert "--max-turns" in cmd
-    assert "30" in cmd
+    assert "--print" in cmd
+    assert "--dangerously-skip-permissions" in cmd
 
 
 @pytest.mark.asyncio

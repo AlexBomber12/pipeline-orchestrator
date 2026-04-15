@@ -357,6 +357,17 @@ def test_update_daemon_config_accepts_timeouts(tmp_path: Path) -> None:
     assert updated.daemon.planned_pr_timeout_sec == 1200
 
 
+def test_fix_idle_timeout_rejects_zero_or_negative() -> None:
+    from pydantic import ValidationError
+
+    from src.config import DaemonConfig
+
+    with pytest.raises(ValidationError):
+        DaemonConfig(fix_idle_timeout_sec=0)
+    with pytest.raises(ValidationError):
+        DaemonConfig(fix_idle_timeout_sec=-5)
+
+
 def test_daemon_config_rate_limit_default() -> None:
     from src.config import DaemonConfig
 
