@@ -378,7 +378,6 @@ class PipelineRunner:
         # overwritten with GitHub's ``updatedAt`` (which advances every
         # time Codex posts, masking whether Codex feedback is fresher
         # than our last push).
-        self._rate_limited_until: datetime | None = None
         self._last_push_at: datetime | None = None
         # PR number the ``_last_push_at`` timestamp belongs to. Without
         # this, a stale timestamp from a prior PR leaks into freshness
@@ -1256,12 +1255,12 @@ return 0
 
     def _check_rate_limit(self) -> bool:
         """Return True if CLI calls are allowed, False if rate-limited."""
-        if self._rate_limited_until is not None:
-            if datetime.now(timezone.utc) < self._rate_limited_until:
-                remaining = (self._rate_limited_until - datetime.now(timezone.utc)).total_seconds()
+        if self.state.rate_limited_until is not None:
+            if datetime.now(timezone.utc) < self.state.rate_limited_until:
+                remaining = (self.state.rate_limited_until - datetime.now(timezone.utc)).total_seconds()
                 self.log_event(f"Rate limited, resuming in {int(remaining)}s")
                 return False
-            self._rate_limited_until = None
+            self.state.rate_limited_until = None
             self.log_event("Rate limit window expired, resuming")
         return True
 
@@ -1274,13 +1273,13 @@ return 0
         msg = (self.state.error_message or "").lower()
         if "rate limit" not in msg and not re.search(r"\b429\b", msg):
             return False
-        if self._rate_limited_until is None:
+        if self.state.rate_limited_until is None:
             return False
-        if datetime.now(timezone.utc) < self._rate_limited_until:
-            remaining = (self._rate_limited_until - datetime.now(timezone.utc)).total_seconds()
+        if datetime.now(timezone.utc) < self.state.rate_limited_until:
+            remaining = (self.state.rate_limited_until - datetime.now(timezone.utc)).total_seconds()
             self.log_event(f"Rate limit pause active, resuming in {int(remaining)}s")
             return True
-        self._rate_limited_until = None
+        self.state.rate_limited_until = None
         self.state.error_message = None
         self._error_diagnose_count = 0
         if self.state.current_pr is not None:
@@ -1303,7 +1302,7 @@ return 0
             triggered = True
         if triggered:
             pause_min = 30
-            self._rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=pause_min)
+            self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=pause_min)
             self.log_event(f"Rate limit detected, pausing for {pause_min} min")
 
     async def handle_coding(self) -> None:

@@ -3559,10 +3559,10 @@ def test_check_rate_limit_blocks_when_limited(
     """_check_rate_limit returns False when _rate_limited_until is in future."""
     _patch_subprocess(monkeypatch)
     runner = _make_runner()
-    runner._rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
 
     assert runner._check_rate_limit() is False
-    assert runner._rate_limited_until is not None
+    assert runner.state.rate_limited_until is not None
 
 
 def test_check_rate_limit_allows_when_expired(
@@ -3571,10 +3571,10 @@ def test_check_rate_limit_allows_when_expired(
     """_check_rate_limit returns True and clears when _rate_limited_until is past."""
     _patch_subprocess(monkeypatch)
     runner = _make_runner()
-    runner._rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+    runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
 
     assert runner._check_rate_limit() is True
-    assert runner._rate_limited_until is None
+    assert runner.state.rate_limited_until is None
 
 
 def test_handle_coding_skips_when_rate_limited(
@@ -3593,7 +3593,7 @@ def test_handle_coding_skips_when_rate_limited(
     runner.state.current_task = QueueTask(
         pr_id="PR-099", title="test", branch="pr-099-test", status=TaskStatus.TODO
     )
-    runner._rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
 
     asyncio.run(runner.handle_coding())
 
@@ -3646,14 +3646,14 @@ def test_detect_rate_limit_sets_pause(
     """_detect_rate_limit sets _rate_limited_until on rate limit signal."""
     _patch_subprocess(monkeypatch)
     runner = _make_runner()
-    assert runner._rate_limited_until is None
+    assert runner.state.rate_limited_until is None
 
     runner._detect_rate_limit("Error: 429 Too Many Requests")
 
-    assert runner._rate_limited_until is not None
-    assert runner._rate_limited_until > datetime.now(timezone.utc)
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limited_until > datetime.now(timezone.utc)
     expected_pause = timedelta(minutes=27)
-    actual_pause = runner._rate_limited_until - datetime.now(timezone.utc)
+    actual_pause = runner.state.rate_limited_until - datetime.now(timezone.utc)
     assert actual_pause > expected_pause - timedelta(seconds=5)
 
 
@@ -3666,10 +3666,10 @@ def test_detect_rate_limit_respects_threshold(
     runner.app_config.daemon.rate_limit_pause_percent = 80
 
     runner._detect_rate_limit("Warning: 75% of rate limit capacity used")
-    assert runner._rate_limited_until is None
+    assert runner.state.rate_limited_until is None
 
     runner._detect_rate_limit("Warning: 85% of rate limit capacity used")
-    assert runner._rate_limited_until is not None
+    assert runner.state.rate_limited_until is not None
 
 
 def test_detect_rate_limit_fixed_pause_duration(
@@ -3682,8 +3682,8 @@ def test_detect_rate_limit_fixed_pause_duration(
 
     runner._detect_rate_limit("Error: 429 Too Many Requests")
 
-    assert runner._rate_limited_until is not None
+    assert runner.state.rate_limited_until is not None
     expected_pause = timedelta(minutes=30)
-    actual_pause = runner._rate_limited_until - datetime.now(timezone.utc)
+    actual_pause = runner.state.rate_limited_until - datetime.now(timezone.utc)
     assert actual_pause > expected_pause - timedelta(seconds=5)
     assert actual_pause < expected_pause + timedelta(seconds=5)

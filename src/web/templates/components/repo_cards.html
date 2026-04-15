@@ -132,7 +132,7 @@
         <div class="text-xs text-accent/70 italic mt-1">Claude is coding...</div>
         {% endif %}
         {% endif %}
-        {% if repo.error_message and ('rate limit' in repo.error_message.lower() or '429' in repo.error_message) %}
+        {% if repo.rate_limited_until or (repo.error_message and ('rate limit' in repo.error_message.lower() or '429' in repo.error_message)) %}
         <div class="text-xs text-warn italic mt-1">Rate limited, auto-resuming...</div>
         {% endif %}
         <div id="upload-error-{{ repo.name }}"></div>
