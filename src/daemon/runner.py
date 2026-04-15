@@ -1529,17 +1529,22 @@ return 0
         # Prime the SHA tracker so the first poll can detect a change.
         primed = False
         try:
-            github_client.get_branch_last_push_time(self.owner_repo, pr_number)
+            await asyncio.to_thread(
+                github_client.get_branch_last_push_time,
+                self.owner_repo, pr_number,
+            )
             primed = True
         except github_client.GitHubPollError:
             pass
 
+        poll_interval = min(60, idle_limit)
         last_known_push = time.monotonic()
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(poll_interval)
             try:
-                latest_push_at = github_client.get_branch_last_push_time(
-                    self.owner_repo, pr_number
+                latest_push_at = await asyncio.to_thread(
+                    github_client.get_branch_last_push_time,
+                    self.owner_repo, pr_number,
                 )
                 if not primed:
                     last_known_push = time.monotonic()
