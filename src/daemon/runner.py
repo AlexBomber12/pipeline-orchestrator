@@ -312,30 +312,29 @@ class PipelineRunner:
             except Exception:
                 logger.warning("Could not verify origin for %s — skipping migration", old_path)
         if new_path.exists():
-            try:
-                result = subprocess.run(
-                    ["git", "-C", str(new_path), "remote", "get-url", "origin"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                if result.returncode != 0:
-                    raise RuntimeError(f"git remote get-url failed: {result.stderr}")
-                current_origin = result.stdout.strip()
-                if repo_slug_from_url(current_origin) != self.name:
-                    logger.warning(
-                        "Clone %s has origin %s, expected %s — removing stale clone",
-                        new_path,
-                        current_origin,
-                        repo_config.url,
-                    )
-                    shutil.rmtree(new_path)
-            except Exception:
-                logger.warning(
-                    "Could not verify origin for %s — removing invalid clone",
-                    new_path,
-                )
+            if not (new_path / ".git").exists():
+                logger.warning("Removing non-git directory %s", new_path)
                 shutil.rmtree(new_path, ignore_errors=True)
+            else:
+                try:
+                    result = subprocess.run(
+                        ["git", "-C", str(new_path), "remote", "get-url", "origin"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        check=True,
+                    )
+                    current_origin = result.stdout.strip()
+                    if repo_slug_from_url(current_origin) != self.name:
+                        logger.warning(
+                            "Clone %s has origin %s, expected %s — removing stale clone",
+                            new_path,
+                            current_origin,
+                            repo_config.url,
+                        )
+                        shutil.rmtree(new_path)
+                except Exception:
+                    logger.warning("Could not verify origin for %s", new_path)
         self._old_basename = old_basename
         self.state = RepoState(
             url=repo_config.url,

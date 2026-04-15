@@ -1,5 +1,5 @@
 diff --git a/src/daemon/runner.py b/src/daemon/runner.py
-index 23736f6..c3f9a56 100644
+index 23736f6..b4262cc 100644
 --- a/src/daemon/runner.py
 +++ b/src/daemon/runner.py
 @@ -39,7 +39,7 @@ from src.queue_parser import (
@@ -11,7 +11,7 @@ index 23736f6..c3f9a56 100644
  
  logger = logging.getLogger(__name__)
  
-@@ -281,9 +281,62 @@ class PipelineRunner:
+@@ -281,9 +281,61 @@ class PipelineRunner:
          self.repo_config = repo_config
          self.app_config = app_config
          self.redis = redis_client
@@ -47,35 +47,34 @@ index 23736f6..c3f9a56 100644
 +            except Exception:
 +                logger.warning("Could not verify origin for %s — skipping migration", old_path)
 +        if new_path.exists():
-+            try:
-+                result = subprocess.run(
-+                    ["git", "-C", str(new_path), "remote", "get-url", "origin"],
-+                    capture_output=True,
-+                    text=True,
-+                    timeout=5,
-+                )
-+                if result.returncode != 0:
-+                    raise RuntimeError(f"git remote get-url failed: {result.stderr}")
-+                current_origin = result.stdout.strip()
-+                if repo_slug_from_url(current_origin) != self.name:
-+                    logger.warning(
-+                        "Clone %s has origin %s, expected %s — removing stale clone",
-+                        new_path,
-+                        current_origin,
-+                        repo_config.url,
-+                    )
-+                    shutil.rmtree(new_path)
-+            except Exception:
-+                logger.warning(
-+                    "Could not verify origin for %s — removing invalid clone",
-+                    new_path,
-+                )
++            if not (new_path / ".git").exists():
++                logger.warning("Removing non-git directory %s", new_path)
 +                shutil.rmtree(new_path, ignore_errors=True)
++            else:
++                try:
++                    result = subprocess.run(
++                        ["git", "-C", str(new_path), "remote", "get-url", "origin"],
++                        capture_output=True,
++                        text=True,
++                        timeout=5,
++                        check=True,
++                    )
++                    current_origin = result.stdout.strip()
++                    if repo_slug_from_url(current_origin) != self.name:
++                        logger.warning(
++                            "Clone %s has origin %s, expected %s — removing stale clone",
++                            new_path,
++                            current_origin,
++                            repo_config.url,
++                        )
++                        shutil.rmtree(new_path)
++                except Exception:
++                    logger.warning("Could not verify origin for %s", new_path)
 +        self._old_basename = old_basename
          self.state = RepoState(
              url=repo_config.url,
              name=self.name,
-@@ -348,6 +401,24 @@ class PipelineRunner:
+@@ -348,6 +400,24 @@ class PipelineRunner:
          else:
              payload = self.state.model_dump_json()
          await self.redis.set(f"pipeline:{self.name}", payload)
