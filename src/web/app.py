@@ -63,10 +63,12 @@ async def _get_repo_state_safe(
         raw = await redis_client.get(f"pipeline:{name}")
     except Exception:
         st = _default_repo_state(name, url)
+        st.state = PipelineState.PREFLIGHT
         st.error_message = "Redis unavailable — state unknown"
         return st, "Redis unavailable"
     if raw is None:
         st = _default_repo_state(name, url)
+        st.state = PipelineState.PREFLIGHT
         st.error_message = "Waiting for daemon to initialize"
         return st, "Awaiting daemon initialization"
     try:
@@ -138,6 +140,7 @@ async def get_all_repo_states(
 
         if state is None:
             state = _default_repo_state(name, repo.url)
+            state.state = PipelineState.PREFLIGHT
             state.error_message = "Redis unavailable — state unknown"
 
         states.append(state)

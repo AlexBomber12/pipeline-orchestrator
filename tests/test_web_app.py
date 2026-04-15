@@ -88,7 +88,7 @@ def test_get_all_repo_states_no_redis_returns_idle_defaults(
     assert warning is None
     assert [s.name for s in states] == ["example__alpha", "example__beta"]
     for state in states:
-        assert state.state == PipelineState.IDLE
+        assert state.state == PipelineState.PREFLIGHT
         assert state.current_task is None
         assert state.current_pr is None
         assert state.error_message == "Redis unavailable — state unknown"
@@ -126,7 +126,7 @@ def test_get_all_repo_states_uses_redis_when_present(
     assert states[0].current_pr is not None
     assert states[0].current_pr.number == 42
     # second repo has no redis entry -> awaiting initialization
-    assert states[1].state == PipelineState.IDLE
+    assert states[1].state == PipelineState.PREFLIGHT
     assert states[1].error_message == "Waiting for daemon to initialize"
 
 
@@ -172,7 +172,7 @@ def test_api_states_returns_json(
     assert isinstance(payload, list)
     assert {p["name"] for p in payload} == {"example__alpha", "example__beta"}
     for entry in payload:
-        assert entry["state"] == "IDLE"
+        assert entry["state"] == "PREFLIGHT"
 
 
 def test_partial_repo_list_returns_html_fragment(
@@ -366,7 +366,7 @@ def test_partial_repo_detail_returns_html_fragment(
     body = response.text
     assert "<!DOCTYPE" not in body  # fragment, not full document
     assert "alpha" in body
-    assert "IDLE" in body
+    assert "PREFLIGHT" in body
     assert "Current Task" in body
     assert "Current PR" in body
     # Event log has been split out of /partials/repo/{name} — it now
