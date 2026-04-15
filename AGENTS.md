@@ -7,8 +7,8 @@ Quick rules
 - PLANNED PRs must follow `tasks/QUEUE.md` and the corresponding `tasks/PR-*.md` file exactly.
 - Never commit secrets. Runtime secrets belong in `/data/secrets` (mounted) or injected via env vars.
 - Always run the local gate `scripts/ci.sh` until it exits with code 0.
-- Always generate review artifacts: `artifacts/ci.log`, `artifacts/pr.patch`, `artifacts/structure.txt`.
-- Codex Review is "green" only when the Codex bot reacts with thumbs up (`+1`) on the PR's review anchor comment (see Codex Review gate). Do not use screenshots.
+- Always generate review artifacts: `artifacts/ci.log`, `artifacts/pr.patch`, `artifacts/structure.txt`. These are for review only and must not appear in commits (.gitignore handles this).
+- Codex Review is "green" only when the Codex bot reacts with thumbs up (`+1`) on the PR body or the review anchor comment (see Codex Review gate). Do not use screenshots.
 - Do not drift from the plan and do not add "nice-to-have" work.
 
 ## Work Modes
@@ -28,19 +28,25 @@ When triggered by the pipeline orchestrator daemon (non-interactive):
 - Do not ask for confirmation or clarification.
 - If something is unclear, commit what you have and note the ambiguity in the PR description.
 - Log all decisions to stdout for the daemon to capture.
+- NEVER use `git add -f` or explicitly stage files matched by .gitignore.
+- Artifacts (ci.log, pr.patch, structure.txt) are generated for Codex review but must not appear in commits. The .gitignore already excludes them.
+- NEVER commit .patch files to the repository under any circumstances.
 
 ## Codex Review gate (GitHub PR)
 
 This repo treats Codex Review as a single pass/fail signal.
 
 Pass signal
-- thumbs up (`+1`) reaction from the Codex bot on the PR's review anchor comment.
+- thumbs up (`+1`) reaction from the Codex bot on either:
+  - the PR body (description), OR
+  - the review anchor comment
+- The daemon compares the reaction timestamp against the latest push timestamp. A +1 that predates the most recent push is stale and does not count as a pass.
 
 In-progress signal
 - eyes (`eyes`) reaction from the Codex bot.
 
 Feedback
-- If there is no thumbs up, assume the PR is not approved yet.
+- If there is no valid (non-stale) thumbs up, assume the PR is not approved yet.
 - Codex may post a comment with findings (often labeled `P1` or `P2`). Fix all `P1` and `P2` by default to obtain thumbs up.
 
 Definitions
@@ -57,17 +63,18 @@ push. Codex Automatic Reviews should be configured for PR creation only
 
 Fix loop (used in `FIX REVIEW` mode)
 1. Fetch PR comments, reviews, and reactions via GitHub CLI (`gh`). No screenshots.
-2. Locate the review anchor comment and check Codex reactions.
-3. If thumbs up exists, stop. The PR is green.
-4. Otherwise, collect the latest Codex feedback after the anchor comment:
+2. Check for Codex thumbs up on both the PR body and the review anchor comment.
+3. If a non-stale thumbs up exists (reaction created after the latest push), stop. The PR is green.
+4. Otherwise, collect the latest Codex feedback after the most recent push:
    - review comments
    - top-level PR comments
-5. Extract actionable items and fix them. Treat `P1` as mandatory; treat `P2` as mandatory unless the user explicitly waives them.
-6. Run `scripts/ci.sh` until exit code 0 and generate required review artifacts.
-7. Commit and push to the same PR branch.
-8. Poll the PR for up to 15 minutes:
-   - if thumbs up appears on the anchor comment, stop
-   - if a new Codex feedback comment appears, repeat the loop
+5. If no new feedback exists after the latest push, stop. Do not fix already-resolved issues.
+6. Extract actionable items and fix them. Treat `P1` as mandatory; treat `P2` as mandatory unless the user explicitly waives them.
+7. Run `scripts/ci.sh` until exit code 0 and generate required review artifacts.
+8. Commit and push to the same PR branch.
+9. Poll the PR for up to 15 minutes:
+   - if a non-stale thumbs up appears, stop
+   - if a new Codex feedback comment appears after the push, repeat the loop
 
 ## MCP servers and tool usage
 
@@ -81,7 +88,7 @@ Rules
 ## Repo invariants
 These are non-negotiable contracts:
 - `/data` is the single runtime state root.
-  - Cloned repos: `/data/repos/<repo-name>/`
+  - Cloned repos: `/data/repos/<owner>__<repo>/`
   - Auth tokens: `/data/auth/claude/`, `/data/auth/gh/`
   - Secrets: `/data/secrets/`
 - Docker Compose defines 3 services: `web` (FastAPI dashboard), `daemon` (pipeline state machine), `redis` (state bridge).
@@ -115,7 +122,7 @@ If the script does not exist yet, manual fallback:
 - Save a patch to `artifacts/pr.patch` (diff from `origin/main` to HEAD)
 - Save project structure to `artifacts/structure.txt` (`find . -type f | grep -v __pycache__ | grep -v .git/ | grep -v node_modules | sort`)
 
-Artifacts are required for every PR.
+Artifacts are generated for Codex review but excluded from commits by .gitignore. Do not use `git add -f` to override this.
 
 ## Branch naming
 - PLANNED: use `Branch:` from the active `tasks/PR-*.md` as the source of truth.
@@ -151,7 +158,7 @@ Artifacts are required for every PR.
 - [ ] `git fetch origin main` and created branch from `origin/main`
 - [ ] Implemented only `TASK_FILE` scope
 - [ ] Ran `scripts/ci.sh` to exit 0
-- [ ] Generated `artifacts/ci.log`, `artifacts/pr.patch`, `artifacts/structure.txt`
+- [ ] Generated `artifacts/ci.log`, `artifacts/pr.patch`, `artifacts/structure.txt` (not committed, excluded by .gitignore)
 - [ ] Updated `tasks/QUEUE.md` for current PR: `DOING` -> `DONE`
 - [ ] Commit message: `<PR_ID>: <short summary>`
 - [ ] Pushed branch
@@ -189,7 +196,7 @@ If any condition fails, MICRO is not allowed. Use PLANNED PR.
 - [ ] Branch `micro-YYYYMMDD-<short-slug>` from `origin/main`
 - [ ] Only the requested change
 - [ ] Ran `scripts/ci.sh` to exit 0
-- [ ] Generated review artifacts
+- [ ] Generated review artifacts (not committed, excluded by .gitignore)
 - [ ] Commit: `MICRO: <short summary>`
 - [ ] Pushed branch and opened PR
 
@@ -199,9 +206,9 @@ If any condition fails, MICRO is not allowed. Use PLANNED PR.
 - Stay on the existing PR branch
 - Do not edit `tasks/QUEUE.md` or `tasks/PR-*.md`
 - Fix only the review comments
-- Use the Codex Review gate above and stop only when the Codex thumbs up pass signal is present
+- Use the Codex Review gate above and stop only when a non-stale Codex thumbs up is present
 - Run `scripts/ci.sh` to exit 0
-- Generate review artifacts
+- Generate review artifacts (not committed, excluded by .gitignore)
 - Commit and push to the same PR branch
 
 ## Queue stability rules (PLANNED PR only)
