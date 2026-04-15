@@ -414,8 +414,8 @@ class PipelineRunner:
                 if owns_old_key:
                     old_upload = f"upload:{self._old_basename}:pending"
                     new_upload = f"upload:{self.name}:pending"
-                    if await self.redis.exists(old_upload) and not await self.redis.exists(new_upload):
-                        await self.redis.rename(old_upload, new_upload)
+                    if await self.redis.exists(old_upload):
+                        await self.redis.renamenx(old_upload, new_upload)
             except Exception:
                 pass
 
