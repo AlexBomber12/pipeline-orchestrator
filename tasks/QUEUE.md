@@ -252,7 +252,7 @@
 - Depends on: PR-038
 
 ## PR-043: GitHub API optimization
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-043.md
 - Branch: pr-043-gh-api-optimize
 - Depends on: PR-042

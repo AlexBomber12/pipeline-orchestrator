@@ -13,6 +13,29 @@ _REPO_URL_RE = re.compile(
     r"github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"
 )
 
+_review_status_cache: dict[str, "ReviewStatus"] = {}
+_review_status_cache_cycle: int | None = None
+
+
+def _cache_key(repo: str, pr_number: int, head_sha: str) -> str:
+    return f"{repo}#{pr_number}#{head_sha}"
+
+
+def clear_review_status_cache() -> None:
+    """Clear the review status cache (used in tests)."""
+    global _review_status_cache_cycle
+    _review_status_cache.clear()
+    _review_status_cache_cycle = None
+
+
+def _begin_review_cache_cycle() -> None:
+    """Start a new cache cycle, invalidating all previous entries."""
+    global _review_status_cache_cycle
+    _review_status_cache.clear()
+    if _review_status_cache_cycle is None:
+        _review_status_cache_cycle = 0
+    _review_status_cache_cycle += 1
+
 
 def run_gh(
     args: list[str],
@@ -66,6 +89,7 @@ def get_repo_full_name(url: str) -> str:
 
 def get_open_prs(repo: str) -> list[PRInfo]:
     """Return open PRs for ``repo`` (``owner/repo``) with CI and review status."""
+    _begin_review_cache_cycle()
     raw = run_gh(
         [
             "pr",
@@ -122,35 +146,59 @@ def get_pr_review_status(
        the anchor for P1/P2 → CHANGES_REQUESTED.
     4. Otherwise → PENDING.
     """
-    body_approved = False
+    if head_sha:
+        ck = _cache_key(repo, pr_number, head_sha)
+        cached = _review_status_cache.get(ck)
+        if cached is not None:
+            return cached
+
+    result = _compute_review_status(repo, pr_number, pr_author, head_sha)
+
+    if head_sha:
+        _review_status_cache[_cache_key(repo, pr_number, head_sha)] = result
+    return result
+
+
+def _get_codex_issue_reactions(
+    repo: str, pr_number: int
+) -> list[dict]:
+    """Fetch Codex reactions on a PR body."""
     try:
-        issue_reactions = _gh_api_paginated(
+        reactions = _gh_api_paginated(
             f"repos/{repo}/issues/{pr_number}/reactions"
         )
-        if issue_reactions:
-            codex_reactions = [
-                r
-                for r in issue_reactions
-                if isinstance(r, dict)
-                and "codex" in ((r.get("user") or {}).get("login", "")).lower()
-            ]
+    except RuntimeError as exc:
+        if "HTTP 404" not in str(exc):
+            raise
+        return []
+    if not reactions:
+        return []
+    return [
+        r for r in reactions
+        if isinstance(r, dict)
+        and isinstance(r.get("user"), dict)
+        and re.search(r"codex", r["user"].get("login", ""), re.IGNORECASE)
+    ]
+
+
+def _compute_review_status(
+    repo: str,
+    pr_number: int,
+    pr_author: str,
+    head_sha: str,
+) -> ReviewStatus:
+    """Core review status logic, separated for caching."""
+    body_approved = False
+    try:
+        codex_reactions = _get_codex_issue_reactions(repo, pr_number)
+        if codex_reactions:
             codex_contents = {r.get("content") for r in codex_reactions}
             if "+1" in codex_contents:
                 if head_sha:
-                    plus_one = _find_codex_plus_one_reaction(issue_reactions)
+                    plus_one = _find_codex_plus_one_reaction(codex_reactions)
                     if plus_one:
                         reaction_time = _parse_iso(plus_one.get("created_at"))
                         head_commit_time = _get_commit_time(repo, head_sha)
-                        # Also gather the most recent Codex formal review's
-                        # (commit_id, submitted_at). A force-push that moves
-                        # head back to an older commit would make
-                        # ``head_commit_time`` (committer.date) older than
-                        # ``reaction_time`` again, so the committer-date
-                        # check alone can silently approve stale state.
-                        # Raising the threshold to the later of the head
-                        # commit time and the last Codex review submission
-                        # closes that gap; when the latest formal review is
-                        # ON the current head we accept unconditionally.
                         latest_sha, latest_review_time = (
                             _get_latest_codex_review_info(repo, pr_number)
                         )
@@ -166,12 +214,6 @@ def get_pr_review_status(
                                 )
                             ):
                                 threshold = latest_review_time
-                            # Inclusive comparison: GitHub timestamps
-                            # are second-granular, so a +1 posted in
-                            # the same second as the head commit (or
-                            # latest review) must still count as
-                            # approving the current push — a strict
-                            # ``>`` would mark that valid case stale.
                             if (
                                 reaction_time
                                 and threshold
@@ -203,7 +245,6 @@ def get_pr_review_status(
             raise
         review_comments = []
 
-    # Step 1: latest "@codex review" trigger comment by the PR author.
     anchor = None
     for c in reversed(issue_comments):
         author = (c.get("user") or {}).get("login", "")
@@ -213,7 +254,6 @@ def get_pr_review_status(
             anchor = c
             break
 
-    # Step 2: check Codex reactions on the anchor comment.
     anchor_approved = False
     if anchor is not None:
         cid = anchor.get("id")
@@ -238,7 +278,6 @@ def get_pr_review_status(
                 if "HTTP 404" not in str(exc):
                     raise
 
-    # Step 3: P1/P2 in Codex comments after the anchor → CHANGES_REQUESTED.
     anchor_ts = (anchor.get("created_at") or "") if anchor else ""
     for comment in issue_comments + review_comments:
         user = (comment.get("user") or {}).get("login", "") or ""
@@ -329,6 +368,54 @@ def get_pr_head_commit_iso(repo: str, pr_number: int) -> str:
     except RuntimeError:
         return ""
     return raw_date.strip() if isinstance(raw_date, str) else ""
+
+
+def get_pr_metadata(repo: str, pr_number: int) -> dict:
+    """Fetch PR author, head SHA, and head commit date in 1-2 API calls.
+
+    Replaces separate ``get_pr_author`` + ``get_pr_head_commit_iso`` calls.
+    Returns ``{"author": str, "head_sha": str, "head_commit_date": str}``.
+    """
+    try:
+        raw = run_gh([
+            "api",
+            f"repos/{repo}/pulls/{pr_number}",
+            "--jq",
+            "{author: .user.login, head_sha: .head.sha}",
+        ])
+    except RuntimeError:
+        return {"author": "", "head_sha": "", "head_commit_date": ""}
+    if isinstance(raw, dict):
+        author = raw.get("author") or ""
+        head_sha = raw.get("head_sha") or ""
+    elif isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            author = parsed.get("author") or ""
+            head_sha = parsed.get("head_sha") or ""
+        except (json.JSONDecodeError, AttributeError):
+            return {"author": "", "head_sha": "", "head_commit_date": ""}
+    else:
+        return {"author": "", "head_sha": "", "head_commit_date": ""}
+
+    head_commit_date = ""
+    if head_sha:
+        try:
+            raw_date = run_gh([
+                "api",
+                f"repos/{repo}/commits/{head_sha}",
+                "--jq",
+                ".commit.committer.date",
+            ])
+            head_commit_date = raw_date.strip() if isinstance(raw_date, str) else ""
+        except RuntimeError:
+            pass
+
+    return {
+        "author": author,
+        "head_sha": head_sha,
+        "head_commit_date": head_commit_date,
+    }
 
 
 def has_recent_codex_review_request(
