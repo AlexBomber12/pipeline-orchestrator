@@ -157,21 +157,24 @@ def get_pr_review_status(
 def _get_codex_issue_reactions(
     repo: str, pr_number: int
 ) -> list[dict]:
-    """Fetch only Codex reactions on a PR body using --jq server-side filtering."""
+    """Fetch Codex reactions on a PR body."""
     try:
         raw = run_gh([
-            "api", "--paginate", "--slurp",
+            "api", "--paginate",
             f"repos/{repo}/issues/{pr_number}/reactions",
-            "--jq",
-            '[.[][] | select(.user.login | test("codex";"i"))]',
         ])
     except RuntimeError as exc:
         if "HTTP 404" not in str(exc):
             raise
         return []
-    if isinstance(raw, list):
-        return [r for r in raw if isinstance(r, dict)]
-    return []
+    if not isinstance(raw, list):
+        return []
+    return [
+        r for r in raw
+        if isinstance(r, dict)
+        and isinstance(r.get("user"), dict)
+        and re.search(r"codex", r["user"].get("login", ""), re.IGNORECASE)
+    ]
 
 
 def _compute_review_status(
