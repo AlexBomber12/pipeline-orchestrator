@@ -349,3 +349,19 @@ def test_update_daemon_config_accepts_timeouts(tmp_path: Path) -> None:
     )
     assert updated.daemon.fix_review_timeout_sec == 2000
     assert updated.daemon.planned_pr_timeout_sec == 1200
+
+
+def test_daemon_config_rate_limit_default() -> None:
+    from src.config import DaemonConfig
+
+    assert DaemonConfig().rate_limit_pause_percent == 90
+
+
+def test_update_daemon_config_rate_limit(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text("daemon: {}\n", encoding="utf-8")
+    updated = update_daemon_config(
+        path=str(cfg_path),
+        rate_limit_pause_percent=75,
+    )
+    assert updated.daemon.rate_limit_pause_percent == 75

@@ -3551,3 +3551,104 @@ def test_rehydrate_clears_stale_on_mismatch_when_fetch_fails(
 
     assert runner._last_push_at is None
     assert runner._last_push_at_pr_number == 42
+
+
+def test_check_rate_limit_blocks_when_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_check_rate_limit returns False when _rate_limited_until is in future."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner._rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+    assert runner._check_rate_limit() is False
+    assert runner._rate_limited_until is not None
+
+
+def test_check_rate_limit_allows_when_expired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_check_rate_limit returns True and clears when _rate_limited_until is past."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner._rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+
+    assert runner._check_rate_limit() is True
+    assert runner._rate_limited_until is None
+
+
+def test_handle_coding_skips_when_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """handle_coding returns early without calling claude_cli when rate-limited."""
+    _patch_subprocess(monkeypatch)
+    cli_calls: list[str] = []
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "run_planned_pr",
+        lambda *a, **kw: (cli_calls.append("run_planned_pr"), (0, "", ""))[1],
+    )
+    runner = _make_runner()
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = QueueTask(
+        pr_id="PR-099", title="test", branch="pr-099-test", status=TaskStatus.TODO
+    )
+    runner._rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+    asyncio.run(runner.handle_coding())
+
+    assert cli_calls == []
+
+
+def test_handle_error_skips_diagnose_for_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """handle_error skips diagnose_error when error contains 'rate limit'."""
+    _patch_subprocess(monkeypatch)
+    cli_calls: list[str] = []
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "diagnose_error",
+        lambda *a, **kw: (cli_calls.append("diagnose"), (0, "SKIP", ""))[1],
+    )
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Claude rate limit exceeded"
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+
+
+def test_handle_error_skips_diagnose_for_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """handle_error skips diagnose_error when error contains 'timeout'."""
+    _patch_subprocess(monkeypatch)
+    cli_calls: list[str] = []
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "diagnose_error",
+        lambda *a, **kw: (cli_calls.append("diagnose"), (0, "SKIP", ""))[1],
+    )
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Timeout waiting for response"
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+
+
+def test_detect_rate_limit_sets_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_detect_rate_limit sets _rate_limited_until on rate limit signal."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    assert runner._rate_limited_until is None
+
+    runner._detect_rate_limit("Error: 429 Too Many Requests")
+
+    assert runner._rate_limited_until is not None
+    assert runner._rate_limited_until > datetime.now(timezone.utc)

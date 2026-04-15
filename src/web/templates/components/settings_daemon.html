@@ -51,6 +51,21 @@
                hx-target="#settings-daemon"
                hx-swap="innerHTML">
     </label>
+    <label class="flex flex-col gap-1 text-sm">
+        <span class="text-gray-400">Rate limit pause threshold (%)</span>
+        <input type="number"
+               name="rate_limit_pause_percent"
+               value="{{ daemon.rate_limit_pause_percent }}"
+               min="50"
+               max="99"
+               step="5"
+               class="w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+               hx-put="/settings/daemon"
+               hx-trigger="change"
+               hx-target="#settings-daemon"
+               hx-swap="innerHTML">
+        <span class="text-xs text-gray-500">Daemon pauses Claude CLI calls when usage reaches this percentage of the rate limit window.</span>
+    </label>
 </div>
 
 <div class="space-y-3 pt-4 mt-4 border-t border-white/5">

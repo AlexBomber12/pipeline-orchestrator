@@ -782,6 +782,7 @@ async def put_settings_daemon(
     error_handler_use_ai: str | None = Form(None),
     planned_pr_timeout_sec: str | None = Form(None),
     fix_review_timeout_sec: str | None = Form(None),
+    rate_limit_pause_percent: str | None = Form(None),
 ) -> HTMLResponse:
     """Update daemon settings.
 
@@ -826,6 +827,13 @@ async def put_settings_daemon(
         ):
             updates["fix_review_timeout_sec"] = _coerce_int(
                 fix_review_timeout_sec, "fix_review_timeout_sec", min_value=1
+            )
+        if (
+            rate_limit_pause_percent is not None
+            and rate_limit_pause_percent != ""
+        ):
+            updates["rate_limit_pause_percent"] = _coerce_int(
+                rate_limit_pause_percent, "rate_limit_pause_percent", min_value=50
             )
     except ValueError as exc:
         return _render_settings_daemon_error(request, str(exc), 422)

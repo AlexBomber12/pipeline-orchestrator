@@ -130,6 +130,9 @@
         {% if repo.state.value == 'CODING' %}
         <div class="text-xs text-accent/70 italic mt-1">Claude is coding...</div>
         {% endif %}
+        {% if repo.error_message and 'rate limit' in repo.error_message.lower() %}
+        <div class="text-xs text-warn italic mt-1">Rate limited, auto-resuming...</div>
+        {% endif %}
         {% endif %}
         {% endif %}
         <div id="upload-error-{{ repo.name }}"></div>
