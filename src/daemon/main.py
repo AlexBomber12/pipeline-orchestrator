@@ -197,7 +197,6 @@ async def main() -> None:
                     config = new_config
                     _sync_runners(runners, config, redis_client)
 
-        now = time.monotonic()
         for key, runner in list(runners.items()):
             if not runner.repo_config.active:
                 try:
@@ -209,6 +208,7 @@ async def main() -> None:
                         exc_info=True,
                     )
                 continue
+            now = time.monotonic()
             interval = runner.repo_config.poll_interval_sec
             if key in last_run and now - last_run[key] < interval:
                 continue
