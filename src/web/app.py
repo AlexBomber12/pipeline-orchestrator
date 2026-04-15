@@ -833,7 +833,10 @@ async def put_settings_daemon(
             and rate_limit_pause_percent != ""
         ):
             updates["rate_limit_pause_percent"] = _coerce_int(
-                rate_limit_pause_percent, "rate_limit_pause_percent", min_value=50
+                rate_limit_pause_percent,
+                "rate_limit_pause_percent",
+                min_value=50,
+                max_value=99,
             )
     except ValueError as exc:
         return _render_settings_daemon_error(request, str(exc), 422)
@@ -1044,13 +1047,20 @@ def _coerce_bool(value: str, field: str) -> bool:
     raise ValueError(f"{field} must be a boolean")
 
 
-def _coerce_int(value: str, field: str, min_value: int | None = None) -> int:
+def _coerce_int(
+    value: str,
+    field: str,
+    min_value: int | None = None,
+    max_value: int | None = None,
+) -> int:
     try:
         parsed = int(value.strip())
     except ValueError as exc:
         raise ValueError(f"{field} must be an integer") from exc
     if min_value is not None and parsed < min_value:
         raise ValueError(f"{field} must be at least {min_value}")
+    if max_value is not None and parsed > max_value:
+        raise ValueError(f"{field} must be at most {max_value}")
     return parsed
 
 
