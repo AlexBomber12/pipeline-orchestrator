@@ -16,6 +16,9 @@ from src.web.app import app
 
 
 class _StubAioredisClient:
+    async def ping(self) -> bool:
+        return True
+
     async def get(self, key: str) -> str | None:
         return None
 

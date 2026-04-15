@@ -30,6 +30,9 @@ class _FakeRedis:
     def __init__(self, store: dict[str, str] | None = None) -> None:
         self.store = store or {}
 
+    async def ping(self) -> bool:
+        return True
+
     async def get(self, key: str) -> str | None:
         return self.store.get(key)
 
@@ -38,12 +41,18 @@ class _BoomRedis:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
+    async def ping(self) -> bool:
+        raise RuntimeError("redis is down")
+
     async def get(self, key: str) -> str | None:
         self.calls.append(key)
         raise RuntimeError("redis is down")
 
 
 class _StubAioredisClient:
+    async def ping(self) -> bool:
+        return True
+
     async def get(self, key: str) -> str | None:
         return None
 
@@ -83,14 +92,15 @@ def two_repo_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def test_get_all_repo_states_no_redis_returns_idle_defaults(
     two_repo_config: Path,
 ) -> None:
-    states = asyncio.run(get_all_repo_states(redis_client=None))
+    states, warning = asyncio.run(get_all_repo_states(redis_client=None))
 
+    assert warning is None
     assert [s.name for s in states] == ["example__alpha", "example__beta"]
     for state in states:
-        assert state.state == PipelineState.IDLE
+        assert state.state == PipelineState.PREFLIGHT
         assert state.current_task is None
         assert state.current_pr is None
-        assert state.error_message is None
+        assert state.error_message == "Redis unavailable — state unknown"
 
 
 def test_get_all_repo_states_uses_redis_when_present(
@@ -116,30 +126,29 @@ def test_get_all_repo_states_uses_redis_when_present(
     )
     fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
 
-    states = asyncio.run(get_all_repo_states(redis_client=fake))
+    states, warning = asyncio.run(get_all_repo_states(redis_client=fake))
 
+    assert warning is None
     assert states[0].state == PipelineState.CODING
     assert states[0].current_task is not None
     assert states[0].current_task.pr_id == "PR-099"
     assert states[0].current_pr is not None
     assert states[0].current_pr.number == 42
-    # second repo has no redis entry -> idle default
-    assert states[1].state == PipelineState.IDLE
-    assert states[1].current_task is None
+    # second repo has no redis entry -> awaiting initialization
+    assert states[1].state == PipelineState.PREFLIGHT
+    assert states[1].error_message == "Waiting for daemon to initialize"
 
 
 def test_get_all_repo_states_falls_back_when_redis_raises(
     two_repo_config: Path,
 ) -> None:
     boom = _BoomRedis()
-    states = asyncio.run(get_all_repo_states(redis_client=boom))
+    states, warning = asyncio.run(get_all_repo_states(redis_client=boom))
 
+    assert warning == "Redis connection lost"
     assert len(states) == 2
-    for state in states:
-        assert state.state == PipelineState.IDLE
-    # After the first failure further Redis lookups must be skipped so an
-    # unreachable broker cannot turn each repo into another timing-out call.
-    assert boom.calls == ["pipeline:example__alpha"]
+    # Upfront ping detects the outage so no per-repo get() calls are made.
+    assert boom.calls == []
 
 
 def test_index_route_returns_html(
@@ -171,7 +180,7 @@ def test_api_states_returns_json(
     assert isinstance(payload, list)
     assert {p["name"] for p in payload} == {"example__alpha", "example__beta"}
     for entry in payload:
-        assert entry["state"] == "IDLE"
+        assert entry["state"] == "PREFLIGHT"
 
 
 def test_partial_repo_list_returns_html_fragment(
@@ -187,8 +196,7 @@ def test_partial_repo_list_returns_html_fragment(
     assert "<!DOCTYPE" not in body  # fragment, not full document
     assert "alpha" in body
     assert "beta" in body
-    assert "IDLE" in body
-    assert "0 / 0 done" in body
+    assert "initializing" in body
 
 
 def test_partial_repo_list_empty_state(
@@ -222,6 +230,9 @@ def test_partial_repo_list_renders_queue_progress(
     )
 
     class _StubClientWithQueue:
+        async def ping(self) -> bool:
+            return True
+
         async def get(self, key: str) -> str | None:
             if key == "pipeline:example__alpha":
                 return stored.model_dump_json()
@@ -366,7 +377,7 @@ def test_partial_repo_detail_returns_html_fragment(
     body = response.text
     assert "<!DOCTYPE" not in body  # fragment, not full document
     assert "alpha" in body
-    assert "IDLE" in body
+    assert "PREFLIGHT" in body
     assert "Current Task" in body
     assert "Current PR" in body
     # Event log has been split out of /partials/repo/{name} — it now
@@ -406,6 +417,9 @@ def test_partial_repo_detail_renders_redis_payload(
     )
 
     class _StubClientWithPayload:
+        async def ping(self) -> bool:
+            return True
+
         async def get(self, key: str) -> str | None:
             if key == "pipeline:example__alpha":
                 return stored.model_dump_json()
@@ -551,3 +565,55 @@ def test_updated_header_has_data_ts(
     assert response.status_code == 200
     body = response.text
     assert f'data-ts="{now.isoformat()}"' in body
+
+
+def test_index_shows_warning_when_redis_key_missing(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a Redis key is absent the card must show the initialization
+    warning instead of a clean IDLE state."""
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo-list")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "Waiting for daemon to initialize" in body
+    assert "initializing" in body
+
+
+def test_index_shows_error_on_decode_failure(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a Redis payload cannot be decoded the card must show a decode
+    error instead of silently falling back to IDLE."""
+
+    class _BadPayloadClient:
+        async def ping(self) -> bool:
+            return True
+
+        async def get(self, key: str) -> str | None:
+            if key == "pipeline:example__alpha":
+                return "{not valid json!!"
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
+    class _BadPayloadAioredis:
+        @staticmethod
+        def from_url(
+            url: str, decode_responses: bool = True
+        ) -> _BadPayloadClient:
+            return _BadPayloadClient()
+
+    monkeypatch.setattr(web_app, "aioredis", _BadPayloadAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo-list")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "State decode failed" in body
+    assert "stale" in body

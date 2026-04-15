@@ -94,6 +94,10 @@
         </div>
     </nav>
 
+    <div hx-get="/partials/redis-banner" hx-trigger="every 10s" hx-swap="innerHTML" id="redis-banner">
+        {% include "components/redis_banner.html" %}
+    </div>
+
     <main class="max-w-7xl mx-auto px-6 py-8">
         {% block content %}{% endblock %}
     </main>

@@ -38,9 +38,15 @@
 </header>
 
 {% if repo.error_message %}
+{% if repo.state.value == 'PREFLIGHT' %}
+<div class="mb-6 rounded-lg border border-warn/30 bg-warn/10 px-4 py-3">
+    <p class="text-warn font-mono text-sm break-words">{{ repo.error_message }}</p>
+</div>
+{% else %}
 <div class="mb-6 rounded-lg border border-fail/30 bg-fail/10 px-4 py-3">
     <p class="text-fail font-mono text-sm break-words">{{ repo.error_message }}</p>
 </div>
+{% endif %}
 {% endif %}
 
 <div class="grid gap-4 sm:grid-cols-2 mb-6">
