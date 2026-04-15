@@ -1282,7 +1282,11 @@ return 0
         self.state.rate_limited_until = None
         self.state.error_message = None
         self._error_diagnose_count = 0
-        if self.state.current_pr is not None:
+        if (
+            self.state.current_pr is not None
+            and self.state.current_task is not None
+            and self.state.current_pr.branch == self.state.current_task.branch
+        ):
             self.state.state = PipelineState.WATCH
             self.log_event("Rate limit expired, resuming -> WATCH")
         else:
