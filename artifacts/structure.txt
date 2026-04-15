@@ -1,5 +1,6 @@
 ./AGENTS.md
 ./CLAUDE.md
+./.claude/scheduled_tasks.lock
 ./.claude/settings.local.json
 ./config.yml
 ./docker-compose.yml
@@ -104,6 +105,9 @@
 ./tasks/PR-042.md
 ./tasks/PR-042.md:Zone.Identifier
 ./tasks/PR-043.md
+./tasks/PR-044.md
+./tasks/PR-045.md
+./tasks/PR-046.md
 ./tasks/QUEUE.md
 ./tasks/QUEUE.md:Zone.Identifier
 ./templates/AGENTS.md
