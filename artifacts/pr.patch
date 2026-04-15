@@ -1,5 +1,5 @@
 diff --git a/artifacts/ci.log b/artifacts/ci.log
-index a77b6b4..7dd5b98 100644
+index a77b6b4..043e86d 100644
 --- a/artifacts/ci.log
 +++ b/artifacts/ci.log
 @@ -1,12 +1,12 @@
@@ -19,21 +19,21 @@ index a77b6b4..7dd5b98 100644
 +........................................................................ [ 75%]
 +........................................................................ [ 94%]
 +...................                                                      [100%]
-+379 passed in 12.56s
++379 passed in 11.85s
  ==> ci.sh OK
  ci.sh exit code: 0
 diff --git a/artifacts/pr.patch b/artifacts/pr.patch
-index 58a8353..e097883 100644
+index 58a8353..eee48ee 100644
 --- a/artifacts/pr.patch
 +++ b/artifacts/pr.patch
-@@ -1,517 +1,2749 @@
+@@ -1,517 +1,3661 @@
 -diff --git a/Dockerfile b/Dockerfile
 -index 68102f4..24b221d 100644
 ---- a/Dockerfile
 -+++ b/Dockerfile
 -@@ -42,5 +42,6 @@ RUN chown -R runner:runner /app
 +diff --git a/artifacts/ci.log b/artifacts/ci.log
-+index a77b6b4..37403b6 100644
++index a77b6b4..7dd5b98 100644
 +--- a/artifacts/ci.log
 ++++ b/artifacts/ci.log
 +@@ -1,12 +1,12 @@
@@ -53,21 +53,21 @@ index 58a8353..e097883 100644
 ++........................................................................ [ 75%]
 ++........................................................................ [ 94%]
 ++...................                                                      [100%]
-++379 passed in 13.27s
+++379 passed in 12.56s
 + ==> ci.sh OK
 + ci.sh exit code: 0
 +diff --git a/artifacts/pr.patch b/artifacts/pr.patch
-+index 58a8353..00ed6d0 100644
++index 58a8353..e097883 100644
 +--- a/artifacts/pr.patch
 ++++ b/artifacts/pr.patch
-+@@ -1,517 +1,1837 @@
++@@ -1,517 +1,2749 @@
 +-diff --git a/Dockerfile b/Dockerfile
 +-index 68102f4..24b221d 100644
 +---- a/Dockerfile
 +-+++ b/Dockerfile
 +-@@ -42,5 +42,6 @@ RUN chown -R runner:runner /app
 ++diff --git a/artifacts/ci.log b/artifacts/ci.log
-++index a77b6b4..258818c 100644
+++index a77b6b4..37403b6 100644
 ++--- a/artifacts/ci.log
 +++++ b/artifacts/ci.log
 ++@@ -1,12 +1,12 @@
@@ -87,101 +87,48 @@ index 58a8353..e097883 100644
 +++........................................................................ [ 75%]
 +++........................................................................ [ 94%]
 +++...................                                                      [100%]
-+++379 passed in 10.76s
++++379 passed in 13.27s
 ++ ==> ci.sh OK
 ++ ci.sh exit code: 0
 ++diff --git a/artifacts/pr.patch b/artifacts/pr.patch
-++index 58a8353..6003db3 100644
+++index 58a8353..00ed6d0 100644
 ++--- a/artifacts/pr.patch
 +++++ b/artifacts/pr.patch
-++@@ -1,517 +1,918 @@
+++@@ -1,517 +1,1837 @@
 ++-diff --git a/Dockerfile b/Dockerfile
 ++-index 68102f4..24b221d 100644
 ++---- a/Dockerfile
 ++-+++ b/Dockerfile
 ++-@@ -42,5 +42,6 @@ RUN chown -R runner:runner /app
-++- 
-++- EXPOSE 8000
-++- 
-++-+USER runner
-++- ENTRYPOINT ["bash", "scripts/entrypoint.sh"]
-++- CMD ["uvicorn", "src.web.app:app", "--host", "0.0.0.0", "--port", "8000"]
-++-diff --git a/src/web/app.py b/src/web/app.py
-++-index 5cbab66..f0cde7e 100644
-++---- a/src/web/app.py
-++-+++ b/src/web/app.py
-++-@@ -40,19 +40,46 @@ _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
-++- templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
-++- 
-++- 
-++--def _default_repo_state(name: str, url: str) -> RepoState:
-++-+def _default_repo_state(
-++-+    name: str, url: str, *, error: str | None = None
-++-+) -> RepoState:
-++-     """Return a default ``IDLE`` state for ``name``/``url``."""
-++-     return RepoState(
-++-         url=url,
-++-         name=name,
-++--        state=PipelineState.IDLE,
-++-+        state=PipelineState.ERROR if error else PipelineState.IDLE,
-++-         current_task=None,
-++-         current_pr=None,
-++--        error_message=None,
-++-+        error_message=error,
-++-         last_updated=datetime.now(timezone.utc),
-++-     )
-++- 
-++- 
-++-+async def _get_repo_state_safe(
-++-+    redis_client: aioredis.Redis, name: str, url: str
-++-+) -> tuple[RepoState, str | None]:
-++-+    """Return (state, warning). Warning is non-None when state is synthetic."""
-++-+    try:
-++-+        raw = await redis_client.get(f"pipeline:{name}")
-++-+    except Exception:
-++-+        st = _default_repo_state(name, url)
-++-+        st.state = PipelineState.PREFLIGHT
-++-+        st.error_message = "Redis unavailable — state unknown"
-++-+        return st, "Redis unavailable"
-++-+    if raw is None:
-++-+        st = _default_repo_state(name, url)
-++-+        st.state = PipelineState.PREFLIGHT
-++-+        st.error_message = "Waiting for daemon to initialize"
-++-+        return st, "Awaiting daemon initialization"
-++-+    try:
-++-+        return RepoState.model_validate_json(raw), None
-++-+    except Exception:
-++-+        return (
-++-+            _default_repo_state(name, url, error="State decode failed"),
-++-+            "State decode error",
-++-+        )
 +++diff --git a/artifacts/ci.log b/artifacts/ci.log
-+++index a77b6b4..7fc01cc 100644
++++index a77b6b4..258818c 100644
 +++--- a/artifacts/ci.log
 ++++++ b/artifacts/ci.log
-+++@@ -2,11 +2,10 @@
++++@@ -1,12 +1,12 @@
++++ ==> ruff check src/
 +++ All checks passed!
 +++ ==> pytest -q
-+++ ........................................................................ [ 19%]
++++-........................................................................ [ 19%]
 +++-........................................................................ [ 39%]
 +++-........................................................................ [ 58%]
 +++-........................................................................ [ 78%]
 +++-........................................................................ [ 97%]
 +++-........                                                                 [100%]
 +++-368 passed in 12.37s
-++++........................................................................ [ 38%]
-++++........................................................................ [ 57%]
-++++........................................................................ [ 76%]
-++++........................................................................ [ 95%]
-++++.................                                                        [100%]
-++++377 passed in 12.04s
+++++........................................................................ [ 18%]
+++++........................................................................ [ 37%]
+++++........................................................................ [ 56%]
+++++........................................................................ [ 75%]
+++++........................................................................ [ 94%]
+++++...................                                                      [100%]
+++++379 passed in 10.76s
 +++ ==> ci.sh OK
-+++-ci.sh exit code: 0
++++ ci.sh exit code: 0
 +++diff --git a/artifacts/pr.patch b/artifacts/pr.patch
-+++index 58a8353..e69de29 100644
++++index 58a8353..6003db3 100644
 +++--- a/artifacts/pr.patch
 ++++++ b/artifacts/pr.patch
-+++@@ -1,517 +0,0 @@
++++@@ -1,517 +1,918 @@
 +++-diff --git a/Dockerfile b/Dockerfile
 +++-index 68102f4..24b221d 100644
 +++---- a/Dockerfile
@@ -242,8 +189,638 @@ index 58a8353..e097883 100644
 +++-+            _default_repo_state(name, url, error="State decode failed"),
 +++-+            "State decode error",
 +++-+        )
-+++-+
-+++-+
+++++diff --git a/artifacts/ci.log b/artifacts/ci.log
+++++index a77b6b4..7fc01cc 100644
+++++--- a/artifacts/ci.log
++++++++ b/artifacts/ci.log
+++++@@ -2,11 +2,10 @@
+++++ All checks passed!
+++++ ==> pytest -q
+++++ ........................................................................ [ 19%]
+++++-........................................................................ [ 39%]
+++++-........................................................................ [ 58%]
+++++-........................................................................ [ 78%]
+++++-........................................................................ [ 97%]
+++++-........                                                                 [100%]
+++++-368 passed in 12.37s
++++++........................................................................ [ 38%]
++++++........................................................................ [ 57%]
++++++........................................................................ [ 76%]
++++++........................................................................ [ 95%]
++++++.................                                                        [100%]
++++++377 passed in 12.04s
+++++ ==> ci.sh OK
+++++-ci.sh exit code: 0
+++++diff --git a/artifacts/pr.patch b/artifacts/pr.patch
+++++index 58a8353..e69de29 100644
+++++--- a/artifacts/pr.patch
++++++++ b/artifacts/pr.patch
+++++@@ -1,517 +0,0 @@
+++++-diff --git a/Dockerfile b/Dockerfile
+++++-index 68102f4..24b221d 100644
+++++---- a/Dockerfile
+++++-+++ b/Dockerfile
+++++-@@ -42,5 +42,6 @@ RUN chown -R runner:runner /app
+++++- 
+++++- EXPOSE 8000
+++++- 
+++++-+USER runner
+++++- ENTRYPOINT ["bash", "scripts/entrypoint.sh"]
+++++- CMD ["uvicorn", "src.web.app:app", "--host", "0.0.0.0", "--port", "8000"]
+++++-diff --git a/src/web/app.py b/src/web/app.py
+++++-index 5cbab66..f0cde7e 100644
+++++---- a/src/web/app.py
+++++-+++ b/src/web/app.py
+++++-@@ -40,19 +40,46 @@ _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+++++- templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+++++- 
+++++- 
+++++--def _default_repo_state(name: str, url: str) -> RepoState:
+++++-+def _default_repo_state(
+++++-+    name: str, url: str, *, error: str | None = None
+++++-+) -> RepoState:
+++++-     """Return a default ``IDLE`` state for ``name``/``url``."""
+++++-     return RepoState(
+++++-         url=url,
+++++-         name=name,
+++++--        state=PipelineState.IDLE,
+++++-+        state=PipelineState.ERROR if error else PipelineState.IDLE,
+++++-         current_task=None,
+++++-         current_pr=None,
+++++--        error_message=None,
+++++-+        error_message=error,
+++++-         last_updated=datetime.now(timezone.utc),
+++++-     )
+++++- 
+++++- 
+++++-+async def _get_repo_state_safe(
+++++-+    redis_client: aioredis.Redis, name: str, url: str
+++++-+) -> tuple[RepoState, str | None]:
+++++-+    """Return (state, warning). Warning is non-None when state is synthetic."""
+++++-+    try:
+++++-+        raw = await redis_client.get(f"pipeline:{name}")
+++++-+    except Exception:
+++++-+        st = _default_repo_state(name, url)
+++++-+        st.state = PipelineState.PREFLIGHT
+++++-+        st.error_message = "Redis unavailable — state unknown"
+++++-+        return st, "Redis unavailable"
+++++-+    if raw is None:
+++++-+        st = _default_repo_state(name, url)
+++++-+        st.state = PipelineState.PREFLIGHT
+++++-+        st.error_message = "Waiting for daemon to initialize"
+++++-+        return st, "Awaiting daemon initialization"
+++++-+    try:
+++++-+        return RepoState.model_validate_json(raw), None
+++++-+    except Exception:
+++++-+        return (
+++++-+            _default_repo_state(name, url, error="State decode failed"),
+++++-+            "State decode error",
+++++-+        )
+++++-+
+++++-+
+++++- async def get_repo_state(
+++++-     name: str,
+++++-     redis_client: aioredis.Redis | None,
+++++-@@ -77,15 +104,8 @@ async def get_repo_state(
+++++-             break
+++++- 
+++++-     if found and redis_client is not None:
+++++--        try:
+++++--            payload = await redis_client.get(f"pipeline:{name}")
+++++--        except Exception:
+++++--            payload = None
+++++--        if payload:
+++++--            try:
+++++--                return RepoState.model_validate_json(payload)
+++++--            except Exception:
+++++--                pass
+++++-+        state, _warning = await _get_repo_state_safe(redis_client, name, url)
+++++-+        return state
+++++- 
+++++-     return _default_repo_state(name, url)
+++++- 
+++++-@@ -93,41 +113,39 @@ async def get_repo_state(
+++++- async def get_all_repo_states(
+++++-     redis_client: aioredis.Redis | None,
+++++-     config_path: str = CONFIG_PATH,
+++++--) -> list[RepoState]:
+++++--    """Return the list of repo states for every repo in ``config.yml``.
+++++--
+++++--    For each configured repo, look up ``pipeline:{name}`` in Redis. If the
+++++--    key is missing or Redis is unavailable, fall back to a default ``IDLE``
+++++--    state with the current timestamp. Once a Redis read fails inside a single
+++++--    request, further Redis lookups are skipped so an unreachable broker
+++++--    cannot turn each configured repo into another timing-out call.
+++++-+) -> tuple[list[RepoState], str | None]:
+++++-+    """Return ``(states, redis_warning)`` for every repo in ``config.yml``.
+++++-+
+++++-+    ``redis_warning`` is non-None when Redis is entirely unavailable; it is
+++++-+    intended for a top-level dashboard banner. Per-repo degradation (key
+++++-+    missing, decode failure) is encoded in the individual ``RepoState``
+++++-+    objects via ``error_message``.
+++++-     """
+++++-     cfg = load_config(config_path)
+++++-     states: list[RepoState] = []
+++++-     redis_available = redis_client is not None
+++++-+    redis_warning: str | None = None
+++++- 
+++++-     for repo in cfg.repositories:
+++++-         name = repo_slug_from_url(repo.url)
+++++-         state: RepoState | None = None
+++++- 
+++++-         if redis_available:
+++++--            try:
+++++--                payload = await redis_client.get(f"pipeline:{name}")
+++++--            except Exception:
+++++--                payload = None
+++++-+            state, warning = await _get_repo_state_safe(
+++++-+                redis_client, name, repo.url
+++++-+            )
+++++-+            if warning == "Redis unavailable":
+++++-                 redis_available = False
+++++--            if payload:
+++++--                try:
+++++--                    state = RepoState.model_validate_json(payload)
+++++--                except Exception:
+++++--                    state = None
+++++-+                redis_warning = "Redis connection lost"
+++++- 
+++++-         if state is None:
+++++-             state = _default_repo_state(name, repo.url)
+++++-+            state.state = PipelineState.PREFLIGHT
+++++-+            state.error_message = "Redis unavailable — state unknown"
+++++- 
+++++-         states.append(state)
+++++- 
+++++--    return states
+++++-+    return states, redis_warning
+++++- 
+++++- 
+++++- _MERGE_EVENT_MARKER = "Merged PR"
+++++-@@ -475,7 +493,7 @@ app = FastAPI(title="Pipeline Orchestrator", lifespan=lifespan)
+++++- @app.get("/", response_class=HTMLResponse)
+++++- async def index(request: Request) -> HTMLResponse:
+++++-     redis_client = getattr(request.app.state, "redis", None)
+++++--    states = await get_all_repo_states(redis_client)
+++++-+    states, redis_warning = await get_all_repo_states(redis_client)
+++++-     stats = _compute_stats(states)
+++++-     alerts = _build_alerts(states)
+++++-     latest_alert = min(alerts, key=lambda a: a["duration_seconds"]) if alerts else None
+++++-@@ -487,6 +505,7 @@ async def index(request: Request) -> HTMLResponse:
+++++-             "repos": states,
+++++-             "stats": stats,
+++++-             "latest_alert": latest_alert,
+++++-+            "redis_warning": redis_warning,
+++++-         },
+++++-     )
+++++- 
+++++-@@ -494,32 +513,50 @@ async def index(request: Request) -> HTMLResponse:
+++++- @app.get("/api/states")
+++++- async def api_states(request: Request) -> JSONResponse:
+++++-     redis_client = getattr(request.app.state, "redis", None)
+++++--    states = await get_all_repo_states(redis_client)
+++++-+    states, _warning = await get_all_repo_states(redis_client)
+++++-     return JSONResponse([s.model_dump(mode="json") for s in states])
+++++- 
+++++- 
+++++- @app.get("/api/stats")
+++++- async def api_stats(request: Request) -> JSONResponse:
+++++-     redis_client = getattr(request.app.state, "redis", None)
+++++--    states = await get_all_repo_states(redis_client)
+++++-+    states, _warning = await get_all_repo_states(redis_client)
+++++-     return JSONResponse(_compute_stats(states))
+++++- 
+++++- 
+++++-+@app.get("/partials/redis-banner", response_class=HTMLResponse)
+++++-+async def partial_redis_banner(request: Request) -> HTMLResponse:
+++++-+    redis_client = getattr(request.app.state, "redis", None)
+++++-+    redis_warning: str | None = None
+++++-+    if redis_client is None:
+++++-+        redis_warning = "Redis not configured"
+++++-+    else:
+++++-+        try:
+++++-+            await redis_client.ping()
+++++-+        except Exception:
+++++-+            redis_warning = "Redis connection lost"
+++++-+    return templates.TemplateResponse(
+++++-+        request,
+++++-+        "components/redis_banner.html",
+++++-+        {"redis_warning": redis_warning},
+++++-+    )
+++++-+
+++++-+
+++++- @app.get("/partials/repo-list", response_class=HTMLResponse)
+++++- async def partial_repo_list(request: Request) -> HTMLResponse:
+++++-     redis_client = getattr(request.app.state, "redis", None)
+++++--    states = await get_all_repo_states(redis_client)
+++++-+    states, redis_warning = await get_all_repo_states(redis_client)
+++++-     return templates.TemplateResponse(
+++++-         request,
+++++-         "components/repo_cards.html",
+++++--        {"repos": states},
+++++-+        {"repos": states, "redis_warning": redis_warning},
+++++-     )
+++++- 
+++++- 
+++++- @app.get("/partials/stats", response_class=HTMLResponse)
+++++- async def partial_stats(request: Request) -> HTMLResponse:
+++++-     redis_client = getattr(request.app.state, "redis", None)
+++++--    states = await get_all_repo_states(redis_client)
+++++-+    states, _warning = await get_all_repo_states(redis_client)
+++++-     stats = _compute_stats(states)
+++++-     alerts = _build_alerts(states)
+++++-     latest_alert = min(alerts, key=lambda a: a["duration_seconds"]) if alerts else None
+++++-@@ -533,7 +570,7 @@ async def partial_stats(request: Request) -> HTMLResponse:
+++++- @app.get("/partials/activity-feed", response_class=HTMLResponse)
+++++- async def partial_activity_feed(request: Request) -> HTMLResponse:
+++++-     redis_client = getattr(request.app.state, "redis", None)
+++++--    states = await get_all_repo_states(redis_client)
+++++-+    states, _warning = await get_all_repo_states(redis_client)
+++++-     feed = _build_activity_feed(states)
+++++-     return templates.TemplateResponse(
+++++-         request,
+++++-@@ -545,7 +582,7 @@ async def partial_activity_feed(request: Request) -> HTMLResponse:
+++++- @app.get("/partials/alerts", response_class=HTMLResponse)
+++++- async def partial_alerts(request: Request) -> HTMLResponse:
+++++-     redis_client = getattr(request.app.state, "redis", None)
+++++--    states = await get_all_repo_states(redis_client)
+++++-+    states, _warning = await get_all_repo_states(redis_client)
+++++-     alerts = _build_alerts(states)
+++++-     return templates.TemplateResponse(
+++++-         request,
+++++-diff --git a/src/web/templates/base.html b/src/web/templates/base.html
+++++-index a55612f..ddc3506 100644
+++++---- a/src/web/templates/base.html
+++++-+++ b/src/web/templates/base.html
+++++-@@ -94,6 +94,10 @@
+++++-         </div>
+++++-     </nav>
+++++- 
+++++-+    <div hx-get="/partials/redis-banner" hx-trigger="every 10s" hx-swap="innerHTML" id="redis-banner">
+++++-+        {% include "components/redis_banner.html" %}
+++++-+    </div>
+++++-+
+++++-     <main class="max-w-7xl mx-auto px-6 py-8">
+++++-         {% block content %}{% endblock %}
+++++-     </main>
+++++-diff --git a/src/web/templates/components/redis_banner.html b/src/web/templates/components/redis_banner.html
+++++-new file mode 100644
+++++-index 0000000..82a862f
+++++---- /dev/null
+++++-+++ b/src/web/templates/components/redis_banner.html
+++++-@@ -0,0 +1,5 @@
+++++-+{% if redis_warning %}
+++++-+<div class="bg-warn/10 border border-warn/30 text-warn text-xs text-center py-2">
+++++-+    Dashboard data may be stale: {{ redis_warning }}
+++++-+</div>
+++++-+{% endif %}
+++++-diff --git a/src/web/templates/components/repo_cards.html b/src/web/templates/components/repo_cards.html
+++++-index 0372e40..c141b24 100644
+++++---- a/src/web/templates/components/repo_cards.html
+++++-+++ b/src/web/templates/components/repo_cards.html
+++++-@@ -9,6 +9,8 @@
+++++-     'ERROR':     {'dot': 'bg-fail',      'badge': 'bg-fail/10 text-fail border-fail/30',               'pulse': false},
+++++- } %}
+++++- 
+++++-+{% set init_messages = ['Waiting for daemon to initialize', 'State decode failed', 'Redis unavailable — state unknown'] %}
+++++-+
+++++- {% set ci_styles = {
+++++-     'PENDING': {'dot': 'bg-warn', 'pulse': true, 'label': 'CI pending'},
+++++-     'SUCCESS': {'dot': 'bg-ok',   'pulse': false, 'label': 'CI passed'},
+++++-@@ -33,18 +35,29 @@
+++++- {% else %}
+++++- <div class="grid gap-4 md:grid-cols-2">
+++++-     {% for repo in repos %}
+++++-+    {% set is_synthetic = repo.error_message in init_messages %}
+++++-     {% set style = state_styles.get(repo.state.value, state_styles['IDLE']) %}
+++++--    {% set is_error = repo.state.value == 'ERROR' %}
+++++--    <div class="rounded-lg border bg-surface-2 p-4 cursor-pointer hover:border-white/10 transition-colors {{ 'border-l-2 border-l-fail border-white/5' if is_error else 'border-white/5' }}"
+++++-+    {% set is_error = repo.state.value == 'ERROR' and not is_synthetic %}
+++++-+    <div class="rounded-lg border bg-surface-2 p-4 cursor-pointer hover:border-white/10 transition-colors {{ 'border-l-2 border-l-fail border-white/5' if is_error else ('border-l-2 border-l-warn border-white/5' if is_synthetic else 'border-white/5') }}"
+++++-          onclick="if(!event.target.closest('label,input,button,a')){window.location='/repo/{{ repo.name }}'}">
+++++-         {# Header row #}
+++++-         <div class="flex items-center justify-between mb-3">
+++++-             <div class="flex items-center gap-2 min-w-0">
+++++-+                {% if is_synthetic %}
+++++-+                <span class="w-2.5 h-2.5 rounded-full bg-warn pulse-dot shrink-0"></span>
+++++-+                {% else %}
+++++-                 <span class="w-2.5 h-2.5 rounded-full {{ style.dot }} {% if style.pulse %}pulse-dot{% endif %} shrink-0"></span>
+++++-+                {% endif %}
+++++-                 <a href="/repo/{{ repo.name }}" class="font-mono text-sm text-white truncate hover:text-accent transition-colors">{{ repo.name }}</a>
+++++-+                {% if is_synthetic %}
+++++-+                <span class="text-xs font-medium px-2 py-0.5 rounded border bg-warn/10 text-warn border-warn/30">
+++++-+                    {{ 'initializing' if repo.error_message == 'Waiting for daemon to initialize' else ('unavailable' if 'Redis unavailable' in repo.error_message else 'stale') }}
+++++-+                </span>
+++++-+                {% else %}
+++++-                 <span class="text-xs font-medium px-2 py-0.5 rounded border {{ style.badge }}">
+++++-                     {{ repo.state.value }}
+++++-                 </span>
+++++-+                {% endif %}
+++++-             </div>
+++++-             <div class="flex items-center gap-2 shrink-0">
+++++-                 {% if repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done %}
+++++-@@ -65,7 +78,13 @@
+++++-             </div>
+++++-         </div>
+++++- 
+++++--        {% if is_error and repo.error_message %}
+++++-+        {% if is_synthetic and repo.error_message %}
+++++-+        {# Synthetic/degraded variant: show warning instead of normal body #}
+++++-+        <div class="px-2 py-1.5 rounded bg-warn/10 border border-warn/20 text-warn text-xs truncate"
+++++-+             title="{{ repo.error_message }}">
+++++-+            {{ repo.error_message }}
+++++-+        </div>
+++++-+        {% elif is_error and repo.error_message %}
+++++-         {# Error variant: show error instead of normal body #}
+++++-         <div class="px-2 py-1.5 rounded bg-fail/10 border border-fail/20 text-fail text-xs truncate"
+++++-              title="{{ repo.error_message }}">
+++++-diff --git a/src/web/templates/components/repo_summary.html b/src/web/templates/components/repo_summary.html
+++++-index a758986..bff97f3 100644
+++++---- a/src/web/templates/components/repo_summary.html
+++++-+++ b/src/web/templates/components/repo_summary.html
+++++-@@ -38,10 +38,16 @@
+++++- </header>
+++++- 
+++++- {% if repo.error_message %}
+++++-+{% if repo.state.value == 'PREFLIGHT' %}
+++++-+<div class="mb-6 rounded-lg border border-warn/30 bg-warn/10 px-4 py-3">
+++++-+    <p class="text-warn font-mono text-sm break-words">{{ repo.error_message }}</p>
+++++-+</div>
+++++-+{% else %}
+++++- <div class="mb-6 rounded-lg border border-fail/30 bg-fail/10 px-4 py-3">
+++++-     <p class="text-fail font-mono text-sm break-words">{{ repo.error_message }}</p>
+++++- </div>
+++++- {% endif %}
+++++-+{% endif %}
+++++- 
+++++- <div class="grid gap-4 sm:grid-cols-2 mb-6">
+++++-     <section class="rounded-lg border border-white/5 bg-surface-2 p-5">
+++++-diff --git a/tasks/QUEUE.md b/tasks/QUEUE.md
+++++-index db62cc6..b8dae53 100644
+++++---- a/tasks/QUEUE.md
+++++-+++ b/tasks/QUEUE.md
+++++-@@ -234,7 +234,7 @@
+++++- - Depends on: PR-041
+++++- 
+++++- ## PR-039: Honest dashboard states
+++++--- Status: TODO
+++++-+- Status: DONE
+++++- - Tasks file: tasks/PR-039.md
+++++- - Branch: pr-039-honest-states
+++++- - Depends on: PR-038
+++++-diff --git a/tests/test_daemon_main.py b/tests/test_daemon_main.py
+++++-index 440ce3e..0e14b5d 100644
+++++---- a/tests/test_daemon_main.py
+++++-+++ b/tests/test_daemon_main.py
+++++-@@ -349,6 +349,21 @@ def test_setup_git_auth_handles_timeout() -> None:
+++++- # ---------- _validate_auth tests ----------
+++++- 
+++++- 
+++++-+def test_validate_auth_uses_auth_status() -> None:
+++++-+    """_validate_auth must use 'claude auth status', not 'claude --version'."""
+++++-+    cmds: list[list[str]] = []
+++++-+
+++++-+    def capture_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+++++-+        cmds.append(cmd)
+++++-+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+++++-+
+++++-+    with patch.object(main_module.subprocess, "run", side_effect=capture_run):
+++++-+        main_module._validate_auth()
+++++-+
+++++-+    claude_cmd = next(c for c in cmds if c[0] == "claude")
+++++-+    assert claude_cmd == ["claude", "auth", "status"]
+++++-+
+++++-+
+++++- def test_validate_auth_returns_true_when_both_succeed() -> None:
+++++-     with patch.object(main_module.subprocess, "run") as mock_run:
+++++-         mock_run.return_value = subprocess.CompletedProcess(
+++++-diff --git a/tests/test_web_app.py b/tests/test_web_app.py
+++++-index f23ce4e..a3bf7d1 100644
+++++---- a/tests/test_web_app.py
+++++-+++ b/tests/test_web_app.py
+++++-@@ -83,14 +83,15 @@ def two_repo_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+++++- def test_get_all_repo_states_no_redis_returns_idle_defaults(
+++++-     two_repo_config: Path,
+++++- ) -> None:
+++++--    states = asyncio.run(get_all_repo_states(redis_client=None))
+++++-+    states, warning = asyncio.run(get_all_repo_states(redis_client=None))
+++++- 
+++++-+    assert warning is None
+++++-     assert [s.name for s in states] == ["example__alpha", "example__beta"]
+++++-     for state in states:
+++++--        assert state.state == PipelineState.IDLE
+++++-+        assert state.state == PipelineState.PREFLIGHT
+++++-         assert state.current_task is None
+++++-         assert state.current_pr is None
+++++--        assert state.error_message is None
+++++-+        assert state.error_message == "Redis unavailable — state unknown"
+++++- 
+++++- 
+++++- def test_get_all_repo_states_uses_redis_when_present(
+++++-@@ -116,27 +117,27 @@ def test_get_all_repo_states_uses_redis_when_present(
+++++-     )
+++++-     fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+++++- 
+++++--    states = asyncio.run(get_all_repo_states(redis_client=fake))
+++++-+    states, warning = asyncio.run(get_all_repo_states(redis_client=fake))
+++++- 
+++++-+    assert warning is None
+++++-     assert states[0].state == PipelineState.CODING
+++++-     assert states[0].current_task is not None
+++++-     assert states[0].current_task.pr_id == "PR-099"
+++++-     assert states[0].current_pr is not None
+++++-     assert states[0].current_pr.number == 42
+++++--    # second repo has no redis entry -> idle default
+++++--    assert states[1].state == PipelineState.IDLE
+++++--    assert states[1].current_task is None
+++++-+    # second repo has no redis entry -> awaiting initialization
+++++-+    assert states[1].state == PipelineState.PREFLIGHT
+++++-+    assert states[1].error_message == "Waiting for daemon to initialize"
+++++- 
+++++- 
+++++- def test_get_all_repo_states_falls_back_when_redis_raises(
+++++-     two_repo_config: Path,
+++++- ) -> None:
+++++-     boom = _BoomRedis()
+++++--    states = asyncio.run(get_all_repo_states(redis_client=boom))
+++++-+    states, warning = asyncio.run(get_all_repo_states(redis_client=boom))
+++++- 
+++++-+    assert warning == "Redis connection lost"
+++++-     assert len(states) == 2
+++++--    for state in states:
+++++--        assert state.state == PipelineState.IDLE
+++++-     # After the first failure further Redis lookups must be skipped so an
+++++-     # unreachable broker cannot turn each repo into another timing-out call.
+++++-     assert boom.calls == ["pipeline:example__alpha"]
+++++-@@ -171,7 +172,7 @@ def test_api_states_returns_json(
+++++-     assert isinstance(payload, list)
+++++-     assert {p["name"] for p in payload} == {"example__alpha", "example__beta"}
+++++-     for entry in payload:
+++++--        assert entry["state"] == "IDLE"
+++++-+        assert entry["state"] == "PREFLIGHT"
+++++- 
+++++- 
+++++- def test_partial_repo_list_returns_html_fragment(
+++++-@@ -187,8 +188,7 @@ def test_partial_repo_list_returns_html_fragment(
+++++-     assert "<!DOCTYPE" not in body  # fragment, not full document
+++++-     assert "alpha" in body
+++++-     assert "beta" in body
+++++--    assert "IDLE" in body
+++++--    assert "0 / 0 done" in body
+++++-+    assert "initializing" in body
+++++- 
+++++- 
+++++- def test_partial_repo_list_empty_state(
+++++-@@ -366,7 +366,7 @@ def test_partial_repo_detail_returns_html_fragment(
+++++-     body = response.text
+++++-     assert "<!DOCTYPE" not in body  # fragment, not full document
+++++-     assert "alpha" in body
+++++--    assert "IDLE" in body
+++++-+    assert "PREFLIGHT" in body
+++++-     assert "Current Task" in body
+++++-     assert "Current PR" in body
+++++-     # Event log has been split out of /partials/repo/{name} — it now
+++++-@@ -551,3 +551,52 @@ def test_updated_header_has_data_ts(
+++++-     assert response.status_code == 200
+++++-     body = response.text
+++++-     assert f'data-ts="{now.isoformat()}"' in body
+++++-+
+++++-+
+++++-+def test_index_shows_warning_when_redis_key_missing(
+++++-+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+++++-+) -> None:
+++++-+    """When a Redis key is absent the card must show the initialization
+++++-+    warning instead of a clean IDLE state."""
+++++-+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+++++-+
+++++-+    with TestClient(app) as client:
+++++-+        response = client.get("/partials/repo-list")
+++++-+
+++++-+    assert response.status_code == 200
+++++-+    body = response.text
+++++-+    assert "Waiting for daemon to initialize" in body
+++++-+    assert "initializing" in body
+++++-+
+++++-+
+++++-+def test_index_shows_error_on_decode_failure(
+++++-+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+++++-+) -> None:
+++++-+    """When a Redis payload cannot be decoded the card must show a decode
+++++-+    error instead of silently falling back to IDLE."""
+++++-+
+++++-+    class _BadPayloadClient:
+++++-+        async def get(self, key: str) -> str | None:
+++++-+            if key == "pipeline:example__alpha":
+++++-+                return "{not valid json!!"
+++++-+            return None
+++++-+
+++++-+        async def aclose(self) -> None:
+++++-+            return None
+++++-+
+++++-+    class _BadPayloadAioredis:
+++++-+        @staticmethod
+++++-+        def from_url(
+++++-+            url: str, decode_responses: bool = True
+++++-+        ) -> _BadPayloadClient:
+++++-+            return _BadPayloadClient()
+++++-+
+++++-+    monkeypatch.setattr(web_app, "aioredis", _BadPayloadAioredis())
+++++-+
+++++-+    with TestClient(app) as client:
+++++-+        response = client.get("/partials/repo-list")
+++++-+
+++++-+    assert response.status_code == 200
+++++-+    body = response.text
+++++-+    assert "State decode failed" in body
+++++-+    assert "stale" in body
+++++diff --git a/artifacts/structure.txt b/artifacts/structure.txt
+++++index 4ff6bc8..e3e4b6d 100644
+++++--- a/artifacts/structure.txt
++++++++ b/artifacts/structure.txt
+++++@@ -13,6 +13,9 @@
+++++ ./Dockerfile
+++++ ./LICENSE
+++++ ./README.md
++++++./artifacts/ci.log
++++++./artifacts/pr.patch
++++++./artifacts/structure.txt
+++++ ./config.yml
+++++ ./docker-compose.yml
+++++ ./pyproject.toml
+++++diff --git a/config.yml b/config.yml
+++++index 0f650d8..bddb7aa 100644
+++++--- a/config.yml
++++++++ b/config.yml
+++++@@ -11,6 +11,7 @@ daemon:
+++++   claude_model: opus
+++++   fix_review_timeout_sec: 3600
+++++   planned_pr_timeout_sec: 900
++++++  rate_limit_pause_percent: 90
+++++ web:
+++++   host: 0.0.0.0
+++++   port: 8000
+++++diff --git a/src/config.py b/src/config.py
+++++index 1681fd6..d15fffd 100644
+++++--- a/src/config.py
++++++++ b/src/config.py
+++++@@ -26,6 +26,7 @@ _DAEMON_FIELDS = {
+++++     "claude_model",
+++++     "fix_review_timeout_sec",
+++++     "planned_pr_timeout_sec",
++++++    "rate_limit_pause_percent",
+++++ }
+++++ 
+++++ 
+++++@@ -51,6 +52,7 @@ class DaemonConfig(BaseModel):
+++++     claude_model: str = "opus"
+++++     fix_review_timeout_sec: int = 3600
+++++     planned_pr_timeout_sec: int = 900
++++++    rate_limit_pause_percent: int = 90
+++++ 
+++++ 
+++++ class WebConfig(BaseModel):
+++++diff --git a/src/daemon/runner.py b/src/daemon/runner.py
+++++index fa0d99a..5e5e136 100644
+++++--- a/src/daemon/runner.py
++++++++ b/src/daemon/runner.py
+++++@@ -16,7 +16,7 @@ import logging
+++++ import re
+++++ import shutil
+++++ import subprocess
+++++-from datetime import datetime, timezone
++++++from datetime import datetime, timedelta, timezone
+++++ from pathlib import Path
+++++ 
+++++ import redis.asyncio as aioredis
+++++@@ -378,6 +378,7 @@ class PipelineRunner:
+++++         # overwritten with GitHub's ``updatedAt`` (which advances every
+++++         # time Codex posts, masking whether Codex feedback is fresher
+++++         # than our last push).
++++++        self._rate_limited_until: datetime | None = None
+++++         self._last_push_at: datetime | None = None
+++++         # PR number the ``_last_push_at`` timestamp belongs to. Without
+++++         # this, a stale timestamp from a prior PR leaks into freshness
+++++@@ -1251,6 +1252,23 @@ return 0
+++++         await self.publish_state()
+++++         await self.handle_coding()
+++++ 
++++++    def _check_rate_limit(self) -> bool:
++++++        """Return True if CLI calls are allowed, False if rate-limited."""
++++++        if self._rate_limited_until is not None:
++++++            if datetime.now(timezone.utc) < self._rate_limited_until:
++++++                remaining = (self._rate_limited_until - datetime.now(timezone.utc)).total_seconds()
++++++                self.log_event(f"Rate limited, resuming in {int(remaining)}s")
++++++                return False
++++++            self._rate_limited_until = None
++++++            self.log_event("Rate limit window expired, resuming")
++++++        return True
++++ +
++++++    def _detect_rate_limit(self, stderr: str) -> None:
++++++        """Set rate-limit pause if stderr contains rate-limit signals."""
++++++        if "rate limit" in stderr.lower() or "429" in stderr:
++++++            self._rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=30)
++++++            self.log_event("Rate limit detected, pausing for 30 min")
++++ +
 +++- async def get_repo_state(
 +++-     name: str,
 +++-     redis_client: aioredis.Redis | None,
@@ -373,8 +950,34 @@ index 58a8353..e097883 100644
 +++-+        "components/redis_banner.html",
 +++-+        {"redis_warning": redis_warning},
 +++-+    )
-+++-+
-+++-+
+++++     async def handle_coding(self) -> None:
+++++         """Run ``PLANNED PR`` via the claude CLI and hand off to WATCH.
+++++ 
+++++@@ -1261,6 +1279,9 @@ return 0
+++++         for the PR; because the list API is eventually consistent, we
+++++         retry a few times before surfacing an ERROR.
+++++         """
++++++        if not self._check_rate_limit():
++++++            return
++++ +
+++++         target_branch = (
+++++             self.state.current_task.branch if self.state.current_task else None
+++++         )
+++++@@ -1278,6 +1299,7 @@ return 0
+++++             timeout=self.app_config.daemon.planned_pr_timeout_sec,
+++++         )
+++++         await self._save_cli_log(stdout, stderr, "PLANNED PR output")
++++++        self._detect_rate_limit(stderr)
+++++         if code != 0:
+++++             self.state.state = PipelineState.ERROR
+++++             self.state.error_message = stderr.strip() or f"claude exit {code}"
+++++@@ -1436,6 +1458,9 @@ return 0
+++++ 
+++++     async def handle_fix(self) -> None:
+++++         """Run ``FIX REVIEW`` via the claude CLI and return to WATCH."""
++++++        if not self._check_rate_limit():
++++++            return
++++ +
 +++- @app.get("/partials/repo-list", response_class=HTMLResponse)
 +++- async def partial_repo_list(request: Request) -> HTMLResponse:
 +++-     redis_client = getattr(request.app.state, "redis", None)
@@ -421,7 +1024,53 @@ index 58a8353..e097883 100644
 +++-@@ -94,6 +94,10 @@
 +++-         </div>
 +++-     </nav>
-+++- 
+++++         if (
+++++             self.state.current_pr is not None
+++++             and self.state.current_pr.is_cross_repository
+++++@@ -1495,6 +1520,7 @@ return 0
+++++             timeout=self.app_config.daemon.fix_review_timeout_sec,
+++++         )
+++++         await self._save_cli_log(stdout, stderr, "FIX REVIEW output")
++++++        self._detect_rate_limit(stderr)
+++++         if code != 0:
+++++             self.state.state = PipelineState.ERROR
+++++             self.state.error_message = stderr.strip() or f"claude exit {code}"
+++++@@ -2031,6 +2057,9 @@ return 0
+++++ 
+++++     async def handle_error(self, error_context: str | None = None) -> None:
+++++         """Ask the claude CLI whether to FIX, SKIP, or ESCALATE the error."""
++++++        if not self._check_rate_limit():
++++++            return
++++++
+++++         context = error_context or self.state.error_message or "Unknown error"
+++++         lowered = context.lower()
+++++         if any(kw in lowered for kw in ("rate limit", "timeout", "429")):
+++++diff --git a/src/web/app.py b/src/web/app.py
+++++index 688b9fa..45d1100 100644
+++++--- a/src/web/app.py
++++++++ b/src/web/app.py
+++++@@ -782,6 +782,7 @@ async def put_settings_daemon(
+++++     error_handler_use_ai: str | None = Form(None),
+++++     planned_pr_timeout_sec: str | None = Form(None),
+++++     fix_review_timeout_sec: str | None = Form(None),
++++++    rate_limit_pause_percent: str | None = Form(None),
+++++ ) -> HTMLResponse:
+++++     """Update daemon settings.
+++++ 
+++++@@ -827,6 +828,13 @@ async def put_settings_daemon(
+++++             updates["fix_review_timeout_sec"] = _coerce_int(
+++++                 fix_review_timeout_sec, "fix_review_timeout_sec", min_value=1
+++++             )
++++++        if (
++++++            rate_limit_pause_percent is not None
++++++            and rate_limit_pause_percent != ""
++++++        ):
++++++            updates["rate_limit_pause_percent"] = _coerce_int(
++++++                rate_limit_pause_percent, "rate_limit_pause_percent", min_value=50
++++++            )
+++++     except ValueError as exc:
+++++         return _render_settings_daemon_error(request, str(exc), 422)
++++  
 +++-+    <div hx-get="/partials/redis-banner" hx-trigger="every 10s" hx-swap="innerHTML" id="redis-banner">
 +++-+        {% include "components/redis_banner.html" %}
 +++-+    </div>
@@ -440,10 +1089,11 @@ index 58a8353..e097883 100644
 +++-+    Dashboard data may be stale: {{ redis_warning }}
 +++-+</div>
 +++-+{% endif %}
-+++-diff --git a/src/web/templates/components/repo_cards.html b/src/web/templates/components/repo_cards.html
++++ diff --git a/src/web/templates/components/repo_cards.html b/src/web/templates/components/repo_cards.html
 +++-index 0372e40..c141b24 100644
-+++---- a/src/web/templates/components/repo_cards.html
-+++-+++ b/src/web/templates/components/repo_cards.html
+++++index c141b24..badf463 100644
++++ --- a/src/web/templates/components/repo_cards.html
++++ +++ b/src/web/templates/components/repo_cards.html
 +++-@@ -9,6 +9,8 @@
 +++-     'ERROR':     {'dot': 'bg-fail',      'badge': 'bg-fail/10 text-fail border-fail/30',               'pulse': false},
 +++- } %}
@@ -515,22 +1165,60 @@ index 58a8353..e097883 100644
 +++-+{% else %}
 +++- <div class="mb-6 rounded-lg border border-fail/30 bg-fail/10 px-4 py-3">
 +++-     <p class="text-fail font-mono text-sm break-words">{{ repo.error_message }}</p>
-+++- </div>
+++++@@ -130,6 +130,9 @@
+++++         {% if repo.state.value == 'CODING' %}
+++++         <div class="text-xs text-accent/70 italic mt-1">Claude is coding...</div>
+++++         {% endif %}
++++++        {% if repo.error_message and 'rate limit' in repo.error_message.lower() %}
++++++        <div class="text-xs text-warn italic mt-1">Rate limited, auto-resuming...</div>
++++++        {% endif %}
+++++         {% endif %}
+++++         {% endif %}
+++++         <div id="upload-error-{{ repo.name }}"></div>
+++++diff --git a/src/web/templates/components/settings_daemon.html b/src/web/templates/components/settings_daemon.html
+++++index c6a6c18..ca1e9d1 100644
+++++--- a/src/web/templates/components/settings_daemon.html
++++++++ b/src/web/templates/components/settings_daemon.html
+++++@@ -51,6 +51,21 @@
+++++                hx-target="#settings-daemon"
+++++                hx-swap="innerHTML">
+++++     </label>
++++++    <label class="flex flex-col gap-1 text-sm">
++++++        <span class="text-gray-400">Rate limit pause threshold (%)</span>
++++++        <input type="number"
++++++               name="rate_limit_pause_percent"
++++++               value="{{ daemon.rate_limit_pause_percent }}"
++++++               min="50"
++++++               max="99"
++++++               step="5"
++++++               class="w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
++++++               hx-put="/settings/daemon"
++++++               hx-trigger="change"
++++++               hx-target="#settings-daemon"
++++++               hx-swap="innerHTML">
++++++        <span class="text-xs text-gray-500">Daemon pauses Claude CLI calls when usage reaches this percentage of the rate limit window.</span>
++++++    </label>
++++  </div>
 +++- {% endif %}
 +++-+{% endif %}
-+++- 
++++  
 +++- <div class="grid gap-4 sm:grid-cols-2 mb-6">
 +++-     <section class="rounded-lg border border-white/5 bg-surface-2 p-5">
-+++-diff --git a/tasks/QUEUE.md b/tasks/QUEUE.md
+++++ <div class="space-y-3 pt-4 mt-4 border-t border-white/5">
++++ diff --git a/tasks/QUEUE.md b/tasks/QUEUE.md
 +++-index db62cc6..b8dae53 100644
-+++---- a/tasks/QUEUE.md
-+++-+++ b/tasks/QUEUE.md
+++++index b8dae53..d8bce66 100644
++++ --- a/tasks/QUEUE.md
++++ +++ b/tasks/QUEUE.md
 +++-@@ -234,7 +234,7 @@
 +++- - Depends on: PR-041
-+++- 
+++++@@ -240,7 +240,7 @@
+++++ - Depends on: PR-038
++++  
 +++- ## PR-039: Honest dashboard states
-+++--- Status: TODO
-+++-+- Status: DONE
+++++ ## PR-040: Rate limit auto-pause
++++ -- Status: TODO
++++ +- Status: DONE
 +++- - Tasks file: tasks/PR-039.md
 +++- - Branch: pr-039-honest-states
 +++- - Depends on: PR-038
@@ -584,7 +1272,15 @@ index 58a8353..e097883 100644
 +++- 
 +++- def test_get_all_repo_states_uses_redis_when_present(
 +++-@@ -116,27 +117,27 @@ def test_get_all_repo_states_uses_redis_when_present(
-+++-     )
+++++ - Tasks file: tasks/PR-040.md
+++++ - Branch: pr-040-rate-limit
+++++ - Depends on: PR-041
+++++diff --git a/tests/test_config.py b/tests/test_config.py
+++++index a3c7b75..ec2b283 100644
+++++--- a/tests/test_config.py
++++++++ b/tests/test_config.py
+++++@@ -349,3 +349,19 @@ def test_update_daemon_config_accepts_timeouts(tmp_path: Path) -> None:
++++      )
 +++-     fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
 +++- 
 +++--    states = asyncio.run(get_all_repo_states(redis_client=fake))
@@ -654,65 +1350,189 @@ index 58a8353..e097883 100644
 +++-+
 +++-+def test_index_shows_warning_when_redis_key_missing(
 +++-+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
-+++-+) -> None:
+++++     assert updated.daemon.fix_review_timeout_sec == 2000
+++++     assert updated.daemon.planned_pr_timeout_sec == 1200
++++++
++++++
++++++def test_daemon_config_rate_limit_default() -> None:
++++++    from src.config import DaemonConfig
++++++
++++++    assert DaemonConfig().rate_limit_pause_percent == 90
++++++
++++++
++++++def test_update_daemon_config_rate_limit(tmp_path: Path) -> None:
++++++    cfg_path = tmp_path / "config.yml"
++++++    cfg_path.write_text("daemon: {}\n", encoding="utf-8")
++++++    updated = update_daemon_config(
++++++        path=str(cfg_path),
++++++        rate_limit_pause_percent=75,
++++++    )
++++++    assert updated.daemon.rate_limit_pause_percent == 75
+++++diff --git a/tests/test_runner.py b/tests/test_runner.py
+++++index 62f1007..3261f1c 100644
+++++--- a/tests/test_runner.py
++++++++ b/tests/test_runner.py
+++++@@ -3551,3 +3551,104 @@ def test_rehydrate_clears_stale_on_mismatch_when_fetch_fails(
+++++ 
+++++     assert runner._last_push_at is None
+++++     assert runner._last_push_at_pr_number == 42
++++++
++++++
++++++def test_check_rate_limit_blocks_when_limited(
++++++    monkeypatch: pytest.MonkeyPatch,
++++ +) -> None:
 +++-+    """When a Redis key is absent the card must show the initialization
 +++-+    warning instead of a clean IDLE state."""
 +++-+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
-+++-+
++++++    """_check_rate_limit returns False when _rate_limited_until is in future."""
++++++    _patch_subprocess(monkeypatch)
++++++    runner = _make_runner()
++++++    runner._rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
++++ +
 +++-+    with TestClient(app) as client:
 +++-+        response = client.get("/partials/repo-list")
-+++-+
++++++    assert runner._check_rate_limit() is False
++++++    assert runner._rate_limited_until is not None
++++ +
 +++-+    assert response.status_code == 200
 +++-+    body = response.text
 +++-+    assert "Waiting for daemon to initialize" in body
 +++-+    assert "initializing" in body
-+++-+
-+++-+
++++++
++++++def test_check_rate_limit_allows_when_expired(
++++++    monkeypatch: pytest.MonkeyPatch,
++++++) -> None:
++++++    """_check_rate_limit returns True and clears when _rate_limited_until is past."""
++++++    _patch_subprocess(monkeypatch)
++++++    runner = _make_runner()
++++++    runner._rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
++++++
++++++    assert runner._check_rate_limit() is True
++++++    assert runner._rate_limited_until is None
++++++
++++++
++++++def test_handle_coding_skips_when_rate_limited(
++++++    monkeypatch: pytest.MonkeyPatch,
++++++) -> None:
++++++    """handle_coding returns early without calling claude_cli when rate-limited."""
++++++    _patch_subprocess(monkeypatch)
++++++    cli_calls: list[str] = []
++++++    monkeypatch.setattr(
++++++        runner_module.claude_cli,
++++++        "run_planned_pr",
++++++        lambda *a, **kw: (cli_calls.append("run_planned_pr"), (0, "", ""))[1],
++++++    )
++++++    runner = _make_runner()
++++++    runner.state.state = PipelineState.CODING
++++++    runner.state.current_task = QueueTask(
++++++        pr_id="PR-099", title="test", branch="pr-099-test", status=TaskStatus.TODO
++++++    )
++++++    runner._rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
++++++
++++++    asyncio.run(runner.handle_coding())
++++++
++++++    assert cli_calls == []
++++ +
++++ +
 +++-+def test_index_shows_error_on_decode_failure(
 +++-+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
-+++-+) -> None:
++++++def test_handle_error_skips_diagnose_for_rate_limit(
++++++    monkeypatch: pytest.MonkeyPatch,
++++ +) -> None:
 +++-+    """When a Redis payload cannot be decoded the card must show a decode
 +++-+    error instead of silently falling back to IDLE."""
-+++-+
++++++    """handle_error skips diagnose_error when error contains 'rate limit'."""
++++++    _patch_subprocess(monkeypatch)
++++++    cli_calls: list[str] = []
++++++    monkeypatch.setattr(
++++++        runner_module.claude_cli,
++++++        "diagnose_error",
++++++        lambda *a, **kw: (cli_calls.append("diagnose"), (0, "SKIP", ""))[1],
++++++    )
++++++    runner = _make_runner()
++++++    runner.state.state = PipelineState.ERROR
++++++    runner.state.error_message = "Claude rate limit exceeded"
++++ +
 +++-+    class _BadPayloadClient:
 +++-+        async def get(self, key: str) -> str | None:
 +++-+            if key == "pipeline:example__alpha":
 +++-+                return "{not valid json!!"
 +++-+            return None
-+++-+
++++++    asyncio.run(runner.handle_error())
++++ +
 +++-+        async def aclose(self) -> None:
 +++-+            return None
-+++-+
++++++    assert cli_calls == []
++++ +
 +++-+    class _BadPayloadAioredis:
 +++-+        @staticmethod
 +++-+        def from_url(
 +++-+            url: str, decode_responses: bool = True
 +++-+        ) -> _BadPayloadClient:
 +++-+            return _BadPayloadClient()
-+++-+
++++ +
 +++-+    monkeypatch.setattr(web_app, "aioredis", _BadPayloadAioredis())
-+++-+
-+++-+    with TestClient(app) as client:
++++++def test_handle_error_skips_diagnose_for_timeout(
++++++    monkeypatch: pytest.MonkeyPatch,
++++++) -> None:
++++++    """handle_error skips diagnose_error when error contains 'timeout'."""
++++++    _patch_subprocess(monkeypatch)
++++++    cli_calls: list[str] = []
++++++    monkeypatch.setattr(
++++++        runner_module.claude_cli,
++++++        "diagnose_error",
++++++        lambda *a, **kw: (cli_calls.append("diagnose"), (0, "SKIP", ""))[1],
++++++    )
++++++    runner = _make_runner()
++++++    runner.state.state = PipelineState.ERROR
++++++    runner.state.error_message = "Timeout waiting for response"
++++++
++++++    asyncio.run(runner.handle_error())
++++++
++++++    assert cli_calls == []
++++++
++++++
++++++def test_detect_rate_limit_sets_pause(
++++++    monkeypatch: pytest.MonkeyPatch,
++++++) -> None:
++++++    """_detect_rate_limit sets _rate_limited_until on rate limit signal."""
++++++    _patch_subprocess(monkeypatch)
++++++    runner = _make_runner()
++++++    assert runner._rate_limited_until is None
++++++
++++++    runner._detect_rate_limit("Error: 429 Too Many Requests")
++++++
++++++    assert runner._rate_limited_until is not None
++++++    assert runner._rate_limited_until > datetime.now(timezone.utc)
+++++diff --git a/tests/test_settings.py b/tests/test_settings.py
+++++index 1daa6d0..62f704d 100644
+++++--- a/tests/test_settings.py
++++++++ b/tests/test_settings.py
+++++@@ -918,3 +918,20 @@ def test_partial_auth_status_renders_status_dots(
+++++     assert "bg-fail" in body
+++++     assert "1.2.3" in body
+++++     assert "not logged in" in body
++++++
++++++
++++++def test_update_daemon_rate_limit(
++++++    empty_config: Path,
++++++    monkeypatch: pytest.MonkeyPatch,
++++++) -> None:
++++++    monkeypatch.setattr(web_app, "CONFIG_PATH", str(empty_config))
++++ +
++++ +    with TestClient(app) as client:
 +++-+        response = client.get("/partials/repo-list")
-+++-+
-+++-+    assert response.status_code == 200
++++++        response = client.put(
++++++            "/settings/daemon",
++++++            data={"rate_limit_pause_percent": "75"},
++++++        )
++++ +
++++ +    assert response.status_code == 200
 +++-+    body = response.text
 +++-+    assert "State decode failed" in body
 +++-+    assert "stale" in body
-+++diff --git a/artifacts/structure.txt b/artifacts/structure.txt
-+++index 4ff6bc8..e3e4b6d 100644
-+++--- a/artifacts/structure.txt
-++++++ b/artifacts/structure.txt
-+++@@ -13,6 +13,9 @@
-+++ ./Dockerfile
-+++ ./LICENSE
-+++ ./README.md
-++++./artifacts/ci.log
-++++./artifacts/pr.patch
-++++./artifacts/structure.txt
-+++ ./config.yml
-+++ ./docker-compose.yml
-+++ ./pyproject.toml
++++++    cfg = load_config(str(empty_config))
++++++    assert cfg.daemon.rate_limit_pause_percent == 75
 +++diff --git a/config.yml b/config.yml
 +++index 0f650d8..bddb7aa 100644
 +++--- a/config.yml
@@ -735,18 +1555,44 @@ index 58a8353..e097883 100644
 +++     "planned_pr_timeout_sec",
 ++++    "rate_limit_pause_percent",
 +++ }
-+++ 
-+++ 
+++  
+++- EXPOSE 8000
+++  
+++-+USER runner
+++- ENTRYPOINT ["bash", "scripts/entrypoint.sh"]
+++- CMD ["uvicorn", "src.web.app:app", "--host", "0.0.0.0", "--port", "8000"]
+++-diff --git a/src/web/app.py b/src/web/app.py
+++-index 5cbab66..f0cde7e 100644
+++---- a/src/web/app.py
+++-+++ b/src/web/app.py
+++-@@ -40,19 +40,46 @@ _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+++- templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 +++@@ -51,6 +52,7 @@ class DaemonConfig(BaseModel):
 +++     claude_model: str = "opus"
 +++     fix_review_timeout_sec: int = 3600
 +++     planned_pr_timeout_sec: int = 900
 ++++    rate_limit_pause_percent: int = 90
-+++ 
-+++ 
+++  
+++  
+++--def _default_repo_state(name: str, url: str) -> RepoState:
+++-+def _default_repo_state(
+++-+    name: str, url: str, *, error: str | None = None
+++-+) -> RepoState:
+++-     """Return a default ``IDLE`` state for ``name``/``url``."""
+++-     return RepoState(
+++-         url=url,
+++-         name=name,
+++--        state=PipelineState.IDLE,
+++-+        state=PipelineState.ERROR if error else PipelineState.IDLE,
+++-         current_task=None,
+++-         current_pr=None,
+++--        error_message=None,
+++-+        error_message=error,
+++-         last_updated=datetime.now(timezone.utc),
+++-     )
 +++ class WebConfig(BaseModel):
 +++diff --git a/src/daemon/runner.py b/src/daemon/runner.py
-+++index fa0d99a..5e5e136 100644
++++index fa0d99a..93bc22d 100644
 +++--- a/src/daemon/runner.py
 ++++++ b/src/daemon/runner.py
 +++@@ -16,7 +16,7 @@ import logging
@@ -756,7 +1602,7 @@ index 58a8353..e097883 100644
 +++-from datetime import datetime, timezone
 ++++from datetime import datetime, timedelta, timezone
 +++ from pathlib import Path
-+++ 
+++  
 +++ import redis.asyncio as aioredis
 +++@@ -378,6 +378,7 @@ class PipelineRunner:
 +++         # overwritten with GitHub's ``updatedAt`` (which advances every
@@ -766,10 +1612,33 @@ index 58a8353..e097883 100644
 +++         self._last_push_at: datetime | None = None
 +++         # PR number the ``_last_push_at`` timestamp belongs to. Without
 +++         # this, a stale timestamp from a prior PR leaks into freshness
-+++@@ -1251,6 +1252,23 @@ return 0
++++@@ -1251,6 +1252,32 @@ return 0
 +++         await self.publish_state()
 +++         await self.handle_coding()
-+++ 
+++  
+++-+async def _get_repo_state_safe(
+++-+    redis_client: aioredis.Redis, name: str, url: str
+++-+) -> tuple[RepoState, str | None]:
+++-+    """Return (state, warning). Warning is non-None when state is synthetic."""
+++-+    try:
+++-+        raw = await redis_client.get(f"pipeline:{name}")
+++-+    except Exception:
+++-+        st = _default_repo_state(name, url)
+++-+        st.state = PipelineState.PREFLIGHT
+++-+        st.error_message = "Redis unavailable — state unknown"
+++-+        return st, "Redis unavailable"
+++-+    if raw is None:
+++-+        st = _default_repo_state(name, url)
+++-+        st.state = PipelineState.PREFLIGHT
+++-+        st.error_message = "Waiting for daemon to initialize"
+++-+        return st, "Awaiting daemon initialization"
+++-+    try:
+++-+        return RepoState.model_validate_json(raw), None
+++-+    except Exception:
+++-+        return (
+++-+            _default_repo_state(name, url, error="State decode failed"),
+++-+            "State decode error",
+++-+        )
 ++++    def _check_rate_limit(self) -> bool:
 ++++        """Return True if CLI calls are allowed, False if rate-limited."""
 ++++        if self._rate_limited_until is not None:
@@ -783,9 +1652,18 @@ index 58a8353..e097883 100644
 ++ +
 ++++    def _detect_rate_limit(self, stderr: str) -> None:
 ++++        """Set rate-limit pause if stderr contains rate-limit signals."""
-++++        if "rate limit" in stderr.lower() or "429" in stderr:
-++++            self._rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=30)
-++++            self.log_event("Rate limit detected, pausing for 30 min")
+++++        threshold = self.app_config.daemon.rate_limit_pause_percent
+++++        lower = stderr.lower()
+++++        triggered = False
+++++        m = re.search(r"(\d{1,3})%\s*(?:of\s+)?(?:rate\s*limit|capacity)", lower)
+++++        if m:
+++++            triggered = int(m.group(1)) >= threshold
+++++        elif "429" in stderr or "rate limit" in lower:
+++++            triggered = True
+++++        if triggered:
+++++            pause_min = max(1, int(30 * threshold / 100))
+++++            self._rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=pause_min)
+++++            self.log_event(f"Rate limit detected, pausing for {pause_min} min")
 ++ +
 ++- async def get_repo_state(
 ++-     name: str,
@@ -858,7 +1736,9 @@ index 58a8353..e097883 100644
 ++-             state = _default_repo_state(name, repo.url)
 ++-+            state.state = PipelineState.PREFLIGHT
 ++-+            state.error_message = "Redis unavailable — state unknown"
-++- 
++++     async def handle_coding(self) -> None:
++++         """Run ``PLANNED PR`` via the claude CLI and hand off to WATCH.
+++  
 ++-         states.append(state)
 ++- 
 ++--    return states
@@ -916,10 +1796,7 @@ index 58a8353..e097883 100644
 ++-+        "components/redis_banner.html",
 ++-+        {"redis_warning": redis_warning},
 ++-+    )
-+++     async def handle_coding(self) -> None:
-+++         """Run ``PLANNED PR`` via the claude CLI and hand off to WATCH.
-+++ 
-+++@@ -1261,6 +1279,9 @@ return 0
++++@@ -1261,6 +1288,9 @@ return 0
 +++         for the PR; because the list API is eventually consistent, we
 +++         retry a few times before surfacing an ERROR.
 +++         """
@@ -929,7 +1806,7 @@ index 58a8353..e097883 100644
 +++         target_branch = (
 +++             self.state.current_task.branch if self.state.current_task else None
 +++         )
-+++@@ -1278,6 +1299,7 @@ return 0
++++@@ -1278,6 +1308,7 @@ return 0
 +++             timeout=self.app_config.daemon.planned_pr_timeout_sec,
 +++         )
 +++         await self._save_cli_log(stdout, stderr, "PLANNED PR output")
@@ -937,7 +1814,7 @@ index 58a8353..e097883 100644
 +++         if code != 0:
 +++             self.state.state = PipelineState.ERROR
 +++             self.state.error_message = stderr.strip() or f"claude exit {code}"
-+++@@ -1436,6 +1458,9 @@ return 0
++++@@ -1436,6 +1467,9 @@ return 0
 +++ 
 +++     async def handle_fix(self) -> None:
 +++         """Run ``FIX REVIEW`` via the claude CLI and return to WATCH."""
@@ -955,8 +1832,39 @@ index 58a8353..e097883 100644
 ++--        {"repos": states},
 ++-+        {"repos": states, "redis_warning": redis_warning},
 ++-     )
-++- 
-++- 
++++         if (
++++             self.state.current_pr is not None
++++             and self.state.current_pr.is_cross_repository
++++@@ -1495,6 +1529,7 @@ return 0
++++             timeout=self.app_config.daemon.fix_review_timeout_sec,
++++         )
++++         await self._save_cli_log(stdout, stderr, "FIX REVIEW output")
+++++        self._detect_rate_limit(stderr)
++++         if code != 0:
++++             self.state.state = PipelineState.ERROR
++++             self.state.error_message = stderr.strip() or f"claude exit {code}"
++++@@ -2031,6 +2066,9 @@ return 0
+++  
++++     async def handle_error(self, error_context: str | None = None) -> None:
++++         """Ask the claude CLI whether to FIX, SKIP, or ESCALATE the error."""
+++++        if not self._check_rate_limit():
+++++            return
+++++
++++         context = error_context or self.state.error_message or "Unknown error"
++++         lowered = context.lower()
++++         if any(kw in lowered for kw in ("rate limit", "timeout", "429")):
++++diff --git a/src/web/app.py b/src/web/app.py
++++index 688b9fa..45d1100 100644
++++--- a/src/web/app.py
+++++++ b/src/web/app.py
++++@@ -782,6 +782,7 @@ async def put_settings_daemon(
++++     error_handler_use_ai: str | None = Form(None),
++++     planned_pr_timeout_sec: str | None = Form(None),
++++     fix_review_timeout_sec: str | None = Form(None),
+++++    rate_limit_pause_percent: str | None = Form(None),
++++ ) -> HTMLResponse:
++++     """Update daemon settings.
+++  
 ++- @app.get("/partials/stats", response_class=HTMLResponse)
 ++- async def partial_stats(request: Request) -> HTMLResponse:
 ++-     redis_client = getattr(request.app.state, "redis", None)
@@ -990,39 +1898,6 @@ index 58a8353..e097883 100644
 ++-@@ -94,6 +94,10 @@
 ++-         </div>
 ++-     </nav>
-+++         if (
-+++             self.state.current_pr is not None
-+++             and self.state.current_pr.is_cross_repository
-+++@@ -1495,6 +1520,7 @@ return 0
-+++             timeout=self.app_config.daemon.fix_review_timeout_sec,
-+++         )
-+++         await self._save_cli_log(stdout, stderr, "FIX REVIEW output")
-++++        self._detect_rate_limit(stderr)
-+++         if code != 0:
-+++             self.state.state = PipelineState.ERROR
-+++             self.state.error_message = stderr.strip() or f"claude exit {code}"
-+++@@ -2031,6 +2057,9 @@ return 0
-+++ 
-+++     async def handle_error(self, error_context: str | None = None) -> None:
-+++         """Ask the claude CLI whether to FIX, SKIP, or ESCALATE the error."""
-++++        if not self._check_rate_limit():
-++++            return
-++++
-+++         context = error_context or self.state.error_message or "Unknown error"
-+++         lowered = context.lower()
-+++         if any(kw in lowered for kw in ("rate limit", "timeout", "429")):
-+++diff --git a/src/web/app.py b/src/web/app.py
-+++index 688b9fa..45d1100 100644
-+++--- a/src/web/app.py
-++++++ b/src/web/app.py
-+++@@ -782,6 +782,7 @@ async def put_settings_daemon(
-+++     error_handler_use_ai: str | None = Form(None),
-+++     planned_pr_timeout_sec: str | None = Form(None),
-+++     fix_review_timeout_sec: str | None = Form(None),
-++++    rate_limit_pause_percent: str | None = Form(None),
-+++ ) -> HTMLResponse:
-+++     """Update daemon settings.
-+++ 
 +++@@ -827,6 +828,13 @@ async def put_settings_daemon(
 +++             updates["fix_review_timeout_sec"] = _coerce_int(
 +++                 fix_review_timeout_sec, "fix_review_timeout_sec", min_value=1
@@ -1142,7 +2017,7 @@ index 58a8353..e097883 100644
 +++         {% endif %}
 +++         <div id="upload-error-{{ repo.name }}"></div>
 +++diff --git a/src/web/templates/components/settings_daemon.html b/src/web/templates/components/settings_daemon.html
-+++index c6a6c18..ca1e9d1 100644
++++index c6a6c18..016213b 100644
 +++--- a/src/web/templates/components/settings_daemon.html
 ++++++ b/src/web/templates/components/settings_daemon.html
 +++@@ -51,6 +51,21 @@
@@ -1162,7 +2037,7 @@ index 58a8353..e097883 100644
 ++++               hx-trigger="change"
 ++++               hx-target="#settings-daemon"
 ++++               hx-swap="innerHTML">
-++++        <span class="text-xs text-gray-500">Daemon pauses Claude CLI calls when usage reaches this percentage of the rate limit window.</span>
+++++        <span class="text-xs text-gray-500">Controls pause sensitivity: scales pause duration and triggers on usage warnings above this threshold.</span>
 ++++    </label>
 ++  </div>
 ++- {% endif %}
@@ -1297,25 +2172,6 @@ index 58a8353..e097883 100644
 ++--    assert "0 / 0 done" in body
 ++-+    assert "initializing" in body
 ++- 
-++- 
-++- def test_partial_repo_list_empty_state(
-++-@@ -366,7 +366,7 @@ def test_partial_repo_detail_returns_html_fragment(
-++-     body = response.text
-++-     assert "<!DOCTYPE" not in body  # fragment, not full document
-++-     assert "alpha" in body
-++--    assert "IDLE" in body
-++-+    assert "PREFLIGHT" in body
-++-     assert "Current Task" in body
-++-     assert "Current PR" in body
-++-     # Event log has been split out of /partials/repo/{name} — it now
-++-@@ -551,3 +551,52 @@ def test_updated_header_has_data_ts(
-++-     assert response.status_code == 200
-++-     body = response.text
-++-     assert f'data-ts="{now.isoformat()}"' in body
-++-+
-++-+
-++-+def test_index_shows_warning_when_redis_key_missing(
-++-+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 +++     assert updated.daemon.fix_review_timeout_sec == 2000
 +++     assert updated.daemon.planned_pr_timeout_sec == 1200
 ++++
@@ -1335,11 +2191,29 @@ index 58a8353..e097883 100644
 ++++    )
 ++++    assert updated.daemon.rate_limit_pause_percent == 75
 +++diff --git a/tests/test_runner.py b/tests/test_runner.py
-+++index 62f1007..3261f1c 100644
++++index 62f1007..94a5a17 100644
 +++--- a/tests/test_runner.py
 ++++++ b/tests/test_runner.py
-+++@@ -3551,3 +3551,104 @@ def test_rehydrate_clears_stale_on_mismatch_when_fetch_fails(
-+++ 
++++@@ -3551,3 +3551,139 @@ def test_rehydrate_clears_stale_on_mismatch_when_fetch_fails(
+++  
+++- def test_partial_repo_list_empty_state(
+++-@@ -366,7 +366,7 @@ def test_partial_repo_detail_returns_html_fragment(
+++-     body = response.text
+++-     assert "<!DOCTYPE" not in body  # fragment, not full document
+++-     assert "alpha" in body
+++--    assert "IDLE" in body
+++-+    assert "PREFLIGHT" in body
+++-     assert "Current Task" in body
+++-     assert "Current PR" in body
+++-     # Event log has been split out of /partials/repo/{name} — it now
+++-@@ -551,3 +551,52 @@ def test_updated_header_has_data_ts(
+++-     assert response.status_code == 200
+++-     body = response.text
+++-     assert f'data-ts="{now.isoformat()}"' in body
+++-+
+++-+
+++-+def test_index_shows_warning_when_redis_key_missing(
+++-+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 +++     assert runner._last_push_at is None
 +++     assert runner._last_push_at_pr_number == 42
 ++++
@@ -1359,11 +2233,7 @@ index 58a8353..e097883 100644
 ++-+        response = client.get("/partials/repo-list")
 ++++    assert runner._check_rate_limit() is False
 ++++    assert runner._rate_limited_until is not None
-++ +
-++-+    assert response.status_code == 200
-++-+    body = response.text
-++-+    assert "Waiting for daemon to initialize" in body
-++-+    assert "initializing" in body
+++++
 ++++
 ++++def test_check_rate_limit_allows_when_expired(
 ++++    monkeypatch: pytest.MonkeyPatch,
@@ -1399,14 +2269,14 @@ index 58a8353..e097883 100644
 ++++
 ++++    assert cli_calls == []
 ++ +
+++-+    assert response.status_code == 200
+++-+    body = response.text
+++-+    assert "Waiting for daemon to initialize" in body
+++-+    assert "initializing" in body
 ++ +
-++-+def test_index_shows_error_on_decode_failure(
-++-+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ++++def test_handle_error_skips_diagnose_for_rate_limit(
 ++++    monkeypatch: pytest.MonkeyPatch,
-++ +) -> None:
-++-+    """When a Redis payload cannot be decoded the card must show a decode
-++-+    error instead of silently falling back to IDLE."""
+++++) -> None:
 ++++    """handle_error skips diagnose_error when error contains 'rate limit'."""
 ++++    _patch_subprocess(monkeypatch)
 ++++    cli_calls: list[str] = []
@@ -1418,26 +2288,12 @@ index 58a8353..e097883 100644
 ++++    runner = _make_runner()
 ++++    runner.state.state = PipelineState.ERROR
 ++++    runner.state.error_message = "Claude rate limit exceeded"
-++ +
-++-+    class _BadPayloadClient:
-++-+        async def get(self, key: str) -> str | None:
-++-+            if key == "pipeline:example__alpha":
-++-+                return "{not valid json!!"
-++-+            return None
+++++
 ++++    asyncio.run(runner.handle_error())
-++ +
-++-+        async def aclose(self) -> None:
-++-+            return None
+++++
 ++++    assert cli_calls == []
-++ +
-++-+    class _BadPayloadAioredis:
-++-+        @staticmethod
-++-+        def from_url(
-++-+            url: str, decode_responses: bool = True
-++-+        ) -> _BadPayloadClient:
-++-+            return _BadPayloadClient()
-++ +
-++-+    monkeypatch.setattr(web_app, "aioredis", _BadPayloadAioredis())
+++++
+++++
 ++++def test_handle_error_skips_diagnose_for_timeout(
 ++++    monkeypatch: pytest.MonkeyPatch,
 ++++) -> None:
@@ -1454,22 +2310,75 @@ index 58a8353..e097883 100644
 ++++    runner.state.error_message = "Timeout waiting for response"
 ++++
 ++++    asyncio.run(runner.handle_error())
-++++
+++ +
+++-+def test_index_shows_error_on_decode_failure(
+++-+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ++++    assert cli_calls == []
 ++++
 ++++
 ++++def test_detect_rate_limit_sets_pause(
 ++++    monkeypatch: pytest.MonkeyPatch,
-++++) -> None:
+++ +) -> None:
+++-+    """When a Redis payload cannot be decoded the card must show a decode
+++-+    error instead of silently falling back to IDLE."""
 ++++    """_detect_rate_limit sets _rate_limited_until on rate limit signal."""
 ++++    _patch_subprocess(monkeypatch)
 ++++    runner = _make_runner()
 ++++    assert runner._rate_limited_until is None
+++ +
+++-+    class _BadPayloadClient:
+++-+        async def get(self, key: str) -> str | None:
+++-+            if key == "pipeline:example__alpha":
+++-+                return "{not valid json!!"
+++-+            return None
+++++    runner._detect_rate_limit("Error: 429 Too Many Requests")
+++ +
+++-+        async def aclose(self) -> None:
+++-+            return None
+++++    assert runner._rate_limited_until is not None
+++++    assert runner._rate_limited_until > datetime.now(timezone.utc)
+++++    expected_pause = timedelta(minutes=27)
+++++    actual_pause = runner._rate_limited_until - datetime.now(timezone.utc)
+++++    assert actual_pause > expected_pause - timedelta(seconds=5)
+++ +
+++-+    class _BadPayloadAioredis:
+++-+        @staticmethod
+++-+        def from_url(
+++-+            url: str, decode_responses: bool = True
+++-+        ) -> _BadPayloadClient:
+++-+            return _BadPayloadClient()
+++ +
+++-+    monkeypatch.setattr(web_app, "aioredis", _BadPayloadAioredis())
+++++def test_detect_rate_limit_respects_threshold(
+++++    monkeypatch: pytest.MonkeyPatch,
+++++) -> None:
+++++    """_detect_rate_limit triggers on usage percentage above threshold."""
+++++    _patch_subprocess(monkeypatch)
+++++    runner = _make_runner()
+++++    runner.app_config.daemon.rate_limit_pause_percent = 80
+++++
+++++    runner._detect_rate_limit("Warning: 75% of rate limit capacity used")
+++++    assert runner._rate_limited_until is None
+++++
+++++    runner._detect_rate_limit("Warning: 85% of rate limit capacity used")
+++++    assert runner._rate_limited_until is not None
+++++
+++++
+++++def test_detect_rate_limit_scales_pause_duration(
+++++    monkeypatch: pytest.MonkeyPatch,
+++++) -> None:
+++++    """_detect_rate_limit scales pause duration by rate_limit_pause_percent."""
+++++    _patch_subprocess(monkeypatch)
+++++    runner = _make_runner()
+++++    runner.app_config.daemon.rate_limit_pause_percent = 50
 ++++
 ++++    runner._detect_rate_limit("Error: 429 Too Many Requests")
 ++++
 ++++    assert runner._rate_limited_until is not None
-++++    assert runner._rate_limited_until > datetime.now(timezone.utc)
+++++    expected_pause = timedelta(minutes=15)
+++++    actual_pause = runner._rate_limited_until - datetime.now(timezone.utc)
+++++    assert actual_pause > expected_pause - timedelta(seconds=5)
+++++    assert actual_pause < expected_pause + timedelta(seconds=5)
 +++diff --git a/tests/test_settings.py b/tests/test_settings.py
 +++index 1daa6d0..62f704d 100644
 +++--- a/tests/test_settings.py
@@ -1558,7 +2467,7 @@ index 58a8353..e097883 100644
 +-     )
 ++ class WebConfig(BaseModel):
 ++diff --git a/src/daemon/runner.py b/src/daemon/runner.py
-++index fa0d99a..93bc22d 100644
+++index fa0d99a..9d640ee 100644
 ++--- a/src/daemon/runner.py
 +++++ b/src/daemon/runner.py
 ++@@ -16,7 +16,7 @@ import logging
@@ -1624,7 +2533,7 @@ index 58a8353..e097883 100644
 +++        m = re.search(r"(\d{1,3})%\s*(?:of\s+)?(?:rate\s*limit|capacity)", lower)
 +++        if m:
 +++            triggered = int(m.group(1)) >= threshold
-+++        elif "429" in stderr or "rate limit" in lower:
++++        elif "429" in stderr:
 +++            triggered = True
 +++        if triggered:
 +++            pause_min = max(1, int(30 * threshold / 100))
@@ -1898,7 +2807,7 @@ index 58a8353..e097883 100644
 +-+{% endif %}
 + diff --git a/src/web/templates/components/repo_cards.html b/src/web/templates/components/repo_cards.html
 +-index 0372e40..c141b24 100644
-++index c141b24..badf463 100644
+++index c141b24..f982983 100644
 + --- a/src/web/templates/components/repo_cards.html
 + +++ b/src/web/templates/components/repo_cards.html
 +-@@ -9,6 +9,8 @@
@@ -1944,7 +2853,10 @@ index 58a8353..e097883 100644
 +-                 {% if repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done %}
 +-@@ -65,7 +78,13 @@
 +-             </div>
-+-         </div>
+++@@ -127,9 +127,12 @@
+++             <span class="text-gray-500">iter {{ repo.current_pr.push_count }}</span>
+++             {% endif %}
++          </div>
 +- 
 +--        {% if is_error and repo.error_message %}
 +-+        {% if is_synthetic and repo.error_message %}
@@ -1972,13 +2884,12 @@ index 58a8353..e097883 100644
 +-+{% else %}
 +- <div class="mb-6 rounded-lg border border-fail/30 bg-fail/10 px-4 py-3">
 +-     <p class="text-fail font-mono text-sm break-words">{{ repo.error_message }}</p>
-++@@ -130,6 +130,9 @@
++++        {% endif %}
 ++         {% if repo.state.value == 'CODING' %}
 ++         <div class="text-xs text-accent/70 italic mt-1">Claude is coding...</div>
 ++         {% endif %}
 +++        {% if repo.error_message and 'rate limit' in repo.error_message.lower() %}
 +++        <div class="text-xs text-warn italic mt-1">Rate limited, auto-resuming...</div>
-+++        {% endif %}
 ++         {% endif %}
 ++         {% endif %}
 ++         <div id="upload-error-{{ repo.name }}"></div>
@@ -2199,8 +3110,12 @@ index 58a8353..e097883 100644
 +-+        response = client.get("/partials/repo-list")
 +++    assert runner._check_rate_limit() is False
 +++    assert runner._rate_limited_until is not None
-+++
-+++
++ +
++-+    assert response.status_code == 200
++-+    body = response.text
++-+    assert "Waiting for daemon to initialize" in body
++-+    assert "initializing" in body
++ +
 +++def test_check_rate_limit_allows_when_expired(
 +++    monkeypatch: pytest.MonkeyPatch,
 +++) -> None:
@@ -2211,11 +3126,15 @@ index 58a8353..e097883 100644
 +++
 +++    assert runner._check_rate_limit() is True
 +++    assert runner._rate_limited_until is None
-+++
++ +
++-+def test_index_shows_error_on_decode_failure(
++-+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 +++
 +++def test_handle_coding_skips_when_rate_limited(
 +++    monkeypatch: pytest.MonkeyPatch,
-+++) -> None:
++ +) -> None:
++-+    """When a Redis payload cannot be decoded the card must show a decode
++-+    error instead of silently falling back to IDLE."""
 +++    """handle_coding returns early without calling claude_cli when rate-limited."""
 +++    _patch_subprocess(monkeypatch)
 +++    cli_calls: list[str] = []
@@ -2230,16 +3149,26 @@ index 58a8353..e097883 100644
 +++        pr_id="PR-099", title="test", branch="pr-099-test", status=TaskStatus.TODO
 +++    )
 +++    runner._rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
-+++
++ +
++-+    class _BadPayloadClient:
++-+        async def get(self, key: str) -> str | None:
++-+            if key == "pipeline:example__alpha":
++-+                return "{not valid json!!"
++-+            return None
 +++    asyncio.run(runner.handle_coding())
-+++
++ +
++-+        async def aclose(self) -> None:
++-+            return None
 +++    assert cli_calls == []
 + +
-+-+    assert response.status_code == 200
-+-+    body = response.text
-+-+    assert "Waiting for daemon to initialize" in body
-+-+    assert "initializing" in body
++-+    class _BadPayloadAioredis:
++-+        @staticmethod
++-+        def from_url(
++-+            url: str, decode_responses: bool = True
++-+        ) -> _BadPayloadClient:
++-+            return _BadPayloadClient()
 + +
++-+    monkeypatch.setattr(web_app, "aioredis", _BadPayloadAioredis())
 +++def test_handle_error_skips_diagnose_for_rate_limit(
 +++    monkeypatch: pytest.MonkeyPatch,
 +++) -> None:
@@ -2276,45 +3205,27 @@ index 58a8353..e097883 100644
 +++    runner.state.error_message = "Timeout waiting for response"
 +++
 +++    asyncio.run(runner.handle_error())
-+ +
-+-+def test_index_shows_error_on_decode_failure(
-+-+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
++++
 +++    assert cli_calls == []
 +++
 +++
 +++def test_detect_rate_limit_sets_pause(
 +++    monkeypatch: pytest.MonkeyPatch,
-+ +) -> None:
-+-+    """When a Redis payload cannot be decoded the card must show a decode
-+-+    error instead of silently falling back to IDLE."""
++++) -> None:
 +++    """_detect_rate_limit sets _rate_limited_until on rate limit signal."""
 +++    _patch_subprocess(monkeypatch)
 +++    runner = _make_runner()
 +++    assert runner._rate_limited_until is None
-+ +
-+-+    class _BadPayloadClient:
-+-+        async def get(self, key: str) -> str | None:
-+-+            if key == "pipeline:example__alpha":
-+-+                return "{not valid json!!"
-+-+            return None
++++
 +++    runner._detect_rate_limit("Error: 429 Too Many Requests")
-+ +
-+-+        async def aclose(self) -> None:
-+-+            return None
++++
 +++    assert runner._rate_limited_until is not None
 +++    assert runner._rate_limited_until > datetime.now(timezone.utc)
 +++    expected_pause = timedelta(minutes=27)
 +++    actual_pause = runner._rate_limited_until - datetime.now(timezone.utc)
 +++    assert actual_pause > expected_pause - timedelta(seconds=5)
-+ +
-+-+    class _BadPayloadAioredis:
-+-+        @staticmethod
-+-+        def from_url(
-+-+            url: str, decode_responses: bool = True
-+-+        ) -> _BadPayloadClient:
-+-+            return _BadPayloadClient()
-+ +
-+-+    monkeypatch.setattr(web_app, "aioredis", _BadPayloadAioredis())
++++
++++
 +++def test_detect_rate_limit_respects_threshold(
 +++    monkeypatch: pytest.MonkeyPatch,
 +++) -> None:
@@ -2433,7 +3344,7 @@ index 58a8353..e097883 100644
 -     )
 + class WebConfig(BaseModel):
 +diff --git a/src/daemon/runner.py b/src/daemon/runner.py
-+index fa0d99a..9d640ee 100644
++index fa0d99a..93bc22d 100644
 +--- a/src/daemon/runner.py
 ++++ b/src/daemon/runner.py
 +@@ -16,7 +16,7 @@ import logging
@@ -2499,7 +3410,7 @@ index 58a8353..e097883 100644
 ++        m = re.search(r"(\d{1,3})%\s*(?:of\s+)?(?:rate\s*limit|capacity)", lower)
 ++        if m:
 ++            triggered = int(m.group(1)) >= threshold
-++        elif "429" in stderr:
+++        elif "429" in stderr or "rate limit" in lower:
 ++            triggered = True
 ++        if triggered:
 ++            pause_min = max(1, int(30 * threshold / 100))
@@ -2773,7 +3684,7 @@ index 58a8353..e097883 100644
 -+{% endif %}
  diff --git a/src/web/templates/components/repo_cards.html b/src/web/templates/components/repo_cards.html
 -index 0372e40..c141b24 100644
-+index c141b24..f982983 100644
++index c141b24..86ccfc1 100644
  --- a/src/web/templates/components/repo_cards.html
  +++ b/src/web/templates/components/repo_cards.html
 -@@ -9,6 +9,8 @@
@@ -2819,7 +3730,7 @@ index 58a8353..e097883 100644
 -                 {% if repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done %}
 -@@ -65,7 +78,13 @@
 -             </div>
-+@@ -127,9 +127,12 @@
++@@ -127,10 +127,13 @@
 +             <span class="text-gray-500">iter {{ repo.current_pr.push_count }}</span>
 +             {% endif %}
           </div>
@@ -2854,11 +3765,12 @@ index 58a8353..e097883 100644
 +         {% if repo.state.value == 'CODING' %}
 +         <div class="text-xs text-accent/70 italic mt-1">Claude is coding...</div>
 +         {% endif %}
++         {% endif %}
 ++        {% if repo.error_message and 'rate limit' in repo.error_message.lower() %}
 ++        <div class="text-xs text-warn italic mt-1">Rate limited, auto-resuming...</div>
 +         {% endif %}
-+         {% endif %}
 +         <div id="upload-error-{{ repo.name }}"></div>
++     </div>
 +diff --git a/src/web/templates/components/settings_daemon.html b/src/web/templates/components/settings_daemon.html
 +index c6a6c18..016213b 100644
 +--- a/src/web/templates/components/settings_daemon.html
@@ -3284,7 +4196,7 @@ index 1681fd6..d15fffd 100644
  
  class WebConfig(BaseModel):
 diff --git a/src/daemon/runner.py b/src/daemon/runner.py
-index fa0d99a..93bc22d 100644
+index fa0d99a..b1cab4e 100644
 --- a/src/daemon/runner.py
 +++ b/src/daemon/runner.py
 @@ -16,7 +16,7 @@ import logging
@@ -3304,7 +4216,18 @@ index fa0d99a..93bc22d 100644
          self._last_push_at: datetime | None = None
          # PR number the ``_last_push_at`` timestamp belongs to. Without
          # this, a stale timestamp from a prior PR leaks into freshness
-@@ -1251,6 +1252,32 @@ return 0
+@@ -1059,7 +1060,9 @@ class PipelineRunner:
+         elif current == PipelineState.HUNG:
+             await self.handle_hung()
+         elif current == PipelineState.ERROR:
+-            if self.app_config.daemon.error_handler_use_ai:
++            if self._try_recover_rate_limit():
++                pass
++            elif self.app_config.daemon.error_handler_use_ai:
+                 await self.handle_error()
+ 
+         await self.publish_state()
+@@ -1251,6 +1254,57 @@ return 0
          await self.publish_state()
          await self.handle_coding()
  
@@ -3317,6 +4240,31 @@ index fa0d99a..93bc22d 100644
 +                return False
 +            self._rate_limited_until = None
 +            self.log_event("Rate limit window expired, resuming")
++        return True
++
++    def _try_recover_rate_limit(self) -> bool:
++        """If ERROR was caused by a rate limit, recover once the pause expires.
++
++        Returns True if recovery was attempted (caller should skip other
++        error handling), False otherwise.
++        """
++        msg = (self.state.error_message or "").lower()
++        if not any(kw in msg for kw in ("rate limit", "429")):
++            return False
++        if self._rate_limited_until is not None:
++            if datetime.now(timezone.utc) < self._rate_limited_until:
++                remaining = (self._rate_limited_until - datetime.now(timezone.utc)).total_seconds()
++                self.log_event(f"Rate limit pause active, resuming in {int(remaining)}s")
++                return True
++        self._rate_limited_until = None
++        self.state.error_message = None
++        self._error_diagnose_count = 0
++        if self.state.current_pr is not None:
++            self.state.state = PipelineState.WATCH
++            self.log_event("Rate limit expired, resuming -> WATCH")
++        else:
++            self.state.state = PipelineState.IDLE
++            self.log_event("Rate limit expired, resuming -> IDLE")
 +        return True
 +
 +    def _detect_rate_limit(self, stderr: str) -> None:
@@ -3337,7 +4285,7 @@ index fa0d99a..93bc22d 100644
      async def handle_coding(self) -> None:
          """Run ``PLANNED PR`` via the claude CLI and hand off to WATCH.
  
-@@ -1261,6 +1288,9 @@ return 0
+@@ -1261,6 +1315,9 @@ return 0
          for the PR; because the list API is eventually consistent, we
          retry a few times before surfacing an ERROR.
          """
@@ -3347,7 +4295,7 @@ index fa0d99a..93bc22d 100644
          target_branch = (
              self.state.current_task.branch if self.state.current_task else None
          )
-@@ -1278,6 +1308,7 @@ return 0
+@@ -1278,6 +1335,7 @@ return 0
              timeout=self.app_config.daemon.planned_pr_timeout_sec,
          )
          await self._save_cli_log(stdout, stderr, "PLANNED PR output")
@@ -3355,7 +4303,7 @@ index fa0d99a..93bc22d 100644
          if code != 0:
              self.state.state = PipelineState.ERROR
              self.state.error_message = stderr.strip() or f"claude exit {code}"
-@@ -1436,6 +1467,9 @@ return 0
+@@ -1436,6 +1494,9 @@ return 0
  
      async def handle_fix(self) -> None:
          """Run ``FIX REVIEW`` via the claude CLI and return to WATCH."""
@@ -3365,7 +4313,7 @@ index fa0d99a..93bc22d 100644
          if (
              self.state.current_pr is not None
              and self.state.current_pr.is_cross_repository
-@@ -1495,6 +1529,7 @@ return 0
+@@ -1495,6 +1556,7 @@ return 0
              timeout=self.app_config.daemon.fix_review_timeout_sec,
          )
          await self._save_cli_log(stdout, stderr, "FIX REVIEW output")
@@ -3373,7 +4321,7 @@ index fa0d99a..93bc22d 100644
          if code != 0:
              self.state.state = PipelineState.ERROR
              self.state.error_message = stderr.strip() or f"claude exit {code}"
-@@ -2031,6 +2066,9 @@ return 0
+@@ -2031,6 +2093,9 @@ return 0
  
      async def handle_error(self, error_context: str | None = None) -> None:
          """Ask the claude CLI whether to FIX, SKIP, or ESCALATE the error."""

@@ -1272,7 +1272,7 @@ return 0
         error handling), False otherwise.
         """
         msg = (self.state.error_message or "").lower()
-        if not any(kw in msg for kw in ("rate limit", "429")):
+        if "rate limit" not in msg and not re.search(r"\b429\b", msg):
             return False
         if self._rate_limited_until is not None:
             if datetime.now(timezone.utc) < self._rate_limited_until:
@@ -1298,7 +1298,7 @@ return 0
         m = re.search(r"(\d{1,3})%\s*(?:of\s+)?(?:rate\s*limit|capacity)", lower)
         if m:
             triggered = int(m.group(1)) >= threshold
-        elif "429" in stderr or "rate limit" in lower:
+        elif re.search(r"\b429\b", stderr) or "rate limit" in lower:
             triggered = True
         if triggered:
             pause_min = max(1, int(30 * threshold / 100))
@@ -2098,7 +2098,7 @@ return 0
 
         context = error_context or self.state.error_message or "Unknown error"
         lowered = context.lower()
-        if any(kw in lowered for kw in ("rate limit", "timeout", "429")):
+        if "rate limit" in lowered or "timeout" in lowered or re.search(r"\b429\b", lowered):
             self.log_event("Skipping AI diagnosis for rate-limit/timeout error")
             return
         self._error_diagnose_count += 1
@@ -2110,6 +2110,7 @@ return 0
         code, stdout, stderr = claude_cli.diagnose_error(
             self.repo_path, context, model=self.app_config.daemon.claude_model
         )
+        self._detect_rate_limit(stderr)
         if code != 0:
             self.log_event(
                 f"diagnose_error CLI failed: {stderr.strip() or f'exit {code}'}"
