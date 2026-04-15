@@ -1060,7 +1060,9 @@ class PipelineRunner:
         elif current == PipelineState.HUNG:
             await self.handle_hung()
         elif current == PipelineState.ERROR:
-            if self.app_config.daemon.error_handler_use_ai:
+            if self._try_recover_rate_limit():
+                pass
+            elif self.app_config.daemon.error_handler_use_ai:
                 await self.handle_error()
 
         await self.publish_state()
@@ -1261,6 +1263,31 @@ return 0
                 return False
             self._rate_limited_until = None
             self.log_event("Rate limit window expired, resuming")
+        return True
+
+    def _try_recover_rate_limit(self) -> bool:
+        """If ERROR was caused by a rate limit, recover once the pause expires.
+
+        Returns True if recovery was attempted (caller should skip other
+        error handling), False otherwise.
+        """
+        msg = (self.state.error_message or "").lower()
+        if not any(kw in msg for kw in ("rate limit", "429")):
+            return False
+        if self._rate_limited_until is not None:
+            if datetime.now(timezone.utc) < self._rate_limited_until:
+                remaining = (self._rate_limited_until - datetime.now(timezone.utc)).total_seconds()
+                self.log_event(f"Rate limit pause active, resuming in {int(remaining)}s")
+                return True
+        self._rate_limited_until = None
+        self.state.error_message = None
+        self._error_diagnose_count = 0
+        if self.state.current_pr is not None:
+            self.state.state = PipelineState.WATCH
+            self.log_event("Rate limit expired, resuming -> WATCH")
+        else:
+            self.state.state = PipelineState.IDLE
+            self.log_event("Rate limit expired, resuming -> IDLE")
         return True
 
     def _detect_rate_limit(self, stderr: str) -> None:
