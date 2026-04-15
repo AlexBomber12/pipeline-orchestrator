@@ -327,10 +327,16 @@ def test_update_daemon_config_validates_patch_types(tmp_path: Path) -> None:
     assert reloaded.daemon.poll_interval_sec == 45
 
 
-def test_daemon_config_fix_review_timeout_default() -> None:
+def test_fix_idle_timeout_default() -> None:
     from src.config import DaemonConfig
 
-    assert DaemonConfig().fix_review_timeout_sec == 3600
+    assert DaemonConfig().fix_idle_timeout_sec == 1800
+
+
+def test_fix_review_timeout_removed() -> None:
+    from src.config import DaemonConfig
+
+    assert not hasattr(DaemonConfig(), "fix_review_timeout_sec")
 
 
 def test_daemon_config_planned_pr_timeout_default() -> None:
@@ -344,11 +350,22 @@ def test_update_daemon_config_accepts_timeouts(tmp_path: Path) -> None:
     cfg_path.write_text("daemon: {}\n", encoding="utf-8")
     updated = update_daemon_config(
         path=str(cfg_path),
-        fix_review_timeout_sec=2000,
+        fix_idle_timeout_sec=2000,
         planned_pr_timeout_sec=1200,
     )
-    assert updated.daemon.fix_review_timeout_sec == 2000
+    assert updated.daemon.fix_idle_timeout_sec == 2000
     assert updated.daemon.planned_pr_timeout_sec == 1200
+
+
+def test_fix_idle_timeout_rejects_zero_or_negative() -> None:
+    from pydantic import ValidationError
+
+    from src.config import DaemonConfig
+
+    with pytest.raises(ValidationError):
+        DaemonConfig(fix_idle_timeout_sec=0)
+    with pytest.raises(ValidationError):
+        DaemonConfig(fix_idle_timeout_sec=-5)
 
 
 def test_daemon_config_rate_limit_default() -> None:

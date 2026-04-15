@@ -24,7 +24,7 @@ _DAEMON_FIELDS = {
     "hung_fallback_codex_review",
     "error_handler_use_ai",
     "claude_model",
-    "fix_review_timeout_sec",
+    "fix_idle_timeout_sec",
     "planned_pr_timeout_sec",
     "rate_limit_pause_percent",
 }
@@ -50,7 +50,7 @@ class DaemonConfig(BaseModel):
     hung_fallback_codex_review: bool = True
     error_handler_use_ai: bool = True
     claude_model: str = "opus"
-    fix_review_timeout_sec: int = 3600
+    fix_idle_timeout_sec: int = Field(default=1800, ge=1)
     planned_pr_timeout_sec: int = 900
     rate_limit_pause_percent: int = 90
 
@@ -83,6 +83,12 @@ def load_config(path: str = "config.yml") -> AppConfig:
 
     with config_path.open("r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh) or {}
+
+    daemon = raw.get("daemon")
+    if isinstance(daemon, dict):
+        legacy = daemon.pop("fix_review_timeout_sec", None)
+        if legacy is not None and "fix_idle_timeout_sec" not in daemon:
+            daemon["fix_idle_timeout_sec"] = legacy
 
     return AppConfig.model_validate(raw)
 

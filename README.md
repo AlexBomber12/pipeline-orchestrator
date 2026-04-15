@@ -58,7 +58,7 @@ daemon:
   hung_fallback_codex_review: true
   error_handler_use_ai: true
   claude_model: opus
-  fix_review_timeout_sec: 3600
+  fix_idle_timeout_sec: 1800
   planned_pr_timeout_sec: 900
 
 web:

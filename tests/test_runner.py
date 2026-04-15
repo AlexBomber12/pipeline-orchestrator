@@ -3166,20 +3166,33 @@ def test_handle_coding_uses_configured_timeout(
     assert captured.get("timeout") == 1234
 
 
-def test_handle_fix_uses_configured_timeout(
+def test_fix_idle_timeout_kills_on_no_push(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """fix_review_timeout_sec from config must be forwarded to fix_review."""
+    """Claude task must be cancelled when no push is detected within idle limit."""
     _patch_subprocess(monkeypatch)
-    captured: dict[str, Any] = {}
 
-    async def fake_fix(
+    async def fake_fix_hangs(
         path: str, model: str | None = None, timeout: int | None = None
     ) -> tuple[int, str, str]:
-        captured["timeout"] = timeout
+        await asyncio.Future()
         return (0, "", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", fake_fix)
+    async def immediate_cancel_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+        idle_flag["timed_out"] = True
+        target.cancel()
+
+    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", fake_fix_hangs)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_fix_idle", immediate_cancel_monitor
+    )
     monkeypatch.setattr(
         runner_module.github_client,
         "post_comment",
@@ -3190,14 +3203,97 @@ def test_handle_fix_uses_configured_timeout(
         _repo_cfg(),
         AppConfig(
             repositories=[],
-            daemon=DaemonConfig(fix_review_timeout_sec=2468),
+            daemon=DaemonConfig(fix_idle_timeout_sec=5),
         ),
         _FakeRedis(),
     )
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     asyncio.run(runner.handle_fix())
-    assert captured.get("timeout") == 2468
+    assert runner.state.state == PipelineState.ERROR
+    assert "idle timeout" in (runner.state.error_message or "")
+
+
+def test_fix_idle_timeout_resets_on_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timer must reset when a push is detected, allowing Claude to finish."""
+    _patch_subprocess(monkeypatch)
+
+    async def fake_fix_quick(
+        path: str, model: str | None = None, timeout: int | None = None
+    ) -> tuple[int, str, str]:
+        await asyncio.sleep(0)
+        return (0, "", "")
+
+    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", fake_fix_quick)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = PipelineRunner(
+        _repo_cfg(),
+        AppConfig(
+            repositories=[],
+            daemon=DaemonConfig(fix_idle_timeout_sec=1800),
+        ),
+        _FakeRedis(),
+    )
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.WATCH
+
+
+def test_fix_idle_timeout_monitor_resets_on_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Push detection resets the idle timer so a productive session is not killed."""
+    _patch_subprocess(monkeypatch)
+
+    push_detected = [False]
+
+    async def monitor_with_push_then_finish(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        push_detected[0] = True
+        await asyncio.sleep(0)
+
+    async def fake_fix_quick(
+        path: str, model: str | None = None, timeout: int | None = None
+    ) -> tuple[int, str, str]:
+        await asyncio.sleep(0)
+        return (0, "", "")
+
+    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", fake_fix_quick)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_fix_idle", monitor_with_push_then_finish
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = PipelineRunner(
+        _repo_cfg(),
+        AppConfig(
+            repositories=[],
+            daemon=DaemonConfig(fix_idle_timeout_sec=1800),
+        ),
+        _FakeRedis(),
+    )
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.WATCH
+    assert push_detected[0]
 
 
 def test_handle_watch_stale_feedback_still_times_out(
