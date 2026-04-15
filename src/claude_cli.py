@@ -152,6 +152,7 @@ async def run_claude_async(
     cmd.append(prompt)
     logger.info("running claude CLI with prompt: %s", prompt[:80])
     env = {**os.environ, "NODE_OPTIONS": _build_node_options()}
+    proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -176,11 +177,12 @@ async def run_claude_async(
         logger.error("claude CLI timed out after %ss", timeout)
         return (-1, "", f"Timeout after {timeout}s")
     except asyncio.CancelledError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        await proc.wait()
+        if proc is not None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
         logger.error("claude CLI task cancelled, subprocess killed")
         raise
     except FileNotFoundError as exc:
