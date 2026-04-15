@@ -523,7 +523,14 @@ async def api_stats(request: Request) -> JSONResponse:
 @app.get("/partials/redis-banner", response_class=HTMLResponse)
 async def partial_redis_banner(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
-    _states, redis_warning = await get_all_repo_states(redis_client)
+    redis_warning: str | None = None
+    if redis_client is None:
+        redis_warning = "Redis not configured"
+    else:
+        try:
+            await redis_client.ping()
+        except Exception:
+            redis_warning = "Redis connection lost"
     return templates.TemplateResponse(
         request,
         "components/redis_banner.html",
