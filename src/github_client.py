@@ -159,18 +159,17 @@ def _get_codex_issue_reactions(
 ) -> list[dict]:
     """Fetch Codex reactions on a PR body."""
     try:
-        raw = run_gh([
-            "api", "--paginate",
-            f"repos/{repo}/issues/{pr_number}/reactions",
-        ])
+        reactions = _gh_api_paginated(
+            f"repos/{repo}/issues/{pr_number}/reactions"
+        )
     except RuntimeError as exc:
         if "HTTP 404" not in str(exc):
             raise
         return []
-    if not isinstance(raw, list):
+    if not reactions:
         return []
     return [
-        r for r in raw
+        r for r in reactions
         if isinstance(r, dict)
         and isinstance(r.get("user"), dict)
         and re.search(r"codex", r["user"].get("login", ""), re.IGNORECASE)
