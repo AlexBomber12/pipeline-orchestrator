@@ -457,7 +457,10 @@ class PipelineRunner:
         while True:
             await asyncio.sleep(30)
             self.log_event(f"{label}...")
-            await self.publish_state()
+            try:
+                await self.publish_state()
+            except Exception:
+                logger.warning("[%s] heartbeat publish failed, will retry", self.name)
 
     async def ensure_repo_cloned(self) -> None:
         """Clone the repo if missing, otherwise fetch ``origin/{branch}``.
