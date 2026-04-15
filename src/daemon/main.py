@@ -199,6 +199,7 @@ async def main() -> None:
 
         for key, runner in list(runners.items()):
             if not runner.repo_config.active:
+                last_run.pop(key, None)
                 try:
                     await runner.publish_state()
                 except Exception:

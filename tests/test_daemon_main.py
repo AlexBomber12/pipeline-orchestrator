@@ -41,6 +41,9 @@ class _FakeRunner:
     async def run_cycle(self) -> None:
         self.cycles += 1
 
+    async def publish_state(self) -> None:
+        pass
+
 
 class _StopLoop(Exception):
     """Sentinel raised by the patched ``asyncio.sleep`` to end ``main``."""
@@ -498,3 +501,60 @@ def test_per_repo_poll_interval(
     # clock: 0 (both run), +15 (fast runs, slow skipped), +30 (fast runs, slow skipped)
     assert fast.cycles == 3
     assert slow.cycles == 1
+
+
+def test_unpause_runs_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-enabling a paused repo triggers a run on the very next cycle."""
+    repo = RepoConfig(url="https://github.com/octo/toggle", poll_interval_sec=100)
+    config = AppConfig(
+        repositories=[repo],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+
+    _reset_fake_runner()
+    monkeypatch.setattr(main_module, "load_config", lambda: config)
+    monkeypatch.setattr(
+        main_module.aioredis,
+        "from_url",
+        lambda url, decode_responses: _FakeRedisClient(),
+    )
+    monkeypatch.setattr(main_module, "PipelineRunner", _FakeRunner)
+    monkeypatch.setattr(main_module, "_setup_git_auth", lambda: None)
+    monkeypatch.setattr(
+        main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
+    )
+
+    clock = [0.0]
+    monkeypatch.setattr(main_module.time, "monotonic", lambda: clock[0])
+
+    sleep_count = [0]
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_count[0] += 1
+        clock[0] += 5
+        runner = _FakeRunner.instances[0]
+        if sleep_count[0] == 1:
+            # After first cycle (ran at t=0), pause the repo.
+            runner.repo_config = RepoConfig(
+                url=repo.url, poll_interval_sec=100, active=False,
+            )
+        elif sleep_count[0] == 2:
+            # After second cycle (paused), re-enable it.
+            runner.repo_config = RepoConfig(
+                url=repo.url, poll_interval_sec=100, active=True,
+            )
+        elif sleep_count[0] >= 3:
+            raise _StopLoop
+
+    monkeypatch.setattr(main_module.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    runner = _FakeRunner.instances[0]
+    # Cycle 0 (t=0): active, runs. Cycle 1 (t=5): paused, skipped.
+    # Cycle 2 (t=10): re-enabled, should run immediately despite interval=100
+    # because pause cleared last_run.
+    assert runner.cycles == 2
