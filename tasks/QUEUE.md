@@ -246,7 +246,7 @@
 - Depends on: PR-041
 
 ## PR-042: Async Claude CLI
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-042.md
 - Branch: pr-042-async-cli
 - Depends on: PR-038

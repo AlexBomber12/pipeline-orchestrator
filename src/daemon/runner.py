@@ -1340,7 +1340,7 @@ return 0
             self.log_event(self.state.error_message)
             return
 
-        code, stdout, stderr = claude_cli.run_planned_pr(
+        code, stdout, stderr = await claude_cli.run_planned_pr_async(
             self.repo_path,
             model=self.app_config.daemon.claude_model,
             timeout=self.app_config.daemon.planned_pr_timeout_sec,
@@ -1561,7 +1561,7 @@ return 0
                 self.log_event(self.state.error_message)
                 return
 
-        code, stdout, stderr = claude_cli.fix_review(
+        code, stdout, stderr = await claude_cli.fix_review_async(
             self.repo_path,
             model=self.app_config.daemon.claude_model,
             timeout=self.app_config.daemon.fix_review_timeout_sec,
@@ -2125,7 +2125,7 @@ return 0
                 "diagnose_error: max attempts (3) reached, staying ERROR"
             )
             return
-        code, stdout, stderr = claude_cli.diagnose_error(
+        code, stdout, stderr = await claude_cli.diagnose_error_async(
             self.repo_path, context, model=self.app_config.daemon.claude_model
         )
         self._detect_rate_limit(stderr)

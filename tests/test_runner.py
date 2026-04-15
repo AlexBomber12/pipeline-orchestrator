@@ -24,6 +24,28 @@ from src.models import (
 )
 
 
+def _async_cli_result(*result: object):
+    async def _fn(*args: object, **kwargs: object) -> tuple:
+        return result
+    return _fn
+
+
+def _async_cli_result_with_side_effect(
+    collector: list, label: str, *result: object
+):
+    async def _fn(*args: object, **kwargs: object) -> tuple:
+        collector.append(label)
+        return result
+    return _fn
+
+
+def _async_cli_capture_path(collector: list, *result: object):
+    async def _fn(path: str, *args: object, **kwargs: object) -> tuple:
+        collector.append(path)
+        return result
+    return _fn
+
+
 class _FakeRedis:
     """Minimal async Redis double capturing ``set`` calls."""
 
@@ -263,13 +285,13 @@ def test_handle_idle_picks_task_and_drives_coding(
 
     claude_calls: list[str] = []
 
-    def fake_run_planned_pr(
+    async def fake_run_planned_pr(
         path: str, model: str | None = None, timeout: int | None = None
     ) -> tuple[int, str, str]:
         claude_calls.append(path)
         return (0, "ok", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr", fake_run_planned_pr)
+    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr_async", fake_run_planned_pr)
 
     opened_pr = PRInfo(
         number=17,
@@ -314,8 +336,8 @@ def test_handle_idle_sets_queue_counters_with_mixed_statuses(
     monkeypatch.setattr(runner_module, "get_next_task", lambda t: tasks[2])
     monkeypatch.setattr(
         runner_module.claude_cli,
-        "run_planned_pr",
-        lambda path, model=None, timeout=None: (0, "ok", ""),
+        "run_planned_pr_async",
+        _async_cli_result(0, "ok", ""),
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -341,8 +363,8 @@ def test_handle_coding_errors_when_no_pr_found(
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.claude_cli,
-        "run_planned_pr",
-        lambda path, model=None, timeout=None: (0, "ok", ""),
+        "run_planned_pr_async",
+        _async_cli_result(0, "ok", ""),
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -373,8 +395,8 @@ def test_handle_coding_rejects_unmatched_branch(
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.claude_cli,
-        "run_planned_pr",
-        lambda path, model=None, timeout=None: (0, "ok", ""),
+        "run_planned_pr_async",
+        _async_cli_result(0, "ok", ""),
     )
     unrelated = PRInfo(number=99, branch="other-branch")
     monkeypatch.setattr(
@@ -409,8 +431,8 @@ def test_handle_coding_posts_codex_review_after_pr_found(
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.claude_cli,
-        "run_planned_pr",
-        lambda path, model=None, timeout=None: (0, "ok", ""),
+        "run_planned_pr_async",
+        _async_cli_result(0, "ok", ""),
     )
     opened_pr = PRInfo(number=42, branch="pr-019")
     monkeypatch.setattr(
@@ -451,8 +473,8 @@ def test_handle_coding_survives_post_comment_failure(
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.claude_cli,
-        "run_planned_pr",
-        lambda path, model=None, timeout=None: (0, "ok", ""),
+        "run_planned_pr_async",
+        _async_cli_result(0, "ok", ""),
     )
     opened_pr = PRInfo(number=42, branch="pr-019")
     monkeypatch.setattr(
@@ -490,7 +512,7 @@ def test_handle_fix_posts_codex_review_after_push(
     ``@codex review`` so Codex reviews the freshly-pushed iteration."""
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli, "fix_review", lambda path, model=None, timeout=None: (0, "", "")
+        runner_module.claude_cli, "fix_review_async", _async_cli_result(0, "", "")
     )
     posted: list[tuple[str, int, str]] = []
 
@@ -531,7 +553,7 @@ def test_handle_fix_errors_when_post_comment_fails(
     """
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli, "fix_review", lambda path, model=None, timeout=None: (0, "", "")
+        runner_module.claude_cli, "fix_review_async", _async_cli_result(0, "", "")
     )
 
     def boom(repo: str, number: int, body: str) -> None:
@@ -573,7 +595,7 @@ def test_handle_fix_skips_checkout_on_cross_repo_pr(
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     monkeypatch.setattr(
-        runner_module.claude_cli, "fix_review", lambda path, model=None, timeout=None: (0, "", "")
+        runner_module.claude_cli, "fix_review_async", _async_cli_result(0, "", "")
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -604,13 +626,13 @@ def test_handle_fix_checks_out_pr_branch_before_fix_review(
     calls = _patch_subprocess(monkeypatch)
     fix_called_at: list[int] = []
 
-    def fake_fix(
+    async def fake_fix(
         path: str, model: str | None = None, timeout: int | None = None
     ) -> tuple[int, str, str]:
         fix_called_at.append(len(calls))
         return (0, "", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "fix_review", fake_fix)
+    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", fake_fix)
     monkeypatch.setattr(
         runner_module.github_client,
         "post_comment",
@@ -650,10 +672,8 @@ def test_handle_fix_errors_when_pr_branch_checkout_fails(
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     monkeypatch.setattr(
         runner_module.claude_cli,
-        "fix_review",
-        lambda path, model=None, timeout=None: (
-            fix_calls.append(path), (0, "", "")
-        )[1],
+        "fix_review_async",
+        _async_cli_capture_path(fix_calls, 0, "", ""),
     )
 
     runner = _make_runner()
@@ -685,10 +705,8 @@ def test_handle_fix_errors_when_pr_branch_checkout_times_out(
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     monkeypatch.setattr(
         runner_module.claude_cli,
-        "fix_review",
-        lambda path, model=None, timeout=None: (
-            fix_calls.append(path), (0, "", "")
-        )[1],
+        "fix_review_async",
+        _async_cli_capture_path(fix_calls, 0, "", ""),
     )
 
     runner = _make_runner()
@@ -707,8 +725,8 @@ def test_handle_coding_errors_when_task_has_no_branch(
     calls = _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.claude_cli,
-        "run_planned_pr",
-        lambda path, model=None, timeout=None: (0, "ok", ""),
+        "run_planned_pr_async",
+        _async_cli_result(0, "ok", ""),
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -745,8 +763,8 @@ def test_handle_coding_retries_pr_detection(
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.claude_cli,
-        "run_planned_pr",
-        lambda path, model=None, timeout=None: (0, "ok", ""),
+        "run_planned_pr_async",
+        _async_cli_result(0, "ok", ""),
     )
 
     opened_pr = PRInfo(number=42, branch="pr-001")
@@ -800,8 +818,8 @@ def test_handle_coding_errors_after_all_retries(
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.claude_cli,
-        "run_planned_pr",
-        lambda path, model=None, timeout=None: (0, "ok", ""),
+        "run_planned_pr_async",
+        _async_cli_result(0, "ok", ""),
     )
     call_count = {"n": 0}
 
@@ -920,7 +938,7 @@ def test_handle_watch_changes_requested_triggers_fix(
         runner_module.github_client, "get_open_prs", lambda repo: [pr]
     )
     monkeypatch.setattr(
-        runner_module.claude_cli, "fix_review", lambda path, model=None, timeout=None: (0, "", "")
+        runner_module.claude_cli, "fix_review_async", _async_cli_result(0, "", "")
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -953,7 +971,7 @@ def test_handle_watch_ci_failure_triggers_fix(
         runner_module.github_client, "get_open_prs", lambda repo: [pr]
     )
     monkeypatch.setattr(
-        runner_module.claude_cli, "fix_review", lambda path, model=None, timeout=None: (0, "", "")
+        runner_module.claude_cli, "fix_review_async", _async_cli_result(0, "", "")
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -1733,8 +1751,8 @@ def test_handle_merge_aborts_on_unresolvable_conflict(
 def test_handle_error_skip_clears_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         runner_module.claude_cli,
-        "diagnose_error",
-        lambda path, ctx, model=None: (0, "SKIP", ""),
+        "diagnose_error_async",
+        _async_cli_result(0, "SKIP", ""),
     )
 
     runner = _make_runner()
@@ -1753,8 +1771,8 @@ def test_handle_error_skip_clears_state(monkeypatch: pytest.MonkeyPatch) -> None
 def test_handle_error_escalate_keeps_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         runner_module.claude_cli,
-        "diagnose_error",
-        lambda path, ctx, model=None: (0, "ESCALATE: human help", ""),
+        "diagnose_error_async",
+        _async_cli_result(0, "ESCALATE: human help", ""),
     )
 
     runner = _make_runner()
@@ -2557,8 +2575,8 @@ def test_handle_coding_saves_stdout(
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.claude_cli,
-        "run_planned_pr",
-        lambda path, model=None, timeout=None: (0, "hello from claude", ""),
+        "run_planned_pr_async",
+        _async_cli_result(0, "hello from claude", ""),
     )
     pr = PRInfo(number=42, branch="pr-001")
     monkeypatch.setattr(
@@ -2593,8 +2611,8 @@ def test_handle_fix_saves_stdout(
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.claude_cli,
-        "fix_review",
-        lambda path, model=None, timeout=None: (0, "fix output here", ""),
+        "fix_review_async",
+        _async_cli_result(0, "fix output here", ""),
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -3050,11 +3068,11 @@ def test_handle_error_caps_at_3(monkeypatch: pytest.MonkeyPatch) -> None:
     """handle_error must stop invoking diagnose_error after 3 attempts."""
     calls: list[str] = []
 
-    def fake_diag(path: str, ctx: str, model: str | None = None) -> tuple[int, str, str]:
+    async def fake_diag(path: str, ctx: str, model: str | None = None) -> tuple[int, str, str]:
         calls.append(ctx)
         return (0, "ESCALATE", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "diagnose_error", fake_diag)
+    monkeypatch.setattr(runner_module.claude_cli, "diagnose_error_async", fake_diag)
     runner = _make_runner()
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "generic failure"
@@ -3070,11 +3088,11 @@ def test_handle_error_skips_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     """A timeout-marked error must skip the AI-diagnosis call entirely."""
     called: list[bool] = []
 
-    def fake_diag(*a: Any, **kw: Any) -> tuple[int, str, str]:
+    async def fake_diag(*a: Any, **kw: Any) -> tuple[int, str, str]:
         called.append(True)
         return (0, "SKIP", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "diagnose_error", fake_diag)
+    monkeypatch.setattr(runner_module.claude_cli, "diagnose_error_async", fake_diag)
     runner = _make_runner()
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "claude CLI timeout after 900s"
@@ -3089,11 +3107,11 @@ def test_handle_error_skips_rate_limit(
     """A rate-limit error must skip the AI-diagnosis call entirely."""
     called: list[bool] = []
 
-    def fake_diag(*a: Any, **kw: Any) -> tuple[int, str, str]:
+    async def fake_diag(*a: Any, **kw: Any) -> tuple[int, str, str]:
         called.append(True)
         return (0, "SKIP", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "diagnose_error", fake_diag)
+    monkeypatch.setattr(runner_module.claude_cli, "diagnose_error_async", fake_diag)
     runner = _make_runner()
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "API rate limit exceeded"
@@ -3105,13 +3123,13 @@ def test_handle_fix_skips_fork(monkeypatch: pytest.MonkeyPatch) -> None:
     """Cross-repo (fork) PRs must return to WATCH without running fix_review."""
     fix_called: list[bool] = []
 
-    def fake_fix(
+    async def fake_fix(
         path: str, model: str | None = None, timeout: int | None = None
     ) -> tuple[int, str, str]:
         fix_called.append(True)
         return (0, "", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "fix_review", fake_fix)
+    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", fake_fix)
     runner = _make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(
@@ -3135,13 +3153,13 @@ def test_handle_coding_uses_configured_timeout(
     _patch_subprocess(monkeypatch)
     captured: dict[str, Any] = {}
 
-    def fake_planned(
+    async def fake_planned(
         path: str, model: str | None = None, timeout: int | None = None
     ) -> tuple[int, str, str]:
         captured["timeout"] = timeout
         return (0, "", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr", fake_planned)
+    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr_async", fake_planned)
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
@@ -3175,13 +3193,13 @@ def test_handle_fix_uses_configured_timeout(
     _patch_subprocess(monkeypatch)
     captured: dict[str, Any] = {}
 
-    def fake_fix(
+    async def fake_fix(
         path: str, model: str | None = None, timeout: int | None = None
     ) -> tuple[int, str, str]:
         captured["timeout"] = timeout
         return (0, "", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "fix_review", fake_fix)
+    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", fake_fix)
     monkeypatch.setattr(
         runner_module.github_client,
         "post_comment",
@@ -3252,8 +3270,8 @@ def test_handle_fix_records_last_push_at(
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         runner_module.claude_cli,
-        "fix_review",
-        lambda path, model=None, timeout=None: (0, "", ""),
+        "fix_review_async",
+        _async_cli_result(0, "", ""),
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -3585,8 +3603,8 @@ def test_handle_coding_skips_when_rate_limited(
     cli_calls: list[str] = []
     monkeypatch.setattr(
         runner_module.claude_cli,
-        "run_planned_pr",
-        lambda *a, **kw: (cli_calls.append("run_planned_pr"), (0, "", ""))[1],
+        "run_planned_pr_async",
+        _async_cli_result_with_side_effect(cli_calls, "run_planned_pr_async", 0, "", ""),
     )
     runner = _make_runner()
     runner.state.state = PipelineState.CODING
@@ -3608,8 +3626,8 @@ def test_handle_error_skips_diagnose_for_rate_limit(
     cli_calls: list[str] = []
     monkeypatch.setattr(
         runner_module.claude_cli,
-        "diagnose_error",
-        lambda *a, **kw: (cli_calls.append("diagnose"), (0, "SKIP", ""))[1],
+        "diagnose_error_async",
+        _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
     )
     runner = _make_runner()
     runner.state.state = PipelineState.ERROR
@@ -3628,8 +3646,8 @@ def test_handle_error_skips_diagnose_for_timeout(
     cli_calls: list[str] = []
     monkeypatch.setattr(
         runner_module.claude_cli,
-        "diagnose_error",
-        lambda *a, **kw: (cli_calls.append("diagnose"), (0, "SKIP", ""))[1],
+        "diagnose_error_async",
+        _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
     )
     runner = _make_runner()
     runner.state.state = PipelineState.ERROR
@@ -3687,3 +3705,78 @@ def test_detect_rate_limit_fixed_pause_duration(
     actual_pause = runner.state.rate_limited_until - datetime.now(timezone.utc)
     assert actual_pause > expected_pause - timedelta(seconds=5)
     assert actual_pause < expected_pause + timedelta(seconds=5)
+
+
+def test_handle_coding_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:
+    """handle_coding must call run_planned_pr_async, not the sync version."""
+    _patch_subprocess(monkeypatch)
+    async_calls: list[str] = []
+    sync_calls: list[str] = []
+
+    async def fake_async(
+        path: str, model: str | None = None, timeout: int | None = None
+    ) -> tuple[int, str, str]:
+        async_calls.append(path)
+        return (0, "ok", "")
+
+    def fake_sync(
+        path: str, model: str | None = None, timeout: int | None = None
+    ) -> tuple[int, str, str]:
+        sync_calls.append(path)
+        return (0, "ok", "")
+
+    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr_async", fake_async)
+    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr", fake_sync)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [PRInfo(number=1, branch="pr-001")],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
+    )
+    asyncio.run(runner.handle_coding())
+
+    assert async_calls, "run_planned_pr_async must be called"
+    assert not sync_calls, "sync run_planned_pr must NOT be called"
+
+
+def test_handle_fix_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:
+    """handle_fix must call fix_review_async, not the sync version."""
+    _patch_subprocess(monkeypatch)
+    async_calls: list[str] = []
+    sync_calls: list[str] = []
+
+    async def fake_async(
+        path: str, model: str | None = None, timeout: int | None = None
+    ) -> tuple[int, str, str]:
+        async_calls.append(path)
+        return (0, "", "")
+
+    def fake_sync(
+        path: str, model: str | None = None, timeout: int | None = None
+    ) -> tuple[int, str, str]:
+        sync_calls.append(path)
+        return (0, "", "")
+
+    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", fake_async)
+    monkeypatch.setattr(runner_module.claude_cli, "fix_review", fake_sync)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=10, branch="pr-001")
+    asyncio.run(runner.handle_fix())
+
+    assert async_calls, "fix_review_async must be called"
+    assert not sync_calls, "sync fix_review must NOT be called"
