@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from src.claude_cli import (
     diagnose_error,
+    diagnose_error_async,
     fix_review,
+    fix_review_async,
     parse_diagnosis,
     run_claude,
+    run_claude_async,
     run_planned_pr,
+    run_planned_pr_async,
 )
 
 
@@ -41,13 +47,6 @@ def test_run_claude_success(monkeypatch: pytest.MonkeyPatch) -> None:
         "claude",
         "--print",
         "--dangerously-skip-permissions",
-        "--bare",
-        "--strict-mcp-config",
-        "--no-session-persistence",
-        "--system-prompt-file",
-        "CLAUDE.md",
-        "--max-turns",
-        "30",
         "do a thing",
     ]
     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
@@ -150,15 +149,8 @@ def test_run_claude_with_model(monkeypatch: pytest.MonkeyPatch) -> None:
         "claude",
         "--print",
         "--dangerously-skip-permissions",
-        "--bare",
-        "--strict-mcp-config",
-        "--no-session-persistence",
         "--model",
         "opus",
-        "--system-prompt-file",
-        "CLAUDE.md",
-        "--max-turns",
-        "30",
         "do a thing",
     ]
 
@@ -321,3 +313,93 @@ def test_run_planned_pr_accepts_timeout(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(subprocess, "run", fake_run)
     run_planned_pr("/tmp", timeout=777)
     assert captured["timeout"] == 777
+
+
+# --- Async tests ---
+
+
+def _make_fake_proc(stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0) -> MagicMock:
+    proc = MagicMock()
+    proc.communicate = AsyncMock(return_value=(stdout, stderr))
+    proc.returncode = returncode
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock()
+    return proc
+
+
+@pytest.mark.asyncio
+async def test_run_claude_async_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+    fake_proc = _make_fake_proc(stdout=b"hello", stderr=b"warn", returncode=0)
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        captured["cmd"] = args
+        captured["kwargs"] = kwargs
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.delenv("NODE_OPTIONS", raising=False)
+
+    result = await run_claude_async("do a thing", "/data/repos/demo", timeout=42)
+
+    assert result == (0, "hello", "warn")
+    cmd = list(captured["cmd"])
+    assert cmd[0] == "claude"
+    assert "--bare" in cmd
+    assert "--no-session-persistence" in cmd
+    assert "--system-prompt-file" in cmd
+    assert "CLAUDE.md" in cmd
+    assert "--max-turns" in cmd
+    assert "30" in cmd
+    assert cmd[-1] == "do a thing"
+    assert captured["kwargs"]["cwd"] == "/data/repos/demo"
+
+
+@pytest.mark.asyncio
+async def test_run_claude_async_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_proc = _make_fake_proc()
+    fake_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError)
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    result = await run_claude_async("prompt", "/tmp", timeout=5)
+
+    assert result == (-1, "", "Timeout after 5s")
+    fake_proc.kill.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_claude_async_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        raise FileNotFoundError(2, "No such file or directory", "claude")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    result = await run_claude_async("prompt", "/tmp")
+
+    assert result == (-1, "", "claude CLI not found")
+
+
+@pytest.mark.asyncio
+async def test_run_claude_async_bare_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+    fake_proc = _make_fake_proc(returncode=0)
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        captured["cmd"] = list(args)
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    await run_claude_async("test", "/tmp")
+
+    cmd = captured["cmd"]
+    assert "--bare" in cmd
+    assert "--no-session-persistence" in cmd
+    assert "--system-prompt-file" in cmd
+    assert "CLAUDE.md" in cmd
+    assert "--max-turns" in cmd
+    assert "30" in cmd

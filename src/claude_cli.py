@@ -6,6 +6,7 @@ and ``FIX REVIEW``) plus an infrastructure-error diagnosis helper.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import subprocess
@@ -121,3 +122,86 @@ def parse_diagnosis(stdout: str) -> str:
         if first.startswith(verdict):
             return verdict
     return "ESCALATE"
+
+
+def _build_node_options() -> str:
+    memory_flag = "--max-old-space-size=4096"
+    existing = os.environ.get("NODE_OPTIONS", "").strip()
+    return f"{existing} {memory_flag}".strip() if existing else memory_flag
+
+
+async def run_claude_async(
+    prompt: str,
+    cwd: str,
+    timeout: int = 600,
+    model: str | None = None,
+) -> tuple[int, str, str]:
+    cmd = [
+        "claude",
+        "--print",
+        "--dangerously-skip-permissions",
+        "--bare",
+        "--no-session-persistence",
+    ]
+    if model:
+        cmd.extend(["--model", model])
+    cmd.extend(["--system-prompt-file", "CLAUDE.md"])
+    cmd.extend(["--max-turns", "30"])
+    cmd.append(prompt)
+    logger.info("running claude CLI with prompt: %s", prompt[:80])
+    env = {**os.environ, "NODE_OPTIONS": _build_node_options()}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+            stdin=asyncio.subprocess.DEVNULL,
+            env=env,
+        )
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout
+        )
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
+        code = proc.returncode or 0
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        logger.error("claude CLI timed out after %ss", timeout)
+        return (-1, "", f"Timeout after {timeout}s")
+    except FileNotFoundError as exc:
+        missing = getattr(exc, "filename", "")
+        if missing and missing != cmd[0]:
+            return (-1, "", f"cwd not found: {missing}")
+        return (-1, "", "claude CLI not found")
+    logger.info("claude CLI exited with code %s", code)
+    return (code, stdout, stderr)
+
+
+async def run_planned_pr_async(
+    repo_path: str, model: str | None = None, timeout: int = 900
+) -> tuple[int, str, str]:
+    return await run_claude_async(
+        "PLANNED PR", repo_path, timeout=timeout, model=model
+    )
+
+
+async def fix_review_async(
+    repo_path: str, model: str | None = None, timeout: int = 3600
+) -> tuple[int, str, str]:
+    return await run_claude_async(
+        "FIX REVIEW", repo_path, timeout=timeout, model=model
+    )
+
+
+async def diagnose_error_async(
+    repo_path: str, context: str, model: str | None = None
+) -> tuple[int, str, str]:
+    prompt = (
+        "You are the pipeline orchestrator. An infrastructure error occurred. "
+        f"Error context: {context} "
+        "Respond with exactly one word on the first line: FIX, SKIP, or ESCALATE. "
+        "If FIX, include a brief action plan on subsequent lines."
+    )
+    return await run_claude_async(prompt, repo_path, timeout=120, model=model)
