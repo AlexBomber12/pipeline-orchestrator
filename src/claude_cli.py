@@ -141,15 +141,12 @@ async def run_claude_async(
         "claude",
         "--print",
         "--dangerously-skip-permissions",
-        "--bare",
-        "--no-session-persistence",
     ]
     if model:
         cmd.extend(["--model", model])
     if system_prompt_file:
         cmd.extend(["--append-system-prompt-file", system_prompt_file])
-    cmd.extend(["--max-turns", "30"])
-    cmd.append(prompt)
+    .append(prompt)
     logger.info("running claude CLI with prompt: %s", prompt[:80])
     env = {**os.environ, "NODE_OPTIONS": _build_node_options()}
     try:
