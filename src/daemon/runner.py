@@ -1355,12 +1355,12 @@ return 0
 
         m = re.search(
             r"(\d{1,3})%\s*(?:of\s+)?(?:your\s+)?(?:(weekly|week|session|5-hour)\s+)?rate\s*limit"
-            r"|rate\s*limit\s+(?:at\s+)?(\d{1,3})%",
+            r"|(?:(weekly|week|session|5-hour)\s+)?rate\s*limit\s+(?:at\s+)?(\d{1,3})%",
             lower,
         )
         if not triggered and m:
-            pct = int(m.group(1) or m.group(3))
-            qualifier = m.group(2) or ""
+            pct = int(m.group(1) or m.group(4))
+            qualifier = m.group(2) or m.group(3) or ""
             if qualifier in ("weekly", "week"):
                 limit_type = "weekly"
                 triggered = pct >= weekly_threshold
