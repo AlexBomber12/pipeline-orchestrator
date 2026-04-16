@@ -458,3 +458,15 @@ def test_update_repository_allow_merge_without_checks(tmp_path: Path) -> None:
 
     reloaded = load_config(str(path))
     assert reloaded.repositories[0].allow_merge_without_checks is True
+
+
+def test_update_daemon_config_accepts_strict_queue_validation(
+    tmp_path: Path,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text("daemon: {}\n", encoding="utf-8")
+    updated = update_daemon_config(
+        path=str(cfg_path),
+        strict_queue_validation=False,
+    )
+    assert updated.daemon.strict_queue_validation is False

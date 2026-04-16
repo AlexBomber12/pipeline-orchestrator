@@ -30,6 +30,7 @@ from src.config import (
     update_repository,
 )
 from src.models import PipelineState, RepoState
+from src.queue_parser import QueueValidationError, parse_queue_text
 from src.utils import repo_slug_from_url
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
@@ -1288,6 +1289,34 @@ async def upload_tasks(
     if not has_queue:
         return _render_upload_error(
             request, "QUEUE.md is required in the upload", 422, repo_name=name
+        )
+
+    # Validate the *last* uploaded QUEUE.md with strict mode before staging.
+    # Staging writes every file in order, so if multiple QUEUE.md parts are
+    # present the last one wins on disk.  We must validate that final copy.
+    queue_bytes: bytes | None = None
+    for fname, content in file_contents:
+        if fname == "QUEUE.md":
+            queue_bytes = content
+    assert queue_bytes is not None  # has_queue guard above
+    try:
+        queue_text = queue_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return _render_upload_error(
+            request,
+            "QUEUE.md is not valid UTF-8",
+            400,
+            repo_name=name,
+        )
+    try:
+        parse_queue_text(queue_text, strict=True)
+    except QueueValidationError as exc:
+        issues_text = "\n".join(exc.issues)
+        return _render_upload_error(
+            request,
+            f"QUEUE.md validation failed:\n{issues_text}",
+            400,
+            repo_name=name,
         )
 
     # Stage files to /data/uploads/{repo}/ and enqueue for daemon processing.

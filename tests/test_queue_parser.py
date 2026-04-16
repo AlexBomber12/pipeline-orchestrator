@@ -8,7 +8,14 @@ from pathlib import Path
 import pytest
 
 from src.models import TaskStatus
-from src.queue_parser import get_next_task, mark_task_done, parse_queue
+from src.queue_parser import (
+    QueueValidationError,
+    get_next_task,
+    mark_task_done,
+    parse_queue,
+    parse_queue_text,
+    validate_queue,
+)
 
 SAMPLE_QUEUE = """## PR-001: Bootstrap
 - Status: DONE
@@ -336,3 +343,139 @@ def test_unknown_status_defaults_to_todo_with_warning(
         "Unknown status" in rec.message and "PR-050" in rec.message
         for rec in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# Strict validation tests
+# ---------------------------------------------------------------------------
+
+VALID_QUEUE = """\
+## PR-001: Bootstrap
+- Status: DONE
+- Tasks file: tasks/PR-001.md
+- Branch: pr-001-bootstrap
+
+## PR-002: Models
+- Status: TODO
+- Tasks file: tasks/PR-002.md
+- Branch: pr-002-models
+- Depends on: PR-001
+
+## PR-003: Parser
+- Status: TODO
+- Tasks file: tasks/PR-003.md
+- Branch: pr-003-parser
+- Depends on: PR-002
+"""
+
+
+def test_validate_accepts_valid_queue() -> None:
+    tasks = parse_queue_text(VALID_QUEUE, strict=True)
+    assert len(tasks) == 3
+
+
+def test_validate_rejects_duplicate_pr_id() -> None:
+    content = """\
+## PR-001: First
+- Status: DONE
+- Branch: pr-001-first
+
+## PR-001: Duplicate
+- Status: TODO
+- Branch: pr-001-dup
+"""
+    with pytest.raises(QueueValidationError, match="duplicate pr_id"):
+        parse_queue_text(content, strict=True)
+
+
+def test_validate_rejects_duplicate_branch() -> None:
+    content = """\
+## PR-001: First
+- Status: DONE
+- Branch: shared-branch
+
+## PR-002: Second
+- Status: TODO
+- Branch: shared-branch
+"""
+    with pytest.raises(QueueValidationError, match="duplicate branch"):
+        parse_queue_text(content, strict=True)
+
+
+def test_validate_rejects_missing_dependency() -> None:
+    content = """\
+## PR-001: First
+- Status: DONE
+- Branch: pr-001
+
+## PR-002: Second
+- Status: TODO
+- Branch: pr-002
+- Depends on: PR-999
+"""
+    with pytest.raises(QueueValidationError, match="unknown task"):
+        parse_queue_text(content, strict=True)
+
+
+def test_validate_rejects_simple_cycle() -> None:
+    content = """\
+## PR-A: First
+- Status: TODO
+- Branch: pr-a
+- Depends on: PR-B
+
+## PR-B: Second
+- Status: TODO
+- Branch: pr-b
+- Depends on: PR-A
+"""
+    with pytest.raises(QueueValidationError, match="dependency cycle"):
+        parse_queue_text(content, strict=True)
+
+
+def test_validate_rejects_longer_cycle() -> None:
+    content = """\
+## PR-A: First
+- Status: TODO
+- Branch: pr-a
+- Depends on: PR-B
+
+## PR-B: Second
+- Status: TODO
+- Branch: pr-b
+- Depends on: PR-C
+
+## PR-C: Third
+- Status: TODO
+- Branch: pr-c
+- Depends on: PR-A
+"""
+    with pytest.raises(QueueValidationError, match="dependency cycle"):
+        parse_queue_text(content, strict=True)
+
+
+def test_parse_queue_strict_rejects_unknown_status(tmp_path: Path) -> None:
+    content = """\
+## PR-050: Weird
+- Status: INPROGRESS
+- Branch: pr-050
+"""
+    queue_path = tmp_path / "QUEUE.md"
+    queue_path.write_text(content, encoding="utf-8")
+    with pytest.raises(QueueValidationError, match="unknown status"):
+        parse_queue(str(queue_path), strict=True)
+
+
+def test_parse_queue_non_strict_degrades_unknown_status_to_todo(
+    tmp_path: Path,
+) -> None:
+    content = """\
+## PR-050: Weird
+- Status: INPROGRESS
+- Branch: pr-050
+"""
+    queue_path = tmp_path / "QUEUE.md"
+    queue_path.write_text(content, encoding="utf-8")
+    tasks = parse_queue(str(queue_path), strict=False)
+    assert len(tasks) == 1
+    assert tasks[0].status == TaskStatus.TODO
