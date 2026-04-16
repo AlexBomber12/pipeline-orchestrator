@@ -494,6 +494,10 @@ class PipelineRunner:
             # cannot use ``_git`` (which sets ``cwd=repo_path`` and would
             # fail with ``FileNotFoundError`` before git is even invoked).
             def _do_clone() -> None:
+                # Remove any partial clone left by a previous failed attempt
+                # so git doesn't error with "destination path already exists".
+                if path.exists():
+                    shutil.rmtree(path)
                 subprocess.run(
                     ["git", "clone", self.repo_config.url, self.repo_path],
                     capture_output=True,
