@@ -675,7 +675,9 @@ class PipelineRunner:
         except OSError as exc:
             raise RuntimeError(f"sync_to_main OS error: {exc}") from exc
 
-    def _parse_base_queue(self) -> list[QueueTask] | None:
+    def _parse_base_queue(
+        self, *, strict: bool = False
+    ) -> list[QueueTask] | None:
         """Return QUEUE.md parsed from ``origin/{branch}``, or ``None``.
 
         ``recover_state`` runs before ``preflight``, so the working tree
@@ -697,6 +699,12 @@ class PipelineRunner:
         recovery stays non-destructive. Returns ``None`` when the read
         fails (ref missing, timeout, tasks/QUEUE.md absent on base),
         letting the caller translate the failure into a retryable ERROR.
+
+        When *strict* is ``True``, ``parse_queue_text`` runs the full
+        validation suite (duplicate IDs/branches, missing deps, cycles).
+        A ``QueueValidationError`` is propagated to the caller so
+        recovery can transition to ``ERROR`` instead of driving
+        execution on a malformed queue.
         """
         branch = self.repo_config.branch
         try:
@@ -707,7 +715,7 @@ class PipelineRunner:
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return None
-        return parse_queue_text(result.stdout)
+        return parse_queue_text(result.stdout, strict=strict)
 
     async def recover_state(self) -> bool:
         """Reconstruct state from QUEUE.md + GitHub on daemon startup.
@@ -739,7 +747,16 @@ class PipelineRunner:
         strand the runner detached from an in-flight PR and later allow
         ``handle_error`` to SKIP/FIX it onto new queue work.
         """
-        tasks = self._parse_base_queue()
+        strict = self.app_config.daemon.strict_queue_validation
+        try:
+            tasks = self._parse_base_queue(strict=strict)
+        except QueueValidationError as exc:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = (
+                f"recover_state: queue validation failed: {exc}"
+            )
+            self.log_event(f"recover_state: queue validation failed: {exc}")
+            return False
         if tasks is None:
             # Read failure on origin/{branch}:tasks/QUEUE.md. Treat as a
             # retryable discovery error: returning False leaves

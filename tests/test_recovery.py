@@ -100,7 +100,7 @@ def test_recover_doing_task_with_matching_pr_recovers_to_watch(
         coding_called = True
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
     runner.handle_coding = boom  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
@@ -142,7 +142,7 @@ def test_recover_state_sets_queue_counters(
     )
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: [done_task, doing_task, todo_task]  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [done_task, doing_task, todo_task]  # type: ignore[method-assign]
     runner.handle_coding = lambda: None  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
@@ -168,7 +168,7 @@ def test_recover_doing_task_without_pr_rerun_coding(
         coding_calls.append(runner.state.state)
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
     # Stub out the preserve helper so this test focuses on the
     # state-transition contract. A dedicated test below covers its
@@ -230,7 +230,7 @@ def test_recover_preserves_crashed_run_commits_before_coding(
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
@@ -280,7 +280,7 @@ def test_recover_preserve_tolerates_missing_local_branch(
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
@@ -329,7 +329,7 @@ def test_recover_preserve_refuses_base_branch(
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
@@ -386,7 +386,7 @@ def test_recover_aborts_when_preserve_push_fails(
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
@@ -421,7 +421,7 @@ def test_recover_no_doing_with_done_matched_pr_recovers_to_watch(
     )
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: [done, todo]  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [done, todo]  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
     assert runner.state.state == PipelineState.WATCH
@@ -463,7 +463,7 @@ def test_recover_no_doing_with_todo_matched_pr_recovers_to_watch(
     )
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: [todo]  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [todo]  # type: ignore[method-assign]
     result = asyncio.run(runner.recover_state())
 
     assert result is True
@@ -503,7 +503,7 @@ def test_recover_unrelated_open_pr_stays_idle(
     )
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: [queued_todo]  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [queued_todo]  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
     assert runner.state.state == PipelineState.IDLE
@@ -535,7 +535,7 @@ def test_recover_attaches_only_to_done_matched_pr_among_many(
     )
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: [done]  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [done]  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
     assert runner.state.state == PipelineState.WATCH
@@ -554,7 +554,7 @@ def test_recover_no_doing_no_prs_stays_idle(
     )
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: [_todo_task()]  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [_todo_task()]  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
     assert runner.state.state == PipelineState.IDLE
@@ -580,7 +580,7 @@ def test_recover_clean_slate_resets_prior_error_state(
     )
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: []  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = (
         "recover_state: get_open_prs failed: gh api rate limited"
@@ -608,7 +608,7 @@ def test_recover_clean_slate_resets_error_with_unrelated_prs_present(
     )
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: []  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "recover_state: get_open_prs failed: boom"
 
@@ -635,7 +635,7 @@ def test_recover_get_open_prs_failure_sets_error(
     monkeypatch.setattr(runner_module.github_client, "get_open_prs", boom)
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: []  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
     result = asyncio.run(runner.recover_state())
 
     assert result is False
@@ -723,7 +723,7 @@ def test_run_cycle_recovered_watch_does_not_dispatch_handle_watch(
         return True
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
     runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
     runner.handle_watch = spy_watch  # type: ignore[method-assign]
     runner.handle_fix = spy_fix  # type: ignore[method-assign]
@@ -771,7 +771,7 @@ def test_run_cycle_recovered_idle_does_not_dispatch_handle_idle(
         return True
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: []  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
     runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
     runner.handle_idle = spy_idle  # type: ignore[method-assign]
     runner.preflight = spy_preflight  # type: ignore[method-assign]
@@ -820,7 +820,7 @@ def test_run_cycle_dirty_tree_does_not_clobber_recovered_watch(
         return False
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
     runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
     runner.preflight = fail_preflight  # type: ignore[method-assign]
     runner.handle_watch = noop_watch  # type: ignore[method-assign]
@@ -868,7 +868,7 @@ def test_run_cycle_transient_discovery_failure_stays_retryable(
         return True
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
     runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
     runner.preflight = clean_preflight  # type: ignore[method-assign]
 
@@ -912,7 +912,7 @@ def test_run_cycle_coding_failure_during_recovery_is_not_retried(
         runner.state.error_message = "claude CLI crashed"
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: [task]  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
     runner.handle_coding = failing_coding  # type: ignore[method-assign]
     runner._preserve_crashed_run_commits = lambda branch: True  # type: ignore[method-assign]
 
@@ -1112,7 +1112,7 @@ def test_recover_state_queue_read_failure_sets_error_and_returns_false(
     monkeypatch.setattr(runner_module.github_client, "get_open_prs", spy_gh)
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda: None  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: None  # type: ignore[method-assign]
 
     result = asyncio.run(runner.recover_state())
 
