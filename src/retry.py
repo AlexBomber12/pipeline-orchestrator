@@ -34,6 +34,10 @@ def is_transient_error(exc: Exception) -> bool:
         stderr = (getattr(exc, "stderr", "") or "").lower()
         if any(marker in stderr for marker in TRANSIENT_MARKERS):
             return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc).lower()
+        if any(marker in msg for marker in TRANSIENT_MARKERS):
+            return True
     return False
 
 

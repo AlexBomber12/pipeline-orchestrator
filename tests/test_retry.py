@@ -81,6 +81,36 @@ class TestIsTransientError:
         )
         assert is_transient_error(exc) is False
 
+    def test_runtime_error_502_transient(self) -> None:
+        exc = RuntimeError(
+            "gh api failed (exit 1): 502 bad gateway"
+        )
+        assert is_transient_error(exc) is True
+
+    def test_runtime_error_503_transient(self) -> None:
+        exc = RuntimeError(
+            "gh api failed (exit 1): 503 service unavailable"
+        )
+        assert is_transient_error(exc) is True
+
+    def test_runtime_error_504_transient(self) -> None:
+        exc = RuntimeError(
+            "gh api failed (exit 1): 504 gateway timeout"
+        )
+        assert is_transient_error(exc) is True
+
+    def test_runtime_error_connection_reset_transient(self) -> None:
+        exc = RuntimeError(
+            "gh api failed (exit 1): connection reset"
+        )
+        assert is_transient_error(exc) is True
+
+    def test_runtime_error_not_found_not_transient(self) -> None:
+        exc = RuntimeError(
+            "gh api failed (exit 1): HTTP 404 Not Found"
+        )
+        assert is_transient_error(exc) is False
+
     def test_generic_exception_not_transient(self) -> None:
         exc = ValueError("something went wrong")
         assert is_transient_error(exc) is False
@@ -166,6 +196,21 @@ class TestRetryTransient:
         assert mock_sleep.call_args_list[0][0] == (0.5,)
         assert mock_sleep.call_args_list[1][0] == (1.0,)
         assert mock_sleep.call_args_list[2][0] == (2.0,)
+
+    @patch("src.retry.time.sleep")
+    def test_retries_runtime_error_with_transient_marker(self, mock_sleep) -> None:
+        calls = []
+
+        def op():
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("gh api failed (exit 1): 502 bad gateway")
+            return "ok"
+
+        result = retry_transient(op, operation_name="test")
+        assert result == "ok"
+        assert len(calls) == 2
+        mock_sleep.assert_called_once_with(1.0)
 
     @patch("src.retry.time.sleep")
     def test_runtime_error_wraps_original(self, mock_sleep) -> None:
