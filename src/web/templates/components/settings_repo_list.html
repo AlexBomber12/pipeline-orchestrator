@@ -10,6 +10,7 @@
             <th class="text-left px-4 py-2 font-medium">Repository</th>
             <th class="text-left px-4 py-2 font-medium">Branch</th>
             <th class="text-left px-4 py-2 font-medium">Auto merge</th>
+            <th class="text-left px-4 py-2 font-medium">No CI merge</th>
             <th class="text-left px-4 py-2 font-medium">Review timeout (min)</th>
             <th class="px-4 py-2"></th>
         </tr>
@@ -17,7 +18,7 @@
     <tbody>
         {% if not repos %}
         <tr>
-            <td colspan="5" class="px-4 py-6 text-center text-gray-500 italic">
+            <td colspan="6" class="px-4 py-6 text-center text-gray-500 italic">
                 No repositories configured. Add one below.
             </td>
         </tr>
@@ -56,6 +57,19 @@
                        hx-vals='{"auto_merge": "{{ "false" if repo.auto_merge else "true" }}"}'>
             </td>
             <td class="px-4 py-2">
+                <input type="checkbox"
+                       name="allow_merge_without_checks"
+                       value="true"
+                       {% if repo.allow_merge_without_checks %}checked{% endif %}
+                       class="accent-warn"
+                       hx-put="{{ put_url }}"
+                       hx-trigger="change"
+                       hx-target="#settings-repo-list"
+                       hx-swap="innerHTML"
+                       hx-vals='{"allow_merge_without_checks": "{{ "false" if repo.allow_merge_without_checks else "true" }}"}'
+                       title="Only enable for repos intentionally running without CI. Default off.">
+            </td>
+            <td class="px-4 py-2">
                 <input type="number"
                        name="review_timeout_min"
                        value="{{ repo.review_timeout_min if repo.review_timeout_min is not none else '' }}"
@@ -81,7 +95,7 @@
         </tr>
         {% endfor %}
         <tr class="border-t border-white/5 bg-surface-3/40">
-            <td colspan="5" class="px-4 py-3">
+            <td colspan="6" class="px-4 py-3">
                 <form class="flex flex-wrap items-center gap-2"
                       hx-post="/settings/repos"
                       hx-target="#settings-repo-list"

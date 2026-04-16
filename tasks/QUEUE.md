@@ -306,7 +306,7 @@
 - Depends on: PR-046
 
 ## PR-052: Empty CI rollup returns PENDING not SUCCESS
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-052.md
 - Branch: pr-052-empty-rollup-pending
 - Depends on: PR-046

@@ -1072,6 +1072,7 @@ async def put_settings_repo(
     branch: str | None = Form(None),
     auto_merge: str | None = Form(None),
     review_timeout_min: str | None = Form(None),
+    allow_merge_without_checks: str | None = Form(None),
 ) -> HTMLResponse:
     """Update a repository by its full URL.
 
@@ -1101,6 +1102,10 @@ async def put_settings_repo(
     try:
         if auto_merge is not None and auto_merge != "":
             updates["auto_merge"] = _coerce_bool(auto_merge, "auto_merge")
+        if allow_merge_without_checks is not None and allow_merge_without_checks != "":
+            updates["allow_merge_without_checks"] = _coerce_bool(
+                allow_merge_without_checks, "allow_merge_without_checks"
+            )
         if review_timeout_min is not None:
             if review_timeout_min == "":
                 updates["review_timeout_min"] = None

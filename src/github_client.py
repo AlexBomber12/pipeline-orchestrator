@@ -90,7 +90,10 @@ def get_repo_full_name(url: str) -> str:
     return f"{match.group('owner')}/{match.group('repo')}"
 
 
-def get_open_prs(repo: str) -> list[PRInfo]:
+def get_open_prs(
+    repo: str,
+    allow_merge_without_checks: bool = False,
+) -> list[PRInfo]:
     """Return open PRs for ``repo`` (``owner/repo``) with CI and review status."""
     _begin_review_cache_cycle()
     raw = run_gh(
@@ -118,7 +121,10 @@ def get_open_prs(repo: str) -> list[PRInfo]:
             PRInfo(
                 number=number,
                 branch=entry.get("headRefName", ""),
-                ci_status=_ci_status_from_rollup(entry.get("statusCheckRollup")),
+                ci_status=_ci_status_from_rollup(
+                    entry.get("statusCheckRollup"),
+                    empty_is_success=allow_merge_without_checks,
+                ),
                 review_status=get_pr_review_status(
                     repo,
                     number,
@@ -644,12 +650,15 @@ def _get_latest_codex_review_info(
     return best_sha, best_time
 
 
-def _ci_status_from_rollup(rollup: object) -> CIStatus:
+def _ci_status_from_rollup(
+    rollup: object,
+    empty_is_success: bool = False,
+) -> CIStatus:
     """Map a ``statusCheckRollup`` payload to a single ``CIStatus`` value."""
     if not isinstance(rollup, list):
         return CIStatus.PENDING
     if not rollup:
-        return CIStatus.SUCCESS
+        return CIStatus.SUCCESS if empty_is_success else CIStatus.PENDING
 
     states: list[str] = []
     for check in rollup:

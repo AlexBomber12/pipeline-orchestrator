@@ -304,7 +304,7 @@ def test_handle_idle_picks_task_and_drives_coding(
     # subsequent calls (handle_coding) return the opened PR.
     call_count = {"n": 0}
 
-    def _get_open_prs(repo: str) -> list[PRInfo]:
+    def _get_open_prs(repo: str, **kw: Any) -> list[PRInfo]:
         call_count["n"] += 1
         if call_count["n"] == 1:
             return []  # guard: no existing PR
@@ -353,7 +353,7 @@ def test_handle_idle_sets_queue_counters_with_mixed_statuses(
     # First call (guard) returns no matching PR; subsequent calls return the PR.
     call_count = {"n": 0}
 
-    def _get_open_prs(repo: str) -> list[PRInfo]:
+    def _get_open_prs(repo: str, **kw: Any) -> list[PRInfo]:
         call_count["n"] += 1
         if call_count["n"] == 1:
             return []
@@ -401,7 +401,7 @@ def test_handle_idle_attaches_to_existing_pr_instead_of_coding(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [existing_pr],
+        lambda repo, **kw: [existing_pr],
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -445,7 +445,7 @@ def test_handle_idle_proceeds_to_coding_when_no_matching_pr(
     # Guard returns no matching PR; handle_coding's call returns the PR.
     call_count = {"n": 0}
 
-    def _get_open_prs(repo: str) -> list[PRInfo]:
+    def _get_open_prs(repo: str, **kw: Any) -> list[PRInfo]:
         call_count["n"] += 1
         if call_count["n"] == 1:
             return []
@@ -486,7 +486,7 @@ def test_handle_idle_defers_on_gh_failure(
     monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
     monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: task)
 
-    def _exploding_get_open_prs(repo: str) -> list[PRInfo]:
+    def _exploding_get_open_prs(repo: str, **kw: Any) -> list[PRInfo]:
         raise RuntimeError("GitHub API unavailable")
 
     monkeypatch.setattr(
@@ -520,7 +520,7 @@ def test_handle_coding_errors_when_no_pr_found(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [],
+        lambda repo, **kw: [],
     )
 
     async def instant_sleep(_seconds: float) -> None:
@@ -553,7 +553,7 @@ def test_handle_coding_rejects_unmatched_branch(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [unrelated],
+        lambda repo, **kw: [unrelated],
     )
 
     async def instant_sleep(_seconds: float) -> None:
@@ -589,7 +589,7 @@ def test_handle_coding_posts_codex_review_after_pr_found(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [opened_pr],
+        lambda repo, **kw: [opened_pr],
     )
     posted: list[tuple[str, int, str]] = []
 
@@ -631,7 +631,7 @@ def test_handle_coding_survives_post_comment_failure(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [opened_pr],
+        lambda repo, **kw: [opened_pr],
     )
 
     def boom(repo: str, number: int, body: str) -> None:
@@ -930,7 +930,7 @@ def test_handle_coding_errors_when_task_has_no_branch(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [PRInfo(number=1, branch="anything")],
+        lambda repo, **kw: [PRInfo(number=1, branch="anything")],
     )
 
     runner = _make_runner()
@@ -969,7 +969,7 @@ def test_handle_coding_retries_pr_detection(
     opened_pr = PRInfo(number=42, branch="pr-001")
     call_count = {"n": 0}
 
-    def flaky_get_open_prs(repo: str) -> list[PRInfo]:
+    def flaky_get_open_prs(repo: str, **kw: Any) -> list[PRInfo]:
         call_count["n"] += 1
         if call_count["n"] == 1:
             return []
@@ -1022,7 +1022,7 @@ def test_handle_coding_errors_after_all_retries(
     )
     call_count = {"n": 0}
 
-    def always_empty(repo: str) -> list[PRInfo]:
+    def always_empty(repo: str, **kw: Any) -> list[PRInfo]:
         call_count["n"] += 1
         return []
 
@@ -1060,7 +1060,7 @@ def test_handle_watch_approved_and_green_merges(
         review_status=ReviewStatus.APPROVED,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [pr]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
     )
 
     merged: list[tuple[str, int]] = []
@@ -1097,7 +1097,7 @@ def test_handle_watch_green_but_auto_merge_disabled_stays_watching(
         review_status=ReviewStatus.APPROVED,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [pr]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
     )
 
     merged: list[tuple[str, int]] = []
@@ -1134,7 +1134,7 @@ def test_handle_watch_changes_requested_triggers_fix(
         review_status=ReviewStatus.CHANGES_REQUESTED,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [pr]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
     )
     monkeypatch.setattr(
         runner_module.claude_cli, "fix_review_async", _async_cli_result(0, "", "")
@@ -1167,7 +1167,7 @@ def test_handle_watch_ci_failure_triggers_fix(
         review_status=ReviewStatus.PENDING,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [pr]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
     )
     monkeypatch.setattr(
         runner_module.claude_cli, "fix_review_async", _async_cli_result(0, "", "")
@@ -1200,7 +1200,7 @@ def test_handle_watch_timeout_sets_hung(
         last_activity=stale,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [pr]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
     )
 
     runner = _make_runner(review_timeout_min=30)
@@ -1223,7 +1223,7 @@ def test_handle_watch_within_timeout_stays_watching(
         last_activity=fresh,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [pr]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
     )
 
     runner = _make_runner(review_timeout_min=30)
@@ -1249,7 +1249,7 @@ def test_handle_watch_approved_but_ci_pending_applies_timeout(
         last_activity=stale,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [pr]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
     )
 
     runner = _make_runner(review_timeout_min=30)
@@ -1286,7 +1286,7 @@ def test_handle_watch_falls_back_to_daemon_review_timeout(
         last_activity=stale,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [pr]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
     )
 
     # ``review_timeout_min=None`` on the repo → the runner must use the
@@ -1329,7 +1329,7 @@ def test_handle_watch_repo_timeout_override_wins_over_daemon_default(
         last_activity=stale,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [pr]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
     )
 
     # repo pins 120 min, daemon default is 30 min. 90 minutes of
@@ -1364,7 +1364,7 @@ def test_handle_watch_approved_ci_pending_within_timeout_waits(
         last_activity=fresh,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [pr]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
     )
 
     runner = _make_runner(review_timeout_min=30)
@@ -1383,7 +1383,7 @@ def test_handle_watch_pr_closed_returns_to_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: []
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
     )
 
     runner = _make_runner()
@@ -2042,7 +2042,7 @@ def test_run_cycle_resets_stale_transient_state(
     monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
     monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: []
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
     )
 
     runner = _make_runner()
@@ -2651,7 +2651,7 @@ def test_handle_idle_no_tasks_but_open_pr_sets_current_pr(
         review_status=ReviewStatus.PENDING,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [open_pr]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [open_pr]
     )
 
     runner = _make_runner()
@@ -2670,7 +2670,7 @@ def test_handle_idle_no_tasks_no_open_prs_clears_current_pr(
     monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
     monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: []
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
     )
 
     runner = _make_runner()
@@ -2691,7 +2691,7 @@ def test_handle_idle_no_tasks_does_not_change_state_from_idle(
 
     open_pr = PRInfo(number=7, branch="feature-x")
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [open_pr]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [open_pr]
     )
 
     runner = _make_runner()
@@ -2711,7 +2711,7 @@ def test_handle_idle_open_pr_check_survives_github_failure(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: (_ for _ in ()).throw(RuntimeError("API down")),
+        lambda repo, **kw: (_ for _ in ()).throw(RuntimeError("API down")),
     )
 
     runner = _make_runner()
@@ -2822,7 +2822,7 @@ def test_handle_coding_saves_stdout(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [pr],
+        lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -3173,7 +3173,7 @@ def test_handle_watch_skips_fix_no_new_feedback(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [pr],
+        lambda repo, **kw: [pr],
     )
     # No Codex comments at all -> no new feedback.
     monkeypatch.setattr(
@@ -3217,7 +3217,7 @@ def test_handle_watch_triggers_fix_new_feedback(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [pr],
+        lambda repo, **kw: [pr],
     )
 
     comments = [
@@ -3268,7 +3268,7 @@ def test_handle_watch_still_fixes_ci_failure(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [pr],
+        lambda repo, **kw: [pr],
     )
     fix_called: list[bool] = []
 
@@ -3383,7 +3383,7 @@ def test_handle_coding_uses_configured_timeout(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [PRInfo(number=1, branch="pr-001")],
+        lambda repo, **kw: [PRInfo(number=1, branch="pr-001")],
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -3553,7 +3553,7 @@ def test_handle_watch_stale_feedback_still_times_out(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [pr],
+        lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -3662,7 +3662,7 @@ def test_handle_watch_retries_rehydrate_last_push_at(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [pr],
+        lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -3709,7 +3709,7 @@ def test_recover_state_rehydrates_last_push_at(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [PRInfo(number=7, branch="pr-001")],
+        lambda repo, **kw: [PRInfo(number=7, branch="pr-001")],
     )
 
     runner = _make_runner()
@@ -3764,7 +3764,7 @@ def test_handle_watch_falls_through_for_fork_with_ci_failure(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [pr],
+        lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -3803,7 +3803,7 @@ def test_handle_watch_falls_through_for_fork_with_changes_requested(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [pr],
+        lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -3848,7 +3848,7 @@ def test_handle_watch_rehydrates_on_pr_number_mismatch(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [pr],
+        lambda repo, **kw: [pr],
     )
 
     runner = _make_runner()
@@ -4046,7 +4046,7 @@ def test_handle_coding_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [PRInfo(number=1, branch="pr-001")],
+        lambda repo, **kw: [PRInfo(number=1, branch="pr-001")],
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -4126,7 +4126,7 @@ def test_handle_coding_publishes_heartbeat(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [PRInfo(number=1, branch="pr-001")],
+        lambda repo, **kw: [PRInfo(number=1, branch="pr-001")],
     )
     monkeypatch.setattr(
         runner_module.github_client, "post_comment", lambda *a, **kw: None
@@ -4324,7 +4324,7 @@ def test_handle_watch_stays_in_watch_on_unknown_feedback(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [pr],
+        lambda repo, **kw: [pr],
     )
 
     def _raise(path: str) -> list:
@@ -4375,7 +4375,7 @@ def test_handle_watch_skips_hung_timeout_on_unknown(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [pr],
+        lambda repo, **kw: [pr],
     )
 
     def _raise(path: str) -> list:

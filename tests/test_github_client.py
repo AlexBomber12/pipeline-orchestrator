@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from src.github_client import (
+    _ci_status_from_rollup,
     clear_review_status_cache,
     get_pr_author,
     get_pr_head_commit_iso,
@@ -18,7 +19,7 @@ from src.github_client import (
     merge_pr,
     run_gh,
 )
-from src.models import ReviewStatus
+from src.models import CIStatus, ReviewStatus
 
 
 def _find_api_path(cmd: list[str]) -> str:
@@ -1234,3 +1235,25 @@ def test_get_pr_metadata_returns_empty_on_error(
 
     result = get_pr_metadata("owner/name", 42)
     assert result == {"author": "", "head_sha": "", "head_commit_date": ""}
+
+
+# ---------------------------------------------------------------------------
+# _ci_status_from_rollup tests
+# ---------------------------------------------------------------------------
+
+
+def test_ci_status_empty_rollup_defaults_to_pending() -> None:
+    """Empty rollup list with default flag must return PENDING."""
+    assert _ci_status_from_rollup([]) == CIStatus.PENDING
+
+
+def test_ci_status_empty_rollup_with_flag_returns_success() -> None:
+    """Empty rollup list with empty_is_success=True must return SUCCESS."""
+    assert _ci_status_from_rollup([], empty_is_success=True) == CIStatus.SUCCESS
+
+
+def test_ci_status_non_list_returns_pending() -> None:
+    """Non-list input (None, dict, etc.) must return PENDING regardless of flag."""
+    assert _ci_status_from_rollup(None) == CIStatus.PENDING
+    assert _ci_status_from_rollup({}) == CIStatus.PENDING
+    assert _ci_status_from_rollup(None, empty_is_success=True) == CIStatus.PENDING

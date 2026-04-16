@@ -17,6 +17,7 @@ _REPO_FIELDS = {
     "review_timeout_min",
     "active",
     "poll_interval_sec",
+    "allow_merge_without_checks",
 }
 
 _DAEMON_FIELDS = {
@@ -44,6 +45,7 @@ class RepoConfig(BaseModel):
     review_timeout_min: int | None = None
     active: bool = True
     poll_interval_sec: int = 60
+    allow_merge_without_checks: bool = False
 
     @field_validator("poll_interval_sec", mode="before")
     @classmethod
