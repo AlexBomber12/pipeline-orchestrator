@@ -33,6 +33,7 @@ _DAEMON_FIELDS = {
     "planned_pr_timeout_sec",
     "rate_limit_session_pause_percent",
     "rate_limit_weekly_pause_percent",
+    "strict_queue_validation",
 }
 
 

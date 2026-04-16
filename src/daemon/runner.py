@@ -739,12 +739,16 @@ class PipelineRunner:
         Returns ``True`` once discovery has completed (whether or not a
         subsequent re-run of ``handle_coding`` then failed — that failure
         is handled through the normal ERROR path and must not trigger a
-        second, non-idempotent recovery attempt). Returns ``False`` only
-        when discovery itself could not run — typically a transient
-        GitHub outage during ``get_open_prs`` — so ``run_cycle`` can
-        leave ``_recovered`` unset and retry on the next cycle. Without
-        this distinction, a transient GitHub error at startup would
-        strand the runner detached from an in-flight PR and later allow
+        second, non-idempotent recovery attempt).  Also returns ``True``
+        for permanent errors such as ``QueueValidationError`` — the queue
+        file is malformed and retrying cannot fix it; the ERROR state
+        alerts the operator while ``process_pending_uploads`` remains
+        reachable.  Returns ``False`` only when discovery itself could
+        not run due to a *transient* failure — typically a GitHub outage
+        during ``get_open_prs`` — so ``run_cycle`` can leave
+        ``_recovered`` unset and retry on the next cycle. Without this
+        distinction, a transient GitHub error at startup would strand the
+        runner detached from an in-flight PR and later allow
         ``handle_error`` to SKIP/FIX it onto new queue work.
         """
         strict = self.app_config.daemon.strict_queue_validation
@@ -756,7 +760,11 @@ class PipelineRunner:
                 f"recover_state: queue validation failed: {exc}"
             )
             self.log_event(f"recover_state: queue validation failed: {exc}")
-            return False
+            # Return True: validation errors are permanent (the queue file
+            # is malformed), not transient.  Returning False would leave
+            # _recovered unset and trap the daemon in an infinite recovery
+            # loop, blocking process_pending_uploads and handle_idle.
+            return True
         if tasks is None:
             # Read failure on origin/{branch}:tasks/QUEUE.md. Treat as a
             # retryable discovery error: returning False leaves

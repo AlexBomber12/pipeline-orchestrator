@@ -11,6 +11,7 @@ import pytest
 from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import runner as runner_module
 from src.daemon.runner import PipelineRunner
+from src.queue_parser import QueueValidationError
 from src.models import (
     CIStatus,
     PipelineState,
@@ -1123,3 +1124,21 @@ def test_recover_state_queue_read_failure_sets_error_and_returns_false(
     assert gh_calls == [], "must bail before probing GitHub"
 
 
+def test_recover_validation_error_returns_true() -> None:
+    """Codex P1: QueueValidationError is a permanent error (malformed
+    queue file) — returning False would leave _recovered unset and trap
+    the daemon in an infinite recovery loop, blocking
+    process_pending_uploads and handle_idle.  recover_state must return
+    True so _recovered is set and the ERROR state alerts the operator."""
+
+    def bad_queue(**_: object) -> None:
+        raise QueueValidationError(["duplicate pr_id: PR-001"])
+
+    runner = _make_runner()
+    runner._parse_base_queue = bad_queue  # type: ignore[method-assign]
+    result = asyncio.run(runner.recover_state())
+
+    assert result is True
+    assert runner.state.state == PipelineState.ERROR
+    assert "queue validation failed" in (runner.state.error_message or "")
+    assert "duplicate pr_id" in (runner.state.error_message or "")
