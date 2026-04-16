@@ -614,15 +614,17 @@ def test_handle_fix_skips_checkout_on_cross_repo_pr(
     asyncio.run(runner.handle_fix())
 
     assert runner.state.state == PipelineState.WATCH
+    assert not any(cmd[:2] == ["git", "fetch"] for cmd in calls)
     assert not any(cmd[:2] == ["git", "checkout"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "reset"] for cmd in calls)
 
 
-def test_handle_fix_checks_out_pr_branch_before_fix_review(
+def test_handle_fix_fetches_and_resets_branch_before_fix_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``sync_to_main`` leaves the repo on the base branch. Before invoking
-    Claude's fix_review, ``handle_fix`` must check out the PR branch so the
-    patch lands on the PR's HEAD instead of the base branch.
+    """Before invoking fix_review, ``handle_fix`` must fetch the PR branch
+    from origin, check it out, and hard-reset to ``origin/<branch>`` so the
+    local state matches the remote exactly.
     """
     calls = _patch_subprocess(monkeypatch)
     fix_called_at: list[int] = []
@@ -645,28 +647,42 @@ def test_handle_fix_checks_out_pr_branch_before_fix_review(
     runner.state.current_pr = PRInfo(number=42, branch="pr-042-fix")
     asyncio.run(runner.handle_fix())
 
+    fetch_calls = [
+        i for i, cmd in enumerate(calls)
+        if cmd[:2] == ["git", "fetch"]
+        and any("pr-042-fix" in arg for arg in cmd)
+    ]
     checkout_calls = [
         i for i, cmd in enumerate(calls)
         if cmd[:2] == ["git", "checkout"] and "pr-042-fix" in cmd
     ]
-    assert checkout_calls, "expected git checkout pr-042-fix before fix_review"
+    reset_calls = [
+        i for i, cmd in enumerate(calls)
+        if cmd[:2] == ["git", "reset"]
+        and "--hard" in cmd
+        and "origin/pr-042-fix" in cmd
+    ]
+    assert fetch_calls, "expected git fetch origin pr-042-fix"
+    assert checkout_calls, "expected git checkout pr-042-fix"
+    assert reset_calls, "expected git reset --hard origin/pr-042-fix"
     assert fix_called_at, "fix_review must have been invoked"
-    assert checkout_calls[0] < fix_called_at[0]
+    # Order: fetch < checkout < reset < fix_review
+    assert fetch_calls[0] < checkout_calls[0] < reset_calls[0] < fix_called_at[0]
     assert runner.state.state == PipelineState.WATCH
 
 
-def test_handle_fix_errors_when_pr_branch_checkout_fails(
+def test_handle_fix_errors_when_fetch_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If the PR branch checkout before fix_review fails, the runner must
-    transition to ERROR rather than letting Claude patch the base branch.
+    """If the PR branch fetch before fix_review fails, the runner must
+    transition to ERROR rather than letting Claude patch stale code.
     """
     fix_calls: list[str] = []
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        if cmd[:2] == ["git", "checkout"] and "pr-042-fix" in cmd:
+        if cmd[:2] == ["git", "fetch"] and any("pr-042-fix" in a for a in cmd):
             raise subprocess.CalledProcessError(
-                1, cmd, stderr="error: pathspec 'pr-042-fix' did not match"
+                1, cmd, stderr="fatal: couldn't find remote ref pr-042-fix"
             )
         return _FakeCompletedProcess(args=cmd, returncode=0)
 
@@ -683,18 +699,49 @@ def test_handle_fix_errors_when_pr_branch_checkout_fails(
     asyncio.run(runner.handle_fix())
 
     assert runner.state.state == PipelineState.ERROR
+    assert "git refresh" in (runner.state.error_message or "")
     assert "pr-042-fix" in (runner.state.error_message or "")
-    assert fix_calls == [], "fix_review must not run when checkout fails"
+    assert fix_calls == [], "fix_review must not run when fetch fails"
 
 
-def test_handle_fix_errors_when_pr_branch_checkout_times_out(
+def test_handle_fix_errors_when_reset_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Codex P2: the checkout has ``timeout=30`` so a stalled git lock or
-    slow I/O can raise ``TimeoutExpired``. The except clause must catch it
-    too (alongside ``OSError``), otherwise the exception escapes the daemon
-    loop without setting ``PipelineState.ERROR`` and the state machine
-    drifts on the next cycle.
+    """If ``git reset --hard origin/<branch>`` fails after fetch+checkout,
+    the runner must transition to ERROR so Claude does not run against a
+    diverged local branch.
+    """
+    fix_calls: list[str] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "reset"] and "origin/pr-042-fix" in cmd:
+            raise subprocess.CalledProcessError(
+                1, cmd, stderr="fatal: ambiguous argument"
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "fix_review_async",
+        _async_cli_capture_path(fix_calls, 0, "", ""),
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=42, branch="pr-042-fix")
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "git refresh" in (runner.state.error_message or "")
+    assert fix_calls == [], "fix_review must not run when reset fails"
+
+
+def test_handle_fix_errors_when_checkout_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TimeoutExpired during the refresh sequence must be caught and set
+    PipelineState.ERROR rather than escaping the daemon loop.
     """
     fix_calls: list[str] = []
 
@@ -716,7 +763,8 @@ def test_handle_fix_errors_when_pr_branch_checkout_times_out(
     asyncio.run(runner.handle_fix())
 
     assert runner.state.state == PipelineState.ERROR
-    assert "pr-042-fix" in (runner.state.error_message or "")
+    assert "git refresh" in (runner.state.error_message or "")
+    assert fix_calls == [], "fix_review must not run when checkout times out"
     assert fix_calls == [], "fix_review must not run when checkout times out"
 
 
