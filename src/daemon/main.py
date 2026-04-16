@@ -225,16 +225,18 @@ async def main() -> None:
             if key not in runners:
                 del last_run[key]
 
-        active_intervals = [
-            r.repo_config.poll_interval_sec
-            if r.repo_config.poll_interval_sec is not None
-            else config.daemon.poll_interval_sec
-            for r in runners.values()
-            if r.repo_config.active
-        ]
-        fastest = min(active_intervals) if active_intervals else config.daemon.poll_interval_sec
-        tick = min(fastest, config.daemon.poll_interval_sec)
-        await asyncio.sleep(tick)
+        now_after = time.monotonic()
+        remaining: list[float] = []
+        for key, runner in runners.items():
+            if not runner.repo_config.active:
+                continue
+            repo_poll = runner.repo_config.poll_interval_sec
+            interval = repo_poll if repo_poll is not None else config.daemon.poll_interval_sec
+            due_in = (last_run.get(key, 0.0) + interval) - now_after
+            remaining.append(max(due_in, 0.0))
+        tick = min(remaining) if remaining else config.daemon.poll_interval_sec
+        tick = min(tick, config.daemon.poll_interval_sec)
+        await asyncio.sleep(max(tick, 1))
 
 
 if __name__ == "__main__":
