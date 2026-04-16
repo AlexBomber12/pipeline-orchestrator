@@ -238,11 +238,14 @@ def _compute_review_status(
     latest_review_time = review_info["latest_time"]
     latest_review_sha = review_info["latest_sha"]
     latest_review_state = review_info["latest_state"]
+    approved_review_time: datetime | None = None
     if latest_review_state == "APPROVED" and latest_review_time is not None:
         if not head_sha:
             review_api_approved = True
+            approved_review_time = latest_review_time
         elif latest_review_sha and latest_review_sha == head_sha:
             review_api_approved = True
+            approved_review_time = latest_review_time
 
     try:
         codex_reactions = _get_codex_issue_reactions(repo, pr_number)
@@ -335,7 +338,15 @@ def _compute_review_status(
     for comment in issue_comments + review_comments:
         if not _is_codex_user(comment.get("user")):
             continue
+        comment_created_at = _parse_iso(comment.get("created_at"))
         if anchor_ts and (comment.get("created_at") or "") <= anchor_ts:
+            continue
+        if (
+            review_api_approved
+            and approved_review_time is not None
+            and comment_created_at is not None
+            and comment_created_at <= approved_review_time
+        ):
             continue
         return ReviewStatus.CHANGES_REQUESTED
 
