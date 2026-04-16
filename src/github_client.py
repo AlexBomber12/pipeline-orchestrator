@@ -14,6 +14,9 @@ from src.retry import retry_transient
 _REPO_URL_RE = re.compile(
     r"github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"
 )
+CODEX_BOT_LOGIN_PATTERN = re.compile(
+    r"codex", re.IGNORECASE
+)
 
 _review_status_cache: dict[str, "ReviewStatus"] = {}
 _review_status_cache_cycle: int | None = None
@@ -39,6 +42,28 @@ def _begin_review_cache_cycle() -> None:
     if _review_status_cache_cycle is None:
         _review_status_cache_cycle = 0
     _review_status_cache_cycle += 1
+
+
+def _is_codex_user(user_dict: dict | None) -> bool:
+    """Return True if the GitHub user object represents a Codex bot."""
+    if not isinstance(user_dict, dict):
+        return False
+    login = user_dict.get("login", "") or ""
+    return bool(CODEX_BOT_LOGIN_PATTERN.search(login))
+
+
+def _is_reaction_content(reaction: dict, content: str) -> bool:
+    """Return True when a reaction matches an exact content from Codex."""
+    if not isinstance(reaction, dict):
+        return False
+    if reaction.get("content") != content:
+        return False
+    return _is_codex_user(reaction.get("user"))
+
+
+def _is_plus_one(reaction: dict) -> bool:
+    """Return True if the reaction is exactly +1 from a Codex user."""
+    return _is_reaction_content(reaction, "+1")
 
 
 def run_gh(
@@ -186,8 +211,7 @@ def _get_codex_issue_reactions(
     return [
         r for r in reactions
         if isinstance(r, dict)
-        and isinstance(r.get("user"), dict)
-        and re.search(r"codex", r["user"].get("login", ""), re.IGNORECASE)
+        and _is_codex_user(r.get("user"))
     ]
 
 
@@ -198,45 +222,55 @@ def _compute_review_status(
     head_sha: str,
 ) -> ReviewStatus:
     """Core review status logic, separated for caching."""
+    body_eyes = False
     body_approved = False
+    head_commit_time: datetime | None = None
+
     try:
         codex_reactions = _get_codex_issue_reactions(repo, pr_number)
         if codex_reactions:
-            codex_contents = {r.get("content") for r in codex_reactions}
-            if "+1" in codex_contents:
+            plus_one = _find_codex_plus_one_reaction(codex_reactions)
+            if plus_one is not None:
                 if head_sha:
-                    plus_one = _find_codex_plus_one_reaction(codex_reactions)
-                    if plus_one:
-                        reaction_time = _parse_iso(plus_one.get("created_at"))
-                        head_commit_time = _get_commit_time(repo, head_sha)
-                        latest_sha, latest_review_time = (
-                            _get_latest_codex_review_info(repo, pr_number)
-                        )
-                        if latest_sha and latest_sha == head_sha:
-                            body_approved = True
-                        else:
-                            threshold = head_commit_time
-                            if (
-                                latest_review_time is not None
-                                and (
-                                    threshold is None
-                                    or latest_review_time > threshold
-                                )
-                            ):
-                                threshold = latest_review_time
-                            if (
-                                reaction_time
-                                and threshold
-                                and reaction_time >= threshold
-                            ):
-                                body_approved = True
-                            elif not threshold:
-                                body_approved = True
-                    else:
+                    try:
+                        review_info = _get_codex_review_signals(repo, pr_number)
+                    except RuntimeError:
+                        review_info = {
+                            "latest_sha": "",
+                            "latest_time": None,
+                            "latest_state": "",
+                        }
+                    latest_review_time = review_info["latest_time"]
+                    latest_review_sha = review_info["latest_sha"]
+                    reaction_time = _parse_iso(plus_one.get("created_at"))
+                    if latest_review_sha and latest_review_sha == head_sha:
                         body_approved = True
+                    else:
+                        head_commit_time = _get_commit_time(repo, head_sha)
+                        threshold = head_commit_time
+                        if (
+                            latest_review_time is not None
+                            and (
+                                threshold is None
+                                or latest_review_time > threshold
+                            )
+                        ):
+                            threshold = latest_review_time
+                        if (
+                            reaction_time
+                            and threshold
+                            and reaction_time >= threshold
+                        ):
+                            body_approved = True
+                        elif not threshold:
+                            body_approved = True
                 else:
                     body_approved = True
-            if not body_approved and "eyes" in codex_contents:
+            if not body_approved and any(
+                _is_reaction_content(reaction, "eyes")
+                for reaction in codex_reactions
+            ):
+                body_eyes = True
                 return ReviewStatus.EYES
     except RuntimeError as exc:
         if "HTTP 404" not in str(exc):
@@ -265,6 +299,7 @@ def _compute_review_status(
             break
 
     anchor_approved = False
+    anchor_eyes = False
     if anchor is not None:
         cid = anchor.get("id")
         if cid is not None:
@@ -273,28 +308,27 @@ def _compute_review_status(
                     f"repos/{repo}/issues/comments/{cid}/reactions"
                 )
                 if reactions:
-                    codex_contents = {
-                        r.get("content")
-                        for r in reactions
-                        if isinstance(r, dict)
-                        and "codex"
-                        in ((r.get("user") or {}).get("login", "")).lower()
-                    }
-                    if "+1" in codex_contents:
+                    if any(_is_plus_one(reaction) for reaction in reactions):
                         anchor_approved = True
-                    elif "eyes" in codex_contents:
-                        return ReviewStatus.EYES
+                    elif any(
+                        _is_reaction_content(reaction, "eyes")
+                        for reaction in reactions
+                    ):
+                        anchor_eyes = True
             except RuntimeError as exc:
                 if "HTTP 404" not in str(exc):
                     raise
 
-    if anchor_approved or body_approved:
+    if body_eyes or anchor_eyes:
+        return ReviewStatus.EYES
+    if body_approved:
+        return ReviewStatus.APPROVED
+    if anchor_approved:
         return ReviewStatus.APPROVED
 
     anchor_ts = (anchor.get("created_at") or "") if anchor else ""
     for comment in issue_comments + review_comments:
-        user = (comment.get("user") or {}).get("login", "") or ""
-        if "codex" not in user.lower():
+        if not _is_codex_user(comment.get("user")):
             continue
         if anchor_ts and (comment.get("created_at") or "") <= anchor_ts:
             continue
@@ -596,12 +630,7 @@ def _find_codex_plus_one_reaction(reactions: list[dict]) -> dict | None:
     """Return the most recent +1 reaction from a Codex user, or None."""
     best: dict | None = None
     for r in reactions:
-        if not isinstance(r, dict):
-            continue
-        login = ((r.get("user") or {}).get("login", "")).lower()
-        if "codex" not in login:
-            continue
-        if r.get("content") != "+1":
+        if not _is_plus_one(r):
             continue
         if best is None or (r.get("created_at") or "") > (best.get("created_at") or ""):
             best = r
@@ -619,43 +648,58 @@ def _get_commit_time(repo: str, sha: str) -> datetime | None:
     return _parse_iso(raw.strip() if isinstance(raw, str) else "")
 
 
-def _get_latest_codex_review_info(
+def _get_codex_review_signals(
     repo: str, pr_number: int
-) -> tuple[str, datetime | None]:
-    """Return ``(commit_id, submitted_at)`` of the most recent Codex
-    formal review, or ``("", None)`` if no such review exists.
-
-    Used alongside the head-commit-time check so a force-push that moves
-    HEAD to an older commit cannot silently reinstate a stale ``+1``:
-    the latest review submission time is always at least as new as the
-    moment the previous head was current, so requiring the reaction to
-    beat that threshold too catches the force-push case.
-    """
+) -> dict[str, str | datetime | None]:
+    """Return the latest Codex review timestamp, sha, and state."""
     try:
         reviews = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/reviews")
     except RuntimeError as exc:
         if "HTTP 404" not in str(exc):
             raise
-        return "", None
+        return {
+            "latest_sha": "",
+            "latest_time": None,
+            "latest_state": "",
+        }
     if not reviews:
-        return "", None
+        return {
+            "latest_sha": "",
+            "latest_time": None,
+            "latest_state": "",
+        }
+
     best_sha = ""
     best_time: datetime | None = None
     best_raw = ""
+    best_state = ""
     for review in reviews:
-        user = (review.get("user") or {}).get("login", "") or ""
-        if "codex" not in user.lower():
+        if not _is_codex_user(review.get("user")):
             continue
         submitted_raw = review.get("submitted_at") or ""
-        if best_time is not None and submitted_raw <= best_raw:
-            continue
         parsed = _parse_iso(submitted_raw)
         if parsed is None:
             continue
-        best_sha = review.get("commit_id") or ""
-        best_time = parsed
-        best_raw = submitted_raw
-    return best_sha, best_time
+        if best_time is None or submitted_raw > best_raw:
+            best_sha = review.get("commit_id") or ""
+            best_time = parsed
+            best_raw = submitted_raw
+            best_state = (review.get("state") or "").upper()
+    return {
+        "latest_sha": best_sha,
+        "latest_time": best_time,
+        "latest_state": best_state,
+    }
+
+
+def _get_latest_codex_review_info(
+    repo: str, pr_number: int
+) -> tuple[str, datetime | None]:
+    """Return ``(commit_id, submitted_at)`` of the most recent Codex review."""
+    signals = _get_codex_review_signals(repo, pr_number)
+    latest_sha = signals["latest_sha"]
+    latest_time = signals["latest_time"]
+    return str(latest_sha or ""), latest_time if isinstance(latest_time, datetime) else None
 
 
 def _ci_status_from_rollup(

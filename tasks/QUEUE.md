@@ -342,7 +342,7 @@
 - Depends on: PR-046
 
 ## PR-056: Review status parser strictness
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-056.md
 - Branch: pr-056-review-status-parser
 - Depends on: PR-047

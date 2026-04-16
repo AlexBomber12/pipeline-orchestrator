@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import subprocess
+from datetime import datetime, timedelta
+from datetime import timezone as _tz
 from typing import Any
 
 import pytest
-
 from src.github_client import (
     _ci_status_from_rollup,
+    _is_codex_user,
+    _is_plus_one,
     clear_review_status_cache,
     get_pr_author,
     get_pr_head_commit_iso,
@@ -106,6 +109,32 @@ def test_run_gh_returns_raw_string_when_not_json(
     assert run_gh(["auth", "status"]) == "ok"
 
 
+def test_is_codex_user_matches_bot_logins() -> None:
+    assert _is_codex_user({"login": "codex"}) is True
+    assert _is_codex_user({"login": "chatgpt-codex-conn"}) is True
+    assert _is_codex_user({"login": "codex-bot"}) is True
+    assert _is_codex_user({"login": "mycodexbot"}) is True
+    assert _is_codex_user({"login": "not-codex-related-thing"}) is True
+
+
+def test_is_codex_user_rejects_non_codex() -> None:
+    assert _is_codex_user({"login": "AlexBomber12"}) is False
+    assert _is_codex_user({"login": "dependabot"}) is False
+    assert _is_codex_user({"login": "codec-reviewer"}) is False
+    assert _is_codex_user(None) is False
+
+
+def test_plus_one_requires_exact_content() -> None:
+    assert _is_plus_one({"content": "+1", "user": {"login": "codex-bot"}}) is True
+    assert _is_plus_one({"content": "thumbsup", "user": {"login": "codex-bot"}}) is False
+    assert _is_plus_one({"content": "heart", "user": {"login": "codex-bot"}}) is False
+
+
+def test_plus_one_requires_codex_user() -> None:
+    assert _is_plus_one({"content": "+1", "user": {"login": "AlexBomber12"}}) is False
+    assert _is_plus_one({"content": "+1", "user": {"login": "codex-bot"}}) is True
+
+
 def test_get_pr_review_status_approved_via_pr_body_reaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -135,7 +164,11 @@ def test_get_pr_review_status_approved_via_pr_body_reaction(
         == ReviewStatus.APPROVED
     )
 
-    assert any("issues/42/reactions" in arg for arg in invocations[0])
+    assert any(
+        "issues/42/reactions" in arg
+        for cmd in invocations
+        for arg in cmd
+    )
 
 
 def test_get_pr_review_status_approved_via_first_author_comment_reaction(
@@ -177,8 +210,327 @@ def test_get_pr_review_status_approved_via_first_author_comment_reaction(
     )
 
     assert len(invocations) == 4
+    assert not any(cmd[-1].endswith("/pulls/42/reviews") for cmd in invocations)
     for cmd in invocations:
         assert "--paginate" in cmd, f"missing --paginate in {cmd}"
+
+
+def test_review_api_without_reaction_stays_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A formal Codex APPROVED review alone should not count as approval."""
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if _is_commits_path(cmd):
+            return _FakeCompletedProcess(stdout="2026-01-01T00:00:00Z")
+        path = _find_api_path(cmd)
+        if path.endswith("/pulls/42/reviews"):
+            data = [
+                [
+                    {
+                        "user": {"login": "chatgpt-codex-bot"},
+                        "state": "APPROVED",
+                        "commit_id": "bbbbbb2222",
+                        "submitted_at": "2026-01-02T00:00:00Z",
+                    }
+                ]
+            ]
+        elif "issues" in path and path.endswith("/comments"):
+            data = [[]]
+        elif "pulls" in path and path.endswith("/comments"):
+            data = [[]]
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
+        )
+        == ReviewStatus.PENDING
+    )
+
+
+def test_review_api_approved_requires_matching_head_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A formal APPROVED review for another sha must not auto-approve."""
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if _is_commits_path(cmd):
+            return _FakeCompletedProcess(stdout="2026-01-01T00:00:00Z")
+        path = _find_api_path(cmd)
+        if path.endswith("/pulls/42/reviews"):
+            data = [
+                [
+                    {
+                        "user": {"login": "chatgpt-codex-bot"},
+                        "state": "APPROVED",
+                        "commit_id": "oldsha1111",
+                        "submitted_at": "2026-01-02T00:00:00Z",
+                    }
+                ]
+            ]
+        elif "issues" in path and path.endswith("/comments"):
+            data = [[]]
+        elif "pulls" in path and path.endswith("/comments"):
+            data = [[]]
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
+        )
+        == ReviewStatus.PENDING
+    )
+
+
+def test_review_api_approval_does_not_override_post_anchor_codex_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A formal APPROVED review should not beat newer Codex feedback."""
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = _find_api_path(cmd)
+        if path.endswith("/pulls/42/reviews"):
+            data = [
+                [
+                    {
+                        "user": {"login": "chatgpt-codex-bot"},
+                        "state": "APPROVED",
+                        "commit_id": "bbbbbb2222",
+                        "submitted_at": "2026-01-02T00:00:00Z",
+                    }
+                ]
+            ]
+        elif "issues" in path and path.endswith("/comments"):
+            data = [
+                [
+                    {
+                        "id": 10,
+                        "user": {"login": "author"},
+                        "body": "@codex review",
+                        "created_at": "2026-01-01T00:00:00Z",
+                    },
+                    {
+                        "id": 20,
+                        "user": {"login": "chatgpt-codex-bot"},
+                        "body": "P1: still broken",
+                        "created_at": "2026-01-03T00:00:00Z",
+                    },
+                ]
+            ]
+        elif "pulls" in path and path.endswith("/comments"):
+            data = []
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
+        )
+        == ReviewStatus.CHANGES_REQUESTED
+    )
+
+
+def test_review_api_approved_beats_older_post_anchor_codex_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Older Codex comments still block without a +1 approval signal."""
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = _find_api_path(cmd)
+        if path.endswith("/pulls/42/reviews"):
+            data = [
+                [
+                    {
+                        "user": {"login": "chatgpt-codex-bot"},
+                        "state": "APPROVED",
+                        "commit_id": "bbbbbb2222",
+                        "submitted_at": "2026-01-03T00:00:00Z",
+                    }
+                ]
+            ]
+        elif "issues" in path and path.endswith("/comments"):
+            data = [
+                [
+                    {
+                        "id": 10,
+                        "user": {"login": "author"},
+                        "body": "@codex review",
+                        "created_at": "2026-01-01T00:00:00Z",
+                    },
+                    {
+                        "id": 20,
+                        "user": {"login": "chatgpt-codex-bot"},
+                        "body": "P1: earlier finding",
+                        "created_at": "2026-01-02T00:00:00Z",
+                    },
+                ]
+            ]
+        elif "pulls" in path and path.endswith("/comments"):
+            data = []
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
+        )
+        == ReviewStatus.CHANGES_REQUESTED
+    )
+
+
+def test_latest_codex_review_state_overrides_older_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newer CHANGES_REQUESTED review must beat an older APPROVED review."""
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if _is_commits_path(cmd):
+            return _FakeCompletedProcess(stdout="2026-01-01T00:00:00Z")
+        path = _find_api_path(cmd)
+        if path.endswith("/pulls/42/reviews"):
+            data = [[
+                {
+                    "user": {"login": "chatgpt-codex-bot"},
+                    "state": "APPROVED",
+                    "commit_id": "bbbbbb2222",
+                    "submitted_at": "2026-01-02T00:00:00Z",
+                },
+                {
+                    "user": {"login": "chatgpt-codex-bot"},
+                    "state": "CHANGES_REQUESTED",
+                    "commit_id": "bbbbbb2222",
+                    "submitted_at": "2026-01-03T00:00:00Z",
+                },
+            ]]
+        elif "issues" in path and path.endswith("/comments"):
+            data = [[]]
+        elif "pulls" in path and path.endswith("/comments"):
+            data = [[]]
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
+        )
+        == ReviewStatus.PENDING
+    )
+
+
+def test_review_api_errors_do_not_block_reaction_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-404 review API failures should fall back to reactions/comments."""
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = _find_api_path(cmd)
+        if path.endswith("/pulls/42/reviews"):
+            return _FakeCompletedProcess(
+                stderr="HTTP 403 rate limit exceeded", returncode=1
+            )
+        if path.endswith("/issues/42/reactions"):
+            data = [
+                {
+                    "content": "+1",
+                    "user": {"login": "chatgpt-codex-bot"},
+                    "created_at": "2026-01-03T00:00:00Z",
+                }
+            ]
+        elif _is_commits_path(cmd):
+            return _FakeCompletedProcess(stdout="2026-01-01T00:00:00Z")
+        elif "issues" in path and path.endswith("/comments"):
+            data = [[]]
+        elif "pulls" in path and path.endswith("/comments"):
+            data = [[]]
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
+        )
+        == ReviewStatus.APPROVED
+    )
+
+
+def test_review_api_approved_does_not_trust_unknown_head_commit_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unknown head commit time must not approve a mismatched review SHA."""
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if _is_commits_path(cmd):
+            return _FakeCompletedProcess(stderr="boom", returncode=1)
+        path = _find_api_path(cmd)
+        if path.endswith("/pulls/42/reviews"):
+            data = [
+                [
+                    {
+                        "user": {"login": "chatgpt-codex-bot"},
+                        "state": "APPROVED",
+                        "commit_id": "oldsha1111",
+                        "submitted_at": "2026-01-02T00:00:00Z",
+                    }
+                ]
+            ]
+        elif "issues" in path and path.endswith("/comments"):
+            data = [[]]
+        elif "pulls" in path and path.endswith("/comments"):
+            data = [[]]
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
+        )
+        == ReviewStatus.PENDING
+    )
 
 
 def test_get_pr_review_status_skips_teammate_comment(
@@ -568,6 +920,174 @@ def test_review_status_eyes_wins_over_codex_comment(
     )
 
 
+def test_body_eyes_wins_over_anchor_plus_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PR-body eyes signal should beat an anchor +1 while review is in progress."""
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = _find_api_path(cmd)
+        if "issues" in path and path.endswith("/comments"):
+            data = [[
+                {
+                    "id": 10,
+                    "user": {"login": "author"},
+                    "body": "@codex review",
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ]]
+        elif "pulls" in path and path.endswith("/comments"):
+            data = []
+        elif "comments/10/reactions" in path:
+            data = [[{"content": "+1", "user": {"login": "chatgpt-codex-bot"}}]]
+        elif path.endswith("/reactions"):
+            data = [[{"content": "eyes", "user": {"login": "chatgpt-codex-bot"}}]]
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status("owner/name", 42, pr_author="author")
+        == ReviewStatus.EYES
+    )
+
+
+def test_anchor_eyes_wins_over_body_plus_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An anchor eyes signal should beat a PR-body +1 while review is in progress."""
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = _find_api_path(cmd)
+        if "issues" in path and path.endswith("/comments"):
+            data = [[
+                {
+                    "id": 10,
+                    "user": {"login": "author"},
+                    "body": "@codex review",
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ]]
+        elif "pulls" in path and path.endswith("/comments"):
+            data = []
+        elif "comments/10/reactions" in path:
+            data = [[{"content": "eyes", "user": {"login": "chatgpt-codex-bot"}}]]
+        elif path.endswith("/reactions"):
+            data = [[{"content": "+1", "user": {"login": "chatgpt-codex-bot"}}]]
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status("owner/name", 42, pr_author="author")
+        == ReviewStatus.EYES
+    )
+
+
+def test_review_api_with_body_eyes_stays_eyes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Formal APPROVED review alone should not beat body-level eyes."""
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = _find_api_path(cmd)
+        if path.endswith("/pulls/42/reviews"):
+            data = [[
+                {
+                    "user": {"login": "chatgpt-codex-bot"},
+                    "state": "APPROVED",
+                    "commit_id": "bbbbbb2222",
+                    "submitted_at": "2026-01-02T00:00:00Z",
+                }
+            ]]
+        elif "issues" in path and path.endswith("/comments"):
+            data = [[
+                {
+                    "id": 10,
+                    "user": {"login": "author"},
+                    "body": "@codex review",
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ]]
+        elif "pulls" in path and path.endswith("/comments"):
+            data = []
+        elif path.endswith("/reactions"):
+            data = [[{"content": "eyes", "user": {"login": "chatgpt-codex-bot"}}]]
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
+        )
+        == ReviewStatus.EYES
+    )
+
+
+def test_review_api_with_anchor_eyes_stays_eyes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Formal APPROVED review alone should not beat anchor eyes."""
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = _find_api_path(cmd)
+        if path.endswith("/pulls/42/reviews"):
+            data = [[
+                {
+                    "user": {"login": "chatgpt-codex-bot"},
+                    "state": "APPROVED",
+                    "commit_id": "bbbbbb2222",
+                    "submitted_at": "2026-01-02T00:00:00Z",
+                }
+            ]]
+        elif "issues" in path and path.endswith("/comments"):
+            data = [[
+                {
+                    "id": 10,
+                    "user": {"login": "author"},
+                    "body": "@codex review",
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ]]
+        elif "pulls" in path and path.endswith("/comments"):
+            data = []
+        elif "comments/10/reactions" in path:
+            data = [[{"content": "eyes", "user": {"login": "chatgpt-codex-bot"}}]]
+        elif path.endswith("/reactions"):
+            data = []
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
+        )
+        == ReviewStatus.EYES
+    )
+
+
 def test_get_pr_review_status_handles_404(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -726,6 +1246,76 @@ def test_body_plus_one_no_commit_time_trusts(
     )
 
 
+def test_no_plus_one_does_not_fetch_head_commit_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review and commit-time lookups should stay lazy when no +1 path needs them."""
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if _is_commits_path(cmd):
+            raise AssertionError("commit lookup should not run without +1")
+        path = _find_api_path(cmd)
+        if path.endswith("/pulls/42/reviews"):
+            raise AssertionError("review lookup should not run without +1")
+        elif "issues" in path and path.endswith("/comments"):
+            data = [
+                [
+                    {
+                        "id": 10,
+                        "user": {"login": "author"},
+                        "body": "@codex review",
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ]
+            ]
+        elif "pulls" in path and path.endswith("/comments"):
+            data = []
+        elif path.endswith("/reactions"):
+            data = []
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="deadbeef"
+        )
+        == ReviewStatus.PENDING
+    )
+
+
+def test_body_eyes_returns_before_comment_fetches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A body-level eyes signal should not depend on later comment API calls."""
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = _find_api_path(cmd)
+        if path.endswith("/pulls/42/reviews"):
+            raise AssertionError("review lookup should not run for body eyes only")
+        if "issues" in path and path.endswith("/comments"):
+            raise AssertionError("issue comments should not be fetched after body eyes")
+        if "pulls" in path and path.endswith("/comments"):
+            raise AssertionError("review comments should not be fetched after body eyes")
+        if path.endswith("/reactions"):
+            data = [[{"content": "eyes", "user": {"login": "chatgpt-codex-bot"}}]]
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.EYES
+
+
 def test_find_codex_plus_one_picks_newest() -> None:
     """_find_codex_plus_one_reaction must return the most recent +1."""
     from src.github_client import _find_codex_plus_one_reaction
@@ -808,8 +1398,6 @@ def test_merge_pr_uses_squash(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _iso_utc_now_minus(seconds: int) -> str:
-    from datetime import datetime, timedelta, timezone as _tz
-
     return (
         datetime.now(_tz.utc) - timedelta(seconds=seconds)
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -964,8 +1552,6 @@ def test_has_recent_codex_review_request_respects_after_iso(
         return _FakeCompletedProcess(stdout=_json.dumps(pages))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-
-    from datetime import datetime, timedelta, timezone as _tz
 
     just_now = (
         datetime.now(_tz.utc) - timedelta(seconds=10)
