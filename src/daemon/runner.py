@@ -27,6 +27,7 @@ from src.config import AppConfig, RepoConfig
 from src.daemon import scaffolder
 from src.models import (
     CIStatus,
+    FeedbackCheckResult,
     PipelineState,
     PRInfo,
     QueueTask,
@@ -1473,13 +1474,20 @@ return 0
             await self.handle_fix()
             return
         elif review == ReviewStatus.CHANGES_REQUESTED:
-            if self._has_new_codex_feedback_since_last_push():
+            result = self._has_new_codex_feedback_since_last_push()
+            if result == FeedbackCheckResult.NEW:
                 await self.handle_fix()
                 return
-            # No new feedback since last push. Don't trigger FIX, but
-            # fall through to the timeout check below so a truly stuck
-            # CHANGES_REQUESTED state still escalates to HUNG instead of
-            # pinning the runner in WATCH indefinitely.
+            if result == FeedbackCheckResult.UNKNOWN:
+                self.log_event(
+                    f"PR #{found.number} CHANGES_REQUESTED but feedback check "
+                    "failed; staying in WATCH, will retry next cycle"
+                )
+                return
+            # NONE: no new feedback since last push. Don't trigger FIX,
+            # but fall through to the timeout check below so a truly
+            # stuck CHANGES_REQUESTED state still escalates to HUNG
+            # instead of pinning the runner in WATCH indefinitely.
             self.log_event(
                 f"PR #{found.number} CHANGES_REQUESTED but no new "
                 "Codex feedback since last push; waiting for fresh review"
@@ -2163,16 +2171,19 @@ return 0
         if self._last_push_at is None or head_time > self._last_push_at:
             self._last_push_at = head_time
 
-    def _has_new_codex_feedback_since_last_push(self) -> bool:
-        """Returns True if Codex posted any comment (review or issue) after self._last_push_at.
+    def _has_new_codex_feedback_since_last_push(self) -> FeedbackCheckResult:
+        """Check whether Codex posted any comment after ``self._last_push_at``.
 
-        P1/P2 prioritization is handled by Claude in FIX REVIEW mode.
+        Returns a three-state :class:`FeedbackCheckResult`:
+        - ``NEW``     – new Codex feedback exists after last push
+        - ``NONE``    – no Codex activity after last push
+        - ``UNKNOWN`` – API call failed; caller should stay in WATCH
         """
         if self.state.current_pr is None:
-            return False
+            return FeedbackCheckResult.NONE
         last_activity = self._last_push_at
         if last_activity is None:
-            return True
+            return FeedbackCheckResult.NEW
         if last_activity.tzinfo is None:
             last_activity = last_activity.replace(tzinfo=timezone.utc)
         try:
@@ -2185,7 +2196,13 @@ return 0
                 f"{self.state.current_pr.number}/comments"
             ) or []
         except Exception:
-            return True
+            logger.warning(
+                "GitHub API error checking Codex feedback for PR #%s; "
+                "returning UNKNOWN",
+                self.state.current_pr.number,
+                exc_info=True,
+            )
+            return FeedbackCheckResult.UNKNOWN
         for c in reversed(comments + review_comments):
             user = (c.get("user") or {}).get("login", "")
             if "codex" not in user.lower():
@@ -2196,8 +2213,8 @@ return 0
             if created.tzinfo is None:
                 created = created.replace(tzinfo=timezone.utc)
             if created > last_activity:
-                return True
-        return False
+                return FeedbackCheckResult.NEW
+        return FeedbackCheckResult.NONE
 
     async def handle_error(self, error_context: str | None = None) -> None:
         """Ask the claude CLI whether to FIX, SKIP, or ESCALATE the error."""

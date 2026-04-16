@@ -282,7 +282,7 @@
 - Depends on: PR-046
 
 ## PR-048: Fail-closed for GitHub observation errors
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-048.md
 - Branch: pr-048-fail-closed-observation
 - Depends on: PR-047
