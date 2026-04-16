@@ -311,11 +311,23 @@
 - Branch: pr-052-empty-rollup-pending
 - Depends on: PR-046
 
+## PR-061: Split rate-limit thresholds into session and weekly
+- Status: TODO
+- Tasks file: tasks/PR-061.md
+- Branch: pr-061-rate-limit-thresholds
+- Depends on: PR-052
+
+## PR-062: PAUSED state for rate limit
+- Status: TODO
+- Tasks file: tasks/PR-062.md
+- Branch: pr-062-paused-state
+- Depends on: PR-061
+
 ## PR-053: Separate timeout from rate-limit in error handler
 - Status: TODO
 - Tasks file: tasks/PR-053.md
 - Branch: pr-053-timeout-classification
-- Depends on: PR-046
+- Depends on: PR-062
 
 ## PR-054: Bounded retry/backoff for transient command failures
 - Status: TODO
@@ -335,12 +347,6 @@
 - Branch: pr-056-review-status-parser
 - Depends on: PR-047
 
-## PR-057: Runner.py decomposition
-- Status: TODO
-- Tasks file: tasks/PR-057.md
-- Branch: pr-057-runner-decomposition
-- Depends on: PR-047, PR-048, PR-049, PR-050, PR-051, PR-052, PR-053, PR-054, PR-055, PR-056
-
 ## PR-058: Upload staging cleanup guards
 - Status: TODO
 - Tasks file: tasks/PR-058.md
@@ -352,3 +358,15 @@
 - Tasks file: tasks/PR-059.md
 - Branch: pr-059-agents-update
 - Depends on: PR-046
+
+## PR-060: Settings UX - inline hints and logical grouping
+- Status: TODO
+- Tasks file: tasks/PR-060.md
+- Branch: pr-060-settings-ux
+- Depends on: PR-046
+
+## PR-057: Runner.py decomposition
+- Status: TODO
+- Tasks file: tasks/PR-057.md
+- Branch: pr-057-runner-decomposition
+- Depends on: PR-053, PR-054, PR-055, PR-056, PR-058, PR-059, PR-060, PR-061, PR-062
