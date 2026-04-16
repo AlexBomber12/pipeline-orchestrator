@@ -1643,6 +1643,18 @@ return 0
                 self.log_event(self.state.error_message)
                 return
 
+        # Capture HEAD before running Claude so we can detect whether a
+        # commit actually happened (PR-050).
+        head_before = ""
+        try:
+            head_before = _git(
+                self.repo_path, "rev-parse", "HEAD"
+            ).stdout.strip()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            # Empty string falls through: the post-check will then treat any
+            # resolvable HEAD as "changed" (safer bias than treating as no-op).
+            pass
+
         idle_limit = self.app_config.daemon.fix_idle_timeout_sec
         pr_number = (
             self.state.current_pr.number if self.state.current_pr else 0
@@ -1682,6 +1694,33 @@ return 0
             self.log_event(f"fix_review failed: {self.state.error_message}")
             return
 
+        # Verify HEAD actually moved before treating as a push (PR-050).
+        head_after = ""
+        try:
+            head_after = _git(
+                self.repo_path, "rev-parse", "HEAD"
+            ).stdout.strip()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = f"rev-parse after fix failed: {exc}"
+            self.log_event(self.state.error_message)
+            return
+
+        if head_before and head_before == head_after:
+            # Advance the feedback baseline so that the existing Codex
+            # CHANGES_REQUESTED comment is no longer considered "new" by
+            # _has_new_codex_feedback_since_last_push().  Without this,
+            # a no-op FIX (no commit) would leave _last_push_at stale
+            # and handle_watch would re-enter handle_fix on the next poll.
+            self._last_push_at = datetime.now(timezone.utc)
+            self.state.state = PipelineState.WATCH
+            self.log_event(
+                "FIX REVIEW exited 0 but HEAD unchanged; "
+                "no push, skipping @codex review"
+            )
+            return
+
+        # HEAD moved: proceed with push accounting and post @codex review.
         push_time = datetime.now(timezone.utc)
         self._last_push_at = push_time
         if self.state.current_pr is not None:
