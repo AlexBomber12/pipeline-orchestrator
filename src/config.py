@@ -43,13 +43,13 @@ class RepoConfig(BaseModel):
     # custom value.
     review_timeout_min: int | None = None
     active: bool = True
-    poll_interval_sec: int | None = None
+    poll_interval_sec: int = 60
 
     @field_validator("poll_interval_sec", mode="before")
     @classmethod
-    def _poll_interval_at_least_one(cls, v: Any) -> int | None:
+    def _poll_interval_at_least_one(cls, v: Any) -> int:
         if v is None:
-            return None
+            return 60
         if not isinstance(v, int) or isinstance(v, bool):
             raise ValueError("poll_interval_sec must be an integer")
         if v < 1:

@@ -210,8 +210,7 @@ async def main() -> None:
                     )
                 continue
             now = time.monotonic()
-            repo_poll = runner.repo_config.poll_interval_sec
-            interval = repo_poll if repo_poll is not None else config.daemon.poll_interval_sec
+            interval = runner.repo_config.poll_interval_sec
             if key in last_run and now - last_run[key] < interval:
                 continue
             last_run[key] = now
@@ -232,9 +231,7 @@ async def main() -> None:
         for key, runner in runners.items():
             if not runner.repo_config.active:
                 continue
-            repo_poll = runner.repo_config.poll_interval_sec
-            interval = repo_poll if repo_poll is not None else config.daemon.poll_interval_sec
-            due_in = (last_run.get(key, 0.0) + interval) - now_after
+            due_in = (last_run.get(key, 0.0) + runner.repo_config.poll_interval_sec) - now_after
             remaining.append(max(due_in, 0.0))
         tick = min(remaining) if remaining else config.daemon.poll_interval_sec
         tick = min(tick, config.daemon.poll_interval_sec)
