@@ -1365,7 +1365,10 @@ return 0
         # Window expired: resume to appropriate state
         self.state.rate_limited_until = None
         self._error_diagnose_count = 0
-        if (
+        if self.state.error_message:
+            self.state.state = PipelineState.ERROR
+            self.log_event("Rate limit expired, resuming -> ERROR (preserved context)")
+        elif (
             self.state.current_pr is not None
             and self.state.current_task is not None
             and self.state.current_pr.branch == self.state.current_task.branch
@@ -2383,7 +2386,7 @@ return 0
         self._detect_rate_limit(stderr)
         if self.state.rate_limited_until is not None:
             self.state.state = PipelineState.PAUSED
-            self.state.error_message = None
+            # Preserve error_message so handle_paused resumes to ERROR
             self.log_event(
                 f"Rate limit pause active until "
                 f"{self.state.rate_limited_until.isoformat()}"

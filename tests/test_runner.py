@@ -3974,6 +3974,48 @@ def test_handle_error_skips_diagnose_for_timeout(
     assert cli_calls == []
 
 
+def test_handle_error_preserves_error_message_on_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When diagnose_error_async is rate-limited, error_message is preserved."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "diagnose_error_async",
+        _async_cli_result_with_side_effect([], "diagnose", 1, "", "Error: 429 Too Many Requests"),
+    )
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Build failed: missing dependency X"
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.error_message == "Build failed: missing dependency X"
+
+
+def test_handle_paused_resumes_to_error_when_error_message_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Window expired with error_message set -> ERROR so fault is retried."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+    runner.state.error_message = "Build failed: missing dependency X"
+    runner.state.current_pr = PRInfo(number=50, branch="pr-050")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-050", title="test", branch="pr-050", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "Build failed: missing dependency X"
+    assert runner.state.rate_limited_until is None
+
+
 def test_detect_rate_limit_sets_pause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
