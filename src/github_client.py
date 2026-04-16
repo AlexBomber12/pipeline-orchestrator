@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timezone
 
 from src.models import CIStatus, PRInfo, ReviewStatus
+from src.retry import retry_transient
 
 _REPO_URL_RE = re.compile(
     r"github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"
@@ -570,8 +571,15 @@ def _gh_api_paginated(path: str) -> list[dict] | None:
     which is not parseable as a single document. The pages are then flattened
     into a single list of items. Returns ``None`` if the response is not a
     list (which would indicate an unexpected ``gh`` output).
+
+    Wraps the underlying ``run_gh`` call with ``retry_transient`` so
+    transient network errors (connection reset, 502/503/504, timeout) are
+    retried up to 3 times with exponential backoff before propagating.
     """
-    raw = run_gh(["api", "--paginate", "--slurp", path])
+    raw = retry_transient(
+        lambda: run_gh(["api", "--paginate", "--slurp", path]),
+        operation_name=f"gh api {path}",
+    )
     if not isinstance(raw, list):
         return None
 

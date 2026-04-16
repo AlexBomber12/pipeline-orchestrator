@@ -4895,3 +4895,71 @@ def test_handle_error_timeout_has_distinct_log(
     log_msgs = [e["event"] for e in runner.state.history]
     assert any("timeout error" in m for m in log_msgs)
     assert not any("rate-limit" in m for m in log_msgs)
+
+
+# --- retry integration tests (PR-054) ---
+
+
+def test_sync_to_main_retries_fetch_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """sync_to_main retries git fetch on transient TimeoutExpired."""
+    calls: list[tuple] = []
+
+    def fake_git(repo_path: str, *args: str, **kw: Any) -> _FakeCompletedProcess:
+        calls.append(args)
+        if args[0] == "fetch" and len(calls) == 1:
+            raise subprocess.TimeoutExpired(cmd=["git", "fetch"], timeout=60)
+        return _FakeCompletedProcess(args=list(args), returncode=0)
+
+    monkeypatch.setattr(runner_module, "_git", fake_git)
+    monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
+
+    runner = _make_runner()
+    runner.sync_to_main()
+
+    fetch_calls = [c for c in calls if c[0] == "fetch"]
+    assert len(fetch_calls) == 2
+
+
+def test_sync_to_main_fails_after_retries_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """sync_to_main propagates RuntimeError after retries exhausted."""
+
+    def fake_git(repo_path: str, *args: str, **kw: Any) -> _FakeCompletedProcess:
+        if args[0] == "fetch":
+            raise subprocess.TimeoutExpired(cmd=["git", "fetch"], timeout=60)
+        return _FakeCompletedProcess(args=list(args), returncode=0)
+
+    monkeypatch.setattr(runner_module, "_git", fake_git)
+    monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
+
+    runner = _make_runner()
+    with pytest.raises(RuntimeError, match="failed after 3 attempts"):
+        runner.sync_to_main()
+
+
+def test_git_checkout_does_not_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local git operations (checkout) are NOT wrapped in retry."""
+    calls: list[tuple] = []
+
+    def fake_git(repo_path: str, *args: str, **kw: Any) -> _FakeCompletedProcess:
+        calls.append(args)
+        if args[0] == "checkout":
+            raise subprocess.CalledProcessError(
+                1, ["git", "checkout"], stderr="error: pathspec 'foo' did not match"
+            )
+        return _FakeCompletedProcess(args=list(args), returncode=0)
+
+    monkeypatch.setattr(runner_module, "_git", fake_git)
+    monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
+
+    runner = _make_runner()
+    with pytest.raises(subprocess.CalledProcessError):
+        runner.sync_to_main()
+
+    checkout_calls = [c for c in calls if c[0] == "checkout"]
+    assert len(checkout_calls) == 1

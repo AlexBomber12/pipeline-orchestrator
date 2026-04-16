@@ -330,7 +330,7 @@
 - Depends on: PR-062
 
 ## PR-054: Bounded retry/backoff for transient command failures
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-054.md
 - Branch: pr-054-transient-retry
 - Depends on: PR-053

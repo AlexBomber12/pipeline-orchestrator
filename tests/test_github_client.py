@@ -1257,3 +1257,49 @@ def test_ci_status_non_list_returns_pending() -> None:
     assert _ci_status_from_rollup(None) == CIStatus.PENDING
     assert _ci_status_from_rollup({}) == CIStatus.PENDING
     assert _ci_status_from_rollup(None, empty_is_success=True) == CIStatus.PENDING
+
+
+# ---------------------------------------------------------------------------
+# retry integration tests (PR-054)
+# ---------------------------------------------------------------------------
+
+
+def test_gh_api_paginated_retries_on_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_gh_api_paginated retries on transient 503 then succeeds."""
+    from src.github_client import _gh_api_paginated
+
+    calls: list[int] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(1)
+        if len(calls) == 1:
+            raise subprocess.CalledProcessError(
+                1, cmd, stderr="HTTP 503 Service Unavailable"
+            )
+        return _FakeCompletedProcess(
+            stdout='[[{"id": 1}]]',
+            returncode=0,
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
+
+    result = _gh_api_paginated("repos/test/owner/issues/1/comments")
+    assert result == [{"id": 1}]
+    assert len(calls) == 2
+
+
+def test_gh_api_paginated_fails_after_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_gh_api_paginated raises RuntimeError after all retries exhausted."""
+    from src.github_client import _gh_api_paginated
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        raise subprocess.CalledProcessError(
+            1, cmd, stderr="503 Service Unavailable"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="failed after 3 attempts"):
+        _gh_api_paginated("repos/test/owner/issues/1/comments")
