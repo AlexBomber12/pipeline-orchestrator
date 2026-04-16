@@ -920,6 +920,35 @@ def test_partial_auth_status_renders_status_dots(
     assert "not logged in" in body
 
 
+def test_settings_repo_list_shows_no_ci_merge_checkbox(
+    one_repo_config: Path,
+) -> None:
+    """The settings repo list must render a checkbox for allow_merge_without_checks."""
+    with TestClient(app) as client:
+        response = client.get("/partials/settings/repo-list")
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'name="allow_merge_without_checks"' in body
+    assert "No CI merge" in body
+
+
+def test_put_repo_updates_allow_merge_without_checks(
+    one_repo_config: Path,
+) -> None:
+    """The PUT handler must accept and persist allow_merge_without_checks."""
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/repos",
+            params={"url": "https://github.com/example/alpha.git"},
+            data={"allow_merge_without_checks": "true"},
+        )
+
+    assert response.status_code == 200
+    cfg = load_config(str(one_repo_config))
+    assert cfg.repositories[0].allow_merge_without_checks is True
+
+
 def test_update_daemon_rate_limit(
     empty_config: Path,
     monkeypatch: pytest.MonkeyPatch,

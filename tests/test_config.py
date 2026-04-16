@@ -402,3 +402,36 @@ def test_repo_poll_interval_rejects_negative() -> None:
 def test_repo_poll_interval_rejects_float() -> None:
     with pytest.raises(ValueError, match="must be an integer"):
         RepoConfig(url="https://github.com/example/repo", poll_interval_sec=1.9)
+
+
+def test_repo_allow_merge_without_checks_default() -> None:
+    repo = RepoConfig(url="https://github.com/example/repo")
+    assert repo.allow_merge_without_checks is False
+
+
+def test_repo_allow_merge_without_checks_loads_from_yaml(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/repo\n"
+        "    allow_merge_without_checks: true\n",
+        encoding="utf-8",
+    )
+    cfg = load_config(str(cfg_path))
+    assert cfg.repositories[0].allow_merge_without_checks is True
+
+
+def test_update_repository_allow_merge_without_checks(tmp_path: Path) -> None:
+    path = tmp_path / "config.yml"
+    save_config(AppConfig(), str(path))
+    add_repository("https://github.com/octo/alpha.git", str(path))
+
+    cfg = update_repository(
+        "https://github.com/octo/alpha.git",
+        str(path),
+        allow_merge_without_checks=True,
+    )
+    assert cfg.repositories[0].allow_merge_without_checks is True
+
+    reloaded = load_config(str(path))
+    assert reloaded.repositories[0].allow_merge_without_checks is True

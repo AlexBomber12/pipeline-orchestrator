@@ -90,7 +90,7 @@ def test_recover_doing_task_with_matching_pr_recovers_to_watch(
         review_status=ReviewStatus.PENDING,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [matching_pr]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [matching_pr]
     )
 
     coding_called = False
@@ -138,7 +138,7 @@ def test_recover_state_sets_queue_counters(
         review_status=ReviewStatus.PENDING,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [matching_pr]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [matching_pr]
     )
 
     runner = _make_runner()
@@ -156,7 +156,7 @@ def test_recover_doing_task_without_pr_rerun_coding(
     """DOING task + no matching PR -> CODING + re-run handle_coding()."""
     task = _doing_task()
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: []
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
     )
 
     coding_calls: list[PipelineState] = []
@@ -197,7 +197,7 @@ def test_recover_preserves_crashed_run_commits_before_coding(
     """
     task = _doing_task()
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: []
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
     )
 
     events: list[str] = []
@@ -254,7 +254,7 @@ def test_recover_preserve_tolerates_missing_local_branch(
     no-op rather than failing recovery."""
     task = _doing_task()
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: []
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
     )
 
     pushes: list[list[str]] = []
@@ -305,7 +305,7 @@ def test_recover_preserve_refuses_base_branch(
         branch="main",  # Same as the repo's base branch.
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: []
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
     )
 
     pushes: list[list[str]] = []
@@ -358,7 +358,7 @@ def test_recover_aborts_when_preserve_push_fails(
     work). Stop in ERROR so an operator can intervene."""
     task = _doing_task()
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: []
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
     )
 
     coding_ran: list[bool] = []
@@ -417,7 +417,7 @@ def test_recover_no_doing_with_done_matched_pr_recovers_to_watch(
         review_status=ReviewStatus.APPROVED,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [done_pr]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [done_pr]
     )
 
     runner = _make_runner()
@@ -459,7 +459,7 @@ def test_recover_no_doing_with_todo_matched_pr_recovers_to_watch(
         review_status=ReviewStatus.PENDING,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [in_flight]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [in_flight]
     )
 
     runner = _make_runner()
@@ -499,7 +499,7 @@ def test_recover_unrelated_open_pr_stays_idle(
     )
     unrelated = PRInfo(number=99, branch="dependabot/npm/foo")
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [unrelated]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [unrelated]
     )
 
     runner = _make_runner()
@@ -531,7 +531,7 @@ def test_recover_attaches_only_to_done_matched_pr_among_many(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [unrelated_first, matching, unrelated_last],
+        lambda repo, **kw: [unrelated_first, matching, unrelated_last],
     )
 
     runner = _make_runner()
@@ -550,7 +550,7 @@ def test_recover_no_doing_no_prs_stays_idle(
 ) -> None:
     """Clean slate: no DOING tasks and no open PRs -> stays IDLE."""
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: []
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
     )
 
     runner = _make_runner()
@@ -576,7 +576,7 @@ def test_recover_clean_slate_resets_prior_error_state(
     True, run_cycle would publish the still-ERROR state, and (with
     error_handler_use_ai disabled) the queue would never progress."""
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: []
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
     )
 
     runner = _make_runner()
@@ -604,7 +604,7 @@ def test_recover_clean_slate_resets_error_with_unrelated_prs_present(
     from any prior ERROR state, not just the strictly empty-PR case."""
     unrelated = PRInfo(number=77, branch="dependabot/npm/foo")
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [unrelated]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [unrelated]
     )
 
     runner = _make_runner()
@@ -629,7 +629,7 @@ def test_recover_get_open_prs_failure_sets_error(
     picking up a new task that might collide with an unknown in-flight
     PR)."""
 
-    def boom(repo: str) -> list[PRInfo]:
+    def boom(repo: str, **kw: Any) -> list[PRInfo]:
         raise RuntimeError("gh auth token expired")
 
     monkeypatch.setattr(runner_module.github_client, "get_open_prs", boom)
@@ -700,7 +700,7 @@ def test_run_cycle_recovered_watch_does_not_dispatch_handle_watch(
         review_status=ReviewStatus.CHANGES_REQUESTED,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [recovered_pr]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [recovered_pr]
     )
 
     async def noop_ensure() -> None:
@@ -753,7 +753,7 @@ def test_run_cycle_recovered_idle_does_not_dispatch_handle_idle(
     discovers' contract. The next cycle's handle_idle will sync_to_main
     and pick up the next task normally."""
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: []
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
     )
 
     async def noop_ensure() -> None:
@@ -800,7 +800,7 @@ def test_run_cycle_dirty_tree_does_not_clobber_recovered_watch(
         review_status=ReviewStatus.PENDING,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: [matching_pr]
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [matching_pr]
     )
 
     async def noop_ensure() -> None:
@@ -853,7 +853,7 @@ def test_run_cycle_transient_discovery_failure_stays_retryable(
 
     probe_calls: list[int] = []
 
-    def probe(repo: str) -> list[PRInfo]:
+    def probe(repo: str, **kw: Any) -> list[PRInfo]:
         probe_calls.append(1)
         if len(probe_calls) == 1:
             raise RuntimeError("gh api rate limited")
@@ -901,7 +901,7 @@ def test_run_cycle_coding_failure_during_recovery_is_not_retried(
     belongs to the normal ERROR path, not to a second recovery attempt."""
     task = _doing_task()
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo: []
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
     )
 
     coding_calls: list[int] = []
@@ -1105,7 +1105,7 @@ def test_recover_state_queue_read_failure_sets_error_and_returns_false(
     # get_open_prs is irrelevant here — we must bail before reaching it.
     gh_calls: list[str] = []
 
-    def spy_gh(repo: str) -> list[PRInfo]:
+    def spy_gh(repo: str, **kw: Any) -> list[PRInfo]:
         gh_calls.append(repo)
         return []
 

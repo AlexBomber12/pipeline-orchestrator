@@ -734,7 +734,10 @@ class PipelineRunner:
         doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
 
         try:
-            prs = github_client.get_open_prs(self.owner_repo)
+            prs = github_client.get_open_prs(
+                self.owner_repo,
+                allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+            )
         except Exception as exc:
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"recover_state: get_open_prs failed: {exc}"
@@ -1236,7 +1239,10 @@ return 0
         if task is None:
             self.log_event("No tasks available")
             try:
-                prs = github_client.get_open_prs(self.owner_repo)
+                prs = github_client.get_open_prs(
+                    self.owner_repo,
+                    allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+                )
             except Exception as exc:
                 self.log_event(f"IDLE: open PR check failed: {exc}")
                 self.state.current_pr = None
@@ -1264,7 +1270,10 @@ return 0
 
         if task_branch:
             try:
-                prs = github_client.get_open_prs(self.owner_repo)
+                prs = github_client.get_open_prs(
+                    self.owner_repo,
+                    allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+                )
                 existing = next(
                     (p for p in prs if p.branch == task_branch), None
                 )
@@ -1398,7 +1407,10 @@ return 0
         candidate = None
         for attempt in range(3):
             try:
-                prs = github_client.get_open_prs(self.owner_repo)
+                prs = github_client.get_open_prs(
+                    self.owner_repo,
+                    allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+                )
             except Exception as exc:
                 self.state.state = PipelineState.ERROR
                 self.state.error_message = f"get_open_prs failed: {exc}"
@@ -1438,7 +1450,10 @@ return 0
             return
 
         try:
-            prs = github_client.get_open_prs(self.owner_repo)
+            prs = github_client.get_open_prs(
+                self.owner_repo,
+                allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+            )
         except Exception as exc:
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"get_open_prs failed: {exc}"
