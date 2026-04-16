@@ -300,6 +300,89 @@ def test_latest_codex_review_state_overrides_older_approval(
     )
 
 
+def test_review_api_errors_do_not_block_reaction_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-404 review API failures should fall back to reactions/comments."""
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = _find_api_path(cmd)
+        if path.endswith("/pulls/42/reviews"):
+            return _FakeCompletedProcess(
+                stderr="HTTP 403 rate limit exceeded", returncode=1
+            )
+        if path.endswith("/issues/42/reactions"):
+            data = [
+                {
+                    "content": "+1",
+                    "user": {"login": "chatgpt-codex-bot"},
+                    "created_at": "2026-01-03T00:00:00Z",
+                }
+            ]
+        elif _is_commits_path(cmd):
+            return _FakeCompletedProcess(stdout="2026-01-01T00:00:00Z")
+        elif "issues" in path and path.endswith("/comments"):
+            data = [[]]
+        elif "pulls" in path and path.endswith("/comments"):
+            data = [[]]
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
+        )
+        == ReviewStatus.APPROVED
+    )
+
+
+def test_review_api_approved_does_not_trust_unknown_head_commit_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unknown head commit time must not approve a mismatched review SHA."""
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if _is_commits_path(cmd):
+            return _FakeCompletedProcess(stderr="boom", returncode=1)
+        path = _find_api_path(cmd)
+        if path.endswith("/pulls/42/reviews"):
+            data = [
+                [
+                    {
+                        "user": {"login": "chatgpt-codex-bot"},
+                        "state": "APPROVED",
+                        "commit_id": "oldsha1111",
+                        "submitted_at": "2026-01-02T00:00:00Z",
+                    }
+                ]
+            ]
+        elif "issues" in path and path.endswith("/comments"):
+            data = [[]]
+        elif "pulls" in path and path.endswith("/comments"):
+            data = [[]]
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
+        )
+        == ReviewStatus.PENDING
+    )
+
+
 def test_get_pr_review_status_skips_teammate_comment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

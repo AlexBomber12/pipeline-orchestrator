@@ -226,9 +226,7 @@ def _compute_review_status(
     head_commit_time = _get_commit_time(repo, head_sha) if head_sha else None
     try:
         review_info = _get_codex_review_signals(repo, pr_number)
-    except RuntimeError as exc:
-        if "HTTP 404" not in str(exc):
-            raise
+    except RuntimeError:
         review_info = {
             "latest_sha": "",
             "latest_time": None,
@@ -243,7 +241,10 @@ def _compute_review_status(
             body_approved = True
         elif latest_review_sha and latest_review_sha == head_sha:
             body_approved = True
-        elif head_commit_time is None or latest_review_time >= head_commit_time:
+        elif (
+            head_commit_time is not None
+            and latest_review_time >= head_commit_time
+        ):
             body_approved = True
 
     try:
