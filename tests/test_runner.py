@@ -235,7 +235,7 @@ def test_handle_idle_no_tasks_leaves_state_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = _patch_subprocess(monkeypatch)
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [])
     monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
 
     runner = _make_runner()
@@ -281,7 +281,7 @@ def test_handle_idle_picks_task_and_drives_coding(
         status=TaskStatus.TODO,
         branch="pr-042-sample",
     )
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [task])
     monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: task)
 
     claude_calls: list[str] = []
@@ -343,7 +343,7 @@ def test_handle_idle_sets_queue_counters_with_mixed_statuses(
         QueueTask(pr_id="PR-002", title="Done2", status=TaskStatus.DONE, branch="pr-002"),
         QueueTask(pr_id="PR-003", title="Todo", status=TaskStatus.TODO, branch="pr-003"),
     ]
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: tasks)
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: tasks)
     monkeypatch.setattr(runner_module, "get_next_task", lambda t: tasks[2])
     monkeypatch.setattr(
         runner_module.claude_cli,
@@ -389,7 +389,7 @@ def test_handle_idle_attaches_to_existing_pr_instead_of_coding(
         status=TaskStatus.TODO,
         branch="pr-042-sample",
     )
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [task])
     monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: task)
 
     existing_pr = PRInfo(
@@ -439,7 +439,7 @@ def test_handle_idle_proceeds_to_coding_when_no_matching_pr(
         status=TaskStatus.TODO,
         branch="pr-042-sample",
     )
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [task])
     monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: task)
 
     # Guard returns no matching PR; handle_coding's call returns the PR.
@@ -483,7 +483,7 @@ def test_handle_idle_defers_on_gh_failure(
         status=TaskStatus.TODO,
         branch="pr-042-sample",
     )
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [task])
     monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: task)
 
     def _exploding_get_open_prs(repo: str, **kw: Any) -> list[PRInfo]:
@@ -2039,7 +2039,7 @@ def test_run_cycle_resets_stale_transient_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_subprocess(monkeypatch, stdout="")
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [])
     monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo, **kw: []
@@ -2641,7 +2641,7 @@ def test_handle_idle_no_tasks_but_open_pr_sets_current_pr(
         status=TaskStatus.DONE,
         branch="pr-001-done",
     )
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [done_task])
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [done_task])
     monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
 
     open_pr = PRInfo(
@@ -2667,7 +2667,7 @@ def test_handle_idle_no_tasks_no_open_prs_clears_current_pr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_subprocess(monkeypatch)
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [])
     monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo, **kw: []
@@ -2686,7 +2686,7 @@ def test_handle_idle_no_tasks_does_not_change_state_from_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_subprocess(monkeypatch)
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [])
     monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
 
     open_pr = PRInfo(number=7, branch="feature-x")
@@ -2706,7 +2706,7 @@ def test_handle_idle_open_pr_check_survives_github_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_subprocess(monkeypatch)
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [])
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [])
     monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
     monkeypatch.setattr(
         runner_module.github_client,

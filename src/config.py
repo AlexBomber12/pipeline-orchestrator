@@ -73,6 +73,7 @@ class DaemonConfig(BaseModel):
     planned_pr_timeout_sec: int = 900
     rate_limit_session_pause_percent: int = 95
     rate_limit_weekly_pause_percent: int = 100
+    strict_queue_validation: bool = True
 
 
 class WebConfig(BaseModel):

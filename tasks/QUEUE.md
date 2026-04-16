@@ -336,7 +336,7 @@
 - Depends on: PR-053
 
 ## PR-055: Strict queue validation
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-055.md
 - Branch: pr-055-queue-validation
 - Depends on: PR-046

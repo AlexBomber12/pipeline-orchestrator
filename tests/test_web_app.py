@@ -617,3 +617,97 @@ def test_index_shows_error_on_decode_failure(
     body = response.text
     assert "State decode failed" in body
     assert "stale" in body
+
+
+# ---------------------------------------------------------------------------
+# Upload queue validation tests
+# ---------------------------------------------------------------------------
+
+
+class _UploadRedisClient:
+    """Fake Redis that returns IDLE state for ``pipeline:{name}`` and
+    accepts ``set`` calls for the upload staging manifest."""
+
+    def __init__(self, name: str) -> None:
+        now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
+        idle = RepoState(
+            url=f"https://github.com/example/{name}.git",
+            name=f"example__{name}",
+            state=PipelineState.IDLE,
+            last_updated=now,
+        )
+        self._store = {f"pipeline:example__{name}": idle.model_dump_json()}
+
+    async def ping(self) -> bool:
+        return True
+
+    async def get(self, key: str) -> str | None:
+        return self._store.get(key)
+
+    async def set(self, key: str, value: str, **kw: object) -> None:
+        self._store[key] = value
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _UploadAioredis:
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def from_url(self, url: str, decode_responses: bool = True) -> _UploadRedisClient:
+        return _UploadRedisClient(self._name)
+
+
+def test_upload_rejects_queue_with_duplicate_pr_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories:\n  - url: https://github.com/example/alpha.git\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(web_app, "aioredis", _UploadAioredis("alpha"))
+    monkeypatch.setattr(web_app, "REPOS_DIR", str(tmp_path / "repos"))
+    monkeypatch.setattr(web_app, "UPLOADS_DIR", str(tmp_path / "uploads"))
+    (tmp_path / "repos" / "example__alpha").mkdir(parents=True)
+
+    queue_content = (
+        "## PR-001: First\n- Status: DONE\n- Branch: pr-001\n\n"
+        "## PR-001: Duplicate\n- Status: TODO\n- Branch: pr-001-dup\n"
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[("files", ("QUEUE.md", queue_content.encode(), "text/markdown"))],
+        )
+    assert response.status_code == 400
+    assert "duplicate pr_id" in response.text
+
+
+def test_upload_rejects_queue_with_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories:\n  - url: https://github.com/example/alpha.git\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(web_app, "aioredis", _UploadAioredis("alpha"))
+    monkeypatch.setattr(web_app, "REPOS_DIR", str(tmp_path / "repos"))
+    monkeypatch.setattr(web_app, "UPLOADS_DIR", str(tmp_path / "uploads"))
+    (tmp_path / "repos" / "example__alpha").mkdir(parents=True)
+
+    queue_content = (
+        "## PR-A: First\n- Status: TODO\n- Branch: pr-a\n- Depends on: PR-B\n\n"
+        "## PR-B: Second\n- Status: TODO\n- Branch: pr-b\n- Depends on: PR-A\n"
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[("files", ("QUEUE.md", queue_content.encode(), "text/markdown"))],
+        )
+    assert response.status_code == 400
+    assert "dependency cycle" in response.text

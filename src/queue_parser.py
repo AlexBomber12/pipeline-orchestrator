@@ -10,6 +10,18 @@ from src.models import QueueTask, TaskStatus
 
 logger = logging.getLogger(__name__)
 
+
+class QueueValidationError(ValueError):
+    """Raised when queue contents cannot be unambiguously parsed."""
+
+    def __init__(self, issues: list[str]):
+        self.issues = issues
+        super().__init__(
+            "Queue validation failed:\n"
+            + "\n".join(f"  - {i}" for i in issues)
+        )
+
+
 _HEADER_RE = re.compile(r"^##\s+(PR-[A-Za-z0-9_.-]+):\s*(.+?)\s*$")
 _FIELD_RE = re.compile(r"^-\s*([A-Za-z ]+?)\s*:\s*(.*?)\s*$")
 _STATUS_LINE_RE = re.compile(
@@ -17,18 +29,25 @@ _STATUS_LINE_RE = re.compile(
 )
 
 
-def parse_queue(queue_path: str) -> list[QueueTask]:
+def parse_queue(
+    queue_path: str, *, strict: bool = False
+) -> list[QueueTask]:
     """Parse a QUEUE.md file and return its tasks in document order.
 
-    Returns an empty list if the file does not exist.
+    Returns an empty list if the file does not exist.  When *strict* is
+    ``True``, unknown status values raise ``QueueValidationError`` instead
+    of degrading to TODO, and the parsed queue is validated for duplicates,
+    missing dependencies, and cycles.
     """
     path = Path(queue_path)
     if not path.is_file():
         return []
-    return parse_queue_text(path.read_text(encoding="utf-8"))
+    return parse_queue_text(path.read_text(encoding="utf-8"), strict=strict)
 
 
-def parse_queue_text(text: str) -> list[QueueTask]:
+def parse_queue_text(
+    text: str, *, strict: bool = False
+) -> list[QueueTask]:
     """Parse QUEUE.md content from an in-memory string.
 
     Same grammar as ``parse_queue``; split out so callers that already
@@ -36,9 +55,14 @@ def parse_queue_text(text: str) -> list[QueueTask]:
     reading it from ``origin/{branch}`` via ``git show`` to avoid a
     destructive checkout/reset during recovery — can parse it without
     writing anything back to the working tree.
+
+    When *strict* is ``True``, unknown status values are collected and
+    raised as a ``QueueValidationError`` after parsing, and the parsed
+    queue is also run through ``validate_queue``.
     """
     tasks: list[QueueTask] = []
     current: dict | None = None
+    strict_issues: list[str] = []
 
     for raw_line in text.splitlines():
         line = raw_line.rstrip()
@@ -70,6 +94,11 @@ def parse_queue_text(text: str) -> list[QueueTask]:
             raw_status = value.upper()
             if raw_status in {s.value for s in TaskStatus}:
                 current["status"] = TaskStatus(raw_status)
+            elif strict:
+                strict_issues.append(
+                    f"unknown status {value!r} for {current['pr_id']}"
+                )
+                current["status"] = TaskStatus.TODO
             else:
                 logger.warning(
                     "Unknown status %r for %s, treating as TODO",
@@ -88,6 +117,9 @@ def parse_queue_text(text: str) -> list[QueueTask]:
 
     if current is not None:
         tasks.append(_build_task(current))
+
+    if strict:
+        validate_queue(tasks, _extra_issues=strict_issues)
 
     return tasks
 
@@ -179,6 +211,93 @@ def mark_task_done(content: str, pr_id: str) -> str | None:
         assert match is not None
         lines[i] = f"{match.group(1)}DONE{ending}"
     return "".join(lines)
+
+
+def validate_queue(
+    tasks: list[QueueTask],
+    *,
+    _extra_issues: list[str] | None = None,
+) -> None:
+    """Raise ``QueueValidationError`` if the parsed queue is ambiguous.
+
+    Checks: no duplicate ``pr_id``, no duplicate ``branch``, all
+    dependencies reference known ``pr_id`` values, no dependency cycles.
+    ``_extra_issues`` is an internal hook for ``parse_queue_text`` to
+    forward status-parse errors collected during the parsing pass.
+    """
+    issues: list[str] = list(_extra_issues) if _extra_issues else []
+
+    # Duplicate pr_id
+    seen_ids: dict[str, int] = {}
+    for idx, task in enumerate(tasks, start=1):
+        if task.pr_id in seen_ids:
+            issues.append(
+                f"duplicate pr_id {task.pr_id!r} at task #{idx} "
+                f"(first seen at task #{seen_ids[task.pr_id]})"
+            )
+        else:
+            seen_ids[task.pr_id] = idx
+
+    # Duplicate branch
+    seen_branches: dict[str, str] = {}
+    for task in tasks:
+        if not task.branch:
+            continue
+        if task.branch in seen_branches:
+            issues.append(
+                f"duplicate branch {task.branch!r}: used by "
+                f"{seen_branches[task.branch]} and {task.pr_id}"
+            )
+        else:
+            seen_branches[task.branch] = task.pr_id
+
+    # Missing dependencies
+    known_ids = set(seen_ids.keys())
+    for task in tasks:
+        for dep in task.depends_on:
+            if dep not in known_ids:
+                issues.append(
+                    f"{task.pr_id} depends on unknown task {dep!r}"
+                )
+
+    # Cycle detection
+    cycle = _find_dependency_cycle(tasks)
+    if cycle:
+        issues.append("dependency cycle: " + " -> ".join(cycle))
+
+    if issues:
+        raise QueueValidationError(issues)
+
+
+def _find_dependency_cycle(tasks: list[QueueTask]) -> list[str] | None:
+    """Return cycle path if a dependency cycle exists, else None."""
+    graph = {t.pr_id: list(t.depends_on) for t in tasks}
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    path: list[str] = []
+
+    def dfs(node: str) -> list[str] | None:
+        if node in visited:
+            return None
+        if node in visiting:
+            idx = path.index(node) if node in path else 0
+            return path[idx:] + [node]
+        visiting.add(node)
+        path.append(node)
+        for neighbor in graph.get(node, []):
+            result = dfs(neighbor)
+            if result:
+                return result
+        path.pop()
+        visiting.remove(node)
+        visited.add(node)
+        return None
+
+    for pr_id in graph:
+        result = dfs(pr_id)
+        if result:
+            return result
+    return None
 
 
 def _build_task(data: dict) -> QueueTask:

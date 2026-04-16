@@ -37,6 +37,7 @@ from src.models import (
     TaskStatus,
 )
 from src.queue_parser import (
+    QueueValidationError,
     get_next_task,
     mark_task_done,
     parse_queue,
@@ -1266,7 +1267,14 @@ return 0
                 return
 
         queue_path = str(Path(self.repo_path) / "tasks" / "QUEUE.md")
-        tasks = parse_queue(queue_path)
+        strict = self.app_config.daemon.strict_queue_validation
+        try:
+            tasks = parse_queue(queue_path, strict=strict)
+        except QueueValidationError as exc:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = str(exc)
+            self.log_event(f"Queue validation failed: {exc}")
+            return
         self.state.queue_done = sum(
             1 for t in tasks if t.status == TaskStatus.DONE
         )
