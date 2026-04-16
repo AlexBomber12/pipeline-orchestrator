@@ -354,7 +354,7 @@
 - Depends on: PR-046
 
 ## PR-059: AGENTS.md update - artifacts and stale review
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-059.md
 - Branch: pr-059-agents-update
 - Depends on: PR-046
