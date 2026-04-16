@@ -116,7 +116,7 @@ def test_main_creates_one_runner_per_repo(
     names = [r.name for r in _FakeRunner.instances]
     assert names == ["octo__alpha", "octo__beta"]
     assert all(r.cycles == 1 for r in _FakeRunner.instances)
-    assert ctx["sleep_calls"] == [7]
+    assert ctx["sleep_calls"] == [1]
 
 
 def test_main_warns_when_no_repos_configured(
@@ -501,6 +501,8 @@ def test_per_repo_poll_interval(
     # clock: 0 (both run), +15 (fast runs, slow skipped), +30 (fast runs, slow skipped)
     assert fast.cycles == 3
     assert slow.cycles == 1
+    # Sleep should use the fastest repo interval (10), not the daemon default.
+    assert all(s == 10 for s in sleep_calls)
 
 
 def test_unpause_runs_immediately(
