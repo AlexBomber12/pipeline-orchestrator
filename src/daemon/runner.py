@@ -42,6 +42,7 @@ from src.queue_parser import (
     parse_queue,
     parse_queue_text,
 )
+from src.retry import retry_transient
 from src.utils import repo_slug_from_url
 
 logger = logging.getLogger(__name__)
@@ -492,7 +493,7 @@ class PipelineRunner:
             # ``git clone`` runs before ``self.repo_path`` exists, so it
             # cannot use ``_git`` (which sets ``cwd=repo_path`` and would
             # fail with ``FileNotFoundError`` before git is even invoked).
-            try:
+            def _do_clone() -> None:
                 subprocess.run(
                     ["git", "clone", self.repo_config.url, self.repo_path],
                     capture_output=True,
@@ -500,6 +501,8 @@ class PipelineRunner:
                     timeout=120,
                     check=True,
                 )
+            try:
+                retry_transient(_do_clone, operation_name="git clone")
             except subprocess.CalledProcessError as exc:
                 detail = (exc.stderr or exc.stdout or "").strip()
                 raise RuntimeError(f"git clone failed: {detail}") from exc
@@ -508,12 +511,15 @@ class PipelineRunner:
         else:
             fetch_missing_ref = False
             try:
-                _git(
-                    self.repo_path,
-                    "fetch",
-                    "origin",
-                    self.repo_config.branch,
-                    timeout=60,
+                retry_transient(
+                    lambda: _git(
+                        self.repo_path,
+                        "fetch",
+                        "origin",
+                        self.repo_config.branch,
+                        timeout=60,
+                    ),
+                    operation_name=f"git fetch origin {self.repo_config.branch}",
                 )
             except subprocess.CalledProcessError as exc:
                 detail = (exc.stderr or exc.stdout or "").strip()
@@ -649,7 +655,10 @@ class PipelineRunner:
         """
         branch = self.repo_config.branch
         try:
-            _git(self.repo_path, "fetch", "origin", branch, timeout=60)
+            retry_transient(
+                lambda: _git(self.repo_path, "fetch", "origin", branch, timeout=60),
+                operation_name=f"git fetch origin {branch}",
+            )
             _git(self.repo_path, "checkout", branch)
             _git(self.repo_path, "reset", "--hard", f"origin/{branch}")
             # ``git reset --hard`` only discards tracked-file changes;
@@ -1181,7 +1190,10 @@ return 0
                 combined = f"{commit_result.stderr}\n{commit_result.stdout}"
                 if "nothing to commit" not in combined:
                     raise RuntimeError(combined.strip())
-            _git(self.repo_path, "push", "origin", branch, timeout=60)
+            retry_transient(
+                lambda: _git(self.repo_path, "push", "origin", branch, timeout=60),
+                operation_name=f"git push origin {branch}",
+            )
             self.log_event(f"Pushed uploaded task files: {filenames}")
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
             logger.error("%s: upload git operations failed: %s", self.name, exc)
@@ -1722,11 +1734,14 @@ return 0
         ):
             branch = self.state.current_pr.branch
             try:
-                _git(
-                    self.repo_path,
-                    "fetch", "origin",
-                    f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
-                    timeout=60,
+                retry_transient(
+                    lambda: _git(
+                        self.repo_path,
+                        "fetch", "origin",
+                        f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+                        timeout=60,
+                    ),
+                    operation_name=f"git fetch origin {branch}",
                 )
                 _git(self.repo_path, "checkout", branch)
                 _git(self.repo_path, "reset", "--hard", f"origin/{branch}")
@@ -1734,6 +1749,7 @@ return 0
                 subprocess.CalledProcessError,
                 subprocess.TimeoutExpired,
                 OSError,
+                RuntimeError,
             ) as exc:
                 stderr = getattr(exc, "stderr", "") or ""
                 self.state.state = PipelineState.ERROR
@@ -1880,10 +1896,13 @@ return 0
                 # daemon restart + ``recover_state`` resuming WATCH)
                 # causes a non-fast-forward on push and blocks merge
                 # even when the remote PR is otherwise mergeable.
-                _git(
-                    self.repo_path,
-                    "fetch", "origin", base, pr_branch,
-                    timeout=60,
+                retry_transient(
+                    lambda: _git(
+                        self.repo_path,
+                        "fetch", "origin", base, pr_branch,
+                        timeout=60,
+                    ),
+                    operation_name=f"git fetch origin {base} {pr_branch}",
                 )
                 _git(self.repo_path, "checkout", pr_branch)
                 _git(
@@ -1945,10 +1964,13 @@ return 0
                     )
 
                 if sync_produced_commit:
-                    _git(
-                        self.repo_path,
-                        "push", "origin", pr_branch,
-                        timeout=60,
+                    retry_transient(
+                        lambda: _git(
+                            self.repo_path,
+                            "push", "origin", pr_branch,
+                            timeout=60,
+                        ),
+                        operation_name=f"git push origin {pr_branch}",
                     )
                     # The new commit invalidates any previously observed
                     # green/approved gate state (branch protection may
@@ -1981,7 +2003,7 @@ return 0
                         )
                     return
             except (subprocess.CalledProcessError,
-                    subprocess.TimeoutExpired, OSError) as exc:
+                    subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
                 self.state.state = PipelineState.ERROR
                 self.state.error_message = f"Pre-merge sync failed: {exc}"
                 self.log_event(self.state.error_message)
@@ -2027,7 +2049,10 @@ return 0
         self.state.pending_queue_sync_started_at = datetime.now(timezone.utc)
 
         try:
-            _git(self.repo_path, "fetch", "origin", base)
+            retry_transient(
+                lambda: _git(self.repo_path, "fetch", "origin", base),
+                operation_name=f"git fetch origin {base}",
+            )
             _git(self.repo_path, "checkout", base)
             _git(self.repo_path, "reset", "--hard", f"origin/{base}")
 
@@ -2064,10 +2089,13 @@ return 0
                 "falling back to remediation PR"
             )
             _git(self.repo_path, "checkout", "-B", remediation_branch)
-            _git(
-                self.repo_path,
-                "push", "--force-with-lease", "-u",
-                "origin", remediation_branch,
+            retry_transient(
+                lambda: _git(
+                    self.repo_path,
+                    "push", "--force-with-lease", "-u",
+                    "origin", remediation_branch,
+                ),
+                operation_name=f"git push origin {remediation_branch}",
             )
             github_client.run_gh(
                 ["pr", "create",
