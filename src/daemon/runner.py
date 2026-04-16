@@ -1106,6 +1106,13 @@ class PipelineRunner:
                     if head_ref == branch:
                         on_base = True
                     else:
+                        # Force-clean the tree so checkout can succeed even
+                        # after a crashed cycle left dirty state.  This is
+                        # safe: recovery already failed, so there is no
+                        # in-flight work to preserve.
+                        _git(self.repo_path, "reset", "--hard", "HEAD",
+                             check=False)
+                        _git(self.repo_path, "clean", "-fd", check=False)
                         _git(self.repo_path, "checkout", branch)
                         on_base = True
                 except Exception:
