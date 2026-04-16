@@ -44,6 +44,7 @@ from src.queue_parser import (
     parse_queue_text,
 )
 from src.retry import retry_transient
+from src.usage import OAuthUsageProvider
 from src.utils import repo_slug_from_url
 
 logger = logging.getLogger(__name__)
@@ -409,11 +410,27 @@ class PipelineRunner:
         # newer-but-wrong timestamp under the "only update if newer"
         # gate.
         self._last_push_at_pr_number: int | None = None
+        self._usage_provider = OAuthUsageProvider(
+            credentials_path=str(
+                Path(self.app_config.auth.claude_config_dir) / ".credentials.json"
+            ),
+            user_agent=self.app_config.daemon.usage_api_user_agent,
+            beta_header=self.app_config.daemon.usage_api_beta_header,
+            cache_ttl_sec=self.app_config.daemon.usage_api_cache_ttl_sec,
+        )
 
     async def publish_state(self) -> None:
         """Serialize ``self.state`` and write it to Redis."""
         self.state.active = self.repo_config.active
         self.state.last_updated = datetime.now(timezone.utc)
+        # Sync latest usage snapshot into state for dashboard display.
+        snap = self._usage_provider.fetch()
+        if snap is not None:
+            self.state.usage_session_percent = snap.session_percent
+            self.state.usage_session_resets_at = snap.session_resets_at
+            self.state.usage_weekly_percent = snap.weekly_percent
+            self.state.usage_weekly_resets_at = snap.weekly_resets_at
+        self.state.usage_api_degraded = self._usage_provider.consecutive_failures >= 10
         if not self.repo_config.active:
             data = self.state.model_dump()
             data["state"] = PipelineState.IDLE.value
@@ -1411,6 +1428,42 @@ return 0
         await self.publish_state()
         await self.handle_coding()
 
+    def _proactive_usage_check(self) -> bool:
+        """Return True if CLI calls are allowed, False if usage threshold breached.
+
+        Fail-open: returns True when the provider cannot reach the endpoint,
+        deferring to the reactive _detect_rate_limit on stderr after the CLI run.
+        """
+        snapshot = self._usage_provider.fetch()
+        if snapshot is None:
+            if self._usage_provider.consecutive_failures == 10:
+                self.log_event(
+                    "Usage API degraded (10 consecutive failures), "
+                    "falling back to reactive rate-limit detection"
+                )
+            return True
+        session_threshold = self.app_config.daemon.rate_limit_session_pause_percent
+        weekly_threshold = self.app_config.daemon.rate_limit_weekly_pause_percent
+        breached = None
+        resets_at = 0
+        if snapshot.session_percent >= session_threshold:
+            breached = "session"
+            resets_at = snapshot.session_resets_at
+        elif snapshot.weekly_percent >= weekly_threshold:
+            breached = "weekly"
+            resets_at = snapshot.weekly_resets_at
+        if breached is None:
+            return True
+        self.state.rate_limited_until = datetime.fromtimestamp(resets_at, tz=timezone.utc)
+        self.state.state = PipelineState.PAUSED
+        self.state.error_message = None
+        self.log_event(
+            f"Proactive pause: {breached} usage at "
+            f"{snapshot.session_percent if breached == 'session' else snapshot.weekly_percent}%, "
+            f"resumes at {self.state.rate_limited_until.isoformat()}"
+        )
+        return False
+
     def _check_rate_limit(self) -> bool:
         """Return True if CLI calls are allowed, False if rate-limited."""
         if self.state.rate_limited_until is not None:
@@ -1421,8 +1474,9 @@ return 0
                 self.log_event(f"Rate limited, resuming in {int(remaining)}s")
                 return False
             self.state.rate_limited_until = None
+            self._usage_provider.invalidate_cache()
             self.log_event("Rate limit window expired, resuming")
-        return True
+        return self._proactive_usage_check()
 
     def _detect_rate_limit(self, stderr: str) -> None:
         """Set rate-limit pause if stderr contains rate-limit signals."""

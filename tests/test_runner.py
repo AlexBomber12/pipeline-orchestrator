@@ -105,12 +105,39 @@ def _repo_cfg(**overrides: Any) -> RepoConfig:
     return RepoConfig(**base)
 
 
+class _FakeUsageProvider:
+    """Minimal stub for OAuthUsageProvider used by _make_runner and tests."""
+
+    def __init__(
+        self,
+        snapshot: object | None = None,
+        failures: int = 0,
+    ) -> None:
+        self._snapshot = snapshot
+        self._consecutive_failures = failures
+        self._invalidated = False
+
+    @property
+    def consecutive_failures(self) -> int:
+        return self._consecutive_failures
+
+    def fetch(self) -> object | None:
+        return self._snapshot
+
+    def invalidate_cache(self) -> None:
+        self._invalidated = True
+
+
 def _app_cfg(**daemon_overrides: Any) -> AppConfig:
     return AppConfig(repositories=[], daemon=DaemonConfig(**daemon_overrides))
 
 
 def _make_runner(**repo_overrides: Any) -> PipelineRunner:
-    return PipelineRunner(_repo_cfg(**repo_overrides), _app_cfg(), _FakeRedis())
+    runner = PipelineRunner(_repo_cfg(**repo_overrides), _app_cfg(), _FakeRedis())
+    # Replace the real OAuthUsageProvider with a no-op stub so tests
+    # don't make real HTTP requests or block the event loop.
+    runner._usage_provider = _FakeUsageProvider()
+    return runner
 
 
 def _patch_subprocess(
@@ -4963,3 +4990,128 @@ def test_git_checkout_does_not_retry(
 
     checkout_calls = [c for c in calls if c[0] == "checkout"]
     assert len(checkout_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Proactive usage check (PR-063)
+# ---------------------------------------------------------------------------
+
+
+def test_check_rate_limit_triggers_paused_when_session_over_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.usage import UsageSnapshot
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    snap = UsageSnapshot(
+        session_percent=96,
+        session_resets_at=9999999999,
+        weekly_percent=50,
+        weekly_resets_at=9999999999,
+        fetched_at=0,
+    )
+    runner._usage_provider = _FakeUsageProvider(snapshot=snap)
+    runner.app_config.daemon.rate_limit_session_pause_percent = 95
+
+    assert runner._check_rate_limit() is False
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.rate_limited_until is not None
+
+
+def test_check_rate_limit_triggers_paused_when_weekly_over_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.usage import UsageSnapshot
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    snap = UsageSnapshot(
+        session_percent=50,
+        session_resets_at=9999999999,
+        weekly_percent=100,
+        weekly_resets_at=9999999999,
+        fetched_at=0,
+    )
+    runner._usage_provider = _FakeUsageProvider(snapshot=snap)
+    runner.app_config.daemon.rate_limit_weekly_pause_percent = 100
+
+    assert runner._check_rate_limit() is False
+    assert runner.state.state == PipelineState.PAUSED
+
+
+def test_check_rate_limit_allows_cli_when_under_thresholds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.usage import UsageSnapshot
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    snap = UsageSnapshot(
+        session_percent=50,
+        session_resets_at=9999999999,
+        weekly_percent=60,
+        weekly_resets_at=9999999999,
+        fetched_at=0,
+    )
+    runner._usage_provider = _FakeUsageProvider(snapshot=snap)
+
+    assert runner._check_rate_limit() is True
+
+
+def test_check_rate_limit_fail_open_when_provider_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner._usage_provider = _FakeUsageProvider(snapshot=None)
+
+    assert runner._check_rate_limit() is True
+
+
+def test_check_rate_limit_invalidates_cache_after_pause_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    fake = _FakeUsageProvider(snapshot=None)
+    runner._usage_provider = fake
+    runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+
+    runner._check_rate_limit()
+    assert fake._invalidated is True
+
+
+def test_proactive_check_logs_degradation_at_10_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner._usage_provider = _FakeUsageProvider(snapshot=None, failures=10)
+
+    result = runner._proactive_usage_check()
+    assert result is True
+    assert any("degraded" in e.get("event", "").lower() for e in runner.state.history)
+
+
+def test_rate_limited_until_uses_resets_at_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.usage import UsageSnapshot
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    resets_at = 1744824000
+    snap = UsageSnapshot(
+        session_percent=99,
+        session_resets_at=resets_at,
+        weekly_percent=50,
+        weekly_resets_at=9999999999,
+        fetched_at=0,
+    )
+    runner._usage_provider = _FakeUsageProvider(snapshot=snap)
+    runner.app_config.daemon.rate_limit_session_pause_percent = 95
+
+    runner._check_rate_limit()
+    assert runner.state.rate_limited_until is not None
+    assert int(runner.state.rate_limited_until.timestamp()) == resets_at

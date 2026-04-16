@@ -366,7 +366,7 @@
 - Depends on: PR-046
 
 ## PR-063: Proactive usage check via OAuth usage endpoint
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-063.md
 - Branch: pr-063-proactive-usage-check
 - Depends on: PR-062

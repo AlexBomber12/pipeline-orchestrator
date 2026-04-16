@@ -35,6 +35,9 @@ _DAEMON_FIELDS = {
     "rate_limit_weekly_pause_percent",
     "strict_queue_validation",
     "upload_staging_max_age_hours",
+    "usage_api_user_agent",
+    "usage_api_beta_header",
+    "usage_api_cache_ttl_sec",
 }
 
 
@@ -77,6 +80,9 @@ class DaemonConfig(BaseModel):
     rate_limit_weekly_pause_percent: int = 100
     strict_queue_validation: bool = True
     upload_staging_max_age_hours: int = 24
+    usage_api_user_agent: str = "claude-code/2.1.104"
+    usage_api_beta_header: str = "oauth-2025-04-20"
+    usage_api_cache_ttl_sec: int = Field(default=60, ge=5, le=3600)
 
 
 class WebConfig(BaseModel):
