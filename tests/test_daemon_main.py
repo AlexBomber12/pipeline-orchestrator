@@ -210,8 +210,7 @@ def test_main_reload_detects_new_repository(
     monkeypatch.setattr(
         main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
     )
-    # Reload on every second cycle so the test doesn't need long loops.
-    monkeypatch.setattr(main_module, "CONFIG_RELOAD_EVERY_CYCLES", 2)
+    monkeypatch.setattr(main_module, "CONFIG_RELOAD_INTERVAL_SEC", 3)
 
     clock = [0.0]
     monkeypatch.setattr(main_module.time, "monotonic", lambda: clock[0])
@@ -221,8 +220,6 @@ def test_main_reload_detects_new_repository(
     async def fake_sleep(seconds: float) -> None:
         sleep_calls.append(seconds)
         clock[0] += seconds + 1
-        # Cycle 0: alpha-only. Cycle 1: (no reload yet, idx=1, 1%2 != 0).
-        # Cycle 2: reload fires, beta added, run_cycle runs on both.
         if len(sleep_calls) >= 3:
             raise _StopLoop
 
@@ -278,7 +275,7 @@ def test_main_reload_drops_removed_repository(
     monkeypatch.setattr(
         main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
     )
-    monkeypatch.setattr(main_module, "CONFIG_RELOAD_EVERY_CYCLES", 2)
+    monkeypatch.setattr(main_module, "CONFIG_RELOAD_INTERVAL_SEC", 3)
 
     clock2 = [0.0]
     monkeypatch.setattr(main_module.time, "monotonic", lambda: clock2[0])

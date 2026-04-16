@@ -11,7 +11,7 @@ iterating again. Running with an empty repository list is valid: the
 daemon logs a warning and keeps polling so that a future ``config.yml``
 edit has somewhere to land.
 
-Every ``CONFIG_RELOAD_EVERY_CYCLES`` iterations the loop re-reads
+Every ``CONFIG_RELOAD_INTERVAL_SEC`` seconds the loop re-reads
 ``config.yml`` and reconciles the live set of runners with the new
 configuration: repositories that have been added get a fresh runner,
 repositories that have been removed are dropped, and settings changes
@@ -42,11 +42,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 
-#: Re-read ``config.yml`` every N poll cycles. At the default
-#: ``poll_interval_sec=60`` this is roughly one reload per five minutes,
-#: which is frequent enough for settings-page edits to take effect without
-#: thrashing the filesystem each poll.
-CONFIG_RELOAD_EVERY_CYCLES = 5
+#: Re-read ``config.yml`` at most once per this many seconds. This keeps
+#: settings-page edits taking effect promptly without thrashing the
+#: filesystem when the loop ticks quickly for fast repos.
+CONFIG_RELOAD_INTERVAL_SEC = 300
 
 
 def _setup_git_auth() -> None:
@@ -179,12 +178,11 @@ async def main() -> None:
     _sync_runners(runners, config, redis_client)
 
     last_run: dict[str, float] = {}
-    cycle = 0
+    last_config_check = time.monotonic()
     while True:
-        # Check for config changes every N cycles. We skip the check on
-        # the very first iteration because runners were just built from
-        # the current config above.
-        if cycle > 0 and cycle % CONFIG_RELOAD_EVERY_CYCLES == 0:
+        now_mono = time.monotonic()
+        if now_mono - last_config_check >= CONFIG_RELOAD_INTERVAL_SEC:
+            last_config_check = now_mono
             try:
                 new_config = load_config()
             except Exception:
@@ -237,7 +235,6 @@ async def main() -> None:
         fastest = min(active_intervals) if active_intervals else config.daemon.poll_interval_sec
         tick = min(fastest, config.daemon.poll_interval_sec)
         await asyncio.sleep(tick)
-        cycle += 1
 
 
 if __name__ == "__main__":
