@@ -410,6 +410,7 @@ class PipelineRunner:
         # newer-but-wrong timestamp under the "only update if newer"
         # gate.
         self._last_push_at_pr_number: int | None = None
+        self._usage_degraded_logged = False
         self._usage_provider = OAuthUsageProvider(
             credentials_path=str(
                 Path(self.app_config.auth.claude_config_dir) / ".credentials.json"
@@ -1468,14 +1469,15 @@ return 0
         if snapshot is None:
             if (
                 self._usage_provider.consecutive_failures >= 10
-                and not self.state.usage_api_degraded
+                and not self._usage_degraded_logged
             ):
-                self.state.usage_api_degraded = True
+                self._usage_degraded_logged = True
                 self.log_event(
                     "Usage API degraded (10 consecutive failures), "
                     "falling back to reactive rate-limit detection"
                 )
             return True
+        self._usage_degraded_logged = False
         session_threshold = self.app_config.daemon.rate_limit_session_pause_percent
         weekly_threshold = self.app_config.daemon.rate_limit_weekly_pause_percent
         breached = None

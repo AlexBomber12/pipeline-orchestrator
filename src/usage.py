@@ -68,11 +68,12 @@ class OAuthUsageProvider:
             if age < self._cache_ttl:
                 return self._cached
         # Backoff on repeated failures: wait cache_ttl * min(failures, 5)
-        # before retrying, capping at 5x the normal TTL.
+        # before retrying, capping at 5x the normal TTL.  Return None
+        # (not stale cached data) to preserve fail-open behavior.
         if self._consecutive_failures > 0:
             backoff = self._cache_ttl * min(self._consecutive_failures, 5)
             if time.time() - self._last_failure_at < backoff:
-                return self._cached
+                return None
         token = self._read_token()
         if token is None:
             self._record_failure()
