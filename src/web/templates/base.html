@@ -122,7 +122,9 @@
             function relativeTime(dt) {
                 if (isNaN(dt)) return null;
                 const diffMin = (Date.now() - dt.getTime()) / 60000;
-                if (diffMin < -60) return dt.toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
+                if (diffMin < -1440) return dt.toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
+                if (diffMin < -60) return 'in ' + Math.round(-diffMin / 60) + 'h';
+                if (diffMin < -1) return 'in ' + Math.round(-diffMin) + ' min';
                 if (diffMin < 1) return 'just now';
                 if (diffMin < 60) return Math.round(diffMin) + ' min ago';
                 if (diffMin < 1440) return Math.round(diffMin / 60) + 'h ago';

@@ -1489,8 +1489,12 @@ return 0
         if breached is None:
             return True
         self.state.rate_limited_until = datetime.fromtimestamp(resets_at, tz=timezone.utc)
+        # Only preserve error_message when pausing from ERROR state so
+        # handle_paused correctly resumes to ERROR; clear stale error
+        # context from non-ERROR states to avoid incorrect ERROR resume.
+        if self.state.state != PipelineState.ERROR:
+            self.state.error_message = None
         self.state.state = PipelineState.PAUSED
-        # Preserve error_message so handle_paused resumes to ERROR
         self.log_event(
             f"Proactive pause: {breached} usage at "
             f"{snapshot.session_percent if breached == 'session' else snapshot.weekly_percent}%, "
