@@ -1605,9 +1605,11 @@ return 0
         await self.publish_state()
 
         # ``sync_to_main`` left the repo on the base branch. Claude must run
-        # against the PR's HEAD, so check out the PR branch before invoking
-        # ``fix_review``; otherwise Claude would patch base and the auto-commit
-        # safety net would refuse to push (or worse, push to the base branch).
+        # against the PR's HEAD, so refresh the local PR branch from origin
+        # before invoking ``fix_review``. fetch + checkout + hard-reset
+        # guarantees the local branch matches the remote exactly, avoiding
+        # rejected pushes when origin has moved forward (e.g. Codex commit,
+        # another operator, or a previous daemon instance pushed).
         #
         # Cross-repo (fork) PRs are skipped: the head branch lives on the
         # contributor's fork, not the daemon's ``origin``, so ``git checkout``
@@ -1618,27 +1620,20 @@ return 0
             self.state.current_pr is not None
             and not self.state.current_pr.is_cross_repository
         ):
+            branch = self.state.current_pr.branch
             try:
-                _git(
-                    self.repo_path,
-                    "checkout",
-                    self.state.current_pr.branch,
-                )
+                _git(self.repo_path, "fetch", "origin", branch)
+                _git(self.repo_path, "checkout", branch)
+                _git(self.repo_path, "reset", "--hard", f"origin/{branch}")
             except (
                 subprocess.CalledProcessError,
                 subprocess.TimeoutExpired,
                 OSError,
             ) as exc:
-                # Cover non-zero exit (CalledProcessError), I/O stalls or lock
-                # contention exceeding 30s (TimeoutExpired), and missing git
-                # binary / unreadable cwd (OSError). Without these, the bare
-                # exception escapes run_cycle and the runner never publishes
-                # a clear FIX-stage ERROR.
                 stderr = getattr(exc, "stderr", "") or ""
                 self.state.state = PipelineState.ERROR
                 self.state.error_message = (
-                    f"git checkout {self.state.current_pr.branch} failed: "
-                    f"{stderr.strip() or exc}"
+                    f"git refresh {branch} failed: {stderr.strip() or exc}"
                 )
                 self.log_event(self.state.error_message)
                 return

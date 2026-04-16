@@ -288,7 +288,7 @@
 - Depends on: PR-047
 
 ## PR-049: Refresh PR branch from origin before FIX
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-049.md
 - Branch: pr-049-fix-branch-refresh
 - Depends on: PR-046
