@@ -34,6 +34,7 @@ _DAEMON_FIELDS = {
     "rate_limit_session_pause_percent",
     "rate_limit_weekly_pause_percent",
     "strict_queue_validation",
+    "upload_staging_max_age_hours",
 }
 
 
@@ -75,6 +76,7 @@ class DaemonConfig(BaseModel):
     rate_limit_session_pause_percent: int = 95
     rate_limit_weekly_pause_percent: int = 100
     strict_queue_validation: bool = True
+    upload_staging_max_age_hours: int = 24
 
 
 class WebConfig(BaseModel):
