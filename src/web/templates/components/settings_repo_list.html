@@ -73,7 +73,7 @@
                 <input type="number"
                        name="review_timeout_min"
                        value="{{ repo.review_timeout_min if repo.review_timeout_min is not none else '' }}"
-                       placeholder="{{ daemon.review_timeout_min if daemon is defined else '' }}"
+                       placeholder="{{ daemon.review_timeout_min if daemon is defined else 60 }} (default)"
                        min="1"
                        class="w-20 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 placeholder:text-gray-600 focus:border-accent focus:outline-none"
                        hx-put="{{ put_url }}"

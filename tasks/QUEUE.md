@@ -360,7 +360,7 @@
 - Depends on: PR-046
 
 ## PR-060: Settings UX - inline hints and logical grouping
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-060.md
 - Branch: pr-060-settings-ux
 - Depends on: PR-046

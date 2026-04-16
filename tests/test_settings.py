@@ -949,6 +949,79 @@ def test_put_repo_updates_allow_merge_without_checks(
     assert cfg.repositories[0].allow_merge_without_checks is True
 
 
+# ---------------------------------------------------------------------------
+# PR-060: Settings UX - group headers, hints, and default placeholder
+# ---------------------------------------------------------------------------
+
+
+def test_settings_daemon_renders_with_group_headers(empty_config: Path) -> None:
+    """Settings page must show the four logical group headers."""
+    with TestClient(app) as client:
+        response = client.get("/settings")
+
+    assert response.status_code == 200
+    body = response.text
+    for header in ("Timing", "Review handling", "Rate limits", "Error recovery"):
+        assert header in body, f"Missing group header: {header}"
+
+
+def test_settings_daemon_renders_hints_for_all_fields(empty_config: Path) -> None:
+    """Every daemon field must have a non-empty hint below the input."""
+    with TestClient(app) as client:
+        response = client.get("/partials/settings/daemon")
+
+    assert response.status_code == 200
+    body = response.text
+    # Each field should have at least one hint (text-xs text-gray-500) nearby.
+    hints = [
+        "How often the daemon checks each repo",
+        "Max time Claude gets before being killed",
+        "Codex doesn't review in time",
+        "Kills Claude during FIX if no push",
+        "re-ping Codex on the anchor comment",
+        "session usage exceeds this threshold",
+        "run until API returns 429",
+        "analyze failures before falling back",
+    ]
+    for hint_fragment in hints:
+        assert hint_fragment in body, f"Missing hint: {hint_fragment}"
+
+
+def test_settings_repo_list_shows_default_placeholder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repo without review_timeout_min override shows placeholder containing 'default'."""
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/nohint\n"
+        "    branch: main\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/settings/repo-list")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "default" in body.lower()
+
+
+def test_settings_repo_list_shows_value_when_override_set(
+    one_repo_config: Path,
+) -> None:
+    """Repo with review_timeout_min override shows the actual value, not placeholder."""
+    with TestClient(app) as client:
+        response = client.get("/partials/settings/repo-list")
+
+    assert response.status_code == 200
+    body = response.text
+    # The one_repo_config fixture sets review_timeout_min: 60 explicitly.
+    assert 'value="60"' in body
+
+
 def test_update_daemon_rate_limit_session(
     empty_config: Path,
     monkeypatch: pytest.MonkeyPatch,
