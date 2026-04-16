@@ -274,3 +274,81 @@
 - Tasks file: tasks/PR-046.md
 - Branch: pr-046-per-repo-poll
 - Depends on: PR-042
+
+## PR-047: Fix review status PENDING for any Codex comment after anchor
+- Status: TODO
+- Tasks file: tasks/PR-047.md
+- Branch: pr-047-review-status-pending
+- Depends on: PR-046
+
+## PR-048: Fail-closed for GitHub observation errors
+- Status: TODO
+- Tasks file: tasks/PR-048.md
+- Branch: pr-048-fail-closed-observation
+- Depends on: PR-047
+
+## PR-049: Refresh PR branch from origin before FIX
+- Status: TODO
+- Tasks file: tasks/PR-049.md
+- Branch: pr-049-fix-branch-refresh
+- Depends on: PR-046
+
+## PR-050: Verify head SHA change after FIX push
+- Status: TODO
+- Tasks file: tasks/PR-050.md
+- Branch: pr-050-fix-head-verification
+- Depends on: PR-049
+
+## PR-051: Check for existing open PR before CODING
+- Status: TODO
+- Tasks file: tasks/PR-051.md
+- Branch: pr-051-coding-pr-guard
+- Depends on: PR-046
+
+## PR-052: Empty CI rollup returns PENDING not SUCCESS
+- Status: TODO
+- Tasks file: tasks/PR-052.md
+- Branch: pr-052-empty-rollup-pending
+- Depends on: PR-046
+
+## PR-053: Separate timeout from rate-limit in error handler
+- Status: TODO
+- Tasks file: tasks/PR-053.md
+- Branch: pr-053-timeout-classification
+- Depends on: PR-046
+
+## PR-054: Bounded retry/backoff for transient command failures
+- Status: TODO
+- Tasks file: tasks/PR-054.md
+- Branch: pr-054-transient-retry
+- Depends on: PR-053
+
+## PR-055: Strict queue validation
+- Status: TODO
+- Tasks file: tasks/PR-055.md
+- Branch: pr-055-queue-validation
+- Depends on: PR-046
+
+## PR-056: Review status parser strictness
+- Status: TODO
+- Tasks file: tasks/PR-056.md
+- Branch: pr-056-review-status-parser
+- Depends on: PR-047
+
+## PR-057: Runner.py decomposition
+- Status: TODO
+- Tasks file: tasks/PR-057.md
+- Branch: pr-057-runner-decomposition
+- Depends on: PR-047, PR-048, PR-049, PR-050, PR-051, PR-052, PR-053, PR-054, PR-055, PR-056
+
+## PR-058: Upload staging cleanup guards
+- Status: TODO
+- Tasks file: tasks/PR-058.md
+- Branch: pr-058-upload-cleanup
+- Depends on: PR-046
+
+## PR-059: AGENTS.md update - artifacts and stale review
+- Status: TODO
+- Tasks file: tasks/PR-059.md
+- Branch: pr-059-agents-update
+- Depends on: PR-046
