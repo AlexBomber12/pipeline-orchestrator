@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 import time
 from typing import Callable, TypeVar
@@ -25,18 +26,28 @@ TRANSIENT_MARKERS = (
     "remote end hung up",
 )
 
+# Matches standalone 5xx status codes (e.g. "error: 503", "HTTP 502")
+_NUMERIC_5XX_RE = re.compile(r"\b5[0-9]{2}\b")
+
+
+def _has_transient_signal(text: str) -> bool:
+    """Check text for transient markers or bare 5xx status codes."""
+    lower = text.lower()
+    if any(marker in lower for marker in TRANSIENT_MARKERS):
+        return True
+    return bool(_NUMERIC_5XX_RE.search(lower))
+
 
 def is_transient_error(exc: Exception) -> bool:
     """Return True if exception indicates a likely-transient failure."""
     if isinstance(exc, subprocess.TimeoutExpired):
         return True
     if isinstance(exc, subprocess.CalledProcessError):
-        stderr = (getattr(exc, "stderr", "") or "").lower()
-        if any(marker in stderr for marker in TRANSIENT_MARKERS):
+        stderr = (getattr(exc, "stderr", "") or "")
+        if _has_transient_signal(stderr):
             return True
     if isinstance(exc, RuntimeError):
-        msg = str(exc).lower()
-        if any(marker in msg for marker in TRANSIENT_MARKERS):
+        if _has_transient_signal(str(exc)):
             return True
     return False
 

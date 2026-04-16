@@ -111,6 +111,31 @@ class TestIsTransientError:
         )
         assert is_transient_error(exc) is False
 
+    def test_numeric_503_in_git_stderr(self) -> None:
+        exc = subprocess.CalledProcessError(
+            128, ["git", "fetch"],
+            stderr="fatal: The requested URL returned error: 503"
+        )
+        assert is_transient_error(exc) is True
+
+    def test_numeric_502_in_git_stderr(self) -> None:
+        exc = subprocess.CalledProcessError(
+            128, ["git", "clone"],
+            stderr="error: RPC failed; HTTP 502"
+        )
+        assert is_transient_error(exc) is True
+
+    def test_runtime_error_numeric_503(self) -> None:
+        exc = RuntimeError("gh api failed (exit 1): HTTP 503")
+        assert is_transient_error(exc) is True
+
+    def test_numeric_404_not_transient(self) -> None:
+        exc = subprocess.CalledProcessError(
+            1, ["git", "fetch"],
+            stderr="The requested URL returned error: 404"
+        )
+        assert is_transient_error(exc) is False
+
     def test_generic_exception_not_transient(self) -> None:
         exc = ValueError("something went wrong")
         assert is_transient_error(exc) is False
