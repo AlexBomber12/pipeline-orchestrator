@@ -1707,6 +1707,12 @@ return 0
             return
 
         if head_before and head_before == head_after:
+            # Advance the feedback baseline so that the existing Codex
+            # CHANGES_REQUESTED comment is no longer considered "new" by
+            # _has_new_codex_feedback_since_last_push().  Without this,
+            # a no-op FIX (no commit) would leave _last_push_at stale
+            # and handle_watch would re-enter handle_fix on the next poll.
+            self._last_push_at = datetime.now(timezone.utc)
             self.state.state = PipelineState.WATCH
             self.log_event(
                 "FIX REVIEW exited 0 but HEAD unchanged; "
