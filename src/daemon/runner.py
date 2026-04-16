@@ -2164,16 +2164,9 @@ return 0
             self._last_push_at = head_time
 
     def _has_new_codex_feedback_since_last_push(self) -> bool:
-        """Return True iff Codex posted new P1/P2 feedback after the last push.
+        """Returns True if Codex posted any comment (review or issue) after self._last_push_at.
 
-        Used by ``handle_watch`` to suppress FIX loops that would fire on
-        stale ``CHANGES_REQUESTED`` signals from a review that predates the
-        most recent fix push. Compares comment ``created_at`` against
-        ``self._last_push_at`` — NOT ``current_pr.last_activity``, which
-        ``handle_watch`` overwrites with GitHub's ``updatedAt`` on every
-        cycle (and that value advances past the push whenever Codex posts,
-        making the comparison always false for the fresh feedback that
-        triggered the CHANGES_REQUESTED signal in the first place).
+        P1/P2 prioritization is handled by Claude in FIX REVIEW mode.
         """
         if self.state.current_pr is None:
             return False
@@ -2196,9 +2189,6 @@ return 0
         for c in reversed(comments + review_comments):
             user = (c.get("user") or {}).get("login", "")
             if "codex" not in user.lower():
-                continue
-            body = c.get("body") or ""
-            if "P1" not in body and "P2" not in body:
                 continue
             created = github_client._parse_iso(c.get("created_at"))
             if created is None:

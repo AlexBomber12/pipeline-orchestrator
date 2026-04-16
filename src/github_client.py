@@ -281,6 +281,9 @@ def _compute_review_status(
                 if "HTTP 404" not in str(exc):
                     raise
 
+    if anchor_approved or body_approved:
+        return ReviewStatus.APPROVED
+
     anchor_ts = (anchor.get("created_at") or "") if anchor else ""
     for comment in issue_comments + review_comments:
         user = (comment.get("user") or {}).get("login", "") or ""
@@ -288,12 +291,7 @@ def _compute_review_status(
             continue
         if anchor_ts and (comment.get("created_at") or "") <= anchor_ts:
             continue
-        body = comment.get("body") or ""
-        if "P1" in body or "P2" in body:
-            return ReviewStatus.CHANGES_REQUESTED
-
-    if anchor_approved or body_approved:
-        return ReviewStatus.APPROVED
+        return ReviewStatus.CHANGES_REQUESTED
 
     return ReviewStatus.PENDING
 

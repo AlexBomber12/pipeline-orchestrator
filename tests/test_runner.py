@@ -3975,3 +3975,75 @@ def test_handle_fix_publishes_heartbeat(
     assert len(heartbeat_publishes) >= 2, (
         f"Expected heartbeat to publish at least twice, got {len(heartbeat_publishes)}"
     )
+
+
+# --- _has_new_codex_feedback_since_last_push tests ---
+
+
+def test_has_new_feedback_returns_true_for_any_codex_comment_after_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Codex comment without P1/P2 posted after _last_push_at -> True."""
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
+    runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [
+            {
+                "user": {"login": "chatgpt-codex-bot"},
+                "body": "Consider renaming this variable",
+                "created_at": "2026-01-01T00:05:00Z",
+            },
+        ],
+    )
+
+    assert runner._has_new_codex_feedback_since_last_push() is True
+
+
+def test_has_new_feedback_returns_false_for_old_comments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Codex comment posted before _last_push_at -> False."""
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
+    runner._last_push_at = datetime(2026, 1, 1, 1, 0, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [
+            {
+                "user": {"login": "chatgpt-codex-bot"},
+                "body": "Old feedback",
+                "created_at": "2026-01-01T00:30:00Z",
+            },
+        ],
+    )
+
+    assert runner._has_new_codex_feedback_since_last_push() is False
+
+
+def test_has_new_feedback_ignores_non_codex_users(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A comment from a regular user after _last_push_at -> False."""
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
+    runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [
+            {
+                "user": {"login": "some-reviewer"},
+                "body": "Please fix this",
+                "created_at": "2026-01-01T00:05:00Z",
+            },
+        ],
+    )
+
+    assert runner._has_new_codex_feedback_since_last_push() is False

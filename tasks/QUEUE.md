@@ -276,7 +276,7 @@
 - Depends on: PR-042
 
 ## PR-047: Fix review status PENDING for any Codex comment after anchor
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-047.md
 - Branch: pr-047-review-status-pending
 - Depends on: PR-046
