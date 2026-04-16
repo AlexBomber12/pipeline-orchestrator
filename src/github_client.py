@@ -15,7 +15,7 @@ _REPO_URL_RE = re.compile(
     r"github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"
 )
 CODEX_BOT_LOGIN_PATTERN = re.compile(
-    r"(^|[^a-z])codex($|[^a-z])", re.IGNORECASE
+    r"codex", re.IGNORECASE
 )
 
 _review_status_cache: dict[str, "ReviewStatus"] = {}
@@ -232,18 +232,18 @@ def _compute_review_status(
         review_info = {
             "latest_sha": "",
             "latest_time": None,
-            "approved_sha": "",
-            "approved_time": None,
+            "latest_state": "",
         }
 
-    approved_review_time = review_info["approved_time"]
-    approved_review_sha = review_info["approved_sha"]
-    if approved_review_time is not None:
+    latest_review_time = review_info["latest_time"]
+    latest_review_sha = review_info["latest_sha"]
+    latest_review_state = review_info["latest_state"]
+    if latest_review_state == "APPROVED" and latest_review_time is not None:
         if not head_sha:
             body_approved = True
-        elif approved_review_sha and approved_review_sha == head_sha:
+        elif latest_review_sha and latest_review_sha == head_sha:
             body_approved = True
-        elif head_commit_time is None or approved_review_time >= head_commit_time:
+        elif head_commit_time is None or latest_review_time >= head_commit_time:
             body_approved = True
 
     try:
@@ -253,9 +253,7 @@ def _compute_review_status(
             if plus_one is not None:
                 if head_sha:
                     reaction_time = _parse_iso(plus_one.get("created_at"))
-                    latest_sha = review_info["latest_sha"]
-                    latest_review_time = review_info["latest_time"]
-                    if latest_sha and latest_sha == head_sha:
+                    if latest_review_sha and latest_review_sha == head_sha:
                         body_approved = True
                     else:
                         threshold = head_commit_time
@@ -656,7 +654,7 @@ def _get_commit_time(repo: str, sha: str) -> datetime | None:
 def _get_codex_review_signals(
     repo: str, pr_number: int
 ) -> dict[str, str | datetime | None]:
-    """Return latest Codex review timestamps for generic and approved states."""
+    """Return the latest Codex review timestamp, sha, and state."""
     try:
         reviews = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/reviews")
     except RuntimeError as exc:
@@ -665,23 +663,19 @@ def _get_codex_review_signals(
         return {
             "latest_sha": "",
             "latest_time": None,
-            "approved_sha": "",
-            "approved_time": None,
+            "latest_state": "",
         }
     if not reviews:
         return {
             "latest_sha": "",
             "latest_time": None,
-            "approved_sha": "",
-            "approved_time": None,
+            "latest_state": "",
         }
 
     best_sha = ""
     best_time: datetime | None = None
     best_raw = ""
-    approved_sha = ""
-    approved_time: datetime | None = None
-    approved_raw = ""
+    best_state = ""
     for review in reviews:
         if not _is_codex_user(review.get("user")):
             continue
@@ -693,18 +687,11 @@ def _get_codex_review_signals(
             best_sha = review.get("commit_id") or ""
             best_time = parsed
             best_raw = submitted_raw
-        if (
-            (review.get("state") or "").upper() == "APPROVED"
-            and (approved_time is None or submitted_raw > approved_raw)
-        ):
-            approved_sha = review.get("commit_id") or ""
-            approved_time = parsed
-            approved_raw = submitted_raw
+            best_state = (review.get("state") or "").upper()
     return {
         "latest_sha": best_sha,
         "latest_time": best_time,
-        "approved_sha": approved_sha,
-        "approved_time": approved_time,
+        "latest_state": best_state,
     }
 
 
