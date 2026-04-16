@@ -410,7 +410,7 @@ def test_partial_stats_returns_html_with_four_values(
 def test_api_stats_returns_expected_json_shape(
     observability_config: Path,
 ) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
     fake = _seed_redis(now)
 
     with TestClient(app) as client:

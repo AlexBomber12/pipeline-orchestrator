@@ -382,3 +382,23 @@ def test_update_daemon_config_rate_limit(tmp_path: Path) -> None:
         rate_limit_pause_percent=75,
     )
     assert updated.daemon.rate_limit_pause_percent == 75
+
+
+def test_repo_poll_interval_default() -> None:
+    repo = RepoConfig(url="https://github.com/example/repo")
+    assert repo.poll_interval_sec == 60
+
+
+def test_repo_poll_interval_rejects_zero() -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        RepoConfig(url="https://github.com/example/repo", poll_interval_sec=0)
+
+
+def test_repo_poll_interval_rejects_negative() -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        RepoConfig(url="https://github.com/example/repo", poll_interval_sec=-5)
+
+
+def test_repo_poll_interval_rejects_float() -> None:
+    with pytest.raises(ValueError, match="must be an integer"):
+        RepoConfig(url="https://github.com/example/repo", poll_interval_sec=1.9)

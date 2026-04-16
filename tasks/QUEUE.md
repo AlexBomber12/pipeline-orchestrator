@@ -270,7 +270,7 @@
 - Depends on: PR-042
 
 ## PR-046: Per-repo poll interval
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-046.md
 - Branch: pr-046-per-repo-poll
 - Depends on: PR-042

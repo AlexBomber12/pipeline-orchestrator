@@ -11,7 +11,7 @@ iterating again. Running with an empty repository list is valid: the
 daemon logs a warning and keeps polling so that a future ``config.yml``
 edit has somewhere to land.
 
-Every ``CONFIG_RELOAD_EVERY_CYCLES`` iterations the loop re-reads
+Every ``CONFIG_RELOAD_CYCLES`` daemon-interval-lengths the loop re-reads
 ``config.yml`` and reconciles the live set of runners with the new
 configuration: repositories that have been added get a fresh runner,
 repositories that have been removed are dropped, and settings changes
@@ -24,6 +24,7 @@ import asyncio
 import logging
 import os
 import subprocess
+import time
 from typing import Any
 
 import redis.asyncio as aioredis
@@ -41,11 +42,11 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 
-#: Re-read ``config.yml`` every N poll cycles. At the default
-#: ``poll_interval_sec=60`` this is roughly one reload per five minutes,
-#: which is frequent enough for settings-page edits to take effect without
-#: thrashing the filesystem each poll.
-CONFIG_RELOAD_EVERY_CYCLES = 5
+#: Re-read ``config.yml`` roughly every this many loop cycles (in terms
+#: of the daemon-level poll interval). The actual reload cadence is
+#: ``CONFIG_RELOAD_CYCLES * daemon.poll_interval_sec`` seconds, so it
+#: adapts to both fast and slow deployments.
+CONFIG_RELOAD_CYCLES = 5
 
 
 def _setup_git_auth() -> None:
@@ -177,12 +178,13 @@ async def main() -> None:
     runners: dict[str, PipelineRunner] = {}
     _sync_runners(runners, config, redis_client)
 
-    cycle = 0
+    last_run: dict[str, float] = {}
+    last_config_check = time.monotonic()
     while True:
-        # Check for config changes every N cycles. We skip the check on
-        # the very first iteration because runners were just built from
-        # the current config above.
-        if cycle > 0 and cycle % CONFIG_RELOAD_EVERY_CYCLES == 0:
+        now_mono = time.monotonic()
+        reload_interval = CONFIG_RELOAD_CYCLES * config.daemon.poll_interval_sec
+        if now_mono - last_config_check >= reload_interval:
+            last_config_check = now_mono
             try:
                 new_config = load_config()
             except Exception:
@@ -195,8 +197,9 @@ async def main() -> None:
                     config = new_config
                     _sync_runners(runners, config, redis_client)
 
-        for runner in list(runners.values()):
+        for key, runner in list(runners.items()):
             if not runner.repo_config.active:
+                last_run.pop(key, None)
                 try:
                     await runner.publish_state()
                 except Exception:
@@ -206,14 +209,33 @@ async def main() -> None:
                         exc_info=True,
                     )
                 continue
+            now = time.monotonic()
+            interval = runner.repo_config.poll_interval_sec
+            if key in last_run and now - last_run[key] < interval:
+                continue
+            last_run[key] = now
             try:
                 await runner.run_cycle()
             except Exception:
                 logger.error(
                     "run_cycle failed for %s", runner.name, exc_info=True
                 )
-        await asyncio.sleep(config.daemon.poll_interval_sec)
-        cycle += 1
+
+        # Clean up last_run entries for removed runners.
+        for key in list(last_run.keys()):
+            if key not in runners:
+                del last_run[key]
+
+        now_after = time.monotonic()
+        remaining: list[float] = []
+        for key, runner in runners.items():
+            if not runner.repo_config.active:
+                continue
+            due_in = (last_run.get(key, 0.0) + runner.repo_config.poll_interval_sec) - now_after
+            remaining.append(max(due_in, 0.0))
+        tick = min(remaining) if remaining else config.daemon.poll_interval_sec
+        tick = min(tick, config.daemon.poll_interval_sec)
+        await asyncio.sleep(max(tick, 1))
 
 
 if __name__ == "__main__":
