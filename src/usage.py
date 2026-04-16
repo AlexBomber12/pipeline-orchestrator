@@ -118,7 +118,7 @@ class OAuthUsageProvider:
         try:
             raw = self._credentials_path.read_text(encoding="utf-8")
             data = json.loads(raw)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return None
         for key in ("accessToken", "access_token"):
             token = data.get(key)

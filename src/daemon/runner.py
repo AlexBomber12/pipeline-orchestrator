@@ -431,6 +431,7 @@ class PipelineRunner:
             value.daemon.usage_api_user_agent != old.daemon.usage_api_user_agent
             or value.daemon.usage_api_beta_header != old.daemon.usage_api_beta_header
             or value.daemon.usage_api_cache_ttl_sec != old.daemon.usage_api_cache_ttl_sec
+            or value.auth.claude_config_dir != old.auth.claude_config_dir
         ):
             self._usage_provider = OAuthUsageProvider(
                 credentials_path=str(
