@@ -365,8 +365,32 @@
 - Branch: pr-060-settings-ux
 - Depends on: PR-046
 
+## PR-063: Proactive usage check via OAuth usage endpoint
+- Status: TODO
+- Tasks file: tasks/PR-063.md
+- Branch: pr-063-proactive-usage-check
+- Depends on: PR-062
+
+## PR-064: In-flight rate limit monitor via statusline hook
+- Status: TODO
+- Tasks file: tasks/PR-064.md
+- Branch: pr-064-statusline-inflight-monitor
+- Depends on: PR-063
+
+## PR-065: Codex CLI as alternative coder with manual selection
+- Status: TODO
+- Tasks file: tasks/PR-065.md
+- Branch: pr-065-codex-coder
+- Depends on: PR-063
+
+## PR-066: Codex CLI rate limit detection
+- Status: TODO
+- Tasks file: tasks/PR-066.md
+- Branch: pr-066-codex-rate-limit
+- Depends on: PR-065, PR-063
+
 ## PR-057: Runner.py decomposition
 - Status: TODO
 - Tasks file: tasks/PR-057.md
 - Branch: pr-057-runner-decomposition
-- Depends on: PR-053, PR-054, PR-055, PR-056, PR-058, PR-059, PR-060, PR-061, PR-062
+- Depends on: PR-053, PR-054, PR-055, PR-056, PR-058, PR-059, PR-060, PR-061, PR-062, PR-063, PR-065, PR-066
