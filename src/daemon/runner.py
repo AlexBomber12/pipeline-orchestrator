@@ -1436,7 +1436,11 @@ return 0
         """
         snapshot = self._usage_provider.fetch()
         if snapshot is None:
-            if self._usage_provider.consecutive_failures == 10:
+            if (
+                self._usage_provider.consecutive_failures >= 10
+                and not self.state.usage_api_degraded
+            ):
+                self.state.usage_api_degraded = True
                 self.log_event(
                     "Usage API degraded (10 consecutive failures), "
                     "falling back to reactive rate-limit detection"
@@ -1456,7 +1460,7 @@ return 0
             return True
         self.state.rate_limited_until = datetime.fromtimestamp(resets_at, tz=timezone.utc)
         self.state.state = PipelineState.PAUSED
-        self.state.error_message = None
+        # Preserve error_message so handle_paused resumes to ERROR
         self.log_event(
             f"Proactive pause: {breached} usage at "
             f"{snapshot.session_percent if breached == 'session' else snapshot.weekly_percent}%, "
