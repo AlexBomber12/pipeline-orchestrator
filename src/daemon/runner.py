@@ -1090,35 +1090,38 @@ class PipelineRunner:
             if not recovery_complete:
                 # Discovery phase failed (transient GitHub outage or
                 # queue validation error).  Leave _recovered unset so the
-                # next cycle retries discovery.  Ensure the repo is on the
-                # base branch before processing uploads — process_pending_
-                # uploads commits on HEAD and pushes to origin/{branch},
-                # so running it on a feature branch would push the wrong
-                # ref and silently lose the upload.  If checkout fails
-                # (e.g. dirty tree), skip uploads entirely; the manifest
-                # stays in Redis and retries next cycle.
-                branch = self.repo_config.branch
-                on_base = False
+                # next cycle retries discovery.  Check for pending uploads
+                # first — only force-switch to the base branch when there
+                # is actually an upload to process, to avoid destroying
+                # uncommitted work on a feature branch after a transient
+                # failure with no pending upload.
+                has_pending = False
                 try:
-                    head_ref = _git(
-                        self.repo_path, "rev-parse", "--abbrev-ref", "HEAD",
-                    ).stdout.strip()
-                    if head_ref == branch:
-                        on_base = True
-                    else:
-                        # Force-clean the tree so checkout can succeed even
-                        # after a crashed cycle left dirty state.  This is
-                        # safe: recovery already failed, so there is no
-                        # in-flight work to preserve.
-                        _git(self.repo_path, "reset", "--hard", "HEAD",
-                             check=False)
-                        _git(self.repo_path, "clean", "-fd", check=False)
-                        _git(self.repo_path, "checkout", branch)
-                        on_base = True
+                    raw = await self.redis.get(f"upload:{self.name}:pending")
+                    has_pending = bool(raw)
                 except Exception:
                     pass
-                if on_base:
-                    await self.process_pending_uploads()
+                if has_pending:
+                    branch = self.repo_config.branch
+                    on_base = False
+                    try:
+                        head_ref = _git(
+                            self.repo_path, "rev-parse", "--abbrev-ref",
+                            "HEAD",
+                        ).stdout.strip()
+                        if head_ref == branch:
+                            on_base = True
+                        else:
+                            _git(self.repo_path, "reset", "--hard", "HEAD",
+                                 check=False)
+                            _git(self.repo_path, "clean", "-fd",
+                                 check=False)
+                            _git(self.repo_path, "checkout", branch)
+                            on_base = True
+                    except Exception:
+                        pass
+                    if on_base:
+                        await self.process_pending_uploads()
                 await self.publish_state()
                 return
             self._recovered = True
