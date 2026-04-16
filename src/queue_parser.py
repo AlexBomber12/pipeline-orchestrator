@@ -270,33 +270,42 @@ def validate_queue(
 
 
 def _find_dependency_cycle(tasks: list[QueueTask]) -> list[str] | None:
-    """Return cycle path if a dependency cycle exists, else None."""
+    """Return cycle path if a dependency cycle exists, else None.
+
+    Uses iterative DFS to avoid RecursionError on large queues.
+    """
     graph = {t.pr_id: list(t.depends_on) for t in tasks}
-    visiting: set[str] = set()
     visited: set[str] = set()
-    path: list[str] = []
 
-    def dfs(node: str) -> list[str] | None:
-        if node in visited:
-            return None
-        if node in visiting:
-            idx = path.index(node) if node in path else 0
-            return path[idx:] + [node]
-        visiting.add(node)
-        path.append(node)
-        for neighbor in graph.get(node, []):
-            result = dfs(neighbor)
-            if result:
-                return result
-        path.pop()
-        visiting.remove(node)
-        visited.add(node)
-        return None
+    for start in graph:
+        if start in visited:
+            continue
+        visiting: set[str] = set()
+        path: list[str] = []
+        # Stack entries: (node, neighbor_index)
+        stack: list[tuple[str, int]] = [(start, 0)]
+        visiting.add(start)
+        path.append(start)
 
-    for pr_id in graph:
-        result = dfs(pr_id)
-        if result:
-            return result
+        while stack:
+            node, idx = stack[-1]
+            neighbors = graph.get(node, [])
+            if idx < len(neighbors):
+                stack[-1] = (node, idx + 1)
+                neighbor = neighbors[idx]
+                if neighbor in visiting:
+                    cycle_start = path.index(neighbor)
+                    return path[cycle_start:] + [neighbor]
+                if neighbor not in visited:
+                    visiting.add(neighbor)
+                    path.append(neighbor)
+                    stack.append((neighbor, 0))
+            else:
+                stack.pop()
+                path.pop()
+                visiting.remove(node)
+                visited.add(node)
+
     return None
 
 
