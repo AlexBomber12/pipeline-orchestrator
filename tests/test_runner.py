@@ -649,7 +649,8 @@ def test_handle_fix_fetches_and_resets_branch_before_fix_review(
 
     fetch_calls = [
         i for i, cmd in enumerate(calls)
-        if cmd[:2] == ["git", "fetch"] and "pr-042-fix" in cmd
+        if cmd[:2] == ["git", "fetch"]
+        and any("pr-042-fix" in arg for arg in cmd)
     ]
     checkout_calls = [
         i for i, cmd in enumerate(calls)
@@ -679,7 +680,7 @@ def test_handle_fix_errors_when_fetch_fails(
     fix_calls: list[str] = []
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        if cmd[:2] == ["git", "fetch"] and "pr-042-fix" in cmd:
+        if cmd[:2] == ["git", "fetch"] and any("pr-042-fix" in a for a in cmd):
             raise subprocess.CalledProcessError(
                 1, cmd, stderr="fatal: couldn't find remote ref pr-042-fix"
             )
