@@ -3974,6 +3974,70 @@ def test_handle_error_skips_diagnose_for_timeout(
     assert cli_calls == []
 
 
+def test_handle_error_preserves_error_message_on_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When diagnose_error_async is rate-limited, error_message is preserved."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "diagnose_error_async",
+        _async_cli_result_with_side_effect([], "diagnose", 1, "", "Error: 429 Too Many Requests"),
+    )
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Build failed: missing dependency X"
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.error_message == "Build failed: missing dependency X"
+
+
+def test_handle_paused_resumes_to_error_when_error_message_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Window expired with error_message set -> ERROR so fault is retried."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+    runner.state.error_message = "Build failed: missing dependency X"
+    runner.state.current_pr = PRInfo(number=50, branch="pr-050")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-050", title="test", branch="pr-050", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "Build failed: missing dependency X"
+    assert runner.state.rate_limited_until is None
+
+
+def test_handle_paused_clears_legacy_rate_limit_error_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Window expired with rate-limit error_message -> clear msg, resume WATCH/IDLE (no deadlock)."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+    runner.state.error_message = "API rate limit exceeded (429)"
+    runner.state.current_pr = PRInfo(number=50, branch="pr-050")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-050", title="test", branch="pr-050", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.error_message is None
+    assert any("cleared legacy rate-limit" in e["event"] for e in runner.state.history)
+
+
 def test_detect_rate_limit_sets_pause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4609,3 +4673,173 @@ def test_handle_fix_error_on_rev_parse_after_failure(
 
     assert runner.state.state == PipelineState.ERROR
     assert "rev-parse after fix" in (runner.state.error_message or "")
+
+
+# ── PAUSED state tests ──────────────────────────────────────────────
+
+
+def test_handle_coding_sets_paused_on_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLI returns non-zero with rate limit stderr -> state = PAUSED, error_message = None."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "run_planned_pr_async",
+        _async_cli_result(1, "", "Error: 429 Too Many Requests"),
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = QueueTask(
+        pr_id="PR-099", title="test", branch="pr-099-test", status=TaskStatus.TODO
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.error_message is None
+    assert runner.state.rate_limited_until is not None
+
+
+def test_handle_fix_sets_paused_on_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLI returns non-zero with rate limit stderr in fix path -> PAUSED."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "fix_review_async",
+        _async_cli_result(1, "", "Error: 429 Too Many Requests"),
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.FIX
+    runner.state.current_pr = PRInfo(number=50, branch="pr-050")
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.error_message is None
+    assert runner.state.rate_limited_until is not None
+
+
+def test_handle_paused_waits_when_window_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """rate_limited_until in future -> state stays PAUSED."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=20)
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.rate_limited_until is not None
+
+
+def test_handle_paused_resumes_to_watch_when_window_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Window expired, current_pr and current_task match -> WATCH."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+    runner.state.current_pr = PRInfo(number=50, branch="pr-050")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-050", title="test", branch="pr-050", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.rate_limited_until is None
+
+
+def test_handle_paused_resumes_to_idle_when_no_active_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Window expired, no current_pr -> IDLE."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.rate_limited_until is None
+
+
+def test_handle_paused_handles_missing_rate_limited_until(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """State PAUSED but rate_limited_until None -> IDLE with log."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = None
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert any("PAUSED without rate_limited_until" in e["event"] for e in runner.state.history)
+
+
+def test_paused_not_reset_by_transient_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run_cycle with state=PAUSED does not reset to IDLE via transient check."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner._recovered = True
+    runner._scaffolded = True
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=20)
+
+    asyncio.run(runner.run_cycle())
+
+    assert runner.state.state == PipelineState.PAUSED
+
+
+def test_check_rate_limit_transitions_to_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """rate_limited_until set, state was CODING -> transitions to PAUSED on check."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.CODING
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+    result = runner._check_rate_limit()
+
+    assert result is False
+    assert runner.state.state == PipelineState.PAUSED
+
+
+def test_legacy_error_with_rate_limited_until_converts_to_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy state=ERROR + rate_limited_until -> PAUSED during run_cycle dispatch."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner._recovered = True
+    runner._scaffolded = True
+    runner.state.state = PipelineState.ERROR
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=15)
+    runner.state.error_message = "some real error"
+
+    asyncio.run(runner.run_cycle())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.error_message == "some real error"
+    assert any("Legacy ERROR" in e["event"] for e in runner.state.history)

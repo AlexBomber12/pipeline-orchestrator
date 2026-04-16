@@ -17,6 +17,7 @@ class PipelineState(str, Enum):
     MERGE = "MERGE"
     HUNG = "HUNG"
     ERROR = "ERROR"
+    PAUSED = "PAUSED"
 
 
 class TaskStatus(str, Enum):

@@ -318,7 +318,7 @@
 - Depends on: PR-052
 
 ## PR-062: PAUSED state for rate limit
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-062.md
 - Branch: pr-062-paused-state
 - Depends on: PR-061

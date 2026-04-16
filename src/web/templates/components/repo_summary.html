@@ -13,6 +13,7 @@
     'MERGE':     {'dot': 'bg-ok',        'badge': 'bg-ok/10 text-ok border-ok/30',                     'pulse': false},
     'HUNG':      {'dot': 'bg-hung',      'badge': 'bg-hung/10 text-hung border-hung/30',               'pulse': false},
     'ERROR':     {'dot': 'bg-fail',      'badge': 'bg-fail/10 text-fail border-fail/30',               'pulse': false},
+    'PAUSED':    {'dot': 'bg-warn',      'badge': 'bg-warn/10 text-warn border-warn/30',               'pulse': false},
 } %}
 {% set ci_styles = {
     'SUCCESS': {'dot': 'bg-ok',   'pulse': false, 'label': 'success'},
@@ -37,7 +38,17 @@
     </span>
 </header>
 
-{% if repo.error_message %}
+{% if repo.state.value == 'PAUSED' %}
+<div class="mb-6 rounded-lg border border-warn/30 bg-warn/10 px-4 py-3">
+    {% if repo.rate_limited_until and repo.rate_limited_until > utcnow() %}
+    {% set remaining_sec = (repo.rate_limited_until - utcnow()).total_seconds() | int %}
+    {% set remaining_min = (remaining_sec / 60) | round(0, 'ceil') | int %}
+    <p class="text-warn font-mono text-sm">Rate limited — paused, {{ remaining_min }}m remaining</p>
+    {% else %}
+    <p class="text-warn font-mono text-sm">Paused, resuming soon...</p>
+    {% endif %}
+</div>
+{% elif repo.error_message %}
 {% if repo.state.value == 'PREFLIGHT' %}
 <div class="mb-6 rounded-lg border border-warn/30 bg-warn/10 px-4 py-3">
     <p class="text-warn font-mono text-sm break-words">{{ repo.error_message }}</p>

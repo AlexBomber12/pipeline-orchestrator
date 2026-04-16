@@ -3,7 +3,7 @@
 One ``PipelineRunner`` instance exists per connected repository. The daemon
 main loop calls ``run_cycle`` once per poll interval; each cycle clones or
 fetches the repo, runs a preflight check, and dispatches on the persisted
-state (``IDLE``, ``WATCH``, ``HUNG``, or ``ERROR``). Transient states
+state (``IDLE``, ``WATCH``, ``HUNG``, ``PAUSED``, or ``ERROR``). Transient states
 (``CODING``, ``FIX``, ``MERGE``) are resolved within a single cycle and
 never persisted across cycles.
 """
@@ -1073,9 +1073,12 @@ class PipelineRunner:
             await self.handle_watch()
         elif current == PipelineState.HUNG:
             await self.handle_hung()
+        elif current == PipelineState.PAUSED:
+            await self.handle_paused()
         elif current == PipelineState.ERROR:
-            if self._try_recover_rate_limit():
-                pass
+            if self.state.rate_limited_until is not None:
+                self.state.state = PipelineState.PAUSED
+                self.log_event("Legacy ERROR + rate_limited_until -> PAUSED")
             elif self.app_config.daemon.error_handler_use_ai:
                 await self.handle_error()
 
@@ -1304,41 +1307,13 @@ return 0
         """Return True if CLI calls are allowed, False if rate-limited."""
         if self.state.rate_limited_until is not None:
             if datetime.now(timezone.utc) < self.state.rate_limited_until:
+                if self.state.state != PipelineState.PAUSED:
+                    self.state.state = PipelineState.PAUSED
                 remaining = (self.state.rate_limited_until - datetime.now(timezone.utc)).total_seconds()
                 self.log_event(f"Rate limited, resuming in {int(remaining)}s")
                 return False
             self.state.rate_limited_until = None
             self.log_event("Rate limit window expired, resuming")
-        return True
-
-    def _try_recover_rate_limit(self) -> bool:
-        """If ERROR was caused by a rate limit, recover once the pause expires.
-
-        Returns True if recovery was attempted (caller should skip other
-        error handling), False otherwise.
-        """
-        msg = (self.state.error_message or "").lower()
-        if "rate limit" not in msg and not re.search(r"\b429\b", msg):
-            return False
-        if self.state.rate_limited_until is None:
-            return False
-        if datetime.now(timezone.utc) < self.state.rate_limited_until:
-            remaining = (self.state.rate_limited_until - datetime.now(timezone.utc)).total_seconds()
-            self.log_event(f"Rate limit pause active, resuming in {int(remaining)}s")
-            return True
-        self.state.rate_limited_until = None
-        self.state.error_message = None
-        self._error_diagnose_count = 0
-        if (
-            self.state.current_pr is not None
-            and self.state.current_task is not None
-            and self.state.current_pr.branch == self.state.current_task.branch
-        ):
-            self.state.state = PipelineState.WATCH
-            self.log_event("Rate limit expired, resuming -> WATCH")
-        else:
-            self.state.state = PipelineState.IDLE
-            self.log_event("Rate limit expired, resuming -> IDLE")
         return True
 
     def _detect_rate_limit(self, stderr: str) -> None:
@@ -1378,6 +1353,50 @@ return 0
             self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=pause_min)
             self.log_event(f"Rate limit detected ({limit_type}), pausing for {pause_min} min")
 
+    async def handle_paused(self) -> None:
+        """Wait for rate limit window to expire, then resume previous flow."""
+        if self.state.rate_limited_until is None:
+            self.log_event("PAUSED without rate_limited_until -> IDLE")
+            self.state.state = PipelineState.IDLE
+            return
+        if datetime.now(timezone.utc) < self.state.rate_limited_until:
+            remaining = (
+                self.state.rate_limited_until - datetime.now(timezone.utc)
+            ).total_seconds()
+            self.log_event(f"Paused, resuming in {int(remaining)}s")
+            return
+        # Window expired: resume to appropriate state
+        self.state.rate_limited_until = None
+        self._error_diagnose_count = 0
+        if self.state.error_message:
+            lowered = self.state.error_message.lower()
+            is_rate_limit_msg = (
+                "rate limit" in lowered or re.search(r"\b429\b", lowered)
+            )
+            if is_rate_limit_msg:
+                # Legacy rate-limit error messages would deadlock in ERROR
+                # because handle_error skips diagnosis for rate-limit text.
+                self.state.error_message = None
+                self.log_event(
+                    "Rate limit expired, cleared legacy rate-limit error"
+                )
+            else:
+                self.state.state = PipelineState.ERROR
+                self.log_event(
+                    "Rate limit expired, resuming -> ERROR (preserved context)"
+                )
+                return
+        if (
+            self.state.current_pr is not None
+            and self.state.current_task is not None
+            and self.state.current_pr.branch == self.state.current_task.branch
+        ):
+            self.state.state = PipelineState.WATCH
+            self.log_event("Rate limit expired, resuming -> WATCH")
+        else:
+            self.state.state = PipelineState.IDLE
+            self.log_event("Rate limit expired, resuming -> IDLE")
+
     async def handle_coding(self) -> None:
         """Run ``PLANNED PR`` via the claude CLI and hand off to WATCH.
 
@@ -1414,6 +1433,14 @@ return 0
         await self._save_cli_log(stdout, stderr, "PLANNED PR output")
         self._detect_rate_limit(stderr)
         if code != 0:
+            if self.state.rate_limited_until is not None:
+                self.state.state = PipelineState.PAUSED
+                self.state.error_message = None
+                self.log_event(
+                    f"Rate limit pause active until "
+                    f"{self.state.rate_limited_until.isoformat()}"
+                )
+                return
             self.state.state = PipelineState.ERROR
             self.state.error_message = stderr.strip() or f"claude exit {code}"
             self.log_event(f"claude CLI failed: {self.state.error_message}")
@@ -1745,6 +1772,14 @@ return 0
         await self._save_cli_log(stdout, stderr, "FIX REVIEW output")
         self._detect_rate_limit(stderr)
         if code != 0:
+            if self.state.rate_limited_until is not None:
+                self.state.state = PipelineState.PAUSED
+                self.state.error_message = None
+                self.log_event(
+                    f"Rate limit pause active until "
+                    f"{self.state.rate_limited_until.isoformat()}"
+                )
+                return
             self.state.state = PipelineState.ERROR
             self.state.error_message = stderr.strip() or f"claude exit {code}"
             self.log_event(f"fix_review failed: {self.state.error_message}")
@@ -2367,6 +2402,14 @@ return 0
             self.repo_path, context, model=self.app_config.daemon.claude_model
         )
         self._detect_rate_limit(stderr)
+        if self.state.rate_limited_until is not None:
+            self.state.state = PipelineState.PAUSED
+            # Preserve error_message so handle_paused resumes to ERROR
+            self.log_event(
+                f"Rate limit pause active until "
+                f"{self.state.rate_limited_until.isoformat()}"
+            )
+            return
         if code != 0:
             self.log_event(
                 f"diagnose_error CLI failed: {stderr.strip() or f'exit {code}'}"

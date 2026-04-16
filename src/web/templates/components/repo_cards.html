@@ -7,6 +7,7 @@
     'MERGE':     {'dot': 'bg-ok',        'badge': 'bg-ok/10 text-ok border-ok/30',                     'pulse': false},
     'HUNG':      {'dot': 'bg-hung',      'badge': 'bg-hung/10 text-hung border-hung/30',               'pulse': false},
     'ERROR':     {'dot': 'bg-fail',      'badge': 'bg-fail/10 text-fail border-fail/30',               'pulse': false},
+    'PAUSED':    {'dot': 'bg-warn',      'badge': 'bg-warn/10 text-warn border-warn/30',               'pulse': false},
 } %}
 
 {% set init_messages = ['Waiting for daemon to initialize', 'State decode failed', 'Redis unavailable — state unknown'] %}
@@ -132,8 +133,12 @@
         <div class="text-xs text-accent/70 italic mt-1">Claude is coding...</div>
         {% endif %}
         {% endif %}
-        {% if (repo.rate_limited_until and repo.rate_limited_until > utcnow()) or (repo.error_message and ('rate limit' in repo.error_message.lower() or '429' in repo.error_message)) %}
-        <div class="text-xs text-warn italic mt-1">Rate limited, auto-resuming...</div>
+        {% if repo.state.value == 'PAUSED' and repo.rate_limited_until and repo.rate_limited_until > utcnow() %}
+        {% set remaining_sec = (repo.rate_limited_until - utcnow()).total_seconds() | int %}
+        {% set remaining_min = (remaining_sec / 60) | round(0, 'ceil') | int %}
+        <div class="text-xs text-warn italic mt-1">Paused, {{ remaining_min }}m remaining</div>
+        {% elif repo.state.value == 'PAUSED' %}
+        <div class="text-xs text-warn italic mt-1">Paused, resuming soon...</div>
         {% endif %}
         <div id="upload-error-{{ repo.name }}"></div>
     </div>
