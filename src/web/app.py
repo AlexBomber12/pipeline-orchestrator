@@ -1365,13 +1365,16 @@ async def upload_tasks(
     lock = _get_upload_lock(name)
     async with lock:
         # Best-effort sweep of abandoned staging directories.
+        # Collect active staging dirs for ALL repos so the sweep does not
+        # accidentally remove another repo's still-pending directory.
         try:
-            pending_key_sweep = f"upload:{name}:pending"
-            raw_sweep = await redis_client.get(pending_key_sweep)
             active_dirs: set[str] = set()
-            if raw_sweep:
+            pending_keys = await redis_client.keys("upload:*:pending")
+            for pkey in pending_keys:
                 try:
-                    active_dirs.add(_json.loads(raw_sweep)["staging_dir"])
+                    raw_sweep = await redis_client.get(pkey)
+                    if raw_sweep:
+                        active_dirs.add(_json.loads(raw_sweep)["staging_dir"])
                 except Exception:
                     pass
             max_age = cfg.daemon.upload_staging_max_age_hours
