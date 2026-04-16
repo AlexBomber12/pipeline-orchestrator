@@ -1622,7 +1622,7 @@ return 0
         ):
             branch = self.state.current_pr.branch
             try:
-                _git(self.repo_path, "fetch", "origin", branch)
+                _git(self.repo_path, "fetch", "origin", branch, timeout=60)
                 _git(self.repo_path, "checkout", branch)
                 _git(self.repo_path, "reset", "--hard", f"origin/{branch}")
             except (
