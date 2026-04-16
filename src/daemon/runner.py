@@ -1094,17 +1094,24 @@ class PipelineRunner:
                 # base branch before processing uploads — process_pending_
                 # uploads commits on HEAD and pushes to origin/{branch},
                 # so running it on a feature branch would push the wrong
-                # ref and silently lose the upload.
+                # ref and silently lose the upload.  If checkout fails
+                # (e.g. dirty tree), skip uploads entirely; the manifest
+                # stays in Redis and retries next cycle.
                 branch = self.repo_config.branch
+                on_base = False
                 try:
                     head_ref = _git(
                         self.repo_path, "rev-parse", "--abbrev-ref", "HEAD",
                     ).stdout.strip()
-                    if head_ref != branch:
+                    if head_ref == branch:
+                        on_base = True
+                    else:
                         _git(self.repo_path, "checkout", branch)
+                        on_base = True
                 except Exception:
-                    pass  # best-effort; upload will retry next cycle
-                await self.process_pending_uploads()
+                    pass
+                if on_base:
+                    await self.process_pending_uploads()
                 await self.publish_state()
                 return
             self._recovered = True
