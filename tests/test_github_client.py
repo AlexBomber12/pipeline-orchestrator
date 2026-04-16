@@ -214,10 +214,10 @@ def test_get_pr_review_status_approved_via_first_author_comment_reaction(
         assert "--paginate" in cmd, f"missing --paginate in {cmd}"
 
 
-def test_review_api_approved_overrides_reaction_absence(
+def test_review_api_without_reaction_stays_pending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A formal Codex APPROVED review after the head commit is enough."""
+    """A formal Codex APPROVED review alone should not count as approval."""
     import json as _json
 
     clear_review_status_cache()
@@ -251,7 +251,7 @@ def test_review_api_approved_overrides_reaction_absence(
         get_pr_review_status(
             "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
         )
-        == ReviewStatus.APPROVED
+        == ReviewStatus.PENDING
     )
 
 
@@ -353,7 +353,7 @@ def test_review_api_approval_does_not_override_post_anchor_codex_comment(
 def test_review_api_approved_beats_older_post_anchor_codex_comment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Older Codex comments should not override a later APPROVED review."""
+    """Older Codex comments still block without a +1 approval signal."""
     import json as _json
 
     clear_review_status_cache()
@@ -400,7 +400,7 @@ def test_review_api_approved_beats_older_post_anchor_codex_comment(
         get_pr_review_status(
             "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
         )
-        == ReviewStatus.APPROVED
+        == ReviewStatus.CHANGES_REQUESTED
     )
 
 
@@ -919,10 +919,47 @@ def test_review_status_eyes_wins_over_codex_comment(
     )
 
 
-def test_review_api_approved_wins_over_body_eyes(
+def test_body_eyes_wins_over_anchor_plus_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Formal APPROVED review should beat stale body-level eyes."""
+    """A PR-body eyes signal should beat an anchor +1 while review is in progress."""
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = _find_api_path(cmd)
+        if "issues" in path and path.endswith("/comments"):
+            data = [[
+                {
+                    "id": 10,
+                    "user": {"login": "author"},
+                    "body": "@codex review",
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ]]
+        elif "pulls" in path and path.endswith("/comments"):
+            data = []
+        elif "comments/10/reactions" in path:
+            data = [[{"content": "+1", "user": {"login": "chatgpt-codex-bot"}}]]
+        elif path.endswith("/reactions"):
+            data = [[{"content": "eyes", "user": {"login": "chatgpt-codex-bot"}}]]
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status("owner/name", 42, pr_author="author")
+        == ReviewStatus.EYES
+    )
+
+
+def test_review_api_with_body_eyes_stays_eyes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Formal APPROVED review alone should not beat body-level eyes."""
     import json as _json
 
     clear_review_status_cache()
@@ -961,14 +998,14 @@ def test_review_api_approved_wins_over_body_eyes(
         get_pr_review_status(
             "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
         )
-        == ReviewStatus.APPROVED
+        == ReviewStatus.EYES
     )
 
 
-def test_review_api_approved_wins_over_anchor_eyes(
+def test_review_api_with_anchor_eyes_stays_eyes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Formal APPROVED review should beat stale anchor eyes."""
+    """Formal APPROVED review alone should not beat anchor eyes."""
     import json as _json
 
     clear_review_status_cache()
@@ -1009,7 +1046,7 @@ def test_review_api_approved_wins_over_anchor_eyes(
         get_pr_review_status(
             "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
         )
-        == ReviewStatus.APPROVED
+        == ReviewStatus.EYES
     )
 
 

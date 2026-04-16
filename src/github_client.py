@@ -223,7 +223,6 @@ def _compute_review_status(
 ) -> ReviewStatus:
     """Core review status logic, separated for caching."""
     body_eyes = False
-    review_api_approved = False
     body_approved = False
     head_commit_time: datetime | None = None
     try:
@@ -237,15 +236,6 @@ def _compute_review_status(
 
     latest_review_time = review_info["latest_time"]
     latest_review_sha = review_info["latest_sha"]
-    latest_review_state = review_info["latest_state"]
-    approved_review_time: datetime | None = None
-    if latest_review_state == "APPROVED" and latest_review_time is not None:
-        if not head_sha:
-            review_api_approved = True
-            approved_review_time = latest_review_time
-        elif latest_review_sha and latest_review_sha == head_sha:
-            review_api_approved = True
-            approved_review_time = latest_review_time
 
     try:
         codex_reactions = _get_codex_issue_reactions(repo, pr_number)
@@ -329,29 +319,21 @@ def _compute_review_status(
                 if "HTTP 404" not in str(exc):
                     raise
 
-    if anchor_approved or body_approved:
+    if body_approved:
         return ReviewStatus.APPROVED
-    if not review_api_approved and (body_eyes or anchor_eyes):
+    if body_eyes or anchor_eyes:
         return ReviewStatus.EYES
+    if anchor_approved:
+        return ReviewStatus.APPROVED
 
     anchor_ts = (anchor.get("created_at") or "") if anchor else ""
     for comment in issue_comments + review_comments:
         if not _is_codex_user(comment.get("user")):
             continue
-        comment_created_at = _parse_iso(comment.get("created_at"))
         if anchor_ts and (comment.get("created_at") or "") <= anchor_ts:
-            continue
-        if (
-            review_api_approved
-            and approved_review_time is not None
-            and comment_created_at is not None
-            and comment_created_at <= approved_review_time
-        ):
             continue
         return ReviewStatus.CHANGES_REQUESTED
 
-    if review_api_approved:
-        return ReviewStatus.APPROVED
     return ReviewStatus.PENDING
 
 
