@@ -38,6 +38,23 @@
     </span>
 </header>
 
+{% if repo.usage_session_percent is not none or repo.usage_weekly_percent is not none %}
+<div class="flex flex-wrap items-center gap-3 mb-4 text-xs font-mono text-gray-400">
+    {% if repo.usage_session_percent is not none %}
+    <span>Session {{ repo.usage_session_percent }}%{% if repo.usage_session_resets_at %} <span class="text-gray-600">(resets <span data-ts-unix="{{ repo.usage_session_resets_at }}">{{ repo.usage_session_resets_at }}</span>)</span>{% endif %}</span>
+    {% endif %}
+    {% if repo.usage_weekly_percent is not none %}
+    <span class="text-gray-600">|</span>
+    <span>Weekly {{ repo.usage_weekly_percent }}%{% if repo.usage_weekly_resets_at %} <span class="text-gray-600">(resets <span data-ts-unix="{{ repo.usage_weekly_resets_at }}">{{ repo.usage_weekly_resets_at }}</span>)</span>{% endif %}</span>
+    {% endif %}
+    {% if repo.usage_api_degraded %}
+    <span class="text-warn" title="Usage API has failed 10+ consecutive times; falling back to reactive rate-limit detection">Usage API degraded</span>
+    {% endif %}
+</div>
+{% elif repo.usage_api_degraded %}
+<div class="mb-4 text-xs font-mono text-warn" title="Usage API has failed 10+ consecutive times; falling back to reactive rate-limit detection">Usage API degraded</div>
+{% endif %}
+
 {% if repo.state.value == 'PAUSED' %}
 <div class="mb-6 rounded-lg border border-warn/30 bg-warn/10 px-4 py-3">
     {% if repo.rate_limited_until and repo.rate_limited_until > utcnow() %}

@@ -44,6 +44,7 @@ from src.queue_parser import (
     parse_queue_text,
 )
 from src.retry import retry_transient
+from src.usage import OAuthUsageProvider
 from src.utils import repo_slug_from_url
 
 logger = logging.getLogger(__name__)
@@ -300,7 +301,7 @@ class PipelineRunner:
         redis_client: aioredis.Redis,
     ) -> None:
         self.repo_config = repo_config
-        self.app_config = app_config
+        self._app_config = app_config
         self.redis = redis_client
         self.name = repo_slug_from_url(repo_config.url)
         self.owner_repo = repo_owner_from_url(repo_config.url)
@@ -409,11 +410,58 @@ class PipelineRunner:
         # newer-but-wrong timestamp under the "only update if newer"
         # gate.
         self._last_push_at_pr_number: int | None = None
+        self._usage_degraded_logged = False
+        self._usage_provider = OAuthUsageProvider(
+            credentials_path=str(
+                Path(self.app_config.auth.claude_config_dir) / ".credentials.json"
+            ),
+            user_agent=self.app_config.daemon.usage_api_user_agent,
+            beta_header=self.app_config.daemon.usage_api_beta_header,
+            cache_ttl_sec=self._app_config.daemon.usage_api_cache_ttl_sec,
+        )
+
+    @property
+    def app_config(self) -> AppConfig:
+        return self._app_config
+
+    @app_config.setter
+    def app_config(self, value: AppConfig) -> None:
+        old = self._app_config
+        self._app_config = value
+        if (
+            value.daemon.usage_api_user_agent != old.daemon.usage_api_user_agent
+            or value.daemon.usage_api_beta_header != old.daemon.usage_api_beta_header
+            or value.daemon.usage_api_cache_ttl_sec != old.daemon.usage_api_cache_ttl_sec
+            or value.auth.claude_config_dir != old.auth.claude_config_dir
+        ):
+            self._usage_provider = OAuthUsageProvider(
+                credentials_path=str(
+                    Path(value.auth.claude_config_dir) / ".credentials.json"
+                ),
+                user_agent=value.daemon.usage_api_user_agent,
+                beta_header=value.daemon.usage_api_beta_header,
+                cache_ttl_sec=value.daemon.usage_api_cache_ttl_sec,
+            )
 
     async def publish_state(self) -> None:
         """Serialize ``self.state`` and write it to Redis."""
         self.state.active = self.repo_config.active
         self.state.last_updated = datetime.now(timezone.utc)
+        # Only probe usage for active repos to avoid unnecessary HTTP
+        # calls (and potential timeout latency) for idle/inactive repos.
+        if self.repo_config.active:
+            snap = await asyncio.to_thread(self._usage_provider.fetch)
+            if snap is not None:
+                self.state.usage_session_percent = snap.session_percent
+                self.state.usage_session_resets_at = snap.session_resets_at
+                self.state.usage_weekly_percent = snap.weekly_percent
+                self.state.usage_weekly_resets_at = snap.weekly_resets_at
+            else:
+                self.state.usage_session_percent = None
+                self.state.usage_session_resets_at = None
+                self.state.usage_weekly_percent = None
+                self.state.usage_weekly_resets_at = None
+            self.state.usage_api_degraded = self._usage_provider.consecutive_failures >= 10
         if not self.repo_config.active:
             data = self.state.model_dump()
             data["state"] = PipelineState.IDLE.value
@@ -1411,7 +1459,52 @@ return 0
         await self.publish_state()
         await self.handle_coding()
 
-    def _check_rate_limit(self) -> bool:
+    async def _proactive_usage_check(self) -> bool:
+        """Return True if CLI calls are allowed, False if usage threshold breached.
+
+        Fail-open: returns True when the provider cannot reach the endpoint,
+        deferring to the reactive _detect_rate_limit on stderr after the CLI run.
+        """
+        snapshot = await asyncio.to_thread(self._usage_provider.fetch)
+        if snapshot is None:
+            if (
+                self._usage_provider.consecutive_failures >= 10
+                and not self._usage_degraded_logged
+            ):
+                self._usage_degraded_logged = True
+                self.log_event(
+                    "Usage API degraded (10 consecutive failures), "
+                    "falling back to reactive rate-limit detection"
+                )
+            return True
+        self._usage_degraded_logged = False
+        session_threshold = self.app_config.daemon.rate_limit_session_pause_percent
+        weekly_threshold = self.app_config.daemon.rate_limit_weekly_pause_percent
+        breached = None
+        resets_at = 0
+        if snapshot.session_percent >= session_threshold:
+            breached = "session"
+            resets_at = snapshot.session_resets_at
+        elif snapshot.weekly_percent >= weekly_threshold:
+            breached = "weekly"
+            resets_at = snapshot.weekly_resets_at
+        if breached is None:
+            return True
+        self.state.rate_limited_until = datetime.fromtimestamp(resets_at, tz=timezone.utc)
+        # Only preserve error_message when pausing from ERROR state so
+        # handle_paused correctly resumes to ERROR; clear stale error
+        # context from non-ERROR states to avoid incorrect ERROR resume.
+        if self.state.state != PipelineState.ERROR:
+            self.state.error_message = None
+        self.state.state = PipelineState.PAUSED
+        self.log_event(
+            f"Proactive pause: {breached} usage at "
+            f"{snapshot.session_percent if breached == 'session' else snapshot.weekly_percent}%, "
+            f"resumes at {self.state.rate_limited_until.isoformat()}"
+        )
+        return False
+
+    async def _check_rate_limit(self) -> bool:
         """Return True if CLI calls are allowed, False if rate-limited."""
         if self.state.rate_limited_until is not None:
             if datetime.now(timezone.utc) < self.state.rate_limited_until:
@@ -1421,8 +1514,9 @@ return 0
                 self.log_event(f"Rate limited, resuming in {int(remaining)}s")
                 return False
             self.state.rate_limited_until = None
+            self._usage_provider.invalidate_cache()
             self.log_event("Rate limit window expired, resuming")
-        return True
+        return await self._proactive_usage_check()
 
     def _detect_rate_limit(self, stderr: str) -> None:
         """Set rate-limit pause if stderr contains rate-limit signals."""
@@ -1515,7 +1609,7 @@ return 0
         for the PR; because the list API is eventually consistent, we
         retry a few times before surfacing an ERROR.
         """
-        if not self._check_rate_limit():
+        if not await self._check_rate_limit():
             return
 
         target_branch = (
@@ -1778,7 +1872,7 @@ return 0
 
     async def handle_fix(self) -> None:
         """Run ``FIX REVIEW`` via the claude CLI and return to WATCH."""
-        if not self._check_rate_limit():
+        if not await self._check_rate_limit():
             return
 
         if (
@@ -1998,7 +2092,7 @@ return 0
                     if "CONFLICT" in (
                         merge_result.stdout + merge_result.stderr
                     ):
-                        if not self._check_rate_limit():
+                        if not await self._check_rate_limit():
                             _git(
                                 self.repo_path,
                                 "merge", "--abort",
@@ -2508,7 +2602,7 @@ return 0
 
     async def handle_error(self, error_context: str | None = None) -> None:
         """Ask the claude CLI whether to FIX, SKIP, or ESCALATE the error."""
-        if not self._check_rate_limit():
+        if not await self._check_rate_limit():
             return
 
         context = error_context or self.state.error_message or "Unknown error"
