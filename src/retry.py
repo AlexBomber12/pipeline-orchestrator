@@ -26,8 +26,17 @@ TRANSIENT_MARKERS = (
     "remote end hung up",
 )
 
-# Matches standalone 5xx status codes (e.g. "error: 503", "HTTP 502")
-_NUMERIC_5XX_RE = re.compile(r"\b5[0-9]{2}\b")
+# Matches 5xx status codes preceded by HTTP/status context words
+# (e.g. "error: 503", "HTTP 502", "HTTP/1.1 503", "status code 502")
+# Avoids matching bare numbers in URLs like "issues/503/comments".
+_NUMERIC_5XX_RE = re.compile(
+    r"(?:"
+    r"(?:returned\s+)?error\s*:\s*"
+    r"|http\s*/?\s*(?:\d\.\d\s+)?"
+    r"|status\s*(?:code\s*)?"
+    r")\s*5[0-9]{2}\b",
+    re.IGNORECASE,
+)
 
 
 def _has_transient_signal(text: str) -> bool:

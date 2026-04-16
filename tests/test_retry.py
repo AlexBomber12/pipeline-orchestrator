@@ -136,6 +136,19 @@ class TestIsTransientError:
         )
         assert is_transient_error(exc) is False
 
+    def test_url_with_503_not_transient(self) -> None:
+        exc = RuntimeError(
+            "gh api failed (exit 1): HTTP 404 - repos/owner/repo/issues/503/comments"
+        )
+        assert is_transient_error(exc) is False
+
+    def test_numeric_503_in_url_stderr_not_transient(self) -> None:
+        exc = subprocess.CalledProcessError(
+            1, ["gh", "api", "repos/owner/repo/issues/503/comments"],
+            stderr="HTTP 404 Not Found"
+        )
+        assert is_transient_error(exc) is False
+
     def test_generic_exception_not_transient(self) -> None:
         exc = ValueError("something went wrong")
         assert is_transient_error(exc) is False
