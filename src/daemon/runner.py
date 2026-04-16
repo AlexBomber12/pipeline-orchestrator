@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 
 import redis.asyncio as aioredis
@@ -44,6 +45,22 @@ from src.queue_parser import (
 from src.utils import repo_slug_from_url
 
 logger = logging.getLogger(__name__)
+
+
+class ErrorCategory(Enum):
+    RATE_LIMIT = "rate_limit"
+    TIMEOUT = "timeout"
+    OTHER = "other"
+
+
+def _classify_error(context: str) -> ErrorCategory:
+    lowered = context.lower()
+    if "rate limit" in lowered or re.search(r"\b429\b", lowered):
+        return ErrorCategory.RATE_LIMIT
+    if "timeout" in lowered:
+        return ErrorCategory.TIMEOUT
+    return ErrorCategory.OTHER
+
 
 _TRANSIENT_STATES = {
     PipelineState.CODING,
@@ -2388,9 +2405,15 @@ return 0
             return
 
         context = error_context or self.state.error_message or "Unknown error"
-        lowered = context.lower()
-        if "rate limit" in lowered or "timeout" in lowered or re.search(r"\b429\b", lowered):
-            self.log_event("Skipping AI diagnosis for rate-limit/timeout error")
+        category = _classify_error(context)
+        if category == ErrorCategory.RATE_LIMIT:
+            self.log_event("Skipping AI diagnosis for rate-limit error")
+            return
+        if category == ErrorCategory.TIMEOUT:
+            self.log_event(
+                "Skipping AI diagnosis for timeout error; "
+                "will retry on next cycle"
+            )
             return
         self._error_diagnose_count += 1
         if self._error_diagnose_count > 3:

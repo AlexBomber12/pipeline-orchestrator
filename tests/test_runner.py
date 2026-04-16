@@ -4843,3 +4843,55 @@ def test_legacy_error_with_rate_limited_until_converts_to_paused(
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.error_message == "some real error"
     assert any("Legacy ERROR" in e["event"] for e in runner.state.history)
+
+
+# ── ErrorCategory / _classify_error ──────────────────────────────────
+
+
+from src.daemon.runner import ErrorCategory, _classify_error
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["rate limit exceeded", "429 Too Many Requests", "API rate limit hit"],
+)
+def test_classify_error_rate_limit(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.RATE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["Timeout after 3600s", "network timeout", "claude CLI timeout after 900s"],
+)
+def test_classify_error_timeout(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.TIMEOUT
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["git push failed", "file not found", "Unknown error"],
+)
+def test_classify_error_other(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.OTHER
+
+
+def test_handle_error_timeout_has_distinct_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeout errors must produce a log mentioning 'timeout error', not 'rate-limit'."""
+    called: list[bool] = []
+
+    async def fake_diag(*a: Any, **kw: Any) -> tuple[int, str, str]:
+        called.append(True)
+        return (0, "SKIP", "")
+
+    monkeypatch.setattr(runner_module.claude_cli, "diagnose_error_async", fake_diag)
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Timeout after 600s"
+    asyncio.run(runner.handle_error())
+
+    assert called == []
+    log_msgs = [e["event"] for e in runner.state.history]
+    assert any("timeout error" in m for m in log_msgs)
+    assert not any("rate-limit" in m for m in log_msgs)

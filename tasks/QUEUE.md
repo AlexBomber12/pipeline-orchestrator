@@ -324,7 +324,7 @@
 - Depends on: PR-061
 
 ## PR-053: Separate timeout from rate-limit in error handler
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-053.md
 - Branch: pr-053-timeout-classification
 - Depends on: PR-062
