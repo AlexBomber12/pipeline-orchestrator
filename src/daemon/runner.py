@@ -1090,13 +1090,42 @@ class PipelineRunner:
             if not recovery_complete:
                 # Discovery phase failed (transient GitHub outage or
                 # queue validation error).  Leave _recovered unset so the
-                # next cycle retries discovery.  Do NOT attempt to process
-                # pending uploads here — process_pending_uploads() has an
-                # error handler that runs ``git reset --hard origin/{branch}``
-                # which would destroy uncommitted crash-recovery work if the
-                # repo is on a feature branch.  Pending uploads stay in Redis
-                # and will be applied once recovery succeeds and handle_idle
-                # runs sync_to_main normally.
+                # next cycle retries discovery.  Attempt pending uploads
+                # so operators can fix a malformed queue via dashboard,
+                # but use _safe=True to skip the destructive
+                # ``git reset --hard`` error handler in
+                # process_pending_uploads — the working tree may contain
+                # uncommitted crash-recovery work that must not be
+                # discarded.
+                has_pending = False
+                try:
+                    raw = await self.redis.get(f"upload:{self.name}:pending")
+                    has_pending = bool(raw)
+                except Exception:
+                    pass
+                if has_pending:
+                    branch = self.repo_config.branch
+                    on_base = False
+                    try:
+                        head_ref = _git(
+                            self.repo_path, "rev-parse", "--abbrev-ref",
+                            "HEAD",
+                        ).stdout.strip()
+                        if head_ref == branch:
+                            on_base = True
+                        else:
+                            # Non-destructive checkout: do NOT reset/clean
+                            # the working tree before switching.  If
+                            # checkout fails (dirty tree from a crashed
+                            # coding cycle), the upload stays in Redis and
+                            # will be applied once recovery succeeds and
+                            # handle_idle runs sync_to_main normally.
+                            _git(self.repo_path, "checkout", branch)
+                            on_base = True
+                    except Exception:
+                        pass
+                    if on_base:
+                        await self.process_pending_uploads(_safe=True)
                 await self.publish_state()
                 return
             self._recovered = True
@@ -1170,12 +1199,19 @@ return 0
                 pass
             return False
 
-    async def process_pending_uploads(self) -> bool | None:
+    async def process_pending_uploads(
+        self, *, _safe: bool = False,
+    ) -> bool | None:
         """Commit and push any files staged by the web upload endpoint.
 
         Returns ``True`` if an upload was pushed, ``False`` if there was
         nothing pending, or ``None`` if a pending upload failed (caller
         should skip task dispatch so it retries next cycle).
+
+        When *_safe* is ``True`` the error handler skips the destructive
+        ``git reset --hard origin/{branch}`` cleanup.  This is used by
+        the recovery-failure path where the working tree may contain
+        uncommitted crash-recovery work that must not be discarded.
         """
         key = f"upload:{self.name}:pending"
         try:
@@ -1233,16 +1269,17 @@ return 0
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
             logger.error("%s: upload git operations failed: %s", self.name, exc)
             self.log_event(f"Upload push failed: {exc}")
-            try:
-                _git(
-                    self.repo_path,
-                    "reset",
-                    "--hard",
-                    f"origin/{branch}",
-                    check=False,
-                )
-            except Exception:
-                pass
+            if not _safe:
+                try:
+                    _git(
+                        self.repo_path,
+                        "reset",
+                        "--hard",
+                        f"origin/{branch}",
+                        check=False,
+                    )
+                except Exception:
+                    pass
             return None
 
         deleted = await self._delete_upload_if_unchanged(key, raw)
