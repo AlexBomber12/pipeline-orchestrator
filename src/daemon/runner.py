@@ -301,7 +301,7 @@ class PipelineRunner:
         redis_client: aioredis.Redis,
     ) -> None:
         self.repo_config = repo_config
-        self.app_config = app_config
+        self._app_config = app_config
         self.redis = redis_client
         self.name = repo_slug_from_url(repo_config.url)
         self.owner_repo = repo_owner_from_url(repo_config.url)
@@ -416,15 +416,37 @@ class PipelineRunner:
             ),
             user_agent=self.app_config.daemon.usage_api_user_agent,
             beta_header=self.app_config.daemon.usage_api_beta_header,
-            cache_ttl_sec=self.app_config.daemon.usage_api_cache_ttl_sec,
+            cache_ttl_sec=self._app_config.daemon.usage_api_cache_ttl_sec,
         )
+
+    @property
+    def app_config(self) -> AppConfig:
+        return self._app_config
+
+    @app_config.setter
+    def app_config(self, value: AppConfig) -> None:
+        old = self._app_config
+        self._app_config = value
+        if (
+            value.daemon.usage_api_user_agent != old.daemon.usage_api_user_agent
+            or value.daemon.usage_api_beta_header != old.daemon.usage_api_beta_header
+            or value.daemon.usage_api_cache_ttl_sec != old.daemon.usage_api_cache_ttl_sec
+        ):
+            self._usage_provider = OAuthUsageProvider(
+                credentials_path=str(
+                    Path(value.auth.claude_config_dir) / ".credentials.json"
+                ),
+                user_agent=value.daemon.usage_api_user_agent,
+                beta_header=value.daemon.usage_api_beta_header,
+                cache_ttl_sec=value.daemon.usage_api_cache_ttl_sec,
+            )
 
     async def publish_state(self) -> None:
         """Serialize ``self.state`` and write it to Redis."""
         self.state.active = self.repo_config.active
         self.state.last_updated = datetime.now(timezone.utc)
         # Sync latest usage snapshot into state for dashboard display.
-        snap = self._usage_provider.fetch()
+        snap = await asyncio.to_thread(self._usage_provider.fetch)
         if snap is not None:
             self.state.usage_session_percent = snap.session_percent
             self.state.usage_session_resets_at = snap.session_resets_at
@@ -1428,13 +1450,13 @@ return 0
         await self.publish_state()
         await self.handle_coding()
 
-    def _proactive_usage_check(self) -> bool:
+    async def _proactive_usage_check(self) -> bool:
         """Return True if CLI calls are allowed, False if usage threshold breached.
 
         Fail-open: returns True when the provider cannot reach the endpoint,
         deferring to the reactive _detect_rate_limit on stderr after the CLI run.
         """
-        snapshot = self._usage_provider.fetch()
+        snapshot = await asyncio.to_thread(self._usage_provider.fetch)
         if snapshot is None:
             if (
                 self._usage_provider.consecutive_failures >= 10
@@ -1468,7 +1490,7 @@ return 0
         )
         return False
 
-    def _check_rate_limit(self) -> bool:
+    async def _check_rate_limit(self) -> bool:
         """Return True if CLI calls are allowed, False if rate-limited."""
         if self.state.rate_limited_until is not None:
             if datetime.now(timezone.utc) < self.state.rate_limited_until:
@@ -1480,7 +1502,7 @@ return 0
             self.state.rate_limited_until = None
             self._usage_provider.invalidate_cache()
             self.log_event("Rate limit window expired, resuming")
-        return self._proactive_usage_check()
+        return await self._proactive_usage_check()
 
     def _detect_rate_limit(self, stderr: str) -> None:
         """Set rate-limit pause if stderr contains rate-limit signals."""
@@ -1573,7 +1595,7 @@ return 0
         for the PR; because the list API is eventually consistent, we
         retry a few times before surfacing an ERROR.
         """
-        if not self._check_rate_limit():
+        if not await self._check_rate_limit():
             return
 
         target_branch = (
@@ -1836,7 +1858,7 @@ return 0
 
     async def handle_fix(self) -> None:
         """Run ``FIX REVIEW`` via the claude CLI and return to WATCH."""
-        if not self._check_rate_limit():
+        if not await self._check_rate_limit():
             return
 
         if (
@@ -2056,7 +2078,7 @@ return 0
                     if "CONFLICT" in (
                         merge_result.stdout + merge_result.stderr
                     ):
-                        if not self._check_rate_limit():
+                        if not await self._check_rate_limit():
                             _git(
                                 self.repo_path,
                                 "merge", "--abort",
@@ -2566,7 +2588,7 @@ return 0
 
     async def handle_error(self, error_context: str | None = None) -> None:
         """Ask the claude CLI whether to FIX, SKIP, or ESCALATE the error."""
-        if not self._check_rate_limit():
+        if not await self._check_rate_limit():
             return
 
         context = error_context or self.state.error_message or "Unknown error"

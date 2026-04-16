@@ -3922,7 +3922,7 @@ def test_check_rate_limit_blocks_when_limited(
     runner = _make_runner()
     runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
 
-    assert runner._check_rate_limit() is False
+    assert asyncio.run(runner._check_rate_limit()) is False
     assert runner.state.rate_limited_until is not None
 
 
@@ -3934,7 +3934,7 @@ def test_check_rate_limit_allows_when_expired(
     runner = _make_runner()
     runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
 
-    assert runner._check_rate_limit() is True
+    assert asyncio.run(runner._check_rate_limit()) is True
     assert runner.state.rate_limited_until is None
 
 
@@ -4846,7 +4846,7 @@ def test_check_rate_limit_transitions_to_paused(
     runner.state.state = PipelineState.CODING
     runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
 
-    result = runner._check_rate_limit()
+    result = asyncio.run(runner._check_rate_limit())
 
     assert result is False
     assert runner.state.state == PipelineState.PAUSED
@@ -5014,7 +5014,7 @@ def test_check_rate_limit_triggers_paused_when_session_over_threshold(
     runner._usage_provider = _FakeUsageProvider(snapshot=snap)
     runner.app_config.daemon.rate_limit_session_pause_percent = 95
 
-    assert runner._check_rate_limit() is False
+    assert asyncio.run(runner._check_rate_limit()) is False
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.rate_limited_until is not None
 
@@ -5036,7 +5036,7 @@ def test_check_rate_limit_triggers_paused_when_weekly_over_threshold(
     runner._usage_provider = _FakeUsageProvider(snapshot=snap)
     runner.app_config.daemon.rate_limit_weekly_pause_percent = 100
 
-    assert runner._check_rate_limit() is False
+    assert asyncio.run(runner._check_rate_limit()) is False
     assert runner.state.state == PipelineState.PAUSED
 
 
@@ -5056,7 +5056,7 @@ def test_check_rate_limit_allows_cli_when_under_thresholds(
     )
     runner._usage_provider = _FakeUsageProvider(snapshot=snap)
 
-    assert runner._check_rate_limit() is True
+    assert asyncio.run(runner._check_rate_limit()) is True
 
 
 def test_check_rate_limit_fail_open_when_provider_returns_none(
@@ -5066,7 +5066,7 @@ def test_check_rate_limit_fail_open_when_provider_returns_none(
     runner = _make_runner()
     runner._usage_provider = _FakeUsageProvider(snapshot=None)
 
-    assert runner._check_rate_limit() is True
+    assert asyncio.run(runner._check_rate_limit()) is True
 
 
 def test_check_rate_limit_invalidates_cache_after_pause_expires(
@@ -5078,7 +5078,7 @@ def test_check_rate_limit_invalidates_cache_after_pause_expires(
     runner._usage_provider = fake
     runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
 
-    runner._check_rate_limit()
+    asyncio.run(runner._check_rate_limit())
     assert fake._invalidated is True
 
 
@@ -5089,7 +5089,7 @@ def test_proactive_check_logs_degradation_at_10_failures(
     runner = _make_runner()
     runner._usage_provider = _FakeUsageProvider(snapshot=None, failures=10)
 
-    result = runner._proactive_usage_check()
+    result = asyncio.run(runner._proactive_usage_check())
     assert result is True
     assert any("degraded" in e.get("event", "").lower() for e in runner.state.history)
 
@@ -5112,6 +5112,6 @@ def test_rate_limited_until_uses_resets_at_timestamp(
     runner._usage_provider = _FakeUsageProvider(snapshot=snap)
     runner.app_config.daemon.rate_limit_session_pause_percent = 95
 
-    runner._check_rate_limit()
+    asyncio.run(runner._check_rate_limit())
     assert runner.state.rate_limited_until is not None
     assert int(runner.state.rate_limited_until.timestamp()) == resets_at
