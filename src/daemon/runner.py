@@ -1369,9 +1369,24 @@ return 0
         self.state.rate_limited_until = None
         self._error_diagnose_count = 0
         if self.state.error_message:
-            self.state.state = PipelineState.ERROR
-            self.log_event("Rate limit expired, resuming -> ERROR (preserved context)")
-        elif (
+            lowered = self.state.error_message.lower()
+            is_rate_limit_msg = (
+                "rate limit" in lowered or re.search(r"\b429\b", lowered)
+            )
+            if is_rate_limit_msg:
+                # Legacy rate-limit error messages would deadlock in ERROR
+                # because handle_error skips diagnosis for rate-limit text.
+                self.state.error_message = None
+                self.log_event(
+                    "Rate limit expired, cleared legacy rate-limit error"
+                )
+            else:
+                self.state.state = PipelineState.ERROR
+                self.log_event(
+                    "Rate limit expired, resuming -> ERROR (preserved context)"
+                )
+                return
+        if (
             self.state.current_pr is not None
             and self.state.current_task is not None
             and self.state.current_pr.branch == self.state.current_task.branch

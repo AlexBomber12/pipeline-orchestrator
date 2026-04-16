@@ -4016,6 +4016,28 @@ def test_handle_paused_resumes_to_error_when_error_message_present(
     assert runner.state.rate_limited_until is None
 
 
+def test_handle_paused_clears_legacy_rate_limit_error_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Window expired with rate-limit error_message -> clear msg, resume WATCH/IDLE (no deadlock)."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+    runner.state.error_message = "API rate limit exceeded (429)"
+    runner.state.current_pr = PRInfo(number=50, branch="pr-050")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-050", title="test", branch="pr-050", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.error_message is None
+    assert any("cleared legacy rate-limit" in e["event"] for e in runner.state.history)
+
+
 def test_detect_rate_limit_sets_pause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
