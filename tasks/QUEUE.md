@@ -300,7 +300,7 @@
 - Depends on: PR-049
 
 ## PR-051: Check for existing open PR before CODING
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-051.md
 - Branch: pr-051-coding-pr-guard
 - Depends on: PR-046

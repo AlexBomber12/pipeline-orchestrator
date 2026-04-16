@@ -1260,6 +1260,32 @@ return 0
             return
 
         self.state.current_task = task
+        task_branch = task.branch
+
+        if task_branch:
+            try:
+                prs = github_client.get_open_prs(self.owner_repo)
+                existing = next(
+                    (p for p in prs if p.branch == task_branch), None
+                )
+            except Exception as exc:
+                self.log_event(
+                    f"IDLE: open PR check failed: {exc}; deferring task dispatch"
+                )
+                self.state.current_task = None
+                return
+
+            if existing is not None:
+                self.state.current_pr = existing
+                self.state.state = PipelineState.WATCH
+                self._rehydrate_last_push_at(existing)
+                self.log_event(
+                    f"Task {task.pr_id} has existing open PR #{existing.number} "
+                    f"on {task_branch!r} -> WATCH (no duplicate CODING)"
+                )
+                await self.publish_state()
+                return
+
         self.state.state = PipelineState.CODING
         self.log_event(f"Picked task {task.pr_id}: {task.title}")
         await self.publish_state()
@@ -2153,10 +2179,11 @@ return 0
             self.log_event("posted @codex review -> WATCH")
             return
 
-        self.log_event("hung fallback disabled, skipping")
-        self.state.current_pr = None
-        self.state.current_task = None
-        self.state.state = PipelineState.IDLE
+        self.log_event(
+            "hung fallback disabled; leaving runner in HUNG for operator action. "
+            "Resolve the PR manually or re-enable hung_fallback_codex_review."
+        )
+        # state remains HUNG, current_pr and current_task preserved
 
     def _rehydrate_last_push_at(self, pr: PRInfo) -> None:
         """Seed ``_last_push_at`` from the PR's head commit's committer

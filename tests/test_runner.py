@@ -300,10 +300,20 @@ def test_handle_idle_picks_task_and_drives_coding(
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.PENDING,
     )
+    # First call (guard in handle_idle) returns no matching PR;
+    # subsequent calls (handle_coding) return the opened PR.
+    call_count = {"n": 0}
+
+    def _get_open_prs(repo: str) -> list[PRInfo]:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return []  # guard: no existing PR
+        return [opened_pr]
+
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [opened_pr],
+        _get_open_prs,
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -340,10 +350,19 @@ def test_handle_idle_sets_queue_counters_with_mixed_statuses(
         "run_planned_pr_async",
         _async_cli_result(0, "ok", ""),
     )
+    # First call (guard) returns no matching PR; subsequent calls return the PR.
+    call_count = {"n": 0}
+
+    def _get_open_prs(repo: str) -> list[PRInfo]:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return []
+        return [PRInfo(number=1, branch="pr-003")]
+
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
-        lambda repo: [PRInfo(number=1, branch="pr-003")],
+        _get_open_prs,
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -356,6 +375,137 @@ def test_handle_idle_sets_queue_counters_with_mixed_statuses(
 
     assert runner.state.queue_done == 2
     assert runner.state.queue_total == 3
+
+
+def test_handle_idle_attaches_to_existing_pr_instead_of_coding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a TODO task already has an open PR on its branch, handle_idle
+    should attach to that PR and go to WATCH instead of running CODING."""
+    _patch_subprocess(monkeypatch)
+    task = QueueTask(
+        pr_id="PR-042",
+        title="Sample",
+        status=TaskStatus.TODO,
+        branch="pr-042-sample",
+    )
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
+    monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: task)
+
+    existing_pr = PRInfo(
+        number=99,
+        branch="pr-042-sample",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [existing_pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: {"head_commit_date": "2026-04-14T12:00:00Z"},
+    )
+
+    coding_called = {"v": False}
+    original_handle_coding = runner_module.PipelineRunner.handle_coding
+
+    async def spy_handle_coding(self):
+        coding_called["v"] = True
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "handle_coding", spy_handle_coding)
+
+    runner = _make_runner()
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 99
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == "PR-042"
+    assert not coding_called["v"], "handle_coding should NOT be called"
+
+
+def test_handle_idle_proceeds_to_coding_when_no_matching_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When no open PR matches the task branch, handle_idle proceeds to CODING."""
+    _patch_subprocess(monkeypatch)
+    task = QueueTask(
+        pr_id="PR-042",
+        title="Sample",
+        status=TaskStatus.TODO,
+        branch="pr-042-sample",
+    )
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
+    monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: task)
+
+    # Guard returns no matching PR; handle_coding's call returns the PR.
+    call_count = {"n": 0}
+
+    def _get_open_prs(repo: str) -> list[PRInfo]:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return []
+        return [PRInfo(number=17, branch="pr-042-sample")]
+
+    monkeypatch.setattr(runner_module.github_client, "get_open_prs", _get_open_prs)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "run_planned_pr_async",
+        _async_cli_result(0, "ok", ""),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+
+    runner = _make_runner()
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 17
+
+
+def test_handle_idle_defers_on_gh_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When get_open_prs raises during the guard check, handle_idle defers
+    without entering CODING."""
+    _patch_subprocess(monkeypatch)
+    task = QueueTask(
+        pr_id="PR-042",
+        title="Sample",
+        status=TaskStatus.TODO,
+        branch="pr-042-sample",
+    )
+    monkeypatch.setattr(runner_module, "parse_queue", lambda path: [task])
+    monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: task)
+
+    def _exploding_get_open_prs(repo: str) -> list[PRInfo]:
+        raise RuntimeError("GitHub API unavailable")
+
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", _exploding_get_open_prs
+    )
+
+    coding_called = {"v": False}
+
+    async def spy_handle_coding(self):
+        coding_called["v"] = True
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "handle_coding", spy_handle_coding)
+
+    runner = _make_runner()
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert not coding_called["v"], "handle_coding should NOT be called on GH failure"
 
 
 def test_handle_coding_errors_when_no_pr_found(
@@ -1270,9 +1420,11 @@ def test_handle_hung_posts_codex_review_and_returns_to_watch(
     assert runner.state.current_pr.last_activity is not None
 
 
-def test_handle_hung_without_fallback_returns_to_idle(
+def test_handle_hung_preserves_context_when_fallback_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """When hung_fallback_codex_review=False, runner stays in HUNG with
+    current_pr and current_task preserved for operator intervention."""
     runner = PipelineRunner(
         _repo_cfg(),
         AppConfig(
@@ -1288,9 +1440,11 @@ def test_handle_hung_without_fallback_returns_to_idle(
     )
     asyncio.run(runner.handle_hung())
 
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.current_pr is None
-    assert runner.state.current_task is None
+    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 5
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == "PR-001"
 
 
 def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None:
