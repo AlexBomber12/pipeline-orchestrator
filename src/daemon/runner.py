@@ -1343,25 +1343,40 @@ return 0
 
     def _detect_rate_limit(self, stderr: str) -> None:
         """Set rate-limit pause if stderr contains rate-limit signals."""
-        threshold = self.app_config.daemon.rate_limit_pause_percent
+        session_threshold = self.app_config.daemon.rate_limit_session_pause_percent
+        weekly_threshold = self.app_config.daemon.rate_limit_weekly_pause_percent
         lower = stderr.lower()
         triggered = False
+        limit_type = "session"
+
         if re.search(r"\b429\b", stderr):
             triggered = True
+            limit_type = "session"
+
         m = re.search(
-            r"(\d{1,3})%\s*(?:of\s+)?(?:your\s+)?rate\s*limit"
-            r"|rate\s*limit\s+(?:at\s+)?(\d{1,3})%",
+            r"(\d{1,3})%\s*(?:of\s+)?(?:your\s+)?(?:(weekly|week|session|5-hour)\s+)?rate\s*limit"
+            r"|(?:(weekly|week|session|5-hour)\s+)?rate\s*limit\s+(?:at\s+)?(\d{1,3})%",
             lower,
         )
         if not triggered and m:
-            pct = int(m.group(1) or m.group(2))
-            triggered = pct >= threshold
+            pct = int(m.group(1) or m.group(4))
+            qualifier = m.group(2) or m.group(3) or ""
+            if qualifier in ("weekly", "week"):
+                limit_type = "weekly"
+                triggered = pct >= weekly_threshold
+            else:
+                limit_type = "session"
+                triggered = pct >= session_threshold
+
         if not triggered and not m and "rate limit" in lower:
+            if "weekly" in lower or "week" in lower:
+                limit_type = "weekly"
             triggered = True
+
         if triggered:
             pause_min = 30
             self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=pause_min)
-            self.log_event(f"Rate limit detected, pausing for {pause_min} min")
+            self.log_event(f"Rate limit detected ({limit_type}), pausing for {pause_min} min")
 
     async def handle_coding(self) -> None:
         """Run ``PLANNED PR`` via the claude CLI and hand off to WATCH.

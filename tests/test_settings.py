@@ -949,7 +949,7 @@ def test_put_repo_updates_allow_merge_without_checks(
     assert cfg.repositories[0].allow_merge_without_checks is True
 
 
-def test_update_daemon_rate_limit(
+def test_update_daemon_rate_limit_session(
     empty_config: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -958,9 +958,26 @@ def test_update_daemon_rate_limit(
     with TestClient(app) as client:
         response = client.put(
             "/settings/daemon",
-            data={"rate_limit_pause_percent": "75"},
+            data={"rate_limit_session_pause_percent": "75"},
         )
 
     assert response.status_code == 200
     cfg = load_config(str(empty_config))
-    assert cfg.daemon.rate_limit_pause_percent == 75
+    assert cfg.daemon.rate_limit_session_pause_percent == 75
+
+
+def test_update_daemon_rate_limit_weekly(
+    empty_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(empty_config))
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"rate_limit_weekly_pause_percent": "90"},
+        )
+
+    assert response.status_code == 200
+    cfg = load_config(str(empty_config))
+    assert cfg.daemon.rate_limit_weekly_pause_percent == 90

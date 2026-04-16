@@ -312,7 +312,7 @@
 - Depends on: PR-046
 
 ## PR-061: Split rate-limit thresholds into session and weekly
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-061.md
 - Branch: pr-061-rate-limit-thresholds
 - Depends on: PR-052

@@ -3997,7 +3997,7 @@ def test_detect_rate_limit_respects_threshold(
     """_detect_rate_limit triggers on usage percentage above threshold."""
     _patch_subprocess(monkeypatch)
     runner = _make_runner()
-    runner.app_config.daemon.rate_limit_pause_percent = 80
+    runner.app_config.daemon.rate_limit_session_pause_percent = 80
 
     runner._detect_rate_limit("Warning: 75% of rate limit capacity used")
     assert runner.state.rate_limited_until is None
@@ -4012,7 +4012,7 @@ def test_detect_rate_limit_fixed_pause_duration(
     """_detect_rate_limit always uses a fixed 30-minute cooldown."""
     _patch_subprocess(monkeypatch)
     runner = _make_runner()
-    runner.app_config.daemon.rate_limit_pause_percent = 50
+    runner.app_config.daemon.rate_limit_session_pause_percent = 50
 
     runner._detect_rate_limit("Error: 429 Too Many Requests")
 
@@ -4021,6 +4021,72 @@ def test_detect_rate_limit_fixed_pause_duration(
     actual_pause = runner.state.rate_limited_until - datetime.now(timezone.utc)
     assert actual_pause > expected_pause - timedelta(seconds=5)
     assert actual_pause < expected_pause + timedelta(seconds=5)
+
+
+def test_detect_rate_limit_weekly_respects_weekly_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Weekly limit at 95% with weekly_threshold=100 should NOT trigger pause."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner.app_config.daemon.rate_limit_weekly_pause_percent = 100
+
+    runner._detect_rate_limit("Warning: 95% of your weekly rate limit reached")
+    assert runner.state.rate_limited_until is None
+
+
+def test_detect_rate_limit_weekly_triggers_at_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Weekly limit at 95% with weekly_threshold=90 should trigger pause."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner.app_config.daemon.rate_limit_weekly_pause_percent = 90
+
+    runner._detect_rate_limit("Warning: 95% of your weekly rate limit reached")
+    assert runner.state.rate_limited_until is not None
+
+
+def test_detect_rate_limit_session_respects_session_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session limit at 95% with session_threshold=95 should trigger pause."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner.app_config.daemon.rate_limit_session_pause_percent = 95
+
+    runner._detect_rate_limit("Warning: 95% of your session rate limit reached")
+    assert runner.state.rate_limited_until is not None
+
+
+def test_detect_rate_limit_429_always_pauses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HTTP 429 triggers pause regardless of thresholds."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner.app_config.daemon.rate_limit_session_pause_percent = 100
+    runner.app_config.daemon.rate_limit_weekly_pause_percent = 100
+
+    runner._detect_rate_limit("Error: HTTP 429 Too Many Requests")
+    assert runner.state.rate_limited_until is not None
+
+
+def test_detect_rate_limit_log_identifies_limit_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Event log must distinguish session vs weekly rate limits."""
+    _patch_subprocess(monkeypatch)
+
+    runner1 = _make_runner()
+    runner1.app_config.daemon.rate_limit_session_pause_percent = 80
+    runner1._detect_rate_limit("Warning: 90% of your session rate limit reached")
+    assert any("(session)" in e["event"] for e in runner1.state.history)
+
+    runner2 = _make_runner()
+    runner2.app_config.daemon.rate_limit_weekly_pause_percent = 80
+    runner2._detect_rate_limit("Warning: 90% of your weekly rate limit reached")
+    assert any("(weekly)" in e["event"] for e in runner2.state.history)
 
 
 def test_handle_coding_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:

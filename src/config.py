@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -9,6 +10,8 @@ from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
+
+logger = logging.getLogger(__name__)
 
 _REPO_FIELDS = {
     "url",
@@ -28,7 +31,8 @@ _DAEMON_FIELDS = {
     "claude_model",
     "fix_idle_timeout_sec",
     "planned_pr_timeout_sec",
-    "rate_limit_pause_percent",
+    "rate_limit_session_pause_percent",
+    "rate_limit_weekly_pause_percent",
 }
 
 
@@ -67,7 +71,8 @@ class DaemonConfig(BaseModel):
     claude_model: str = "opus"
     fix_idle_timeout_sec: int = Field(default=1800, ge=1)
     planned_pr_timeout_sec: int = 900
-    rate_limit_pause_percent: int = 90
+    rate_limit_session_pause_percent: int = 95
+    rate_limit_weekly_pause_percent: int = 100
 
 
 class WebConfig(BaseModel):
@@ -104,6 +109,16 @@ def load_config(path: str = "config.yml") -> AppConfig:
         legacy = daemon.pop("fix_review_timeout_sec", None)
         if legacy is not None and "fix_idle_timeout_sec" not in daemon:
             daemon["fix_idle_timeout_sec"] = legacy
+
+        legacy_rate = daemon.pop("rate_limit_pause_percent", None)
+        if legacy_rate is not None:
+            logger.warning(
+                "Deprecated config field 'rate_limit_pause_percent' — "
+                "use 'rate_limit_session_pause_percent' and "
+                "'rate_limit_weekly_pause_percent' instead"
+            )
+            if "rate_limit_session_pause_percent" not in daemon:
+                daemon["rate_limit_session_pause_percent"] = legacy_rate
 
     return AppConfig.model_validate(raw)
 
