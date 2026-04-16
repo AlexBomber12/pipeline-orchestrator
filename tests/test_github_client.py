@@ -956,6 +956,43 @@ def test_body_eyes_wins_over_anchor_plus_one(
     )
 
 
+def test_anchor_eyes_wins_over_body_plus_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An anchor eyes signal should beat a PR-body +1 while review is in progress."""
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = _find_api_path(cmd)
+        if "issues" in path and path.endswith("/comments"):
+            data = [[
+                {
+                    "id": 10,
+                    "user": {"login": "author"},
+                    "body": "@codex review",
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ]]
+        elif "pulls" in path and path.endswith("/comments"):
+            data = []
+        elif "comments/10/reactions" in path:
+            data = [[{"content": "eyes", "user": {"login": "chatgpt-codex-bot"}}]]
+        elif path.endswith("/reactions"):
+            data = [[{"content": "+1", "user": {"login": "chatgpt-codex-bot"}}]]
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status("owner/name", 42, pr_author="author")
+        == ReviewStatus.EYES
+    )
+
+
 def test_review_api_with_body_eyes_stays_eyes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

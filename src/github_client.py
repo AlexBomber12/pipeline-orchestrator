@@ -319,10 +319,10 @@ def _compute_review_status(
                 if "HTTP 404" not in str(exc):
                     raise
 
-    if body_approved:
-        return ReviewStatus.APPROVED
     if body_eyes or anchor_eyes:
         return ReviewStatus.EYES
+    if body_approved:
+        return ReviewStatus.APPROVED
     if anchor_approved:
         return ReviewStatus.APPROVED
 
