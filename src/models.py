@@ -38,6 +38,12 @@ class CIStatus(str, Enum):
     FAILURE = "FAILURE"
 
 
+class FeedbackCheckResult(str, Enum):
+    NEW = "new"  # Codex posted after last push
+    NONE = "none"  # No Codex activity after last push
+    UNKNOWN = "unknown"  # API call failed, cannot determine
+
+
 class QueueTask(BaseModel):
     pr_id: str
     title: str

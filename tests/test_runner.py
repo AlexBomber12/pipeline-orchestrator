@@ -16,6 +16,7 @@ from src.daemon import runner as runner_module
 from src.daemon.runner import PipelineRunner
 from src.models import (
     CIStatus,
+    FeedbackCheckResult,
     PipelineState,
     PRInfo,
     QueueTask,
@@ -4000,7 +4001,7 @@ def test_has_new_feedback_returns_true_for_any_codex_comment_after_push(
         ],
     )
 
-    assert runner._has_new_codex_feedback_since_last_push() is True
+    assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.NEW
 
 
 def test_has_new_feedback_returns_false_for_old_comments(
@@ -4023,7 +4024,7 @@ def test_has_new_feedback_returns_false_for_old_comments(
         ],
     )
 
-    assert runner._has_new_codex_feedback_since_last_push() is False
+    assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.NONE
 
 
 def test_has_new_feedback_ignores_non_codex_users(
@@ -4046,4 +4047,122 @@ def test_has_new_feedback_ignores_non_codex_users(
         ],
     )
 
-    assert runner._has_new_codex_feedback_since_last_push() is False
+    assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.NONE
+
+
+def test_feedback_check_returns_unknown_on_api_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub API failure during feedback check returns UNKNOWN, not NEW."""
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
+    runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    def _raise(path: str) -> list:
+        raise RuntimeError("GitHub API unavailable")
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        _raise,
+    )
+
+    assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.UNKNOWN
+
+
+def test_handle_watch_stays_in_watch_on_unknown_feedback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CHANGES_REQUESTED + UNKNOWN feedback check -> stay in WATCH, no FIX."""
+    last_push = datetime.now(timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-001",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=last_push,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [pr],
+    )
+
+    def _raise(path: str) -> list:
+        raise RuntimeError("GitHub API unavailable")
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        _raise,
+    )
+    fix_called: list[bool] = []
+
+    async def fake_fix() -> None:
+        fix_called.append(True)
+
+    runner = _make_runner()
+    runner._last_push_at = last_push
+    runner._last_push_at_pr_number = pr.number
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.handle_fix = fake_fix  # type: ignore[assignment]
+    asyncio.run(runner.handle_watch())
+
+    assert fix_called == []
+    assert runner.state.state == PipelineState.WATCH
+    assert any(
+        "feedback check failed" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_watch_skips_hung_timeout_on_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CHANGES_REQUESTED + UNKNOWN + elapsed > timeout_min -> stay WATCH, not HUNG.
+
+    When the observation itself is unreliable we cannot trust the elapsed
+    time either. The runner must stay in WATCH and retry next cycle.
+    """
+    last_push = datetime.now(timezone.utc) - timedelta(hours=2)
+    pr = PRInfo(
+        number=42,
+        branch="pr-001",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=last_push,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo: [pr],
+    )
+
+    def _raise(path: str) -> list:
+        raise RuntimeError("GitHub API unavailable")
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        _raise,
+    )
+    fix_called: list[bool] = []
+
+    async def fake_fix() -> None:
+        fix_called.append(True)
+
+    runner = _make_runner(review_timeout_min=30)
+    runner._last_push_at = last_push
+    runner._last_push_at_pr_number = pr.number
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.handle_fix = fake_fix  # type: ignore[assignment]
+    asyncio.run(runner.handle_watch())
+
+    assert fix_called == []
+    assert runner.state.state == PipelineState.WATCH
+    assert any(
+        "feedback check failed" in e["event"]
+        for e in runner.state.history
+    )
