@@ -1369,7 +1369,9 @@ async def upload_tasks(
         # accidentally remove another repo's still-pending directory.
         try:
             active_dirs: set[str] = set()
-            pending_keys = await redis_client.keys("upload:*:pending")
+            pending_keys: list[bytes] = []
+            async for pkey in redis_client.scan_iter(match="upload:*:pending"):
+                pending_keys.append(pkey)
             for pkey in pending_keys:
                 try:
                     raw_sweep = await redis_client.get(pkey)
