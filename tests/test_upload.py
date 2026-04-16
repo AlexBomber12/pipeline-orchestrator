@@ -231,3 +231,128 @@ def test_upload_writes_redis_manifest(
     assert set(manifest["files"]) == {"QUEUE.md", "PR-002.md"}
     assert "staging_dir" in manifest
     assert "/example__alpha/" in manifest["staging_dir"]
+
+
+# ---------------------------------------------------------------------------
+# Cleanup guard tests
+# ---------------------------------------------------------------------------
+
+
+def test_upload_cleans_staging_on_redis_failure(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Staging directory is removed when Redis set raises."""
+
+    class _FailingRedis:
+        async def get(self, key: str) -> str | None:
+            if key.startswith("pipeline:"):
+                name = key.split(":", 1)[1]
+                return f'{{"url":"","name":"{name}","state":"IDLE"}}'
+            return None
+
+        async def set(self, key: str, value: str, **kw: object) -> None:
+            raise RuntimeError("Redis unavailable")
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        web_app,
+        "aioredis",
+        type("R", (), {"from_url": staticmethod(lambda *a, **kw: _FailingRedis())})(),
+    )
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_queue_file()],
+        )
+
+    assert resp.status_code == 503
+    assert "Redis error" in resp.text
+
+    # The staging directory should have been cleaned up.
+    repo_upload = uploads_dir / "example__alpha"
+    if repo_upload.exists():
+        assert list(repo_upload.iterdir()) == []
+
+
+def test_upload_preserves_staging_on_success(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    """Staging directory remains when upload succeeds."""
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_queue_file()],
+        )
+
+    assert resp.status_code == 200
+    repo_upload = uploads_dir / "example__alpha"
+    subdirs = list(repo_upload.iterdir())
+    assert len(subdirs) >= 1
+    assert (subdirs[0] / "QUEUE.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# Sweep tests
+# ---------------------------------------------------------------------------
+
+import time  # noqa: E402
+
+from src.web.app import sweep_abandoned_staging  # noqa: E402
+
+
+def test_sweep_removes_old_orphans(tmp_path: Path) -> None:
+    """Directories older than max_age_hours with no Redis key are removed."""
+    uploads = tmp_path / "uploads"
+    repo_dir_s = uploads / "myrepo"
+    old = repo_dir_s / "old-submission"
+    old.mkdir(parents=True)
+    (old / "QUEUE.md").write_text("# Queue\n")
+    # Set mtime to 48 hours ago.
+    old_time = time.time() - 48 * 3600
+    import os  # noqa: E402
+
+    os.utime(old, (old_time, old_time))
+
+    removed = sweep_abandoned_staging(str(uploads), set(), max_age_hours=24)
+    assert removed == 1
+    assert not old.exists()
+
+
+def test_sweep_preserves_young_directories(tmp_path: Path) -> None:
+    """Directories newer than max_age_hours are preserved."""
+    uploads = tmp_path / "uploads"
+    repo_dir_s = uploads / "myrepo"
+    young = repo_dir_s / "young-submission"
+    young.mkdir(parents=True)
+    (young / "QUEUE.md").write_text("# Queue\n")
+
+    removed = sweep_abandoned_staging(str(uploads), set(), max_age_hours=24)
+    assert removed == 0
+    assert young.exists()
+
+
+def test_sweep_preserves_keyed_directories(tmp_path: Path) -> None:
+    """Directories matching an active Redis key are preserved even if old."""
+    uploads = tmp_path / "uploads"
+    repo_dir_s = uploads / "myrepo"
+    old = repo_dir_s / "active-submission"
+    old.mkdir(parents=True)
+    (old / "QUEUE.md").write_text("# Queue\n")
+    old_time = time.time() - 48 * 3600
+    import os as _os  # noqa: E402
+
+    _os.utime(old, (old_time, old_time))
+
+    removed = sweep_abandoned_staging(
+        str(uploads), {str(old)}, max_age_hours=24
+    )
+    assert removed == 0
+    assert old.exists()

@@ -1150,9 +1150,49 @@ UPLOADS_DIR = "/data/uploads"
 import json as _json  # noqa: E402 — kept near usage
 import re as _re  # noqa: E402 — kept near usage
 import shutil  # noqa: E402 — kept near usage
+import time as _time  # noqa: E402 — kept near usage
 import uuid as _uuid  # noqa: E402 — kept near usage
 
+_STAGING_MAX_AGE_HOURS = 24
+
 _upload_locks: dict[str, asyncio.Lock] = {}
+
+
+def sweep_abandoned_staging(
+    uploads_root: str,
+    active_staging_dirs: set[str],
+    max_age_hours: int = _STAGING_MAX_AGE_HOURS,
+) -> int:
+    """Remove staging directories older than *max_age_hours* with no active key.
+
+    *active_staging_dirs* is the set of staging directory paths that are
+    currently referenced by a Redis upload manifest.  These are preserved
+    regardless of age.
+
+    Returns the count of directories removed.
+    """
+    root = Path(uploads_root)
+    if not root.is_dir():
+        return 0
+    now = _time.time()
+    cutoff = now - max_age_hours * 3600
+    removed = 0
+    for repo_dir in root.iterdir():
+        if not repo_dir.is_dir():
+            continue
+        for entry in repo_dir.iterdir():
+            if not entry.is_dir():
+                continue
+            if str(entry) in active_staging_dirs:
+                continue
+            try:
+                mtime = entry.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
+                removed += 1
+    return removed
 
 
 def _get_upload_lock(repo_name: str) -> asyncio.Lock:
@@ -1324,52 +1364,77 @@ async def upload_tasks(
     # dashboard's read-only contract with the repository working trees.
     lock = _get_upload_lock(name)
     async with lock:
+        # Best-effort sweep of abandoned staging directories.
+        try:
+            pending_key_sweep = f"upload:{name}:pending"
+            raw_sweep = await redis_client.get(pending_key_sweep)
+            active_dirs: set[str] = set()
+            if raw_sweep:
+                try:
+                    active_dirs.add(_json.loads(raw_sweep)["staging_dir"])
+                except Exception:
+                    pass
+            max_age = cfg.daemon.upload_staging_max_age_hours
+            await asyncio.to_thread(
+                sweep_abandoned_staging, UPLOADS_DIR, active_dirs, max_age
+            )
+        except Exception:
+            pass
+
         submission_id = _uuid.uuid4().hex[:12]
         staging_dir = Path(UPLOADS_DIR) / name / submission_id
         await asyncio.to_thread(staging_dir.mkdir, parents=True, exist_ok=True)
 
-        for fname, content in file_contents:
-            await asyncio.to_thread((staging_dir / fname).write_bytes, content)
-
-        new_files = [fn for fn, _ in file_contents]
-        pending_key = f"upload:{name}:pending"
+        committed = False
         try:
-            existing_raw = await redis_client.get(pending_key)
-        except Exception:
-            existing_raw = None
+            for fname, content in file_contents:
+                await asyncio.to_thread((staging_dir / fname).write_bytes, content)
 
-        if existing_raw:
+            new_files = [fn for fn, _ in file_contents]
+            pending_key = f"upload:{name}:pending"
             try:
-                existing = _json.loads(existing_raw)
-                old_staging = Path(existing["staging_dir"])
-                for old_fn in existing.get("files", []):
-                    if old_fn not in new_files and (old_staging / old_fn).is_file():
-                        await asyncio.to_thread(
-                            shutil.copy2,
-                            str(old_staging / old_fn),
-                            str(staging_dir / old_fn),
-                        )
-                        new_files.append(old_fn)
+                existing_raw = await redis_client.get(pending_key)
             except Exception:
-                pass
+                existing_raw = None
 
-        manifest = {
-            "repo": name,
-            "files": new_files,
-            "staging_dir": str(staging_dir),
-        }
-        try:
-            await redis_client.set(
-                pending_key,
-                _json.dumps(manifest),
-            )
-        except Exception:
-            return _render_upload_error(
-                request,
-                "Failed to enqueue upload (Redis error).",
-                503,
-                repo_name=name,
-            )
+            if existing_raw:
+                try:
+                    existing = _json.loads(existing_raw)
+                    old_staging = Path(existing["staging_dir"])
+                    for old_fn in existing.get("files", []):
+                        if old_fn not in new_files and (old_staging / old_fn).is_file():
+                            await asyncio.to_thread(
+                                shutil.copy2,
+                                str(old_staging / old_fn),
+                                str(staging_dir / old_fn),
+                            )
+                            new_files.append(old_fn)
+                except Exception:
+                    pass
+
+            manifest = {
+                "repo": name,
+                "files": new_files,
+                "staging_dir": str(staging_dir),
+            }
+            try:
+                await redis_client.set(
+                    pending_key,
+                    _json.dumps(manifest),
+                )
+            except Exception:
+                return _render_upload_error(
+                    request,
+                    "Failed to enqueue upload (Redis error).",
+                    503,
+                    repo_name=name,
+                )
+            committed = True
+        finally:
+            if not committed:
+                await asyncio.to_thread(
+                    shutil.rmtree, str(staging_dir), True
+                )
 
     return _render_upload_success(
         request,

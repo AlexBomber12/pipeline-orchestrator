@@ -348,7 +348,7 @@
 - Depends on: PR-047
 
 ## PR-058: Upload staging cleanup guards
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-058.md
 - Branch: pr-058-upload-cleanup
 - Depends on: PR-046
