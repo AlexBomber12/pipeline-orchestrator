@@ -225,17 +225,6 @@ def _compute_review_status(
     body_eyes = False
     body_approved = False
     head_commit_time: datetime | None = None
-    try:
-        review_info = _get_codex_review_signals(repo, pr_number)
-    except RuntimeError:
-        review_info = {
-            "latest_sha": "",
-            "latest_time": None,
-            "latest_state": "",
-        }
-
-    latest_review_time = review_info["latest_time"]
-    latest_review_sha = review_info["latest_sha"]
 
     try:
         codex_reactions = _get_codex_issue_reactions(repo, pr_number)
@@ -243,6 +232,16 @@ def _compute_review_status(
             plus_one = _find_codex_plus_one_reaction(codex_reactions)
             if plus_one is not None:
                 if head_sha:
+                    try:
+                        review_info = _get_codex_review_signals(repo, pr_number)
+                    except RuntimeError:
+                        review_info = {
+                            "latest_sha": "",
+                            "latest_time": None,
+                            "latest_state": "",
+                        }
+                    latest_review_time = review_info["latest_time"]
+                    latest_review_sha = review_info["latest_sha"]
                     reaction_time = _parse_iso(plus_one.get("created_at"))
                     if latest_review_sha and latest_review_sha == head_sha:
                         body_approved = True
@@ -272,6 +271,7 @@ def _compute_review_status(
                 for reaction in codex_reactions
             ):
                 body_eyes = True
+                return ReviewStatus.EYES
     except RuntimeError as exc:
         if "HTTP 404" not in str(exc):
             raise

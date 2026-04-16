@@ -209,7 +209,8 @@ def test_get_pr_review_status_approved_via_first_author_comment_reaction(
         == ReviewStatus.APPROVED
     )
 
-    assert len(invocations) == 5
+    assert len(invocations) == 4
+    assert not any(cmd[-1].endswith("/pulls/42/reviews") for cmd in invocations)
     for cmd in invocations:
         assert "--paginate" in cmd, f"missing --paginate in {cmd}"
 
@@ -1248,7 +1249,7 @@ def test_body_plus_one_no_commit_time_trusts(
 def test_no_plus_one_does_not_fetch_head_commit_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Commit-time lookup should stay lazy when no +1 path needs it."""
+    """Review and commit-time lookups should stay lazy when no +1 path needs them."""
     import json as _json
 
     clear_review_status_cache()
@@ -1258,7 +1259,7 @@ def test_no_plus_one_does_not_fetch_head_commit_time(
             raise AssertionError("commit lookup should not run without +1")
         path = _find_api_path(cmd)
         if path.endswith("/pulls/42/reviews"):
-            data = []
+            raise AssertionError("review lookup should not run without +1")
         elif "issues" in path and path.endswith("/comments"):
             data = [
                 [
@@ -1286,6 +1287,33 @@ def test_no_plus_one_does_not_fetch_head_commit_time(
         )
         == ReviewStatus.PENDING
     )
+
+
+def test_body_eyes_returns_before_comment_fetches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A body-level eyes signal should not depend on later comment API calls."""
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = _find_api_path(cmd)
+        if path.endswith("/pulls/42/reviews"):
+            raise AssertionError("review lookup should not run for body eyes only")
+        if "issues" in path and path.endswith("/comments"):
+            raise AssertionError("issue comments should not be fetched after body eyes")
+        if "pulls" in path and path.endswith("/comments"):
+            raise AssertionError("review comments should not be fetched after body eyes")
+        if path.endswith("/reactions"):
+            data = [[{"content": "eyes", "user": {"login": "chatgpt-codex-bot"}}]]
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.EYES
 
 
 def test_find_codex_plus_one_picks_newest() -> None:
