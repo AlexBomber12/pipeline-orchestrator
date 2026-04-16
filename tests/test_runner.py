@@ -4801,3 +4801,23 @@ def test_check_rate_limit_transitions_to_paused(
 
     assert result is False
     assert runner.state.state == PipelineState.PAUSED
+
+
+def test_legacy_error_with_rate_limited_until_converts_to_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy state=ERROR + rate_limited_until -> PAUSED during run_cycle dispatch."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner._recovered = True
+    runner._scaffolded = True
+    runner.state.state = PipelineState.ERROR
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=15)
+    runner.state.error_message = "some real error"
+
+    asyncio.run(runner.run_cycle())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.error_message == "some real error"
+    assert any("Legacy ERROR" in e["event"] for e in runner.state.history)

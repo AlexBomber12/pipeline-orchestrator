@@ -1076,7 +1076,10 @@ class PipelineRunner:
         elif current == PipelineState.PAUSED:
             await self.handle_paused()
         elif current == PipelineState.ERROR:
-            if self.app_config.daemon.error_handler_use_ai:
+            if self.state.rate_limited_until is not None:
+                self.state.state = PipelineState.PAUSED
+                self.log_event("Legacy ERROR + rate_limited_until -> PAUSED")
+            elif self.app_config.daemon.error_handler_use_ai:
                 await self.handle_error()
 
         await self.publish_state()
