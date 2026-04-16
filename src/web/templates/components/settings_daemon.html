@@ -52,19 +52,34 @@
                hx-swap="innerHTML">
     </label>
     <label class="flex flex-col gap-1 text-sm">
-        <span class="text-gray-400">Rate limit pause threshold (%)</span>
+        <span class="text-gray-400">Session rate limit pause (%)</span>
         <input type="number"
-               name="rate_limit_pause_percent"
-               value="{{ daemon.rate_limit_pause_percent }}"
+               name="rate_limit_session_pause_percent"
+               value="{{ daemon.rate_limit_session_pause_percent }}"
                min="50"
-               max="99"
+               max="100"
                step="5"
                class="w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
                hx-put="/settings/daemon"
                hx-trigger="change"
                hx-target="#settings-daemon"
                hx-swap="innerHTML">
-        <span class="text-xs text-gray-500">Controls pause sensitivity: scales pause duration and triggers on usage warnings above this threshold.</span>
+        <span class="text-xs text-gray-500">Pause when 5-hour session usage exceeds this threshold.</span>
+    </label>
+    <label class="flex flex-col gap-1 text-sm">
+        <span class="text-gray-400">Weekly rate limit pause (%)</span>
+        <input type="number"
+               name="rate_limit_weekly_pause_percent"
+               value="{{ daemon.rate_limit_weekly_pause_percent }}"
+               min="50"
+               max="100"
+               step="5"
+               class="w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+               hx-put="/settings/daemon"
+               hx-trigger="change"
+               hx-target="#settings-daemon"
+               hx-swap="innerHTML">
+        <span class="text-xs text-gray-500">Set to 100 to run until API returns 429.</span>
     </label>
 </div>
 

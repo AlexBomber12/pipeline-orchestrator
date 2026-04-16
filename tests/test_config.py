@@ -368,20 +368,43 @@ def test_fix_idle_timeout_rejects_zero_or_negative() -> None:
         DaemonConfig(fix_idle_timeout_sec=-5)
 
 
-def test_daemon_config_rate_limit_default() -> None:
+def test_daemon_config_rate_limit_defaults() -> None:
     from src.config import DaemonConfig
 
-    assert DaemonConfig().rate_limit_pause_percent == 90
+    assert DaemonConfig().rate_limit_session_pause_percent == 95
+    assert DaemonConfig().rate_limit_weekly_pause_percent == 100
 
 
-def test_update_daemon_config_rate_limit(tmp_path: Path) -> None:
+def test_update_daemon_config_rate_limit_session(tmp_path: Path) -> None:
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text("daemon: {}\n", encoding="utf-8")
     updated = update_daemon_config(
         path=str(cfg_path),
-        rate_limit_pause_percent=75,
+        rate_limit_session_pause_percent=75,
     )
-    assert updated.daemon.rate_limit_pause_percent == 75
+    assert updated.daemon.rate_limit_session_pause_percent == 75
+
+
+def test_update_daemon_config_rate_limit_weekly(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text("daemon: {}\n", encoding="utf-8")
+    updated = update_daemon_config(
+        path=str(cfg_path),
+        rate_limit_weekly_pause_percent=90,
+    )
+    assert updated.daemon.rate_limit_weekly_pause_percent == 90
+
+
+def test_deprecated_rate_limit_pause_percent(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n  rate_limit_pause_percent: 80\n", encoding="utf-8"
+    )
+    from src.config import load_config
+
+    cfg = load_config(str(cfg_path))
+    assert cfg.daemon.rate_limit_session_pause_percent == 80
+    assert cfg.daemon.rate_limit_weekly_pause_percent == 100
 
 
 def test_repo_poll_interval_default() -> None:
