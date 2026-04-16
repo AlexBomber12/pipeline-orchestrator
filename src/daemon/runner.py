@@ -1090,10 +1090,19 @@ class PipelineRunner:
             if not recovery_complete:
                 # Discovery phase failed (transient GitHub outage or
                 # queue validation error).  Leave _recovered unset so the
-                # next cycle retries discovery.  Still process pending
-                # uploads so an operator can fix the queue via the
-                # dashboard even while recovery is failing.
-                await self.process_pending_uploads()
+                # next cycle retries discovery.  Process pending uploads
+                # only when the repo is already on the base branch —
+                # process_pending_uploads commits on HEAD and pushes to
+                # origin/{branch}, so running it on a feature branch
+                # would push the wrong ref and silently lose the upload.
+                try:
+                    head_ref = _git(
+                        self.repo_path, "rev-parse", "--abbrev-ref", "HEAD",
+                    ).stdout.strip()
+                except Exception:
+                    head_ref = ""
+                if head_ref == self.repo_config.branch:
+                    await self.process_pending_uploads()
                 await self.publish_state()
                 return
             self._recovered = True
