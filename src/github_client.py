@@ -222,6 +222,7 @@ def _compute_review_status(
     head_sha: str,
 ) -> ReviewStatus:
     """Core review status logic, separated for caching."""
+    body_eyes = False
     review_api_approved = False
     body_approved = False
     head_commit_time: datetime | None = None
@@ -277,7 +278,7 @@ def _compute_review_status(
                 _is_reaction_content(reaction, "eyes")
                 for reaction in codex_reactions
             ):
-                return ReviewStatus.EYES
+                body_eyes = True
     except RuntimeError as exc:
         if "HTTP 404" not in str(exc):
             raise
@@ -305,6 +306,7 @@ def _compute_review_status(
             break
 
     anchor_approved = False
+    anchor_eyes = False
     if anchor is not None:
         cid = anchor.get("id")
         if cid is not None:
@@ -319,13 +321,15 @@ def _compute_review_status(
                         _is_reaction_content(reaction, "eyes")
                         for reaction in reactions
                     ):
-                        return ReviewStatus.EYES
+                        anchor_eyes = True
             except RuntimeError as exc:
                 if "HTTP 404" not in str(exc):
                     raise
 
     if anchor_approved or body_approved:
         return ReviewStatus.APPROVED
+    if not review_api_approved and (body_eyes or anchor_eyes):
+        return ReviewStatus.EYES
 
     anchor_ts = (anchor.get("created_at") or "") if anchor else ""
     for comment in issue_comments + review_comments:
@@ -335,7 +339,7 @@ def _compute_review_status(
             continue
         return ReviewStatus.CHANGES_REQUESTED
 
-    if anchor_approved or body_approved or review_api_approved:
+    if review_api_approved:
         return ReviewStatus.APPROVED
     return ReviewStatus.PENDING
 
