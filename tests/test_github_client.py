@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import subprocess
+from datetime import datetime, timedelta
+from datetime import timezone as _tz
 from typing import Any
 
 import pytest
-
 from src.github_client import (
     _ci_status_from_rollup,
+    _is_codex_user,
+    _is_plus_one,
     clear_review_status_cache,
     get_pr_author,
     get_pr_head_commit_iso,
@@ -106,6 +109,32 @@ def test_run_gh_returns_raw_string_when_not_json(
     assert run_gh(["auth", "status"]) == "ok"
 
 
+def test_is_codex_user_matches_bot_logins() -> None:
+    assert _is_codex_user({"login": "codex"}) is True
+    assert _is_codex_user({"login": "chatgpt-codex-conn"}) is True
+    assert _is_codex_user({"login": "codex-bot"}) is True
+    # Hyphen-delimited "codex" still counts as a Codex login token.
+    assert _is_codex_user({"login": "not-codex-related-thing"}) is True
+
+
+def test_is_codex_user_rejects_non_codex() -> None:
+    assert _is_codex_user({"login": "AlexBomber12"}) is False
+    assert _is_codex_user({"login": "dependabot"}) is False
+    assert _is_codex_user({"login": "supercodexreviewer"}) is False
+    assert _is_codex_user(None) is False
+
+
+def test_plus_one_requires_exact_content() -> None:
+    assert _is_plus_one({"content": "+1", "user": {"login": "codex-bot"}}) is True
+    assert _is_plus_one({"content": "thumbsup", "user": {"login": "codex-bot"}}) is False
+    assert _is_plus_one({"content": "heart", "user": {"login": "codex-bot"}}) is False
+
+
+def test_plus_one_requires_codex_user() -> None:
+    assert _is_plus_one({"content": "+1", "user": {"login": "AlexBomber12"}}) is False
+    assert _is_plus_one({"content": "+1", "user": {"login": "codex-bot"}}) is True
+
+
 def test_get_pr_review_status_approved_via_pr_body_reaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -135,7 +164,11 @@ def test_get_pr_review_status_approved_via_pr_body_reaction(
         == ReviewStatus.APPROVED
     )
 
-    assert any("issues/42/reactions" in arg for arg in invocations[0])
+    assert any(
+        "issues/42/reactions" in arg
+        for cmd in invocations
+        for arg in cmd
+    )
 
 
 def test_get_pr_review_status_approved_via_first_author_comment_reaction(
@@ -176,9 +209,50 @@ def test_get_pr_review_status_approved_via_first_author_comment_reaction(
         == ReviewStatus.APPROVED
     )
 
-    assert len(invocations) == 4
+    assert len(invocations) == 5
     for cmd in invocations:
         assert "--paginate" in cmd, f"missing --paginate in {cmd}"
+
+
+def test_review_api_approved_overrides_reaction_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A formal Codex APPROVED review after the head commit is enough."""
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if _is_commits_path(cmd):
+            return _FakeCompletedProcess(stdout="2026-01-01T00:00:00Z")
+        path = _find_api_path(cmd)
+        if path.endswith("/pulls/42/reviews"):
+            data = [
+                [
+                    {
+                        "user": {"login": "chatgpt-codex-bot"},
+                        "state": "APPROVED",
+                        "commit_id": "bbbbbb2222",
+                        "submitted_at": "2026-01-02T00:00:00Z",
+                    }
+                ]
+            ]
+        elif "issues" in path and path.endswith("/comments"):
+            data = [[]]
+        elif "pulls" in path and path.endswith("/comments"):
+            data = [[]]
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status(
+            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
+        )
+        == ReviewStatus.APPROVED
+    )
 
 
 def test_get_pr_review_status_skips_teammate_comment(
@@ -808,8 +882,6 @@ def test_merge_pr_uses_squash(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _iso_utc_now_minus(seconds: int) -> str:
-    from datetime import datetime, timedelta, timezone as _tz
-
     return (
         datetime.now(_tz.utc) - timedelta(seconds=seconds)
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -964,8 +1036,6 @@ def test_has_recent_codex_review_request_respects_after_iso(
         return _FakeCompletedProcess(stdout=_json.dumps(pages))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-
-    from datetime import datetime, timedelta, timezone as _tz
 
     just_now = (
         datetime.now(_tz.utc) - timedelta(seconds=10)
