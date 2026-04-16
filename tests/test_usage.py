@@ -136,14 +136,14 @@ class TestOAuthProviderCache:
 
 class TestOAuthProviderConsecutiveFailures:
     def test_increment(self, tmp_path: Path) -> None:
-        provider = _make_provider(tmp_path, creds=None)
+        provider = _make_provider(tmp_path, creds=None, cache_ttl_sec=0)
         provider.fetch()
         provider.fetch()
         provider.fetch()
         assert provider.consecutive_failures == 3
 
     def test_reset_on_success(self, tmp_path: Path) -> None:
-        provider = _make_provider(tmp_path, creds={"accessToken": "tok"})
+        provider = _make_provider(tmp_path, creds={"accessToken": "tok"}, cache_ttl_sec=0)
         # Force some failures first.
         provider._credentials_path = Path("/nonexistent")
         provider.fetch()

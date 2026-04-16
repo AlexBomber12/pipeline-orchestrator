@@ -56,6 +56,7 @@ class OAuthUsageProvider:
         self._timeout = request_timeout_sec
         self._cached: UsageSnapshot | None = None
         self._consecutive_failures = 0
+        self._last_failure_at: float = 0.0
 
     @property
     def consecutive_failures(self) -> int:
@@ -66,9 +67,15 @@ class OAuthUsageProvider:
             age = time.time() - self._cached.fetched_at
             if age < self._cache_ttl:
                 return self._cached
+        # Backoff on repeated failures: wait cache_ttl * min(failures, 5)
+        # before retrying, capping at 5x the normal TTL.
+        if self._consecutive_failures > 0:
+            backoff = self._cache_ttl * min(self._consecutive_failures, 5)
+            if time.time() - self._last_failure_at < backoff:
+                return self._cached
         token = self._read_token()
         if token is None:
-            self._consecutive_failures += 1
+            self._record_failure()
             return None
         try:
             response = httpx.get(
@@ -83,14 +90,14 @@ class OAuthUsageProvider:
             )
         except (httpx.HTTPError, OSError) as exc:
             logger.warning("usage endpoint request failed: %s", exc)
-            self._consecutive_failures += 1
+            self._record_failure()
             return None
         if response.status_code != 200:
             logger.warning(
                 "usage endpoint returned %s (check anthropic-beta header)",
                 response.status_code,
             )
-            self._consecutive_failures += 1
+            self._record_failure()
             return None
         try:
             data = response.json()
@@ -103,11 +110,15 @@ class OAuthUsageProvider:
             )
         except (KeyError, TypeError, ValueError) as exc:
             logger.warning("usage endpoint returned unexpected shape: %s", exc)
-            self._consecutive_failures += 1
+            self._record_failure()
             return None
         self._cached = snap
         self._consecutive_failures = 0
         return snap
+
+    def _record_failure(self) -> None:
+        self._consecutive_failures += 1
+        self._last_failure_at = time.time()
 
     def invalidate_cache(self) -> None:
         self._cached = None

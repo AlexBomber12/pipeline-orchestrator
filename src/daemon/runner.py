@@ -446,14 +446,16 @@ class PipelineRunner:
         """Serialize ``self.state`` and write it to Redis."""
         self.state.active = self.repo_config.active
         self.state.last_updated = datetime.now(timezone.utc)
-        # Sync latest usage snapshot into state for dashboard display.
-        snap = await asyncio.to_thread(self._usage_provider.fetch)
-        if snap is not None:
-            self.state.usage_session_percent = snap.session_percent
-            self.state.usage_session_resets_at = snap.session_resets_at
-            self.state.usage_weekly_percent = snap.weekly_percent
-            self.state.usage_weekly_resets_at = snap.weekly_resets_at
-        self.state.usage_api_degraded = self._usage_provider.consecutive_failures >= 10
+        # Only probe usage for active repos to avoid unnecessary HTTP
+        # calls (and potential timeout latency) for idle/inactive repos.
+        if self.repo_config.active:
+            snap = await asyncio.to_thread(self._usage_provider.fetch)
+            if snap is not None:
+                self.state.usage_session_percent = snap.session_percent
+                self.state.usage_session_resets_at = snap.session_resets_at
+                self.state.usage_weekly_percent = snap.weekly_percent
+                self.state.usage_weekly_resets_at = snap.weekly_resets_at
+            self.state.usage_api_degraded = self._usage_provider.consecutive_failures >= 10
         if not self.repo_config.active:
             data = self.state.model_dump()
             data["state"] = PipelineState.IDLE.value
