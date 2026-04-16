@@ -11,7 +11,7 @@ iterating again. Running with an empty repository list is valid: the
 daemon logs a warning and keeps polling so that a future ``config.yml``
 edit has somewhere to land.
 
-Every ``CONFIG_RELOAD_INTERVAL_SEC`` seconds the loop re-reads
+Every ``CONFIG_RELOAD_CYCLES`` daemon-interval-lengths the loop re-reads
 ``config.yml`` and reconciles the live set of runners with the new
 configuration: repositories that have been added get a fresh runner,
 repositories that have been removed are dropped, and settings changes
@@ -42,10 +42,11 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 
-#: Re-read ``config.yml`` at most once per this many seconds. This keeps
-#: settings-page edits taking effect promptly without thrashing the
-#: filesystem when the loop ticks quickly for fast repos.
-CONFIG_RELOAD_INTERVAL_SEC = 300
+#: Re-read ``config.yml`` roughly every this many loop cycles (in terms
+#: of the daemon-level poll interval). The actual reload cadence is
+#: ``CONFIG_RELOAD_CYCLES * daemon.poll_interval_sec`` seconds, so it
+#: adapts to both fast and slow deployments.
+CONFIG_RELOAD_CYCLES = 5
 
 
 def _setup_git_auth() -> None:
@@ -181,7 +182,8 @@ async def main() -> None:
     last_config_check = time.monotonic()
     while True:
         now_mono = time.monotonic()
-        if now_mono - last_config_check >= CONFIG_RELOAD_INTERVAL_SEC:
+        reload_interval = CONFIG_RELOAD_CYCLES * config.daemon.poll_interval_sec
+        if now_mono - last_config_check >= reload_interval:
             last_config_check = now_mono
             try:
                 new_config = load_config()

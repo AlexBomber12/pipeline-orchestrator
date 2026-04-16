@@ -210,7 +210,7 @@ def test_main_reload_detects_new_repository(
     monkeypatch.setattr(
         main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
     )
-    monkeypatch.setattr(main_module, "CONFIG_RELOAD_INTERVAL_SEC", 3)
+    monkeypatch.setattr(main_module, "CONFIG_RELOAD_CYCLES", 3)
 
     clock = [0.0]
     monkeypatch.setattr(main_module.time, "monotonic", lambda: clock[0])
@@ -275,7 +275,7 @@ def test_main_reload_drops_removed_repository(
     monkeypatch.setattr(
         main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
     )
-    monkeypatch.setattr(main_module, "CONFIG_RELOAD_INTERVAL_SEC", 3)
+    monkeypatch.setattr(main_module, "CONFIG_RELOAD_CYCLES", 3)
 
     clock2 = [0.0]
     monkeypatch.setattr(main_module.time, "monotonic", lambda: clock2[0])
