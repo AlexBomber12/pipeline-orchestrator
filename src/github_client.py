@@ -241,11 +241,6 @@ def _compute_review_status(
             body_approved = True
         elif latest_review_sha and latest_review_sha == head_sha:
             body_approved = True
-        elif (
-            head_commit_time is not None
-            and latest_review_time >= head_commit_time
-        ):
-            body_approved = True
 
     try:
         codex_reactions = _get_codex_issue_reactions(repo, pr_number)
