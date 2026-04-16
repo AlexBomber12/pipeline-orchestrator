@@ -455,6 +455,11 @@ class PipelineRunner:
                 self.state.usage_session_resets_at = snap.session_resets_at
                 self.state.usage_weekly_percent = snap.weekly_percent
                 self.state.usage_weekly_resets_at = snap.weekly_resets_at
+            else:
+                self.state.usage_session_percent = None
+                self.state.usage_session_resets_at = None
+                self.state.usage_weekly_percent = None
+                self.state.usage_weekly_resets_at = None
             self.state.usage_api_degraded = self._usage_provider.consecutive_failures >= 10
         if not self.repo_config.active:
             data = self.state.model_dump()
