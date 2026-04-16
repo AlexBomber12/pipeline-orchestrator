@@ -294,7 +294,7 @@
 - Depends on: PR-046
 
 ## PR-050: Verify head SHA change after FIX push
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-050.md
 - Branch: pr-050-fix-head-verification
 - Depends on: PR-049

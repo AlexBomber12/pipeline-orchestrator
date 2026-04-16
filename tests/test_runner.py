@@ -4214,3 +4214,141 @@ def test_handle_watch_skips_hung_timeout_on_unknown(
         "feedback check failed" in e["event"]
         for e in runner.state.history
     )
+
+
+# ---------------------------------------------------------------------------
+# PR-050: HEAD SHA verification after FIX
+# ---------------------------------------------------------------------------
+
+
+def test_handle_fix_skips_review_post_when_head_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-050: when FIX exits 0 but HEAD hasn't moved, handle_fix must
+    skip push accounting and @codex review, returning to WATCH."""
+    same_sha = "abc123"
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "rev-parse"] and "HEAD" in cmd:
+            return _FakeCompletedProcess(
+                args=cmd, stdout=f"{same_sha}\n", returncode=0
+            )
+        if cmd[:2] == ["git", "rev-list"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout="0\n", returncode=0
+            )
+        return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "fix_review_async",
+        _async_cli_result(0, "", ""),
+    )
+    posted: list[str] = []
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: posted.append("posted"),
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=50, branch="pr-050")
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.push_count == 0
+    assert posted == []
+    assert any(
+        "HEAD unchanged" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_fix_counts_push_when_head_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-050: when HEAD moves after FIX, handle_fix must increment
+    push_count, update _last_push_at, and post @codex review."""
+    sha_before = "aaa111"
+    sha_after = "bbb222"
+    call_count = {"n": 0}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "rev-parse"] and "HEAD" in cmd:
+            call_count["n"] += 1
+            sha = sha_before if call_count["n"] == 1 else sha_after
+            return _FakeCompletedProcess(
+                args=cmd, stdout=f"{sha}\n", returncode=0
+            )
+        if cmd[:2] == ["git", "rev-list"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout="0\n", returncode=0
+            )
+        return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "fix_review_async",
+        _async_cli_result(0, "", ""),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=50, branch="pr-050")
+    before = datetime.now(timezone.utc)
+    asyncio.run(runner.handle_fix())
+    after = datetime.now(timezone.utc)
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.push_count == 1
+    assert runner._last_push_at is not None
+    assert before <= runner._last_push_at <= after
+
+
+def test_handle_fix_error_on_rev_parse_after_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-050: if rev-parse fails after FIX, handle_fix must go to ERROR."""
+    call_count = {"n": 0}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "rev-parse"] and "HEAD" in cmd:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return _FakeCompletedProcess(
+                    args=cmd, stdout="aaa111\n", returncode=0
+                )
+            # Second call: simulate failure
+            raise subprocess.CalledProcessError(
+                128, cmd, stderr="fatal: bad object HEAD"
+            )
+        if cmd[:2] == ["git", "rev-list"]:
+            return _FakeCompletedProcess(
+                args=cmd, stdout="0\n", returncode=0
+            )
+        return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "fix_review_async",
+        _async_cli_result(0, "", ""),
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=50, branch="pr-050")
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "rev-parse after fix" in (runner.state.error_message or "")
