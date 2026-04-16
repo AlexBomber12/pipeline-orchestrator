@@ -234,7 +234,8 @@ async def main() -> None:
             for r in runners.values()
             if r.repo_config.active
         ]
-        tick = min(active_intervals) if active_intervals else config.daemon.poll_interval_sec
+        fastest = min(active_intervals) if active_intervals else config.daemon.poll_interval_sec
+        tick = min(fastest, config.daemon.poll_interval_sec)
         await asyncio.sleep(tick)
         cycle += 1
 

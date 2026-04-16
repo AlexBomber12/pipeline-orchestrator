@@ -501,8 +501,8 @@ def test_per_repo_poll_interval(
     # clock: 0 (both run), +15 (fast runs, slow skipped), +30 (fast runs, slow skipped)
     assert fast.cycles == 3
     assert slow.cycles == 1
-    # Sleep should use the fastest repo interval (10), not the daemon default.
-    assert all(s == 10 for s in sleep_calls)
+    # Sleep should use min(fastest_repo=10, daemon=1) = 1.
+    assert all(s == 1 for s in sleep_calls)
 
 
 def test_unpause_runs_immediately(
