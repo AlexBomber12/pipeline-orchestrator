@@ -739,17 +739,16 @@ class PipelineRunner:
         Returns ``True`` once discovery has completed (whether or not a
         subsequent re-run of ``handle_coding`` then failed — that failure
         is handled through the normal ERROR path and must not trigger a
-        second, non-idempotent recovery attempt).  Also returns ``True``
-        for permanent errors such as ``QueueValidationError`` — the queue
-        file is malformed and retrying cannot fix it; the ERROR state
-        alerts the operator while ``process_pending_uploads`` remains
-        reachable.  Returns ``False`` only when discovery itself could
-        not run due to a *transient* failure — typically a GitHub outage
-        during ``get_open_prs`` — so ``run_cycle`` can leave
-        ``_recovered`` unset and retry on the next cycle. Without this
-        distinction, a transient GitHub error at startup would strand the
-        runner detached from an in-flight PR and later allow
-        ``handle_error`` to SKIP/FIX it onto new queue work.
+        second, non-idempotent recovery attempt).  Returns ``False`` when
+        discovery could not complete — either a transient GitHub outage
+        during ``get_open_prs``, or a ``QueueValidationError`` from a
+        malformed queue.  In both cases ``run_cycle`` leaves
+        ``_recovered`` unset and retries next cycle, but still processes
+        pending uploads so an operator can fix the queue via the
+        dashboard.  Without this distinction, a transient GitHub error at
+        startup would strand the runner detached from an in-flight PR
+        and later allow ``handle_error`` to SKIP/FIX it onto new queue
+        work.
         """
         strict = self.app_config.daemon.strict_queue_validation
         try:
@@ -760,11 +759,12 @@ class PipelineRunner:
                 f"recover_state: queue validation failed: {exc}"
             )
             self.log_event(f"recover_state: queue validation failed: {exc}")
-            # Return True: validation errors are permanent (the queue file
-            # is malformed), not transient.  Returning False would leave
-            # _recovered unset and trap the daemon in an infinite recovery
-            # loop, blocking process_pending_uploads and handle_idle.
-            return True
+            # Return False so _recovered stays unset and the next cycle
+            # retries recovery.  This allows the daemon to self-heal once
+            # an operator fixes the queue (e.g. via dashboard upload or
+            # push).  run_cycle processes pending uploads even on a failed
+            # recovery so the upload path is not blocked.
+            return False
         if tasks is None:
             # Read failure on origin/{branch}:tasks/QUEUE.md. Treat as a
             # retryable discovery error: returning False leaves
@@ -1088,10 +1088,12 @@ class PipelineRunner:
             # in-memory state from QUEUE.md + GitHub regardless.
             recovery_complete = await self.recover_state()
             if not recovery_complete:
-                # Discovery phase failed transiently (e.g. GitHub
-                # unreachable). Leave _recovered unset so the next cycle
-                # retries discovery before the runner drifts away from an
-                # in-flight PR.
+                # Discovery phase failed (transient GitHub outage or
+                # queue validation error).  Leave _recovered unset so the
+                # next cycle retries discovery.  Still process pending
+                # uploads so an operator can fix the queue via the
+                # dashboard even while recovery is failing.
+                await self.process_pending_uploads()
                 await self.publish_state()
                 return
             self._recovered = True

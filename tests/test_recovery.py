@@ -1124,12 +1124,11 @@ def test_recover_state_queue_read_failure_sets_error_and_returns_false(
     assert gh_calls == [], "must bail before probing GitHub"
 
 
-def test_recover_validation_error_returns_true() -> None:
-    """Codex P1: QueueValidationError is a permanent error (malformed
-    queue file) — returning False would leave _recovered unset and trap
-    the daemon in an infinite recovery loop, blocking
-    process_pending_uploads and handle_idle.  recover_state must return
-    True so _recovered is set and the ERROR state alerts the operator."""
+def test_recover_validation_error_returns_false() -> None:
+    """QueueValidationError returns False so _recovered stays unset and
+    the daemon retries recovery each cycle — allowing self-heal once
+    the operator fixes the queue.  run_cycle processes pending uploads
+    even on a failed recovery so the upload path is not blocked."""
 
     def bad_queue(**_: object) -> None:
         raise QueueValidationError(["duplicate pr_id: PR-001"])
@@ -1138,7 +1137,7 @@ def test_recover_validation_error_returns_true() -> None:
     runner._parse_base_queue = bad_queue  # type: ignore[method-assign]
     result = asyncio.run(runner.recover_state())
 
-    assert result is True
+    assert result is False
     assert runner.state.state == PipelineState.ERROR
     assert "queue validation failed" in (runner.state.error_message or "")
     assert "duplicate pr_id" in (runner.state.error_message or "")
