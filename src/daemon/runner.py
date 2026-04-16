@@ -1090,45 +1090,13 @@ class PipelineRunner:
             if not recovery_complete:
                 # Discovery phase failed (transient GitHub outage or
                 # queue validation error).  Leave _recovered unset so the
-                # next cycle retries discovery.  Check for pending uploads
-                # first — attempt a non-destructive checkout to the base
-                # branch only when there is actually an upload to process.
-                # If checkout fails (dirty tree from a crashed coding
-                # cycle), skip upload processing; the upload stays in
-                # Redis and will be applied once recovery succeeds and
-                # handle_idle runs sync_to_main normally.
-                has_pending = False
-                try:
-                    raw = await self.redis.get(f"upload:{self.name}:pending")
-                    has_pending = bool(raw)
-                except Exception:
-                    pass
-                if has_pending:
-                    branch = self.repo_config.branch
-                    on_base = False
-                    try:
-                        head_ref = _git(
-                            self.repo_path, "rev-parse", "--abbrev-ref",
-                            "HEAD",
-                        ).stdout.strip()
-                        if head_ref == branch:
-                            on_base = True
-                        else:
-                            # Non-destructive checkout: do NOT reset/clean
-                            # the working tree before switching.  A
-                            # transient recovery failure (e.g. GitHub API
-                            # outage) while the repo sits on a feature
-                            # branch would otherwise destroy uncommitted
-                            # crash-run work.  If checkout fails (dirty
-                            # tree), the pending upload stays in Redis and
-                            # will be processed once recovery succeeds and
-                            # handle_idle runs sync_to_main normally.
-                            _git(self.repo_path, "checkout", branch)
-                            on_base = True
-                    except Exception:
-                        pass
-                    if on_base:
-                        await self.process_pending_uploads()
+                # next cycle retries discovery.  Do NOT attempt to process
+                # pending uploads here — process_pending_uploads() has an
+                # error handler that runs ``git reset --hard origin/{branch}``
+                # which would destroy uncommitted crash-recovery work if the
+                # repo is on a feature branch.  Pending uploads stay in Redis
+                # and will be applied once recovery succeeds and handle_idle
+                # runs sync_to_main normally.
                 await self.publish_state()
                 return
             self._recovered = True
