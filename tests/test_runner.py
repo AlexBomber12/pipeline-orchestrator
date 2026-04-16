@@ -1423,8 +1423,13 @@ def test_handle_hung_posts_codex_review_and_returns_to_watch(
 def test_handle_hung_preserves_context_when_fallback_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When hung_fallback_codex_review=False, runner stays in HUNG with
-    current_pr and current_task preserved for operator intervention."""
+    """When hung_fallback_codex_review=False and PR is still open, runner
+    stays in HUNG with current_pr and current_task preserved."""
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
     runner = PipelineRunner(
         _repo_cfg(),
         AppConfig(
@@ -1445,6 +1450,38 @@ def test_handle_hung_preserves_context_when_fallback_disabled(
     assert runner.state.current_pr.number == 5
     assert runner.state.current_task is not None
     assert runner.state.current_task.pr_id == "PR-001"
+
+
+@pytest.mark.parametrize("pr_state", ["MERGED", "CLOSED"])
+def test_handle_hung_transitions_to_idle_when_pr_resolved(
+    monkeypatch: pytest.MonkeyPatch,
+    pr_state: str,
+) -> None:
+    """When hung_fallback_codex_review=False and the operator has closed or
+    merged the PR, the runner should transition back to IDLE."""
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: {"state": pr_state},
+    )
+    runner = PipelineRunner(
+        _repo_cfg(),
+        AppConfig(
+            repositories=[],
+            daemon=DaemonConfig(hung_fallback_codex_review=False),
+        ),
+        _FakeRedis(),
+    )
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_hung())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+    assert runner.state.current_task is None
 
 
 def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None:

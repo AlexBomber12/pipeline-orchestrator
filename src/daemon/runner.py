@@ -2179,6 +2179,41 @@ return 0
             self.log_event("posted @codex review -> WATCH")
             return
 
+        # With fallback disabled, check whether the operator has already
+        # resolved the PR (closed or merged).  If so, transition to IDLE
+        # so queue progress can resume.
+        if self.state.current_pr is not None:
+            try:
+                result = github_client.run_gh(
+                    [
+                        "pr",
+                        "view",
+                        str(self.state.current_pr.number),
+                        "--json",
+                        "state",
+                    ],
+                    repo=self.owner_repo,
+                )
+            except Exception as exc:
+                self.log_event(
+                    f"hung: failed to check PR state: {exc}; staying HUNG"
+                )
+                return
+
+            pr_state = ""
+            if isinstance(result, dict):
+                pr_state = str(result.get("state") or "").upper()
+
+            if pr_state in ("MERGED", "CLOSED"):
+                self.log_event(
+                    f"PR #{self.state.current_pr.number} {pr_state} "
+                    "by operator -> IDLE"
+                )
+                self.state.current_pr = None
+                self.state.current_task = None
+                self.state.state = PipelineState.IDLE
+                return
+
         self.log_event(
             "hung fallback disabled; leaving runner in HUNG for operator action. "
             "Resolve the PR manually or re-enable hung_fallback_codex_review."
