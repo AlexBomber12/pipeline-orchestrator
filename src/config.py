@@ -81,16 +81,16 @@ class RepoConfig(BaseModel):
 
 class DaemonConfig(BaseModel):
     poll_interval_sec: int = 60
-    review_timeout_min: int = 60
+    review_timeout_min: int = Field(default=60, ge=1)
     hung_fallback_codex_review: bool = True
     error_handler_use_ai: bool = True
     claude_model: str = "opus"
     fix_idle_timeout_sec: int = Field(default=1800, ge=1)
-    planned_pr_timeout_sec: int = 900
-    rate_limit_session_pause_percent: int = 95
-    rate_limit_weekly_pause_percent: int = 100
+    planned_pr_timeout_sec: int = Field(default=900, ge=60)
+    rate_limit_session_pause_percent: int = Field(default=95, ge=0, le=100)
+    rate_limit_weekly_pause_percent: int = Field(default=100, ge=0, le=100)
     strict_queue_validation: bool = True
-    upload_staging_max_age_hours: int = 24
+    upload_staging_max_age_hours: int = Field(default=24, ge=1)
     usage_api_user_agent: str = "claude-code/2.1.104"
     usage_api_beta_header: str = "oauth-2025-04-20"
     usage_api_cache_ttl_sec: int = Field(default=60, ge=5, le=3600)
@@ -101,7 +101,7 @@ class DaemonConfig(BaseModel):
 
 class WebConfig(BaseModel):
     host: str = "0.0.0.0"
-    port: int = 8000
+    port: int = Field(default=8000, ge=1, le=65535)
 
 
 class AuthConfig(BaseModel):
