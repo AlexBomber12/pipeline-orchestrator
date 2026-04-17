@@ -97,11 +97,11 @@ _BREACH_DIR = "/tmp/pipeline-breach"
 def _clean_breach_dir() -> None:
     """Remove all stale breach markers on daemon startup."""
     breach_path = Path(_BREACH_DIR)
-    if breach_path.exists():
-        if not breach_path.is_dir():
-            breach_path.unlink()
-        else:
+    if breach_path.is_symlink() or breach_path.exists():
+        if breach_path.is_dir() and not breach_path.is_symlink():
             shutil.rmtree(breach_path, ignore_errors=True)
+        else:
+            breach_path.unlink()
     breach_path.mkdir(parents=True, exist_ok=True)
 
 
