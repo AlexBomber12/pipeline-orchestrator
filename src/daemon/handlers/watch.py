@@ -78,6 +78,8 @@ class WatchMixin:
         elif ci == CIStatus.FAILURE:
             await self.handle_fix()
             return
+        elif ci == CIStatus.PENDING:
+            pass
         elif review == ReviewStatus.CHANGES_REQUESTED:
             result = self._has_new_codex_feedback_since_last_push()
             if result == FeedbackCheckResult.NEW:

@@ -406,7 +406,7 @@
 - Branch: pr-068-heartbeat-cleanup
 
 ## PR-069: BUG-1 - no FIX when CI is PENDING
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-069.md
 - Branch: pr-069-no-fix-ci-pending
 

@@ -1160,7 +1160,78 @@ def test_handle_watch_changes_requested_triggers_fix(
     pr = PRInfo(
         number=5,
         branch="pr-001",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
+    )
+    monkeypatch.setattr(
+        runner_module.claude_cli, "fix_review_async", _async_cli_result(0, "", "")
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.push_count == 1
+    assert any("Fix pushed" in e["event"] for e in runner.state.history)
+
+
+def test_handle_watch_no_fix_when_ci_pending_and_changes_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    pr = PRInfo(
+        number=5,
+        branch="pr-001",
         ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=datetime.now(timezone.utc),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
+    )
+    fix_called: list[bool] = []
+
+    async def _no_fix(*_args: object, **_kwargs: object) -> tuple:
+        fix_called.append(True)
+        return (0, "", "")
+
+    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", _no_fix)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert fix_called == []
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.push_count == 0
+
+
+def test_handle_watch_fix_when_ci_success_and_changes_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    pr = PRInfo(
+        number=5,
+        branch="pr-001",
+        ci_status=CIStatus.SUCCESS,
         review_status=ReviewStatus.CHANGES_REQUESTED,
     )
     monkeypatch.setattr(
