@@ -384,7 +384,7 @@
 - Depends on: PR-063
 
 ## PR-066: Codex CLI rate limit detection
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-066.md
 - Branch: pr-066-codex-rate-limit
 - Depends on: PR-065, PR-063

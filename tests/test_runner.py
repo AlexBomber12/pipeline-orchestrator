@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -134,9 +135,10 @@ def _app_cfg(**daemon_overrides: Any) -> AppConfig:
 
 def _make_runner(**repo_overrides: Any) -> PipelineRunner:
     runner = PipelineRunner(_repo_cfg(**repo_overrides), _app_cfg(), _FakeRedis())
-    # Replace the real OAuthUsageProvider with a no-op stub so tests
+    # Replace the real usage providers with no-op stubs so tests
     # don't make real HTTP requests or block the event loop.
-    runner._usage_provider = _FakeUsageProvider()
+    runner._claude_usage_provider = _FakeUsageProvider()
+    runner._codex_usage_provider = _FakeUsageProvider()
     return runner
 
 
@@ -5011,7 +5013,7 @@ def test_check_rate_limit_triggers_paused_when_session_over_threshold(
         weekly_resets_at=9999999999,
         fetched_at=0,
     )
-    runner._usage_provider = _FakeUsageProvider(snapshot=snap)
+    runner._claude_usage_provider = _FakeUsageProvider(snapshot=snap)
     runner.app_config.daemon.rate_limit_session_pause_percent = 95
 
     assert asyncio.run(runner._check_rate_limit()) is False
@@ -5033,7 +5035,7 @@ def test_check_rate_limit_triggers_paused_when_weekly_over_threshold(
         weekly_resets_at=9999999999,
         fetched_at=0,
     )
-    runner._usage_provider = _FakeUsageProvider(snapshot=snap)
+    runner._claude_usage_provider = _FakeUsageProvider(snapshot=snap)
     runner.app_config.daemon.rate_limit_weekly_pause_percent = 100
 
     assert asyncio.run(runner._check_rate_limit()) is False
@@ -5054,7 +5056,7 @@ def test_check_rate_limit_allows_cli_when_under_thresholds(
         weekly_resets_at=9999999999,
         fetched_at=0,
     )
-    runner._usage_provider = _FakeUsageProvider(snapshot=snap)
+    runner._claude_usage_provider = _FakeUsageProvider(snapshot=snap)
 
     assert asyncio.run(runner._check_rate_limit()) is True
 
@@ -5064,7 +5066,7 @@ def test_check_rate_limit_fail_open_when_provider_returns_none(
 ) -> None:
     _patch_subprocess(monkeypatch)
     runner = _make_runner()
-    runner._usage_provider = _FakeUsageProvider(snapshot=None)
+    runner._claude_usage_provider = _FakeUsageProvider(snapshot=None)
 
     assert asyncio.run(runner._check_rate_limit()) is True
 
@@ -5075,7 +5077,7 @@ def test_check_rate_limit_invalidates_cache_after_pause_expires(
     _patch_subprocess(monkeypatch)
     runner = _make_runner()
     fake = _FakeUsageProvider(snapshot=None)
-    runner._usage_provider = fake
+    runner._claude_usage_provider = fake
     runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
 
     asyncio.run(runner._check_rate_limit())
@@ -5087,7 +5089,7 @@ def test_proactive_check_logs_degradation_at_10_failures(
 ) -> None:
     _patch_subprocess(monkeypatch)
     runner = _make_runner()
-    runner._usage_provider = _FakeUsageProvider(snapshot=None, failures=10)
+    runner._claude_usage_provider = _FakeUsageProvider(snapshot=None, failures=10)
 
     result = asyncio.run(runner._proactive_usage_check())
     assert result is True
@@ -5109,7 +5111,7 @@ def test_rate_limited_until_uses_resets_at_timestamp(
         weekly_resets_at=9999999999,
         fetched_at=0,
     )
-    runner._usage_provider = _FakeUsageProvider(snapshot=snap)
+    runner._claude_usage_provider = _FakeUsageProvider(snapshot=snap)
     runner.app_config.daemon.rate_limit_session_pause_percent = 95
 
     asyncio.run(runner._check_rate_limit())
@@ -5132,7 +5134,7 @@ def test_monitor_inflight_breach_cancels_claude_task_on_marker(
 
     async def _run() -> None:
         runner = _make_runner()
-        runner._usage_provider = _FakeUsageProvider()
+        runner._claude_usage_provider = _FakeUsageProvider()
 
         cancelled = asyncio.Event()
 
@@ -5168,6 +5170,7 @@ def test_monitor_inflight_breach_cancels_claude_task_on_marker(
         assert breach_flag["breached"] is True
         assert cancelled.is_set()
         assert runner.state.rate_limited_until is not None
+        assert runner.state.rate_limit_reactive_coder == "claude"
 
         monitor.cancel()
 
@@ -5186,7 +5189,7 @@ def test_monitor_inflight_breach_sets_paused_state_with_resets_at(
 
     async def _run() -> None:
         runner = _make_runner()
-        runner._usage_provider = _FakeUsageProvider()
+        runner._claude_usage_provider = _FakeUsageProvider()
 
         async def fake_cli() -> tuple[int, str, str]:
             await asyncio.sleep(999)
@@ -5230,7 +5233,7 @@ def test_monitor_inflight_breach_exits_when_claude_task_completes(
 
     async def _run() -> None:
         runner = _make_runner()
-        runner._usage_provider = _FakeUsageProvider()
+        runner._claude_usage_provider = _FakeUsageProvider()
 
         async def fake_cli_quick() -> tuple[int, str, str]:
             await asyncio.sleep(0.05)
@@ -5485,9 +5488,10 @@ def test_event_log_includes_coder_identity(
     assert any("[codex]" in e for e in events)
 
 
-def test_check_rate_limit_skips_proactive_for_codex(
+def test_check_rate_limit_runs_proactive_for_codex(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Proactive usage check now runs for Codex too (OpenAI provider)."""
     from src.config import CoderType
 
     runner = _make_runner(coder=CoderType.CODEX)
@@ -5502,19 +5506,58 @@ def test_check_rate_limit_skips_proactive_for_codex(
 
     result = asyncio.run(runner._check_rate_limit())
     assert result is True
-    assert proactive_called == []  # Should not have been called
+    assert proactive_called == [True]
 
 
-def test_check_rate_limit_codex_clears_claude_pause(
+def test_check_rate_limit_codex_clears_proactive_claude_pause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Codex clears a non-reactive (Claude-originated) rate-limit pause."""
+    """Codex clears a proactive Claude pause for general work."""
     from src.config import CoderType
 
     _patch_subprocess(monkeypatch)
     runner = _make_runner(coder=CoderType.CODEX)
     runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
     runner.state.rate_limit_reactive = False
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.state = PipelineState.PAUSED
+
+    result = asyncio.run(runner._check_rate_limit())
+    assert result is True
+    assert runner.state.rate_limited_until is None
+    assert runner.state.state == PipelineState.IDLE
+
+
+def test_check_rate_limit_honors_claude_pause_with_proactive_coder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """proactive_coder='claude' honors a Claude pause (merge/diagnosis)."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limit_reactive = False
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.state = PipelineState.PAUSED
+
+    result = asyncio.run(runner._check_rate_limit(proactive_coder="claude"))
+    assert result is False
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.state == PipelineState.PAUSED
+
+
+def test_check_rate_limit_codex_clears_reactive_claude_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex clears a reactive (stderr-detected) Claude pause."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limit_reactive = True
+    runner.state.rate_limit_reactive_coder = "claude"
     runner.state.state = PipelineState.PAUSED
 
     result = asyncio.run(runner._check_rate_limit())
@@ -5539,3 +5582,163 @@ def test_check_rate_limit_codex_honors_reactive_pause(
     result = asyncio.run(runner._check_rate_limit())
     assert result is False
     assert runner.state.rate_limited_until is not None
+
+
+# ---------- Codex-specific rate limit detection tests ----------
+
+
+def test_detect_rate_limit_codex_try_again_pattern(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex 'try again in X days Y hours Z minutes' -> exact pause, weekly."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner._detect_rate_limit(
+        "You've hit your usage limit. Upgrade to Pro or try again in 3 days 13 hours 6 minutes.",
+        coder_name="codex",
+    )
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "codex"
+    expected_pause = timedelta(minutes=3 * 1440 + 13 * 60 + 6)
+    actual_pause = runner.state.rate_limited_until - datetime.now(timezone.utc)
+    assert actual_pause > expected_pause - timedelta(seconds=10)
+    assert any("(weekly)" in e["event"] for e in runner.state.history)
+
+
+def test_detect_rate_limit_codex_session_pattern(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex 'try again in 4 hours 32 minutes' -> session, exact pause."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner._detect_rate_limit(
+        "You've hit your usage limit. Try again in 4 hours 32 minutes.",
+        coder_name="codex",
+    )
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "codex"
+    expected_pause = timedelta(minutes=4 * 60 + 32)
+    actual_pause = runner.state.rate_limited_until - datetime.now(timezone.utc)
+    assert actual_pause > expected_pause - timedelta(seconds=10)
+    assert any("(session)" in e["event"] for e in runner.state.history)
+
+
+def test_detect_rate_limit_codex_hit_limit_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex 'You've hit your usage limit' (no retry info) triggers pause."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner._detect_rate_limit(
+        "You've hit your usage limit.",
+        coder_name="codex",
+    )
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "codex"
+
+
+def test_detect_rate_limit_codex_429(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generic 429 triggers rate limit for Codex coder."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner._detect_rate_limit("Error: 429 Too Many Requests", coder_name="codex")
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "codex"
+
+
+def test_detect_rate_limit_codex_retry_no_duration_falls_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """'try again in' with no parseable duration should fall through to generic fallback."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner._detect_rate_limit(
+        "Rate limit reached. Please try again in 6.379s",
+        coder_name="codex",
+    )
+    # The regex matches "try again in" but captures no days/hours/minutes,
+    # so it must NOT suppress the generic "rate limit" fallback.
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "codex"
+
+
+def test_detect_rate_limit_anthropic_regex_skipped_for_codex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Anthropic percentage pattern should not trigger when coder is codex."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.app_config.daemon.rate_limit_session_pause_percent = 80
+    runner._detect_rate_limit(
+        "Warning: 95% of session rate limit reached",
+        coder_name="codex",
+    )
+    # Should NOT match the Anthropic regex path; falls through to
+    # generic "rate limit" fallback instead.
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "codex"
+
+
+def test_proactive_check_uses_codex_provider_when_coder_is_codex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_proactive_usage_check should use codex provider for codex coder."""
+    from src.config import CoderType
+    from src.usage import UsageSnapshot
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.app_config.daemon.rate_limit_session_pause_percent = 80
+    snap = UsageSnapshot(
+        session_percent=90,
+        session_resets_at=int(time.time()) + 3600,
+        weekly_percent=10,
+        weekly_resets_at=int(time.time()) + 86400,
+        fetched_at=time.time(),
+    )
+    runner._codex_usage_provider = _FakeUsageProvider(snapshot=snap)
+    runner._claude_usage_provider = _FakeUsageProvider(snapshot=None)
+
+    result = asyncio.run(runner._proactive_usage_check())
+    assert result is False
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.rate_limit_reactive_coder == "codex"
+
+
+def test_proactive_check_uses_claude_provider_when_coder_is_claude(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_proactive_usage_check should use claude provider for claude coder."""
+    from src.usage import UsageSnapshot
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner.app_config.daemon.rate_limit_session_pause_percent = 80
+    snap = UsageSnapshot(
+        session_percent=90,
+        session_resets_at=int(time.time()) + 3600,
+        weekly_percent=10,
+        weekly_resets_at=int(time.time()) + 86400,
+        fetched_at=time.time(),
+    )
+    runner._claude_usage_provider = _FakeUsageProvider(snapshot=snap)
+    runner._codex_usage_provider = _FakeUsageProvider(snapshot=None)
+
+    result = asyncio.run(runner._proactive_usage_check())
+    assert result is False
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.rate_limit_reactive_coder == "claude"
