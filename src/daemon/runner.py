@@ -2160,6 +2160,19 @@ return 0
                 # unconditionally advancing past real Codex feedback.
                 if self.state.current_pr is not None:
                     self._rehydrate_last_push_at(self.state.current_pr)
+                    # If Claude pushed before cancellation, trigger a Codex
+                    # review so the PR doesn't sit in CHANGES_REQUESTED with
+                    # no fresh review request after pause expiry.
+                    try:
+                        head_now = _git(
+                            self.repo_path, "rev-parse", "HEAD"
+                        ).stdout.strip()
+                    except Exception:
+                        head_now = ""
+                    if head_before and head_now and head_before != head_now:
+                        self._post_codex_review(
+                            self.state.current_pr.number
+                        )
                 self.state.state = PipelineState.PAUSED
                 self.state.error_message = None
                 self.log_event(
@@ -2185,6 +2198,17 @@ return 0
             # unconditionally advancing past real Codex feedback.
             if self.state.current_pr is not None:
                 self._rehydrate_last_push_at(self.state.current_pr)
+                # If Claude pushed before the breach, trigger a Codex review
+                # so the PR doesn't sit in CHANGES_REQUESTED with no fresh
+                # review request after pause expiry.
+                try:
+                    head_now = _git(
+                        self.repo_path, "rev-parse", "HEAD"
+                    ).stdout.strip()
+                except Exception:
+                    head_now = ""
+                if head_before and head_now and head_before != head_now:
+                    self._post_codex_review(self.state.current_pr.number)
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
             self.log_event(
