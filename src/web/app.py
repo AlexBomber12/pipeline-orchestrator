@@ -920,6 +920,15 @@ def _auth_probe_env(**overrides: str) -> dict[str, str]:
     return env
 
 
+def _first_probe_line(text: str) -> str:
+    """Return the first meaningful line from CLI probe output."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.lower().startswith("warning:"):
+            return stripped
+    return ""
+
+
 def _check_claude_auth() -> dict[str, str]:
     """Probe the ``claude`` CLI and report its authorization status."""
     cfg = load_config(CONFIG_PATH)
@@ -936,9 +945,9 @@ def _check_claude_auth() -> dict[str, str]:
 def _check_codex_auth() -> dict[str, str]:
     """Probe the ``codex`` CLI and report its authorization status.
 
-    Uses ``codex login status`` which checks credentials, not just the
-    binary presence.  Falls back to reporting the CLI as missing when the
-    binary is not found.
+    Runs ``codex --version`` first so the dashboard always exposes the
+    installed Codex CLI version when the binary is present, then
+    ``codex login status`` to report the credential state.
 
     The probe runs with ``HOME`` set from the config so the web service
     reads the same credential directory that the daemon uses (Codex
@@ -946,16 +955,28 @@ def _check_codex_auth() -> dict[str, str]:
     """
     cfg = load_config(CONFIG_PATH)
     env = _auth_probe_env(HOME=cfg.auth.codex_home_dir)
+    version_rc, version_stdout, version_stderr = _run_auth_command(
+        ["codex", "--version"], env=env
+    )
+    version_combined = f"{version_stdout}\n{version_stderr}".strip()
+    version_line = _first_probe_line(version_combined)
+    if version_rc != 0:
+        if (
+            "not found" in version_combined.lower()
+            or "no such file" in version_combined.lower()
+        ):
+            return {"status": "error", "detail": "codex CLI not installed"}
+        detail = version_line or "codex CLI not installed"
+        return {"status": "error", "detail": detail}
+
+    installed_detail = (
+        f"{version_line} (installed)" if version_line else "codex CLI installed"
+    )
     rc, stdout, stderr = _run_auth_command(["codex", "login", "status"], env=env)
     combined = f"{stdout}\n{stderr}".strip()
     if rc == 0:
-        detail = ""
-        for line in combined.splitlines():
-            stripped = line.strip()
-            if stripped:
-                detail = stripped
-                break
-        return {"status": "ok", "detail": detail or "codex authenticated"}
+        detail = _first_probe_line(combined) or "codex authenticated"
+        return {"status": "ok", "detail": f"{installed_detail}; {detail}"}
     # Distinguish "not logged in" from "binary not found"
     if "not found" in combined.lower() or "no such file" in combined.lower():
         return {"status": "error", "detail": "codex CLI not installed"}
@@ -964,10 +985,10 @@ def _check_codex_auth() -> dict[str, str]:
     # can distinguish "no credentials at all" from "key set but login
     # status failed".
     api_key = env.get("OPENAI_API_KEY", "")
-    base_detail = combined.splitlines()[0].strip() if combined else "codex not authenticated"
+    base_detail = _first_probe_line(combined) or "codex not authenticated"
     if api_key:
-        return {"status": "error", "detail": f"{base_detail} (OPENAI_API_KEY set but unverified)"}
-    return {"status": "error", "detail": base_detail}
+        base_detail = f"{base_detail} (OPENAI_API_KEY set but unverified)"
+    return {"status": "error", "detail": f"{installed_detail}; {base_detail}"}
 
 
 def _check_gh_auth() -> dict[str, str]:

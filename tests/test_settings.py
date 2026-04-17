@@ -707,10 +707,13 @@ def _install_fake_subprocess(
     claude: _FakeCompleted | Exception,
     gh: _FakeCompleted | Exception,
     codex: _FakeCompleted | Exception | None = None,
+    codex_version: _FakeCompleted | Exception | None = None,
 ) -> None:
     """Patch ``subprocess.run`` inside src.web.app with canned auth probes."""
     if codex is None:
         codex = _FakeCompleted(127, stderr="codex not found")
+    if codex_version is None:
+        codex_version = codex
 
     def fake_run(
         cmd: list[str], *args: object, **kwargs: object
@@ -720,9 +723,10 @@ def _install_fake_subprocess(
                 raise claude
             return claude
         if cmd and cmd[0] == "codex":
-            if isinstance(codex, Exception):
-                raise codex
-            return codex
+            result = codex_version if cmd[1:] == ["--version"] else codex
+            if isinstance(result, Exception):
+                raise result
+            return result
         if cmd and cmd[0] == "gh":
             if isinstance(gh, Exception):
                 raise gh
@@ -929,6 +933,35 @@ def test_partial_auth_status_renders_status_dots(
     assert "bg-fail" in body
     assert "1.2.3" in body
     assert "not logged in" in body
+
+
+def test_api_auth_status_reports_codex_version_and_installation(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_fake_subprocess(
+        monkeypatch,
+        claude=_FakeCompleted(0, stdout="claude 1.2.3\n"),
+        gh=_FakeCompleted(
+            0,
+            stderr="github.com\n  ✓ Logged in to github.com as octocat (oauth_token)\n",
+        ),
+        codex=_FakeCompleted(
+            0, stdout="Logged in with ChatGPT\n", stderr="WARNING: ignored\n"
+        ),
+        codex_version=_FakeCompleted(
+            0, stdout="codex-cli 0.121.0\n", stderr="WARNING: ignored\n"
+        ),
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/auth-status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["codex"]["status"] == "ok"
+    assert "codex-cli 0.121.0" in payload["codex"]["detail"]
+    assert "installed" in payload["codex"]["detail"]
+    assert "Logged in with ChatGPT" in payload["codex"]["detail"]
 
 
 def test_settings_repo_list_shows_no_ci_merge_checkbox(
