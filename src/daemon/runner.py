@@ -1655,6 +1655,24 @@ return 0
         except asyncio.CancelledError:
             if not breach_flag["breached"]:
                 raise
+            # Record the PR if Claude already created one before cancellation,
+            # so it enters WATCH/auto-merge flow after pause expiry.
+            if target_branch:
+                try:
+                    prs = github_client.get_open_prs(
+                        self.owner_repo,
+                        allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+                    )
+                    match = next(
+                        (pr for pr in prs if pr.branch == target_branch), None
+                    )
+                    if match:
+                        self.state.current_pr = match
+                        self.log_event(
+                            f"Recorded PR #{match.number} before breach-cancel pause"
+                        )
+                except Exception:
+                    pass  # best-effort; the pause is still correct
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
             self.log_event(
