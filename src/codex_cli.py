@@ -28,6 +28,8 @@ async def run_codex_async(
         "codex",
         "exec",
         "--full-auto",
+        "--ask-for-approval",
+        "never",
     ]
     if model:
         cmd.extend(["--model", model])
