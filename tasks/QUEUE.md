@@ -390,7 +390,7 @@
 - Depends on: PR-065, PR-063
 
 ## PR-057: Runner.py decomposition
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-057.md
 - Branch: pr-057-runner-decomposition
 - Depends on: PR-053, PR-054, PR-055, PR-056, PR-058, PR-059, PR-060, PR-061, PR-062, PR-063, PR-065, PR-066

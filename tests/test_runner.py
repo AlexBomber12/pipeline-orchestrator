@@ -13,7 +13,10 @@ from typing import Any
 import pytest
 
 from src.config import AppConfig, DaemonConfig, RepoConfig
+from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
+from src.daemon.handlers import breach as breach_module
+from src.daemon.handlers import idle as idle_module
 from src.daemon.runner import PipelineRunner
 from src.models import (
     CIStatus,
@@ -264,8 +267,8 @@ def test_handle_idle_no_tasks_leaves_state_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = _patch_subprocess(monkeypatch)
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [])
-    monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
 
     runner = _make_runner()
     asyncio.run(runner.handle_idle())
@@ -310,8 +313,8 @@ def test_handle_idle_picks_task_and_drives_coding(
         status=TaskStatus.TODO,
         branch="pr-042-sample",
     )
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [task])
-    monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: task)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: task)
 
     claude_calls: list[str] = []
 
@@ -372,8 +375,8 @@ def test_handle_idle_sets_queue_counters_with_mixed_statuses(
         QueueTask(pr_id="PR-002", title="Done2", status=TaskStatus.DONE, branch="pr-002"),
         QueueTask(pr_id="PR-003", title="Todo", status=TaskStatus.TODO, branch="pr-003"),
     ]
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: tasks)
-    monkeypatch.setattr(runner_module, "get_next_task", lambda t: tasks[2])
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: tasks)
+    monkeypatch.setattr(idle_module, "get_next_task", lambda t: tasks[2])
     monkeypatch.setattr(
         runner_module.claude_cli,
         "run_planned_pr_async",
@@ -418,8 +421,8 @@ def test_handle_idle_attaches_to_existing_pr_instead_of_coding(
         status=TaskStatus.TODO,
         branch="pr-042-sample",
     )
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [task])
-    monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: task)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: task)
 
     existing_pr = PRInfo(
         number=99,
@@ -468,8 +471,8 @@ def test_handle_idle_proceeds_to_coding_when_no_matching_pr(
         status=TaskStatus.TODO,
         branch="pr-042-sample",
     )
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [task])
-    monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: task)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: task)
 
     # Guard returns no matching PR; handle_coding's call returns the PR.
     call_count = {"n": 0}
@@ -512,8 +515,8 @@ def test_handle_idle_defers_on_gh_failure(
         status=TaskStatus.TODO,
         branch="pr-042-sample",
     )
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [task])
-    monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: task)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: task)
 
     def _exploding_get_open_prs(repo: str, **kw: Any) -> list[PRInfo]:
         raise RuntimeError("GitHub API unavailable")
@@ -2068,8 +2071,8 @@ def test_run_cycle_resets_stale_transient_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_subprocess(monkeypatch, stdout="")
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [])
-    monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo, **kw: []
     )
@@ -2670,8 +2673,8 @@ def test_handle_idle_no_tasks_but_open_pr_sets_current_pr(
         status=TaskStatus.DONE,
         branch="pr-001-done",
     )
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [done_task])
-    monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [done_task])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
 
     open_pr = PRInfo(
         number=42,
@@ -2696,8 +2699,8 @@ def test_handle_idle_no_tasks_no_open_prs_clears_current_pr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_subprocess(monkeypatch)
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [])
-    monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo, **kw: []
     )
@@ -2715,8 +2718,8 @@ def test_handle_idle_no_tasks_does_not_change_state_from_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_subprocess(monkeypatch)
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [])
-    monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
 
     open_pr = PRInfo(number=7, branch="feature-x")
     monkeypatch.setattr(
@@ -2735,8 +2738,8 @@ def test_handle_idle_open_pr_check_survives_github_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_subprocess(monkeypatch)
-    monkeypatch.setattr(runner_module, "parse_queue", lambda path, **kw: [])
-    monkeypatch.setattr(runner_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
@@ -3728,7 +3731,7 @@ def test_recover_state_rehydrates_last_push_at(
             )
         return _FakeCompletedProcess(args=list(args), returncode=0)
 
-    monkeypatch.setattr(runner_module, "_git", fake_git)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
     head_iso = "2026-04-10T12:00:00Z"
     monkeypatch.setattr(
         runner_module.github_client,
@@ -4941,7 +4944,7 @@ def test_sync_to_main_retries_fetch_on_timeout(
             raise subprocess.TimeoutExpired(cmd=["git", "fetch"], timeout=60)
         return _FakeCompletedProcess(args=list(args), returncode=0)
 
-    monkeypatch.setattr(runner_module, "_git", fake_git)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
     monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
 
     runner = _make_runner()
@@ -4961,7 +4964,7 @@ def test_sync_to_main_fails_after_retries_exhausted(
             raise subprocess.TimeoutExpired(cmd=["git", "fetch"], timeout=60)
         return _FakeCompletedProcess(args=list(args), returncode=0)
 
-    monkeypatch.setattr(runner_module, "_git", fake_git)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
     monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
 
     runner = _make_runner()
@@ -4983,7 +4986,7 @@ def test_git_checkout_does_not_retry(
             )
         return _FakeCompletedProcess(args=list(args), returncode=0)
 
-    monkeypatch.setattr(runner_module, "_git", fake_git)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
     monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
 
     runner = _make_runner()
@@ -5127,8 +5130,8 @@ def test_monitor_inflight_breach_cancels_claude_task_on_marker(
 ) -> None:
     """Breach marker file triggers task cancellation and PAUSED state."""
     _patch_subprocess(monkeypatch)
-    monkeypatch.setattr(runner_module, "_BREACH_DIR", str(tmp_path))
-    monkeypatch.setattr(runner_module, "_BREACH_POLL_SEC", 0.05)
+    monkeypatch.setattr(breach_module, "_BREACH_DIR", str(tmp_path))
+    monkeypatch.setattr(breach_module, "_BREACH_POLL_SEC", 0.05)
 
     breach_run_id = "test-breach-001"
 
@@ -5182,8 +5185,8 @@ def test_monitor_inflight_breach_sets_paused_state_with_resets_at(
 ) -> None:
     """Breach monitor sets rate_limited_until from breach marker resets_at."""
     _patch_subprocess(monkeypatch)
-    monkeypatch.setattr(runner_module, "_BREACH_DIR", str(tmp_path))
-    monkeypatch.setattr(runner_module, "_BREACH_POLL_SEC", 0.05)
+    monkeypatch.setattr(breach_module, "_BREACH_DIR", str(tmp_path))
+    monkeypatch.setattr(breach_module, "_BREACH_POLL_SEC", 0.05)
 
     breach_run_id = "test-resets-at"
 
@@ -5226,8 +5229,8 @@ def test_monitor_inflight_breach_exits_when_claude_task_completes(
 ) -> None:
     """Monitor exits cleanly when the CLI task completes without a breach."""
     _patch_subprocess(monkeypatch)
-    monkeypatch.setattr(runner_module, "_BREACH_DIR", str(tmp_path))
-    monkeypatch.setattr(runner_module, "_BREACH_POLL_SEC", 0.05)
+    monkeypatch.setattr(breach_module, "_BREACH_DIR", str(tmp_path))
+    monkeypatch.setattr(breach_module, "_BREACH_POLL_SEC", 0.05)
 
     breach_run_id = "test-no-breach"
 
@@ -5264,7 +5267,7 @@ def test_handle_coding_cleans_up_breach_marker_after_run(
 ) -> None:
     """Late breach marker is detected, causes PAUSED, and is cleaned up."""
     _patch_subprocess(monkeypatch)
-    monkeypatch.setattr(runner_module, "_BREACH_DIR", str(tmp_path))
+    monkeypatch.setattr(breach_module, "_BREACH_DIR", str(tmp_path))
 
     captured_run_id: list[str] = []
 
@@ -5309,8 +5312,8 @@ def test_handle_coding_pauses_on_inflight_breach(
 ) -> None:
     """handle_coding transitions to PAUSED when in-flight breach is detected."""
     _patch_subprocess(monkeypatch)
-    monkeypatch.setattr(runner_module, "_BREACH_DIR", str(tmp_path))
-    monkeypatch.setattr(runner_module, "_BREACH_POLL_SEC", 0.05)
+    monkeypatch.setattr(breach_module, "_BREACH_DIR", str(tmp_path))
+    monkeypatch.setattr(breach_module, "_BREACH_POLL_SEC", 0.05)
 
     async def fake_planned_hangs(
         path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
