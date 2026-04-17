@@ -1668,6 +1668,24 @@ return 0
             self._check_late_breach(breach_dir, breach_run_id, breach_flag)
             self._cleanup_breach_marker(breach_dir, breach_run_id)
         if breach_flag["breached"]:
+            # Record the PR if Claude already created one, so it is not
+            # orphaned while the runner is paused.
+            if target_branch:
+                try:
+                    prs = github_client.get_open_prs(
+                        self.owner_repo,
+                        allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+                    )
+                    match = next(
+                        (pr for pr in prs if pr.branch == target_branch), None
+                    )
+                    if match:
+                        self.state.current_pr = match
+                        self.log_event(
+                            f"Recorded PR #{match.number} before late-breach pause"
+                        )
+                except Exception:
+                    pass  # best-effort; the pause is still correct
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
             self.log_event(
@@ -2116,13 +2134,10 @@ return 0
                 return
             if not idle_flag["timed_out"]:
                 raise
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = (
-                f"FIX idle timeout: no push for {idle_limit}s"
-            )
-            self.log_event(self.state.error_message)
-            await self._save_cli_log("", "", "FIX idle timeout")
-            return
+            # Mark that we came from idle timeout; don't return yet so
+            # _check_late_breach in finally can detect a marker written
+            # near exit.  We re-check breach_flag after the finally block.
+            code, stdout, stderr = 1, "", ""
         finally:
             breach_monitor.cancel()
             idle_monitor.cancel()
@@ -2136,6 +2151,14 @@ return 0
                 f"FIX paused: late in-flight rate limit breach, "
                 f"paused until {self.state.rate_limited_until}"
             )
+            return
+        if idle_flag["timed_out"]:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = (
+                f"FIX idle timeout: no push for {idle_limit}s"
+            )
+            self.log_event(self.state.error_message)
+            await self._save_cli_log("", "", "FIX idle timeout")
             return
         await self._save_cli_log(stdout, stderr, "FIX REVIEW output")
         self._detect_rate_limit(stderr)
