@@ -3256,6 +3256,41 @@ def test_codex_review_git_head_lookup_failure_does_not_dedup(
     )
 
 
+def test_codex_review_metadata_failure_posts_without_pr_author_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Metadata lookup failures must not escape or suppress review posts."""
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: (_ for _ in ()).throw(OSError("gh timed out")),
+    )
+    monkeypatch.setattr(
+        git_ops_module,
+        "_git",
+        lambda *args, **kwargs: _FakeCompletedProcess(
+            args=list(args), stdout="head-1\n", returncode=0
+        ),
+    )
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
+
+    assert runner._post_codex_review(42) is True
+    assert posted == [(runner.owner_repo, 42, "@codex review")]
+    assert runner._last_codex_review_pr == 42
+    assert runner._last_codex_review_head_sha == "head-1"
+    assert any(
+        "failed to load PR metadata for @codex review dedup" in e["event"]
+        for e in runner.state.history
+    )
+
+
 def test_save_cli_log_includes_stderr() -> None:
     """Both stdout and stderr must be saved to the CLI log."""
     runner = _make_runner()

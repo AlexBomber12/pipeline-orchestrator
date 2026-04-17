@@ -14,6 +14,24 @@ from src.daemon import git_ops
 from src.models import PipelineState
 
 
+def _author_already_requested_review(
+    owner_repo: str,
+    pr_number: int,
+    pr_author: str,
+    head_commit_date: str,
+) -> bool:
+    """Treat author-trigger dedup as best-effort and fail open."""
+    try:
+        return github_client.has_recent_codex_review_request(
+            owner_repo,
+            pr_number,
+            pr_author=pr_author,
+            after_iso=head_commit_date,
+        )
+    except Exception:
+        return False
+
+
 class HungMixin:
     """Nudge the reviewer with ``@codex review`` or give up, per config."""
 
@@ -51,10 +69,21 @@ class HungMixin:
             ).stdout.strip() or None
         except Exception:
             head_sha = None
-        metadata = github_client.get_pr_metadata(self.owner_repo, pr_number)
-        if isinstance(metadata, dict):
-            pr_author = str(metadata.get("author") or "")
-            head_commit_date = str(metadata.get("head_commit_date") or "")
+        try:
+            metadata = github_client.get_pr_metadata(
+                self.owner_repo, pr_number
+            )
+            if isinstance(metadata, dict):
+                pr_author = str(metadata.get("author") or "")
+                head_commit_date = str(
+                    metadata.get("head_commit_date") or ""
+                )
+        except Exception as exc:
+            self.log_event(
+                "Warning: failed to load PR metadata for @codex review "
+                f"dedup on PR #{pr_number}: {exc}; posting without "
+                "PR-author dedup"
+            )
         if head_sha is None:
             self.log_event(
                 f"Warning: failed to resolve HEAD for PR #{pr_number}; "
@@ -63,11 +92,11 @@ class HungMixin:
         elif (
             pr_author
             and head_commit_date
-            and github_client.has_recent_codex_review_request(
+            and _author_already_requested_review(
                 self.owner_repo,
                 pr_number,
-                pr_author=pr_author,
-                after_iso=head_commit_date,
+                pr_author,
+                head_commit_date,
             )
         ):
             self._last_codex_review_pr = pr_number
