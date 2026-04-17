@@ -234,7 +234,7 @@ class RateLimitMixin:
             triggered = True
 
         # Codex "usage limit" fallback (without "try again")
-        if not triggered and "usage limit" in lower:
+        if not triggered and "usage limit" in lower and coder_name != "codex":
             limit_type = "session"
             triggered = True
 
