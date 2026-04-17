@@ -411,7 +411,7 @@
 - Branch: pr-069-no-fix-ci-pending
 
 ## PR-070: Async run_claude in merge handler
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-070.md
 - Branch: pr-070-async-merge-resolve
 

@@ -1899,13 +1899,17 @@ def test_handle_merge_resolves_conflict(
 
     claude_calls: list[tuple[str, str]] = []
 
-    def fake_claude(
-        prompt: str, cwd: str, timeout: int = 600, model: str | None = None
+    async def fake_claude(
+        prompt: str,
+        cwd: str,
+        timeout: int | None = 600,
+        model: str | None = None,
+        **kwargs: Any,
     ) -> tuple[int, str, str]:
         claude_calls.append((prompt, cwd))
         return (0, "", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "run_claude", fake_claude)
+    monkeypatch.setattr(runner_module.claude_cli, "run_claude_async", fake_claude)
 
     merge_pr_calls: list[tuple[str, int]] = []
     monkeypatch.setattr(
@@ -2056,10 +2060,19 @@ def test_handle_merge_aborts_on_unresolvable_conflict(
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
 
+    async def fake_claude_async(
+        prompt: str,
+        cwd: str,
+        timeout: int | None = 600,
+        model: str | None = None,
+        **kwargs: Any,
+    ) -> tuple[int, str, str]:
+        return (1, "", "claude failed")
+
     monkeypatch.setattr(
         runner_module.claude_cli,
-        "run_claude",
-        lambda prompt, cwd, timeout=600, model=None: (1, "", "claude failed"),
+        "run_claude_async",
+        fake_claude_async,
     )
 
     merge_pr_calls: list[tuple[str, int]] = []
