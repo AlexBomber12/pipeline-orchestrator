@@ -130,12 +130,8 @@
         </div>
         {% endif %}
         {% if repo.state.value == 'CODING' or repo.state.value == 'FIX' %}
-        {% set _last_event = repo.history[-1].event|default('') if repo.history else '' %}
-        {% if '[codex]' in _last_event %}
-        <div class="text-xs text-accent/70 italic mt-1">Codex is {{ 'coding' if repo.state.value == 'CODING' else 'fixing' }}...</div>
-        {% else %}
-        <div class="text-xs text-accent/70 italic mt-1">Claude is {{ 'coding' if repo.state.value == 'CODING' else 'fixing' }}...</div>
-        {% endif %}
+        {% set _coder_name = 'Codex' if repo.coder == 'codex' else 'Claude' %}
+        <div class="text-xs text-accent/70 italic mt-1">{{ _coder_name }} is {{ 'coding' if repo.state.value == 'CODING' else 'fixing' }}...</div>
         {% endif %}
         {% endif %}
         {% if repo.usage_api_degraded %}

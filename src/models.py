@@ -92,3 +92,4 @@ class RepoState(BaseModel):
     usage_weekly_percent: int | None = None
     usage_weekly_resets_at: int | None = None
     usage_api_degraded: bool = False
+    coder: str | None = None

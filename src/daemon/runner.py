@@ -465,6 +465,8 @@ class PipelineRunner:
         """Serialize ``self.state`` and write it to Redis."""
         self.state.active = self.repo_config.active
         self.state.last_updated = datetime.now(timezone.utc)
+        coder = self.repo_config.coder or self.app_config.daemon.coder
+        self.state.coder = coder.value
         # Only probe usage for active repos to avoid unnecessary HTTP
         # calls (and potential timeout latency) for idle/inactive repos.
         if self.repo_config.active:
@@ -1595,10 +1597,12 @@ return 0
             self.log_event("PAUSED without rate_limited_until -> IDLE")
             self.state.state = PipelineState.IDLE
             return
-        # Codex is unaffected by Claude rate-limit pauses
+        # Codex is unaffected by Claude-originated pauses, but reactive
+        # pauses (stderr 429s from Codex itself) must still be honoured.
         coder = self.repo_config.coder or self.app_config.daemon.coder
-        if coder == CoderType.CODEX:
+        if coder == CoderType.CODEX and not self.state.rate_limit_reactive:
             self.state.rate_limited_until = None
+            self.state.rate_limit_reactive = False
             self._usage_provider.invalidate_cache()
             self.state.state = PipelineState.IDLE
             self.log_event("Codex active, clearing Claude rate-limit pause -> IDLE")
