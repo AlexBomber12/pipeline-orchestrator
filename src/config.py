@@ -96,7 +96,7 @@ class DaemonConfig(BaseModel):
     usage_api_cache_ttl_sec: int = Field(default=60, ge=5, le=3600)
     install_statusline_hook: bool = True
     coder: CoderType = CoderType.CLAUDE
-    codex_model: str = "o3"
+    codex_model: str = ""
 
 
 class WebConfig(BaseModel):

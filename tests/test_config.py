@@ -484,7 +484,7 @@ def test_daemon_config_default_coder_is_claude() -> None:
 
     d = DaemonConfig()
     assert d.coder == CoderType.CLAUDE
-    assert d.codex_model == "o3"
+    assert d.codex_model == ""
 
 
 def test_repo_config_coder_override_none_inherits_daemon() -> None:
