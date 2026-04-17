@@ -10,6 +10,7 @@ services:
     volumes:
       - .:/app
       - ./data:/data
+      - codex-auth:/data/auth/.codex
     environment:
       REDIS_URL: redis://redis:6379/0
       CLAUDE_CONFIG_DIR: /data/auth/claude
