@@ -5534,6 +5534,7 @@ def test_check_rate_limit_codex_honors_reactive_pause(
     runner = _make_runner(coder=CoderType.CODEX)
     runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
     runner.state.rate_limit_reactive = True
+    runner.state.rate_limit_reactive_coder = CoderType.CODEX.value
 
     result = asyncio.run(runner._check_rate_limit())
     assert result is False

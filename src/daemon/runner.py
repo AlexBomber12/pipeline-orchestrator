@@ -1528,11 +1528,16 @@ return 0
         """Return True if CLI calls are allowed, False if rate-limited."""
         coder = self.repo_config.coder or self.app_config.daemon.coder
         if self.state.rate_limited_until is not None:
-            if coder == CoderType.CODEX and not self.state.rate_limit_reactive:
+            codex_reactive = (
+                self.state.rate_limit_reactive
+                and self.state.rate_limit_reactive_coder == CoderType.CODEX.value
+            )
+            if coder == CoderType.CODEX and not codex_reactive:
                 # Claude-originated pause does not apply to Codex;
-                # reactive pauses (from stderr 429s) still apply.
+                # reactive pauses from Codex itself still apply.
                 self.state.rate_limited_until = None
                 self.state.rate_limit_reactive = False
+                self.state.rate_limit_reactive_coder = None
                 self._usage_provider.invalidate_cache()
                 if self.state.state == PipelineState.PAUSED:
                     self.state.state = PipelineState.IDLE
@@ -1546,6 +1551,7 @@ return 0
                 return False
             self.state.rate_limited_until = None
             self.state.rate_limit_reactive = False
+            self.state.rate_limit_reactive_coder = None
             self._usage_provider.invalidate_cache()
             self.log_event("Rate limit window expired, resuming")
         # Proactive OAuth check only applies to the Claude provider
@@ -1587,8 +1593,10 @@ return 0
 
         if triggered:
             pause_min = 30
+            coder = self.repo_config.coder or self.app_config.daemon.coder
             self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=pause_min)
             self.state.rate_limit_reactive = True
+            self.state.rate_limit_reactive_coder = coder.value
             self.log_event(f"Rate limit detected ({limit_type}), pausing for {pause_min} min")
 
     async def handle_paused(self) -> None:
@@ -1600,9 +1608,14 @@ return 0
         # Codex is unaffected by Claude-originated pauses, but reactive
         # pauses (stderr 429s from Codex itself) must still be honoured.
         coder = self.repo_config.coder or self.app_config.daemon.coder
-        if coder == CoderType.CODEX and not self.state.rate_limit_reactive:
+        codex_reactive = (
+            self.state.rate_limit_reactive
+            and self.state.rate_limit_reactive_coder == CoderType.CODEX.value
+        )
+        if coder == CoderType.CODEX and not codex_reactive:
             self.state.rate_limited_until = None
             self.state.rate_limit_reactive = False
+            self.state.rate_limit_reactive_coder = None
             self._usage_provider.invalidate_cache()
             self.state.state = PipelineState.IDLE
             self.log_event("Codex active, clearing Claude rate-limit pause -> IDLE")
@@ -1616,6 +1629,7 @@ return 0
         # Window expired: resume to appropriate state
         self.state.rate_limited_until = None
         self.state.rate_limit_reactive = False
+        self.state.rate_limit_reactive_coder = None
         self._error_diagnose_count = 0
         if self.state.error_message:
             lowered = self.state.error_message.lower()
