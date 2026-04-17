@@ -1649,12 +1649,14 @@ return 0
             r"try again in\s+(?:(\d+)\s*days?)?\s*(?:(\d+)\s*hours?)?\s*(?:(\d+)\s*minutes?)?",
             lower,
         )
+        codex_retry_parsed = False
         if not triggered and m_codex_retry and coder_name == "codex":
             days = int(m_codex_retry.group(1) or 0)
             hours = int(m_codex_retry.group(2) or 0)
             minutes = int(m_codex_retry.group(3) or 0)
             total_min = days * 1440 + hours * 60 + minutes
             if total_min > 0:
+                codex_retry_parsed = True
                 triggered = True
                 pause_min = total_min
                 limit_type = "weekly" if days > 0 or hours > 12 else "session"
@@ -1665,9 +1667,9 @@ return 0
             limit_type = "session"
 
         # Generic "rate limit" fallback (both coders).
-        # Skip only if the coder-specific regex already handled the text.
+        # Skip only if the coder-specific regex actually extracted a value.
         anthropic_handled = m_anthropic and coder_name == "claude"
-        codex_retry_handled = m_codex_retry and coder_name == "codex"
+        codex_retry_handled = codex_retry_parsed
         if not triggered and not anthropic_handled and not codex_retry_handled and "rate limit" in lower:
             if "weekly" in lower or "week" in lower:
                 limit_type = "weekly"

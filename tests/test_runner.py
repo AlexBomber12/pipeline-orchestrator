@@ -5618,6 +5618,24 @@ def test_detect_rate_limit_codex_429(
     assert runner.state.rate_limit_reactive_coder == "codex"
 
 
+def test_detect_rate_limit_codex_retry_no_duration_falls_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """'try again in' with no parseable duration should fall through to generic fallback."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner._detect_rate_limit(
+        "Rate limit reached. Please try again in 6.379s",
+        coder_name="codex",
+    )
+    # The regex matches "try again in" but captures no days/hours/minutes,
+    # so it must NOT suppress the generic "rate limit" fallback.
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "codex"
+
+
 def test_detect_rate_limit_anthropic_regex_skipped_for_codex(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
