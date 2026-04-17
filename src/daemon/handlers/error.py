@@ -10,6 +10,7 @@ Module-level:
 
 from __future__ import annotations
 
+import asyncio
 import re
 from enum import Enum
 
@@ -37,9 +38,18 @@ class ErrorMixin:
 
     async def handle_error(self, error_context: str | None = None) -> None:
         """Ask the claude CLI whether to FIX, SKIP, or ESCALATE the error."""
-        # Diagnosis always uses claude_cli, so check Claude's quota
-        # regardless of the repo's configured coder.
-        if not await self._check_rate_limit(proactive_coder="claude"):
+        # Diagnosis always uses claude_cli, but a Claude session cap
+        # should skip diagnosis without pausing other coders.
+        snapshot = await asyncio.to_thread(self._claude_usage_provider.fetch)
+        if (
+            snapshot
+            and snapshot.session_percent
+            >= self.app_config.daemon.rate_limit_session_pause_percent
+        ):
+            self.log_event("Skipping AI diagnosis: Claude rate limited")
+            self.state.state = PipelineState.IDLE
+            self.state.error_message = None
+            self._error_diagnose_count = 0
             return
 
         context = error_context or self.state.error_message or "Unknown error"
