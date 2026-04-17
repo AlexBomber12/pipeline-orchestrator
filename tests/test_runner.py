@@ -3174,6 +3174,37 @@ def test_codex_review_reposted_after_new_push(
     assert runner._last_codex_review_head_sha == "head-2"
 
 
+def test_codex_review_git_head_lookup_failure_does_not_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient HEAD lookup failure must not suppress review requests."""
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    def fake_git(*args: object, **kwargs: object) -> _FakeCompletedProcess:
+        raise RuntimeError("git rev-parse failed")
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
+
+    assert runner._post_codex_review(42) is True
+    assert runner._post_codex_review(42) is True
+    assert posted == [
+        (runner.owner_repo, 42, "@codex review"),
+        (runner.owner_repo, 42, "@codex review"),
+    ]
+    assert runner._last_codex_review_pr is None
+    assert runner._last_codex_review_head_sha is None
+    assert any(
+        "posting @codex review without dedup" in e["event"]
+        for e in runner.state.history
+    )
+
+
 def test_save_cli_log_includes_stderr() -> None:
     """Both stdout and stderr must be saved to the CLI log."""
     runner = _make_runner()

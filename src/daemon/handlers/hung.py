@@ -41,6 +41,7 @@ class HungMixin:
         still fires on the creation event itself.
         """
         current_pr = self.state.current_pr
+        cache_dedup_key = False
         head_sha: str | None = None
         try:
             head_sha = git_ops._git(
@@ -48,7 +49,12 @@ class HungMixin:
             ).stdout.strip() or None
         except Exception:
             head_sha = None
-        if (
+        if head_sha is None:
+            self.log_event(
+                f"Warning: failed to resolve HEAD for PR #{pr_number}; "
+                "posting @codex review without dedup"
+            )
+        elif (
             self._last_codex_review_pr == pr_number
             and self._last_codex_review_head_sha == head_sha
         ):
@@ -57,8 +63,10 @@ class HungMixin:
             )
             return True
 
-        self._last_codex_review_pr = pr_number
-        self._last_codex_review_head_sha = head_sha
+        if head_sha is not None:
+            self._last_codex_review_pr = pr_number
+            self._last_codex_review_head_sha = head_sha
+            cache_dedup_key = True
 
         try:
             if current_pr is not None and current_pr.number == pr_number:
@@ -69,8 +77,9 @@ class HungMixin:
             self.log_event(f"Posted @codex review on PR #{pr_number}")
             return True
         except Exception as exc:
-            self._last_codex_review_pr = None
-            self._last_codex_review_head_sha = None
+            if cache_dedup_key:
+                self._last_codex_review_pr = None
+                self._last_codex_review_head_sha = None
             self.log_event(
                 f"Warning: failed to post @codex review on PR "
                 f"#{pr_number}: {exc}"
