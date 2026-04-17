@@ -5964,10 +5964,10 @@ def test_detect_rate_limit_codex_429(
     assert runner.state.rate_limit_reactive_coder == "codex"
 
 
-def test_detect_rate_limit_codex_retry_no_duration_falls_through(
+def test_detect_rate_limit_codex_retry_no_duration_does_not_trigger(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """'try again in' with no parseable duration should fall through to generic fallback."""
+    """Codex retry text without a parsed duration should not trigger a pause."""
     from src.config import CoderType
 
     _patch_subprocess(monkeypatch)
@@ -5976,10 +5976,8 @@ def test_detect_rate_limit_codex_retry_no_duration_falls_through(
         "Rate limit reached. Please try again in 6.379s",
         coder_name="codex",
     )
-    # The regex matches "try again in" but captures no days/hours/minutes,
-    # so it must NOT suppress the generic "rate limit" fallback.
-    assert runner.state.rate_limited_until is not None
-    assert runner.state.rate_limit_reactive_coder == "codex"
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive_coder is None
 
 
 def test_detect_rate_limit_anthropic_regex_skipped_for_codex(
@@ -5995,10 +5993,24 @@ def test_detect_rate_limit_anthropic_regex_skipped_for_codex(
         "Warning: 95% of session rate limit reached",
         coder_name="codex",
     )
-    # Should NOT match the Anthropic regex path; falls through to
-    # generic "rate limit" fallback instead.
-    assert runner.state.rate_limited_until is not None
-    assert runner.state.rate_limit_reactive_coder == "codex"
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive_coder is None
+
+
+def test_detect_rate_limit_codex_progress_output_does_not_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex progress output with remaining weekly rate limit must not pause."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner._detect_rate_limit(
+        "Progress update: weekly rate limit: 87% remaining",
+        coder_name="codex",
+    )
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive_coder is None
 
 
 def test_proactive_check_uses_codex_provider_when_coder_is_codex(

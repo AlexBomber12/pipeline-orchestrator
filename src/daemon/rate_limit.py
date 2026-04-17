@@ -201,7 +201,13 @@ class RateLimitMixin:
         # Skip only if the coder-specific regex actually extracted a value.
         anthropic_handled = m_anthropic and coder_name == "claude"
         codex_retry_handled = codex_retry_parsed
-        if not triggered and not anthropic_handled and not codex_retry_handled and "rate limit" in lower:
+        if (
+            not triggered
+            and not anthropic_handled
+            and not codex_retry_handled
+            and "rate limit" in lower
+            and coder_name != "codex"
+        ):
             if "weekly" in lower or "week" in lower:
                 limit_type = "weekly"
             triggered = True
