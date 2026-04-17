@@ -24,8 +24,8 @@ from pathlib import Path
 
 import redis.asyncio as aioredis
 
-from src import claude_cli, github_client
-from src.config import AppConfig, RepoConfig
+from src import claude_cli, codex_cli, github_client
+from src.config import AppConfig, CoderType, RepoConfig
 from src.daemon import scaffolder
 from src.models import (
     CIStatus,
@@ -450,13 +450,27 @@ class PipelineRunner:
                 cache_ttl_sec=value.daemon.usage_api_cache_ttl_sec,
             )
 
+    def _get_coder(self) -> tuple[str, object]:
+        """Return ``(coder_name, coder_module)`` for the active coder.
+
+        Per-repo ``coder`` overrides the daemon-level default.  Returns
+        either ``("claude", claude_cli)`` or ``("codex", codex_cli)``.
+        """
+        coder = self.repo_config.coder or self.app_config.daemon.coder
+        if coder == CoderType.CODEX:
+            return "codex", codex_cli
+        return "claude", claude_cli
+
     async def publish_state(self) -> None:
         """Serialize ``self.state`` and write it to Redis."""
         self.state.active = self.repo_config.active
         self.state.last_updated = datetime.now(timezone.utc)
-        # Only probe usage for active repos to avoid unnecessary HTTP
-        # calls (and potential timeout latency) for idle/inactive repos.
-        if self.repo_config.active:
+        coder = self.repo_config.coder or self.app_config.daemon.coder
+        self.state.coder = coder.value
+        # Only probe usage for active repos using Claude to avoid unnecessary
+        # HTTP calls (and potential timeout latency) for idle/inactive repos
+        # or repos using Codex (which doesn't use the Claude usage endpoint).
+        if self.repo_config.active and coder != CoderType.CODEX:
             snap = await asyncio.to_thread(self._usage_provider.fetch)
             if snap is not None:
                 self.state.usage_session_percent = snap.session_percent
@@ -469,6 +483,14 @@ class PipelineRunner:
                 self.state.usage_weekly_percent = None
                 self.state.usage_weekly_resets_at = None
             self.state.usage_api_degraded = self._usage_provider.consecutive_failures >= 10
+        elif self.repo_config.active:
+            # Codex mode: clear stale Claude usage data so the dashboard
+            # does not display outdated Claude metrics or false degraded warnings.
+            self.state.usage_session_percent = None
+            self.state.usage_session_resets_at = None
+            self.state.usage_weekly_percent = None
+            self.state.usage_weekly_resets_at = None
+            self.state.usage_api_degraded = False
         if not self.repo_config.active:
             data = self.state.model_dump()
             data["state"] = PipelineState.IDLE.value
@@ -1513,20 +1535,74 @@ return 0
 
     async def _check_rate_limit(self) -> bool:
         """Return True if CLI calls are allowed, False if rate-limited."""
+        coder = self.repo_config.coder or self.app_config.daemon.coder
         if self.state.rate_limited_until is not None:
-            if datetime.now(timezone.utc) < self.state.rate_limited_until:
+            # Diagnosis pauses always use Claude — honour regardless of coder.
+            diagnosis_pause = (
+                self.state.rate_limit_reactive
+                and self.state.error_message is not None
+            )
+            # A reactive pause from a *different* coder doesn't apply:
+            # e.g. a Claude pause doesn't block Codex, and vice-versa.
+            # Non-reactive (proactive) pauses are Claude-only; clear for Codex.
+            if not diagnosis_pause and self.state.rate_limit_reactive and self.state.rate_limit_reactive_coder:
+                other_coder_reactive = self.state.rate_limit_reactive_coder != coder.value
+            else:
+                # Non-reactive (proactive) pauses are Claude-only
+                other_coder_reactive = False
+            clearable = (
+                not diagnosis_pause
+                and (
+                    other_coder_reactive
+                    or (not self.state.rate_limit_reactive and coder == CoderType.CODEX)
+                )
+            )
+            if clearable:
+                self.state.rate_limited_until = None
+                self.state.rate_limit_reactive = False
+                self.state.rate_limit_reactive_coder = None
+                self._usage_provider.invalidate_cache()
+                if self.state.state == PipelineState.PAUSED:
+                    if (
+                        self.state.current_pr is not None
+                        and self.state.current_task is not None
+                        and self.state.current_pr.branch == self.state.current_task.branch
+                    ):
+                        self.state.state = PipelineState.WATCH
+                    else:
+                        self.state.state = PipelineState.IDLE
+                self.log_event(
+                    f"{coder.value.capitalize()} active, clearing other-coder rate-limit pause"
+                )
+                # Fall through so the proactive usage check still runs
+                # when the active coder is Claude (avoids launching work
+                # that exceeds Claude's usage thresholds).
+            elif datetime.now(timezone.utc) < self.state.rate_limited_until:
                 if self.state.state != PipelineState.PAUSED:
                     self.state.state = PipelineState.PAUSED
                 remaining = (self.state.rate_limited_until - datetime.now(timezone.utc)).total_seconds()
                 self.log_event(f"Rate limited, resuming in {int(remaining)}s")
                 return False
-            self.state.rate_limited_until = None
-            self._usage_provider.invalidate_cache()
-            self.log_event("Rate limit window expired, resuming")
+            else:
+                self.state.rate_limited_until = None
+                self.state.rate_limit_reactive = False
+                self.state.rate_limit_reactive_coder = None
+                self._usage_provider.invalidate_cache()
+                self.log_event("Rate limit window expired, resuming")
+        # Proactive OAuth check only applies to the Claude provider
+        if coder == CoderType.CODEX:
+            return True
         return await self._proactive_usage_check()
 
-    def _detect_rate_limit(self, stderr: str) -> None:
-        """Set rate-limit pause if stderr contains rate-limit signals."""
+    def _detect_rate_limit(self, stderr: str, coder_name: str | None = None) -> None:
+        """Set rate-limit pause if stderr contains rate-limit signals.
+
+        ``coder_name`` identifies the CLI that produced *stderr*.  When
+        omitted the configured coder is used, but callers that always
+        invoke a specific CLI (e.g. ``handle_error`` → ``claude_cli``)
+        should pass the name explicitly so reactive pauses are attributed
+        to the correct provider.
+        """
         session_threshold = self.app_config.daemon.rate_limit_session_pause_percent
         weekly_threshold = self.app_config.daemon.rate_limit_weekly_pause_percent
         lower = stderr.lower()
@@ -1557,9 +1633,20 @@ return 0
                 limit_type = "weekly"
             triggered = True
 
+        # Codex reports quota exhaustion as "usage limit" rather than
+        # "rate limit", e.g. "usage limit … try again in …".
+        if not triggered and "usage limit" in lower:
+            limit_type = "session"
+            triggered = True
+
         if triggered:
             pause_min = 30
+            if coder_name is None:
+                coder = self.repo_config.coder or self.app_config.daemon.coder
+                coder_name = coder.value
             self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=pause_min)
+            self.state.rate_limit_reactive = True
+            self.state.rate_limit_reactive_coder = coder_name
             self.log_event(f"Rate limit detected ({limit_type}), pausing for {pause_min} min")
 
     async def handle_paused(self) -> None:
@@ -1567,6 +1654,56 @@ return 0
         if self.state.rate_limited_until is None:
             self.log_event("PAUSED without rate_limited_until -> IDLE")
             self.state.state = PipelineState.IDLE
+            return
+        # A pause from a different coder doesn't apply after switching.
+        # Diagnosis pauses always use Claude — honour regardless of coder.
+        coder = self.repo_config.coder or self.app_config.daemon.coder
+        diagnosis_pause = (
+            self.state.rate_limit_reactive
+            and self.state.error_message is not None
+        )
+        if not diagnosis_pause and self.state.rate_limit_reactive and self.state.rate_limit_reactive_coder:
+            other_coder_reactive = self.state.rate_limit_reactive_coder != coder.value
+        else:
+            other_coder_reactive = False
+        clearable = (
+            not diagnosis_pause
+            and (
+                other_coder_reactive
+                or (not self.state.rate_limit_reactive and coder == CoderType.CODEX)
+            )
+        )
+        if clearable:
+            self.state.rate_limited_until = None
+            self.state.rate_limit_reactive = False
+            self.state.rate_limit_reactive_coder = None
+            self._usage_provider.invalidate_cache()
+            self._error_diagnose_count = 0
+            label = f"{coder.value.capitalize()} active, clearing other-coder pause"
+            # Preserve error context so diagnosis/recovery continues.
+            if self.state.error_message:
+                lowered = self.state.error_message.lower()
+                is_rate_limit_msg = (
+                    "rate limit" in lowered or re.search(r"\b429\b", lowered)
+                )
+                if is_rate_limit_msg:
+                    self.state.error_message = None
+                    self.log_event(f"{label}, cleared legacy rate-limit error")
+                else:
+                    self.state.state = PipelineState.ERROR
+                    self.log_event(f"{label} -> ERROR (preserved context)")
+                    return
+            # Resume to the appropriate workflow state.
+            if (
+                self.state.current_pr is not None
+                and self.state.current_task is not None
+                and self.state.current_pr.branch == self.state.current_task.branch
+            ):
+                self.state.state = PipelineState.WATCH
+                self.log_event(f"{label} -> WATCH")
+            else:
+                self.state.state = PipelineState.IDLE
+                self.log_event(f"{label} -> IDLE")
             return
         if datetime.now(timezone.utc) < self.state.rate_limited_until:
             remaining = (
@@ -1576,6 +1713,8 @@ return 0
             return
         # Window expired: resume to appropriate state
         self.state.rate_limited_until = None
+        self.state.rate_limit_reactive = False
+        self.state.rate_limit_reactive_coder = None
         self._error_diagnose_count = 0
         if self.state.error_message:
             lowered = self.state.error_message.lower()
@@ -1607,9 +1746,9 @@ return 0
             self.log_event("Rate limit expired, resuming -> IDLE")
 
     async def handle_coding(self) -> None:
-        """Run ``PLANNED PR`` via the claude CLI and hand off to WATCH.
+        """Run ``PLANNED PR`` via the active coder CLI and hand off to WATCH.
 
-        Claude owns the full git workflow per AGENTS.md: branch creation,
+        The coder owns the full git workflow per AGENTS.md: branch creation,
         commit, push, and PR creation. The daemon must not pre-create the
         task branch — doing so conflicts with AGENTS.md step 4 ("create
         branch from origin/main"). After the CLI returns 0 we poll GitHub
@@ -1618,6 +1757,9 @@ return 0
         """
         if not await self._check_rate_limit():
             return
+
+        coder_name, coder_module = self._get_coder()
+        self.log_event(f"[{coder_name}] Starting PLANNED PR")
 
         target_branch = (
             self.state.current_task.branch if self.state.current_task else None
@@ -1633,23 +1775,37 @@ return 0
         breach_dir, breach_run_id = self._breach_env()
         breach_flag: dict[str, bool] = {"breached": False}
 
+        model = (
+            self.app_config.daemon.codex_model
+            if coder_name == "codex"
+            else self.app_config.daemon.claude_model
+        )
+
         heartbeat = asyncio.create_task(self._publish_while_waiting("CODING"))
-        claude_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
-            claude_cli.run_planned_pr_async(
-                self.repo_path,
-                model=self.app_config.daemon.claude_model,
-                timeout=self.app_config.daemon.planned_pr_timeout_sec,
+        coder_kwargs: dict[str, object] = {
+            "model": model,
+            "timeout": self.app_config.daemon.planned_pr_timeout_sec,
+        }
+        if coder_name == "claude":
+            coder_kwargs.update(
                 breach_dir=breach_dir,
                 breach_run_id=breach_run_id,
                 session_threshold=self.app_config.daemon.rate_limit_session_pause_percent,
                 weekly_threshold=self.app_config.daemon.rate_limit_weekly_pause_percent,
             )
-        )
-        breach_monitor = asyncio.create_task(
-            self._monitor_inflight_breach(
-                breach_dir, breach_run_id, claude_task, breach_flag,
+        claude_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
+            coder_module.run_planned_pr_async(
+                self.repo_path,
+                **coder_kwargs,
             )
         )
+        breach_monitor: asyncio.Task[None] | None = None
+        if coder_name == "claude":
+            breach_monitor = asyncio.create_task(
+                self._monitor_inflight_breach(
+                    breach_dir, breach_run_id, claude_task, breach_flag,
+                )
+            )
         try:
             code, stdout, stderr = await claude_task
         except asyncio.CancelledError:
@@ -1687,12 +1843,14 @@ return 0
             )
             return
         finally:
-            breach_monitor.cancel()
+            if breach_monitor is not None:
+                breach_monitor.cancel()
             heartbeat.cancel()
-            self._check_late_breach(breach_dir, breach_run_id, breach_flag)
-            self._cleanup_breach_marker(breach_dir, breach_run_id)
+            if coder_name == "claude":
+                self._check_late_breach(breach_dir, breach_run_id, breach_flag)
+                self._cleanup_breach_marker(breach_dir, breach_run_id)
         if breach_flag["breached"]:
-            # Record the PR if Claude already created one, so it is not
+            # Record the PR if the coder already created one, so it is not
             # orphaned while the runner is paused.
             # Retry up to 3 times — PR list visibility is eventually consistent.
             if target_branch:
@@ -1723,8 +1881,8 @@ return 0
                 f"paused until {self.state.rate_limited_until}"
             )
             return
-        await self._save_cli_log(stdout, stderr, "PLANNED PR output")
-        self._detect_rate_limit(stderr)
+        await self._save_cli_log(stdout, stderr, f"PLANNED PR output [{coder_name}]")
+        self._detect_rate_limit(stderr, coder_name=coder_name)
         if code != 0:
             if self.state.rate_limited_until is not None:
                 self.state.state = PipelineState.PAUSED
@@ -1735,8 +1893,8 @@ return 0
                 )
                 return
             self.state.state = PipelineState.ERROR
-            self.state.error_message = stderr.strip() or f"claude exit {code}"
-            self.log_event(f"claude CLI failed: {self.state.error_message}")
+            self.state.error_message = stderr.strip() or f"{coder_name} exit {code}"
+            self.log_event(f"[{coder_name}] CLI failed: {self.state.error_message}")
             return
 
         candidate = None
@@ -2050,9 +2208,11 @@ return 0
             pass
 
     async def handle_fix(self) -> None:
-        """Run ``FIX REVIEW`` via the claude CLI and return to WATCH."""
+        """Run ``FIX REVIEW`` via the active coder CLI and return to WATCH."""
         if not await self._check_rate_limit():
             return
+
+        coder_name, coder_module = self._get_coder()
 
         if (
             self.state.current_pr is not None
@@ -2065,10 +2225,10 @@ return 0
             return
 
         self.state.state = PipelineState.FIX
-        self.log_event("entering FIX")
+        self.log_event(f"[{coder_name}] entering FIX")
         await self.publish_state()
 
-        # ``sync_to_main`` left the repo on the base branch. Claude must run
+        # ``sync_to_main`` left the repo on the base branch. The coder must run
         # against the PR's HEAD, so refresh the local PR branch from origin
         # before invoking ``fix_review``. fetch + checkout + hard-reset
         # guarantees the local branch matches the remote exactly, avoiding
@@ -2132,25 +2292,37 @@ return 0
         breach_flag: dict[str, bool] = {"breached": False}
         idle_flag: dict[str, bool] = {"timed_out": False}
 
+        model = (
+            self.app_config.daemon.codex_model
+            if coder_name == "codex"
+            else self.app_config.daemon.claude_model
+        )
+
         heartbeat = asyncio.create_task(self._publish_while_waiting("FIX"))
-        claude_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
-            claude_cli.fix_review_async(
-                self.repo_path,
-                model=self.app_config.daemon.claude_model,
+        fix_kwargs: dict[str, object] = {"model": model}
+        if coder_name == "claude":
+            fix_kwargs.update(
                 breach_dir=breach_dir,
                 breach_run_id=breach_run_id,
                 session_threshold=self.app_config.daemon.rate_limit_session_pause_percent,
                 weekly_threshold=self.app_config.daemon.rate_limit_weekly_pause_percent,
             )
+        claude_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
+            coder_module.fix_review_async(
+                self.repo_path,
+                **fix_kwargs,
+            )
         )
         idle_monitor = asyncio.create_task(
             self._monitor_fix_idle(pr_number, idle_limit, claude_task, idle_flag)
         )
-        breach_monitor = asyncio.create_task(
-            self._monitor_inflight_breach(
-                breach_dir, breach_run_id, claude_task, breach_flag,
+        breach_monitor: asyncio.Task[None] | None = None
+        if coder_name == "claude":
+            breach_monitor = asyncio.create_task(
+                self._monitor_inflight_breach(
+                    breach_dir, breach_run_id, claude_task, breach_flag,
+                )
             )
-        )
         try:
             code, stdout, stderr = await claude_task
         except asyncio.CancelledError:
@@ -2196,11 +2368,13 @@ return 0
             # near exit.  We re-check breach_flag after the finally block.
             code, stdout, stderr = 1, "", ""
         finally:
-            breach_monitor.cancel()
+            if breach_monitor is not None:
+                breach_monitor.cancel()
             idle_monitor.cancel()
             heartbeat.cancel()
-            self._check_late_breach(breach_dir, breach_run_id, breach_flag)
-            self._cleanup_breach_marker(breach_dir, breach_run_id)
+            if coder_name == "claude":
+                self._check_late_breach(breach_dir, breach_run_id, breach_flag)
+                self._cleanup_breach_marker(breach_dir, breach_run_id)
         if breach_flag["breached"]:
             # Refresh the feedback baseline from HEAD so that any push
             # Claude made before the breach is accounted for, without
@@ -2244,8 +2418,8 @@ return 0
             self.log_event(self.state.error_message)
             await self._save_cli_log("", "", "FIX idle timeout")
             return
-        await self._save_cli_log(stdout, stderr, "FIX REVIEW output")
-        self._detect_rate_limit(stderr)
+        await self._save_cli_log(stdout, stderr, f"FIX REVIEW output [{coder_name}]")
+        self._detect_rate_limit(stderr, coder_name=coder_name)
         if code != 0:
             if self.state.rate_limited_until is not None:
                 self.state.state = PipelineState.PAUSED
@@ -2256,8 +2430,8 @@ return 0
                 )
                 return
             self.state.state = PipelineState.ERROR
-            self.state.error_message = stderr.strip() or f"claude exit {code}"
-            self.log_event(f"fix_review failed: {self.state.error_message}")
+            self.state.error_message = stderr.strip() or f"{coder_name} exit {code}"
+            self.log_event(f"[{coder_name}] fix_review failed: {self.state.error_message}")
             return
 
         # Verify HEAD actually moved before treating as a push (PR-050).
@@ -2894,7 +3068,7 @@ return 0
         code, stdout, stderr = await claude_cli.diagnose_error_async(
             self.repo_path, context, model=self.app_config.daemon.claude_model
         )
-        self._detect_rate_limit(stderr)
+        self._detect_rate_limit(stderr, coder_name="claude")
         if self.state.rate_limited_until is not None:
             self.state.state = PipelineState.PAUSED
             # Preserve error_message so handle_paused resumes to ERROR

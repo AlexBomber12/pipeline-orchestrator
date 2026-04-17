@@ -470,3 +470,72 @@ def test_update_daemon_config_accepts_strict_queue_validation(
         strict_queue_validation=False,
     )
     assert updated.daemon.strict_queue_validation is False
+
+
+def test_coder_type_enum_values() -> None:
+    from src.config import CoderType
+
+    assert CoderType.CLAUDE.value == "claude"
+    assert CoderType.CODEX.value == "codex"
+
+
+def test_daemon_config_default_coder_is_claude() -> None:
+    from src.config import CoderType, DaemonConfig
+
+    d = DaemonConfig()
+    assert d.coder == CoderType.CLAUDE
+    assert d.codex_model == "o3"
+
+
+def test_repo_config_coder_override_none_inherits_daemon() -> None:
+    repo = RepoConfig(url="https://github.com/example/repo")
+    assert repo.coder is None
+
+
+def test_repo_config_coder_override_codex() -> None:
+    from src.config import CoderType
+
+    repo = RepoConfig(url="https://github.com/example/repo", coder="codex")
+    assert repo.coder == CoderType.CODEX
+
+
+def test_update_daemon_config_coder(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text("daemon: {}\n", encoding="utf-8")
+    updated = update_daemon_config(path=str(cfg_path), coder="codex")
+    assert updated.daemon.coder.value == "codex"
+
+
+def test_update_daemon_config_codex_model(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text("daemon: {}\n", encoding="utf-8")
+    updated = update_daemon_config(path=str(cfg_path), codex_model="o4-mini")
+    assert updated.daemon.codex_model == "o4-mini"
+
+
+def test_update_repository_coder_override(tmp_path: Path) -> None:
+    path = tmp_path / "config.yml"
+    save_config(AppConfig(), str(path))
+    add_repository("https://github.com/octo/alpha.git", str(path))
+
+    cfg = update_repository(
+        "https://github.com/octo/alpha.git",
+        str(path),
+        coder="codex",
+    )
+    assert cfg.repositories[0].coder is not None
+    assert cfg.repositories[0].coder.value == "codex"
+
+
+def test_update_repository_coder_clear(tmp_path: Path) -> None:
+    path = tmp_path / "config.yml"
+    save_config(AppConfig(), str(path))
+    add_repository("https://github.com/octo/alpha.git", str(path))
+    update_repository(
+        "https://github.com/octo/alpha.git", str(path), coder="codex"
+    )
+
+    cfg = update_repository(
+        "https://github.com/octo/alpha.git", str(path), coder=None
+    )
+    assert cfg.repositories[0].coder is None

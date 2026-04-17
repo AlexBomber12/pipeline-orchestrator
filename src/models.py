@@ -86,8 +86,11 @@ class RepoState(BaseModel):
     pending_queue_sync_branch: str | None = None
     pending_queue_sync_started_at: datetime | None = None
     rate_limited_until: datetime | None = None
+    rate_limit_reactive: bool = False
+    rate_limit_reactive_coder: str | None = None
     usage_session_percent: int | None = None
     usage_session_resets_at: int | None = None
     usage_weekly_percent: int | None = None
     usage_weekly_resets_at: int | None = None
     usage_api_degraded: bool = False
+    coder: str | None = None

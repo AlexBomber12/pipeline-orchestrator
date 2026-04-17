@@ -5337,3 +5337,205 @@ def test_handle_coding_pauses_on_inflight_breach(
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.rate_limited_until is not None
     assert runner.state.error_message is None
+
+
+# -----------------------------------------------------------------------
+# PR-065: Coder selection tests
+# -----------------------------------------------------------------------
+
+
+def test_get_coder_returns_claude_by_default() -> None:
+    runner = _make_runner()
+    name, mod = runner._get_coder()
+    assert name == "claude"
+    from src import claude_cli
+    assert mod is claude_cli
+
+
+def test_get_coder_returns_codex_when_configured() -> None:
+    from src.config import CoderType
+    runner = _make_runner()
+    runner._app_config = _app_cfg(coder=CoderType.CODEX)
+    name, mod = runner._get_coder()
+    assert name == "codex"
+    from src import codex_cli
+    assert mod is codex_cli
+
+
+def test_get_coder_repo_override_takes_precedence() -> None:
+    from src.config import CoderType
+    runner = _make_runner(coder=CoderType.CODEX)
+    # Daemon default is claude, repo override is codex
+    name, mod = runner._get_coder()
+    assert name == "codex"
+    from src import codex_cli
+    assert mod is codex_cli
+
+
+def test_handle_coding_uses_codex_cli_when_coder_is_codex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.config import CoderType
+    from src import codex_cli
+
+    calls = _patch_subprocess(monkeypatch)
+    captured_module: list[str] = []
+
+    async def fake_run_planned_pr(path: str, **kwargs: object) -> tuple:
+        captured_module.append("codex")
+        return (0, "ok", "")
+
+    monkeypatch.setattr(codex_cli, "run_planned_pr_async", fake_run_planned_pr)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda *a, **kw: [PRInfo(
+            number=42,
+            url="https://github.com/octo/demo/pull/42",
+            branch="pr-001",
+            ci_status=CIStatus.PENDING,
+            review_status=ReviewStatus.PENDING,
+        )],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: True,
+    )
+
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001",
+    )
+    asyncio.run(runner.handle_coding())
+
+    assert captured_module == ["codex"]
+    assert runner.state.state == PipelineState.WATCH
+
+
+def test_handle_fix_uses_codex_cli_when_coder_is_codex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.config import CoderType
+    from src import codex_cli
+
+    calls = _patch_subprocess(monkeypatch)
+    captured_module: list[str] = []
+
+    async def fake_fix_review(path: str, **kwargs: object) -> tuple:
+        captured_module.append("codex")
+        return (0, "ok", "")
+
+    monkeypatch.setattr(codex_cli, "fix_review_async", fake_fix_review)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: True,
+    )
+
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.current_pr = PRInfo(
+        number=42,
+        url="https://github.com/octo/demo/pull/42",
+        branch="fix-branch",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+    asyncio.run(runner.handle_fix())
+
+    assert captured_module == ["codex"]
+
+
+def test_event_log_includes_coder_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.config import CoderType
+    from src import codex_cli
+
+    _patch_subprocess(monkeypatch)
+
+    async def fake_run_planned_pr(path: str, **kwargs: object) -> tuple:
+        return (0, "ok", "")
+
+    monkeypatch.setattr(codex_cli, "run_planned_pr_async", fake_run_planned_pr)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda *a, **kw: [PRInfo(
+            number=42,
+            url="https://github.com/octo/demo/pull/42",
+            branch="pr-001",
+            ci_status=CIStatus.PENDING,
+            review_status=ReviewStatus.PENDING,
+        )],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: True,
+    )
+
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001",
+    )
+    asyncio.run(runner.handle_coding())
+
+    events = [h["event"] for h in runner.state.history]
+    assert any("[codex]" in e for e in events)
+
+
+def test_check_rate_limit_skips_proactive_for_codex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.config import CoderType
+
+    runner = _make_runner(coder=CoderType.CODEX)
+
+    proactive_called = []
+
+    async def fake_proactive(*a: object, **kw: object) -> bool:
+        proactive_called.append(True)
+        return True
+
+    monkeypatch.setattr(runner, "_proactive_usage_check", fake_proactive)
+
+    result = asyncio.run(runner._check_rate_limit())
+    assert result is True
+    assert proactive_called == []  # Should not have been called
+
+
+def test_check_rate_limit_codex_clears_claude_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex clears a non-reactive (Claude-originated) rate-limit pause."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limit_reactive = False
+    runner.state.state = PipelineState.PAUSED
+
+    result = asyncio.run(runner._check_rate_limit())
+    assert result is True
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive is False
+    assert runner.state.state == PipelineState.IDLE
+
+
+def test_check_rate_limit_codex_honors_reactive_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex respects a reactive (stderr-detected) rate-limit pause."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limit_reactive = True
+    runner.state.rate_limit_reactive_coder = CoderType.CODEX.value
+
+    result = asyncio.run(runner._check_rate_limit())
+    assert result is False
+    assert runner.state.rate_limited_until is not None

@@ -1,3 +1,35 @@
+<!-- Coder -->
+<div class="mb-6">
+    <h3 class="text-sm font-semibold text-gray-300 uppercase tracking-wide mb-3">Coder</h3>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <label class="flex flex-col gap-1 text-sm">
+            <span class="text-gray-400">Coder</span>
+            <select name="coder"
+                    class="w-48 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+                    hx-put="/settings/daemon"
+                    hx-trigger="change"
+                    hx-target="#settings-daemon"
+                    hx-swap="innerHTML">
+                <option value="claude" {% if daemon.coder == "claude" or daemon.coder.value == "claude" %}selected{% endif %}>Claude Code</option>
+                <option value="codex" {% if daemon.coder == "codex" or daemon.coder.value == "codex" %}selected{% endif %}>Codex CLI</option>
+            </select>
+            <span class="text-xs text-gray-500">Which coding agent runs PLANNED PR and FIX REVIEW.</span>
+        </label>
+        <label class="flex flex-col gap-1 text-sm">
+            <span class="text-gray-400">Codex model</span>
+            <input type="text"
+                   name="codex_model"
+                   value="{{ daemon.codex_model }}"
+                   class="w-48 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+                   hx-put="/settings/daemon"
+                   hx-trigger="change"
+                   hx-target="#settings-daemon"
+                   hx-swap="innerHTML">
+            <span class="text-xs text-gray-500">OpenAI model for Codex CLI (o3, o4-mini, gpt-5-codex).</span>
+        </label>
+    </div>
+</div>
+
 <!-- Timing -->
 <div class="mb-6">
     <h3 class="text-sm font-semibold text-gray-300 uppercase tracking-wide mb-3">Timing</h3>

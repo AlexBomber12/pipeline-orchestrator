@@ -5,11 +5,17 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
+
+
+class CoderType(str, Enum):
+    CLAUDE = "claude"
+    CODEX = "codex"
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +27,7 @@ _REPO_FIELDS = {
     "active",
     "poll_interval_sec",
     "allow_merge_without_checks",
+    "coder",
 }
 
 _DAEMON_FIELDS = {
@@ -39,6 +46,8 @@ _DAEMON_FIELDS = {
     "usage_api_beta_header",
     "usage_api_cache_ttl_sec",
     "install_statusline_hook",
+    "coder",
+    "codex_model",
 }
 
 
@@ -56,6 +65,7 @@ class RepoConfig(BaseModel):
     active: bool = True
     poll_interval_sec: int = 60
     allow_merge_without_checks: bool = False
+    coder: CoderType | None = None
 
     @field_validator("poll_interval_sec", mode="before")
     @classmethod
@@ -85,6 +95,8 @@ class DaemonConfig(BaseModel):
     usage_api_beta_header: str = "oauth-2025-04-20"
     usage_api_cache_ttl_sec: int = Field(default=60, ge=5, le=3600)
     install_statusline_hook: bool = True
+    coder: CoderType = CoderType.CLAUDE
+    codex_model: str = "o3"
 
 
 class WebConfig(BaseModel):
@@ -95,6 +107,7 @@ class WebConfig(BaseModel):
 class AuthConfig(BaseModel):
     claude_config_dir: str = "/data/auth/claude"
     gh_config_dir: str = "/data/auth/gh"
+    codex_home_dir: str = "/data/auth"
 
 
 class AppConfig(BaseModel):

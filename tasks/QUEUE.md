@@ -378,7 +378,7 @@
 - Depends on: PR-063
 
 ## PR-065: Codex CLI as alternative coder with manual selection
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-065.md
 - Branch: pr-065-codex-coder
 - Depends on: PR-063
