@@ -5967,7 +5967,7 @@ def test_detect_rate_limit_codex_429(
 def test_detect_rate_limit_codex_retry_no_duration_falls_through(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """'try again in' with no parseable duration should fall through to generic fallback."""
+    """Codex retry text without a parsed duration should use generic fallback."""
     from src.config import CoderType
 
     _patch_subprocess(monkeypatch)
@@ -5976,8 +5976,6 @@ def test_detect_rate_limit_codex_retry_no_duration_falls_through(
         "Rate limit reached. Please try again in 6.379s",
         coder_name="codex",
     )
-    # The regex matches "try again in" but captures no days/hours/minutes,
-    # so it must NOT suppress the generic "rate limit" fallback.
     assert runner.state.rate_limited_until is not None
     assert runner.state.rate_limit_reactive_coder == "codex"
 
@@ -5985,7 +5983,7 @@ def test_detect_rate_limit_codex_retry_no_duration_falls_through(
 def test_detect_rate_limit_anthropic_regex_skipped_for_codex(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Anthropic percentage pattern should not trigger when coder is codex."""
+    """Anthropic percentage pattern should fall through to generic Codex fallback."""
     from src.config import CoderType
 
     _patch_subprocess(monkeypatch)
@@ -5995,8 +5993,55 @@ def test_detect_rate_limit_anthropic_regex_skipped_for_codex(
         "Warning: 95% of session rate limit reached",
         coder_name="codex",
     )
-    # Should NOT match the Anthropic regex path; falls through to
-    # generic "rate limit" fallback instead.
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "codex"
+
+
+def test_detect_rate_limit_codex_progress_output_does_not_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex progress output with remaining weekly rate limit must not pause."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner._detect_rate_limit(
+        "Progress update: weekly rate limit: 87% remaining",
+        coder_name="codex",
+    )
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive_coder is None
+
+
+def test_detect_rate_limit_codex_exhausted_progress_output_triggers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex exhausted remaining budget should still trigger the fallback."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner._detect_rate_limit(
+        "Progress update: weekly rate limit: 0% remaining",
+        coder_name="codex",
+    )
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "codex"
+
+
+def test_detect_rate_limit_codex_progress_output_with_error_still_triggers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mixed Codex progress and failure output should still enter pause."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner._detect_rate_limit(
+        "Progress update: weekly rate limit: 87% remaining\n"
+        "Rate limit reached. Please try again in 6.379s",
+        coder_name="codex",
+    )
     assert runner.state.rate_limited_until is not None
     assert runner.state.rate_limit_reactive_coder == "codex"
 
