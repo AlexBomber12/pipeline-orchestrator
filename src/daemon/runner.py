@@ -467,9 +467,10 @@ class PipelineRunner:
         self.state.last_updated = datetime.now(timezone.utc)
         coder = self.repo_config.coder or self.app_config.daemon.coder
         self.state.coder = coder.value
-        # Only probe usage for active repos to avoid unnecessary HTTP
-        # calls (and potential timeout latency) for idle/inactive repos.
-        if self.repo_config.active:
+        # Only probe usage for active repos using Claude to avoid unnecessary
+        # HTTP calls (and potential timeout latency) for idle/inactive repos
+        # or repos using Codex (which doesn't use the Claude usage endpoint).
+        if self.repo_config.active and coder != CoderType.CODEX:
             snap = await asyncio.to_thread(self._usage_provider.fetch)
             if snap is not None:
                 self.state.usage_session_percent = snap.session_percent
@@ -482,6 +483,14 @@ class PipelineRunner:
                 self.state.usage_weekly_percent = None
                 self.state.usage_weekly_resets_at = None
             self.state.usage_api_degraded = self._usage_provider.consecutive_failures >= 10
+        elif self.repo_config.active:
+            # Codex mode: clear stale Claude usage data so the dashboard
+            # does not display outdated Claude metrics or false degraded warnings.
+            self.state.usage_session_percent = None
+            self.state.usage_session_resets_at = None
+            self.state.usage_weekly_percent = None
+            self.state.usage_weekly_resets_at = None
+            self.state.usage_api_degraded = False
         if not self.repo_config.active:
             data = self.state.model_dump()
             data["state"] = PipelineState.IDLE.value
