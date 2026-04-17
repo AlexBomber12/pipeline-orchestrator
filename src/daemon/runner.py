@@ -1528,24 +1528,36 @@ return 0
         """Return True if CLI calls are allowed, False if rate-limited."""
         coder = self.repo_config.coder or self.app_config.daemon.coder
         if self.state.rate_limited_until is not None:
-            codex_reactive = (
-                self.state.rate_limit_reactive
-                and self.state.rate_limit_reactive_coder == CoderType.CODEX.value
-            )
+            # Diagnosis pauses always use Claude — honour regardless of coder.
             diagnosis_pause = (
                 self.state.rate_limit_reactive
                 and self.state.error_message is not None
             )
-            if coder == CoderType.CODEX and not codex_reactive and not diagnosis_pause:
-                # Claude-originated CODING/FIX pause does not apply to Codex;
-                # reactive pauses from Codex itself or error diagnosis still apply.
+            # A reactive pause from a *different* coder doesn't apply:
+            # e.g. a Claude pause doesn't block Codex, and vice-versa.
+            # Non-reactive (proactive) pauses are Claude-only; clear for Codex.
+            if not diagnosis_pause and self.state.rate_limit_reactive and self.state.rate_limit_reactive_coder:
+                other_coder_reactive = self.state.rate_limit_reactive_coder != coder.value
+            else:
+                # Non-reactive (proactive) pauses are Claude-only
+                other_coder_reactive = False
+            clearable = (
+                not diagnosis_pause
+                and (
+                    other_coder_reactive
+                    or (not self.state.rate_limit_reactive and coder == CoderType.CODEX)
+                )
+            )
+            if clearable:
                 self.state.rate_limited_until = None
                 self.state.rate_limit_reactive = False
                 self.state.rate_limit_reactive_coder = None
                 self._usage_provider.invalidate_cache()
                 if self.state.state == PipelineState.PAUSED:
                     self.state.state = PipelineState.IDLE
-                self.log_event("Codex active, clearing Claude rate-limit pause")
+                self.log_event(
+                    f"{coder.value.capitalize()} active, clearing other-coder rate-limit pause"
+                )
                 return True
             if datetime.now(timezone.utc) < self.state.rate_limited_until:
                 if self.state.state != PipelineState.PAUSED:
@@ -1624,26 +1636,33 @@ return 0
             self.log_event("PAUSED without rate_limited_until -> IDLE")
             self.state.state = PipelineState.IDLE
             return
-        # Codex is unaffected by Claude-originated CODING/FIX pauses,
-        # but reactive pauses from Codex itself must still be honoured.
-        # When error_message is set the pause came from error diagnosis
-        # which always uses Claude — honour that regardless of coder.
+        # A pause from a different coder doesn't apply after switching.
+        # Diagnosis pauses always use Claude — honour regardless of coder.
         coder = self.repo_config.coder or self.app_config.daemon.coder
-        codex_reactive = (
-            self.state.rate_limit_reactive
-            and self.state.rate_limit_reactive_coder == CoderType.CODEX.value
-        )
         diagnosis_pause = (
             self.state.rate_limit_reactive
             and self.state.error_message is not None
         )
-        if coder == CoderType.CODEX and not codex_reactive and not diagnosis_pause:
+        if not diagnosis_pause and self.state.rate_limit_reactive and self.state.rate_limit_reactive_coder:
+            other_coder_reactive = self.state.rate_limit_reactive_coder != coder.value
+        else:
+            other_coder_reactive = False
+        clearable = (
+            not diagnosis_pause
+            and (
+                other_coder_reactive
+                or (not self.state.rate_limit_reactive and coder == CoderType.CODEX)
+            )
+        )
+        if clearable:
             self.state.rate_limited_until = None
             self.state.rate_limit_reactive = False
             self.state.rate_limit_reactive_coder = None
             self._usage_provider.invalidate_cache()
             self.state.state = PipelineState.IDLE
-            self.log_event("Codex active, clearing Claude rate-limit pause -> IDLE")
+            self.log_event(
+                f"{coder.value.capitalize()} active, clearing other-coder pause -> IDLE"
+            )
             return
         if datetime.now(timezone.utc) < self.state.rate_limited_until:
             remaining = (
