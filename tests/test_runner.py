@@ -6013,6 +6013,22 @@ def test_detect_rate_limit_codex_progress_output_does_not_trigger(
     assert runner.state.rate_limit_reactive_coder is None
 
 
+def test_detect_rate_limit_codex_exhausted_progress_output_triggers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex exhausted remaining budget should still trigger the fallback."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner._detect_rate_limit(
+        "Progress update: weekly rate limit: 0% remaining",
+        coder_name="codex",
+    )
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "codex"
+
+
 def test_proactive_check_uses_codex_provider_when_coder_is_codex(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

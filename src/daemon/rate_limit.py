@@ -197,13 +197,17 @@ class RateLimitMixin:
             triggered = True
             limit_type = "session"
 
-        # Codex progress output can report remaining budget on stderr.
-        codex_usage_progress = bool(
-            coder_name == "codex"
-            and re.search(
-                r"\b(?:weekly|week|session)\s+rate\s*limit\b[^\n]*\b\d{1,3}%\s+remaining\b",
+        # Codex progress output can report non-exhausted remaining budget on stderr.
+        m_codex_usage_progress = (
+            re.search(
+                r"\b(?:weekly|week|session)\s+rate\s*limit\b[^\n]*\b(\d{1,3})%\s+remaining\b",
                 lower,
             )
+            if coder_name == "codex"
+            else None
+        )
+        codex_usage_progress = bool(
+            m_codex_usage_progress and int(m_codex_usage_progress.group(1)) > 0
         )
 
         # Generic "rate limit" fallback (both coders).
