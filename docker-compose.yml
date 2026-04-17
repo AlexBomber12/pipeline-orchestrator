@@ -10,6 +10,7 @@ services:
     volumes:
       - .:/app
       - ./data:/data
+      - codex-auth:/data/auth/.codex
     environment:
       REDIS_URL: redis://redis:6379/0
       CLAUDE_CONFIG_DIR: /data/auth/claude
@@ -27,7 +28,7 @@ services:
     volumes:
       - .:/app:ro
       - ./data:/data
-      - codex-auth:/home/runner/.codex
+      - codex-auth:/data/auth/.codex
     environment:
       REDIS_URL: redis://redis:6379/0
       CLAUDE_CONFIG_DIR: /data/auth/claude
