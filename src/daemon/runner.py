@@ -2155,6 +2155,11 @@ return 0
             code, stdout, stderr = await claude_task
         except asyncio.CancelledError:
             if breach_flag["breached"]:
+                # Advance the push baseline so stale Codex comments are not
+                # treated as new when the runner resumes in WATCH after pause.
+                self._last_push_at = datetime.now(timezone.utc)
+                if self.state.current_pr is not None:
+                    self._last_push_at_pr_number = self.state.current_pr.number
                 self.state.state = PipelineState.PAUSED
                 self.state.error_message = None
                 self.log_event(
@@ -2175,6 +2180,11 @@ return 0
             self._check_late_breach(breach_dir, breach_run_id, breach_flag)
             self._cleanup_breach_marker(breach_dir, breach_run_id)
         if breach_flag["breached"]:
+            # Advance the push baseline so stale Codex comments are not
+            # treated as new when the runner resumes in WATCH after pause.
+            self._last_push_at = datetime.now(timezone.utc)
+            if self.state.current_pr is not None:
+                self._last_push_at_pr_number = self.state.current_pr.number
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
             self.log_event(
