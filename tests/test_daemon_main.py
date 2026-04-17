@@ -5,12 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
-import time
 from typing import Any
 from unittest.mock import patch
 
 import pytest
-
 from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import main as main_module
 
@@ -423,8 +421,6 @@ def test_main_calls_setup_git_auth_before_runners(
     """main() must call _setup_git_auth before creating runners."""
     call_order: list[str] = []
 
-    original_setup = main_module._setup_git_auth
-
     def tracking_setup() -> None:
         call_order.append("setup_git_auth")
 
@@ -609,7 +605,6 @@ def test_install_statusline_hook_respects_operator_override(
 
 def test_clean_breach_dir_removes_stale_markers(tmp_path: Any) -> None:
     """_clean_breach_dir removes all files in the breach directory."""
-    import json
 
     monkeypatch_breach = str(tmp_path / "breach")
     (tmp_path / "breach").mkdir()

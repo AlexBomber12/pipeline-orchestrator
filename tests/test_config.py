@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from src.config import (
     AppConfig,
     RepoConfig,
@@ -359,7 +358,6 @@ def test_update_daemon_config_accepts_timeouts(tmp_path: Path) -> None:
 
 def test_fix_idle_timeout_rejects_zero_or_negative() -> None:
     from pydantic import ValidationError
-
     from src.config import DaemonConfig
 
     with pytest.raises(ValidationError):

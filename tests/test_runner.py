@@ -11,13 +11,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
 from src.daemon.handlers import breach as breach_module
 from src.daemon.handlers import idle as idle_module
-from src.daemon.runner import PipelineRunner
+from src.daemon.runner import ErrorCategory, PipelineRunner, _classify_error
 from src.models import (
     CIStatus,
     FeedbackCheckResult,
@@ -442,7 +441,6 @@ def test_handle_idle_attaches_to_existing_pr_instead_of_coding(
     )
 
     coding_called = {"v": False}
-    original_handle_coding = runner_module.PipelineRunner.handle_coding
 
     async def spy_handle_coding(self):
         coding_called["v"] = True
@@ -4294,8 +4292,6 @@ def test_handle_coding_publishes_heartbeat(
         runner_module.github_client, "post_comment", lambda *a, **kw: None
     )
 
-    original_pww = PipelineRunner._publish_while_waiting
-
     async def fast_heartbeat(self: Any, label: str) -> None:
         while True:
             await asyncio.sleep(0.01)
@@ -4880,9 +4876,6 @@ def test_legacy_error_with_rate_limited_until_converts_to_paused(
 # ── ErrorCategory / _classify_error ──────────────────────────────────
 
 
-from src.daemon.runner import ErrorCategory, _classify_error
-
-
 @pytest.mark.parametrize(
     "msg",
     ["rate limit exceeded", "429 Too Many Requests", "API rate limit hit"],
@@ -5250,7 +5243,7 @@ def test_monitor_inflight_breach_exits_when_claude_task_completes(
             )
         )
 
-        result = await task
+        await task
         # Give monitor a moment to notice the task is done
         await asyncio.sleep(0.2)
 
@@ -5381,10 +5374,10 @@ def test_get_coder_repo_override_takes_precedence() -> None:
 def test_handle_coding_uses_codex_cli_when_coder_is_codex(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from src.config import CoderType
     from src import codex_cli
+    from src.config import CoderType
 
-    calls = _patch_subprocess(monkeypatch)
+    _patch_subprocess(monkeypatch)
     captured_module: list[str] = []
 
     async def fake_run_planned_pr(path: str, **kwargs: object) -> tuple:
@@ -5422,10 +5415,10 @@ def test_handle_coding_uses_codex_cli_when_coder_is_codex(
 def test_handle_fix_uses_codex_cli_when_coder_is_codex(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from src.config import CoderType
     from src import codex_cli
+    from src.config import CoderType
 
-    calls = _patch_subprocess(monkeypatch)
+    _patch_subprocess(monkeypatch)
     captured_module: list[str] = []
 
     async def fake_fix_review(path: str, **kwargs: object) -> tuple:
@@ -5455,8 +5448,8 @@ def test_handle_fix_uses_codex_cli_when_coder_is_codex(
 def test_event_log_includes_coder_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from src.config import CoderType
     from src import codex_cli
+    from src.config import CoderType
 
     _patch_subprocess(monkeypatch)
 

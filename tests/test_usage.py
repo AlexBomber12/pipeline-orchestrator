@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import json
-import time
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
 import httpx
-import pytest
-
-from src.usage import OAuthUsageProvider, OpenAIUsageProvider, UsageSnapshot
+from src.usage import OAuthUsageProvider, OpenAIUsageProvider
 
 
 def _valid_response_json() -> dict:
@@ -102,7 +99,6 @@ class TestOAuthProviderCache:
     def test_caches_within_ttl(self, tmp_path: Path) -> None:
         provider = _make_provider(tmp_path, creds={"accessToken": "tok"}, cache_ttl_sec=300)
         call_count = 0
-        original_get = httpx.get
 
         def counting_get(*args, **kwargs):
             nonlocal call_count

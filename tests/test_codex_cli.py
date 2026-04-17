@@ -7,7 +7,6 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from src.codex_cli import (
     fix_review_async,
     run_codex_async,

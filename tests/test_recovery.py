@@ -7,11 +7,9 @@ import subprocess
 from typing import Any
 
 import pytest
-
 from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import runner as runner_module
 from src.daemon.runner import PipelineRunner
-from src.queue_parser import QueueValidationError
 from src.models import (
     CIStatus,
     PipelineState,
@@ -20,6 +18,7 @@ from src.models import (
     ReviewStatus,
     TaskStatus,
 )
+from src.queue_parser import QueueValidationError
 
 
 class _FakeRedis:

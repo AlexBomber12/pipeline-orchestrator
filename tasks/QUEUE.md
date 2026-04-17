@@ -396,7 +396,7 @@
 - Depends on: PR-053, PR-054, PR-055, PR-056, PR-058, PR-059, PR-060, PR-061, PR-062, PR-063, PR-065, PR-066
 
 ## PR-067: Test hygiene - ruff and pytest-asyncio warnings
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-067.md
 - Branch: pr-067-test-hygiene
 
