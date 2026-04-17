@@ -9,6 +9,7 @@ Mixin methods:
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -175,9 +176,13 @@ class RateLimitMixin:
                 limit_type = "session"
                 triggered = pct >= session_threshold
 
-        # Codex "try again in X days Y hours Z minutes" pattern
+        # Codex "try again in X days Y hours Z minutes/seconds" pattern
         m_codex_retry = re.search(
-            r"try again in\s+(?:(\d+)\s*days?)?\s*(?:(\d+)\s*hours?)?\s*(?:(\d+)\s*minutes?)?",
+            r"try again in\s+"
+            r"(?:(\d+)\s*days?)?\s*"
+            r"(?:(\d+)\s*hours?)?\s*"
+            r"(?:(\d+)\s*minutes?)?\s*"
+            r"(?:(\d+(?:\.\d+)?)\s*(?:seconds?|secs?|s))?",
             lower,
         )
         codex_retry_parsed = False
@@ -185,11 +190,12 @@ class RateLimitMixin:
             days = int(m_codex_retry.group(1) or 0)
             hours = int(m_codex_retry.group(2) or 0)
             minutes = int(m_codex_retry.group(3) or 0)
-            total_min = days * 1440 + hours * 60 + minutes
-            if total_min > 0:
+            seconds = float(m_codex_retry.group(4) or 0)
+            total_seconds = days * 86400 + hours * 3600 + minutes * 60 + seconds
+            if total_seconds > 0:
                 codex_retry_parsed = True
                 triggered = True
-                pause_min = total_min
+                pause_min = max(1, math.ceil(total_seconds / 60))
                 limit_type = "weekly" if days > 0 or hours > 12 else "session"
 
         # Codex "You've hit your usage limit"

@@ -5964,10 +5964,10 @@ def test_detect_rate_limit_codex_429(
     assert runner.state.rate_limit_reactive_coder == "codex"
 
 
-def test_detect_rate_limit_codex_retry_without_parsed_duration_does_not_trigger(
+def test_detect_rate_limit_codex_retry_seconds_pattern(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Codex retry text without a parsed duration must not use generic fallback."""
+    """Codex retry text with seconds should trigger a minimum one-minute pause."""
     from src.config import CoderType
 
     _patch_subprocess(monkeypatch)
@@ -5976,8 +5976,12 @@ def test_detect_rate_limit_codex_retry_without_parsed_duration_does_not_trigger(
         "Rate limit reached. Please try again in 6.379s",
         coder_name="codex",
     )
-    assert runner.state.rate_limited_until is None
-    assert runner.state.rate_limit_reactive_coder is None
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "codex"
+    expected_pause = timedelta(minutes=1)
+    actual_pause = runner.state.rate_limited_until - datetime.now(timezone.utc)
+    assert actual_pause > expected_pause - timedelta(seconds=5)
+    assert actual_pause < expected_pause + timedelta(seconds=5)
 
 
 def test_detect_rate_limit_anthropic_regex_does_not_fallback_for_codex(
@@ -6029,10 +6033,10 @@ def test_detect_rate_limit_codex_progress_output_zero_remaining_does_not_trigger
     assert runner.state.rate_limit_reactive_coder is None
 
 
-def test_detect_rate_limit_codex_progress_output_with_unparsed_retry_does_not_trigger(
+def test_detect_rate_limit_codex_progress_output_with_seconds_retry_triggers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Codex stderr without a confirmed pattern must not pause."""
+    """Codex progress mixed with a confirmed seconds retry should still pause."""
     from src.config import CoderType
 
     _patch_subprocess(monkeypatch)
@@ -6042,8 +6046,8 @@ def test_detect_rate_limit_codex_progress_output_with_unparsed_retry_does_not_tr
         "Rate limit reached. Please try again in 6.379s",
         coder_name="codex",
     )
-    assert runner.state.rate_limited_until is None
-    assert runner.state.rate_limit_reactive_coder is None
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "codex"
 
 
 def test_detect_rate_limit_generic_fallback_still_applies_to_claude(
