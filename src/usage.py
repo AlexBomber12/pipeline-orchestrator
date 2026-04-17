@@ -232,7 +232,7 @@ class OpenAIUsageProvider:
                 weekly_resets_at=int(secondary["reset_at"]),
                 fetched_at=time.time(),
             )
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
             logger.warning("OpenAI usage endpoint returned unexpected shape: %s", exc)
             logger.debug("OpenAI usage response body: %s", response.text[:500])
             self._record_failure()
