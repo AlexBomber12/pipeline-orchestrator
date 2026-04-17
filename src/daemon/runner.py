@@ -1665,7 +1665,16 @@ return 0
         finally:
             breach_monitor.cancel()
             heartbeat.cancel()
+            self._check_late_breach(breach_dir, breach_run_id, breach_flag)
             self._cleanup_breach_marker(breach_dir, breach_run_id)
+        if breach_flag["breached"]:
+            self.state.state = PipelineState.PAUSED
+            self.state.error_message = None
+            self.log_event(
+                f"CODING paused: late in-flight rate limit breach, "
+                f"paused until {self.state.rate_limited_until}"
+            )
+            return
         await self._save_cli_log(stdout, stderr, "PLANNED PR output")
         self._detect_rate_limit(stderr)
         if code != 0:
@@ -1948,6 +1957,36 @@ return 0
         run_id = uuid.uuid4().hex[:12]
         return breach_dir, run_id
 
+    def _check_late_breach(
+        self, breach_dir: str, run_id: str, breach_flag: dict[str, bool],
+    ) -> None:
+        """Final synchronous check for a breach marker the poll loop missed."""
+        if breach_flag["breached"]:
+            return
+        marker = Path(breach_dir) / f"{run_id}.breach"
+        if not marker.is_file():
+            return
+        try:
+            data = json.loads(marker.read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+        resets_at = data.get("resets_at", 0)
+        if resets_at:
+            self.state.rate_limited_until = datetime.fromtimestamp(
+                resets_at, tz=timezone.utc
+            )
+        else:
+            self.state.rate_limited_until = (
+                datetime.now(timezone.utc) + timedelta(minutes=30)
+            )
+        breach_type = data.get("type", "session")
+        pct_key = "session_pct" if breach_type == "session" else "weekly_pct"
+        pct_val = data.get(pct_key, "?")
+        self.log_event(
+            f"Late in-flight breach detected: {breach_type} at {pct_val}%"
+        )
+        breach_flag["breached"] = True
+
     def _cleanup_breach_marker(self, breach_dir: str, run_id: str) -> None:
         """Remove the breach marker file for a completed run."""
         marker = Path(breach_dir) / f"{run_id}.breach"
@@ -2082,7 +2121,16 @@ return 0
             breach_monitor.cancel()
             idle_monitor.cancel()
             heartbeat.cancel()
+            self._check_late_breach(breach_dir, breach_run_id, breach_flag)
             self._cleanup_breach_marker(breach_dir, breach_run_id)
+        if breach_flag["breached"]:
+            self.state.state = PipelineState.PAUSED
+            self.state.error_message = None
+            self.log_event(
+                f"FIX paused: late in-flight rate limit breach, "
+                f"paused until {self.state.rate_limited_until}"
+            )
+            return
         await self._save_cli_log(stdout, stderr, "FIX REVIEW output")
         self._detect_rate_limit(stderr)
         if code != 0:

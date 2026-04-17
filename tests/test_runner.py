@@ -5259,7 +5259,7 @@ def test_monitor_inflight_breach_exits_when_claude_task_completes(
 def test_handle_coding_cleans_up_breach_marker_after_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """Breach marker is cleaned up after handle_coding completes."""
+    """Late breach marker is detected, causes PAUSED, and is cleaned up."""
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(runner_module, "_BREACH_DIR", str(tmp_path))
 
@@ -5271,7 +5271,7 @@ def test_handle_coding_cleans_up_breach_marker_after_run(
         run_id = kwargs.get("breach_run_id", "")
         if run_id:
             captured_run_id.append(run_id)
-            # Simulate breach marker written by hook
+            # Simulate breach marker written by hook near end of CLI run
             marker = tmp_path / f"{run_id}.breach"
             marker.write_text('{"type":"session","resets_at":0}')
         return (0, "ok", "")
@@ -5296,6 +5296,9 @@ def test_handle_coding_cleans_up_breach_marker_after_run(
     assert captured_run_id
     marker = tmp_path / f"{captured_run_id[0]}.breach"
     assert not marker.exists()
+    # Late breach detection should have paused the runner
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.rate_limited_until is not None
 
 
 def test_handle_coding_pauses_on_inflight_breach(
