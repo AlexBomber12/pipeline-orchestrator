@@ -1524,7 +1524,16 @@ return 0
 
     async def _check_rate_limit(self) -> bool:
         """Return True if CLI calls are allowed, False if rate-limited."""
+        coder = self.repo_config.coder or self.app_config.daemon.coder
         if self.state.rate_limited_until is not None:
+            if coder == CoderType.CODEX:
+                # Claude-originated pause does not apply to Codex
+                self.state.rate_limited_until = None
+                self._usage_provider.invalidate_cache()
+                if self.state.state == PipelineState.PAUSED:
+                    self.state.state = PipelineState.IDLE
+                self.log_event("Codex active, clearing Claude rate-limit pause")
+                return True
             if datetime.now(timezone.utc) < self.state.rate_limited_until:
                 if self.state.state != PipelineState.PAUSED:
                     self.state.state = PipelineState.PAUSED
@@ -1535,7 +1544,6 @@ return 0
             self._usage_provider.invalidate_cache()
             self.log_event("Rate limit window expired, resuming")
         # Proactive OAuth check only applies to the Claude provider
-        coder = self.repo_config.coder or self.app_config.daemon.coder
         if coder == CoderType.CODEX:
             return True
         return await self._proactive_usage_check()
@@ -1582,6 +1590,14 @@ return 0
         if self.state.rate_limited_until is None:
             self.log_event("PAUSED without rate_limited_until -> IDLE")
             self.state.state = PipelineState.IDLE
+            return
+        # Codex is unaffected by Claude rate-limit pauses
+        coder = self.repo_config.coder or self.app_config.daemon.coder
+        if coder == CoderType.CODEX:
+            self.state.rate_limited_until = None
+            self._usage_provider.invalidate_cache()
+            self.state.state = PipelineState.IDLE
+            self.log_event("Codex active, clearing Claude rate-limit pause -> IDLE")
             return
         if datetime.now(timezone.utc) < self.state.rate_limited_until:
             remaining = (

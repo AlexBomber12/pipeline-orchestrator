@@ -934,13 +934,26 @@ def _check_claude_auth() -> dict[str, str]:
 
 
 def _check_codex_auth() -> dict[str, str]:
-    """Probe the ``codex`` CLI and report its authorization status."""
-    rc, stdout, stderr = _run_auth_command(["codex", "--version"])
+    """Probe the ``codex`` CLI and report its authorization status.
+
+    Uses ``codex login status`` which checks credentials, not just the
+    binary presence.  Falls back to reporting the CLI as missing when the
+    binary is not found.
+    """
+    rc, stdout, stderr = _run_auth_command(["codex", "login", "status"])
+    combined = f"{stdout}\n{stderr}".strip()
     if rc == 0:
-        output = (stdout or stderr).strip()
-        detail = output.splitlines()[0] if output else "codex CLI available"
-        return {"status": "ok", "detail": detail}
-    detail = (stderr or stdout).strip() or "codex CLI not available"
+        detail = ""
+        for line in combined.splitlines():
+            stripped = line.strip()
+            if stripped:
+                detail = stripped
+                break
+        return {"status": "ok", "detail": detail or "codex authenticated"}
+    # Distinguish "not logged in" from "binary not found"
+    if "not found" in combined.lower() or "no such file" in combined.lower():
+        return {"status": "error", "detail": "codex CLI not installed"}
+    detail = combined.splitlines()[0].strip() if combined else "codex not authenticated"
     return {"status": "error", "detail": detail}
 
 
