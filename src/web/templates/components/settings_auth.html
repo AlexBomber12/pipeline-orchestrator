@@ -1,5 +1,5 @@
-<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-    {% for label, key in [("Claude CLI", "claude"), ("GitHub CLI", "gh")] %}
+<div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+    {% for label, key in [("Claude CLI", "claude"), ("Codex CLI", "codex"), ("GitHub CLI", "gh")] %}
     {% set entry = auth[key] %}
     {% set ok = entry.status == "ok" %}
     <div class="rounded-lg border border-white/10 bg-surface-3 p-4">
@@ -12,7 +12,7 @@
             </span>
         </div>
         <div class="font-mono text-xs text-gray-400 break-all">
-            {{ entry.detail or ("claude CLI available" if ok else "Not configured") }}
+            {{ entry.detail or (label ~ " available" if ok else "Not configured") }}
         </div>
     </div>
     {% endfor %}

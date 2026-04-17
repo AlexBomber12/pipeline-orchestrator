@@ -12,13 +12,14 @@
             <th class="text-left px-4 py-2 font-medium">Auto merge</th>
             <th class="text-left px-4 py-2 font-medium">No CI merge</th>
             <th class="text-left px-4 py-2 font-medium">Review timeout (min)</th>
+            <th class="text-left px-4 py-2 font-medium">Coder</th>
             <th class="px-4 py-2"></th>
         </tr>
     </thead>
     <tbody>
         {% if not repos %}
         <tr>
-            <td colspan="6" class="px-4 py-6 text-center text-gray-500 italic">
+            <td colspan="7" class="px-4 py-6 text-center text-gray-500 italic">
                 No repositories configured. Add one below.
             </td>
         </tr>
@@ -82,6 +83,18 @@
                        hx-swap="innerHTML"
                        title="Leave blank to inherit the daemon default ({{ daemon.review_timeout_min if daemon is defined else 60 }} min).">
             </td>
+            <td class="px-4 py-2">
+                <select name="coder"
+                        class="w-24 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 text-xs focus:border-accent focus:outline-none"
+                        hx-put="{{ put_url }}"
+                        hx-trigger="change"
+                        hx-target="#settings-repo-list"
+                        hx-swap="innerHTML">
+                    <option value="" {% if repo.coder is none %}selected{% endif %}>Inherit</option>
+                    <option value="claude" {% if repo.coder is not none and repo.coder.value == "claude" %}selected{% endif %}>Claude</option>
+                    <option value="codex" {% if repo.coder is not none and repo.coder.value == "codex" %}selected{% endif %}>Codex</option>
+                </select>
+            </td>
             <td class="px-4 py-2 text-right">
                 <button type="button"
                         class="text-xs font-medium px-2 py-1 rounded border border-fail/30 text-fail hover:bg-fail/10"
@@ -95,7 +108,7 @@
         </tr>
         {% endfor %}
         <tr class="border-t border-white/5 bg-surface-3/40">
-            <td colspan="6" class="px-4 py-3">
+            <td colspan="7" class="px-4 py-3">
                 <form class="flex flex-wrap items-center gap-2"
                       hx-post="/settings/repos"
                       hx-target="#settings-repo-list"

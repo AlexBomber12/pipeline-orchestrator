@@ -27,6 +27,9 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g @anthropic-ai/claude-code
 
+RUN curl -fsSL https://codex.openai.com/install.sh | sh \
+    && ln -sf /root/.codex/bin/codex /usr/local/bin/codex
+
 RUN useradd -m -u 1000 runner \
     && mkdir -p /data/auth /data/repos \
     && chown -R runner:runner /data \

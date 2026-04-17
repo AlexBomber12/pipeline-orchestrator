@@ -786,6 +786,8 @@ async def put_settings_daemon(
     fix_idle_timeout_sec: str | None = Form(None),
     rate_limit_session_pause_percent: str | None = Form(None),
     rate_limit_weekly_pause_percent: str | None = Form(None),
+    coder: str | None = Form(None),
+    codex_model: str | None = Form(None),
 ) -> HTMLResponse:
     """Update daemon settings.
 
@@ -851,6 +853,12 @@ async def put_settings_daemon(
                 min_value=50,
                 max_value=100,
             )
+        if coder is not None and coder != "":
+            if coder not in ("claude", "codex"):
+                raise ValueError("coder must be 'claude' or 'codex'")
+            updates["coder"] = coder
+        if codex_model is not None and codex_model != "":
+            updates["codex_model"] = codex_model
     except ValueError as exc:
         return _render_settings_daemon_error(request, str(exc), 422)
 
@@ -925,6 +933,17 @@ def _check_claude_auth() -> dict[str, str]:
     return {"status": "error", "detail": detail}
 
 
+def _check_codex_auth() -> dict[str, str]:
+    """Probe the ``codex`` CLI and report its authorization status."""
+    rc, stdout, stderr = _run_auth_command(["codex", "--version"])
+    if rc == 0:
+        output = (stdout or stderr).strip()
+        detail = output.splitlines()[0] if output else "codex CLI available"
+        return {"status": "ok", "detail": detail}
+    detail = (stderr or stdout).strip() or "codex CLI not available"
+    return {"status": "error", "detail": detail}
+
+
 def _check_gh_auth() -> dict[str, str]:
     """Probe the ``gh`` CLI and report its authorization status."""
     cfg = load_config(CONFIG_PATH)
@@ -961,11 +980,12 @@ async def _collect_auth_status() -> dict[str, dict[str, str]]:
     auth-status poll cannot stall the worker for up to ~10s (two serial
     5s timeouts) whenever a CLI is missing or slow.
     """
-    claude, gh = await asyncio.gather(
+    claude, codex, gh = await asyncio.gather(
         asyncio.to_thread(_check_claude_auth),
+        asyncio.to_thread(_check_codex_auth),
         asyncio.to_thread(_check_gh_auth),
     )
-    return {"claude": claude, "gh": gh}
+    return {"claude": claude, "codex": codex, "gh": gh}
 
 
 @app.get("/api/auth-status")
@@ -1085,6 +1105,7 @@ async def put_settings_repo(
     auto_merge: str | None = Form(None),
     review_timeout_min: str | None = Form(None),
     allow_merge_without_checks: str | None = Form(None),
+    coder: str | None = Form(None),
 ) -> HTMLResponse:
     """Update a repository by its full URL.
 
@@ -1125,6 +1146,13 @@ async def put_settings_repo(
                 updates["review_timeout_min"] = _coerce_int(
                     review_timeout_min, "review_timeout_min", min_value=1
                 )
+        if coder is not None:
+            if coder == "":
+                updates["coder"] = None
+            elif coder in ("claude", "codex"):
+                updates["coder"] = coder
+            else:
+                raise ValueError("coder must be 'claude', 'codex', or empty")
     except ValueError as exc:
         return _render_settings_error(request, str(exc), 422)
 

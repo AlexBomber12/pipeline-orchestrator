@@ -706,8 +706,11 @@ def _install_fake_subprocess(
     monkeypatch: pytest.MonkeyPatch,
     claude: _FakeCompleted | Exception,
     gh: _FakeCompleted | Exception,
+    codex: _FakeCompleted | Exception | None = None,
 ) -> None:
     """Patch ``subprocess.run`` inside src.web.app with canned auth probes."""
+    if codex is None:
+        codex = _FakeCompleted(127, stderr="codex not found")
 
     def fake_run(
         cmd: list[str], *args: object, **kwargs: object
@@ -716,6 +719,10 @@ def _install_fake_subprocess(
             if isinstance(claude, Exception):
                 raise claude
             return claude
+        if cmd and cmd[0] == "codex":
+            if isinstance(codex, Exception):
+                raise codex
+            return codex
         if cmd and cmd[0] == "gh":
             if isinstance(gh, Exception):
                 raise gh
@@ -742,7 +749,7 @@ def test_api_auth_status_returns_ok_for_both(
 
     assert response.status_code == 200
     payload = response.json()
-    assert set(payload.keys()) == {"claude", "gh"}
+    assert set(payload.keys()) == {"claude", "codex", "gh"}
     assert payload["claude"]["status"] == "ok"
     assert "1.2.3" in payload["claude"]["detail"]
     assert payload["gh"]["status"] == "ok"
@@ -832,6 +839,8 @@ def test_auth_probes_inject_config_auth_dirs_into_env(
         if cmd and cmd[0] == "claude":
             captured["claude"] = dict(env)
             return _FakeCompleted(0, stdout="claude 1.2.3\n")
+        if cmd and cmd[0] == "codex":
+            return _FakeCompleted(127, stderr="codex not found")
         if cmd and cmd[0] == "gh":
             captured["gh"] = dict(env)
             return _FakeCompleted(
@@ -867,17 +876,19 @@ def test_auth_status_probes_run_concurrently_off_loop(
     for the second to show up and the test times out; if they run
     concurrently, both reach the barrier and the request completes.
     """
-    barrier = threading.Barrier(parties=2, timeout=5)
+    barrier = threading.Barrier(parties=3, timeout=5)
 
     def fake_run(
         cmd: list[str], *args: object, **kwargs: object
     ) -> _FakeCompleted:
-        # Block until the sibling probe also reaches the barrier. With a
-        # serial implementation this wait times out because the second
-        # probe is never dispatched.
+        # Block until all sibling probes also reach the barrier. With a
+        # serial implementation this wait times out because the later
+        # probes are never dispatched.
         barrier.wait()
         if cmd and cmd[0] == "claude":
             return _FakeCompleted(0, stdout="claude 1.2.3\n")
+        if cmd and cmd[0] == "codex":
+            return _FakeCompleted(127, stderr="codex not found")
         if cmd and cmd[0] == "gh":
             return _FakeCompleted(
                 0, stderr="  ✓ Logged in to github.com as octocat\n"
@@ -1054,3 +1065,98 @@ def test_update_daemon_rate_limit_weekly(
     assert response.status_code == 200
     cfg = load_config(str(empty_config))
     assert cfg.daemon.rate_limit_weekly_pause_percent == 90
+
+
+# -----------------------------------------------------------------------
+# PR-065: Coder settings tests
+# -----------------------------------------------------------------------
+
+
+def test_coder_dropdown_renders_with_current_value(
+    empty_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(empty_config))
+
+    with TestClient(app) as client:
+        response = client.get("/settings")
+
+    assert response.status_code == 200
+    assert "Coder" in response.text
+    assert "Claude Code" in response.text
+    assert "Codex CLI" in response.text
+
+
+def test_coder_setting_saves_and_reloads(
+    empty_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(empty_config))
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 200
+    cfg = load_config(str(empty_config))
+    assert cfg.daemon.coder.value == "codex"
+
+
+def test_codex_model_setting_saves(
+    empty_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(empty_config))
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"codex_model": "o4-mini"},
+        )
+
+    assert response.status_code == 200
+    cfg = load_config(str(empty_config))
+    assert cfg.daemon.codex_model == "o4-mini"
+
+
+def test_repo_coder_override_saves(
+    one_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(one_repo_config))
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/repos?url=https://github.com/example/alpha.git",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 200
+    cfg = load_config(str(one_repo_config))
+    assert cfg.repositories[0].coder is not None
+    assert cfg.repositories[0].coder.value == "codex"
+
+
+def test_repo_coder_override_clear(
+    one_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(one_repo_config))
+
+    with TestClient(app) as client:
+        # First set to codex
+        client.put(
+            "/settings/repos?url=https://github.com/example/alpha.git",
+            data={"coder": "codex"},
+        )
+        # Then clear (inherit)
+        response = client.put(
+            "/settings/repos?url=https://github.com/example/alpha.git",
+            data={"coder": ""},
+        )
+
+    assert response.status_code == 200
+    cfg = load_config(str(one_repo_config))
+    assert cfg.repositories[0].coder is None
