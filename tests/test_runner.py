@@ -5509,10 +5509,10 @@ def test_check_rate_limit_runs_proactive_for_codex(
     assert proactive_called == [True]
 
 
-def test_check_rate_limit_codex_honors_proactive_claude_pause(
+def test_check_rate_limit_codex_clears_proactive_claude_pause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Codex honors a proactive Claude pause (e.g. merge/diagnosis)."""
+    """Codex clears a proactive Claude pause for general work."""
     from src.config import CoderType
 
     _patch_subprocess(monkeypatch)
@@ -5523,6 +5523,25 @@ def test_check_rate_limit_codex_honors_proactive_claude_pause(
     runner.state.state = PipelineState.PAUSED
 
     result = asyncio.run(runner._check_rate_limit())
+    assert result is True
+    assert runner.state.rate_limited_until is None
+    assert runner.state.state == PipelineState.IDLE
+
+
+def test_check_rate_limit_honors_claude_pause_with_proactive_coder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """proactive_coder='claude' honors a Claude pause (merge/diagnosis)."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limit_reactive = False
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.state = PipelineState.PAUSED
+
+    result = asyncio.run(runner._check_rate_limit(proactive_coder="claude"))
     assert result is False
     assert runner.state.rate_limited_until is not None
     assert runner.state.state == PipelineState.PAUSED

@@ -182,17 +182,20 @@ class OpenAIUsageProvider:
             backoff = self._cache_ttl * min(self._consecutive_failures, 5)
             if time.time() - self._last_failure_at < backoff:
                 return None
-        token = self._read_token()
+        token, account_id = self._read_credentials()
         if token is None:
             self._record_failure()
             return None
         try:
+            headers: dict[str, str] = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+            }
+            if account_id:
+                headers["Openai-Account"] = account_id
             response = httpx.get(
                 self.ENDPOINT,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "application/json",
-                },
+                headers=headers,
                 timeout=self._timeout,
             )
         except (httpx.HTTPError, OSError) as exc:
@@ -248,17 +251,26 @@ class OpenAIUsageProvider:
     def invalidate_cache(self) -> None:
         self._cached = None
 
-    def _read_token(self) -> str | None:
+    def _read_credentials(self) -> tuple[str | None, str | None]:
+        """Return ``(access_token, account_id)`` from Codex auth file."""
         if not self._credentials_path.is_file():
-            return None
+            return None, None
         try:
             raw = self._credentials_path.read_text(encoding="utf-8")
             data = json.loads(raw)
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            return None
+            return None, None
+        token = None
         tokens = data.get("tokens")
         if isinstance(tokens, dict):
             token = tokens.get("access_token")
-            if isinstance(token, str) and token:
-                return token
-        return None
+            if not isinstance(token, str) or not token:
+                token = None
+        account_id = data.get("account_id")
+        if not isinstance(account_id, str) or not account_id:
+            account_id = None
+        return token, account_id
+
+    def _read_token(self) -> str | None:
+        token, _ = self._read_credentials()
+        return token

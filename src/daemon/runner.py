@@ -1562,6 +1562,7 @@ return 0
         callers that always invoke a specific CLI can check the right quota.
         """
         coder = self.repo_config.coder or self.app_config.daemon.coder
+        effective_coder = proactive_coder or coder.value
         if self.state.rate_limited_until is not None:
             # Diagnosis pauses always use Claude — honour regardless of coder
             # and regardless of whether the pause is reactive or proactive.
@@ -1571,16 +1572,14 @@ return 0
                 self.state.error_message is not None
                 and self.state.rate_limit_reactive_coder in ("claude", None)
             )
-            # A reactive pause from a *different* coder doesn't apply:
-            # e.g. a Claude pause from coding doesn't block Codex.
-            # Only reactive pauses (from _detect_rate_limit on stderr)
-            # are clearable; proactive pauses are intentionally targeted
-            # at a specific CLI and must expire naturally.
+            # A pause from a *different* effective coder doesn't apply.
+            # When proactive_coder is set (e.g. "claude" for merge/diagnosis),
+            # only pauses matching that coder block; otherwise the repo's
+            # configured coder is used.
             other_coder = (
                 not diagnosis_pause
-                and self.state.rate_limit_reactive
                 and self.state.rate_limit_reactive_coder is not None
-                and self.state.rate_limit_reactive_coder != coder.value
+                and self.state.rate_limit_reactive_coder != effective_coder
             )
             clearable = other_coder
             if clearable:
@@ -1718,12 +1717,10 @@ return 0
             self.state.error_message is not None
             and self.state.rate_limit_reactive_coder in ("claude", None)
         )
-        # Only reactive pauses (from _detect_rate_limit on stderr) are
-        # clearable on coder switch; proactive pauses are intentionally
-        # targeted at a specific CLI and must expire naturally.
+        # A pause from a different coder doesn't block the current coder.
+        # handle_paused uses the repo coder (no proactive_coder context).
         other_coder = (
             not diagnosis_pause
-            and self.state.rate_limit_reactive
             and self.state.rate_limit_reactive_coder is not None
             and self.state.rate_limit_reactive_coder != coder.value
         )
