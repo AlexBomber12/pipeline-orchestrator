@@ -192,7 +192,7 @@ class OpenAIUsageProvider:
                 "Accept": "application/json",
             }
             if account_id:
-                headers["Openai-Account"] = account_id
+                headers["ChatGPT-Account-Id"] = account_id
             response = httpx.get(
                 self.ENDPOINT,
                 headers=headers,
