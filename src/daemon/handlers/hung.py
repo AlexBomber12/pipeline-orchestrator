@@ -39,35 +39,35 @@ class HungMixin:
         creation it can stay a warning because Codex Automatic Reviews
         still fires on the creation event itself.
         """
-        try:
-            metadata = github_client.get_pr_metadata(
-                self.owner_repo, pr_number
-            )
-            pr_author = metadata.get("author", "")
-            head_commit_iso = metadata.get("head_commit_date", "")
-            if pr_author and github_client.has_recent_codex_review_request(
-                self.owner_repo,
-                pr_number,
-                pr_author=pr_author,
-                within_minutes=5,
-                after_iso=head_commit_iso or None,
-            ):
-                self.log_event(
-                    f"Skipping duplicate @codex review on PR #{pr_number}"
-                )
-                return True
-        except Exception as exc:
+        current_pr = self.state.current_pr
+        push_count = (
+            current_pr.push_count
+            if current_pr is not None and current_pr.number == pr_number
+            else None
+        )
+        if (
+            self._last_codex_review_pr == pr_number
+            and self._last_codex_review_push_count == push_count
+        ):
             self.log_event(
-                f"Dedup check failed on PR #{pr_number}: {exc}"
+                f"Skipping duplicate @codex review for PR #{pr_number}"
             )
+            return True
+
+        self._last_codex_review_pr = pr_number
+        self._last_codex_review_push_count = push_count
 
         try:
+            if current_pr is not None and current_pr.number == pr_number:
+                current_pr.last_activity = datetime.now(timezone.utc)
             github_client.post_comment(
                 self.owner_repo, pr_number, "@codex review"
             )
             self.log_event(f"Posted @codex review on PR #{pr_number}")
             return True
         except Exception as exc:
+            self._last_codex_review_pr = None
+            self._last_codex_review_push_count = None
             self.log_event(
                 f"Warning: failed to post @codex review on PR "
                 f"#{pr_number}: {exc}"

@@ -3109,22 +3109,11 @@ def test_dirty_tree_auto_recovery_failure_stays_error(
     )
 
 
-def test_post_codex_review_skips_duplicate(
+def test_codex_review_not_reposted_same_pr_same_push(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When ``has_recent_codex_review_request`` returns True the daemon
-    must not post another ``@codex review`` comment, preventing Codex
-    from starting two redundant reviews back-to-back."""
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
-        lambda repo, number: {"author": "claude-bot", "head_sha": "", "head_commit_date": "2026-04-14T12:00:00Z"},
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "has_recent_codex_review_request",
-        lambda *a, **kw: True,
-    )
+    """The runner must not repost ``@codex review`` for the same PR
+    when no new push has happened since the last post."""
     posted: list[tuple[str, int, str]] = []
 
     def fake_post(repo: str, number: int, body: str) -> None:
@@ -3132,30 +3121,23 @@ def test_post_codex_review_skips_duplicate(
 
     monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
     runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
 
     assert runner._post_codex_review(42) is True
-    assert posted == []
+    assert runner._post_codex_review(42) is True
+    assert posted == [(runner.owner_repo, 42, "@codex review")]
+    assert runner._last_codex_review_pr == 42
+    assert runner._last_codex_review_push_count == 1
     assert any(
-        "Skipping duplicate @codex review on PR #42" in e["event"]
+        "Skipping duplicate @codex review for PR #42" in e["event"]
         for e in runner.state.history
     )
 
 
-def test_post_codex_review_posts_when_no_duplicate(
+def test_codex_review_reposted_after_new_push(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With no recent duplicate the daemon still posts ``@codex
-    review`` exactly once."""
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
-        lambda repo, number: {"author": "claude-bot", "head_sha": "", "head_commit_date": "2026-04-14T12:00:00Z"},
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "has_recent_codex_review_request",
-        lambda *a, **kw: False,
-    )
+    """A new push on the same PR must allow a fresh review trigger."""
     posted: list[tuple[str, int, str]] = []
 
     def fake_post(repo: str, number: int, body: str) -> None:
@@ -3163,98 +3145,18 @@ def test_post_codex_review_posts_when_no_duplicate(
 
     monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
     runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
 
     assert runner._post_codex_review(42) is True
-    assert posted == [(runner.owner_repo, 42, "@codex review")]
+    runner.state.current_pr.push_count += 1
 
-
-def test_post_codex_review_uses_pr_author_not_gh_identity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The dedup filter must match against the actual PR author from PR
-    metadata, not the daemon's gh identity. Claude CLI may run under a
-    different auth context than the daemon; if the daemon's gh user is
-    passed instead, ``has_recent_codex_review_request`` misses Claude's
-    trigger comment and a duplicate @codex review gets posted anyway."""
-    captured: dict[str, Any] = {}
-
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
-        lambda repo, number: {"author": "claude-cli-bot", "head_sha": "", "head_commit_date": "2026-04-14T12:00:00Z"},
-    )
-
-    def fake_has_recent(
-        repo: str,
-        pr_number: int,
-        pr_author: str,
-        within_minutes: int = 5,
-        after_iso: str | None = None,
-    ) -> bool:
-        captured["pr_author"] = pr_author
-        captured["after_iso"] = after_iso
-        return True
-
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "has_recent_codex_review_request",
-        fake_has_recent,
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
-        lambda *a, **kw: None,
-    )
-
-    runner = _make_runner()
-    assert runner._post_codex_review(7) is True
-    assert captured["pr_author"] == "claude-cli-bot"
-    assert captured["after_iso"] == "2026-04-14T12:00:00Z"
-
-
-def test_post_codex_review_passes_head_commit_iso_to_dedup(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The dedup filter must be scoped to the current head commit so
-    the daemon's own prior trigger for an earlier commit does not
-    suppress the fresh anchor the new commit needs. Without this the
-    runner could stay in repeated FIX cycles without ever
-    re-requesting review on the new commit when the daemon and PR
-    author share a gh identity."""
-    captured: dict[str, Any] = {}
-
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
-        lambda repo, number: {"author": "same-user", "head_sha": "", "head_commit_date": "2026-04-14T13:37:00Z"},
-    )
-
-    def fake_has_recent(
-        repo: str,
-        pr_number: int,
-        pr_author: str,
-        within_minutes: int = 5,
-        after_iso: str | None = None,
-    ) -> bool:
-        captured["after_iso"] = after_iso
-        return False
-
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "has_recent_codex_review_request",
-        fake_has_recent,
-    )
-    posted: list[tuple[str, int, str]] = []
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
-        lambda r, n, b: posted.append((r, n, b)),
-    )
-
-    runner = _make_runner()
-    assert runner._post_codex_review(11) is True
-    assert captured["after_iso"] == "2026-04-14T13:37:00Z"
-    assert posted == [(runner.owner_repo, 11, "@codex review")]
+    assert runner._post_codex_review(42) is True
+    assert posted == [
+        (runner.owner_repo, 42, "@codex review"),
+        (runner.owner_repo, 42, "@codex review"),
+    ]
+    assert runner._last_codex_review_pr == 42
+    assert runner._last_codex_review_push_count == 2
 
 
 def test_save_cli_log_includes_stderr() -> None:
