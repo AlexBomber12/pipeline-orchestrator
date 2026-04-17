@@ -73,13 +73,14 @@ class MergeMixin:
                         self.log_event(
                             "Merge conflict with main, resolving..."
                         )
-                        code, _stdout, _stderr = claude_cli.run_claude(
+                        code, _stdout, _stderr = await claude_cli.run_claude_async(
                             "Resolve all merge conflicts in the working "
                             "tree. Keep both sides where possible. "
                             "Run scripts/ci.sh to verify.",
                             self.repo_path,
                             timeout=300,
                             model=self.app_config.daemon.claude_model,
+                            system_prompt_file=None,
                         )
                         if code != 0:
                             git_ops._git(
