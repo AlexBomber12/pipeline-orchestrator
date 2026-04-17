@@ -1571,12 +1571,14 @@ return 0
                 self.state.error_message is not None
                 and self.state.rate_limit_reactive_coder in ("claude", None)
             )
-            # A pause from a *different* coder doesn't apply:
-            # e.g. a Claude pause doesn't block Codex, and vice-versa.
-            # Legacy pauses (rate_limit_reactive_coder=None) are left to
-            # the expiry path since we cannot confirm the source coder.
+            # A reactive pause from a *different* coder doesn't apply:
+            # e.g. a Claude pause from coding doesn't block Codex.
+            # Only reactive pauses (from _detect_rate_limit on stderr)
+            # are clearable; proactive pauses are intentionally targeted
+            # at a specific CLI and must expire naturally.
             other_coder = (
                 not diagnosis_pause
+                and self.state.rate_limit_reactive
                 and self.state.rate_limit_reactive_coder is not None
                 and self.state.rate_limit_reactive_coder != coder.value
             )
@@ -1716,10 +1718,12 @@ return 0
             self.state.error_message is not None
             and self.state.rate_limit_reactive_coder in ("claude", None)
         )
-        # Legacy pauses (rate_limit_reactive_coder=None) are left to
-        # the expiry path since we cannot confirm the source coder.
+        # Only reactive pauses (from _detect_rate_limit on stderr) are
+        # clearable on coder switch; proactive pauses are intentionally
+        # targeted at a specific CLI and must expire naturally.
         other_coder = (
             not diagnosis_pause
+            and self.state.rate_limit_reactive
             and self.state.rate_limit_reactive_coder is not None
             and self.state.rate_limit_reactive_coder != coder.value
         )
