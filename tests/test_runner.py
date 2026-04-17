@@ -3174,6 +3174,57 @@ def test_codex_review_reposted_after_new_push(
     assert runner._last_codex_review_head_sha == "head-2"
 
 
+def test_codex_review_not_reposted_when_author_already_requested_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recent PR-author trigger on the current head should suppress
+    the daemon's first duplicate comment for that same head."""
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    runner = _make_runner()
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: {
+            "author": "alice",
+            "head_sha": "head-1",
+            "head_commit_date": "2026-04-17T23:14:11Z",
+        },
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "has_recent_codex_review_request",
+        lambda repo, number, pr_author, within_minutes=5, after_iso=None: (
+            repo == runner.owner_repo
+            and number == 42
+            and pr_author == "alice"
+            and after_iso == "2026-04-17T23:14:11Z"
+        ),
+    )
+    monkeypatch.setattr(
+        git_ops_module,
+        "_git",
+        lambda *args, **kwargs: _FakeCompletedProcess(
+            args=list(args), stdout="head-1\n", returncode=0
+        ),
+    )
+    runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
+
+    assert runner._post_codex_review(42) is True
+    assert posted == []
+    assert runner._last_codex_review_pr == 42
+    assert runner._last_codex_review_head_sha == "head-1"
+    assert any(
+        "PR author already requested review for this head" in e["event"]
+        for e in runner.state.history
+    )
+
+
 def test_codex_review_git_head_lookup_failure_does_not_dedup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

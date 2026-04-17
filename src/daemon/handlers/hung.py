@@ -43,17 +43,40 @@ class HungMixin:
         current_pr = self.state.current_pr
         cache_dedup_key = False
         head_sha: str | None = None
+        pr_author = ""
+        head_commit_date = ""
         try:
             head_sha = git_ops._git(
                 self.repo_path, "rev-parse", "HEAD"
             ).stdout.strip() or None
         except Exception:
             head_sha = None
+        metadata = github_client.get_pr_metadata(self.owner_repo, pr_number)
+        if isinstance(metadata, dict):
+            pr_author = str(metadata.get("author") or "")
+            head_commit_date = str(metadata.get("head_commit_date") or "")
         if head_sha is None:
             self.log_event(
                 f"Warning: failed to resolve HEAD for PR #{pr_number}; "
                 "posting @codex review without dedup"
             )
+        elif (
+            pr_author
+            and head_commit_date
+            and github_client.has_recent_codex_review_request(
+                self.owner_repo,
+                pr_number,
+                pr_author=pr_author,
+                after_iso=head_commit_date,
+            )
+        ):
+            self._last_codex_review_pr = pr_number
+            self._last_codex_review_head_sha = head_sha
+            self.log_event(
+                f"Skipping duplicate @codex review for PR #{pr_number}; "
+                "PR author already requested review for this head"
+            )
+            return True
         elif (
             self._last_codex_review_pr == pr_number
             and self._last_codex_review_head_sha == head_sha
