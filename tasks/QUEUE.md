@@ -394,3 +394,149 @@
 - Tasks file: tasks/PR-057.md
 - Branch: pr-057-runner-decomposition
 - Depends on: PR-053, PR-054, PR-055, PR-056, PR-058, PR-059, PR-060, PR-061, PR-062, PR-063, PR-065, PR-066
+
+## PR-067: Test hygiene - ruff and pytest-asyncio warnings
+- Status: TODO
+- Tasks file: tasks/PR-067.md
+- Branch: pr-067-test-hygiene
+
+## PR-068: Remove heartbeat spam from event log
+- Status: TODO
+- Tasks file: tasks/PR-068.md
+- Branch: pr-068-heartbeat-cleanup
+
+## PR-069: BUG-1 - no FIX when CI is PENDING
+- Status: TODO
+- Tasks file: tasks/PR-069.md
+- Branch: pr-069-no-fix-ci-pending
+
+## PR-070: Async run_claude in merge handler
+- Status: TODO
+- Tasks file: tasks/PR-070.md
+- Branch: pr-070-async-merge-resolve
+
+## PR-071: Pydantic validation for config fields
+- Status: TODO
+- Tasks file: tasks/PR-071.md
+- Branch: pr-071-config-validation
+
+## PR-072: BUG-3 - codex review dedup by PR number
+- Status: TODO
+- Tasks file: tasks/PR-072.md
+- Branch: pr-072-review-dedup-by-pr
+
+## PR-073: CoderPlugin protocol and registry
+- Status: TODO
+- Tasks file: tasks/PR-073.md
+- Branch: pr-073-coder-plugin-protocol
+
+## PR-074: Claude coder plugin
+- Status: TODO
+- Tasks file: tasks/PR-074.md
+- Branch: pr-074-claude-plugin
+- Depends on: PR-073
+
+## PR-075: Codex coder plugin
+- Status: TODO
+- Tasks file: tasks/PR-075.md
+- Branch: pr-075-codex-plugin
+- Depends on: PR-073
+
+## PR-076: Shared process-level usage provider
+- Status: TODO
+- Tasks file: tasks/PR-076.md
+- Branch: pr-076-shared-usage-provider
+- Depends on: PR-074, PR-075
+
+## PR-077: Runner uses plugin registry
+- Status: TODO
+- Tasks file: tasks/PR-077.md
+- Branch: pr-077-runner-plugin-integration
+- Depends on: PR-074, PR-075, PR-076
+
+## PR-078: Unified coder settings table
+- Status: TODO
+- Tasks file: tasks/PR-078.md
+- Branch: pr-078-coder-settings-table
+- Depends on: PR-077
+
+## PR-079: Model dropdown validated from plugin
+- Status: TODO
+- Tasks file: tasks/PR-079.md
+- Branch: pr-079-model-dropdown
+- Depends on: PR-078
+
+## PR-080: RunRecord schema and storage
+- Status: TODO
+- Tasks file: tasks/PR-080.md
+- Branch: pr-080-run-record-schema
+
+## PR-081: Capture metrics in coding handler
+- Status: TODO
+- Tasks file: tasks/PR-081.md
+- Branch: pr-081-coding-metrics
+- Depends on: PR-080
+
+## PR-082: Capture metrics in fix and merge handlers
+- Status: TODO
+- Tasks file: tasks/PR-082.md
+- Branch: pr-082-fix-merge-metrics
+- Depends on: PR-081
+
+## PR-083: Dashboard per-PR metrics panel
+- Status: TODO
+- Tasks file: tasks/PR-083.md
+- Branch: pr-083-metrics-dashboard
+- Depends on: PR-082
+
+## PR-084: Task file header parser
+- Status: TODO
+- Tasks file: tasks/PR-084.md
+- Branch: pr-084-task-header-parser
+
+## PR-085: Status derivation from git
+- Status: TODO
+- Tasks file: tasks/PR-085.md
+- Branch: pr-085-status-from-git
+- Depends on: PR-084
+
+## PR-086: DAG builder and eligible task selector
+- Status: TODO
+- Tasks file: tasks/PR-086.md
+- Branch: pr-086-dag-builder
+- Depends on: PR-085
+
+## PR-087: Auto-queue integration in handle_idle
+- Status: TODO
+- Tasks file: tasks/PR-087.md
+- Branch: pr-087-auto-queue-idle
+- Depends on: PR-086
+
+## PR-088: QUEUE.md auto-generation
+- Status: TODO
+- Tasks file: tasks/PR-088.md
+- Branch: pr-088-queue-auto-generate
+- Depends on: PR-087
+
+## PR-089: Upload validation for task file headers
+- Status: TODO
+- Tasks file: tasks/PR-089.md
+- Branch: pr-089-upload-header-validation
+- Depends on: PR-084
+
+## PR-090: Expanded error classification
+- Status: TODO
+- Tasks file: tasks/PR-090.md
+- Branch: pr-090-error-classification
+
+## PR-091: Auto-fallback chain on rate limit
+- Status: TODO
+- Tasks file: tasks/PR-091.md
+- Branch: pr-091-auto-fallback
+- Depends on: PR-077
+
+## PR-092: DESIGN.md
+- Status: TODO
+- Tasks file: tasks/PR-092.md
+- Branch: pr-092-design-doc
+- Depends on: PR-077, PR-087
