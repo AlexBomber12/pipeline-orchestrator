@@ -1966,9 +1966,15 @@ return 0
         marker = Path(breach_dir) / f"{run_id}.breach"
         if not marker.is_file():
             return
-        try:
-            data = json.loads(marker.read_text())
-        except (OSError, json.JSONDecodeError):
+        # Retry a few times — the hook may still be writing the file.
+        data = None
+        for _ in range(3):
+            try:
+                data = json.loads(marker.read_text())
+                break
+            except (OSError, json.JSONDecodeError):
+                time.sleep(0.1)
+        if data is None:
             return
         resets_at = data.get("resets_at", 0)
         if resets_at:

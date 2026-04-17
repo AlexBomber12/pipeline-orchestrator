@@ -98,7 +98,10 @@ def _clean_breach_dir() -> None:
     """Remove all stale breach markers on daemon startup."""
     breach_path = Path(_BREACH_DIR)
     if breach_path.exists():
-        shutil.rmtree(breach_path, ignore_errors=True)
+        if not breach_path.is_dir():
+            breach_path.unlink()
+        else:
+            shutil.rmtree(breach_path, ignore_errors=True)
     breach_path.mkdir(parents=True, exist_ok=True)
 
 
