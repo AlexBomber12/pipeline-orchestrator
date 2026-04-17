@@ -1559,8 +1559,15 @@ return 0
             return True
         return await self._proactive_usage_check()
 
-    def _detect_rate_limit(self, stderr: str) -> None:
-        """Set rate-limit pause if stderr contains rate-limit signals."""
+    def _detect_rate_limit(self, stderr: str, coder_name: str | None = None) -> None:
+        """Set rate-limit pause if stderr contains rate-limit signals.
+
+        ``coder_name`` identifies the CLI that produced *stderr*.  When
+        omitted the configured coder is used, but callers that always
+        invoke a specific CLI (e.g. ``handle_error`` → ``claude_cli``)
+        should pass the name explicitly so reactive pauses are attributed
+        to the correct provider.
+        """
         session_threshold = self.app_config.daemon.rate_limit_session_pause_percent
         weekly_threshold = self.app_config.daemon.rate_limit_weekly_pause_percent
         lower = stderr.lower()
@@ -1593,10 +1600,12 @@ return 0
 
         if triggered:
             pause_min = 30
-            coder = self.repo_config.coder or self.app_config.daemon.coder
+            if coder_name is None:
+                coder = self.repo_config.coder or self.app_config.daemon.coder
+                coder_name = coder.value
             self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=pause_min)
             self.state.rate_limit_reactive = True
-            self.state.rate_limit_reactive_coder = coder.value
+            self.state.rate_limit_reactive_coder = coder_name
             self.log_event(f"Rate limit detected ({limit_type}), pausing for {pause_min} min")
 
     async def handle_paused(self) -> None:
@@ -1797,7 +1806,7 @@ return 0
             )
             return
         await self._save_cli_log(stdout, stderr, f"PLANNED PR output [{coder_name}]")
-        self._detect_rate_limit(stderr)
+        self._detect_rate_limit(stderr, coder_name=coder_name)
         if code != 0:
             if self.state.rate_limited_until is not None:
                 self.state.state = PipelineState.PAUSED
@@ -2334,7 +2343,7 @@ return 0
             await self._save_cli_log("", "", "FIX idle timeout")
             return
         await self._save_cli_log(stdout, stderr, f"FIX REVIEW output [{coder_name}]")
-        self._detect_rate_limit(stderr)
+        self._detect_rate_limit(stderr, coder_name=coder_name)
         if code != 0:
             if self.state.rate_limited_until is not None:
                 self.state.state = PipelineState.PAUSED
@@ -2983,7 +2992,7 @@ return 0
         code, stdout, stderr = await claude_cli.diagnose_error_async(
             self.repo_path, context, model=self.app_config.daemon.claude_model
         )
-        self._detect_rate_limit(stderr)
+        self._detect_rate_limit(stderr, coder_name="claude")
         if self.state.rate_limited_until is not None:
             self.state.state = PipelineState.PAUSED
             # Preserve error_message so handle_paused resumes to ERROR
