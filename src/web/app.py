@@ -953,6 +953,10 @@ def _check_codex_auth() -> dict[str, str]:
     # Distinguish "not logged in" from "binary not found"
     if "not found" in combined.lower() or "no such file" in combined.lower():
         return {"status": "error", "detail": "codex CLI not installed"}
+    # Codex can also authenticate via OPENAI_API_KEY env var, which
+    # ``codex login status`` does not detect.
+    if os.environ.get("OPENAI_API_KEY"):
+        return {"status": "ok", "detail": "codex authenticated (API key)"}
     detail = combined.splitlines()[0].strip() if combined else "codex not authenticated"
     return {"status": "error", "detail": detail}
 
