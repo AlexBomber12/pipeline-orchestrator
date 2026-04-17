@@ -5,20 +5,17 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from src.claude_cli import (
     diagnose_error,
     diagnose_error_async,
     fix_review,
-    fix_review_async,
     parse_diagnosis,
     run_claude,
     run_claude_async,
     run_planned_pr,
-    run_planned_pr_async,
 )
 
 

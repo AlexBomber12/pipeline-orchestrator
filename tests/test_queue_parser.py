@@ -6,7 +6,6 @@ import logging
 from pathlib import Path
 
 import pytest
-
 from src.models import TaskStatus
 from src.queue_parser import (
     QueueValidationError,
@@ -14,7 +13,6 @@ from src.queue_parser import (
     mark_task_done,
     parse_queue,
     parse_queue_text,
-    validate_queue,
 )
 
 SAMPLE_QUEUE = """## PR-001: Bootstrap

@@ -6,10 +6,7 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
-
-import pytest
 
 HOOK_SCRIPT = str(
     Path(__file__).resolve().parent.parent / "scripts" / "statusline_hook.py"

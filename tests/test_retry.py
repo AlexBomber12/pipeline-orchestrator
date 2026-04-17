@@ -6,7 +6,6 @@ import subprocess
 from unittest.mock import patch
 
 import pytest
-
 from src.retry import is_transient_error, retry_transient
 
 
