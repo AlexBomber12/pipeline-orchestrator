@@ -1554,7 +1554,14 @@ return 0
                 self.state.rate_limit_reactive_coder = None
                 self._usage_provider.invalidate_cache()
                 if self.state.state == PipelineState.PAUSED:
-                    self.state.state = PipelineState.IDLE
+                    if (
+                        self.state.current_pr is not None
+                        and self.state.current_task is not None
+                        and self.state.current_pr.branch == self.state.current_task.branch
+                    ):
+                        self.state.state = PipelineState.WATCH
+                    else:
+                        self.state.state = PipelineState.IDLE
                 self.log_event(
                     f"{coder.value.capitalize()} active, clearing other-coder rate-limit pause"
                 )
@@ -1659,10 +1666,23 @@ return 0
             self.state.rate_limit_reactive = False
             self.state.rate_limit_reactive_coder = None
             self._usage_provider.invalidate_cache()
-            self.state.state = PipelineState.IDLE
-            self.log_event(
-                f"{coder.value.capitalize()} active, clearing other-coder pause -> IDLE"
-            )
+            self._error_diagnose_count = 0
+            # Resume to the appropriate workflow state rather than
+            # unconditionally dropping to IDLE.
+            if (
+                self.state.current_pr is not None
+                and self.state.current_task is not None
+                and self.state.current_pr.branch == self.state.current_task.branch
+            ):
+                self.state.state = PipelineState.WATCH
+                self.log_event(
+                    f"{coder.value.capitalize()} active, clearing other-coder pause -> WATCH"
+                )
+            else:
+                self.state.state = PipelineState.IDLE
+                self.log_event(
+                    f"{coder.value.capitalize()} active, clearing other-coder pause -> IDLE"
+                )
             return
         if datetime.now(timezone.utc) < self.state.rate_limited_until:
             remaining = (
