@@ -5503,3 +5503,38 @@ def test_check_rate_limit_skips_proactive_for_codex(
     result = asyncio.run(runner._check_rate_limit())
     assert result is True
     assert proactive_called == []  # Should not have been called
+
+
+def test_check_rate_limit_codex_clears_claude_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex clears a non-reactive (Claude-originated) rate-limit pause."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limit_reactive = False
+    runner.state.state = PipelineState.PAUSED
+
+    result = asyncio.run(runner._check_rate_limit())
+    assert result is True
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive is False
+    assert runner.state.state == PipelineState.IDLE
+
+
+def test_check_rate_limit_codex_honors_reactive_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex respects a reactive (stderr-detected) rate-limit pause."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limit_reactive = True
+
+    result = asyncio.run(runner._check_rate_limit())
+    assert result is False
+    assert runner.state.rate_limited_until is not None

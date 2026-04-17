@@ -1526,9 +1526,11 @@ return 0
         """Return True if CLI calls are allowed, False if rate-limited."""
         coder = self.repo_config.coder or self.app_config.daemon.coder
         if self.state.rate_limited_until is not None:
-            if coder == CoderType.CODEX:
-                # Claude-originated pause does not apply to Codex
+            if coder == CoderType.CODEX and not self.state.rate_limit_reactive:
+                # Claude-originated pause does not apply to Codex;
+                # reactive pauses (from stderr 429s) still apply.
                 self.state.rate_limited_until = None
+                self.state.rate_limit_reactive = False
                 self._usage_provider.invalidate_cache()
                 if self.state.state == PipelineState.PAUSED:
                     self.state.state = PipelineState.IDLE
@@ -1541,6 +1543,7 @@ return 0
                 self.log_event(f"Rate limited, resuming in {int(remaining)}s")
                 return False
             self.state.rate_limited_until = None
+            self.state.rate_limit_reactive = False
             self._usage_provider.invalidate_cache()
             self.log_event("Rate limit window expired, resuming")
         # Proactive OAuth check only applies to the Claude provider
@@ -1583,6 +1586,7 @@ return 0
         if triggered:
             pause_min = 30
             self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=pause_min)
+            self.state.rate_limit_reactive = True
             self.log_event(f"Rate limit detected ({limit_type}), pausing for {pause_min} min")
 
     async def handle_paused(self) -> None:
