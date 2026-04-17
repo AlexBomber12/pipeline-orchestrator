@@ -1565,14 +1565,16 @@ return 0
         if self.state.rate_limited_until is not None:
             # Diagnosis pauses always use Claude — honour regardless of coder
             # and regardless of whether the pause is reactive or proactive.
+            # Treat None (legacy/unattributed) as potentially Claude to avoid
+            # clearing diagnosis pauses from pre-PR-066 state.
             diagnosis_pause = (
                 self.state.error_message is not None
-                and self.state.rate_limit_reactive_coder == "claude"
+                and self.state.rate_limit_reactive_coder in ("claude", None)
             )
             # A pause from a *different* coder doesn't apply:
             # e.g. a Claude pause doesn't block Codex, and vice-versa.
-            # This applies to both reactive and proactive pauses since
-            # both now set rate_limit_reactive_coder.
+            # Legacy pauses (rate_limit_reactive_coder=None) are left to
+            # the expiry path since we cannot confirm the source coder.
             other_coder = (
                 not diagnosis_pause
                 and self.state.rate_limit_reactive_coder is not None
@@ -1707,11 +1709,15 @@ return 0
         # A pause from a different coder doesn't apply after switching.
         # Diagnosis pauses always use Claude — honour regardless of coder
         # and regardless of whether the pause is reactive or proactive.
+        # Treat None (legacy/unattributed) as potentially Claude to avoid
+        # clearing diagnosis pauses from pre-PR-066 state.
         coder = self.repo_config.coder or self.app_config.daemon.coder
         diagnosis_pause = (
             self.state.error_message is not None
-            and self.state.rate_limit_reactive_coder == "claude"
+            and self.state.rate_limit_reactive_coder in ("claude", None)
         )
+        # Legacy pauses (rate_limit_reactive_coder=None) are left to
+        # the expiry path since we cannot confirm the source coder.
         other_coder = (
             not diagnosis_pause
             and self.state.rate_limit_reactive_coder is not None
