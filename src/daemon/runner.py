@@ -1499,13 +1499,17 @@ return 0
         await self.publish_state()
         await self.handle_coding()
 
-    async def _proactive_usage_check(self) -> bool:
+    async def _proactive_usage_check(self, proactive_coder: str | None = None) -> bool:
         """Return True if CLI calls are allowed, False if usage threshold breached.
 
         Fail-open: returns True when the provider cannot reach the endpoint,
         deferring to the reactive _detect_rate_limit on stderr after the CLI run.
+
+        When *proactive_coder* is set it overrides the configured coder so
+        callers that always use a specific CLI (e.g. ``handle_error`` →
+        ``claude_cli``) check the correct provider's quota.
         """
-        coder_name, _ = self._get_coder()
+        coder_name = proactive_coder or self._get_coder()[0]
         provider = (
             self._claude_usage_provider
             if coder_name == "claude"
@@ -1551,8 +1555,12 @@ return 0
         )
         return False
 
-    async def _check_rate_limit(self) -> bool:
-        """Return True if CLI calls are allowed, False if rate-limited."""
+    async def _check_rate_limit(self, proactive_coder: str | None = None) -> bool:
+        """Return True if CLI calls are allowed, False if rate-limited.
+
+        *proactive_coder* is forwarded to ``_proactive_usage_check`` so
+        callers that always invoke a specific CLI can check the right quota.
+        """
         coder = self.repo_config.coder or self.app_config.daemon.coder
         if self.state.rate_limited_until is not None:
             # Diagnosis pauses always use Claude — honour regardless of coder.
@@ -1603,7 +1611,7 @@ return 0
                 self._claude_usage_provider.invalidate_cache()
                 self._codex_usage_provider.invalidate_cache()
                 self.log_event("Rate limit window expired, resuming")
-        return await self._proactive_usage_check()
+        return await self._proactive_usage_check(proactive_coder=proactive_coder)
 
     def _detect_rate_limit(self, stderr: str, coder_name: str | None = None) -> None:
         """Set rate-limit pause if stderr contains rate-limit signals.
@@ -3083,7 +3091,9 @@ return 0
 
     async def handle_error(self, error_context: str | None = None) -> None:
         """Ask the claude CLI whether to FIX, SKIP, or ESCALATE the error."""
-        if not await self._check_rate_limit():
+        # Diagnosis always uses claude_cli, so check Claude's quota
+        # regardless of the repo's configured coder.
+        if not await self._check_rate_limit(proactive_coder="claude"):
             return
 
         context = error_context or self.state.error_message or "Unknown error"
