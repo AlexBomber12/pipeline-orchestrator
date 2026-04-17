@@ -954,9 +954,11 @@ def _check_codex_auth() -> dict[str, str]:
     if "not found" in combined.lower() or "no such file" in combined.lower():
         return {"status": "error", "detail": "codex CLI not installed"}
     # Codex can also authenticate via OPENAI_API_KEY env var, which
-    # ``codex login status`` does not detect.
-    if os.environ.get("OPENAI_API_KEY"):
-        return {"status": "ok", "detail": "codex authenticated (API key)"}
+    # ``codex login status`` does not detect.  Validate key format to
+    # avoid false positives from typo'd/revoked values.
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if api_key.startswith("sk-") and len(api_key) >= 20:
+        return {"status": "ok", "detail": "codex authenticated (OPENAI_API_KEY)"}
     detail = combined.splitlines()[0].strip() if combined else "codex not authenticated"
     return {"status": "error", "detail": detail}
 
