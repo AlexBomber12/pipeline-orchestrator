@@ -1532,9 +1532,13 @@ return 0
                 self.state.rate_limit_reactive
                 and self.state.rate_limit_reactive_coder == CoderType.CODEX.value
             )
-            if coder == CoderType.CODEX and not codex_reactive:
-                # Claude-originated pause does not apply to Codex;
-                # reactive pauses from Codex itself still apply.
+            diagnosis_pause = (
+                self.state.rate_limit_reactive
+                and self.state.error_message is not None
+            )
+            if coder == CoderType.CODEX and not codex_reactive and not diagnosis_pause:
+                # Claude-originated CODING/FIX pause does not apply to Codex;
+                # reactive pauses from Codex itself or error diagnosis still apply.
                 self.state.rate_limited_until = None
                 self.state.rate_limit_reactive = False
                 self.state.rate_limit_reactive_coder = None
@@ -1614,14 +1618,20 @@ return 0
             self.log_event("PAUSED without rate_limited_until -> IDLE")
             self.state.state = PipelineState.IDLE
             return
-        # Codex is unaffected by Claude-originated pauses, but reactive
-        # pauses (stderr 429s from Codex itself) must still be honoured.
+        # Codex is unaffected by Claude-originated CODING/FIX pauses,
+        # but reactive pauses from Codex itself must still be honoured.
+        # When error_message is set the pause came from error diagnosis
+        # which always uses Claude — honour that regardless of coder.
         coder = self.repo_config.coder or self.app_config.daemon.coder
         codex_reactive = (
             self.state.rate_limit_reactive
             and self.state.rate_limit_reactive_coder == CoderType.CODEX.value
         )
-        if coder == CoderType.CODEX and not codex_reactive:
+        diagnosis_pause = (
+            self.state.rate_limit_reactive
+            and self.state.error_message is not None
+        )
+        if coder == CoderType.CODEX and not codex_reactive and not diagnosis_pause:
             self.state.rate_limited_until = None
             self.state.rate_limit_reactive = False
             self.state.rate_limit_reactive_coder = None
