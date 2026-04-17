@@ -2589,7 +2589,7 @@ return 0
                     if "CONFLICT" in (
                         merge_result.stdout + merge_result.stderr
                     ):
-                        if not await self._check_rate_limit():
+                        if not await self._check_rate_limit(proactive_coder="claude"):
                             _git(
                                 self.repo_path,
                                 "merge", "--abort",
