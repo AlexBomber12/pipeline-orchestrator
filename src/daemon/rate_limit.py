@@ -203,6 +203,22 @@ class RateLimitMixin:
             triggered = True
             limit_type = "session"
 
+        # Codex error fallback for unmatched rate-limit failures that still
+        # carry concrete retry language, while ignoring progress-only stderr.
+        if (
+            not triggered
+            and coder_name == "codex"
+            and "rate limit" in lower
+            and (
+                "rate limit exceeded" in lower
+                or "please try again" in lower
+                or "try again later" in lower
+                or "retry later" in lower
+            )
+        ):
+            triggered = True
+            limit_type = "weekly" if "weekly" in lower or "week" in lower else "session"
+
         # Generic "rate limit" fallback for non-Codex stderr only.
         anthropic_handled = m_anthropic and coder_name == "claude"
         codex_retry_handled = codex_retry_parsed

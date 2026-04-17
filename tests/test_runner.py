@@ -6033,6 +6033,22 @@ def test_detect_rate_limit_codex_progress_output_zero_remaining_does_not_trigger
     assert runner.state.rate_limit_reactive_coder is None
 
 
+def test_detect_rate_limit_codex_error_fallback_without_parseable_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex unmatched retry text should still pause on concrete rate-limit failures."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner._detect_rate_limit(
+        "Rate limit reached. Please try again later.",
+        coder_name="codex",
+    )
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "codex"
+
+
 def test_detect_rate_limit_codex_progress_output_with_seconds_retry_triggers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
