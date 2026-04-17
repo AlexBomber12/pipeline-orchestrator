@@ -207,7 +207,12 @@ class RateLimitMixin:
             else None
         )
         codex_usage_progress = bool(
-            m_codex_usage_progress and int(m_codex_usage_progress.group(1)) > 0
+            m_codex_usage_progress
+            and int(m_codex_usage_progress.group(1)) > 0
+            and "rate limit reached" not in lower
+            and "try again in" not in lower
+            and "usage limit" not in lower
+            and "error" not in lower
         )
 
         # Generic "rate limit" fallback (both coders).

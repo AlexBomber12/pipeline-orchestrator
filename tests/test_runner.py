@@ -6029,6 +6029,23 @@ def test_detect_rate_limit_codex_exhausted_progress_output_triggers(
     assert runner.state.rate_limit_reactive_coder == "codex"
 
 
+def test_detect_rate_limit_codex_progress_output_with_error_still_triggers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mixed Codex progress and failure output should still enter pause."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner._detect_rate_limit(
+        "Progress update: weekly rate limit: 87% remaining\n"
+        "Rate limit reached. Please try again in 6.379s",
+        coder_name="codex",
+    )
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "codex"
+
+
 def test_proactive_check_uses_codex_provider_when_coder_is_codex(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
