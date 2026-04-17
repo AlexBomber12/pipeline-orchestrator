@@ -26,8 +26,11 @@ async def run_codex_async(
     """
     cmd = [
         "codex",
+        "--ask-for-approval",
+        "never",
         "exec",
-        "--full-auto",
+        "--sandbox",
+        "danger-full-access",
     ]
     if model:
         cmd.extend(["--model", model])
