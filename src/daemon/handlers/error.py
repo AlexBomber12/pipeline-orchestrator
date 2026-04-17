@@ -10,6 +10,7 @@ Module-level:
 
 from __future__ import annotations
 
+import asyncio
 import re
 from enum import Enum
 
@@ -37,12 +38,44 @@ class ErrorMixin:
 
     async def handle_error(self, error_context: str | None = None) -> None:
         """Ask the claude CLI whether to FIX, SKIP, or ESCALATE the error."""
-        # Diagnosis always uses claude_cli, so check Claude's quota
-        # regardless of the repo's configured coder.
-        if not await self._check_rate_limit(proactive_coder="claude"):
-            return
-
         context = error_context or self.state.error_message or "Unknown error"
+        coder_name, _ = self._get_coder()
+        if coder_name == "claude":
+            # Claude-backed repos must preserve the original pause-and-resume
+            # behavior so ERROR context survives until Claude recovers.
+            if not await self._check_rate_limit(proactive_coder="claude"):
+                return
+        else:
+            # Diagnosis still uses claude_cli, but when another coder is
+            # active we should skip diagnosis rather than pausing all work.
+            snapshot = await asyncio.to_thread(self._claude_usage_provider.fetch)
+            if snapshot and (
+                snapshot.session_percent
+                >= self.app_config.daemon.rate_limit_session_pause_percent
+                or snapshot.weekly_percent
+                >= self.app_config.daemon.rate_limit_weekly_pause_percent
+            ):
+                if context == self._error_skip_context:
+                    self._error_skip_count += 1
+                else:
+                    self._error_skip_context = context
+                    self._error_skip_count = 1
+                self._error_skip_active = True
+                if self._error_skip_count > 3:
+                    self.log_event(
+                        "Skipping AI diagnosis: Claude rate limited; "
+                        "max soft-skip retries (3) reached, staying ERROR"
+                    )
+                    return
+                self.log_event("Skipping AI diagnosis: Claude rate limited")
+                self.state.state = PipelineState.IDLE
+                self.state.error_message = None
+                self._error_diagnose_count = 0
+                return
+
+        self._error_skip_context = None
+        self._error_skip_count = 0
+        self._error_skip_active = False
         category = _classify_error(context)
         if category == ErrorCategory.RATE_LIMIT:
             self.log_event("Skipping AI diagnosis for rate-limit error")
