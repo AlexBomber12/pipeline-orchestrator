@@ -1667,22 +1667,31 @@ return 0
             self.state.rate_limit_reactive_coder = None
             self._usage_provider.invalidate_cache()
             self._error_diagnose_count = 0
-            # Resume to the appropriate workflow state rather than
-            # unconditionally dropping to IDLE.
+            label = f"{coder.value.capitalize()} active, clearing other-coder pause"
+            # Preserve error context so diagnosis/recovery continues.
+            if self.state.error_message:
+                lowered = self.state.error_message.lower()
+                is_rate_limit_msg = (
+                    "rate limit" in lowered or re.search(r"\b429\b", lowered)
+                )
+                if is_rate_limit_msg:
+                    self.state.error_message = None
+                    self.log_event(f"{label}, cleared legacy rate-limit error")
+                else:
+                    self.state.state = PipelineState.ERROR
+                    self.log_event(f"{label} -> ERROR (preserved context)")
+                    return
+            # Resume to the appropriate workflow state.
             if (
                 self.state.current_pr is not None
                 and self.state.current_task is not None
                 and self.state.current_pr.branch == self.state.current_task.branch
             ):
                 self.state.state = PipelineState.WATCH
-                self.log_event(
-                    f"{coder.value.capitalize()} active, clearing other-coder pause -> WATCH"
-                )
+                self.log_event(f"{label} -> WATCH")
             else:
                 self.state.state = PipelineState.IDLE
-                self.log_event(
-                    f"{coder.value.capitalize()} active, clearing other-coder pause -> IDLE"
-                )
+                self.log_event(f"{label} -> IDLE")
             return
         if datetime.now(timezone.utc) < self.state.rate_limited_until:
             remaining = (
