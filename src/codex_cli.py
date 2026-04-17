@@ -26,6 +26,8 @@ async def run_codex_async(
     """
     cmd = [
         "codex",
+        "--ask-for-approval",
+        "never",
         "exec",
         "--sandbox",
         "danger-full-access",

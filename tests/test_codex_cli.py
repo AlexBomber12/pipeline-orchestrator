@@ -41,7 +41,14 @@ async def test_run_codex_async_success(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert result == (0, "done", "info")
     cmd = captured["cmd"]
-    assert cmd[:4] == ["codex", "exec", "--sandbox", "danger-full-access"]
+    assert cmd[:6] == [
+        "codex",
+        "--ask-for-approval",
+        "never",
+        "exec",
+        "--sandbox",
+        "danger-full-access",
+    ]
     assert cmd[-1] == "do a thing"
     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
 
@@ -90,7 +97,14 @@ async def test_run_planned_pr_async_calls_exec_with_docker_sandbox(
     await run_planned_pr_async("/data/repos/demo", model="o3")
 
     cmd = captured["cmd"]
-    assert cmd[:4] == ["codex", "exec", "--sandbox", "danger-full-access"]
+    assert cmd[:6] == [
+        "codex",
+        "--ask-for-approval",
+        "never",
+        "exec",
+        "--sandbox",
+        "danger-full-access",
+    ]
     assert "--model" in cmd
     assert cmd[cmd.index("--model") + 1] == "o3"
     assert cmd[-1] == "PLANNED PR"
@@ -112,7 +126,14 @@ async def test_fix_review_async_passes_prompt(
     await fix_review_async("/data/repos/demo")
 
     cmd = captured["cmd"]
-    assert cmd[:4] == ["codex", "exec", "--sandbox", "danger-full-access"]
+    assert cmd[:6] == [
+        "codex",
+        "--ask-for-approval",
+        "never",
+        "exec",
+        "--sandbox",
+        "danger-full-access",
+    ]
     assert cmd[-1] == "FIX REVIEW"
 
 
