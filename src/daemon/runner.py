@@ -1565,18 +1565,21 @@ return 0
                 self.log_event(
                     f"{coder.value.capitalize()} active, clearing other-coder rate-limit pause"
                 )
-                return True
-            if datetime.now(timezone.utc) < self.state.rate_limited_until:
+                # Fall through so the proactive usage check still runs
+                # when the active coder is Claude (avoids launching work
+                # that exceeds Claude's usage thresholds).
+            elif datetime.now(timezone.utc) < self.state.rate_limited_until:
                 if self.state.state != PipelineState.PAUSED:
                     self.state.state = PipelineState.PAUSED
                 remaining = (self.state.rate_limited_until - datetime.now(timezone.utc)).total_seconds()
                 self.log_event(f"Rate limited, resuming in {int(remaining)}s")
                 return False
-            self.state.rate_limited_until = None
-            self.state.rate_limit_reactive = False
-            self.state.rate_limit_reactive_coder = None
-            self._usage_provider.invalidate_cache()
-            self.log_event("Rate limit window expired, resuming")
+            else:
+                self.state.rate_limited_until = None
+                self.state.rate_limit_reactive = False
+                self.state.rate_limit_reactive_coder = None
+                self._usage_provider.invalidate_cache()
+                self.log_event("Rate limit window expired, resuming")
         # Proactive OAuth check only applies to the Claude provider
         if coder == CoderType.CODEX:
             return True

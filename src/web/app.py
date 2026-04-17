@@ -939,8 +939,14 @@ def _check_codex_auth() -> dict[str, str]:
     Uses ``codex login status`` which checks credentials, not just the
     binary presence.  Falls back to reporting the CLI as missing when the
     binary is not found.
+
+    The probe runs with ``HOME`` set from the config so the web service
+    reads the same credential directory that the daemon uses (Codex
+    stores credentials under ``~/.codex``).
     """
-    rc, stdout, stderr = _run_auth_command(["codex", "login", "status"])
+    cfg = load_config(CONFIG_PATH)
+    env = _auth_probe_env(HOME=cfg.auth.codex_home_dir)
+    rc, stdout, stderr = _run_auth_command(["codex", "login", "status"], env=env)
     combined = f"{stdout}\n{stderr}".strip()
     if rc == 0:
         detail = ""
@@ -956,7 +962,7 @@ def _check_codex_auth() -> dict[str, str]:
     # Codex can also authenticate via OPENAI_API_KEY env var, which
     # ``codex login status`` does not detect.  Validate key format to
     # avoid false positives from typo'd/revoked values.
-    api_key = os.environ.get("OPENAI_API_KEY", "")
+    api_key = env.get("OPENAI_API_KEY", "")
     if api_key.startswith("sk-") and len(api_key) >= 20:
         return {"status": "ok", "detail": "codex authenticated (OPENAI_API_KEY)"}
     detail = combined.splitlines()[0].strip() if combined else "codex not authenticated"

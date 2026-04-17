@@ -107,6 +107,7 @@ class WebConfig(BaseModel):
 class AuthConfig(BaseModel):
     claude_config_dir: str = "/data/auth/claude"
     gh_config_dir: str = "/data/auth/gh"
+    codex_home_dir: str = "/data/auth"
 
 
 class AppConfig(BaseModel):
