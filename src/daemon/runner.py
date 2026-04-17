@@ -2155,6 +2155,11 @@ return 0
             code, stdout, stderr = await claude_task
         except asyncio.CancelledError:
             if breach_flag["breached"]:
+                # Refresh the feedback baseline from HEAD so that any push
+                # Claude made before cancellation is accounted for, without
+                # unconditionally advancing past real Codex feedback.
+                if self.state.current_pr is not None:
+                    self._rehydrate_last_push_at(self.state.current_pr)
                 self.state.state = PipelineState.PAUSED
                 self.state.error_message = None
                 self.log_event(
@@ -2175,6 +2180,11 @@ return 0
             self._check_late_breach(breach_dir, breach_run_id, breach_flag)
             self._cleanup_breach_marker(breach_dir, breach_run_id)
         if breach_flag["breached"]:
+            # Refresh the feedback baseline from HEAD so that any push
+            # Claude made before the breach is accounted for, without
+            # unconditionally advancing past real Codex feedback.
+            if self.state.current_pr is not None:
+                self._rehydrate_last_push_at(self.state.current_pr)
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
             self.log_event(
