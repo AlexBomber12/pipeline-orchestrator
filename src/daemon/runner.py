@@ -1602,6 +1602,12 @@ return 0
                 limit_type = "weekly"
             triggered = True
 
+        # Codex reports quota exhaustion as "usage limit" rather than
+        # "rate limit", e.g. "usage limit … try again in …".
+        if not triggered and "usage limit" in lower:
+            limit_type = "session"
+            triggered = True
+
         if triggered:
             pause_min = 30
             if coder_name is None:
