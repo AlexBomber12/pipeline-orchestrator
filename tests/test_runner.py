@@ -5964,10 +5964,10 @@ def test_detect_rate_limit_codex_429(
     assert runner.state.rate_limit_reactive_coder == "codex"
 
 
-def test_detect_rate_limit_codex_retry_no_duration_does_not_trigger(
+def test_detect_rate_limit_codex_retry_no_duration_falls_through(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Codex retry text without a parsed duration should not trigger a pause."""
+    """Codex retry text without a parsed duration should use generic fallback."""
     from src.config import CoderType
 
     _patch_subprocess(monkeypatch)
@@ -5976,14 +5976,14 @@ def test_detect_rate_limit_codex_retry_no_duration_does_not_trigger(
         "Rate limit reached. Please try again in 6.379s",
         coder_name="codex",
     )
-    assert runner.state.rate_limited_until is None
-    assert runner.state.rate_limit_reactive_coder is None
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "codex"
 
 
 def test_detect_rate_limit_anthropic_regex_skipped_for_codex(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Anthropic percentage pattern should not trigger when coder is codex."""
+    """Anthropic percentage pattern should fall through to generic Codex fallback."""
     from src.config import CoderType
 
     _patch_subprocess(monkeypatch)
@@ -5993,8 +5993,8 @@ def test_detect_rate_limit_anthropic_regex_skipped_for_codex(
         "Warning: 95% of session rate limit reached",
         coder_name="codex",
     )
-    assert runner.state.rate_limited_until is None
-    assert runner.state.rate_limit_reactive_coder is None
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "codex"
 
 
 def test_detect_rate_limit_codex_progress_output_does_not_trigger(

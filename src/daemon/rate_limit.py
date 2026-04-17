@@ -197,6 +197,15 @@ class RateLimitMixin:
             triggered = True
             limit_type = "session"
 
+        # Codex progress output can report remaining budget on stderr.
+        codex_usage_progress = bool(
+            coder_name == "codex"
+            and re.search(
+                r"\b(?:weekly|week|session)\s+rate\s*limit\b[^\n]*\b\d{1,3}%\s+remaining\b",
+                lower,
+            )
+        )
+
         # Generic "rate limit" fallback (both coders).
         # Skip only if the coder-specific regex actually extracted a value.
         anthropic_handled = m_anthropic and coder_name == "claude"
@@ -206,7 +215,7 @@ class RateLimitMixin:
             and not anthropic_handled
             and not codex_retry_handled
             and "rate limit" in lower
-            and coder_name != "codex"
+            and not codex_usage_progress
         ):
             if "weekly" in lower or "week" in lower:
                 limit_type = "weekly"
