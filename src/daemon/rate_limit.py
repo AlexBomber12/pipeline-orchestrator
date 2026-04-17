@@ -9,6 +9,7 @@ Mixin methods:
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -175,9 +176,13 @@ class RateLimitMixin:
                 limit_type = "session"
                 triggered = pct >= session_threshold
 
-        # Codex "try again in X days Y hours Z minutes" pattern
+        # Codex "try again in X days Y hours Z minutes/seconds" pattern
         m_codex_retry = re.search(
-            r"try again in\s+(?:(\d+)\s*days?)?\s*(?:(\d+)\s*hours?)?\s*(?:(\d+)\s*minutes?)?",
+            r"try again in\s+"
+            r"(?:(\d+)\s*days?)?\s*"
+            r"(?:(\d+)\s*hours?)?\s*"
+            r"(?:(\d+)\s*minutes?)?\s*"
+            r"(?:(\d+(?:\.\d+)?)\s*(?:seconds?|secs?|s))?",
             lower,
         )
         codex_retry_parsed = False
@@ -185,11 +190,12 @@ class RateLimitMixin:
             days = int(m_codex_retry.group(1) or 0)
             hours = int(m_codex_retry.group(2) or 0)
             minutes = int(m_codex_retry.group(3) or 0)
-            total_min = days * 1440 + hours * 60 + minutes
-            if total_min > 0:
+            seconds = float(m_codex_retry.group(4) or 0)
+            total_seconds = days * 86400 + hours * 3600 + minutes * 60 + seconds
+            if total_seconds > 0:
                 codex_retry_parsed = True
                 triggered = True
-                pause_min = total_min
+                pause_min = max(1, math.ceil(total_seconds / 60))
                 limit_type = "weekly" if days > 0 or hours > 12 else "session"
 
         # Codex "You've hit your usage limit"
@@ -197,26 +203,23 @@ class RateLimitMixin:
             triggered = True
             limit_type = "session"
 
-        # Codex progress output can report non-exhausted remaining budget on stderr.
-        m_codex_usage_progress = (
-            re.search(
-                r"\b(?:weekly|week|session)\s+rate\s*limit\b[^\n]*\b(\d{1,3})%\s+remaining\b",
-                lower,
+        # Codex error fallback for unmatched rate-limit failures that still
+        # carry concrete retry language, while ignoring progress-only stderr.
+        if (
+            not triggered
+            and coder_name == "codex"
+            and "rate limit" in lower
+            and (
+                "rate limit exceeded" in lower
+                or "please try again" in lower
+                or "try again later" in lower
+                or "retry later" in lower
             )
-            if coder_name == "codex"
-            else None
-        )
-        codex_usage_progress = bool(
-            m_codex_usage_progress
-            and int(m_codex_usage_progress.group(1)) > 0
-            and "rate limit reached" not in lower
-            and "try again in" not in lower
-            and "usage limit" not in lower
-            and "error" not in lower
-        )
+        ):
+            triggered = True
+            limit_type = "weekly" if "weekly" in lower or "week" in lower else "session"
 
-        # Generic "rate limit" fallback (both coders).
-        # Skip only if the coder-specific regex actually extracted a value.
+        # Generic "rate limit" fallback for non-Codex stderr only.
         anthropic_handled = m_anthropic and coder_name == "claude"
         codex_retry_handled = codex_retry_parsed
         if (
@@ -224,7 +227,7 @@ class RateLimitMixin:
             and not anthropic_handled
             and not codex_retry_handled
             and "rate limit" in lower
-            and not codex_usage_progress
+            and coder_name != "codex"
         ):
             if "weekly" in lower or "week" in lower:
                 limit_type = "weekly"
