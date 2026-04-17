@@ -1657,22 +1657,28 @@ return 0
                 raise
             # Record the PR if Claude already created one before cancellation,
             # so it enters WATCH/auto-merge flow after pause expiry.
+            # Retry up to 3 times — PR list visibility is eventually consistent.
             if target_branch:
-                try:
-                    prs = github_client.get_open_prs(
-                        self.owner_repo,
-                        allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
-                    )
-                    match = next(
-                        (pr for pr in prs if pr.branch == target_branch), None
-                    )
-                    if match:
-                        self.state.current_pr = match
-                        self.log_event(
-                            f"Recorded PR #{match.number} before breach-cancel pause"
+                for _attempt in range(3):
+                    try:
+                        prs = github_client.get_open_prs(
+                            self.owner_repo,
+                            allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
                         )
-                except Exception:
-                    pass  # best-effort; the pause is still correct
+                        match = next(
+                            (pr for pr in prs if pr.branch == target_branch),
+                            None,
+                        )
+                        if match:
+                            self.state.current_pr = match
+                            self.log_event(
+                                f"Recorded PR #{match.number} before breach-cancel pause"
+                            )
+                            break
+                    except Exception:
+                        pass  # best-effort; the pause is still correct
+                    if _attempt < 2:
+                        time.sleep(5)
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
             self.log_event(
@@ -1688,22 +1694,28 @@ return 0
         if breach_flag["breached"]:
             # Record the PR if Claude already created one, so it is not
             # orphaned while the runner is paused.
+            # Retry up to 3 times — PR list visibility is eventually consistent.
             if target_branch:
-                try:
-                    prs = github_client.get_open_prs(
-                        self.owner_repo,
-                        allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
-                    )
-                    match = next(
-                        (pr for pr in prs if pr.branch == target_branch), None
-                    )
-                    if match:
-                        self.state.current_pr = match
-                        self.log_event(
-                            f"Recorded PR #{match.number} before late-breach pause"
+                for _attempt in range(3):
+                    try:
+                        prs = github_client.get_open_prs(
+                            self.owner_repo,
+                            allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
                         )
-                except Exception:
-                    pass  # best-effort; the pause is still correct
+                        match = next(
+                            (pr for pr in prs if pr.branch == target_branch),
+                            None,
+                        )
+                        if match:
+                            self.state.current_pr = match
+                            self.log_event(
+                                f"Recorded PR #{match.number} before late-breach pause"
+                            )
+                            break
+                    except Exception:
+                        pass  # best-effort; the pause is still correct
+                    if _attempt < 2:
+                        await asyncio.sleep(5)
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
             self.log_event(
