@@ -1678,7 +1678,7 @@ return 0
                     except Exception:
                         pass  # best-effort; the pause is still correct
                     if _attempt < 2:
-                        time.sleep(5)
+                        await asyncio.sleep(5)
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
             self.log_event(
