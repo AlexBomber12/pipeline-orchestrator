@@ -1564,13 +1564,14 @@ return 0
         coder = self.repo_config.coder or self.app_config.daemon.coder
         effective_coder = proactive_coder or coder.value
         if self.state.rate_limited_until is not None:
-            # Diagnosis pauses always use Claude — honour regardless of coder
-            # and regardless of whether the pause is reactive or proactive.
-            # Treat None (legacy/unattributed) as potentially Claude to avoid
-            # clearing diagnosis pauses from pre-PR-066 state.
+            # Legacy pauses (pre-PR-066) have no coder attribution;
+            # treat them as Claude since that was the only coder.
+            pause_coder = self.state.rate_limit_reactive_coder or "claude"
+            # Diagnosis pauses always use Claude — honour regardless of
+            # the repo's configured coder.
             diagnosis_pause = (
                 self.state.error_message is not None
-                and self.state.rate_limit_reactive_coder in ("claude", None)
+                and pause_coder == "claude"
             )
             # A pause from a *different* effective coder doesn't apply.
             # When proactive_coder is set (e.g. "claude" for merge/diagnosis),
@@ -1578,8 +1579,7 @@ return 0
             # configured coder is used.
             other_coder = (
                 not diagnosis_pause
-                and self.state.rate_limit_reactive_coder is not None
-                and self.state.rate_limit_reactive_coder != effective_coder
+                and pause_coder != effective_coder
             )
             clearable = other_coder
             if clearable:
@@ -1708,21 +1708,20 @@ return 0
             self.state.state = PipelineState.IDLE
             return
         # A pause from a different coder doesn't apply after switching.
-        # Diagnosis pauses always use Claude — honour regardless of coder
-        # and regardless of whether the pause is reactive or proactive.
-        # Treat None (legacy/unattributed) as potentially Claude to avoid
-        # clearing diagnosis pauses from pre-PR-066 state.
+        # Legacy pauses (pre-PR-066) have no coder attribution;
+        # treat them as Claude since that was the only coder.
         coder = self.repo_config.coder or self.app_config.daemon.coder
+        pause_coder = self.state.rate_limit_reactive_coder or "claude"
+        # Diagnosis pauses always use Claude — honour regardless of
+        # the repo's configured coder.
         diagnosis_pause = (
             self.state.error_message is not None
-            and self.state.rate_limit_reactive_coder in ("claude", None)
+            and pause_coder == "claude"
         )
         # A pause from a different coder doesn't block the current coder.
-        # handle_paused uses the repo coder (no proactive_coder context).
         other_coder = (
             not diagnosis_pause
-            and self.state.rate_limit_reactive_coder is not None
-            and self.state.rate_limit_reactive_coder != coder.value
+            and pause_coder != coder.value
         )
         clearable = other_coder
         if clearable:
