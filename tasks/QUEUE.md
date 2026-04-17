@@ -401,7 +401,7 @@
 - Branch: pr-067-test-hygiene
 
 ## PR-068: Remove heartbeat spam from event log
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-068.md
 - Branch: pr-068-heartbeat-cleanup
 
