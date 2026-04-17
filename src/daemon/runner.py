@@ -305,7 +305,6 @@ class PipelineRunner(
         """Publish state every 30s while a long-running CLI call is active."""
         while True:
             await asyncio.sleep(30)
-            self.log_event(f"{label}...")
             try:
                 await self.publish_state()
             except Exception:
