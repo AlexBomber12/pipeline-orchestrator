@@ -158,6 +158,7 @@ class PipelineRunner(
         self._error_diagnose_count = 0
         self._error_skip_context: str | None = None
         self._error_skip_count = 0
+        self._error_skip_active = False
         self._last_push_at: datetime | None = None
         self._last_push_at_pr_number: int | None = None
         self._usage_degraded_logged = False
@@ -380,5 +381,14 @@ class PipelineRunner(
                 self.log_event("Legacy ERROR + rate_limited_until -> PAUSED")
             elif self.app_config.daemon.error_handler_use_ai:
                 await self.handle_error()
+
+        if (
+            current != PipelineState.ERROR
+            and self._error_skip_active
+            and self.state.state != PipelineState.ERROR
+        ):
+            self._error_skip_context = None
+            self._error_skip_count = 0
+            self._error_skip_active = False
 
         await self.publish_state()

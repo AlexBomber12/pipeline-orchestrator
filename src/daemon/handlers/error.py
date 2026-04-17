@@ -60,6 +60,7 @@ class ErrorMixin:
                 else:
                     self._error_skip_context = context
                     self._error_skip_count = 1
+                self._error_skip_active = True
                 if self._error_skip_count > 3:
                     self.log_event(
                         "Skipping AI diagnosis: Claude rate limited; "
@@ -74,6 +75,7 @@ class ErrorMixin:
 
         self._error_skip_context = None
         self._error_skip_count = 0
+        self._error_skip_active = False
         category = _classify_error(context)
         if category == ErrorCategory.RATE_LIMIT:
             self.log_event("Skipping AI diagnosis for rate-limit error")
