@@ -416,7 +416,7 @@
 - Branch: pr-070-async-merge-resolve
 
 ## PR-071: Pydantic validation for config fields
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-071.md
 - Branch: pr-071-config-validation
 

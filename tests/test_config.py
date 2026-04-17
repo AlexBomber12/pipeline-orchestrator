@@ -344,6 +344,30 @@ def test_daemon_config_planned_pr_timeout_default() -> None:
     assert DaemonConfig().planned_pr_timeout_sec == 900
 
 
+def test_config_rejects_negative_review_timeout(tmp_path: Path) -> None:
+    from pydantic import ValidationError
+
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n  review_timeout_min: -1\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(str(cfg_path))
+
+
+def test_config_rejects_zero_planned_pr_timeout(tmp_path: Path) -> None:
+    from pydantic import ValidationError
+
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n  planned_pr_timeout_sec: 0\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(str(cfg_path))
+
+
 def test_update_daemon_config_accepts_timeouts(tmp_path: Path) -> None:
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text("daemon: {}\n", encoding="utf-8")
@@ -371,6 +395,19 @@ def test_daemon_config_rate_limit_defaults() -> None:
 
     assert DaemonConfig().rate_limit_session_pause_percent == 95
     assert DaemonConfig().rate_limit_weekly_pause_percent == 100
+
+
+def test_config_rejects_rate_limit_over_100(tmp_path: Path) -> None:
+    from pydantic import ValidationError
+
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n  rate_limit_session_pause_percent: 101\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(str(cfg_path))
 
 
 def test_update_daemon_config_rate_limit_session(tmp_path: Path) -> None:
@@ -440,6 +477,16 @@ def test_repo_allow_merge_without_checks_loads_from_yaml(tmp_path: Path) -> None
     )
     cfg = load_config(str(cfg_path))
     assert cfg.repositories[0].allow_merge_without_checks is True
+
+
+def test_config_rejects_invalid_port(tmp_path: Path) -> None:
+    from pydantic import ValidationError
+
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text("web:\n  port: 70000\n", encoding="utf-8")
+
+    with pytest.raises(ValidationError):
+        load_config(str(cfg_path))
 
 
 def test_update_repository_allow_merge_without_checks(tmp_path: Path) -> None:
