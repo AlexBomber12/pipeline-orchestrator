@@ -21,10 +21,13 @@ are propagated onto existing runners without restarting the process.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import shutil
 import subprocess
 import time
+from pathlib import Path
 from typing import Any
 
 import redis.asyncio as aioredis
@@ -86,6 +89,56 @@ def _validate_auth() -> dict[str, bool]:
             checks[name] = False
     logger.info("Auth status: %s", checks)
     return checks
+
+
+_BREACH_DIR = "/tmp/pipeline-breach"
+
+
+def _clean_breach_dir() -> None:
+    """Remove all stale breach markers on daemon startup."""
+    breach_path = Path(_BREACH_DIR)
+    if breach_path.is_symlink() or breach_path.exists():
+        if breach_path.is_dir() and not breach_path.is_symlink():
+            shutil.rmtree(breach_path, ignore_errors=True)
+        else:
+            breach_path.unlink()
+    breach_path.mkdir(parents=True, exist_ok=True)
+
+
+def _install_statusline_hook(claude_config_dir: str) -> None:
+    """Register the statusline hook in Claude CLI settings.
+
+    Merges with existing settings. If a non-default statusLine command is
+    already present, logs a warning and preserves it.
+    """
+    settings_path = Path(claude_config_dir) / "settings.json"
+    try:
+        existing = json.loads(settings_path.read_text()) if settings_path.is_file() else {}
+    except (OSError, json.JSONDecodeError):
+        existing = {}
+
+    hook_path = str(Path(__file__).resolve().parent.parent.parent / "scripts" / "statusline_hook.py")
+    expected_command = f"python3 {hook_path}"
+
+    current_sl = existing.get("statusLine")
+    if isinstance(current_sl, dict):
+        current_cmd = current_sl.get("command", "")
+        if current_cmd and current_cmd != expected_command:
+            logger.warning(
+                "statusLine already configured to %r; not overwriting "
+                "(set daemon.install_statusline_hook=false to suppress)",
+                current_cmd,
+            )
+            return
+
+    existing["statusLine"] = {
+        "type": "command",
+        "command": expected_command,
+        "padding": 0,
+    }
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(existing, indent=2))
+    logger.info("Installed statusline hook at %s", settings_path)
 
 
 def _build_runner(
@@ -164,6 +217,14 @@ async def main() -> None:
         )
 
     config = load_config()
+
+    _clean_breach_dir()
+    if config.daemon.install_statusline_hook:
+        try:
+            _install_statusline_hook(config.auth.claude_config_dir)
+        except Exception:
+            logger.warning("Failed to install statusline hook", exc_info=True)
+
     redis_url = os.environ.get("REDIS_URL", DEFAULT_REDIS_URL)
     redis_client = aioredis.from_url(redis_url, decode_responses=True)
 

@@ -557,3 +557,70 @@ def test_unpause_runs_immediately(
     # Cycle 2 (t=10): re-enabled, should run immediately despite interval=100
     # because pause cleared last_run.
     assert runner.cycles == 2
+
+
+# ---- Statusline hook installer tests ----
+
+
+def test_install_statusline_hook_creates_settings(tmp_path: Any) -> None:
+    """Hook installer creates settings.json with statusLine block."""
+    main_module._install_statusline_hook(str(tmp_path))
+
+    import json
+    settings = json.loads((tmp_path / "settings.json").read_text())
+    assert "statusLine" in settings
+    assert settings["statusLine"]["type"] == "command"
+    assert "statusline_hook.py" in settings["statusLine"]["command"]
+
+
+def test_install_statusline_hook_preserves_existing_keys(tmp_path: Any) -> None:
+    """Hook installer merges into existing settings without clobbering."""
+    import json
+    existing = {"theme": "dark", "someKey": True}
+    (tmp_path / "settings.json").write_text(json.dumps(existing))
+
+    main_module._install_statusline_hook(str(tmp_path))
+
+    settings = json.loads((tmp_path / "settings.json").read_text())
+    assert settings["theme"] == "dark"
+    assert settings["someKey"] is True
+    assert "statusLine" in settings
+
+
+def test_install_statusline_hook_respects_operator_override(
+    tmp_path: Any,
+) -> None:
+    """Hook installer does not overwrite a non-default statusLine command."""
+    import json
+    existing = {
+        "statusLine": {
+            "type": "command",
+            "command": "ccusage --custom",
+            "padding": 0,
+        }
+    }
+    (tmp_path / "settings.json").write_text(json.dumps(existing))
+
+    main_module._install_statusline_hook(str(tmp_path))
+
+    settings = json.loads((tmp_path / "settings.json").read_text())
+    assert settings["statusLine"]["command"] == "ccusage --custom"
+
+
+def test_clean_breach_dir_removes_stale_markers(tmp_path: Any) -> None:
+    """_clean_breach_dir removes all files in the breach directory."""
+    import json
+
+    monkeypatch_breach = str(tmp_path / "breach")
+    (tmp_path / "breach").mkdir()
+    (tmp_path / "breach" / "stale.breach").write_text('{"type":"session"}')
+
+    original = main_module._BREACH_DIR
+    main_module._BREACH_DIR = monkeypatch_breach
+    try:
+        main_module._clean_breach_dir()
+        # Directory should exist but be empty (old files removed)
+        assert (tmp_path / "breach").is_dir()
+        assert not list((tmp_path / "breach").glob("*.breach"))
+    finally:
+        main_module._BREACH_DIR = original
