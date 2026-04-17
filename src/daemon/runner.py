@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -93,6 +94,12 @@ _QUEUE_SYNC_MAX_WAIT_SEC = 3600
 # returns IDLE instead of ERROR. Without this safety net a single
 # interrupted Claude run can leave the runner stuck in ERROR forever.
 _DIRTY_CYCLES_BEFORE_AUTO_RESET = 3
+
+# Directory where the statusline hook writes breach marker files.
+_BREACH_DIR = "/tmp/pipeline-breach"
+
+# Poll interval for the in-flight breach monitor (seconds).
+_BREACH_POLL_SEC = 2
 
 
 def repo_owner_from_url(url: str) -> str:
@@ -1623,15 +1630,42 @@ return 0
             self.log_event(self.state.error_message)
             return
 
+        breach_dir, breach_run_id = self._breach_env()
+        breach_flag: dict[str, bool] = {"breached": False}
+
         heartbeat = asyncio.create_task(self._publish_while_waiting("CODING"))
-        try:
-            code, stdout, stderr = await claude_cli.run_planned_pr_async(
+        claude_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
+            claude_cli.run_planned_pr_async(
                 self.repo_path,
                 model=self.app_config.daemon.claude_model,
                 timeout=self.app_config.daemon.planned_pr_timeout_sec,
+                breach_dir=breach_dir,
+                breach_run_id=breach_run_id,
+                session_threshold=self.app_config.daemon.rate_limit_session_pause_percent,
+                weekly_threshold=self.app_config.daemon.rate_limit_weekly_pause_percent,
             )
+        )
+        breach_monitor = asyncio.create_task(
+            self._monitor_inflight_breach(
+                breach_dir, breach_run_id, claude_task, breach_flag,
+            )
+        )
+        try:
+            code, stdout, stderr = await claude_task
+        except asyncio.CancelledError:
+            if not breach_flag["breached"]:
+                raise
+            self.state.state = PipelineState.PAUSED
+            self.state.error_message = None
+            self.log_event(
+                f"CODING aborted: in-flight rate limit breach, "
+                f"paused until {self.state.rate_limited_until}"
+            )
+            return
         finally:
+            breach_monitor.cancel()
             heartbeat.cancel()
+            self._cleanup_breach_marker(breach_dir, breach_run_id)
         await self._save_cli_log(stdout, stderr, "PLANNED PR output")
         self._detect_rate_limit(stderr)
         if code != 0:
@@ -1870,6 +1904,58 @@ return 0
                 target.cancel()
                 return
 
+    async def _monitor_inflight_breach(
+        self,
+        breach_dir: str,
+        run_id: str,
+        claude_task: asyncio.Task,  # type: ignore[type-arg]
+        breach_flag: dict[str, bool],
+    ) -> None:
+        """Cancel *claude_task* if the statusline hook writes a breach marker."""
+        marker = Path(breach_dir) / f"{run_id}.breach"
+        while not claude_task.done():
+            if marker.is_file():
+                try:
+                    data = json.loads(marker.read_text())
+                except (OSError, json.JSONDecodeError):
+                    await asyncio.sleep(_BREACH_POLL_SEC)
+                    continue
+                resets_at = data.get("resets_at", 0)
+                if resets_at:
+                    self.state.rate_limited_until = datetime.fromtimestamp(
+                        resets_at, tz=timezone.utc
+                    )
+                else:
+                    self.state.rate_limited_until = (
+                        datetime.now(timezone.utc) + timedelta(minutes=30)
+                    )
+                breach_type = data.get("type", "session")
+                pct_key = "session_pct" if breach_type == "session" else "weekly_pct"
+                pct_val = data.get(pct_key, "?")
+                self.log_event(
+                    f"In-flight breach: {breach_type} at {pct_val}%, "
+                    f"killing Claude CLI"
+                )
+                breach_flag["breached"] = True
+                claude_task.cancel()
+                return
+            await asyncio.sleep(_BREACH_POLL_SEC)
+
+    def _breach_env(self) -> tuple[str, str]:
+        """Return ``(breach_dir, run_id)`` for an in-flight breach monitor."""
+        breach_dir = _BREACH_DIR
+        Path(breach_dir).mkdir(parents=True, exist_ok=True)
+        run_id = uuid.uuid4().hex[:12]
+        return breach_dir, run_id
+
+    def _cleanup_breach_marker(self, breach_dir: str, run_id: str) -> None:
+        """Remove the breach marker file for a completed run."""
+        marker = Path(breach_dir) / f"{run_id}.breach"
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     async def handle_fix(self) -> None:
         """Run ``FIX REVIEW`` via the claude CLI and return to WATCH."""
         if not await self._check_rate_limit():
@@ -1949,20 +2035,40 @@ return 0
             self.state.current_pr.number if self.state.current_pr else 0
         )
 
+        breach_dir, breach_run_id = self._breach_env()
+        breach_flag: dict[str, bool] = {"breached": False}
         idle_flag: dict[str, bool] = {"timed_out": False}
+
         heartbeat = asyncio.create_task(self._publish_while_waiting("FIX"))
         claude_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
             claude_cli.fix_review_async(
                 self.repo_path,
                 model=self.app_config.daemon.claude_model,
+                breach_dir=breach_dir,
+                breach_run_id=breach_run_id,
+                session_threshold=self.app_config.daemon.rate_limit_session_pause_percent,
+                weekly_threshold=self.app_config.daemon.rate_limit_weekly_pause_percent,
             )
         )
         idle_monitor = asyncio.create_task(
             self._monitor_fix_idle(pr_number, idle_limit, claude_task, idle_flag)
         )
+        breach_monitor = asyncio.create_task(
+            self._monitor_inflight_breach(
+                breach_dir, breach_run_id, claude_task, breach_flag,
+            )
+        )
         try:
             code, stdout, stderr = await claude_task
         except asyncio.CancelledError:
+            if breach_flag["breached"]:
+                self.state.state = PipelineState.PAUSED
+                self.state.error_message = None
+                self.log_event(
+                    f"FIX aborted: in-flight rate limit breach, "
+                    f"paused until {self.state.rate_limited_until}"
+                )
+                return
             if not idle_flag["timed_out"]:
                 raise
             self.state.state = PipelineState.ERROR
@@ -1973,8 +2079,10 @@ return 0
             await self._save_cli_log("", "", "FIX idle timeout")
             return
         finally:
+            breach_monitor.cancel()
             idle_monitor.cancel()
             heartbeat.cancel()
+            self._cleanup_breach_marker(breach_dir, breach_run_id)
         await self._save_cli_log(stdout, stderr, "FIX REVIEW output")
         self._detect_rate_limit(stderr)
         if code != 0:

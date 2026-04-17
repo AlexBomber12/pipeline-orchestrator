@@ -314,7 +314,7 @@ def test_handle_idle_picks_task_and_drives_coding(
     claude_calls: list[str] = []
 
     async def fake_run_planned_pr(
-        path: str, model: str | None = None, timeout: int | None = None
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
     ) -> tuple[int, str, str]:
         claude_calls.append(path)
         return (0, "ok", "")
@@ -807,7 +807,7 @@ def test_handle_fix_fetches_and_resets_branch_before_fix_review(
     fix_called_at: list[int] = []
 
     async def fake_fix(
-        path: str, model: str | None = None, timeout: int | None = None
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
     ) -> tuple[int, str, str]:
         fix_called_at.append(len(calls))
         return (0, "", "")
@@ -1028,7 +1028,7 @@ def test_handle_coding_retries_pr_detection(
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.number == 42
     assert call_count["n"] == 2
-    assert slept == [5]
+    assert 5 in slept
     assert any(
         "PR not found for 'pr-001'" in e["event"] and "1/3" in e["event"]
         for e in runner.state.history
@@ -1073,7 +1073,7 @@ def test_handle_coding_errors_after_all_retries(
     assert runner.state.state == PipelineState.ERROR
     assert "no PR found" in (runner.state.error_message or "")
     assert call_count["n"] == 3
-    assert slept == [5, 5]
+    assert slept.count(5) == 2
 
 
 def test_handle_watch_approved_and_green_merges(
@@ -3371,7 +3371,7 @@ def test_handle_fix_skips_fork(monkeypatch: pytest.MonkeyPatch) -> None:
     fix_called: list[bool] = []
 
     async def fake_fix(
-        path: str, model: str | None = None, timeout: int | None = None
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
     ) -> tuple[int, str, str]:
         fix_called.append(True)
         return (0, "", "")
@@ -3401,7 +3401,7 @@ def test_handle_coding_uses_configured_timeout(
     captured: dict[str, Any] = {}
 
     async def fake_planned(
-        path: str, model: str | None = None, timeout: int | None = None
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
     ) -> tuple[int, str, str]:
         captured["timeout"] = timeout
         return (0, "", "")
@@ -3440,7 +3440,7 @@ def test_fix_idle_timeout_kills_on_no_push(
     _patch_subprocess(monkeypatch)
 
     async def fake_fix_hangs(
-        path: str, model: str | None = None, timeout: int | None = None
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
     ) -> tuple[int, str, str]:
         await asyncio.Future()
         return (0, "", "")
@@ -3488,7 +3488,7 @@ def test_fix_idle_timeout_resets_on_push(
     _patch_subprocess(monkeypatch)
 
     async def fake_fix_quick(
-        path: str, model: str | None = None, timeout: int | None = None
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
     ) -> tuple[int, str, str]:
         await asyncio.sleep(0)
         return (0, "", "")
@@ -3533,7 +3533,7 @@ def test_fix_idle_timeout_monitor_resets_on_push(
         await asyncio.sleep(0)
 
     async def fake_fix_quick(
-        path: str, model: str | None = None, timeout: int | None = None
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
     ) -> tuple[int, str, str]:
         await asyncio.sleep(0)
         return (0, "", "")
@@ -4187,7 +4187,7 @@ def test_handle_coding_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:
     sync_calls: list[str] = []
 
     async def fake_async(
-        path: str, model: str | None = None, timeout: int | None = None
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
     ) -> tuple[int, str, str]:
         async_calls.append(path)
         return (0, "ok", "")
@@ -4228,7 +4228,7 @@ def test_handle_fix_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:
     sync_calls: list[str] = []
 
     async def fake_async(
-        path: str, model: str | None = None, timeout: int | None = None
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
     ) -> tuple[int, str, str]:
         async_calls.append(path)
         return (0, "", "")
@@ -4272,7 +4272,7 @@ def test_handle_coding_publishes_heartbeat(
     cli_done = None
 
     async def slow_cli(
-        path: str, model: str | None = None, timeout: int | None = None
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
     ) -> tuple[int, str, str]:
         nonlocal cli_done
         cli_done = asyncio.get_event_loop().create_future()
@@ -4336,7 +4336,7 @@ def test_handle_fix_publishes_heartbeat(
     cli_done = None
 
     async def slow_cli(
-        path: str, model: str | None = None, timeout: int | None = None
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
     ) -> tuple[int, str, str]:
         nonlocal cli_done
         cli_done = asyncio.get_event_loop().create_future()
@@ -5115,3 +5115,222 @@ def test_rate_limited_until_uses_resets_at_timestamp(
     asyncio.run(runner._check_rate_limit())
     assert runner.state.rate_limited_until is not None
     assert int(runner.state.rate_limited_until.timestamp()) == resets_at
+
+
+# ---- In-flight breach monitor tests ----
+
+
+def test_monitor_inflight_breach_cancels_claude_task_on_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Breach marker file triggers task cancellation and PAUSED state."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(runner_module, "_BREACH_DIR", str(tmp_path))
+    monkeypatch.setattr(runner_module, "_BREACH_POLL_SEC", 0.05)
+
+    breach_run_id = "test-breach-001"
+
+    async def _run() -> None:
+        runner = _make_runner()
+        runner._usage_provider = _FakeUsageProvider()
+
+        cancelled = asyncio.Event()
+
+        async def fake_cli_forever() -> tuple[int, str, str]:
+            try:
+                await asyncio.sleep(999)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            return (0, "", "")
+
+        task = asyncio.create_task(fake_cli_forever())
+        breach_flag: dict[str, bool] = {"breached": False}
+        monitor = asyncio.create_task(
+            runner._monitor_inflight_breach(
+                str(tmp_path), breach_run_id, task, breach_flag,
+            )
+        )
+
+        # Write breach marker after a short delay
+        await asyncio.sleep(0.1)
+        marker = tmp_path / f"{breach_run_id}.breach"
+        marker.write_text(json.dumps({
+            "type": "session",
+            "resets_at": 1700000000,
+            "session_pct": 97,
+            "weekly_pct": 30,
+            "detected_at": 1234567890.0,
+        }))
+
+        # Wait for monitor to detect and cancel
+        await asyncio.sleep(0.3)
+        assert breach_flag["breached"] is True
+        assert cancelled.is_set()
+        assert runner.state.rate_limited_until is not None
+
+        monitor.cancel()
+
+    asyncio.run(_run())
+
+
+def test_monitor_inflight_breach_sets_paused_state_with_resets_at(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Breach monitor sets rate_limited_until from breach marker resets_at."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(runner_module, "_BREACH_DIR", str(tmp_path))
+    monkeypatch.setattr(runner_module, "_BREACH_POLL_SEC", 0.05)
+
+    breach_run_id = "test-resets-at"
+
+    async def _run() -> None:
+        runner = _make_runner()
+        runner._usage_provider = _FakeUsageProvider()
+
+        async def fake_cli() -> tuple[int, str, str]:
+            await asyncio.sleep(999)
+            return (0, "", "")
+
+        task = asyncio.create_task(fake_cli())
+        breach_flag: dict[str, bool] = {"breached": False}
+        monitor = asyncio.create_task(
+            runner._monitor_inflight_breach(
+                str(tmp_path), breach_run_id, task, breach_flag,
+            )
+        )
+
+        marker = tmp_path / f"{breach_run_id}.breach"
+        marker.write_text(json.dumps({
+            "type": "weekly",
+            "resets_at": 1800000000,
+            "session_pct": 50,
+            "weekly_pct": 105,
+            "detected_at": 1234567890.0,
+        }))
+
+        await asyncio.sleep(0.3)
+        assert runner.state.rate_limited_until is not None
+        assert int(runner.state.rate_limited_until.timestamp()) == 1800000000
+
+        monitor.cancel()
+
+    asyncio.run(_run())
+
+
+def test_monitor_inflight_breach_exits_when_claude_task_completes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Monitor exits cleanly when the CLI task completes without a breach."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(runner_module, "_BREACH_DIR", str(tmp_path))
+    monkeypatch.setattr(runner_module, "_BREACH_POLL_SEC", 0.05)
+
+    breach_run_id = "test-no-breach"
+
+    async def _run() -> None:
+        runner = _make_runner()
+        runner._usage_provider = _FakeUsageProvider()
+
+        async def fake_cli_quick() -> tuple[int, str, str]:
+            await asyncio.sleep(0.05)
+            return (0, "done", "")
+
+        task = asyncio.create_task(fake_cli_quick())
+        breach_flag: dict[str, bool] = {"breached": False}
+        monitor = asyncio.create_task(
+            runner._monitor_inflight_breach(
+                str(tmp_path), breach_run_id, task, breach_flag,
+            )
+        )
+
+        result = await task
+        # Give monitor a moment to notice the task is done
+        await asyncio.sleep(0.2)
+
+        assert breach_flag["breached"] is False
+        assert runner.state.rate_limited_until is None
+
+        monitor.cancel()
+
+    asyncio.run(_run())
+
+
+def test_handle_coding_cleans_up_breach_marker_after_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Breach marker is cleaned up after handle_coding completes."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(runner_module, "_BREACH_DIR", str(tmp_path))
+
+    captured_run_id: list[str] = []
+
+    async def fake_planned(
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+    ) -> tuple[int, str, str]:
+        run_id = kwargs.get("breach_run_id", "")
+        if run_id:
+            captured_run_id.append(run_id)
+            # Simulate breach marker written by hook
+            marker = tmp_path / f"{run_id}.breach"
+            marker.write_text('{"type":"session","resets_at":0}')
+        return (0, "ok", "")
+
+    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr_async", fake_planned)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [PRInfo(number=1, branch="pr-001")],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "post_comment", lambda *a, **kw: None,
+    )
+
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001",
+    )
+    asyncio.run(runner.handle_coding())
+
+    # The marker should have been cleaned up
+    assert captured_run_id
+    marker = tmp_path / f"{captured_run_id[0]}.breach"
+    assert not marker.exists()
+
+
+def test_handle_coding_pauses_on_inflight_breach(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """handle_coding transitions to PAUSED when in-flight breach is detected."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(runner_module, "_BREACH_DIR", str(tmp_path))
+    monkeypatch.setattr(runner_module, "_BREACH_POLL_SEC", 0.05)
+
+    async def fake_planned_hangs(
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+    ) -> tuple[int, str, str]:
+        run_id = kwargs.get("breach_run_id", "")
+        # Write breach marker immediately to simulate mid-flight breach
+        if run_id:
+            marker = tmp_path / f"{run_id}.breach"
+            marker.write_text(json.dumps({
+                "type": "session",
+                "resets_at": 1700000000,
+                "session_pct": 98,
+                "weekly_pct": 30,
+                "detected_at": 1234567890.0,
+            }))
+        await asyncio.sleep(999)  # Block until cancelled
+        return (0, "", "")
+
+    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr_async", fake_planned_hangs)
+
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001",
+    )
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.error_message is None

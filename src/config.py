@@ -38,6 +38,7 @@ _DAEMON_FIELDS = {
     "usage_api_user_agent",
     "usage_api_beta_header",
     "usage_api_cache_ttl_sec",
+    "install_statusline_hook",
 }
 
 
@@ -83,6 +84,7 @@ class DaemonConfig(BaseModel):
     usage_api_user_agent: str = "claude-code/2.1.104"
     usage_api_beta_header: str = "oauth-2025-04-20"
     usage_api_cache_ttl_sec: int = Field(default=60, ge=5, le=3600)
+    install_statusline_hook: bool = True
 
 
 class WebConfig(BaseModel):

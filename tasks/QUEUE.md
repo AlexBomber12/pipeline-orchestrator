@@ -372,7 +372,7 @@
 - Depends on: PR-062
 
 ## PR-064: In-flight rate limit monitor via statusline hook
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-064.md
 - Branch: pr-064-statusline-inflight-monitor
 - Depends on: PR-063

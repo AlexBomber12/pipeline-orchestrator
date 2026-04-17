@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import subprocess
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,10 @@ async def run_claude_async(
     timeout: int | None = 600,
     model: str | None = None,
     system_prompt_file: str | None = "CLAUDE.md",
+    breach_dir: str | None = None,
+    breach_run_id: str | None = None,
+    session_threshold: int | None = None,
+    weekly_threshold: int | None = None,
 ) -> tuple[int, str, str]:
     cmd = [
         "claude",
@@ -149,6 +154,18 @@ async def run_claude_async(
     cmd.append(prompt)
     logger.info("running claude CLI with prompt: %s", prompt[:80])
     env = {**os.environ, "NODE_OPTIONS": _build_node_options()}
+
+    # In-flight rate-limit monitoring: the caller provides a breach_dir
+    # and run_id so the statusline hook can write a breach marker that the
+    # daemon monitors concurrently.
+    if breach_dir is not None:
+        env["PIPELINE_BREACH_DIR"] = breach_dir
+        env["PIPELINE_RUN_ID"] = breach_run_id or uuid.uuid4().hex[:12]
+        if session_threshold is not None:
+            env["PIPELINE_SESSION_THRESHOLD"] = str(session_threshold)
+        if weekly_threshold is not None:
+            env["PIPELINE_WEEKLY_THRESHOLD"] = str(weekly_threshold)
+
     proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -159,6 +176,7 @@ async def run_claude_async(
             stdin=asyncio.subprocess.DEVNULL,
             env=env,
         )
+
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             proc.communicate(), timeout=timeout
         )
@@ -192,18 +210,44 @@ async def run_claude_async(
 
 
 async def run_planned_pr_async(
-    repo_path: str, model: str | None = None, timeout: int = 900
+    repo_path: str,
+    model: str | None = None,
+    timeout: int = 900,
+    breach_dir: str | None = None,
+    breach_run_id: str | None = None,
+    session_threshold: int | None = None,
+    weekly_threshold: int | None = None,
 ) -> tuple[int, str, str]:
     return await run_claude_async(
-        "PLANNED PR", repo_path, timeout=timeout, model=model
+        "PLANNED PR",
+        repo_path,
+        timeout=timeout,
+        model=model,
+        breach_dir=breach_dir,
+        breach_run_id=breach_run_id,
+        session_threshold=session_threshold,
+        weekly_threshold=weekly_threshold,
     )
 
 
 async def fix_review_async(
-    repo_path: str, model: str | None = None, timeout: int | None = None
+    repo_path: str,
+    model: str | None = None,
+    timeout: int | None = None,
+    breach_dir: str | None = None,
+    breach_run_id: str | None = None,
+    session_threshold: int | None = None,
+    weekly_threshold: int | None = None,
 ) -> tuple[int, str, str]:
     return await run_claude_async(
-        "FIX REVIEW", repo_path, timeout=timeout, model=model
+        "FIX REVIEW",
+        repo_path,
+        timeout=timeout,
+        model=model,
+        breach_dir=breach_dir,
+        breach_run_id=breach_run_id,
+        session_threshold=session_threshold,
+        weekly_threshold=weekly_threshold,
     )
 
 
