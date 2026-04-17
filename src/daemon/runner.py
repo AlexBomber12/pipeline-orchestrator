@@ -2170,9 +2170,18 @@ return 0
                     except Exception:
                         head_now = ""
                     if head_before and head_now and head_before != head_now:
-                        self._post_codex_review(
+                        if not self._post_codex_review(
                             self.state.current_pr.number
-                        )
+                        ):
+                            self.state.state = PipelineState.ERROR
+                            self.state.error_message = (
+                                f"Failed to post @codex review on PR "
+                                f"#{self.state.current_pr.number} after "
+                                "breach-cancel fix push; manual review "
+                                "trigger required"
+                            )
+                            self.log_event(self.state.error_message)
+                            return
                 self.state.state = PipelineState.PAUSED
                 self.state.error_message = None
                 self.log_event(
@@ -2208,7 +2217,18 @@ return 0
                 except Exception:
                     head_now = ""
                 if head_before and head_now and head_before != head_now:
-                    self._post_codex_review(self.state.current_pr.number)
+                    if not self._post_codex_review(
+                        self.state.current_pr.number
+                    ):
+                        self.state.state = PipelineState.ERROR
+                        self.state.error_message = (
+                            f"Failed to post @codex review on PR "
+                            f"#{self.state.current_pr.number} after "
+                            "late-breach fix push; manual review "
+                            "trigger required"
+                        )
+                        self.log_event(self.state.error_message)
+                        return
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
             self.log_event(
