@@ -1718,9 +1718,14 @@ return 0
             self.state.error_message is not None
             and pause_coder == "claude"
         )
-        # A pause from a different coder doesn't block the current coder.
+        # A reactive pause from a different coder doesn't block the
+        # current coder.  Proactive pauses (from _proactive_usage_check)
+        # were intentionally targeted at a specific CLI and should
+        # expire naturally; _check_rate_limit with effective_coder
+        # handles clearing them when appropriate.
         other_coder = (
             not diagnosis_pause
+            and self.state.rate_limit_reactive
             and pause_coder != coder.value
         )
         clearable = other_coder
