@@ -4149,6 +4149,82 @@ def test_handle_error_skips_ai_diagnosis_when_claude_session_is_limited(
     )
 
 
+def test_handle_error_honors_claude_rate_limit_when_active_coder_is_claude(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.usage import UsageSnapshot
+
+    cli_calls: list[str] = []
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "diagnose_error_async",
+        _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    runner = _make_runner()
+    runner.app_config.daemon.rate_limit_session_pause_percent = 80
+    runner._claude_usage_provider = _FakeUsageProvider(
+        snapshot=UsageSnapshot(
+            session_percent=90,
+            session_resets_at=int(time.time()) + 3600,
+            weekly_percent=10,
+            weekly_resets_at=int(time.time()) + 86400,
+            fetched_at=time.time(),
+        )
+    )
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Build failed: missing dependency X"
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.error_message == "Build failed: missing dependency X"
+    assert runner.state.rate_limited_until is not None
+
+
+def test_handle_error_skips_ai_diagnosis_when_claude_weekly_is_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.config import CoderType
+    from src.usage import UsageSnapshot
+
+    cli_calls: list[str] = []
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "diagnose_error_async",
+        _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.app_config.daemon.rate_limit_session_pause_percent = 80
+    runner.app_config.daemon.rate_limit_weekly_pause_percent = 90
+    runner._claude_usage_provider = _FakeUsageProvider(
+        snapshot=UsageSnapshot(
+            session_percent=20,
+            session_resets_at=int(time.time()) + 3600,
+            weekly_percent=95,
+            weekly_resets_at=int(time.time()) + 86400,
+            fetched_at=time.time(),
+        )
+    )
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Build failed: missing dependency X"
+    runner._error_diagnose_count = 2
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None
+    assert runner.state.rate_limited_until is None
+    assert runner._error_diagnose_count == 0
+    assert any(
+        e["event"] == "Skipping AI diagnosis: Claude rate limited"
+        for e in runner.state.history
+    )
+
+
 def test_handle_paused_resumes_to_error_when_error_message_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
