@@ -2200,6 +2200,7 @@ return 0
                     self.state.rate_limited_until = (
                         datetime.now(timezone.utc) + timedelta(minutes=30)
                     )
+                self.state.rate_limit_reactive = True
                 self.state.rate_limit_reactive_coder = "claude"
                 breach_type = data.get("type", "session")
                 pct_key = "session_pct" if breach_type == "session" else "weekly_pct"
@@ -2248,6 +2249,7 @@ return 0
             self.state.rate_limited_until = (
                 datetime.now(timezone.utc) + timedelta(minutes=30)
             )
+        self.state.rate_limit_reactive = True
         self.state.rate_limit_reactive_coder = "claude"
         breach_type = data.get("type", "session")
         pct_key = "session_pct" if breach_type == "session" else "weekly_pct"
