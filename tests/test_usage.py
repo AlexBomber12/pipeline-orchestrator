@@ -298,6 +298,22 @@ class TestOpenAIProviderReturnsNone:
         ):
             assert provider.fetch() is None
 
+    def test_on_missing_used_percent(self, tmp_path: Path) -> None:
+        provider = _make_openai_provider(
+            tmp_path, creds={"tokens": {"access_token": "tok"}}
+        )
+        partial_data = {
+            "rate_limit": {
+                "primary_window": {"reset_at": 123},
+                "secondary_window": {"reset_at": 456},
+            }
+        }
+        with patch.object(
+            httpx, "get", return_value=_mock_openai_response(json_data=partial_data)
+        ):
+            assert provider.fetch() is None
+        assert provider.consecutive_failures == 1
+
 
 class TestOpenAIProviderCache:
     def test_caches_within_ttl(self, tmp_path: Path) -> None:

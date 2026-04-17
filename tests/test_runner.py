@@ -5170,6 +5170,7 @@ def test_monitor_inflight_breach_cancels_claude_task_on_marker(
         assert breach_flag["breached"] is True
         assert cancelled.is_set()
         assert runner.state.rate_limited_until is not None
+        assert runner.state.rate_limit_reactive_coder == "claude"
 
         monitor.cancel()
 

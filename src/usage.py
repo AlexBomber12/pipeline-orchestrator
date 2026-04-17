@@ -211,10 +211,17 @@ class OpenAIUsageProvider:
             rl = data.get("rate_limit") or {}
             primary = rl.get("primary_window") or {}
             secondary = rl.get("secondary_window") or {}
+            if "used_percent" not in primary or "used_percent" not in secondary:
+                logger.warning(
+                    "OpenAI usage response missing used_percent fields"
+                )
+                logger.debug("OpenAI usage response body: %s", response.text[:500])
+                self._record_failure()
+                return None
             snap = UsageSnapshot(
-                session_percent=int(primary.get("used_percent", 0)),
+                session_percent=int(primary["used_percent"]),
                 session_resets_at=int(primary.get("reset_at") or 0),
-                weekly_percent=int(secondary.get("used_percent", 0)),
+                weekly_percent=int(secondary["used_percent"]),
                 weekly_resets_at=int(secondary.get("reset_at") or 0),
                 fetched_at=time.time(),
             )
