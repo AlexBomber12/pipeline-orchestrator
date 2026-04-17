@@ -4178,9 +4178,14 @@ def test_handle_error_honors_claude_rate_limit_when_active_coder_is_claude(
     asyncio.run(runner.handle_error())
 
     assert cli_calls == []
-    assert runner.state.state == PipelineState.PAUSED
-    assert runner.state.error_message == "Build failed: missing dependency X"
-    assert runner.state.rate_limited_until is not None
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None
+    assert runner.state.rate_limited_until is None
+    assert runner._error_diagnose_count == 0
+    assert any(
+        e["event"] == "Skipping AI diagnosis: Claude rate limited"
+        for e in runner.state.history
+    )
 
 
 def test_handle_error_skips_ai_diagnosis_when_claude_weekly_is_limited(
