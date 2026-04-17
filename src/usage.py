@@ -218,11 +218,18 @@ class OpenAIUsageProvider:
                 logger.debug("OpenAI usage response body: %s", response.text[:500])
                 self._record_failure()
                 return None
+            if "reset_at" not in primary or "reset_at" not in secondary:
+                logger.warning(
+                    "OpenAI usage response missing reset_at fields"
+                )
+                logger.debug("OpenAI usage response body: %s", response.text[:500])
+                self._record_failure()
+                return None
             snap = UsageSnapshot(
                 session_percent=int(primary["used_percent"]),
-                session_resets_at=int(primary.get("reset_at") or 0),
+                session_resets_at=int(primary["reset_at"]),
                 weekly_percent=int(secondary["used_percent"]),
-                weekly_resets_at=int(secondary.get("reset_at") or 0),
+                weekly_resets_at=int(secondary["reset_at"]),
                 fetched_at=time.time(),
             )
         except (KeyError, TypeError, ValueError) as exc:

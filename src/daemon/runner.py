@@ -1563,10 +1563,11 @@ return 0
         """
         coder = self.repo_config.coder or self.app_config.daemon.coder
         if self.state.rate_limited_until is not None:
-            # Diagnosis pauses always use Claude — honour regardless of coder.
+            # Diagnosis pauses always use Claude — honour regardless of coder
+            # and regardless of whether the pause is reactive or proactive.
             diagnosis_pause = (
-                self.state.rate_limit_reactive
-                and self.state.error_message is not None
+                self.state.error_message is not None
+                and self.state.rate_limit_reactive_coder == "claude"
             )
             # A pause from a *different* coder doesn't apply:
             # e.g. a Claude pause doesn't block Codex, and vice-versa.
@@ -1577,7 +1578,7 @@ return 0
                 and self.state.rate_limit_reactive_coder is not None
                 and self.state.rate_limit_reactive_coder != coder.value
             )
-            clearable = not diagnosis_pause and other_coder
+            clearable = other_coder
             if clearable:
                 self.state.rate_limited_until = None
                 self.state.rate_limit_reactive = False
@@ -1704,18 +1705,19 @@ return 0
             self.state.state = PipelineState.IDLE
             return
         # A pause from a different coder doesn't apply after switching.
-        # Diagnosis pauses always use Claude — honour regardless of coder.
+        # Diagnosis pauses always use Claude — honour regardless of coder
+        # and regardless of whether the pause is reactive or proactive.
         coder = self.repo_config.coder or self.app_config.daemon.coder
         diagnosis_pause = (
-            self.state.rate_limit_reactive
-            and self.state.error_message is not None
+            self.state.error_message is not None
+            and self.state.rate_limit_reactive_coder == "claude"
         )
         other_coder = (
             not diagnosis_pause
             and self.state.rate_limit_reactive_coder is not None
             and self.state.rate_limit_reactive_coder != coder.value
         )
-        clearable = not diagnosis_pause and other_coder
+        clearable = other_coder
         if clearable:
             self.state.rate_limited_until = None
             self.state.rate_limit_reactive = False
