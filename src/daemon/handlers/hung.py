@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from src import github_client
+from src.daemon import git_ops
 from src.models import PipelineState
 
 
@@ -40,14 +41,16 @@ class HungMixin:
         still fires on the creation event itself.
         """
         current_pr = self.state.current_pr
-        push_count = (
-            current_pr.push_count
-            if current_pr is not None and current_pr.number == pr_number
-            else None
-        )
+        head_sha: str | None = None
+        try:
+            head_sha = git_ops._git(
+                self.repo_path, "rev-parse", "HEAD"
+            ).stdout.strip() or None
+        except Exception:
+            head_sha = None
         if (
             self._last_codex_review_pr == pr_number
-            and self._last_codex_review_push_count == push_count
+            and self._last_codex_review_head_sha == head_sha
         ):
             self.log_event(
                 f"Skipping duplicate @codex review for PR #{pr_number}"
@@ -55,7 +58,7 @@ class HungMixin:
             return True
 
         self._last_codex_review_pr = pr_number
-        self._last_codex_review_push_count = push_count
+        self._last_codex_review_head_sha = head_sha
 
         try:
             if current_pr is not None and current_pr.number == pr_number:
@@ -67,7 +70,7 @@ class HungMixin:
             return True
         except Exception as exc:
             self._last_codex_review_pr = None
-            self._last_codex_review_push_count = None
+            self._last_codex_review_head_sha = None
             self.log_event(
                 f"Warning: failed to post @codex review on PR "
                 f"#{pr_number}: {exc}"

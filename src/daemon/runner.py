@@ -162,7 +162,7 @@ class PipelineRunner(
         self._last_push_at: datetime | None = None
         self._last_push_at_pr_number: int | None = None
         self._last_codex_review_pr: int | None = None
-        self._last_codex_review_push_count: int | None = None
+        self._last_codex_review_head_sha: str | None = None
         self._usage_degraded_logged = False
         self._claude_usage_provider = OAuthUsageProvider(
             credentials_path=str(

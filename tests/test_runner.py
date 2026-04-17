@@ -3120,6 +3120,13 @@ def test_codex_review_not_reposted_same_pr_same_push(
         posted.append((repo, number, body))
 
     monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr(
+        git_ops_module,
+        "_git",
+        lambda *args, **kwargs: _FakeCompletedProcess(
+            args=list(args), stdout="head-1\n", returncode=0
+        ),
+    )
     runner = _make_runner()
     runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
 
@@ -3127,7 +3134,7 @@ def test_codex_review_not_reposted_same_pr_same_push(
     assert runner._post_codex_review(42) is True
     assert posted == [(runner.owner_repo, 42, "@codex review")]
     assert runner._last_codex_review_pr == 42
-    assert runner._last_codex_review_push_count == 1
+    assert runner._last_codex_review_head_sha == "head-1"
     assert any(
         "Skipping duplicate @codex review for PR #42" in e["event"]
         for e in runner.state.history
@@ -3144,6 +3151,14 @@ def test_codex_review_reposted_after_new_push(
         posted.append((repo, number, body))
 
     monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    head_shas = iter(["head-1\n", "head-2\n"])
+    monkeypatch.setattr(
+        git_ops_module,
+        "_git",
+        lambda *args, **kwargs: _FakeCompletedProcess(
+            args=list(args), stdout=next(head_shas), returncode=0
+        ),
+    )
     runner = _make_runner()
     runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
 
@@ -3156,7 +3171,7 @@ def test_codex_review_reposted_after_new_push(
         (runner.owner_repo, 42, "@codex review"),
     ]
     assert runner._last_codex_review_pr == 42
-    assert runner._last_codex_review_push_count == 2
+    assert runner._last_codex_review_head_sha == "head-2"
 
 
 def test_save_cli_log_includes_stderr() -> None:
