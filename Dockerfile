@@ -3,7 +3,8 @@ FROM python:3.12-slim
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PATH="/home/runner/.npm-global/bin:${PATH}"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -27,13 +28,12 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g @anthropic-ai/claude-code
 
-RUN curl -fsSL https://codex.openai.com/install.sh | sh \
-    && cp /root/.codex/bin/codex /usr/local/bin/codex \
-    && chmod 755 /usr/local/bin/codex
+RUN mkdir -p /home/runner/.npm-global \
+    && npm i -g --prefix /home/runner/.npm-global @openai/codex
 
 RUN useradd -m -u 1000 runner \
     && mkdir -p /data/auth /data/repos \
-    && chown -R runner:runner /data \
+    && chown -R runner:runner /home/runner /data \
     && git config --system safe.directory '*'
 
 WORKDIR /app

@@ -27,6 +27,7 @@ services:
     volumes:
       - .:/app:ro
       - ./data:/data
+      - codex-auth:/home/runner/.codex
     environment:
       REDIS_URL: redis://redis:6379/0
       CLAUDE_CONFIG_DIR: /data/auth/claude
@@ -44,4 +45,5 @@ services:
     restart: unless-stopped
 
 volumes:
+  codex-auth:
   redis_data:
