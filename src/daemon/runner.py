@@ -1615,6 +1615,7 @@ return 0
             return
         # Window expired: resume to appropriate state
         self.state.rate_limited_until = None
+        self.state.rate_limit_reactive = False
         self._error_diagnose_count = 0
         if self.state.error_message:
             lowered = self.state.error_message.lower()
