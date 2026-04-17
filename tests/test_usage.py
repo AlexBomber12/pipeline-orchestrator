@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,8 +16,14 @@ from src.usage import OAuthUsageProvider, OpenAIUsageProvider, UsageSnapshot
 
 def _valid_response_json() -> dict:
     return {
-        "five_hour": {"used_percentage": 87, "resets_at": 1744824000},
-        "seven_day": {"used_percentage": 92, "resets_at": 1745430000},
+        "five_hour": {
+            "utilization": 87.9,
+            "resets_at": "2025-04-16T18:00:00+00:00",
+        },
+        "seven_day": {
+            "utilization": 92.4,
+            "resets_at": "2025-04-23T18:20:00+00:00",
+        },
     }
 
 
@@ -59,9 +66,13 @@ class TestOAuthProviderReturnsSnapshot:
             snap = provider.fetch()
         assert snap is not None
         assert snap.session_percent == 87
-        assert snap.session_resets_at == 1744824000
+        assert snap.session_resets_at == int(
+            datetime.fromisoformat("2025-04-16T18:00:00+00:00").timestamp()
+        )
         assert snap.weekly_percent == 92
-        assert snap.weekly_resets_at == 1745430000
+        assert snap.weekly_resets_at == int(
+            datetime.fromisoformat("2025-04-23T18:20:00+00:00").timestamp()
+        )
         assert snap.fetched_at > 0
 
 

@@ -11,6 +11,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -103,10 +104,14 @@ class OAuthUsageProvider:
         try:
             data = response.json()
             snap = UsageSnapshot(
-                session_percent=int(data["five_hour"]["used_percentage"]),
-                session_resets_at=int(data["five_hour"]["resets_at"]),
-                weekly_percent=int(data["seven_day"]["used_percentage"]),
-                weekly_resets_at=int(data["seven_day"]["resets_at"]),
+                session_percent=int(data["five_hour"]["utilization"]),
+                session_resets_at=int(
+                    datetime.fromisoformat(data["five_hour"]["resets_at"]).timestamp()
+                ),
+                weekly_percent=int(data["seven_day"]["utilization"]),
+                weekly_resets_at=int(
+                    datetime.fromisoformat(data["seven_day"]["resets_at"]).timestamp()
+                ),
                 fetched_at=time.time(),
             )
         except (KeyError, TypeError, ValueError) as exc:
