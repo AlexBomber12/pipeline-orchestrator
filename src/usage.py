@@ -1,8 +1,8 @@
-"""Proactive usage-check provider for Claude CLI rate-limit avoidance.
+"""Proactive usage-check providers for rate-limit avoidance.
 
-Calls the undocumented OAuth usage endpoint that powers Claude Code's
-``/usage`` slash command. Fail-open: any error returns ``None`` and the
-daemon falls back to the reactive ``_detect_rate_limit`` on stderr.
+Supports both Claude (Anthropic OAuth) and Codex (ChatGPT /wham/usage).
+Fail-open: any error returns ``None`` and the daemon falls back to the
+reactive ``_detect_rate_limit`` on stderr.
 """
 
 from __future__ import annotations
@@ -142,4 +142,109 @@ class OAuthUsageProvider:
                 token = claude_ai.get(key)
                 if isinstance(token, str) and token:
                     return token
+        return None
+
+
+class OpenAIUsageProvider:
+    """Proactive usage provider for Codex CLI (ChatGPT subscription).
+
+    Calls the same endpoint that Codex CLI polls internally every 60s:
+    ``GET https://chatgpt.com/backend-api/wham/usage``
+
+    Source: ``backend-client/src/client.rs::get_rate_limits`` (openai/codex).
+    """
+
+    ENDPOINT = "https://chatgpt.com/backend-api/wham/usage"
+
+    def __init__(
+        self,
+        credentials_path: str,
+        cache_ttl_sec: int = 60,
+        request_timeout_sec: float = 5.0,
+    ) -> None:
+        self._credentials_path = Path(credentials_path)
+        self._cache_ttl = cache_ttl_sec
+        self._timeout = request_timeout_sec
+        self._cached: UsageSnapshot | None = None
+        self._consecutive_failures = 0
+        self._last_failure_at: float = 0.0
+
+    @property
+    def consecutive_failures(self) -> int:
+        return self._consecutive_failures
+
+    def fetch(self) -> UsageSnapshot | None:
+        if self._cached is not None:
+            age = time.time() - self._cached.fetched_at
+            if age < self._cache_ttl:
+                return self._cached
+        if self._consecutive_failures > 0:
+            backoff = self._cache_ttl * min(self._consecutive_failures, 5)
+            if time.time() - self._last_failure_at < backoff:
+                return None
+        token = self._read_token()
+        if token is None:
+            self._record_failure()
+            return None
+        try:
+            response = httpx.get(
+                self.ENDPOINT,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                },
+                timeout=self._timeout,
+            )
+        except (httpx.HTTPError, OSError) as exc:
+            logger.warning("OpenAI usage endpoint request failed: %s", exc)
+            self._record_failure()
+            return None
+        if response.status_code != 200:
+            logger.warning(
+                "OpenAI usage endpoint returned %s",
+                response.status_code,
+            )
+            self._record_failure()
+            return None
+        try:
+            data = response.json()
+            rl = data.get("rate_limit") or {}
+            primary = rl.get("primary_window") or {}
+            secondary = rl.get("secondary_window") or {}
+            snap = UsageSnapshot(
+                session_percent=int(primary.get("used_percent", 0)),
+                session_resets_at=int(primary.get("reset_at") or 0),
+                weekly_percent=int(secondary.get("used_percent", 0)),
+                weekly_resets_at=int(secondary.get("reset_at") or 0),
+                fetched_at=time.time(),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning("OpenAI usage endpoint returned unexpected shape: %s", exc)
+            logger.debug("OpenAI usage response body: %s", response.text[:500])
+            self._record_failure()
+            return None
+        self._cached = snap
+        self._consecutive_failures = 0
+        return snap
+
+    def _record_failure(self) -> None:
+        self._consecutive_failures += 1
+        self._last_failure_at = time.time()
+
+    def invalidate_cache(self) -> None:
+        self._cached = None
+
+    def _read_token(self) -> str | None:
+        if not self._credentials_path.is_file():
+            return None
+        try:
+            raw = self._credentials_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        tokens = data.get("tokens")
+        if isinstance(tokens, dict):
+            token = tokens.get("access_token")
+            if isinstance(token, str) and token:
+                return token
         return None

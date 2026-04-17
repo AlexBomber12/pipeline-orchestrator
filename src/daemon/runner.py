@@ -45,7 +45,7 @@ from src.queue_parser import (
     parse_queue_text,
 )
 from src.retry import retry_transient
-from src.usage import OAuthUsageProvider
+from src.usage import OAuthUsageProvider, OpenAIUsageProvider
 from src.utils import repo_slug_from_url
 
 logger = logging.getLogger(__name__)
@@ -418,12 +418,18 @@ class PipelineRunner:
         # gate.
         self._last_push_at_pr_number: int | None = None
         self._usage_degraded_logged = False
-        self._usage_provider = OAuthUsageProvider(
+        self._claude_usage_provider = OAuthUsageProvider(
             credentials_path=str(
                 Path(self.app_config.auth.claude_config_dir) / ".credentials.json"
             ),
             user_agent=self.app_config.daemon.usage_api_user_agent,
             beta_header=self.app_config.daemon.usage_api_beta_header,
+            cache_ttl_sec=self._app_config.daemon.usage_api_cache_ttl_sec,
+        )
+        self._codex_usage_provider = OpenAIUsageProvider(
+            credentials_path=str(
+                Path(self.app_config.auth.codex_home_dir) / ".codex" / "auth.json"
+            ),
             cache_ttl_sec=self._app_config.daemon.usage_api_cache_ttl_sec,
         )
 
@@ -441,12 +447,22 @@ class PipelineRunner:
             or value.daemon.usage_api_cache_ttl_sec != old.daemon.usage_api_cache_ttl_sec
             or value.auth.claude_config_dir != old.auth.claude_config_dir
         ):
-            self._usage_provider = OAuthUsageProvider(
+            self._claude_usage_provider = OAuthUsageProvider(
                 credentials_path=str(
                     Path(value.auth.claude_config_dir) / ".credentials.json"
                 ),
                 user_agent=value.daemon.usage_api_user_agent,
                 beta_header=value.daemon.usage_api_beta_header,
+                cache_ttl_sec=value.daemon.usage_api_cache_ttl_sec,
+            )
+        if (
+            value.daemon.usage_api_cache_ttl_sec != old.daemon.usage_api_cache_ttl_sec
+            or value.auth.codex_home_dir != old.auth.codex_home_dir
+        ):
+            self._codex_usage_provider = OpenAIUsageProvider(
+                credentials_path=str(
+                    Path(value.auth.codex_home_dir) / ".codex" / "auth.json"
+                ),
                 cache_ttl_sec=value.daemon.usage_api_cache_ttl_sec,
             )
 
@@ -467,11 +483,14 @@ class PipelineRunner:
         self.state.last_updated = datetime.now(timezone.utc)
         coder = self.repo_config.coder or self.app_config.daemon.coder
         self.state.coder = coder.value
-        # Only probe usage for active repos using Claude to avoid unnecessary
-        # HTTP calls (and potential timeout latency) for idle/inactive repos
-        # or repos using Codex (which doesn't use the Claude usage endpoint).
-        if self.repo_config.active and coder != CoderType.CODEX:
-            snap = await asyncio.to_thread(self._usage_provider.fetch)
+        # Probe usage for active repos using the correct provider per coder.
+        if self.repo_config.active:
+            provider = (
+                self._claude_usage_provider
+                if coder != CoderType.CODEX
+                else self._codex_usage_provider
+            )
+            snap = await asyncio.to_thread(provider.fetch)
             if snap is not None:
                 self.state.usage_session_percent = snap.session_percent
                 self.state.usage_session_resets_at = snap.session_resets_at
@@ -482,15 +501,7 @@ class PipelineRunner:
                 self.state.usage_session_resets_at = None
                 self.state.usage_weekly_percent = None
                 self.state.usage_weekly_resets_at = None
-            self.state.usage_api_degraded = self._usage_provider.consecutive_failures >= 10
-        elif self.repo_config.active:
-            # Codex mode: clear stale Claude usage data so the dashboard
-            # does not display outdated Claude metrics or false degraded warnings.
-            self.state.usage_session_percent = None
-            self.state.usage_session_resets_at = None
-            self.state.usage_weekly_percent = None
-            self.state.usage_weekly_resets_at = None
-            self.state.usage_api_degraded = False
+            self.state.usage_api_degraded = provider.consecutive_failures >= 10
         if not self.repo_config.active:
             data = self.state.model_dump()
             data["state"] = PipelineState.IDLE.value
@@ -1494,15 +1505,21 @@ return 0
         Fail-open: returns True when the provider cannot reach the endpoint,
         deferring to the reactive _detect_rate_limit on stderr after the CLI run.
         """
-        snapshot = await asyncio.to_thread(self._usage_provider.fetch)
+        coder_name, _ = self._get_coder()
+        provider = (
+            self._claude_usage_provider
+            if coder_name == "claude"
+            else self._codex_usage_provider
+        )
+        snapshot = await asyncio.to_thread(provider.fetch)
         if snapshot is None:
             if (
-                self._usage_provider.consecutive_failures >= 10
+                provider.consecutive_failures >= 10
                 and not self._usage_degraded_logged
             ):
                 self._usage_degraded_logged = True
                 self.log_event(
-                    "Usage API degraded (10 consecutive failures), "
+                    f"[{coder_name}] Usage API degraded (10 consecutive failures), "
                     "falling back to reactive rate-limit detection"
                 )
             return True
@@ -1520,6 +1537,7 @@ return 0
         if breached is None:
             return True
         self.state.rate_limited_until = datetime.fromtimestamp(resets_at, tz=timezone.utc)
+        self.state.rate_limit_reactive_coder = coder_name
         # Only preserve error_message when pausing from ERROR state so
         # handle_paused correctly resumes to ERROR; clear stale error
         # context from non-ERROR states to avoid incorrect ERROR resume.
@@ -1527,7 +1545,7 @@ return 0
             self.state.error_message = None
         self.state.state = PipelineState.PAUSED
         self.log_event(
-            f"Proactive pause: {breached} usage at "
+            f"[{coder_name}] Proactive pause: {breached} usage at "
             f"{snapshot.session_percent if breached == 'session' else snapshot.weekly_percent}%, "
             f"resumes at {self.state.rate_limited_until.isoformat()}"
         )
@@ -1542,26 +1560,22 @@ return 0
                 self.state.rate_limit_reactive
                 and self.state.error_message is not None
             )
-            # A reactive pause from a *different* coder doesn't apply:
+            # A pause from a *different* coder doesn't apply:
             # e.g. a Claude pause doesn't block Codex, and vice-versa.
-            # Non-reactive (proactive) pauses are Claude-only; clear for Codex.
-            if not diagnosis_pause and self.state.rate_limit_reactive and self.state.rate_limit_reactive_coder:
-                other_coder_reactive = self.state.rate_limit_reactive_coder != coder.value
-            else:
-                # Non-reactive (proactive) pauses are Claude-only
-                other_coder_reactive = False
-            clearable = (
+            # This applies to both reactive and proactive pauses since
+            # both now set rate_limit_reactive_coder.
+            other_coder = (
                 not diagnosis_pause
-                and (
-                    other_coder_reactive
-                    or (not self.state.rate_limit_reactive and coder == CoderType.CODEX)
-                )
+                and self.state.rate_limit_reactive_coder is not None
+                and self.state.rate_limit_reactive_coder != coder.value
             )
+            clearable = not diagnosis_pause and other_coder
             if clearable:
                 self.state.rate_limited_until = None
                 self.state.rate_limit_reactive = False
                 self.state.rate_limit_reactive_coder = None
-                self._usage_provider.invalidate_cache()
+                self._claude_usage_provider.invalidate_cache()
+                self._codex_usage_provider.invalidate_cache()
                 if self.state.state == PipelineState.PAUSED:
                     if (
                         self.state.current_pr is not None
@@ -1575,8 +1589,7 @@ return 0
                     f"{coder.value.capitalize()} active, clearing other-coder rate-limit pause"
                 )
                 # Fall through so the proactive usage check still runs
-                # when the active coder is Claude (avoids launching work
-                # that exceeds Claude's usage thresholds).
+                # to avoid launching work that exceeds usage thresholds.
             elif datetime.now(timezone.utc) < self.state.rate_limited_until:
                 if self.state.state != PipelineState.PAUSED:
                     self.state.state = PipelineState.PAUSED
@@ -1587,11 +1600,9 @@ return 0
                 self.state.rate_limited_until = None
                 self.state.rate_limit_reactive = False
                 self.state.rate_limit_reactive_coder = None
-                self._usage_provider.invalidate_cache()
+                self._claude_usage_provider.invalidate_cache()
+                self._codex_usage_provider.invalidate_cache()
                 self.log_event("Rate limit window expired, resuming")
-        # Proactive OAuth check only applies to the Claude provider
-        if coder == CoderType.CODEX:
-            return True
         return await self._proactive_usage_check()
 
     def _detect_rate_limit(self, stderr: str, coder_name: str | None = None) -> None:
@@ -1603,24 +1614,29 @@ return 0
         should pass the name explicitly so reactive pauses are attributed
         to the correct provider.
         """
+        if coder_name is None:
+            coder = self.repo_config.coder or self.app_config.daemon.coder
+            coder_name = coder.value
         session_threshold = self.app_config.daemon.rate_limit_session_pause_percent
         weekly_threshold = self.app_config.daemon.rate_limit_weekly_pause_percent
         lower = stderr.lower()
         triggered = False
         limit_type = "session"
+        pause_min = 30
 
         if re.search(r"\b429\b", stderr):
             triggered = True
             limit_type = "session"
 
-        m = re.search(
+        # Anthropic percentage-based pattern (Claude only)
+        m_anthropic = re.search(
             r"(\d{1,3})%\s*(?:of\s+)?(?:your\s+)?(?:(weekly|week|session|5-hour)\s+)?rate\s*limit"
             r"|(?:(weekly|week|session|5-hour)\s+)?rate\s*limit\s+(?:at\s+)?(\d{1,3})%",
             lower,
         )
-        if not triggered and m:
-            pct = int(m.group(1) or m.group(4))
-            qualifier = m.group(2) or m.group(3) or ""
+        if not triggered and m_anthropic and coder_name == "claude":
+            pct = int(m_anthropic.group(1) or m_anthropic.group(4))
+            qualifier = m_anthropic.group(2) or m_anthropic.group(3) or ""
             if qualifier in ("weekly", "week"):
                 limit_type = "weekly"
                 triggered = pct >= weekly_threshold
@@ -1628,26 +1644,48 @@ return 0
                 limit_type = "session"
                 triggered = pct >= session_threshold
 
-        if not triggered and not m and "rate limit" in lower:
+        # Codex "try again in X days Y hours Z minutes" pattern
+        m_codex_retry = re.search(
+            r"try again in\s+(?:(\d+)\s*days?)?\s*(?:(\d+)\s*hours?)?\s*(?:(\d+)\s*minutes?)?",
+            lower,
+        )
+        if not triggered and m_codex_retry and coder_name == "codex":
+            days = int(m_codex_retry.group(1) or 0)
+            hours = int(m_codex_retry.group(2) or 0)
+            minutes = int(m_codex_retry.group(3) or 0)
+            total_min = days * 1440 + hours * 60 + minutes
+            if total_min > 0:
+                triggered = True
+                pause_min = total_min
+                limit_type = "weekly" if days > 0 or hours > 12 else "session"
+
+        # Codex "You've hit your usage limit"
+        if not triggered and "you've hit your usage limit" in lower:
+            triggered = True
+            limit_type = "session"
+
+        # Generic "rate limit" fallback (both coders).
+        # Skip only if the coder-specific regex already handled the text.
+        anthropic_handled = m_anthropic and coder_name == "claude"
+        codex_retry_handled = m_codex_retry and coder_name == "codex"
+        if not triggered and not anthropic_handled and not codex_retry_handled and "rate limit" in lower:
             if "weekly" in lower or "week" in lower:
                 limit_type = "weekly"
             triggered = True
 
-        # Codex reports quota exhaustion as "usage limit" rather than
-        # "rate limit", e.g. "usage limit … try again in …".
+        # Codex "usage limit" fallback (without "try again")
         if not triggered and "usage limit" in lower:
             limit_type = "session"
             triggered = True
 
         if triggered:
-            pause_min = 30
-            if coder_name is None:
-                coder = self.repo_config.coder or self.app_config.daemon.coder
-                coder_name = coder.value
             self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=pause_min)
             self.state.rate_limit_reactive = True
             self.state.rate_limit_reactive_coder = coder_name
-            self.log_event(f"Rate limit detected ({limit_type}), pausing for {pause_min} min")
+            self.log_event(
+                f"[{coder_name}] Rate limit detected ({limit_type}), "
+                f"pausing for {pause_min} min"
+            )
 
     async def handle_paused(self) -> None:
         """Wait for rate limit window to expire, then resume previous flow."""
@@ -1662,22 +1700,18 @@ return 0
             self.state.rate_limit_reactive
             and self.state.error_message is not None
         )
-        if not diagnosis_pause and self.state.rate_limit_reactive and self.state.rate_limit_reactive_coder:
-            other_coder_reactive = self.state.rate_limit_reactive_coder != coder.value
-        else:
-            other_coder_reactive = False
-        clearable = (
+        other_coder = (
             not diagnosis_pause
-            and (
-                other_coder_reactive
-                or (not self.state.rate_limit_reactive and coder == CoderType.CODEX)
-            )
+            and self.state.rate_limit_reactive_coder is not None
+            and self.state.rate_limit_reactive_coder != coder.value
         )
+        clearable = not diagnosis_pause and other_coder
         if clearable:
             self.state.rate_limited_until = None
             self.state.rate_limit_reactive = False
             self.state.rate_limit_reactive_coder = None
-            self._usage_provider.invalidate_cache()
+            self._claude_usage_provider.invalidate_cache()
+            self._codex_usage_provider.invalidate_cache()
             self._error_diagnose_count = 0
             label = f"{coder.value.capitalize()} active, clearing other-coder pause"
             # Preserve error context so diagnosis/recovery continues.
