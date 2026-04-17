@@ -4225,6 +4225,51 @@ def test_handle_error_skips_ai_diagnosis_when_claude_weekly_is_limited(
     )
 
 
+def test_handle_error_soft_skip_caps_repeated_codex_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.config import CoderType
+    from src.usage import UsageSnapshot
+
+    cli_calls: list[str] = []
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "diagnose_error_async",
+        _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.app_config.daemon.rate_limit_session_pause_percent = 80
+    runner._claude_usage_provider = _FakeUsageProvider(
+        snapshot=UsageSnapshot(
+            session_percent=90,
+            session_resets_at=int(time.time()) + 3600,
+            weekly_percent=10,
+            weekly_resets_at=int(time.time()) + 86400,
+            fetched_at=time.time(),
+        )
+    )
+
+    for _ in range(3):
+        runner.state.state = PipelineState.ERROR
+        runner.state.error_message = "sync_to_main failed: auth denied"
+        asyncio.run(runner.handle_error())
+        assert runner.state.state == PipelineState.IDLE
+        assert runner.state.error_message is None
+
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "sync_to_main failed: auth denied"
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "sync_to_main failed: auth denied"
+    assert any(
+        "max soft-skip retries (3) reached" in e["event"]
+        for e in runner.state.history
+    )
+
+
 def test_handle_paused_resumes_to_error_when_error_message_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

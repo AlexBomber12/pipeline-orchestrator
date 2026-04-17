@@ -156,6 +156,8 @@ class PipelineRunner(
         self._scaffolded = _repo_looks_scaffolded(self.repo_path)
         self._consecutive_dirty_cycles = 0
         self._error_diagnose_count = 0
+        self._error_skip_context: str | None = None
+        self._error_skip_count = 0
         self._last_push_at: datetime | None = None
         self._last_push_at_pr_number: int | None = None
         self._usage_degraded_logged = False
