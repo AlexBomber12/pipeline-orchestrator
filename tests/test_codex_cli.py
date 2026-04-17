@@ -41,9 +41,7 @@ async def test_run_codex_async_success(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert result == (0, "done", "info")
     cmd = captured["cmd"]
-    assert cmd[0] == "codex"
-    assert "exec" in cmd
-    assert "--full-auto" in cmd
+    assert cmd[:4] == ["codex", "exec", "--sandbox", "danger-full-access"]
     assert cmd[-1] == "do a thing"
     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
 
@@ -77,7 +75,7 @@ async def test_run_codex_async_not_found(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 @pytest.mark.asyncio
-async def test_run_planned_pr_async_calls_exec_full_auto(
+async def test_run_planned_pr_async_calls_exec_with_docker_sandbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
@@ -92,8 +90,7 @@ async def test_run_planned_pr_async_calls_exec_full_auto(
     await run_planned_pr_async("/data/repos/demo", model="o3")
 
     cmd = captured["cmd"]
-    assert "exec" in cmd
-    assert "--full-auto" in cmd
+    assert cmd[:4] == ["codex", "exec", "--sandbox", "danger-full-access"]
     assert "--model" in cmd
     assert cmd[cmd.index("--model") + 1] == "o3"
     assert cmd[-1] == "PLANNED PR"
@@ -115,9 +112,8 @@ async def test_fix_review_async_passes_prompt(
     await fix_review_async("/data/repos/demo")
 
     cmd = captured["cmd"]
+    assert cmd[:4] == ["codex", "exec", "--sandbox", "danger-full-access"]
     assert cmd[-1] == "FIX REVIEW"
-    assert "exec" in cmd
-    assert "--full-auto" in cmd
 
 
 @pytest.mark.asyncio
