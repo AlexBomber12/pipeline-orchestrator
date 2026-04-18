@@ -935,7 +935,7 @@ async def put_settings_daemon(
             updates["coder"] = coder
         if claude_model is not None and claude_model != "":
             updates["claude_model"] = claude_model
-        if codex_model is not None and codex_model != "":
+        if codex_model is not None:
             updates["codex_model"] = codex_model
     except ValueError as exc:
         return _render_settings_daemon_error(request, str(exc), 422)

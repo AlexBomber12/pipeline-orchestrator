@@ -1237,6 +1237,25 @@ def test_codex_model_setting_saves(
     assert cfg.daemon.codex_model == "o4-mini"
 
 
+def test_codex_model_setting_clears_to_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text("daemon:\n  codex_model: o4-mini\n", encoding="utf-8")
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"codex_model": ""},
+        )
+
+    assert response.status_code == 200
+    cfg = load_config(str(cfg_path))
+    assert cfg.daemon.codex_model == ""
+
+
 def test_claude_model_setting_saves(
     empty_config: Path,
     monkeypatch: pytest.MonkeyPatch,
