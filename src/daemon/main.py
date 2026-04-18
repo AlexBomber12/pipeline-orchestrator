@@ -21,6 +21,7 @@ are propagated onto existing runners without restarting the process.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -32,6 +33,8 @@ from typing import Any
 
 import redis.asyncio as aioredis
 
+from src.coder_registry import CoderRegistry
+from src.coders import build_coder_registry
 from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
 from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
@@ -150,16 +153,20 @@ def _build_runner(
     redis_client: Any,
     claude_usage_provider: UsageProvider,
     codex_usage_provider: UsageProvider,
+    registry: CoderRegistry,
 ) -> PipelineRunner | None:
     """Construct a runner, logging and swallowing init failures."""
     try:
-        return PipelineRunner(
-            repo_config=repo,
-            app_config=config,
-            redis_client=redis_client,
-            claude_usage_provider=claude_usage_provider,
-            codex_usage_provider=codex_usage_provider,
-        )
+        kwargs: dict[str, Any] = {
+            "repo_config": repo,
+            "app_config": config,
+            "redis_client": redis_client,
+            "claude_usage_provider": claude_usage_provider,
+            "codex_usage_provider": codex_usage_provider,
+        }
+        if "registry" in inspect.signature(PipelineRunner).parameters:
+            kwargs["registry"] = registry
+        return PipelineRunner(**kwargs)
     except Exception:
         logger.error(
             "Failed to initialize runner for %s; skipping",
@@ -183,6 +190,7 @@ def _sync_runners(
     redis_client: Any,
     claude_usage_provider: UsageProvider,
     codex_usage_provider: UsageProvider,
+    registry: CoderRegistry,
 ) -> None:
     """Reconcile ``runners`` with ``config.repositories`` in place.
 
@@ -221,6 +229,7 @@ def _sync_runners(
             redis_client,
             claude_usage_provider,
             codex_usage_provider,
+            registry,
         )
         if runner is not None:
             runners[key] = runner
@@ -246,6 +255,7 @@ async def main() -> None:
         )
 
     config = load_config()
+    registry = build_coder_registry()
     claude_usage_provider, codex_usage_provider = _create_usage_providers(config)
 
     _clean_breach_dir()
@@ -273,6 +283,7 @@ async def main() -> None:
         redis_client,
         claude_usage_provider,
         codex_usage_provider,
+        registry,
     )
 
     last_run: dict[str, float] = {}
@@ -299,6 +310,7 @@ async def main() -> None:
                         redis_client,
                         claude_usage_provider,
                         codex_usage_provider,
+                        registry,
                     )
 
         for key, runner in list(runners.items()):

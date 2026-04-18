@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from src.coders import claude as claude_plugin_module
 from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
@@ -26,6 +27,8 @@ from src.models import (
     ReviewStatus,
     TaskStatus,
 )
+
+claude_cli = claude_plugin_module.claude_cli
 
 
 def _async_cli_result(*result: object):
@@ -329,7 +332,7 @@ def test_handle_idle_picks_task_and_drives_coding(
         claude_calls.append(path)
         return (0, "ok", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr_async", fake_run_planned_pr)
+    monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_run_planned_pr)
 
     opened_pr = PRInfo(
         number=17,
@@ -383,7 +386,7 @@ def test_handle_idle_sets_queue_counters_with_mixed_statuses(
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: tasks)
     monkeypatch.setattr(idle_module, "get_next_task", lambda t: tasks[2])
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "run_planned_pr_async",
         _async_cli_result(0, "ok", ""),
     )
@@ -489,7 +492,7 @@ def test_handle_idle_proceeds_to_coding_when_no_matching_pr(
 
     monkeypatch.setattr(runner_module.github_client, "get_open_prs", _get_open_prs)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "run_planned_pr_async",
         _async_cli_result(0, "ok", ""),
     )
@@ -549,7 +552,7 @@ def test_handle_coding_errors_when_no_pr_found(
 ) -> None:
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "run_planned_pr_async",
         _async_cli_result(0, "ok", ""),
     )
@@ -581,7 +584,7 @@ def test_handle_coding_rejects_unmatched_branch(
     attaching to an unrelated newest open PR."""
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "run_planned_pr_async",
         _async_cli_result(0, "ok", ""),
     )
@@ -617,7 +620,7 @@ def test_handle_coding_posts_codex_review_after_pr_found(
     for PR creation only, to avoid duplicate reviews)."""
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "run_planned_pr_async",
         _async_cli_result(0, "ok", ""),
     )
@@ -659,7 +662,7 @@ def test_handle_coding_survives_post_comment_failure(
     otherwise healthy pipeline to ``ERROR``."""
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "run_planned_pr_async",
         _async_cli_result(0, "ok", ""),
     )
@@ -699,7 +702,7 @@ def test_handle_fix_posts_codex_review_after_push(
     ``@codex review`` so Codex reviews the freshly-pushed iteration."""
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli, "fix_review_async", _async_cli_result(0, "", "")
+        claude_cli, "fix_review_async", _async_cli_result(0, "", "")
     )
     posted: list[tuple[str, int, str]] = []
 
@@ -740,7 +743,7 @@ def test_handle_fix_errors_when_post_comment_fails(
     """
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli, "fix_review_async", _async_cli_result(0, "", "")
+        claude_cli, "fix_review_async", _async_cli_result(0, "", "")
     )
 
     def boom(repo: str, number: int, body: str) -> None:
@@ -782,7 +785,7 @@ def test_handle_fix_skips_checkout_on_cross_repo_pr(
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     monkeypatch.setattr(
-        runner_module.claude_cli, "fix_review_async", _async_cli_result(0, "", "")
+        claude_cli, "fix_review_async", _async_cli_result(0, "", "")
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -821,7 +824,7 @@ def test_handle_fix_fetches_and_resets_branch_before_fix_review(
         fix_called_at.append(len(calls))
         return (0, "", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", fake_fix)
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
     monkeypatch.setattr(
         runner_module.github_client,
         "post_comment",
@@ -874,7 +877,7 @@ def test_handle_fix_errors_when_fetch_fails(
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "fix_review_async",
         _async_cli_capture_path(fix_calls, 0, "", ""),
     )
@@ -908,7 +911,7 @@ def test_handle_fix_errors_when_reset_fails(
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "fix_review_async",
         _async_cli_capture_path(fix_calls, 0, "", ""),
     )
@@ -938,7 +941,7 @@ def test_handle_fix_errors_when_checkout_times_out(
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "fix_review_async",
         _async_cli_capture_path(fix_calls, 0, "", ""),
     )
@@ -959,7 +962,7 @@ def test_handle_coding_errors_when_task_has_no_branch(
 ) -> None:
     calls = _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "run_planned_pr_async",
         _async_cli_result(0, "ok", ""),
     )
@@ -997,7 +1000,7 @@ def test_handle_coding_retries_pr_detection(
     up to 3 times before giving up."""
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "run_planned_pr_async",
         _async_cli_result(0, "ok", ""),
     )
@@ -1052,7 +1055,7 @@ def test_handle_coding_errors_after_all_retries(
     a PR."""
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "run_planned_pr_async",
         _async_cli_result(0, "ok", ""),
     )
@@ -1173,7 +1176,7 @@ def test_handle_watch_changes_requested_triggers_fix(
         runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
     )
     monkeypatch.setattr(
-        runner_module.claude_cli, "fix_review_async", _async_cli_result(0, "", "")
+        claude_cli, "fix_review_async", _async_cli_result(0, "", "")
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -1212,7 +1215,7 @@ def test_handle_watch_no_fix_when_ci_pending_and_changes_requested(
         fix_called.append(True)
         return (0, "", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", _no_fix)
+    monkeypatch.setattr(claude_cli, "fix_review_async", _no_fix)
     monkeypatch.setattr(
         runner_module.github_client,
         "post_comment",
@@ -1244,7 +1247,7 @@ def test_handle_watch_fix_when_ci_success_and_changes_requested(
         runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
     )
     monkeypatch.setattr(
-        runner_module.claude_cli, "fix_review_async", _async_cli_result(0, "", "")
+        claude_cli, "fix_review_async", _async_cli_result(0, "", "")
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -1277,7 +1280,7 @@ def test_handle_watch_ci_failure_triggers_fix(
         runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
     )
     monkeypatch.setattr(
-        runner_module.claude_cli, "fix_review_async", _async_cli_result(0, "", "")
+        claude_cli, "fix_review_async", _async_cli_result(0, "", "")
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -1927,7 +1930,7 @@ def test_handle_merge_resolves_conflict(
         claude_calls.append((prompt, cwd))
         return (0, "", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "run_claude_async", fake_claude)
+    monkeypatch.setattr(claude_cli, "run_claude_async", fake_claude)
 
     merge_pr_calls: list[tuple[str, int]] = []
     monkeypatch.setattr(
@@ -2088,7 +2091,7 @@ def test_handle_merge_aborts_on_unresolvable_conflict(
         return (1, "", "claude failed")
 
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "run_claude_async",
         fake_claude_async,
     )
@@ -2122,7 +2125,7 @@ def test_handle_merge_aborts_on_unresolvable_conflict(
 
 def test_handle_error_skip_clears_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "diagnose_error_async",
         _async_cli_result(0, "SKIP", ""),
     )
@@ -2142,7 +2145,7 @@ def test_handle_error_skip_clears_state(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_handle_error_escalate_keeps_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "diagnose_error_async",
         _async_cli_result(0, "ESCALATE: human help", ""),
     )
@@ -2946,7 +2949,7 @@ def test_handle_coding_saves_stdout(
     """handle_coding must save CLI stdout to Redis via _save_cli_log."""
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "run_planned_pr_async",
         _async_cli_result(0, "hello from claude", ""),
     )
@@ -2982,7 +2985,7 @@ def test_handle_fix_saves_stdout(
     """handle_fix must save CLI stdout to Redis via _save_cli_log."""
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "fix_review_async",
         _async_cli_result(0, "fix output here", ""),
     )
@@ -3458,7 +3461,7 @@ def test_handle_error_caps_at_3(monkeypatch: pytest.MonkeyPatch) -> None:
         calls.append(ctx)
         return (0, "ESCALATE", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "diagnose_error_async", fake_diag)
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake_diag)
     runner = _make_runner()
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "generic failure"
@@ -3478,7 +3481,7 @@ def test_handle_error_skips_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
         called.append(True)
         return (0, "SKIP", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "diagnose_error_async", fake_diag)
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake_diag)
     runner = _make_runner()
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "claude CLI timeout after 900s"
@@ -3497,7 +3500,7 @@ def test_handle_error_skips_rate_limit(
         called.append(True)
         return (0, "SKIP", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "diagnose_error_async", fake_diag)
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake_diag)
     runner = _make_runner()
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "API rate limit exceeded"
@@ -3515,7 +3518,7 @@ def test_handle_fix_skips_fork(monkeypatch: pytest.MonkeyPatch) -> None:
         fix_called.append(True)
         return (0, "", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", fake_fix)
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
     runner = _make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(
@@ -3545,7 +3548,7 @@ def test_handle_coding_uses_configured_timeout(
         captured["timeout"] = timeout
         return (0, "", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr_async", fake_planned)
+    monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_planned)
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
@@ -3573,6 +3576,41 @@ def test_handle_coding_uses_configured_timeout(
     assert captured.get("timeout") == 1234
 
 
+def test_handle_fix_does_not_forward_idle_timeout_as_cli_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FIX REVIEW should stay uncapped while the idle monitor enforces no-push timeouts."""
+    _patch_subprocess(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    async def fake_fix(
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+    ) -> tuple[int, str, str]:
+        captured["timeout"] = timeout
+        return (0, "", "")
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = PipelineRunner(
+        _repo_cfg(),
+        AppConfig(
+            repositories=[],
+            daemon=DaemonConfig(fix_idle_timeout_sec=5),
+        ),
+        _FakeRedis(),
+        *_usage_providers(),
+    )
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    asyncio.run(runner.handle_fix())
+    assert captured.get("timeout") is None
+
+
 def test_fix_idle_timeout_kills_on_no_push(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3596,7 +3634,7 @@ def test_fix_idle_timeout_kills_on_no_push(
         idle_flag["timed_out"] = True
         target.cancel()
 
-    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", fake_fix_hangs)
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix_hangs)
     monkeypatch.setattr(
         PipelineRunner, "_monitor_fix_idle", immediate_cancel_monitor
     )
@@ -3634,7 +3672,7 @@ def test_fix_idle_timeout_resets_on_push(
         await asyncio.sleep(0)
         return (0, "", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", fake_fix_quick)
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix_quick)
     monkeypatch.setattr(
         runner_module.github_client,
         "post_comment",
@@ -3680,7 +3718,7 @@ def test_fix_idle_timeout_monitor_resets_on_push(
         await asyncio.sleep(0)
         return (0, "", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", fake_fix_quick)
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix_quick)
     monkeypatch.setattr(
         PipelineRunner, "_monitor_fix_idle", monitor_with_push_then_finish
     )
@@ -3755,7 +3793,7 @@ def test_handle_fix_records_last_push_at(
     ``updatedAt`` (which advances every time Codex posts)."""
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "fix_review_async",
         _async_cli_result(0, "", ""),
     )
@@ -4088,7 +4126,7 @@ def test_handle_coding_skips_when_rate_limited(
     _patch_subprocess(monkeypatch)
     cli_calls: list[str] = []
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "run_planned_pr_async",
         _async_cli_result_with_side_effect(cli_calls, "run_planned_pr_async", 0, "", ""),
     )
@@ -4111,7 +4149,7 @@ def test_handle_error_skips_diagnose_for_rate_limit(
     _patch_subprocess(monkeypatch)
     cli_calls: list[str] = []
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "diagnose_error_async",
         _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
     )
@@ -4131,7 +4169,7 @@ def test_handle_error_skips_diagnose_for_timeout(
     _patch_subprocess(monkeypatch)
     cli_calls: list[str] = []
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "diagnose_error_async",
         _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
     )
@@ -4150,7 +4188,7 @@ def test_handle_error_preserves_error_message_on_rate_limit(
     """When diagnose_error_async is rate-limited, error_message is preserved."""
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "diagnose_error_async",
         _async_cli_result_with_side_effect([], "diagnose", 1, "", "Error: 429 Too Many Requests"),
     )
@@ -4173,7 +4211,7 @@ def test_handle_error_skips_ai_diagnosis_when_claude_session_is_limited(
     cli_calls: list[str] = []
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "diagnose_error_async",
         _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
     )
@@ -4213,7 +4251,7 @@ def test_handle_error_honors_claude_rate_limit_when_active_coder_is_claude(
     cli_calls: list[str] = []
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "diagnose_error_async",
         _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
     )
@@ -4253,7 +4291,7 @@ def test_handle_error_skips_ai_diagnosis_when_claude_weekly_is_limited(
     cli_calls: list[str] = []
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "diagnose_error_async",
         _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
     )
@@ -4295,7 +4333,7 @@ def test_handle_error_soft_skip_caps_repeated_codex_retries(
     cli_calls: list[str] = []
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "diagnose_error_async",
         _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
     )
@@ -4340,7 +4378,7 @@ def test_run_cycle_clears_soft_skip_budget_after_successful_non_error_cycle(
     cli_calls: list[str] = []
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "diagnose_error_async",
         _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
     )
@@ -4569,8 +4607,8 @@ def test_handle_coding_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:
         sync_calls.append(path)
         return (0, "ok", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr_async", fake_async)
-    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr", fake_sync)
+    monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_async)
+    monkeypatch.setattr(claude_cli, "run_planned_pr", fake_sync)
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
@@ -4610,8 +4648,8 @@ def test_handle_fix_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:
         sync_calls.append(path)
         return (0, "", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", fake_async)
-    monkeypatch.setattr(runner_module.claude_cli, "fix_review", fake_sync)
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_async)
+    monkeypatch.setattr(claude_cli, "fix_review", fake_sync)
     monkeypatch.setattr(
         runner_module.github_client,
         "post_comment",
@@ -4650,7 +4688,7 @@ def test_handle_coding_publishes_heartbeat(
         await cli_done
         return (0, "ok", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr_async", slow_cli)
+    monkeypatch.setattr(claude_cli, "run_planned_pr_async", slow_cli)
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
@@ -4712,7 +4750,7 @@ def test_handle_fix_publishes_heartbeat(
         await cli_done
         return (0, "", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "fix_review_async", slow_cli)
+    monkeypatch.setattr(claude_cli, "fix_review_async", slow_cli)
     monkeypatch.setattr(
         runner_module.github_client, "post_comment", lambda *a, **kw: None
     )
@@ -4958,7 +4996,7 @@ def test_handle_fix_skips_review_post_when_head_unchanged(
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "fix_review_async",
         _async_cli_result(0, "", ""),
     )
@@ -5008,7 +5046,7 @@ def test_handle_fix_counts_push_when_head_changes(
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "fix_review_async",
         _async_cli_result(0, "", ""),
     )
@@ -5057,7 +5095,7 @@ def test_handle_fix_error_on_rev_parse_after_failure(
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "fix_review_async",
         _async_cli_result(0, "", ""),
     )
@@ -5080,7 +5118,7 @@ def test_handle_coding_sets_paused_on_rate_limit(
     """CLI returns non-zero with rate limit stderr -> state = PAUSED, error_message = None."""
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "run_planned_pr_async",
         _async_cli_result(1, "", "Error: 429 Too Many Requests"),
     )
@@ -5104,7 +5142,7 @@ def test_handle_fix_sets_paused_on_rate_limit(
     """CLI returns non-zero with rate limit stderr in fix path -> PAUSED."""
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "fix_review_async",
         _async_cli_result(1, "", "Error: 429 Too Many Requests"),
     )
@@ -5126,7 +5164,7 @@ def test_handle_coding_success_ignores_rate_limit_text_in_stderr(
     """Successful coding runs must not convert informational stderr into PAUSED."""
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "run_planned_pr_async",
         _async_cli_result(0, "ok", "Error: 429 Too Many Requests"),
     )
@@ -5157,7 +5195,7 @@ def test_handle_fix_success_ignores_rate_limit_text_in_stderr(
     """Successful fix runs must not convert informational stderr into PAUSED."""
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.claude_cli,
+        claude_cli,
         "fix_review_async",
         _async_cli_result(0, "ok", "Error: 429 Too Many Requests"),
     )
@@ -5332,7 +5370,7 @@ def test_handle_error_timeout_has_distinct_log(
         called.append(True)
         return (0, "SKIP", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "diagnose_error_async", fake_diag)
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake_diag)
     runner = _make_runner()
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "Timeout after 600s"
@@ -5697,7 +5735,7 @@ def test_handle_coding_cleans_up_breach_marker_after_run(
             marker.write_text('{"type":"session","resets_at":0}')
         return (0, "ok", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr_async", fake_planned)
+    monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_planned)
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
@@ -5747,7 +5785,7 @@ def test_handle_coding_pauses_on_inflight_breach(
         await asyncio.sleep(999)  # Block until cancelled
         return (0, "", "")
 
-    monkeypatch.setattr(runner_module.claude_cli, "run_planned_pr_async", fake_planned_hangs)
+    monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_planned_hangs)
 
     runner = _make_runner()
     runner.state.current_task = QueueTask(
@@ -5767,30 +5805,27 @@ def test_handle_coding_pauses_on_inflight_breach(
 
 def test_get_coder_returns_claude_by_default() -> None:
     runner = _make_runner()
-    name, mod = runner._get_coder()
+    name, plugin = runner._get_coder()
     assert name == "claude"
-    from src import claude_cli
-    assert mod is claude_cli
+    assert plugin.name == "claude"
 
 
 def test_get_coder_returns_codex_when_configured() -> None:
     from src.config import CoderType
     runner = _make_runner()
     runner._app_config = _app_cfg(coder=CoderType.CODEX)
-    name, mod = runner._get_coder()
+    name, plugin = runner._get_coder()
     assert name == "codex"
-    from src import codex_cli
-    assert mod is codex_cli
+    assert plugin.name == "codex"
 
 
 def test_get_coder_repo_override_takes_precedence() -> None:
     from src.config import CoderType
     runner = _make_runner(coder=CoderType.CODEX)
     # Daemon default is claude, repo override is codex
-    name, mod = runner._get_coder()
+    name, plugin = runner._get_coder()
     assert name == "codex"
-    from src import codex_cli
-    assert mod is codex_cli
+    assert plugin.name == "codex"
 
 
 def test_handle_coding_uses_codex_cli_when_coder_is_codex(

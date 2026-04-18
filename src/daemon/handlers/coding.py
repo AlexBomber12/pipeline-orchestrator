@@ -28,7 +28,7 @@ class CodingMixin:
         if not await self._check_rate_limit():
             return
 
-        coder_name, coder_module = self._get_coder()
+        coder_name, plugin = self._get_coder()
         self.log_event(f"[{coder_name}] Starting PLANNED PR")
 
         target_branch = (
@@ -63,8 +63,8 @@ class CodingMixin:
                 session_threshold=self.app_config.daemon.rate_limit_session_pause_percent,
                 weekly_threshold=self.app_config.daemon.rate_limit_weekly_pause_percent,
             )
-        claude_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
-            coder_module.run_planned_pr_async(
+        cli_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
+            plugin.run_planned_pr(
                 self.repo_path,
                 **coder_kwargs,
             )
@@ -73,11 +73,11 @@ class CodingMixin:
         if coder_name == "claude":
             breach_monitor = asyncio.create_task(
                 self._monitor_inflight_breach(
-                    breach_dir, breach_run_id, claude_task, breach_flag,
+                    breach_dir, breach_run_id, cli_task, breach_flag,
                 )
             )
         try:
-            code, stdout, stderr = await claude_task
+            code, stdout, stderr = await cli_task
         except asyncio.CancelledError:
             if not breach_flag["breached"]:
                 raise

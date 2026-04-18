@@ -449,7 +449,7 @@
 - Depends on: PR-074, PR-075
 
 ## PR-077: Runner uses plugin registry
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-077.md
 - Branch: pr-077-runner-plugin-integration
 - Depends on: PR-074, PR-075, PR-076
