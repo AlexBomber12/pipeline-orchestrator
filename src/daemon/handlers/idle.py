@@ -77,8 +77,10 @@ class IdleMixin:
                 f"IDLE: open PR check failed: {exc}; deferring task dispatch"
             )
             self.state.current_pr = None
+            self.state.current_task = None
             return
         try:
+            github_client.clear_merged_prs_cache()
             merged_prs = github_client.get_merged_prs(
                 self.owner_repo,
                 self.repo_config.branch,

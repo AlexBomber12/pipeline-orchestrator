@@ -293,6 +293,39 @@ def test_get_merged_prs_uses_cache_within_ttl(
     assert [pr.number for pr in second] == [101]
 
 
+def test_clear_merged_prs_cache_forces_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_merged_prs_cache()
+    calls = 0
+
+    def fake_paginated(path: str) -> list[dict[str, Any]]:
+        nonlocal calls
+        calls += 1
+        return [
+            {
+                "number": 100 + calls,
+                "title": f"PR-{100 + calls}: shipped work",
+                "merged_at": "2026-04-18T10:00:00Z",
+                "head": {
+                    "ref": f"pr-{100 + calls}-shipped-work",
+                    "repo": {"fork": False},
+                },
+                "base": {"ref": "main"},
+            }
+        ]
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    first = get_merged_prs("owner/name", base_branch="main")
+    clear_merged_prs_cache()
+    second = get_merged_prs("owner/name", base_branch="main")
+
+    assert calls == 2
+    assert [pr.number for pr in first] == [101]
+    assert [pr.number for pr in second] == [102]
+
+
 def test_is_codex_user_matches_bot_logins() -> None:
     assert _is_codex_user({"login": "codex"}) is True
     assert _is_codex_user({"login": "chatgpt-codex-conn"}) is True

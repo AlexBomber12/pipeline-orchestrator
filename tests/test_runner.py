@@ -588,6 +588,12 @@ def test_handle_idle_defers_on_gh_failure(
     monkeypatch.setattr(runner_module.PipelineRunner, "handle_coding", spy_handle_coding)
 
     runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-999",
+        title="Stale task",
+        status=TaskStatus.DOING,
+        branch="pr-999-stale-task",
+    )
     asyncio.run(runner.handle_idle())
 
     assert runner.state.state == PipelineState.IDLE
@@ -3342,6 +3348,58 @@ def test_handle_idle_merged_pr_check_survives_github_failure(
     assert runner.state.state == PipelineState.CODING
     assert runner.state.current_task == task
     assert any("merged PR check failed" in e["event"] for e in runner.state.history)
+
+
+def test_handle_idle_clears_merged_pr_cache_before_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    task = QueueTask(
+        pr_id="PR-123",
+        title="Refresh merged PRs",
+        branch="pr-123-refresh-merged-prs",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-123.md",
+    )
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    calls: list[str] = []
+
+    def fake_clear_merged_prs_cache() -> None:
+        calls.append("clear")
+
+    def fake_get_merged_prs(repo: str, branch: str) -> list[PRInfo]:
+        calls.append("get")
+        return []
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "clear_merged_prs_cache",
+        fake_clear_merged_prs_cache,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        fake_get_merged_prs,
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda tasks, repo_path, base_branch, prs, merged_prs=(): tasks,
+    )
+
+    async def fake_handle_coding() -> None:
+        return None
+
+    runner = _make_runner()
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    asyncio.run(runner.handle_idle())
+
+    assert calls[:2] == ["clear", "get"]
 
 
 # ------------------------------------------------------------------
