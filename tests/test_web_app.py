@@ -373,6 +373,9 @@ def test_repo_detail_route_renders_full_page(
     assert 'hx-trigger="every 5s"' in body
     assert "Current Task" in body
     assert "Current PR" in body
+    assert "Coder: Claude Code" in body
+    assert 'name="coder"' not in body
+    assert "Recent PRs" not in body
     assert "Event log" in body
 
 
@@ -465,41 +468,6 @@ def test_metrics_endpoint_returns_records(
     assert payload[1]["coder"] == "claude"
     assert payload[1]["model"] == "opus"
     assert payload[1]["exit_reason_label"] == "merged"
-
-
-def test_metrics_panel_renders(
-    two_repo_config: Path,
-) -> None:
-    fake = _FakeRedis(
-        store={
-            "metrics:run:run-1": _metrics_record(
-                "run-1",
-                task_id="PR-083",
-                started_at="2026-04-18T12:00:00+00:00",
-                duration_ms=125000,
-                fix_iterations=3,
-                exit_reason="error",
-            )
-        },
-        lists={"metrics:repo:example__alpha:PR": ["run-1"]},
-    )
-
-    with TestClient(app) as client:
-        client.app.state.redis = fake
-        response = client.get("/repo/example__alpha")
-
-    assert response.status_code == 200
-    body = response.text
-    assert "Recent PRs" in body
-    assert 'hx-get="/partials/repo/example__alpha/metrics"' in body
-    assert 'hx-trigger="every 60s"' in body
-    assert "PR-083" in body
-    assert "claude" in body
-    assert "opus" in body
-    assert "2m 5s" in body
-    assert "3" in body
-    assert "error" in body
-
 
 def test_partial_repo_detail_returns_html_fragment(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch

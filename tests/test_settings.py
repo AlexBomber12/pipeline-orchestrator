@@ -1508,7 +1508,7 @@ def test_coders_table_omits_unknown_selected_model(
     assert "(default)" in body
 
 
-def test_repo_detail_coder_dropdown_renders(
+def test_repo_detail_coder_badge_renders(
     one_repo_config: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1519,12 +1519,12 @@ def test_repo_detail_coder_dropdown_renders(
 
     assert response.status_code == 200
     body = response.text
-    assert 'hx-put="/settings/repo/example__alpha"' in body
-    assert "Inherit (Claude)" in body
-    assert "Codex CLI" in body
+    assert "Coder: Claude Code" in body
+    assert 'name="coder"' not in body
+    assert "Coder: Codex CLI" not in body
 
 
-def test_repo_detail_inherit_label_uses_daemon_default(
+def test_repo_detail_badge_shows_repo_effective_coder(
     one_repo_config: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1546,8 +1546,8 @@ def test_repo_detail_inherit_label_uses_daemon_default(
 
     assert response.status_code == 200
     body = response.text
-    assert "Inherit (Claude)" in body
-    assert "Inherit (Codex)" not in body
+    assert "Coder: Codex CLI" in body
+    assert "Coder: Claude Code" not in body
 
 
 def test_repo_coder_change_saves_to_config(
