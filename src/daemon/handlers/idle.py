@@ -15,14 +15,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from src import github_client
+from src.daemon import git_ops
 from src.dag import get_eligible_tasks
 from src.models import PipelineState, QueueTask, TaskStatus
 from src.queue_parser import (
     QueueValidationError,
+    TaskHeader,
     get_next_task,
     parse_queue,
     parse_task_header,
 )
+from src.retry import is_transient_error, retry_transient
 from src.task_status import (
     derive_queue_task_statuses,
     derive_task_status,
@@ -33,6 +36,151 @@ from src.task_status import (
 
 class IdleMixin:
     """Handle IDLE state: sync, pick next task, dispatch to CODING."""
+
+    @staticmethod
+    def _generate_queue_md(
+        headers: list[TaskHeader],
+        statuses: dict[str, TaskStatus],
+    ) -> str:
+        """Render a visually compatible QUEUE.md from structured task headers."""
+        lines = ["# Task Queue\n"]
+        for header in headers:
+            lines.append(f"## {header.pr_id}: {header.title}")
+            lines.append(f"- Status: {statuses[header.pr_id].value}")
+            lines.append(f"- Tasks file: tasks/{header.pr_id}.md")
+            lines.append(f"- Branch: {header.branch}")
+            if header.depends_on:
+                lines.append(f"- Depends on: {', '.join(header.depends_on)}")
+            lines.append("")
+        return "\n".join(lines)
+
+    def _write_generated_queue_md(
+        self,
+        headers: list[TaskHeader],
+        statuses: dict[str, TaskStatus],
+    ) -> bool:
+        """Write and publish QUEUE.md only when the generated report changed.
+
+        Returns ``True`` when the generated queue is synchronized locally
+        after the call. A rejected push is treated as recoverable: the
+        helper drops the local auto-generated queue commit and returns
+        ``False`` so IDLE can continue without carrying a stray local
+        queue commit.
+        """
+        queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
+        self._idle_generated_queue_needs_resync = False
+        content = self._generate_queue_md(headers, statuses)
+        existing = (
+            queue_path.read_text(encoding="utf-8")
+            if queue_path.exists()
+            else None
+        )
+        if existing == content:
+            return True
+
+        queue_path.parent.mkdir(parents=True, exist_ok=True)
+        queue_path.write_text(content, encoding="utf-8")
+        git_ops._git(self.repo_path, "add", "tasks/QUEUE.md")
+        git_ops._git(
+            self.repo_path,
+            "commit",
+            "-m",
+            "AUTO: regenerate QUEUE.md from DAG",
+        )
+
+        def _push_queue_md() -> subprocess.CompletedProcess[str]:
+            result = git_ops._git(
+                self.repo_path,
+                "push",
+                "origin",
+                self.repo_config.branch,
+                timeout=60,
+                check=False,
+            )
+            if result.returncode != 0:
+                exc = subprocess.CalledProcessError(
+                    result.returncode,
+                    result.args,
+                    output=result.stdout,
+                    stderr=result.stderr,
+                )
+                if is_transient_error(exc):
+                    raise exc
+            return result
+
+        def _rollback_generated_queue_commit() -> None:
+            local_base = "HEAD~1"
+            remote_base = f"refs/remotes/origin/{self.repo_config.branch}"
+            try:
+                fetch = git_ops._git(
+                    self.repo_path,
+                    "fetch",
+                    "origin",
+                    self.repo_config.branch,
+                    timeout=60,
+                    check=False,
+                )
+                local_base_sha = git_ops._git(
+                    self.repo_path,
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    local_base,
+                    check=False,
+                )
+                remote_base_sha = git_ops._git(
+                    self.repo_path,
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    remote_base,
+                    check=False,
+                )
+                if (
+                    fetch.returncode == 0
+                    and local_base_sha.returncode == 0
+                    and remote_base_sha.returncode == 0
+                    and local_base_sha.stdout.strip() != remote_base_sha.stdout.strip()
+                ):
+                    self._idle_generated_queue_needs_resync = True
+                    git_ops._git(
+                        self.repo_path,
+                        "reset",
+                        "--hard",
+                        remote_base,
+                    )
+                    return
+            except (OSError, subprocess.TimeoutExpired):
+                self._idle_generated_queue_needs_resync = True
+            else:
+                if (
+                    fetch.returncode != 0
+                    or local_base_sha.returncode != 0
+                    or remote_base_sha.returncode != 0
+                ):
+                    self._idle_generated_queue_needs_resync = True
+            git_ops._git(
+                self.repo_path,
+                "reset",
+                "--hard",
+                local_base,
+            )
+
+        try:
+            push_result = retry_transient(
+                _push_queue_md,
+                operation_name=f"git push origin {self.repo_config.branch}",
+            )
+        except RuntimeError as exc:
+            if not is_transient_error(exc) and not is_transient_error(exc.__cause__):
+                raise
+            _rollback_generated_queue_commit()
+            return False
+        if push_result.returncode == 0:
+            return True
+
+        _rollback_generated_queue_commit()
+        return False
 
     @staticmethod
     def _validate_task_file_header_match(task_file: Path, header_pr_id: str) -> None:
@@ -64,6 +212,20 @@ class IdleMixin:
             any(issue.endswith(suffix) for suffix in allowed_suffixes)
             for issue in exc.issues
         )
+
+    @staticmethod
+    def _queue_md_contains_visible_legacy_entries(
+        queue_path: str | Path,
+        structured_pr_ids: set[str],
+    ) -> bool:
+        path = Path(queue_path)
+        if not path.is_file():
+            return False
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            match = re.match(r"^##\s+(PR-[A-Za-z0-9_.-]+)\b", raw_line.rstrip())
+            if match and match.group(1) not in structured_pr_ids:
+                return True
+        return False
 
     @staticmethod
     def _filter_dag_headers_with_available_dependencies(
@@ -105,6 +267,8 @@ class IdleMixin:
     async def _select_next_task_from_dag(self) -> QueueTask | None:
         """Pick the next eligible task from structured task headers."""
         self._idle_dag_tasks = None
+        self._idle_dag_headers = None
+        self._idle_dag_statuses = None
         task_dir = Path(self.repo_path) / "tasks"
         if not task_dir.is_dir():
             return None
@@ -179,9 +343,11 @@ class IdleMixin:
         except ValueError as exc:
             raise QueueValidationError([str(exc)]) from exc
 
+        self._idle_dag_headers = list(dag_headers)
+        self._idle_dag_statuses = dict(statuses)
         self._idle_dag_tasks = [
             self._queue_task_from_header(header, statuses[header.pr_id], task_files)
-            for header in headers
+            for header in dag_headers
         ]
         doing_tasks = [
             task for task in self._idle_dag_tasks if task.status == TaskStatus.DOING
@@ -297,6 +463,8 @@ class IdleMixin:
         queue_task = None
         structured_pr_ids = {queued.pr_id for queued in dag_tasks or []}
         has_legacy_queue_tasks = False
+        legacy_queue_check_succeeded = False
+        visible_legacy_queue_entries = False
         try:
             tasks = parse_queue(queue_path, strict=strict)
         except QueueValidationError as exc:
@@ -309,6 +477,11 @@ class IdleMixin:
                 "Queue validation failed after DAG selection; "
                 f"continuing with DAG task: {exc}"
             )
+            visible_legacy_queue_entries = self._queue_md_contains_visible_legacy_entries(
+                queue_path,
+                structured_pr_ids,
+            )
+            legacy_queue_check_succeeded = not visible_legacy_queue_entries
         else:
             try:
                 derive_args = (
@@ -341,12 +514,21 @@ class IdleMixin:
                 )
                 tasks = []
                 queue_task = None
-                has_legacy_queue_tasks = False
+                visible_legacy_queue_entries = self._queue_md_contains_visible_legacy_entries(
+                    queue_path,
+                    structured_pr_ids,
+                )
+                legacy_queue_check_succeeded = not visible_legacy_queue_entries
             else:
                 queue_task = get_next_task(tasks)
+                visible_legacy_queue_entries = self._queue_md_contains_visible_legacy_entries(
+                    queue_path,
+                    structured_pr_ids,
+                )
                 has_legacy_queue_tasks = any(
                     queued.pr_id not in structured_pr_ids for queued in tasks
-                )
+                ) or visible_legacy_queue_entries
+                legacy_queue_check_succeeded = not visible_legacy_queue_entries
 
         task = dag_task
         if queue_task is not None:
@@ -368,6 +550,41 @@ class IdleMixin:
             1 for t in queue_tasks if t.status == TaskStatus.DONE
         )
         self.state.queue_total = len(queue_tasks)
+        generated_headers = getattr(self, "_idle_dag_headers", None)
+        generated_statuses = getattr(self, "_idle_dag_statuses", None)
+        if (
+            generated_headers
+            and generated_statuses
+            and legacy_queue_check_succeeded
+            and not has_legacy_queue_tasks
+        ):
+            try:
+                published_queue = self._write_generated_queue_md(
+                    generated_headers,
+                    generated_statuses,
+                )
+            except (
+                OSError,
+                RuntimeError,
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+            ) as exc:
+                message = f"QUEUE.md auto-generation failed: {exc}"
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = message
+                self.log_event(message)
+                return
+            if not published_queue:
+                self.log_event(
+                    "QUEUE.md auto-generation push rejected; "
+                    "continuing without publishing"
+                )
+                if getattr(self, "_idle_generated_queue_needs_resync", False):
+                    self.log_event(
+                        "QUEUE.md auto-generation refreshed origin state; "
+                        "retrying task selection next cycle"
+                    )
+                    return
         if task is None:
             self.log_event("No tasks available")
             if prs:
