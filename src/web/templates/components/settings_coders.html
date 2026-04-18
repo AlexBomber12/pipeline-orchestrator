@@ -29,9 +29,12 @@
                                 hx-trigger="change"
                                 hx-target="#settings-daemon"
                                 hx-swap="innerHTML">
+                            <option value="" {% if coder.selected_model == "" %}selected{% endif %}>
+                                (default)
+                            </option>
                             {% for model in coder.models %}
                             <option value="{{ model }}" {% if coder.selected_model == model %}selected{% endif %}>
-                                {{ "(default)" if model == "" else model }}
+                                {{ model }}
                             </option>
                             {% endfor %}
                         </select>
