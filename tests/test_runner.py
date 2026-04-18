@@ -413,6 +413,11 @@ def test_handle_idle_sets_queue_counters_with_mixed_statuses(
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: tasks)
     monkeypatch.setattr(idle_module, "get_next_task", lambda t: tasks[2])
     monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda tasks, repo_path, base_branch, open_pr_branches: tasks,
+    )
+    monkeypatch.setattr(
         claude_cli,
         "run_planned_pr_async",
         _async_cli_result(0, "ok", ""),

@@ -74,13 +74,6 @@ class RecoveryMixin:
             )
             return False
 
-        self.state.queue_done = sum(
-            1 for t in tasks if t.status == TaskStatus.DONE
-        )
-        self.state.queue_total = len(tasks)
-
-        doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
-
         try:
             prs = github_client.get_open_prs(
                 self.owner_repo,
@@ -91,6 +84,12 @@ class RecoveryMixin:
             self.state.error_message = f"recover_state: get_open_prs failed: {exc}"
             self.log_event(f"recover_state failed: {exc}")
             return False
+        self.state.queue_done = sum(
+            1 for t in tasks if t.status == TaskStatus.DONE
+        )
+        self.state.queue_total = len(tasks)
+
+        doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
 
         pending_sync = next(
             (p for p in prs if (p.branch or "").startswith("queue-done-")),
