@@ -102,8 +102,34 @@ def _branch_matches_task_pr(
     return candidate_pr_id == pr_id
 
 
-def get_merged_pr_ids(repo_path: str, base_branch: str) -> set[str]:
+def get_merged_pr_ids(
+    repo_path: str,
+    base_branch: str,
+    candidate_pr_ids: Iterable[str] | None = None,
+) -> set[str]:
     """Return queue PR identifiers already present in ``origin/base_branch`` history."""
+    candidate_set = {pr_id for pr_id in candidate_pr_ids or () if pr_id}
+    if candidate_set:
+        try:
+            result = _scan_candidate_merged_pr_ids(
+                repo_path,
+                f"origin/{base_branch}",
+                candidate_set,
+            )
+        except subprocess.TimeoutExpired:
+            return set()
+        if result is None:
+            try:
+                result = _scan_candidate_merged_pr_ids(
+                    repo_path,
+                    base_branch,
+                    candidate_set,
+                )
+            except subprocess.TimeoutExpired:
+                return set()
+        if result is not None:
+            return result
+
     try:
         result = _run_merged_pr_probe(repo_path, f"origin/{base_branch}")
     except subprocess.TimeoutExpired:
@@ -150,6 +176,51 @@ def _run_merged_pr_probe(
     )
 
 
+def _scan_candidate_merged_pr_ids(
+    repo_path: str,
+    target_ref: str,
+    candidate_pr_ids: set[str],
+    timeout: int = 10,
+) -> set[str] | None:
+    """Return matching merged PR ids, or ``None`` when the ref cannot be read."""
+    pattern = "|".join(re.escape(pr_id) for pr_id in sorted(candidate_pr_ids))
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            repo_path,
+            "log",
+            target_ref,
+            "--format=%s",
+            "--extended-regexp",
+            f"--grep=^({pattern}):",
+            f"--max-count={len(candidate_pr_ids)}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        if stderr.startswith("fatal: ambiguous argument "):
+            return None
+        raise RuntimeError(
+            "git log failed while probing merged PR ids: "
+            f"{stderr or target_ref}"
+        )
+
+    found: set[str] = set()
+    for line in result.stdout.strip().splitlines():
+        subject = line.strip()
+        if not subject:
+            continue
+        match = _MERGED_SUBJECT_RE.match(subject)
+        if match:
+            found.add(match.group("pr_id"))
+    return found
+
+
 def derive_queue_task_statuses(
     tasks: list[QueueTask],
     repo_path: str,
@@ -158,9 +229,13 @@ def derive_queue_task_statuses(
     merged_prs: Iterable[PRInfo] = (),
 ) -> list[QueueTask]:
     """Return queue tasks with status refreshed from git/GitHub state."""
-    merged_pr_ids = get_merged_pr_ids(repo_path, base_branch)
     open_prs = list(open_prs)
     merged_prs = list(merged_prs)
+    merged_pr_ids = get_merged_pr_ids(
+        repo_path,
+        base_branch,
+        (task.pr_id for task in tasks),
+    )
     derived: list[QueueTask] = []
 
     for task in tasks:

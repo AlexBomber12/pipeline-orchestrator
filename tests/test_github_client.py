@@ -126,6 +126,7 @@ def test_get_merged_prs_paginates_closed_prs_without_fixed_limit(
                     "ref": "pr-101-shipped-work",
                     "repo": {"fork": False},
                 },
+                "base": {"ref": "main"},
             },
             {
                 "number": 102,
@@ -135,6 +136,7 @@ def test_get_merged_prs_paginates_closed_prs_without_fixed_limit(
                     "ref": "pr-102-closed",
                     "repo": {"fork": False},
                 },
+                "base": {"ref": "main"},
             },
             {
                 "number": 103,
@@ -144,6 +146,7 @@ def test_get_merged_prs_paginates_closed_prs_without_fixed_limit(
                     "ref": "pr-103-custom-title",
                     "repo": {"fork": True},
                 },
+                "base": {"ref": "release"},
             },
         ]
 
@@ -157,6 +160,41 @@ def test_get_merged_prs_paginates_closed_prs_without_fixed_limit(
     assert prs[0].branch == "pr-101-shipped-work"
     assert prs[1].pr_id is None
     assert prs[1].is_cross_repository is True
+
+
+def test_get_merged_prs_filters_by_base_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_paginated(path: str) -> list[dict[str, Any]]:
+        assert path == "repos/owner/name/pulls?state=closed&per_page=100"
+        return [
+            {
+                "number": 101,
+                "title": "PR-101: shipped work",
+                "merged_at": "2026-04-18T10:00:00Z",
+                "head": {
+                    "ref": "pr-101-shipped-work",
+                    "repo": {"fork": False},
+                },
+                "base": {"ref": "main"},
+            },
+            {
+                "number": 102,
+                "title": "PR-102: merged elsewhere",
+                "merged_at": "2026-04-18T11:00:00Z",
+                "head": {
+                    "ref": "pr-102-release-work",
+                    "repo": {"fork": False},
+                },
+                "base": {"ref": "release"},
+            },
+        ]
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    prs = get_merged_prs("owner/name", base_branch="main")
+
+    assert [pr.number for pr in prs] == [101]
 
 
 def test_get_merged_prs_handles_deleted_head_repo(
@@ -173,6 +211,7 @@ def test_get_merged_prs_handles_deleted_head_repo(
                     "ref": "pr-104-deleted-fork",
                     "repo": None,
                 },
+                "base": {"ref": "main"},
             }
         ]
 

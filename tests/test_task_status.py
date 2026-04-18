@@ -155,6 +155,28 @@ def test_get_merged_pr_ids_accepts_full_queue_pr_id_grammar(
     assert get_merged_pr_ids("/repo", "main") == {"PR-abc_1.2"}
 
 
+def test_get_merged_pr_ids_limits_probe_to_requested_candidates(
+    monkeypatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(*args, **kwargs) -> subprocess.CompletedProcess[str]:
+        calls.append(args[0])
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout="PR-085: queue subject\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("src.task_status.subprocess.run", fake_run)
+
+    assert get_merged_pr_ids("/repo", "main", {"PR-085", "PR-099"}) == {"PR-085"}
+    assert "--extended-regexp" in calls[0]
+    assert "--max-count=2" in calls[0]
+    assert any(arg.startswith("--grep=^(") for arg in calls[0])
+
+
 def test_find_matching_open_pr_rejects_conflicting_pr_identity() -> None:
     match = find_matching_open_pr(
         "PR-085",
@@ -276,7 +298,7 @@ def test_derive_queue_task_statuses_does_not_trust_stale_done_queue_status(
 
     monkeypatch.setattr(
         "src.task_status.get_merged_pr_ids",
-        lambda repo_path, base_branch: set(),
+        lambda repo_path, base_branch, candidate_pr_ids=None: set(),
     )
     monkeypatch.setattr(
         "src.task_status._load_task_header",
@@ -308,7 +330,7 @@ def test_derive_queue_task_statuses_marks_done_from_merged_pr_history(
 
     monkeypatch.setattr(
         "src.task_status.get_merged_pr_ids",
-        lambda repo_path, base_branch: {"PR-001"},
+        lambda repo_path, base_branch, candidate_pr_ids=None: {"PR-001"},
     )
     monkeypatch.setattr(
         "src.task_status._load_task_header",
@@ -341,7 +363,7 @@ def test_derive_queue_task_statuses_rejects_mismatched_task_file_pr_id(
 
     monkeypatch.setattr(
         "src.task_status.get_merged_pr_ids",
-        lambda repo_path, base_branch: set(),
+        lambda repo_path, base_branch, candidate_pr_ids=None: set(),
     )
     monkeypatch.setattr(
         "src.task_status._load_task_header",

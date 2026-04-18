@@ -177,7 +177,7 @@ def get_open_prs(
     return prs
 
 
-def get_merged_prs(repo: str) -> list[PRInfo]:
+def get_merged_prs(repo: str, base_branch: str | None = None) -> list[PRInfo]:
     """Return merged PRs for ``repo``.
 
     This is a best-effort fallback used by queue status derivation when
@@ -199,6 +199,9 @@ def get_merged_prs(repo: str) -> list[PRInfo]:
     prs: list[PRInfo] = []
     for entry in raw:
         if entry.get("merged_at") in (None, ""):
+            continue
+        base = entry.get("base") or {}
+        if base_branch and base.get("ref") != base_branch:
             continue
         number = int(entry.get("number", 0))
         if not number:

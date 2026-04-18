@@ -78,7 +78,10 @@ class IdleMixin:
             )
             self.state.current_pr = None
             return
-        merged_prs = github_client.get_merged_prs(self.owner_repo)
+        merged_prs = github_client.get_merged_prs(
+            self.owner_repo,
+            self.repo_config.branch,
+        )
         try:
             derive_args = (
                 tasks,
