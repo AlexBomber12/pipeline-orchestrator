@@ -82,13 +82,14 @@ class IdleMixin:
             return None
 
         structured_pr_ids = {header.pr_id for header in headers}
-        if any(
-            dependency in skipped_legacy_pr_ids
-            for header in headers
-            for dependency in header.depends_on
-            if dependency not in structured_pr_ids
-        ):
-            return None
+        for header in headers:
+            for dependency in header.depends_on:
+                if dependency in structured_pr_ids:
+                    continue
+                if dependency in skipped_legacy_pr_ids:
+                    return None
+                if not (task_dir / f"{dependency}.md").exists():
+                    return None
 
         try:
             merged_pr_ids = get_merged_pr_ids(
