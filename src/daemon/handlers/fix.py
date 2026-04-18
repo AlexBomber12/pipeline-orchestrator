@@ -92,6 +92,8 @@ class FixMixin(BreachMixin):
         self.state.state = PipelineState.FIX
         self.log_event(f"[{coder_name}] entering FIX")
         await self.publish_state()
+        if self._current_run_record is not None:
+            self._current_run_record.fix_iterations += 1
 
         if (
             self.state.current_pr is not None

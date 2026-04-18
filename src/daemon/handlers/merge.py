@@ -92,6 +92,7 @@ class MergeMixin:
                             self.state.error_message = (
                                 "Merge conflict resolution failed"
                             )
+                            await self._save_current_run_record("error")
                             self.log_event(self.state.error_message)
                             return
                         sync_produced_commit = True
@@ -101,6 +102,7 @@ class MergeMixin:
                             f"git merge origin/{base} failed: "
                             f"{merge_result.stderr.strip()}"
                         )
+                        await self._save_current_run_record("error")
                         self.log_event(self.state.error_message)
                         return
                 else:
@@ -136,6 +138,7 @@ class MergeMixin:
                     subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
                 self.state.state = PipelineState.ERROR
                 self.state.error_message = f"Pre-merge sync failed: {exc}"
+                await self._save_current_run_record("error")
                 self.log_event(self.state.error_message)
                 return
 
@@ -145,6 +148,7 @@ class MergeMixin:
         except Exception as exc:
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"merge_pr failed: {exc}"
+            await self._save_current_run_record("error")
             self.log_event(str(exc))
             return
 
@@ -153,6 +157,8 @@ class MergeMixin:
         except Exception as exc:
             self.log_event(f"Warning: queue-sync step failed: {exc}")
 
+        await self._save_current_run_record("success_merged")
+        self._current_run_record = None
         self.state.current_pr = None
         self.state.current_task = None
         self.state.state = PipelineState.IDLE

@@ -878,6 +878,35 @@ def test_handle_fix_posts_codex_review_after_push(
     )
 
 
+def test_fix_increments_iterations(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", _async_cli_result(0, "", "")
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._start_current_run_record("claude", "opus")
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-001")
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner._current_run_record is not None
+    assert runner._current_run_record.fix_iterations == 1
+
+
 def test_handle_fix_errors_when_post_comment_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1778,6 +1807,92 @@ def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is None
     assert runner.state.current_task is None
+
+
+def test_merge_finalizes_record(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.github_client, "merge_pr", lambda repo, num: None
+    )
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._start_current_run_record("claude", "opus")
+
+    asyncio.run(runner.handle_merge())
+
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+
+    assert len(recent) == 1
+    assert recent[0].exit_reason == "success_merged"
+    assert recent[0].ended_at is not None
+    assert recent[0].duration_ms is not None
+    assert runner._current_run_record is None
+
+
+def test_merge_calculates_duration(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.github_client, "merge_pr", lambda repo, num: None
+    )
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+
+    fixed_now = datetime(2026, 4, 18, 12, 0, 6, 500000, tzinfo=timezone.utc)
+
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            if tz is None:
+                return fixed_now.replace(tzinfo=None)
+            return fixed_now.astimezone(tz)
+
+    monkeypatch.setattr(runner_module, "datetime", _FixedDateTime)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._start_current_run_record("claude", "opus")
+    assert runner._current_run_record is not None
+    runner._current_run_record.started_at = "2026-04-18T12:00:00+00:00"
+
+    asyncio.run(runner.handle_merge())
+
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+
+    assert len(recent) == 1
+    assert recent[0].duration_ms == 6500
 
 
 def test_handle_merge_queue_sync_failure_still_goes_idle(
