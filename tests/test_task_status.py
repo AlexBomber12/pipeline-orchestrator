@@ -78,6 +78,25 @@ def test_get_merged_pr_ids(monkeypatch) -> None:
     }
 
 
+def test_get_merged_pr_ids_accepts_full_queue_pr_id_grammar(
+    monkeypatch,
+) -> None:
+    def fake_run(*args, **kwargs) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout=(
+                "PR-abc_1.2: queue parser parity\n"
+                "Merge pull request #98 from AlexBomber12/pr-feature-x\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("src.task_status.subprocess.run", fake_run)
+
+    assert get_merged_pr_ids("/repo", "main") == {"PR-abc_1.2"}
+
+
 def test_load_task_header_falls_back_for_legacy_task_files(
     tmp_path: Path,
 ) -> None:
@@ -111,14 +130,14 @@ def test_load_task_header_falls_back_for_legacy_task_files(
     )
 
 
-def test_derive_queue_task_statuses_preserves_done_without_remote_branch(
+def test_derive_queue_task_statuses_does_not_trust_stale_done_queue_status(
     monkeypatch,
 ) -> None:
     task = QueueTask(
         pr_id="PR-001",
-        title="Completed task",
+        title="Queued task",
         status=TaskStatus.DONE,
-        branch="pr-001-completed",
+        branch="pr-001-queued-task",
     )
 
     monkeypatch.setattr(
@@ -127,7 +146,10 @@ def test_derive_queue_task_statuses_preserves_done_without_remote_branch(
     )
     monkeypatch.setattr(
         "src.task_status._load_task_header",
-        lambda current_task, repo_path: _header("pr-001-completed"),
+        lambda current_task, repo_path: _header(
+            "pr-001-queued-task",
+            pr_id="PR-001",
+        ),
     )
 
     derived = derive_queue_task_statuses(
@@ -137,7 +159,7 @@ def test_derive_queue_task_statuses_preserves_done_without_remote_branch(
         set(),
     )
 
-    assert derived[0].status == TaskStatus.DONE
+    assert derived[0].status == TaskStatus.TODO
 
 
 def test_derive_queue_task_statuses_marks_done_from_merged_pr_history(

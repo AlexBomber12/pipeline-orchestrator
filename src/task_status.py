@@ -8,12 +8,15 @@ from pathlib import Path
 
 from src.models import QueueTask, TaskStatus
 from src.queue_parser import (
+    _PR_ID_RE,
     QueueValidationError,
     TaskHeader,
     parse_task_header,
 )
 
-_MERGED_PR_ID_RE = re.compile(r"\b(PR-\d+)\b")
+_MERGED_PR_ID_RE = re.compile(
+    _PR_ID_RE.pattern.removeprefix("^").removesuffix("$")
+)
 
 
 def derive_task_status(
@@ -47,7 +50,7 @@ def get_merged_pr_ids(repo_path: str, base_branch: str) -> set[str]:
             continue
         match = _MERGED_PR_ID_RE.search(subject)
         if match:
-            pr_ids.add(match.group(1))
+            pr_ids.add(match.group(0))
     return pr_ids
 
 
@@ -84,12 +87,6 @@ def derive_queue_task_statuses(
     for task in tasks:
         header = _load_task_header(task, repo_path)
         status = derive_task_status(header, merged_pr_ids, open_pr_branches)
-        if (
-            status == TaskStatus.TODO
-            and task.status == TaskStatus.DONE
-            and header.branch not in open_pr_branches
-        ):
-            status = TaskStatus.DONE
         derived.append(
             task.model_copy(update={"status": status, "branch": header.branch})
         )
