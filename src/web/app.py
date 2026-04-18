@@ -197,9 +197,7 @@ def _build_coder_rows(
             if plugin.name == "claude"
             else config.daemon.codex_model
         )
-        model_options = list(plugin.models)
-        if selected_model not in model_options:
-            model_options.append(selected_model)
+        model_options = [model for model in plugin.models if model != ""]
         rows.append(
             {
                 "name": plugin.name,
@@ -217,6 +215,18 @@ def _build_coder_rows(
             }
         )
     return rows
+
+
+def _validate_coder_model(
+    model: str, *, field_name: str, plugin: ClaudePlugin | CodexPlugin
+) -> str:
+    """Return ``model`` when it is empty or supported by ``plugin``."""
+    allowed_models = {candidate for candidate in plugin.models if candidate != ""}
+    if model != "" and model not in allowed_models:
+        raise ValueError(
+            f"{field_name} must be one of: {', '.join(sorted(allowed_models))}"
+        )
+    return model
 
 
 async def _repo_template_context(
@@ -995,10 +1005,18 @@ async def put_settings_daemon(
             if coder not in ("claude", "codex"):
                 raise ValueError("coder must be 'claude' or 'codex'")
             updates["coder"] = coder
-        if claude_model is not None and claude_model != "":
-            updates["claude_model"] = claude_model
+        if claude_model is not None:
+            updates["claude_model"] = _validate_coder_model(
+                claude_model,
+                field_name="claude_model",
+                plugin=ClaudePlugin(),
+            )
         if codex_model is not None:
-            updates["codex_model"] = codex_model
+            updates["codex_model"] = _validate_coder_model(
+                codex_model,
+                field_name="codex_model",
+                plugin=CodexPlugin(),
+            )
     except ValueError as exc:
         return await _render_settings_daemon_error(request, str(exc), 422)
 

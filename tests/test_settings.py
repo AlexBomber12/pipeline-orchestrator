@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 from src import config as src_config
+from src.coders.claude import ClaudePlugin
+from src.coders.codex import CodexPlugin
 from src.config import load_config
 from src.web import app as web_app
 from src.web.app import app
@@ -599,6 +601,57 @@ def test_put_daemon_updates_boolean_fields(empty_config: Path) -> None:
     cfg = load_config(str(empty_config))
     assert cfg.daemon.hung_fallback_codex_review is False
     assert cfg.daemon.error_handler_use_ai is False
+
+
+def test_model_save_rejects_unknown_model(empty_config: Path) -> None:
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={
+                "claude_model": "o3",
+                "codex_model": "not-a-real-model",
+            },
+        )
+
+    assert response.status_code == 422
+    assert "text/html" in response.headers["content-type"]
+    assert "claude_model" in response.text or "codex_model" in response.text
+
+    cfg = load_config(str(empty_config))
+    assert cfg.daemon.claude_model == "opus"
+    assert cfg.daemon.codex_model == ""
+
+
+def test_model_save_accepts_valid_model(empty_config: Path) -> None:
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={
+                "claude_model": ClaudePlugin.models[-1],
+                "codex_model": CodexPlugin.models[-1],
+            },
+        )
+
+    assert response.status_code == 200
+    cfg = load_config(str(empty_config))
+    assert cfg.daemon.claude_model == ClaudePlugin.models[-1]
+    assert cfg.daemon.codex_model == CodexPlugin.models[-1]
+
+
+def test_model_dropdown_includes_default_option(empty_config: Path) -> None:
+    with TestClient(app) as client:
+        response = client.get("/partials/settings/coders")
+
+    assert response.status_code == 200
+    body = response.text
+    assert '<option value=""' in body
+    assert "(default)" in body
+    for model in ClaudePlugin.models:
+        if model != "":
+            assert f'value="{model}"' in body
+    for model in CodexPlugin.models:
+        if model != "":
+            assert f'value="{model}"' in body
 
 
 def test_put_daemon_empty_numeric_inputs_are_no_ops(empty_config: Path) -> None:
@@ -1297,12 +1350,12 @@ def test_codex_model_setting_saves(
     with TestClient(app) as client:
         response = client.put(
             "/settings/daemon",
-            data={"codex_model": "o4-mini"},
+            data={"codex_model": "gpt-5.4"},
         )
 
     assert response.status_code == 200
     cfg = load_config(str(empty_config))
-    assert cfg.daemon.codex_model == "o4-mini"
+    assert cfg.daemon.codex_model == "gpt-5.4"
 
 
 def test_codex_model_setting_clears_to_default(
@@ -1416,7 +1469,7 @@ def test_coders_table_polls_for_auth_refresh(empty_config: Path) -> None:
     assert 'hx-trigger="every 30s"' in body
 
 
-def test_coders_table_includes_unknown_selected_model(
+def test_coders_table_omits_unknown_selected_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg_path = tmp_path / "config.yml"
@@ -1431,10 +1484,9 @@ def test_coders_table_includes_unknown_selected_model(
 
     assert response.status_code == 200
     body = response.text
-    assert (
-        '<option value="custom-model" selected>'
-        in body
-    )
+    assert 'value="custom-model"' not in body
+    assert 'value=""' in body
+    assert "(default)" in body
 
 
 def test_repo_detail_coder_dropdown_renders(

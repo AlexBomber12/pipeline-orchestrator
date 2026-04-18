@@ -461,7 +461,7 @@
 - Depends on: PR-077
 
 ## PR-079: Model dropdown validated from plugin
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-079.md
 - Branch: pr-079-model-dropdown
 - Depends on: PR-078
