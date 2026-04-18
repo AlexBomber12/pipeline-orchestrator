@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 from src.models import CIStatus, PRInfo, ReviewStatus
-from src.retry import retry_transient
+from src.retry import is_transient_error, retry_transient
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,10 @@ _MERGED_PRS_CACHE_TTL_SECONDS = 60.0
 
 def _is_http_404_error(exc: RuntimeError) -> bool:
     return ("HTTP" + " 404") in str(exc)
+
+
+def _should_degrade_reactions_error(exc: RuntimeError) -> bool:
+    return _is_http_404_error(exc) or is_transient_error(exc)
 
 
 def _cache_key(repo: str, pr_number: int, head_sha: str) -> str:
@@ -296,8 +300,10 @@ def _get_codex_issue_reactions(
             f"repos/{repo}/issues/{pr_number}/reactions"
         )
     except RuntimeError as exc:
-        if "HTTP 404" in str(exc):
+        if _is_http_404_error(exc):
             return []
+        if not is_transient_error(exc):
+            raise
         logger.warning(
             "Reactions fetch degraded for PR %s in %s: %s",
             pr_number,
@@ -415,15 +421,17 @@ def _compute_review_status(
                     ):
                         anchor_eyes = True
             except RuntimeError as exc:
-                if "HTTP 404" in str(exc):
+                if _is_http_404_error(exc):
                     pass
-                else:
+                elif _should_degrade_reactions_error(exc):
                     logger.warning(
                         "Anchor comment reactions fetch degraded for comment %s in %s: %s",
                         cid,
                         repo,
                         exc,
                     )
+                else:
+                    raise
 
     if body_eyes or anchor_eyes:
         return ReviewStatus.EYES

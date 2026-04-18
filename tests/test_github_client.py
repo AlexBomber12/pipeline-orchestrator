@@ -1425,6 +1425,31 @@ def test_get_codex_issue_reactions_logs_warning_on_runtime_error(
     )
 
 
+def test_compute_review_status_propagates_non_transient_body_reactions_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/42/reactions"):
+            raise RuntimeError("HTTP 403 rate limit exceeded")
+        if path.endswith("/issues/42/comments"):
+            return [
+                {
+                    "id": 10,
+                    "user": {"login": "author"},
+                    "body": "@codex review",
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ]
+        if path.endswith("/pulls/42/comments"):
+            return []
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    with pytest.raises(RuntimeError, match="403"):
+        _compute_review_status("owner/name", 42, "author", "")
+
+
 def test_compute_review_status_degrades_when_anchor_reactions_fail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1452,6 +1477,33 @@ def test_compute_review_status_degrades_when_anchor_reactions_fail(
         _compute_review_status("owner/name", 42, "author", "")
         == ReviewStatus.PENDING
     )
+
+
+def test_compute_review_status_propagates_non_transient_anchor_reactions_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/42/reactions"):
+            return []
+        if path.endswith("/issues/42/comments"):
+            return [
+                {
+                    "id": 10,
+                    "user": {"login": "author"},
+                    "body": "@codex review",
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ]
+        if path.endswith("/pulls/42/comments"):
+            return []
+        if path.endswith("/issues/comments/10/reactions"):
+            raise RuntimeError("HTTP 403 rate limit exceeded")
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    with pytest.raises(RuntimeError, match="403"):
+        _compute_review_status("owner/name", 42, "author", "")
 
 
 def _is_commits_path(cmd: list[str]) -> bool:
