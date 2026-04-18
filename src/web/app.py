@@ -359,7 +359,12 @@ async def _recent_repo_metrics_payload(
         )
     except Exception:
         return []
-    completed = [record for record in records if record.ended_at is not None]
+    completed = [
+        record
+        for record in records
+        if record.ended_at is not None
+        and record.exit_reason in _TERMINAL_METRICS_EXIT_REASONS
+    ]
     completed.sort(
         key=lambda record: _parse_iso8601(record.ended_at)
         or datetime.min.replace(tzinfo=timezone.utc),
@@ -373,6 +378,7 @@ async def _recent_repo_metrics_payload(
 
 _MERGE_EVENT_MARKER = "Merged PR"
 _ITERATION_EVENT_MARKER = "Fix pushed, iteration"
+_TERMINAL_METRICS_EXIT_REASONS = frozenset({"error", "rate_limit", "success_merged"})
 _ACTIVE_STATES = frozenset(
     {PipelineState.CODING, PipelineState.WATCH, PipelineState.FIX}
 )

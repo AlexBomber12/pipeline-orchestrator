@@ -412,6 +412,15 @@ def test_metrics_endpoint_returns_records(
 ) -> None:
     fake = _FakeRedis(
         store={
+            "metrics:run:active-finished-step": _metrics_record(
+                "active-finished-step",
+                task_id="PR-083",
+                started_at="2026-04-18T12:00:00+00:00",
+                ended_at="2026-04-18T12:03:00+00:00",
+                duration_ms=180000,
+                fix_iterations=0,
+                exit_reason="coding_complete",
+            ),
             "metrics:run:older": _metrics_record(
                 "older",
                 task_id="PR-081",
@@ -432,7 +441,13 @@ def test_metrics_endpoint_returns_records(
                 exit_reason="success_merged",
             ),
         },
-        lists={"metrics:repo:example__alpha:PR": ["older", "newer"]},
+        lists={
+            "metrics:repo:example__alpha:PR": [
+                "active-finished-step",
+                "older",
+                "newer",
+            ]
+        },
     )
 
     with TestClient(app) as client:
@@ -442,6 +457,7 @@ def test_metrics_endpoint_returns_records(
     assert response.status_code == 200
     payload = response.json()
     assert [record["task_id"] for record in payload] == ["PR-081", "PR-082"]
+    assert all(record["exit_reason"] != "coding_complete" for record in payload)
     assert payload[0]["coder"] == "codex"
     assert payload[0]["model"] == "gpt-5.4"
     assert payload[0]["duration_text"] == "1m 1s"
