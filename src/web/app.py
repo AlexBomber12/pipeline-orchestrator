@@ -816,38 +816,53 @@ async def settings_page(request: Request) -> HTMLResponse:
     )
 
 
-def _render_settings_daemon(request: Request) -> HTMLResponse:
-    """Render the daemon settings form for a successful response.
-
-    Uses ``settings_daemon_response.html`` rather than the bare
-    ``settings_daemon.html`` partial so HTMX also receives an OOB clear
-    of ``#settings-daemon-error`` — otherwise an error banner left over
-    from a prior 422/503 PUT would keep hanging around after a subsequent
-    successful mutation.
-    """
+async def _settings_daemon_template_context(
+    request: Request,
+) -> dict[str, Any]:
     cfg = load_config(CONFIG_PATH)
+    auth = await _collect_auth_status()
+    return {
+        "daemon": cfg.daemon,
+        "coders": _build_coder_rows(cfg, auth),
+        "auth": auth,
+    }
+
+
+async def _render_settings_daemon_response(request: Request) -> HTMLResponse:
+    """Render the daemon settings form for a successful mutation response.
+
+    Successful PUTs re-render both the daemon form and the coder controls.
+    The coder block is sent as an out-of-band swap so HTMX resets any
+    radio/select state that the browser changed optimistically before the
+    server accepted the update.
+    """
     return templates.TemplateResponse(
         request,
         "components/settings_daemon_response.html",
-        {"daemon": cfg.daemon},
+        await _settings_daemon_template_context(request),
     )
 
 
-def _render_settings_daemon_error(
+async def _render_settings_daemon_error(
     request: Request, message: str, status_code: int
 ) -> HTMLResponse:
-    cfg = load_config(CONFIG_PATH)
+    context = await _settings_daemon_template_context(request)
     return templates.TemplateResponse(
         request,
         "components/settings_daemon_error.html",
-        {"daemon": cfg.daemon, "message": message},
+        {**context, "message": message},
         status_code=status_code,
     )
 
 
 @app.get("/partials/settings/daemon", response_class=HTMLResponse)
 async def partial_settings_daemon(request: Request) -> HTMLResponse:
-    return _render_settings_daemon(request)
+    context = await _settings_daemon_template_context(request)
+    return templates.TemplateResponse(
+        request,
+        "components/settings_daemon_response.html",
+        context,
+    )
 
 
 @app.put("/settings/daemon", response_class=HTMLResponse)
@@ -938,17 +953,17 @@ async def put_settings_daemon(
         if codex_model is not None:
             updates["codex_model"] = codex_model
     except ValueError as exc:
-        return _render_settings_daemon_error(request, str(exc), 422)
+        return await _render_settings_daemon_error(request, str(exc), 422)
 
     try:
         update_daemon_config(path=CONFIG_PATH, **updates)
     except ValueError as exc:
-        return _render_settings_daemon_error(request, str(exc), 422)
+        return await _render_settings_daemon_error(request, str(exc), 422)
     except OSError as exc:
-        return _render_settings_daemon_error(
+        return await _render_settings_daemon_error(
             request, f"Failed to write config.yml: {exc}", 503
         )
-    return _render_settings_daemon(request)
+    return await _render_settings_daemon_response(request)
 
 
 _AUTH_CHECK_TIMEOUT_SEC = 5

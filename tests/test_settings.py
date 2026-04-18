@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import threading
 from pathlib import Path
@@ -708,6 +709,37 @@ def test_put_daemon_success_oob_clears_stale_error(empty_config: Path) -> None:
     body = response.text
     assert 'id="settings-daemon-error"' in body
     assert 'hx-swap-oob="innerHTML"' in body
+    assert 'id="settings-coders"' in body
+    assert 'hx-swap-oob="outerHTML"' in body
+
+
+def test_put_daemon_error_oob_refreshes_coder_controls(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(src_config, "save_config", _raise_permission_error)
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 503
+    body = response.text
+    assert 'id="settings-coders"' in body
+    assert 'hx-swap-oob="outerHTML"' in body
+    assert re.search(
+        r'name="coder"[\s\S]*value="claude"[\s\S]*checked',
+        body,
+    )
+    assert re.search(
+        r'name="coder"[\s\S]*value="codex"',
+        body,
+    )
+    assert not re.search(
+        r'name="coder"[\s\S]*value="codex"[\s\S]*checked',
+        body,
+    )
 
 
 # ---------------------------------------------------------------------------
