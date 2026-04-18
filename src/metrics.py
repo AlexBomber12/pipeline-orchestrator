@@ -25,6 +25,7 @@ class RunRecord:
     tokens_out: int
     exit_reason: str
     operator_intervention: bool
+    repo_name: str = ""
 
 
 class MetricsStore:
@@ -36,7 +37,7 @@ class MetricsStore:
     async def save(self, record: RunRecord) -> None:
         key = self._record_key(record.run_id)
         payload = json.dumps(asdict(record), sort_keys=True)
-        recent_key = self._recent_key(record.task_id)
+        recent_key = self._recent_key(record.task_id, record.repo_name)
         await self._redis.set(key, payload, ex=_TTL_SECONDS)
         await self._redis.lrem(recent_key, 0, record.run_id)
         await self._redis.lpush(recent_key, record.run_id)
@@ -48,10 +49,19 @@ class MetricsStore:
             return None
         return RunRecord(**json.loads(raw))
 
-    async def recent(self, task_id: str = "PR", limit: int = 20) -> list[RunRecord]:
+    async def recent(
+        self,
+        task_id: str = "PR",
+        limit: int = 20,
+        repo_name: str = "",
+    ) -> list[RunRecord]:
         if limit <= 0:
             return []
-        run_ids = await self._redis.lrange(self._recent_key(task_id), 0, limit - 1)
+        run_ids = await self._redis.lrange(
+            self._recent_key(task_id, repo_name),
+            0,
+            limit - 1,
+        )
         records: list[RunRecord] = []
         for run_id in run_ids:
             record = await self.get(run_id)
@@ -64,5 +74,7 @@ class MetricsStore:
         return f"metrics:run:{run_id}"
 
     @staticmethod
-    def _recent_key(task_id: str) -> str:
-        return f"metrics:repo:{task_id.split('-', 1)[0]}"
+    def _recent_key(task_id: str, repo_name: str = "") -> str:
+        task_prefix = task_id.split("-", 1)[0]
+        repo_scope = repo_name or "global"
+        return f"metrics:repo:{repo_scope}:{task_prefix}"
