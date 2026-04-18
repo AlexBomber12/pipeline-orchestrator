@@ -3310,7 +3310,7 @@ def test_handle_idle_open_pr_check_survives_github_failure(
     assert any("open PR check failed" in e["event"] for e in runner.state.history)
 
 
-def test_handle_idle_merged_pr_check_survives_github_failure(
+def test_handle_idle_defers_on_merged_pr_check_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_subprocess(monkeypatch)
@@ -3345,8 +3345,9 @@ def test_handle_idle_merged_pr_check_survives_github_failure(
     runner.state.current_pr = PRInfo(number=5, branch="stale")
     asyncio.run(runner.handle_idle())
 
-    assert runner.state.state == PipelineState.CODING
-    assert runner.state.current_task == task
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+    assert runner.state.current_task is None
     assert any("merged PR check failed" in e["event"] for e in runner.state.history)
 
 
