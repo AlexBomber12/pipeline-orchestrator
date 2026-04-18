@@ -330,23 +330,33 @@ class IdleMixin:
                 QueueValidationError,
                 subprocess.TimeoutExpired,
             ) as exc:
-                self.state.state = PipelineState.ERROR
-                self.state.error_message = f"Task status derivation failed: {exc}"
-                self.log_event(f"Task status derivation failed: {exc}")
-                return
-
-            queue_task = get_next_task(tasks)
-            has_legacy_queue_tasks = any(
-                queued.pr_id not in structured_pr_ids for queued in tasks
-            )
+                if dag_tasks is None:
+                    self.state.state = PipelineState.ERROR
+                    self.state.error_message = f"Task status derivation failed: {exc}"
+                    self.log_event(f"Task status derivation failed: {exc}")
+                    return
+                self.log_event(
+                    "Task status derivation failed after DAG selection; "
+                    f"continuing with DAG tasks: {exc}"
+                )
+                tasks = []
+                queue_task = None
+                has_legacy_queue_tasks = False
+            else:
+                queue_task = get_next_task(tasks)
+                has_legacy_queue_tasks = any(
+                    queued.pr_id not in structured_pr_ids for queued in tasks
+                )
 
         task = dag_task
         if queue_task is not None:
-            if task is None:
+            queue_task_is_legacy = queue_task.pr_id not in structured_pr_ids
+            if task is None and (dag_tasks is None or queue_task_is_legacy):
                 task = queue_task
             elif (
-                task.status != TaskStatus.DOING
-                and queue_task.pr_id not in structured_pr_ids
+                task is not None
+                and task.status != TaskStatus.DOING
+                and queue_task_is_legacy
             ):
                 task = queue_task
 
