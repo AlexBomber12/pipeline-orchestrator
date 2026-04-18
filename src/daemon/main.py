@@ -32,8 +32,11 @@ from typing import Any
 
 import redis.asyncio as aioredis
 
+from src.coders.claude import ClaudePlugin
+from src.coders.codex import CodexPlugin
 from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
 from src.daemon.runner import PipelineRunner
+from src.usage import UsageProvider
 
 logging.basicConfig(
     level=logging.INFO,
@@ -142,7 +145,11 @@ def _install_statusline_hook(claude_config_dir: str) -> None:
 
 
 def _build_runner(
-    repo: RepoConfig, config: AppConfig, redis_client: Any
+    repo: RepoConfig,
+    config: AppConfig,
+    redis_client: Any,
+    claude_usage_provider: UsageProvider,
+    codex_usage_provider: UsageProvider,
 ) -> PipelineRunner | None:
     """Construct a runner, logging and swallowing init failures."""
     try:
@@ -150,6 +157,8 @@ def _build_runner(
             repo_config=repo,
             app_config=config,
             redis_client=redis_client,
+            claude_usage_provider=claude_usage_provider,
+            codex_usage_provider=codex_usage_provider,
         )
     except Exception:
         logger.error(
@@ -164,6 +173,8 @@ def _sync_runners(
     runners: dict[str, PipelineRunner],
     config: AppConfig,
     redis_client: Any,
+    claude_usage_provider: UsageProvider,
+    codex_usage_provider: UsageProvider,
 ) -> None:
     """Reconcile ``runners`` with ``config.repositories`` in place.
 
@@ -192,7 +203,13 @@ def _sync_runners(
             runners[key].repo_config = repo
             runners[key].app_config = config
             continue
-        runner = _build_runner(repo, config, redis_client)
+        runner = _build_runner(
+            repo,
+            config,
+            redis_client,
+            claude_usage_provider,
+            codex_usage_provider,
+        )
         if runner is not None:
             runners[key] = runner
             logger.info("Added runner for %s", repo.url)
@@ -217,6 +234,8 @@ async def main() -> None:
         )
 
     config = load_config()
+    claude_usage_provider = ClaudePlugin().create_usage_provider(config=config)
+    codex_usage_provider = CodexPlugin().create_usage_provider(config=config)
 
     _clean_breach_dir()
     if config.daemon.install_statusline_hook:
@@ -237,7 +256,13 @@ async def main() -> None:
         )
 
     runners: dict[str, PipelineRunner] = {}
-    _sync_runners(runners, config, redis_client)
+    _sync_runners(
+        runners,
+        config,
+        redis_client,
+        claude_usage_provider,
+        codex_usage_provider,
+    )
 
     last_run: dict[str, float] = {}
     last_config_check = time.monotonic()
@@ -256,7 +281,13 @@ async def main() -> None:
                         "Config change detected; reconciling runners"
                     )
                     config = new_config
-                    _sync_runners(runners, config, redis_client)
+                    _sync_runners(
+                        runners,
+                        config,
+                        redis_client,
+                        claude_usage_provider,
+                        codex_usage_provider,
+                    )
 
         for key, runner in list(runners.items()):
             if not runner.repo_config.active:

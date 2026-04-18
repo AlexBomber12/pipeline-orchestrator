@@ -27,10 +27,14 @@ class _FakeRunner:
         repo_config: RepoConfig,
         app_config: AppConfig,
         redis_client: Any,
+        claude_usage_provider: Any,
+        codex_usage_provider: Any,
     ) -> None:
         self.repo_config = repo_config
         self.app_config = app_config
         self.redis_client = redis_client
+        self.claude_usage_provider = claude_usage_provider
+        self.codex_usage_provider = codex_usage_provider
         from src.utils import repo_slug_from_url
         self.name = repo_slug_from_url(repo_config.url)
         self.cycles = 0
@@ -143,10 +147,18 @@ def test_main_skips_runner_whose_init_raises(
             repo_config: RepoConfig,
             app_config: AppConfig,
             redis_client: Any,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
         ) -> None:
             if "broken" in repo_config.url:
                 raise ValueError(f"Not a recognizable GitHub URL: {repo_config.url!r}")
-            super().__init__(repo_config, app_config, redis_client)
+            super().__init__(
+                repo_config,
+                app_config,
+                redis_client,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
 
     config = AppConfig(
         repositories=[

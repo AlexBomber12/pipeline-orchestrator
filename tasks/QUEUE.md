@@ -443,7 +443,7 @@
 - Depends on: PR-073
 
 ## PR-076: Shared process-level usage provider
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-076.md
 - Branch: pr-076-shared-usage-provider
 - Depends on: PR-074, PR-075

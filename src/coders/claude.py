@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from src import claude_cli
-from src.config import load_config
+from src.config import AppConfig, load_config
 from src.usage import OAuthUsageProvider, UsageProvider
 
 CONFIG_PATH = "config.yml"
@@ -80,7 +80,10 @@ class ClaudePlugin:
         return {"status": "error", "detail": detail}
 
     def create_usage_provider(self, **kwargs: Any) -> UsageProvider:
-        cfg = load_config(kwargs.pop("config_path", CONFIG_PATH))
+        cfg = kwargs.pop("config", None)
+        if cfg is None:
+            cfg = load_config(kwargs.pop("config_path", CONFIG_PATH))
+        assert isinstance(cfg, AppConfig)
         credentials_path = kwargs.pop(
             "credentials_path",
             str(Path(cfg.auth.claude_config_dir) / ".credentials.json"),
