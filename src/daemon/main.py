@@ -169,6 +169,14 @@ def _build_runner(
         return None
 
 
+def _create_usage_providers(config: AppConfig) -> tuple[UsageProvider, UsageProvider]:
+    """Create the shared daemon-level usage providers for the current config."""
+    return (
+        ClaudePlugin().create_usage_provider(config=config),
+        CodexPlugin().create_usage_provider(config=config),
+    )
+
+
 def _sync_runners(
     runners: dict[str, PipelineRunner],
     config: AppConfig,
@@ -202,6 +210,10 @@ def _sync_runners(
         if key in runners:
             runners[key].repo_config = repo
             runners[key].app_config = config
+            runners[key].set_usage_providers(
+                claude_usage_provider,
+                codex_usage_provider,
+            )
             continue
         runner = _build_runner(
             repo,
@@ -234,8 +246,7 @@ async def main() -> None:
         )
 
     config = load_config()
-    claude_usage_provider = ClaudePlugin().create_usage_provider(config=config)
-    codex_usage_provider = CodexPlugin().create_usage_provider(config=config)
+    claude_usage_provider, codex_usage_provider = _create_usage_providers(config)
 
     _clean_breach_dir()
     if config.daemon.install_statusline_hook:
@@ -281,6 +292,7 @@ async def main() -> None:
                         "Config change detected; reconciling runners"
                     )
                     config = new_config
+                    claude_usage_provider, codex_usage_provider = _create_usage_providers(config)
                     _sync_runners(
                         runners,
                         config,

@@ -46,6 +46,14 @@ class _FakeRunner:
     async def publish_state(self) -> None:
         pass
 
+    def set_usage_providers(
+        self,
+        claude_usage_provider: Any,
+        codex_usage_provider: Any,
+    ) -> None:
+        self.claude_usage_provider = claude_usage_provider
+        self.codex_usage_provider = codex_usage_provider
+
 
 class _StopLoop(Exception):
     """Sentinel raised by the patched ``asyncio.sleep`` to end ``main``."""
@@ -309,6 +317,81 @@ def test_main_reload_drops_removed_repository(
     # and does NOT run that cycle.
     assert beta.cycles == 2
     assert alpha.cycles == 3
+
+
+def test_main_reload_recreates_shared_usage_providers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reloading config must refresh the shared providers for all runners."""
+    first = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    second = AppConfig(
+        repositories=[
+            _repo("https://github.com/octo/alpha.git"),
+            _repo("https://github.com/octo/beta.git"),
+        ],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+
+    _reset_fake_runner()
+    load_calls = {"n": 0}
+
+    def fake_load_config() -> AppConfig:
+        load_calls["n"] += 1
+        return first if load_calls["n"] == 1 else second
+
+    class _PluginFactory:
+        def __init__(self, prefix: str) -> None:
+            self.prefix = prefix
+            self.calls = 0
+
+        def create_usage_provider(self, *, config: AppConfig) -> str:
+            self.calls += 1
+            return f"{self.prefix}-{self.calls}-{id(config)}"
+
+    claude_factory = _PluginFactory("claude")
+    codex_factory = _PluginFactory("codex")
+
+    monkeypatch.setattr(main_module, "load_config", fake_load_config)
+    monkeypatch.setattr(
+        main_module.aioredis,
+        "from_url",
+        lambda url, decode_responses: _FakeRedisClient(),
+    )
+    monkeypatch.setattr(main_module, "PipelineRunner", _FakeRunner)
+    monkeypatch.setattr(main_module, "_setup_git_auth", lambda: None)
+    monkeypatch.setattr(
+        main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
+    )
+    monkeypatch.setattr(main_module, "CONFIG_RELOAD_CYCLES", 3)
+    monkeypatch.setattr(main_module, "ClaudePlugin", lambda: claude_factory)
+    monkeypatch.setattr(main_module, "CodexPlugin", lambda: codex_factory)
+
+    clock = [0.0]
+    monkeypatch.setattr(main_module.time, "monotonic", lambda: clock[0])
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock[0] += seconds + 1
+        if len(sleep_calls) >= 3:
+            raise _StopLoop
+
+    monkeypatch.setattr(main_module.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    alpha = next(r for r in _FakeRunner.instances if r.name == "octo__alpha")
+    beta = next(r for r in _FakeRunner.instances if r.name == "octo__beta")
+
+    assert alpha.claude_usage_provider == f"claude-2-{id(second)}"
+    assert alpha.codex_usage_provider == f"codex-2-{id(second)}"
+    assert beta.claude_usage_provider == f"claude-2-{id(second)}"
+    assert beta.codex_usage_provider == f"codex-2-{id(second)}"
 
 
 def test_main_continues_when_one_runner_raises(

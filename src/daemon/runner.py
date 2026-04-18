@@ -177,6 +177,15 @@ class PipelineRunner(
     def app_config(self, value: AppConfig) -> None:
         self._app_config = value
 
+    def set_usage_providers(
+        self,
+        claude_usage_provider: UsageProvider,
+        codex_usage_provider: UsageProvider,
+    ) -> None:
+        """Swap in the shared daemon-level usage providers."""
+        self._claude_usage_provider = claude_usage_provider
+        self._codex_usage_provider = codex_usage_provider
+
     def _get_coder(self) -> tuple[str, object]:
         """Return ``(coder_name, coder_module)`` for the active coder.
 
