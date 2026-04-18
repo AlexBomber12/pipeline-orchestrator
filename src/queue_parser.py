@@ -25,6 +25,7 @@ class QueueValidationError(ValueError):
 
 _HEADER_RE = re.compile(r"^##\s+(PR-[A-Za-z0-9_.-]+):\s*(.+?)\s*$")
 _TASK_HEADER_RE = re.compile(r"^#\s+(PR-[A-Za-z0-9_.-]+):\s*(.+?)\s*$")
+_PR_ID_RE = re.compile(r"^PR-[A-Za-z0-9_.-]+$")
 _FIELD_RE = re.compile(r"^-\s*([A-Za-z ]+?)\s*:\s*(.*?)\s*$")
 _TASK_BRANCH_RE = re.compile(r"^Branch\s*:\s*(.*?)\s*$")
 _STATUS_LINE_RE = re.compile(
@@ -227,9 +228,16 @@ def parse_task_header(path: str | Path) -> TaskHeader:
     elif depends_raw.lower() == "none":
         depends_on = []
     else:
-        depends_on = [
-            dep.strip() for dep in depends_raw.split(",") if dep.strip()
-        ]
+        depends_on = []
+        for dep in (part.strip() for part in depends_raw.split(",")):
+            if not dep or not _PR_ID_RE.fullmatch(dep):
+                issues.append(
+                    f"{task_path}: invalid Depends on {depends_raw!r}; expected "
+                    "'none' or a comma-separated PR list"
+                )
+                depends_on = []
+                break
+            depends_on.append(dep)
 
     priority_raw = fields.get("priority")
     if priority_raw in {None, ""}:
