@@ -107,10 +107,21 @@ class IdleMixin:
                     raise exc
             return result
 
-        push_result = retry_transient(
-            _push_queue_md,
-            operation_name=f"git push origin {self.repo_config.branch}",
-        )
+        try:
+            push_result = retry_transient(
+                _push_queue_md,
+                operation_name=f"git push origin {self.repo_config.branch}",
+            )
+        except RuntimeError as exc:
+            if not is_transient_error(exc) and not is_transient_error(exc.__cause__):
+                raise
+            git_ops._git(
+                self.repo_path,
+                "reset",
+                "--hard",
+                "HEAD~1",
+            )
+            return False
         if push_result.returncode == 0:
             return True
 
@@ -404,6 +415,7 @@ class IdleMixin:
         structured_pr_ids = {queued.pr_id for queued in dag_tasks or []}
         has_legacy_queue_tasks = False
         legacy_queue_check_succeeded = False
+        visible_legacy_queue_entries = False
         try:
             tasks = parse_queue(queue_path, strict=strict)
         except QueueValidationError as exc:
@@ -416,11 +428,11 @@ class IdleMixin:
                 "Queue validation failed after DAG selection; "
                 f"continuing with DAG task: {exc}"
             )
-            has_legacy_queue_tasks = self._queue_md_contains_visible_legacy_entries(
+            visible_legacy_queue_entries = self._queue_md_contains_visible_legacy_entries(
                 queue_path,
                 structured_pr_ids,
             )
-            legacy_queue_check_succeeded = not has_legacy_queue_tasks
+            legacy_queue_check_succeeded = not visible_legacy_queue_entries
         else:
             try:
                 derive_args = (
@@ -453,11 +465,11 @@ class IdleMixin:
                 )
                 tasks = []
                 queue_task = None
-                has_legacy_queue_tasks = self._queue_md_contains_visible_legacy_entries(
+                visible_legacy_queue_entries = self._queue_md_contains_visible_legacy_entries(
                     queue_path,
                     structured_pr_ids,
                 )
-                legacy_queue_check_succeeded = not has_legacy_queue_tasks
+                legacy_queue_check_succeeded = not visible_legacy_queue_entries
             else:
                 queue_task = get_next_task(tasks)
                 has_legacy_queue_tasks = any(

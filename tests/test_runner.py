@@ -4313,6 +4313,75 @@ def test_handle_idle_keeps_dag_state_when_queue_status_derivation_fails(
     )
 
 
+def test_handle_idle_keeps_dag_metrics_when_derivation_fails_with_visible_legacy_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    dag_task = QueueTask(
+        pr_id="PR-123",
+        title="Structured task",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-123.md",
+        branch="pr-123-structured",
+    )
+    dag_tasks = [dag_task]
+    queue_tasks = [
+        QueueTask(
+            pr_id="PR-123",
+            title="Structured task",
+            status=TaskStatus.TODO,
+            task_file="tasks/PR-123.md",
+            branch="pr-123-structured",
+        )
+    ]
+
+    async def fake_select(self):
+        self._idle_dag_tasks = dag_tasks
+        return dag_task
+
+    monkeypatch.setattr(idle_module.IdleMixin, "_select_next_task_from_dag", fake_select)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: queue_tasks)
+    monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            idle_module.QueueValidationError(
+                ["tasks/QUEUE.md: PR-123 does not match task file"]
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    async def fake_handle_coding() -> None:
+        return None
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    (queue_dir / "QUEUE.md").write_text(
+        "# Task Queue\n\n## PR-001: Legacy queue task\n- Status: TODO\n",
+        encoding="utf-8",
+    )
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.CODING
+    assert runner.state.current_task == dag_task
+    assert runner.state.queue_done == 0
+    assert runner.state.queue_total == 1
+
+
 def test_handle_idle_keeps_dag_state_when_queue_validation_fails_without_dag_pick(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5164,6 +5233,61 @@ def test_write_generated_queue_md_retries_numeric_503_push_failure(
     assert published is True
     assert push_attempts["count"] == 3
     assert not any(cmd[:2] == ["git", "reset"] for cmd in git_calls)
+
+
+def test_write_generated_queue_md_recovers_after_exhausted_transient_push_retries(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "QUEUE.md"
+    original = "# Task Queue\n\n## PR-000: Existing\n"
+    queue_path.write_text(original, encoding="utf-8")
+    headers = [
+        TaskHeader(
+            pr_id="PR-001",
+            title="Project bootstrap",
+            branch="pr-001-bootstrap",
+            task_type="feature",
+            complexity="low",
+            depends_on=[],
+            priority=1,
+            coder="any",
+        )
+    ]
+    statuses = {"PR-001": TaskStatus.DONE}
+
+    git_calls: list[list[str]] = []
+    push_attempts = {"count": 0}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append(cmd)
+        if cmd[:2] == ["git", "push"]:
+            push_attempts["count"] += 1
+            queue_path.write_text("generated queue", encoding="utf-8")
+            return _FakeCompletedProcess(
+                args=cmd,
+                returncode=1,
+                stderr="fatal: The requested URL returned error: 503",
+            )
+        if cmd[:2] == ["git", "reset"]:
+            queue_path.write_text(original, encoding="utf-8")
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(git_ops_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(retry_module.time, "sleep", lambda _: None)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+
+    published = runner._write_generated_queue_md(headers, statuses)
+
+    assert published is False
+    assert push_attempts["count"] == 3
+    assert queue_path.read_text(encoding="utf-8") == original
+    assert ["git", "reset", "--hard", "HEAD~1"] in git_calls
 
 
 def test_select_next_task_from_dag_skips_merged_probe_without_structured_headers(
