@@ -431,7 +431,7 @@
 - Branch: pr-073-coder-plugin-protocol
 
 ## PR-074: Claude coder plugin
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-074.md
 - Branch: pr-074-claude-plugin
 - Depends on: PR-073

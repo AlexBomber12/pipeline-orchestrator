@@ -22,6 +22,7 @@ from fastapi import FastAPI, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
+from src.coders.claude import ClaudePlugin
 from src.config import (
     add_repository,
     load_config,
@@ -931,15 +932,7 @@ def _first_probe_line(text: str) -> str:
 
 def _check_claude_auth() -> dict[str, str]:
     """Probe the ``claude`` CLI and report its authorization status."""
-    cfg = load_config(CONFIG_PATH)
-    env = _auth_probe_env(CLAUDE_CONFIG_DIR=cfg.auth.claude_config_dir)
-    rc, stdout, stderr = _run_auth_command(["claude", "--version"], env=env)
-    if rc == 0:
-        output = (stdout or stderr).strip()
-        detail = output.splitlines()[0] if output else "claude CLI available"
-        return {"status": "ok", "detail": detail}
-    detail = (stderr or stdout).strip() or "claude CLI not available"
-    return {"status": "error", "detail": detail}
+    return ClaudePlugin().check_auth(config_path=CONFIG_PATH)
 
 
 def _check_codex_auth() -> dict[str, str]:
