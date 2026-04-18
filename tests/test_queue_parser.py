@@ -154,6 +154,40 @@ Branch: pr-084-task-header-parser
         parse_task_header(task_path)
 
 
+def test_parse_task_header_depends_on_empty_raises(tmp_path: Path) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: feature
+- Complexity: medium
+- Depends on:
+""",
+    )
+
+    with pytest.raises(QueueValidationError, match="invalid Depends on"):
+        parse_task_header(task_path)
+
+
+def test_parse_task_header_allows_existing_repo_task_types(
+    tmp_path: Path,
+) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: config
+- Complexity: low
+- Depends on: none
+""",
+    )
+
+    header = parse_task_header(task_path)
+
+    assert header.task_type == "config"
+
 def test_parse_task_header_priority_default(tmp_path: Path) -> None:
     task_path = _write_task_file(
         tmp_path,

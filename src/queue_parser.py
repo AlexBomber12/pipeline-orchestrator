@@ -30,7 +30,15 @@ _TASK_BRANCH_RE = re.compile(r"^Branch\s*:\s*(.*?)\s*$")
 _STATUS_LINE_RE = re.compile(
     r"^(-\s*status\s*:\s*)(\S*)(.*)$", re.IGNORECASE
 )
-_TASK_TYPE_VALUES = {"bugfix", "feature", "architecture", "refactor", "docs"}
+_TASK_TYPE_VALUES = {
+    "architecture",
+    "bugfix",
+    "config",
+    "docs",
+    "feature",
+    "refactor",
+    "ux",
+}
 _COMPLEXITY_VALUES = {"low", "medium", "high"}
 _CODER_VALUES = {"claude", "codex", "any"}
 
@@ -201,6 +209,12 @@ def parse_task_header(path: str | Path) -> TaskHeader:
     if depends_raw is None:
         issues.append(f"{task_path}: missing Depends on")
         depends_on: list[str] = []
+    elif depends_raw == "":
+        issues.append(
+            f"{task_path}: invalid Depends on {depends_raw!r}; expected 'none' "
+            "or a comma-separated PR list"
+        )
+        depends_on = []
     elif depends_raw.lower() == "none":
         depends_on = []
     else:
