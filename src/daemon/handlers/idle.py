@@ -521,10 +521,14 @@ class IdleMixin:
                 legacy_queue_check_succeeded = not visible_legacy_queue_entries
             else:
                 queue_task = get_next_task(tasks)
+                visible_legacy_queue_entries = self._queue_md_contains_visible_legacy_entries(
+                    queue_path,
+                    structured_pr_ids,
+                )
                 has_legacy_queue_tasks = any(
                     queued.pr_id not in structured_pr_ids for queued in tasks
-                )
-                legacy_queue_check_succeeded = True
+                ) or visible_legacy_queue_entries
+                legacy_queue_check_succeeded = not visible_legacy_queue_entries
 
         task = dag_task
         if queue_task is not None:
