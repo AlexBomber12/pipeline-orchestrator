@@ -88,11 +88,9 @@ class IdleMixin:
         except Exception as exc:
             self.log_event(
                 f"IDLE: merged PR check failed: {exc}; "
-                "deferring task dispatch"
+                "continuing with local merged-status heuristics"
             )
-            self.state.current_pr = None
-            self.state.current_task = None
-            return
+            merged_prs = []
         try:
             derive_args = (
                 tasks,
