@@ -4726,8 +4726,9 @@ def test_handle_idle_continues_when_queue_regeneration_push_is_rejected(
     runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
     asyncio.run(runner.handle_idle())
 
-    assert coding_called["v"] is False
-    assert runner.state.state == PipelineState.IDLE
+    assert coding_called["v"] is True
+    assert runner.state.state == PipelineState.CODING
+    assert runner.state.current_task == dag_task
     assert any(
         "QUEUE.md auto-generation push rejected" in entry["event"]
         for entry in runner.state.history
@@ -4974,8 +4975,8 @@ def test_write_generated_queue_md_resets_on_push_rejection(
 
     assert published is False
     assert queue_path.read_text(encoding="utf-8") == original
-    assert any(cmd[:2] == ["git", "fetch"] for cmd in git_calls)
     assert any(cmd[:2] == ["git", "reset"] for cmd in git_calls)
+    assert ["git", "reset", "--hard", "HEAD~1"] in git_calls
 
 
 def test_write_generated_queue_md_retries_transient_push_failure(

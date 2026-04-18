@@ -63,8 +63,9 @@ class IdleMixin:
 
         Returns ``True`` when the generated queue is synchronized locally
         after the call. A rejected push is treated as recoverable: the
-        helper resets back to ``origin/<base>`` and returns ``False`` so
-        IDLE can continue without carrying a stray local queue commit.
+        helper drops the local auto-generated queue commit and returns
+        ``False`` so IDLE can continue without carrying a stray local
+        queue commit.
         """
         queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
         content = self._generate_queue_md(headers, statuses)
@@ -130,20 +131,11 @@ class IdleMixin:
         if push_result.returncode == 0:
             return True
 
-        retry_transient(
-            lambda: git_ops._git(
-                self.repo_path,
-                "fetch",
-                "origin",
-                self.repo_config.branch,
-            ),
-            operation_name=f"git fetch origin {self.repo_config.branch}",
-        )
         git_ops._git(
             self.repo_path,
             "reset",
             "--hard",
-            f"origin/{self.repo_config.branch}",
+            "HEAD~1",
         )
         return False
 
@@ -514,9 +506,8 @@ class IdleMixin:
             if not published_queue:
                 self.log_event(
                     "QUEUE.md auto-generation push rejected; "
-                    "refreshing queue state before retry"
+                    "continuing without publishing"
                 )
-                return
         if task is None:
             self.log_event("No tasks available")
             if prs:
