@@ -1,0 +1,49 @@
+{% set panel_repo_name = repo_name if repo_name is defined else repo.name %}
+<section id="repo-pr-metrics-{{ panel_repo_name }}"
+         class="mt-6 rounded-lg border border-white/5 bg-surface-2 p-5"
+         hx-get="/partials/repo/{{ panel_repo_name }}/metrics"
+         hx-trigger="every 60s"
+         hx-swap="outerHTML">
+    <div class="mb-4 flex items-center justify-between gap-3">
+        <div>
+            <h3 class="text-sm font-semibold text-gray-300">Recent PRs</h3>
+            <p class="text-xs text-gray-500">Last 20 completed runs</p>
+        </div>
+        <span class="font-mono text-xs text-gray-500">{{ metrics_records|length }} rows</span>
+    </div>
+
+    {% if metrics_records %}
+    <div class="overflow-x-auto">
+        <table class="min-w-full text-left text-sm">
+            <thead class="border-b border-white/5 text-xs uppercase tracking-[0.16em] text-gray-500">
+                <tr>
+                    <th class="pb-3 pr-4 font-medium">Task</th>
+                    <th class="pb-3 pr-4 font-medium">Coder</th>
+                    <th class="pb-3 pr-4 font-medium">Model</th>
+                    <th class="pb-3 pr-4 font-medium">Duration</th>
+                    <th class="pb-3 pr-4 font-medium">FIX Iterations</th>
+                    <th class="pb-3 font-medium">Exit Reason</th>
+                </tr>
+            </thead>
+            <tbody class="divide-y divide-white/5">
+                {% for record in metrics_records %}
+                <tr class="align-top">
+                    <td class="py-3 pr-4 font-mono text-gray-200">{{ record.task_id }}</td>
+                    <td class="py-3 pr-4 text-gray-300">{{ record.coder }}</td>
+                    <td class="py-3 pr-4 font-mono text-xs text-gray-400">{{ record.model }}</td>
+                    <td class="py-3 pr-4 font-mono text-gray-300">{{ record.duration_text }}</td>
+                    <td class="py-3 pr-4 font-mono text-gray-300">{{ record.fix_iterations }}</td>
+                    <td class="py-3">
+                        <span class="inline-flex rounded-full border px-2 py-1 text-xs font-medium {{ record.exit_reason_classes }}">
+                            {{ record.exit_reason_label }}
+                        </span>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p class="text-sm italic text-gray-500">No completed PR runs recorded yet.</p>
+    {% endif %}
+</section>

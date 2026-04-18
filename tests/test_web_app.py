@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,14 +27,25 @@ from src.web.app import (
 
 
 class _FakeRedis:
-    def __init__(self, store: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        store: dict[str, str] | None = None,
+        lists: dict[str, list[str]] | None = None,
+    ) -> None:
         self.store = store or {}
+        self.lists = lists or {}
 
     async def ping(self) -> bool:
         return True
 
     async def get(self, key: str) -> str | None:
         return self.store.get(key)
+
+    async def lrange(self, key: str, start: int, stop: int) -> list[str]:
+        values = self.lists.get(key, [])
+        if stop < 0:
+            stop = len(values) + stop
+        return values[start : stop + 1]
 
 
 class _BoomRedis:
@@ -364,6 +376,131 @@ def test_repo_detail_route_renders_full_page(
     assert "Event log" in body
 
 
+def _metrics_record(
+    run_id: str,
+    *,
+    task_id: str,
+    started_at: str,
+    ended_at: str = "2026-04-18T10:05:00+00:00",
+    duration_ms: int,
+    fix_iterations: int,
+    exit_reason: str,
+    profile_id: str = "claude:opus:container",
+) -> str:
+    return json.dumps(
+        {
+            "run_id": run_id,
+            "task_id": task_id,
+            "repo_name": "example__alpha",
+            "profile_id": profile_id,
+            "task_type": "feature",
+            "complexity": "medium",
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "duration_ms": duration_ms,
+            "fix_iterations": fix_iterations,
+            "tokens_in": 1200,
+            "tokens_out": 800,
+            "exit_reason": exit_reason,
+            "operator_intervention": False,
+        }
+    )
+
+
+def test_metrics_endpoint_returns_records(
+    two_repo_config: Path,
+) -> None:
+    fake = _FakeRedis(
+        store={
+            "metrics:run:active-finished-step": _metrics_record(
+                "active-finished-step",
+                task_id="PR-083",
+                started_at="2026-04-18T12:00:00+00:00",
+                ended_at="2026-04-18T12:03:00+00:00",
+                duration_ms=180000,
+                fix_iterations=0,
+                exit_reason="coding_complete",
+            ),
+            "metrics:run:older": _metrics_record(
+                "older",
+                task_id="PR-081",
+                started_at="2026-04-18T09:00:00+00:00",
+                ended_at="2026-04-18T11:05:00+00:00",
+                duration_ms=61000,
+                fix_iterations=1,
+                exit_reason="rate_limit",
+                profile_id="codex:gpt-5.4:container",
+            ),
+            "metrics:run:newer": _metrics_record(
+                "newer",
+                task_id="PR-082",
+                started_at="2026-04-18T11:00:00+00:00",
+                ended_at="2026-04-18T10:05:00+00:00",
+                duration_ms=300000,
+                fix_iterations=2,
+                exit_reason="success_merged",
+            ),
+        },
+        lists={
+            "metrics:repo:example__alpha:PR": [
+                "active-finished-step",
+                "older",
+                "newer",
+            ]
+        },
+    )
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.get("/repo/example__alpha/metrics")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [record["task_id"] for record in payload] == ["PR-081", "PR-082"]
+    assert all(record["exit_reason"] != "coding_complete" for record in payload)
+    assert payload[0]["coder"] == "codex"
+    assert payload[0]["model"] == "gpt-5.4"
+    assert payload[0]["duration_text"] == "1m 1s"
+    assert payload[0]["exit_reason_label"] == "rate limit"
+    assert payload[1]["coder"] == "claude"
+    assert payload[1]["model"] == "opus"
+    assert payload[1]["exit_reason_label"] == "merged"
+
+
+def test_metrics_panel_renders(
+    two_repo_config: Path,
+) -> None:
+    fake = _FakeRedis(
+        store={
+            "metrics:run:run-1": _metrics_record(
+                "run-1",
+                task_id="PR-083",
+                started_at="2026-04-18T12:00:00+00:00",
+                duration_ms=125000,
+                fix_iterations=3,
+                exit_reason="error",
+            )
+        },
+        lists={"metrics:repo:example__alpha:PR": ["run-1"]},
+    )
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.get("/repo/example__alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "Recent PRs" in body
+    assert 'hx-get="/partials/repo/example__alpha/metrics"' in body
+    assert 'hx-trigger="every 60s"' in body
+    assert "PR-083" in body
+    assert "claude" in body
+    assert "opus" in body
+    assert "2m 5s" in body
+    assert "3" in body
+    assert "error" in body
+
+
 def test_partial_repo_detail_returns_html_fragment(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -384,6 +521,29 @@ def test_partial_repo_detail_returns_html_fragment(
     # tab survives across summary refreshes. See
     # test_partial_repo_events_* in test_observability.py for coverage.
     assert "Event log" not in body
+
+
+def test_partial_repo_detail_skips_metrics_fetch(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    async def _fail_metrics_fetch(
+        name: str, redis_client: object | None
+    ) -> list[dict[str, object]]:
+        raise AssertionError("summary poll should not fetch metrics")
+
+    monkeypatch.setattr(
+        web_app,
+        "_recent_repo_metrics_payload",
+        _fail_metrics_fetch,
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo/example__alpha")
+
+    assert response.status_code == 200
+    assert "Current PR" in response.text
 
 
 def test_partial_repo_detail_renders_redis_payload(
