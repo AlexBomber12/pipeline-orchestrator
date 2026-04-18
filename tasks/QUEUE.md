@@ -513,7 +513,7 @@
 - Depends on: PR-086
 
 ## PR-088: QUEUE.md auto-generation
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-088.md
 - Branch: pr-088-queue-auto-generate
 - Depends on: PR-087

@@ -15,14 +15,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from src import github_client
+from src.daemon import git_ops
 from src.dag import get_eligible_tasks
 from src.models import PipelineState, QueueTask, TaskStatus
 from src.queue_parser import (
     QueueValidationError,
+    TaskHeader,
     get_next_task,
     parse_queue,
     parse_task_header,
 )
+from src.retry import retry_transient
 from src.task_status import (
     derive_queue_task_statuses,
     derive_task_status,
@@ -33,6 +36,59 @@ from src.task_status import (
 
 class IdleMixin:
     """Handle IDLE state: sync, pick next task, dispatch to CODING."""
+
+    @staticmethod
+    def _generate_queue_md(
+        headers: list[TaskHeader],
+        statuses: dict[str, TaskStatus],
+    ) -> str:
+        """Render a visually compatible QUEUE.md from structured task headers."""
+        lines = ["# Task Queue\n"]
+        for header in headers:
+            lines.append(f"## {header.pr_id}: {header.title}")
+            lines.append(f"- Status: {statuses[header.pr_id].value}")
+            lines.append(f"- Tasks file: tasks/{header.pr_id}.md")
+            lines.append(f"- Branch: {header.branch}")
+            if header.depends_on:
+                lines.append(f"- Depends on: {', '.join(header.depends_on)}")
+            lines.append("")
+        return "\n".join(lines)
+
+    def _write_generated_queue_md(
+        self,
+        headers: list[TaskHeader],
+        statuses: dict[str, TaskStatus],
+    ) -> None:
+        """Write and publish QUEUE.md only when the generated report changed."""
+        queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
+        content = self._generate_queue_md(headers, statuses)
+        existing = (
+            queue_path.read_text(encoding="utf-8")
+            if queue_path.exists()
+            else None
+        )
+        if existing == content:
+            return
+
+        queue_path.parent.mkdir(parents=True, exist_ok=True)
+        queue_path.write_text(content, encoding="utf-8")
+        git_ops._git(self.repo_path, "add", "tasks/QUEUE.md")
+        git_ops._git(
+            self.repo_path,
+            "commit",
+            "-m",
+            "AUTO: regenerate QUEUE.md from DAG",
+        )
+        retry_transient(
+            lambda: git_ops._git(
+                self.repo_path,
+                "push",
+                "origin",
+                self.repo_config.branch,
+                timeout=60,
+            ),
+            operation_name=f"git push origin {self.repo_config.branch}",
+        )
 
     @staticmethod
     def _validate_task_file_header_match(task_file: Path, header_pr_id: str) -> None:
@@ -105,6 +161,8 @@ class IdleMixin:
     async def _select_next_task_from_dag(self) -> QueueTask | None:
         """Pick the next eligible task from structured task headers."""
         self._idle_dag_tasks = None
+        self._idle_dag_headers = None
+        self._idle_dag_statuses = None
         task_dir = Path(self.repo_path) / "tasks"
         if not task_dir.is_dir():
             return None
@@ -179,6 +237,8 @@ class IdleMixin:
         except ValueError as exc:
             raise QueueValidationError([str(exc)]) from exc
 
+        self._idle_dag_headers = list(headers)
+        self._idle_dag_statuses = dict(statuses)
         self._idle_dag_tasks = [
             self._queue_task_from_header(header, statuses[header.pr_id], task_files)
             for header in headers
@@ -368,6 +428,21 @@ class IdleMixin:
             1 for t in queue_tasks if t.status == TaskStatus.DONE
         )
         self.state.queue_total = len(queue_tasks)
+        generated_headers = getattr(self, "_idle_dag_headers", None)
+        generated_statuses = getattr(self, "_idle_dag_statuses", None)
+        if generated_headers and generated_statuses:
+            try:
+                self._write_generated_queue_md(
+                    generated_headers,
+                    generated_statuses,
+                )
+            except (
+                OSError,
+                RuntimeError,
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+            ) as exc:
+                self.log_event(f"QUEUE.md auto-generation failed: {exc}")
         if task is None:
             self.log_event("No tasks available")
             if prs:

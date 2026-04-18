@@ -27,7 +27,7 @@ from src.models import (
     ReviewStatus,
     TaskStatus,
 )
-from src.queue_parser import QueueValidationError
+from src.queue_parser import QueueValidationError, TaskHeader
 
 claude_cli = claude_plugin_module.claude_cli
 _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG = idle_module.IdleMixin._select_next_task_from_dag
@@ -4526,6 +4526,97 @@ def test_handle_idle_requests_fresh_merged_prs_for_status_derivation(
     asyncio.run(runner.handle_idle())
 
     assert refresh_calls == [True]
+
+
+def test_generate_queue_md_format() -> None:
+    runner = _make_runner()
+    headers = [
+        TaskHeader(
+            pr_id="PR-001",
+            title="Project bootstrap",
+            branch="pr-001-bootstrap",
+            task_type="feature",
+            complexity="low",
+            depends_on=[],
+            priority=1,
+            coder="any",
+        ),
+        TaskHeader(
+            pr_id="PR-002",
+            title="Config loader",
+            branch="pr-002-models",
+            task_type="feature",
+            complexity="low",
+            depends_on=["PR-001"],
+            priority=2,
+            coder="any",
+        ),
+    ]
+
+    rendered = runner._generate_queue_md(
+        headers,
+        {
+            "PR-001": TaskStatus.DONE,
+            "PR-002": TaskStatus.TODO,
+        },
+    )
+
+    assert rendered == (
+        "# Task Queue\n\n"
+        "## PR-001: Project bootstrap\n"
+        "- Status: DONE\n"
+        "- Tasks file: tasks/PR-001.md\n"
+        "- Branch: pr-001-bootstrap\n\n"
+        "## PR-002: Config loader\n"
+        "- Status: TODO\n"
+        "- Tasks file: tasks/PR-002.md\n"
+        "- Branch: pr-002-models\n"
+        "- Depends on: PR-001\n"
+    )
+
+
+def test_queue_md_not_committed_when_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "QUEUE.md"
+    headers = [
+        TaskHeader(
+            pr_id="PR-001",
+            title="Project bootstrap",
+            branch="pr-001-bootstrap",
+            task_type="feature",
+            complexity="low",
+            depends_on=[],
+            priority=1,
+            coder="any",
+        )
+    ]
+    statuses = {"PR-001": TaskStatus.DONE}
+    queue_path.write_text(
+        _make_runner()._generate_queue_md(headers, statuses),
+        encoding="utf-8",
+    )
+
+    git_calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append(cmd)
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(git_ops_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._write_generated_queue_md(headers, statuses)
+
+    assert git_calls == []
+    assert queue_path.read_text(encoding="utf-8") == runner._generate_queue_md(
+        headers,
+        statuses,
+    )
 
 
 def test_select_next_task_from_dag_skips_merged_probe_without_structured_headers(
