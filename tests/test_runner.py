@@ -4506,8 +4506,9 @@ def test_handle_idle_skips_queue_regeneration_when_legacy_tasks_exist(
     assert write_calls == []
 
 
-def test_handle_idle_skips_queue_regeneration_when_legacy_check_fails(
+def test_handle_idle_skips_queue_regeneration_when_legacy_check_fails_with_visible_legacy_rows(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     _patch_subprocess(monkeypatch)
     dag_task = QueueTask(
@@ -4573,10 +4574,99 @@ def test_handle_idle_skips_queue_regeneration_when_legacy_check_fails(
         return None
 
     runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    (queue_dir / "QUEUE.md").write_text(
+        "# Task Queue\n\n## PR-001: Legacy queue task\n- Status: TODO\n",
+        encoding="utf-8",
+    )
     runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
     asyncio.run(runner.handle_idle())
 
     assert write_calls == []
+
+
+def test_handle_idle_regenerates_queue_when_validation_fails_without_visible_legacy_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    dag_task = QueueTask(
+        pr_id="PR-123",
+        title="Structured in-flight task",
+        status=TaskStatus.DOING,
+        task_file="tasks/PR-123.md",
+        branch="pr-123-structured",
+    )
+
+    async def fake_select(self):
+        self._idle_dag_tasks = [dag_task]
+        self._idle_dag_headers = [
+            TaskHeader(
+                pr_id=dag_task.pr_id,
+                title=dag_task.title,
+                branch=dag_task.branch or "",
+                task_type="feature",
+                complexity="low",
+                depends_on=[],
+                priority=1,
+                coder="any",
+            )
+        ]
+        self._idle_dag_statuses = {dag_task.pr_id: dag_task.status}
+        return dag_task
+
+    monkeypatch.setattr(idle_module.IdleMixin, "_select_next_task_from_dag", fake_select)
+    monkeypatch.setattr(
+        idle_module,
+        "parse_queue",
+        lambda path, **kw: (_ for _ in ()).throw(
+            idle_module.QueueValidationError(["Queue validation failed"])
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    write_calls: list[tuple[list[TaskHeader], dict[str, TaskStatus]]] = []
+
+    def fake_write_generated_queue_md(
+        self,
+        headers: list[TaskHeader],
+        statuses: dict[str, TaskStatus],
+    ) -> bool:
+        write_calls.append((headers, statuses))
+        return True
+
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_write_generated_queue_md",
+        fake_write_generated_queue_md,
+    )
+
+    async def fake_handle_coding() -> None:
+        return None
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    (queue_dir / "QUEUE.md").write_text(
+        "# Task Queue\n\n## PR-123: Structured in-flight task\n- Status: TODO,\n",
+        encoding="utf-8",
+    )
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    asyncio.run(runner.handle_idle())
+
+    assert write_calls == [([runner._idle_dag_headers[0]], {dag_task.pr_id: dag_task.status})]
 
 
 def test_handle_idle_stops_when_queue_regeneration_fails(
@@ -5012,6 +5102,54 @@ def test_write_generated_queue_md_retries_transient_push_failure(
                     args=cmd,
                     returncode=1,
                     stderr="operation timed out",
+                )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(git_ops_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(retry_module.time, "sleep", lambda _: None)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+
+    published = runner._write_generated_queue_md(headers, statuses)
+
+    assert published is True
+    assert push_attempts["count"] == 3
+    assert not any(cmd[:2] == ["git", "reset"] for cmd in git_calls)
+
+
+def test_write_generated_queue_md_retries_numeric_503_push_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    headers = [
+        TaskHeader(
+            pr_id="PR-001",
+            title="Project bootstrap",
+            branch="pr-001-bootstrap",
+            task_type="feature",
+            complexity="low",
+            depends_on=[],
+            priority=1,
+            coder="any",
+        )
+    ]
+    statuses = {"PR-001": TaskStatus.DONE}
+
+    git_calls: list[list[str]] = []
+    push_attempts = {"count": 0}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append(cmd)
+        if cmd[:2] == ["git", "push"]:
+            push_attempts["count"] += 1
+            if push_attempts["count"] < 3:
+                return _FakeCompletedProcess(
+                    args=cmd,
+                    returncode=1,
+                    stderr="fatal: The requested URL returned error: 503",
                 )
         return _FakeCompletedProcess(args=cmd, returncode=0)
 

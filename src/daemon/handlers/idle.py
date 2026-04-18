@@ -25,7 +25,7 @@ from src.queue_parser import (
     parse_queue,
     parse_task_header,
 )
-from src.retry import retry_transient
+from src.retry import is_transient_error, retry_transient
 from src.task_status import (
     derive_queue_task_statuses,
     derive_task_status,
@@ -96,32 +96,15 @@ class IdleMixin:
                 timeout=60,
                 check=False,
             )
-            if result.returncode != 0 and any(
-                marker in (result.stderr or "").lower()
-                for marker in (
-                    "connection reset",
-                    "connection refused",
-                    "network unreachable",
-                    "temporary failure",
-                    "could not resolve host",
-                    "operation timed out",
-                    "timed out",
-                    "tls handshake timeout",
-                    "i/o timeout",
-                    "handshake timeout",
-                    "context deadline exceeded",
-                    "502 bad gateway",
-                    "503 service unavailable",
-                    "504 gateway timeout",
-                    "remote end hung up",
-                )
-            ):
-                raise subprocess.CalledProcessError(
+            if result.returncode != 0:
+                exc = subprocess.CalledProcessError(
                     result.returncode,
                     result.args,
                     output=result.stdout,
                     stderr=result.stderr,
                 )
+                if is_transient_error(exc):
+                    raise exc
             return result
 
         push_result = retry_transient(
@@ -169,6 +152,20 @@ class IdleMixin:
             any(issue.endswith(suffix) for suffix in allowed_suffixes)
             for issue in exc.issues
         )
+
+    @staticmethod
+    def _queue_md_contains_visible_legacy_entries(
+        queue_path: str | Path,
+        structured_pr_ids: set[str],
+    ) -> bool:
+        path = Path(queue_path)
+        if not path.is_file():
+            return False
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            match = re.match(r"^##\s+(PR-[A-Za-z0-9_.-]+):", raw_line.rstrip())
+            if match and match.group(1) not in structured_pr_ids:
+                return True
+        return False
 
     @staticmethod
     def _filter_dag_headers_with_available_dependencies(
@@ -419,6 +416,11 @@ class IdleMixin:
                 "Queue validation failed after DAG selection; "
                 f"continuing with DAG task: {exc}"
             )
+            has_legacy_queue_tasks = self._queue_md_contains_visible_legacy_entries(
+                queue_path,
+                structured_pr_ids,
+            )
+            legacy_queue_check_succeeded = not has_legacy_queue_tasks
         else:
             try:
                 derive_args = (
@@ -451,7 +453,11 @@ class IdleMixin:
                 )
                 tasks = []
                 queue_task = None
-                has_legacy_queue_tasks = False
+                has_legacy_queue_tasks = self._queue_md_contains_visible_legacy_entries(
+                    queue_path,
+                    structured_pr_ids,
+                )
+                legacy_queue_check_succeeded = not has_legacy_queue_tasks
             else:
                 queue_task = get_next_task(tasks)
                 has_legacy_queue_tasks = any(
