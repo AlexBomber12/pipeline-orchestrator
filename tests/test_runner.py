@@ -779,6 +779,82 @@ def test_handle_idle_dag_falls_back_for_legacy_task_files(
     assert runner.state.error_message is None
 
 
+def test_handle_idle_dag_falls_back_when_structured_task_depends_on_legacy_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Legacy task\n\n"
+        "Branch: pr-001-legacy\n",
+        encoding="utf-8",
+    )
+    (tasks_dir / "PR-002.md").write_text(
+        "# PR-002: Structured task\n\n"
+        "Branch: pr-002-structured\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: PR-001\n",
+        encoding="utf-8",
+    )
+
+    fallback_task = QueueTask(
+        pr_id="PR-001",
+        title="Legacy task",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-001.md",
+        branch="pr-001-legacy",
+    )
+    parse_calls: list[str] = []
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "parse_queue",
+        lambda path, **kw: parse_calls.append(path) or [fallback_task],
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda *args, **kwargs: [fallback_task],
+    )
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: fallback_task)
+
+    coding_called = {"v": False}
+
+    async def fake_handle_coding() -> None:
+        coding_called["v"] = True
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    asyncio.run(runner.handle_idle())
+
+    assert parse_calls == [str(tasks_dir / "QUEUE.md")]
+    assert coding_called["v"] is True
+    assert runner.state.state == PipelineState.CODING
+    assert runner.state.current_task == fallback_task
+    assert runner.state.error_message is None
+
+
 def test_handle_idle_prefers_legacy_queue_task_over_dag_task(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

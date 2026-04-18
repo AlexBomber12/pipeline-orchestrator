@@ -61,6 +61,7 @@ class IdleMixin:
             return None
 
         headers = []
+        skipped_legacy_pr_ids: set[str] = set()
         task_files: dict[str, str] = {}
         repo_root = Path(self.repo_path)
         for task_file in sorted(task_dir.glob("PR-*.md")):
@@ -72,11 +73,21 @@ class IdleMixin:
                     or self._is_legacy_unstructured_task_error(exc)
                 ):
                     raise
+                skipped_legacy_pr_ids.add(task_file.stem)
                 continue
             headers.append(header)
             task_files[header.pr_id] = task_file.relative_to(repo_root).as_posix()
 
         if not headers:
+            return None
+
+        structured_pr_ids = {header.pr_id for header in headers}
+        if any(
+            dependency in skipped_legacy_pr_ids
+            for header in headers
+            for dependency in header.depends_on
+            if dependency not in structured_pr_ids
+        ):
             return None
 
         try:
