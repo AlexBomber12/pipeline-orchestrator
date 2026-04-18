@@ -394,6 +394,61 @@ def test_main_reload_recreates_shared_usage_providers(
     assert beta.codex_usage_provider == f"codex-2-{id(second)}"
 
 
+def test_hot_reload_updates_repo_config_coder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    second = AppConfig(
+        repositories=[
+            _repo("https://github.com/octo/alpha.git", coder="codex")
+        ],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+
+    _reset_fake_runner()
+    load_calls = {"n": 0}
+
+    def fake_load_config() -> AppConfig:
+        load_calls["n"] += 1
+        return first if load_calls["n"] == 1 else second
+
+    monkeypatch.setattr(main_module, "load_config", fake_load_config)
+    monkeypatch.setattr(
+        main_module.aioredis,
+        "from_url",
+        lambda url, decode_responses: _FakeRedisClient(),
+    )
+    monkeypatch.setattr(main_module, "PipelineRunner", _FakeRunner)
+    monkeypatch.setattr(main_module, "_setup_git_auth", lambda: None)
+    monkeypatch.setattr(
+        main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
+    )
+    monkeypatch.setattr(main_module, "CONFIG_RELOAD_CYCLES", 3)
+
+    clock = [0.0]
+    monkeypatch.setattr(main_module.time, "monotonic", lambda: clock[0])
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock[0] += seconds + 1
+        if len(sleep_calls) >= 3:
+            raise _StopLoop
+
+    monkeypatch.setattr(main_module.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    alpha = next(r for r in _FakeRunner.instances if r.name == "octo__alpha")
+    assert alpha.repo_config.coder is not None
+    assert alpha.repo_config.coder.value == "codex"
+
+
 def test_main_continues_when_one_runner_raises(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

@@ -241,6 +241,15 @@ def _configs_differ(a: AppConfig, b: AppConfig) -> bool:
     return a.model_dump_json() != b.model_dump_json()
 
 
+def _find_repo_config(config: AppConfig, url: str) -> RepoConfig | None:
+    """Return the repo config matching ``url`` in ``config`` if present."""
+    needle = normalize_repo_url(url)
+    for repo in config.repositories:
+        if normalize_repo_url(repo.url) == needle:
+            return repo
+    return None
+
+
 async def main() -> None:
     """Initialize runners and drive the poll loop forever."""
     gh_dir = os.environ.get("GH_CONFIG_DIR")
@@ -304,6 +313,12 @@ async def main() -> None:
                     )
                     config = new_config
                     claude_usage_provider, codex_usage_provider = _create_usage_providers(config)
+                    for runner in runners.values():
+                        new_repo_config = _find_repo_config(
+                            config, runner.repo_config.url
+                        )
+                        if new_repo_config is not None:
+                            runner.repo_config = new_repo_config
                     _sync_runners(
                         runners,
                         config,
