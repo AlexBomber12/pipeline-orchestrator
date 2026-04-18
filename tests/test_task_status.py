@@ -236,6 +236,23 @@ def test_find_matching_open_pr_allows_same_branch_when_pr_id_is_unavailable() ->
     assert match is not None
 
 
+def test_find_matching_open_pr_allows_cross_repository_pr_with_matching_identity() -> None:
+    match = find_matching_open_pr(
+        "PR-085",
+        "pr-085-status-from-git",
+        [
+            PRInfo(
+                number=109,
+                branch="pr-085-status-from-git",
+                title="PR-085: Status derivation from git",
+                is_cross_repository=True,
+            )
+        ],
+    )
+
+    assert match is not None
+
+
 def test_derive_done_when_merged_pr_branch_matches_without_queue_prefix() -> None:
     status = derive_task_status(
         _header("pr-085-status-from-git"),
@@ -375,6 +392,17 @@ def test_derive_queue_task_statuses_marks_done_from_merged_pr_history(
     )
 
     assert derived[0].status == TaskStatus.DONE
+
+
+def test_derive_queue_task_statuses_skips_merged_probe_when_queue_is_empty(
+    monkeypatch,
+) -> None:
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("get_merged_pr_ids should not run for an empty queue")
+
+    monkeypatch.setattr("src.task_status.get_merged_pr_ids", _fail_if_called)
+
+    assert derive_queue_task_statuses([], "/repo", "main", set()) == []
 
 
 def test_derive_queue_task_statuses_rejects_mismatched_task_file_pr_id(

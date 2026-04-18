@@ -92,8 +92,8 @@ def _branch_matches_task_pr(
     pr_id: str,
     branch: str,
 ) -> bool:
-    """Return True when a same-repo PR branch can be attributed to a task."""
-    if not branch or pr.branch != branch or pr.is_cross_repository:
+    """Return True when a PR branch can be attributed to a task."""
+    if not branch or pr.branch != branch:
         return False
 
     candidate_pr_id = pr.pr_id or extract_queue_pr_id(pr.title)
@@ -228,6 +228,9 @@ def derive_queue_task_statuses(
     merged_prs: Iterable[PRInfo] = (),
 ) -> list[QueueTask]:
     """Return queue tasks with status refreshed from git/GitHub state."""
+    if not tasks:
+        return []
+
     open_prs = list(open_prs)
     merged_prs = list(merged_prs)
     merged_pr_ids = get_merged_pr_ids(
