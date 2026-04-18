@@ -157,6 +157,7 @@ def parse_task_header(path: str | Path) -> TaskHeader:
     issues: list[str] = []
     header_match: re.Match[str] | None = None
     fields: dict[str, str] = {}
+    in_header_block = False
 
     for raw_line in lines:
         line = raw_line.rstrip()
@@ -164,16 +165,24 @@ def parse_task_header(path: str | Path) -> TaskHeader:
             header_match = _TASK_HEADER_RE.match(line)
             continue
 
+        if not line.strip():
+            continue
+
         branch_match = _TASK_BRANCH_RE.match(line)
         if branch_match:
             fields["branch"] = branch_match.group(1).strip()
+            in_header_block = True
             continue
 
         field_match = _FIELD_RE.match(line)
-        if not field_match:
+        if field_match:
+            key = field_match.group(1).strip().lower()
+            fields[key] = field_match.group(2).strip()
+            in_header_block = True
             continue
-        key = field_match.group(1).strip().lower()
-        fields[key] = field_match.group(2).strip()
+
+        if line.startswith("#") or in_header_block:
+            break
 
     if header_match is None:
         raise QueueValidationError(

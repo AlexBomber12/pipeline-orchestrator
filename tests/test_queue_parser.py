@@ -188,6 +188,31 @@ Branch: pr-084-task-header-parser
 
     assert header.task_type == "config"
 
+
+def test_parse_task_header_ignores_metadata_like_bullets_after_header(
+    tmp_path: Path,
+) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: feature
+- Complexity: medium
+- Depends on: none
+
+## Notes
+
+- Depends on: PR-999
+- Type: docs
+""",
+    )
+
+    header = parse_task_header(task_path)
+
+    assert header.depends_on == []
+    assert header.task_type == "feature"
+
 def test_parse_task_header_priority_default(tmp_path: Path) -> None:
     task_path = _write_task_file(
         tmp_path,
