@@ -38,6 +38,7 @@ class MetricsStore:
         payload = json.dumps(asdict(record), sort_keys=True)
         recent_key = self._recent_key(record.task_id)
         await self._redis.set(key, payload, ex=_TTL_SECONDS)
+        await self._redis.lrem(recent_key, 0, record.run_id)
         await self._redis.lpush(recent_key, record.run_id)
         await self._redis.ltrim(recent_key, 0, _RECENT_INDEX_LIMIT - 1)
 

@@ -25,6 +25,15 @@ class _FakeRedis:
         bucket.insert(0, value)
         return len(bucket)
 
+    async def lrem(self, key: str, count: int, value: str) -> int:
+        values = self.lists.setdefault(key, [])
+        if count != 0:
+            raise NotImplementedError("test fake only supports removing all matches")
+        kept = [item for item in values if item != value]
+        removed = len(values) - len(kept)
+        self.lists[key] = kept
+        return removed
+
     async def lrange(self, key: str, start: int, stop: int) -> list[str]:
         values = self.lists.get(key, [])
         if stop < 0:
@@ -109,6 +118,20 @@ async def test_save_trims_recent_index() -> None:
     assert len(recent_ids) == 200
     assert recent_ids[0] == "run-204"
     assert recent_ids[-1] == "run-5"
+
+
+async def test_save_deduplicates_recent_index() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+
+    await store.save(_record("run-1", task_id="PR-080", fix_iterations=0))
+    await store.save(_record("run-2", task_id="PR-080"))
+    await store.save(_record("run-1", task_id="PR-080", fix_iterations=1))
+
+    recent = await store.recent(task_id="PR-080", limit=5)
+
+    assert [record.run_id for record in recent] == ["run-1", "run-2"]
+    assert recent[0].fix_iterations == 1
 
 
 async def test_record_serialization() -> None:
