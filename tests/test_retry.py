@@ -104,6 +104,30 @@ class TestIsTransientError:
         )
         assert is_transient_error(exc) is True
 
+    def test_runtime_error_tls_handshake_timeout_transient(self) -> None:
+        exc = RuntimeError(
+            "gh api failed (exit 1): tls handshake timeout"
+        )
+        assert is_transient_error(exc) is True
+
+    def test_runtime_error_io_timeout_transient(self) -> None:
+        exc = RuntimeError(
+            "gh api failed (exit 1): i/o timeout"
+        )
+        assert is_transient_error(exc) is True
+
+    def test_runtime_error_handshake_timeout_transient(self) -> None:
+        exc = RuntimeError(
+            "gh api failed (exit 1): handshake timeout"
+        )
+        assert is_transient_error(exc) is True
+
+    def test_runtime_error_context_deadline_exceeded_transient(self) -> None:
+        exc = RuntimeError(
+            "gh api failed (exit 1): context deadline exceeded"
+        )
+        assert is_transient_error(exc) is True
+
     def test_runtime_error_not_found_not_transient(self) -> None:
         exc = RuntimeError(
             "gh api failed (exit 1): HTTP 404 Not Found"
@@ -242,6 +266,21 @@ class TestRetryTransient:
             calls.append(1)
             if len(calls) == 1:
                 raise RuntimeError("gh api failed (exit 1): 502 bad gateway")
+            return "ok"
+
+        result = retry_transient(op, operation_name="test")
+        assert result == "ok"
+        assert len(calls) == 2
+        mock_sleep.assert_called_once_with(1.0)
+
+    @patch("src.retry.time.sleep")
+    def test_retries_runtime_error_with_tls_handshake_timeout(self, mock_sleep) -> None:
+        calls = []
+
+        def op():
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("gh api failed (exit 1): TLS handshake timeout")
             return "ok"
 
         result = retry_transient(op, operation_name="test")
