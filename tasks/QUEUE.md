@@ -501,7 +501,7 @@
 - Depends on: PR-084
 
 ## PR-086: DAG builder and eligible task selector
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-086.md
 - Branch: pr-086-dag-builder
 - Depends on: PR-085
