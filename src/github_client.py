@@ -185,7 +185,12 @@ def get_open_prs(
     return prs
 
 
-def get_merged_prs(repo: str, base_branch: str | None = None) -> list[PRInfo]:
+def get_merged_prs(
+    repo: str,
+    base_branch: str | None = None,
+    *,
+    refresh: bool = False,
+) -> list[PRInfo]:
     """Return merged PRs for ``repo``.
 
     This is a best-effort fallback used by queue status derivation when
@@ -197,7 +202,11 @@ def get_merged_prs(repo: str, base_branch: str | None = None) -> list[PRInfo]:
     cache_key = (repo, base_branch or "")
     cached = _merged_prs_cache.get(cache_key)
     now = time.monotonic()
-    if cached is not None and (now - cached[0]) < _MERGED_PRS_CACHE_TTL_SECONDS:
+    if (
+        not refresh
+        and cached is not None
+        and (now - cached[0]) < _MERGED_PRS_CACHE_TTL_SECONDS
+    ):
         return list(cached[1])
 
     path = f"repos/{repo}/pulls?state=closed&per_page=100"

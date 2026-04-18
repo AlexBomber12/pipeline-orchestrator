@@ -305,7 +305,7 @@ def test_handle_idle_no_tasks_leaves_state_idle(
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
     monkeypatch.setattr(
-        runner_module.github_client, "get_merged_prs", lambda repo, branch: []
+        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
     )
 
     runner = _make_runner()
@@ -386,7 +386,7 @@ def test_handle_idle_picks_task_and_drives_coding(
         _get_open_prs,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_merged_prs", lambda repo, branch: []
+        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -443,7 +443,7 @@ def test_handle_idle_sets_queue_counters_with_mixed_statuses(
         _get_open_prs,
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_merged_prs", lambda repo, branch: []
+        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -486,7 +486,7 @@ def test_handle_idle_attaches_to_existing_pr_instead_of_coding(
         lambda repo, **kw: [existing_pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_merged_prs", lambda repo, branch: []
+        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -537,7 +537,7 @@ def test_handle_idle_proceeds_to_coding_when_no_matching_pr(
 
     monkeypatch.setattr(runner_module.github_client, "get_open_prs", _get_open_prs)
     monkeypatch.setattr(
-        runner_module.github_client, "get_merged_prs", lambda repo, branch: []
+        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
     )
     monkeypatch.setattr(
         claude_cli,
@@ -618,7 +618,7 @@ def test_handle_idle_sets_error_when_task_status_derivation_times_out(
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_merged_prs", lambda repo, branch: []
+        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
     )
 
     def _timed_out(*args: Any, **kwargs: Any) -> list[QueueTask]:
@@ -3234,7 +3234,7 @@ def test_handle_idle_no_tasks_but_open_pr_sets_current_pr(
         runner_module.github_client, "get_open_prs", lambda repo, **kw: [open_pr]
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_merged_prs", lambda repo, branch: []
+        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
     )
 
     runner = _make_runner()
@@ -3256,7 +3256,7 @@ def test_handle_idle_no_tasks_no_open_prs_clears_current_pr(
         runner_module.github_client, "get_open_prs", lambda repo, **kw: []
     )
     monkeypatch.setattr(
-        runner_module.github_client, "get_merged_prs", lambda repo, branch: []
+        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
     )
 
     runner = _make_runner()
@@ -3330,7 +3330,7 @@ def test_handle_idle_defers_on_merged_pr_check_failure(
     monkeypatch.setattr(
         runner_module.github_client,
         "get_merged_prs",
-        lambda repo, branch: (_ for _ in ()).throw(RuntimeError("API down")),
+        lambda repo, branch, refresh=False: (_ for _ in ()).throw(RuntimeError("API down")),
     )
     derived_calls: list[list[PRInfo]] = []
     monkeypatch.setattr(
@@ -3359,7 +3359,7 @@ def test_handle_idle_defers_on_merged_pr_check_failure(
     assert any("merged PR check failed" in e["event"] for e in runner.state.history)
 
 
-def test_handle_idle_reads_merged_prs_without_clearing_cache(
+def test_handle_idle_requests_fresh_merged_prs_for_status_derivation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_subprocess(monkeypatch)
@@ -3376,10 +3376,14 @@ def test_handle_idle_reads_merged_prs_without_clearing_cache(
         "get_open_prs",
         lambda repo, **kw: [],
     )
-    calls: list[str] = []
+    refresh_calls: list[bool] = []
 
-    def fake_get_merged_prs(repo: str, branch: str) -> list[PRInfo]:
-        calls.append("get")
+    def fake_get_merged_prs(
+        repo: str,
+        branch: str,
+        refresh: bool = False,
+    ) -> list[PRInfo]:
+        refresh_calls.append(refresh)
         return []
 
     monkeypatch.setattr(
@@ -3400,7 +3404,7 @@ def test_handle_idle_reads_merged_prs_without_clearing_cache(
     runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
     asyncio.run(runner.handle_idle())
 
-    assert calls == ["get"]
+    assert refresh_calls == [True]
 
 
 # ------------------------------------------------------------------

@@ -83,6 +83,7 @@ class IdleMixin:
             merged_prs = github_client.get_merged_prs(
                 self.owner_repo,
                 self.repo_config.branch,
+                refresh=True,
             )
         except Exception as exc:
             self.log_event(
