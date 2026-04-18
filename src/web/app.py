@@ -932,7 +932,7 @@ def _first_probe_line(text: str) -> str:
 
 def _check_claude_auth() -> dict[str, str]:
     """Probe the ``claude`` CLI and report its authorization status."""
-    return ClaudePlugin().check_auth()
+    return ClaudePlugin().check_auth(config_path=CONFIG_PATH)
 
 
 def _check_codex_auth() -> dict[str, str]:

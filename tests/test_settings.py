@@ -862,6 +862,68 @@ def test_auth_probes_inject_config_auth_dirs_into_env(
     assert captured["gh"].get("GH_CONFIG_DIR") == "/custom/gh-home"
 
 
+def test_api_auth_status_uses_overridden_config_path_for_claude_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude auth probe must honor the web app's overridden ``CONFIG_PATH``.
+
+    Regression for a P2 Codex finding on PR-074: `_check_claude_auth()`
+    delegated to `ClaudePlugin.check_auth()` without passing
+    `web_app.CONFIG_PATH`, so the probe reloaded `config.yml` from the
+    plugin module's default location and ignored the web app's test/runtime
+    override. That made Claude auth status drift from the rest of the
+    dashboard whenever the app was pointed at a non-default config file.
+    """
+    default_cfg = tmp_path / "config.yml"
+    default_cfg.write_text(
+        "repositories: []\n"
+        "auth:\n"
+        "  claude_config_dir: /default/claude-home\n"
+        "  gh_config_dir: /default/gh-home\n",
+        encoding="utf-8",
+    )
+    override_cfg = tmp_path / "override.yml"
+    override_cfg.write_text(
+        "repositories: []\n"
+        "auth:\n"
+        "  claude_config_dir: /override/claude-home\n"
+        "  gh_config_dir: /override/gh-home\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(override_cfg))
+
+    captured: dict[str, dict[str, str]] = {}
+
+    def fake_run(
+        cmd: list[str], *args: object, **kwargs: object
+    ) -> _FakeCompleted:
+        env = kwargs.get("env") or {}
+        if cmd and cmd[0] == "claude":
+            captured["claude"] = dict(env)
+            return _FakeCompleted(0, stdout="claude 1.2.3\n")
+        if cmd and cmd[0] == "codex":
+            return _FakeCompleted(127, stderr="codex not found")
+        if cmd and cmd[0] == "gh":
+            captured["gh"] = dict(env)
+            return _FakeCompleted(
+                0,
+                stderr="  ✓ Logged in to github.com as octocat\n",
+            )
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(web_app.subprocess, "run", fake_run)
+
+    with TestClient(app) as client:
+        response = client.get("/api/auth-status")
+
+    assert response.status_code == 200
+    assert captured["claude"].get("CLAUDE_CONFIG_DIR") == "/override/claude-home"
+    assert captured["gh"].get("GH_CONFIG_DIR") == "/override/gh-home"
+
+
 def test_auth_status_probes_run_concurrently_off_loop(
     empty_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

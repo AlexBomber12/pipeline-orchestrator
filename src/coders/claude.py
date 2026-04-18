@@ -65,8 +65,8 @@ class ClaudePlugin:
             timeout=timeout,
         )
 
-    def check_auth(self) -> dict[str, str]:
-        cfg = load_config(CONFIG_PATH)
+    def check_auth(self, *, config_path: str = CONFIG_PATH) -> dict[str, str]:
+        cfg = load_config(config_path)
         env = {
             **os.environ,
             "CLAUDE_CONFIG_DIR": cfg.auth.claude_config_dir,
