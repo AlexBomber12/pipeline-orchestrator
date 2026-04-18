@@ -421,7 +421,7 @@
 - Branch: pr-071-config-validation
 
 ## PR-072: BUG-3 - codex review dedup by PR number
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-072.md
 - Branch: pr-072-review-dedup-by-pr
 
