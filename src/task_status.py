@@ -110,35 +110,23 @@ def get_merged_pr_ids(
     """Return queue PR identifiers already present in ``origin/base_branch`` history."""
     candidate_set = {pr_id for pr_id in candidate_pr_ids or () if pr_id}
     if candidate_set:
-        try:
+        result = _scan_candidate_merged_pr_ids(
+            repo_path,
+            f"origin/{base_branch}",
+            candidate_set,
+        )
+        if result is None:
             result = _scan_candidate_merged_pr_ids(
                 repo_path,
-                f"origin/{base_branch}",
+                base_branch,
                 candidate_set,
             )
-        except subprocess.TimeoutExpired:
-            return set()
-        if result is None:
-            try:
-                result = _scan_candidate_merged_pr_ids(
-                    repo_path,
-                    base_branch,
-                    candidate_set,
-                )
-            except subprocess.TimeoutExpired:
-                return set()
         if result is not None:
             return result
 
-    try:
-        result = _run_merged_pr_probe(repo_path, f"origin/{base_branch}")
-    except subprocess.TimeoutExpired:
-        return set()
+    result = _run_merged_pr_probe(repo_path, f"origin/{base_branch}")
     if result.returncode != 0:
-        try:
-            result = _run_merged_pr_probe(repo_path, base_branch)
-        except subprocess.TimeoutExpired:
-            return set()
+        result = _run_merged_pr_probe(repo_path, base_branch)
     if result.returncode != 0:
         raise RuntimeError(
             "git log failed while probing merged PR ids: "

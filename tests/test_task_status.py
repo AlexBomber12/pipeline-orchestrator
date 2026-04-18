@@ -105,7 +105,7 @@ def test_get_merged_pr_ids(monkeypatch) -> None:
     assert "--max-count=2048" not in calls[0]
 
 
-def test_get_merged_pr_ids_returns_empty_set_on_timeout(
+def test_get_merged_pr_ids_propagates_timeout(
     monkeypatch,
 ) -> None:
     def fake_run(*args, **kwargs) -> subprocess.CompletedProcess[str]:
@@ -113,7 +113,8 @@ def test_get_merged_pr_ids_returns_empty_set_on_timeout(
 
     monkeypatch.setattr("src.task_status.subprocess.run", fake_run)
 
-    assert get_merged_pr_ids("/repo", "main") == set()
+    with pytest.raises(subprocess.TimeoutExpired):
+        get_merged_pr_ids("/repo", "main")
 
 
 def test_get_merged_pr_ids_ignores_noncanonical_subject_mentions(
