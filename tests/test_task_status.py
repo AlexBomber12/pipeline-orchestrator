@@ -81,7 +81,10 @@ def test_derive_todo_when_neither() -> None:
 
 
 def test_get_merged_pr_ids(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
     def fake_run(*args, **kwargs) -> subprocess.CompletedProcess[str]:
+        calls.append(args[0])
         return subprocess.CompletedProcess(
             args=args[0],
             returncode=0,
@@ -99,6 +102,18 @@ def test_get_merged_pr_ids(monkeypatch) -> None:
         "PR-084",
         "PR-085",
     }
+    assert "--max-count=2048" in calls[0]
+
+
+def test_get_merged_pr_ids_returns_empty_set_on_timeout(
+    monkeypatch,
+) -> None:
+    def fake_run(*args, **kwargs) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+
+    monkeypatch.setattr("src.task_status.subprocess.run", fake_run)
+
+    assert get_merged_pr_ids("/repo", "main") == set()
 
 
 def test_get_merged_pr_ids_ignores_noncanonical_subject_mentions(
@@ -220,6 +235,33 @@ def test_load_task_header_falls_back_for_legacy_task_files(
         priority=3,
         coder="any",
     )
+
+
+def test_load_task_header_rejects_mismatched_legacy_task_files(
+    tmp_path: Path,
+) -> None:
+    task_file = tmp_path / "tasks" / "PR-999.md"
+    task_file.parent.mkdir()
+    task_file.write_text(
+        "# PR-999: Wrong task\n\n"
+        "Branch: pr-999-wrong-task\n",
+        encoding="utf-8",
+    )
+    task = QueueTask(
+        pr_id="PR-001",
+        title="Queued task",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-999.md",
+        depends_on=[],
+        branch="pr-001-queued-task",
+    )
+
+    with pytest.raises(QueueValidationError) as excinfo:
+        _load_task_header(task, str(tmp_path))
+
+    assert excinfo.value.issues == [
+        "tasks/PR-999.md: header PR ID 'PR-999' does not match queue entry 'PR-001'"
+    ]
 
 
 def test_derive_queue_task_statuses_does_not_trust_stale_done_queue_status(

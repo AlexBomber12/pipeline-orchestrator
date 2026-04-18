@@ -18,6 +18,11 @@ from src.queue_parser import (
 
 _PR_ID_PATTERN = _PR_ID_RE.pattern.removeprefix("^").removesuffix("$")
 _MERGED_SUBJECT_RE = re.compile(rf"^(?P<pr_id>{_PR_ID_PATTERN}):(?:\s|$)")
+_LEGACY_FALLBACK_SUFFIXES = {
+    ": missing Type",
+    ": missing Complexity",
+    ": missing Depends on",
+}
 
 
 def derive_task_status(
@@ -99,9 +104,15 @@ def _branch_matches_task_pr(
 
 def get_merged_pr_ids(repo_path: str, base_branch: str) -> set[str]:
     """Return queue PR identifiers already present in ``origin/base_branch`` history."""
-    result = _run_merged_pr_probe(repo_path, f"origin/{base_branch}")
+    try:
+        result = _run_merged_pr_probe(repo_path, f"origin/{base_branch}")
+    except subprocess.TimeoutExpired:
+        return set()
     if result.returncode != 0:
-        result = _run_merged_pr_probe(repo_path, base_branch)
+        try:
+            result = _run_merged_pr_probe(repo_path, base_branch)
+        except subprocess.TimeoutExpired:
+            return set()
     if result.returncode != 0:
         raise RuntimeError(
             "git log failed while probing merged PR ids: "
@@ -130,6 +141,7 @@ def _run_merged_pr_probe(
             repo_path,
             "log",
             target_ref,
+            "--max-count=2048",
             "--format=%s",
         ],
         capture_output=True,
@@ -177,13 +189,69 @@ def _load_task_header(task: QueueTask, repo_path: str) -> TaskHeader:
         if task_path.is_file():
             try:
                 return parse_task_header(task_path)
-            except QueueValidationError:
-                pass
+            except QueueValidationError as exc:
+                legacy_header = _load_legacy_task_header(task, task_path, exc)
+                if legacy_header is not None:
+                    return legacy_header
+                raise
 
     return TaskHeader(
         pr_id=task.pr_id,
         title=task.title,
         branch=task.branch or "",
+        task_type="feature",
+        complexity="medium",
+        depends_on=list(task.depends_on),
+        priority=3,
+        coder="any",
+    )
+
+
+def _load_legacy_task_header(
+    task: QueueTask,
+    task_path: Path,
+    exc: QueueValidationError,
+) -> TaskHeader | None:
+    """Return a narrow fallback only for known legacy task-file headers."""
+    if not exc.issues or any(
+        not any(issue.endswith(suffix) for suffix in _LEGACY_FALLBACK_SUFFIXES)
+        for issue in exc.issues
+    ):
+        return None
+
+    header_match: re.Match[str] | None = None
+    branch: str | None = None
+    for raw_line in task_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.rstrip()
+        if header_match is None:
+            header_match = re.match(r"^#\s+(PR-[A-Za-z0-9_.-]+):\s*(.+?)\s*$", line)
+            continue
+        if not line.strip():
+            continue
+        branch_match = re.match(r"^Branch\s*:\s*(.*?)\s*$", line)
+        if branch_match:
+            branch = branch_match.group(1).strip()
+            break
+        if line.startswith("#") or line.startswith("- "):
+            break
+
+    if header_match is None or not branch:
+        return None
+
+    header_pr_id = header_match.group(1)
+    if header_pr_id != task.pr_id:
+        task_ref = task.task_file or str(task_path)
+        raise QueueValidationError(
+            [
+                f"{task_ref}: header PR ID {header_pr_id!r} "
+                f"does not match queue entry {task.pr_id!r}"
+            ]
+        )
+
+    return TaskHeader(
+        pr_id=header_pr_id,
+        title=header_match.group(2),
+        branch=branch,
         task_type="feature",
         complexity="medium",
         depends_on=list(task.depends_on),
