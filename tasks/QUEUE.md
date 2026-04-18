@@ -437,7 +437,7 @@
 - Depends on: PR-073
 
 ## PR-075: Codex coder plugin
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-075.md
 - Branch: pr-075-codex-plugin
 - Depends on: PR-073
