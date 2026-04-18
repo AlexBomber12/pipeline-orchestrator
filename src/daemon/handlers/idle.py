@@ -85,15 +85,46 @@ class IdleMixin:
             "-m",
             "AUTO: regenerate QUEUE.md from DAG",
         )
-        push_result = retry_transient(
-            lambda: git_ops._git(
+
+        def _push_queue_md() -> subprocess.CompletedProcess[str]:
+            result = git_ops._git(
                 self.repo_path,
                 "push",
                 "origin",
                 self.repo_config.branch,
                 timeout=60,
                 check=False,
-            ),
+            )
+            if result.returncode != 0 and any(
+                marker in (result.stderr or "").lower()
+                for marker in (
+                    "connection reset",
+                    "connection refused",
+                    "network unreachable",
+                    "temporary failure",
+                    "could not resolve host",
+                    "operation timed out",
+                    "timed out",
+                    "tls handshake timeout",
+                    "i/o timeout",
+                    "handshake timeout",
+                    "context deadline exceeded",
+                    "502 bad gateway",
+                    "503 service unavailable",
+                    "504 gateway timeout",
+                    "remote end hung up",
+                )
+            ):
+                raise subprocess.CalledProcessError(
+                    result.returncode,
+                    result.args,
+                    output=result.stdout,
+                    stderr=result.stderr,
+                )
+            return result
+
+        push_result = retry_transient(
+            _push_queue_md,
             operation_name=f"git push origin {self.repo_config.branch}",
         )
         if push_result.returncode == 0:
@@ -483,8 +514,9 @@ class IdleMixin:
             if not published_queue:
                 self.log_event(
                     "QUEUE.md auto-generation push rejected; "
-                    "continuing without publishing"
+                    "refreshing queue state before retry"
                 )
+                return
         if task is None:
             self.log_event("No tasks available")
             if prs:

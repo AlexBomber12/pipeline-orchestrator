@@ -18,6 +18,7 @@ from src.daemon import runner as runner_module
 from src.daemon.handlers import breach as breach_module
 from src.daemon.handlers import idle as idle_module
 from src.daemon.runner import ErrorCategory, PipelineRunner, _classify_error
+from src import retry as retry_module
 from src.models import (
     CIStatus,
     FeedbackCheckResult,
@@ -4723,8 +4724,8 @@ def test_handle_idle_continues_when_queue_regeneration_push_is_rejected(
     runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
     asyncio.run(runner.handle_idle())
 
-    assert coding_called["v"] is True
-    assert runner.state.state == PipelineState.CODING
+    assert coding_called["v"] is False
+    assert runner.state.state == PipelineState.IDLE
     assert any(
         "QUEUE.md auto-generation push rejected" in entry["event"]
         for entry in runner.state.history
@@ -4973,6 +4974,55 @@ def test_write_generated_queue_md_resets_on_push_rejection(
     assert queue_path.read_text(encoding="utf-8") == original
     assert any(cmd[:2] == ["git", "fetch"] for cmd in git_calls)
     assert any(cmd[:2] == ["git", "reset"] for cmd in git_calls)
+
+
+def test_write_generated_queue_md_retries_transient_push_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "QUEUE.md"
+    headers = [
+        TaskHeader(
+            pr_id="PR-001",
+            title="Project bootstrap",
+            branch="pr-001-bootstrap",
+            task_type="feature",
+            complexity="low",
+            depends_on=[],
+            priority=1,
+            coder="any",
+        )
+    ]
+    statuses = {"PR-001": TaskStatus.DONE}
+
+    git_calls: list[list[str]] = []
+    push_attempts = {"count": 0}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append(cmd)
+        if cmd[:2] == ["git", "push"]:
+            push_attempts["count"] += 1
+            if push_attempts["count"] < 3:
+                return _FakeCompletedProcess(
+                    args=cmd,
+                    returncode=1,
+                    stderr="operation timed out",
+                )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(git_ops_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(retry_module.time, "sleep", lambda _: None)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+
+    published = runner._write_generated_queue_md(headers, statuses)
+
+    assert published is True
+    assert push_attempts["count"] == 3
+    assert not any(cmd[:2] == ["git", "reset"] for cmd in git_calls)
 
 
 def test_select_next_task_from_dag_skips_merged_probe_without_structured_headers(
