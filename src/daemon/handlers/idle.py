@@ -40,6 +40,18 @@ class IdleMixin:
             for issue in exc.issues
         )
 
+    @staticmethod
+    def _is_legacy_unstructured_task_error(exc: QueueValidationError) -> bool:
+        allowed_suffixes = {
+            ": missing Type",
+            ": missing Complexity",
+            ": missing Depends on",
+        }
+        return bool(exc.issues) and all(
+            any(issue.endswith(suffix) for suffix in allowed_suffixes)
+            for issue in exc.issues
+        )
+
     async def _select_next_task_from_dag(self) -> QueueTask | None:
         """Pick the next eligible task from structured task headers."""
         self._idle_dag_tasks = None
@@ -54,7 +66,10 @@ class IdleMixin:
             try:
                 header = parse_task_header(task_file)
             except QueueValidationError as exc:
-                if not self._is_missing_task_header_error(exc):
+                if not (
+                    self._is_missing_task_header_error(exc)
+                    or self._is_legacy_unstructured_task_error(exc)
+                ):
                     raise
                 continue
             headers.append(header)
