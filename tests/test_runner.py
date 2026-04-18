@@ -4656,6 +4656,88 @@ def test_handle_idle_skips_queue_regeneration_when_legacy_check_fails_with_visib
     assert write_calls == []
 
 
+def test_handle_idle_skips_queue_regeneration_when_visible_legacy_row_is_malformed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    dag_task = QueueTask(
+        pr_id="PR-123",
+        title="Structured in-flight task",
+        status=TaskStatus.DOING,
+        task_file="tasks/PR-123.md",
+        branch="pr-123-structured",
+    )
+
+    async def fake_select(self):
+        self._idle_dag_tasks = [dag_task]
+        self._idle_dag_headers = [
+            TaskHeader(
+                pr_id=dag_task.pr_id,
+                title=dag_task.title,
+                branch=dag_task.branch or "",
+                task_type="feature",
+                complexity="low",
+                depends_on=[],
+                priority=1,
+                coder="any",
+            )
+        ]
+        self._idle_dag_statuses = {dag_task.pr_id: dag_task.status}
+        return dag_task
+
+    monkeypatch.setattr(idle_module.IdleMixin, "_select_next_task_from_dag", fake_select)
+    monkeypatch.setattr(
+        idle_module,
+        "parse_queue",
+        lambda path, **kw: (_ for _ in ()).throw(
+            idle_module.QueueValidationError(["Queue validation failed"])
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    write_calls: list[tuple[list[TaskHeader], dict[str, TaskStatus]]] = []
+
+    def fake_write_generated_queue_md(
+        self,
+        headers: list[TaskHeader],
+        statuses: dict[str, TaskStatus],
+    ) -> bool:
+        write_calls.append((headers, statuses))
+        return True
+
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_write_generated_queue_md",
+        fake_write_generated_queue_md,
+    )
+
+    async def fake_handle_coding() -> None:
+        return None
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    (queue_dir / "QUEUE.md").write_text(
+        "# Task Queue\n\n## PR-001 Legacy queue task\n- Status: TODO\n",
+        encoding="utf-8",
+    )
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    asyncio.run(runner.handle_idle())
+
+    assert write_calls == []
+
+
 def test_handle_idle_regenerates_queue_when_validation_fails_without_visible_legacy_rows(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

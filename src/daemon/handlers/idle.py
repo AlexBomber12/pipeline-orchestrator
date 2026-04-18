@@ -173,7 +173,7 @@ class IdleMixin:
         if not path.is_file():
             return False
         for raw_line in path.read_text(encoding="utf-8").splitlines():
-            match = re.match(r"^##\s+(PR-[A-Za-z0-9_.-]+):", raw_line.rstrip())
+            match = re.match(r"^##\s+(PR-[A-Za-z0-9_.-]+)\b", raw_line.rstrip())
             if match and match.group(1) not in structured_pr_ids:
                 return True
         return False
