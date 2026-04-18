@@ -504,6 +504,29 @@ def test_partial_repo_detail_returns_html_fragment(
     assert "Event log" not in body
 
 
+def test_partial_repo_detail_skips_metrics_fetch(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    async def _fail_metrics_fetch(
+        name: str, redis_client: object | None
+    ) -> list[dict[str, object]]:
+        raise AssertionError("summary poll should not fetch metrics")
+
+    monkeypatch.setattr(
+        web_app,
+        "_recent_repo_metrics_payload",
+        _fail_metrics_fetch,
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo/example__alpha")
+
+    assert response.status_code == 200
+    assert "Current PR" in response.text
+
+
 def test_partial_repo_detail_renders_redis_payload(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

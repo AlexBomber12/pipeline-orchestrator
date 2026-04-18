@@ -244,6 +244,8 @@ async def _repo_template_context(
     name: str,
     redis_client: aioredis.Redis | None,
     config_path: str = CONFIG_PATH,
+    *,
+    include_metrics: bool = False,
 ) -> dict[str, Any]:
     """Return template context for repo detail renders."""
     config = load_config(config_path)
@@ -256,7 +258,11 @@ async def _repo_template_context(
         "coders": build_coder_registry().list_coders(),
         "effective_coder": _effective_coder_name(repo_config, config),
         "inherit_coder": _daemon_default_coder_name(config),
-        "metrics_records": await _recent_repo_metrics_payload(name, redis_client),
+        "metrics_records": (
+            await _recent_repo_metrics_payload(name, redis_client)
+            if include_metrics
+            else []
+        ),
         "repo_name": name,
     }
 
@@ -811,7 +817,11 @@ async def partial_alerts(request: Request) -> HTMLResponse:
 @app.get("/repo/{name}", response_class=HTMLResponse)
 async def repo_detail(request: Request, name: str) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
-    context = await _repo_template_context(name, redis_client)
+    context = await _repo_template_context(
+        name,
+        redis_client,
+        include_metrics=True,
+    )
     return templates.TemplateResponse(
         request,
         "repo.html",
