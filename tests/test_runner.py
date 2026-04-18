@@ -668,6 +668,101 @@ def test_handle_idle_dag_skips_files_without_headers(
     assert runner.state.queue_total == 1
 
 
+def test_handle_idle_dag_surfaces_malformed_task_headers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Broken structured task\n\n"
+        "Branch: pr-001-broken\n"
+        "- Type: definitely-not-valid\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message is not None
+    assert "invalid Type" in runner.state.error_message
+
+
+def test_select_next_task_from_dag_prefers_doing_task(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: In flight task\n\n"
+        "Branch: pr-001-in-flight\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n",
+        encoding="utf-8",
+    )
+    (tasks_dir / "PR-002.md").write_text(
+        "# PR-002: Fresh task\n\n"
+        "Branch: pr-002-fresh\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(
+        idle_module,
+        "derive_task_status",
+        lambda header, merged_pr_ids, open_prs, merged_prs: (
+            TaskStatus.DOING
+            if header.pr_id == "PR-001"
+            else TaskStatus.TODO
+        ),
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-001"
+    assert task.status == TaskStatus.DOING
+
+
 def test_handle_idle_attaches_to_existing_pr_instead_of_coding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3567,6 +3662,70 @@ def test_handle_idle_falls_back_when_merged_pr_check_fails(
     assert coding_called["v"] is True
     assert derived_calls == [[]]
     assert any("merged PR check failed" in e["event"] for e in runner.state.history)
+
+
+def test_handle_idle_uses_fallback_queue_counters_when_dag_picks_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    dag_tasks = [
+        QueueTask(
+            pr_id="PR-001",
+            title="Done DAG task",
+            status=TaskStatus.DONE,
+            task_file="tasks/PR-001.md",
+            branch="pr-001-done",
+        ),
+        QueueTask(
+            pr_id="PR-002",
+            title="Blocked DAG task",
+            status=TaskStatus.TODO,
+            task_file="tasks/PR-002.md",
+            branch="pr-002-blocked",
+        ),
+    ]
+    fallback_task = QueueTask(
+        pr_id="PR-099",
+        title="Fallback queue task",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-099.md",
+        branch="pr-099-fallback",
+    )
+    fallback_tasks = [fallback_task]
+
+    async def fake_select(self):
+        self._idle_dag_tasks = dag_tasks
+        return None
+
+    monkeypatch.setattr(idle_module.IdleMixin, "_select_next_task_from_dag", fake_select)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: fallback_tasks)
+    monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda tasks, repo_path, base_branch, prs, merged_prs=(): tasks,
+    )
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: fallback_task)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    async def fake_handle_coding() -> None:
+        return None
+
+    runner = _make_runner()
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.current_task == fallback_task
+    assert runner.state.queue_done == 0
+    assert runner.state.queue_total == 1
 
 
 def test_handle_idle_requests_fresh_merged_prs_for_status_derivation(

@@ -33,6 +33,13 @@ from src.task_status import (
 class IdleMixin:
     """Handle IDLE state: sync, pick next task, dispatch to CODING."""
 
+    @staticmethod
+    def _is_missing_task_header_error(exc: QueueValidationError) -> bool:
+        return bool(exc.issues) and all(
+            "missing task header like '# PR-123: Title'" in issue
+            for issue in exc.issues
+        )
+
     async def _select_next_task_from_dag(self) -> QueueTask | None:
         """Pick the next eligible task from structured task headers."""
         self._idle_dag_tasks = None
@@ -46,7 +53,9 @@ class IdleMixin:
         for task_file in sorted(task_dir.glob("PR-*.md")):
             try:
                 header = parse_task_header(task_file)
-            except QueueValidationError:
+            except QueueValidationError as exc:
+                if not self._is_missing_task_header_error(exc):
+                    raise
                 continue
             headers.append(header)
             task_files[header.pr_id] = task_file.relative_to(repo_root).as_posix()
@@ -79,6 +88,11 @@ class IdleMixin:
             self._queue_task_from_header(header, statuses[header.pr_id], task_files)
             for header in headers
         ]
+        doing_tasks = [
+            task for task in self._idle_dag_tasks if task.status == TaskStatus.DOING
+        ]
+        if doing_tasks:
+            return doing_tasks[0]
         if not eligible:
             return None
 
@@ -186,6 +200,7 @@ class IdleMixin:
 
         tasks = dag_tasks
         task = dag_task
+        queue_tasks = dag_tasks if dag_tasks is not None else []
         if task is None:
             try:
                 tasks = parse_queue(queue_path, strict=strict)
@@ -219,8 +234,7 @@ class IdleMixin:
                 self.log_event(f"Task status derivation failed: {exc}")
                 return
             task = get_next_task(tasks)
-
-        queue_tasks = dag_tasks if dag_tasks is not None else tasks
+            queue_tasks = tasks
         self.state.queue_done = sum(
             1 for t in queue_tasks if t.status == TaskStatus.DONE
         )
