@@ -5297,6 +5297,39 @@ def test_handle_coding_sets_paused_on_rate_limit(
     assert recent[0].exit_reason == "rate_limit"
 
 
+def test_handle_coding_saves_record_on_proactive_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = QueueTask(
+        pr_id="PR-099", title="test", branch="pr-099-test", status=TaskStatus.TODO
+    )
+
+    async def fake_check_rate_limit() -> bool:
+        runner.state.state = PipelineState.PAUSED
+        runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+        return False
+
+    monkeypatch.setattr(runner, "_check_rate_limit", fake_check_rate_limit)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.rate_limited_until is not None
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-099",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+    assert len(recent) == 1
+    assert recent[0].exit_reason == "rate_limit"
+    assert recent[0].ended_at is not None
+    assert recent[0].duration_ms is not None
+
+
 def test_handle_fix_sets_paused_on_rate_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -25,18 +25,18 @@ class CodingMixin:
         for the PR; because the list API is eventually consistent, we
         retry a few times before surfacing an ERROR.
         """
-        if not await self._check_rate_limit():
-            return
-
         coder_name, plugin = self._get_coder()
-        self.log_event(f"[{coder_name}] Starting PLANNED PR")
-
         model = (
             self.app_config.daemon.codex_model
             if coder_name == "codex"
             else self.app_config.daemon.claude_model
         )
         self._start_current_run_record(coder_name, model)
+        if not await self._check_rate_limit():
+            await self._save_current_run_record("rate_limit")
+            return
+
+        self.log_event(f"[{coder_name}] Starting PLANNED PR")
 
         target_branch = (
             self.state.current_task.branch if self.state.current_task else None
