@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -12,44 +13,45 @@ from src.queue_parser import (
     parse_task_header,
 )
 
+_MERGED_PR_ID_RE = re.compile(r"\b(PR-\d+)\b")
+
 
 def derive_task_status(
     task_header: TaskHeader,
-    merged_branches: set[str],
+    merged_pr_ids: set[str],
     open_pr_branches: set[str],
 ) -> TaskStatus:
     """Derive task status from git state."""
-    if task_header.branch in merged_branches:
+    if task_header.pr_id in merged_pr_ids:
         return TaskStatus.DONE
     if task_header.branch in open_pr_branches:
         return TaskStatus.DOING
     return TaskStatus.TODO
 
 
-def get_merged_branches(repo_path: str, base_branch: str) -> set[str]:
-    """Return remote branches already merged into ``origin/base_branch``."""
-    result = _run_merged_branch_probe(repo_path, f"origin/{base_branch}")
+def get_merged_pr_ids(repo_path: str, base_branch: str) -> set[str]:
+    """Return queue PR identifiers already present in ``origin/base_branch`` history."""
+    result = _run_merged_pr_probe(repo_path, f"origin/{base_branch}")
     if result.returncode != 0:
-        result = _run_merged_branch_probe(repo_path, base_branch)
+        result = _run_merged_pr_probe(repo_path, base_branch)
     if result.returncode != 0:
         raise RuntimeError(
-            "git branch --merged failed: "
+            "git log failed while probing merged PR ids: "
             f"{(result.stderr or '').strip() or result.stdout.strip()}"
         )
 
-    branches: set[str] = set()
+    pr_ids: set[str] = set()
     for line in result.stdout.strip().splitlines():
-        ref = line.strip()
-        if not ref or "->" in ref:
+        subject = line.strip()
+        if not subject:
             continue
-        if ref.startswith("origin/"):
-            ref = ref.removeprefix("origin/")
-        if ref and ref != base_branch:
-            branches.add(ref)
-    return branches
+        match = _MERGED_PR_ID_RE.search(subject)
+        if match:
+            pr_ids.add(match.group(1))
+    return pr_ids
 
 
-def _run_merged_branch_probe(
+def _run_merged_pr_probe(
     repo_path: str,
     target_ref: str,
 ) -> subprocess.CompletedProcess[str]:
@@ -58,10 +60,9 @@ def _run_merged_branch_probe(
             "git",
             "-C",
             repo_path,
-            "branch",
-            "--merged",
+            "log",
             target_ref,
-            "-r",
+            "--format=%s",
         ],
         capture_output=True,
         text=True,
@@ -77,12 +78,12 @@ def derive_queue_task_statuses(
     open_pr_branches: set[str],
 ) -> list[QueueTask]:
     """Return queue tasks with status refreshed from git/GitHub state."""
-    merged_branches = get_merged_branches(repo_path, base_branch)
+    merged_pr_ids = get_merged_pr_ids(repo_path, base_branch)
     derived: list[QueueTask] = []
 
     for task in tasks:
         header = _load_task_header(task, repo_path)
-        status = derive_task_status(header, merged_branches, open_pr_branches)
+        status = derive_task_status(header, merged_pr_ids, open_pr_branches)
         if (
             status == TaskStatus.TODO
             and task.status == TaskStatus.DONE

@@ -10,13 +10,13 @@ from src.task_status import (
     _load_task_header,
     derive_task_status,
     derive_queue_task_statuses,
-    get_merged_branches,
+    get_merged_pr_ids,
 )
 
 
-def _header(branch: str) -> TaskHeader:
+def _header(branch: str, pr_id: str = "PR-085") -> TaskHeader:
     return TaskHeader(
-        pr_id="PR-085",
+        pr_id=pr_id,
         title="Status derivation from git",
         branch=branch,
         task_type="feature",
@@ -27,10 +27,10 @@ def _header(branch: str) -> TaskHeader:
     )
 
 
-def test_derive_done_when_branch_merged() -> None:
+def test_derive_done_when_pr_id_is_in_merged_history() -> None:
     status = derive_task_status(
         _header("pr-085-status-from-git"),
-        {"pr-085-status-from-git"},
+        {"PR-085"},
         set(),
     )
 
@@ -57,25 +57,24 @@ def test_derive_todo_when_neither() -> None:
     assert status == TaskStatus.TODO
 
 
-def test_get_merged_branches(monkeypatch) -> None:
+def test_get_merged_pr_ids(monkeypatch) -> None:
     def fake_run(*args, **kwargs) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(
             args=args[0],
             returncode=0,
             stdout=(
-                "  origin/HEAD -> origin/main\n"
-                "  origin/main\n"
-                "  origin/pr-084-task-header-parser\n"
-                "  origin/pr-085-status-from-git\n"
+                "PR-084: add task file header parser (#108)\n"
+                "Merge pull request #97 from AlexBomber12/micro-20260418-rate-limit-on-failure\n"
+                "PR-085: Status derivation from git (#109)\n"
             ),
             stderr="",
         )
 
     monkeypatch.setattr("src.task_status.subprocess.run", fake_run)
 
-    assert get_merged_branches("/repo", "main") == {
-        "pr-084-task-header-parser",
-        "pr-085-status-from-git",
+    assert get_merged_pr_ids("/repo", "main") == {
+        "PR-084",
+        "PR-085",
     }
 
 
@@ -123,12 +122,44 @@ def test_derive_queue_task_statuses_preserves_done_without_remote_branch(
     )
 
     monkeypatch.setattr(
-        "src.task_status.get_merged_branches",
+        "src.task_status.get_merged_pr_ids",
         lambda repo_path, base_branch: set(),
     )
     monkeypatch.setattr(
         "src.task_status._load_task_header",
         lambda current_task, repo_path: _header("pr-001-completed"),
+    )
+
+    derived = derive_queue_task_statuses(
+        [task],
+        "/repo",
+        "main",
+        set(),
+    )
+
+    assert derived[0].status == TaskStatus.DONE
+
+
+def test_derive_queue_task_statuses_marks_done_from_merged_pr_history(
+    monkeypatch,
+) -> None:
+    task = QueueTask(
+        pr_id="PR-001",
+        title="Completed task",
+        status=TaskStatus.TODO,
+        branch="pr-001-completed",
+    )
+
+    monkeypatch.setattr(
+        "src.task_status.get_merged_pr_ids",
+        lambda repo_path, base_branch: {"PR-001"},
+    )
+    monkeypatch.setattr(
+        "src.task_status._load_task_header",
+        lambda current_task, repo_path: _header(
+            "pr-001-deleted-branch",
+            pr_id="PR-001",
+        ),
     )
 
     derived = derive_queue_task_statuses(
