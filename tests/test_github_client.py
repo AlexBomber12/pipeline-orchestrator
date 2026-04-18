@@ -13,6 +13,7 @@ from src.github_client import (
     _is_codex_user,
     _is_plus_one,
     clear_review_status_cache,
+    get_merged_prs,
     get_pr_author,
     get_pr_head_commit_iso,
     get_pr_metadata,
@@ -107,6 +108,55 @@ def test_run_gh_returns_raw_string_when_not_json(
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert run_gh(["auth", "status"]) == "ok"
+
+
+def test_get_merged_prs_paginates_closed_prs_without_fixed_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_paginated(path: str) -> list[dict[str, Any]]:
+        captured["path"] = path
+        return [
+            {
+                "number": 101,
+                "title": "PR-101: shipped work",
+                "merged_at": "2026-04-18T10:00:00Z",
+                "head": {
+                    "ref": "pr-101-shipped-work",
+                    "repo": {"fork": False},
+                },
+            },
+            {
+                "number": 102,
+                "title": "closed without merge",
+                "merged_at": None,
+                "head": {
+                    "ref": "pr-102-closed",
+                    "repo": {"fork": False},
+                },
+            },
+            {
+                "number": 103,
+                "title": "custom squash title",
+                "merged_at": "2026-04-18T11:00:00Z",
+                "head": {
+                    "ref": "pr-103-custom-title",
+                    "repo": {"fork": True},
+                },
+            },
+        ]
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    prs = get_merged_prs("owner/name")
+
+    assert captured["path"] == "repos/owner/name/pulls?state=closed&per_page=100"
+    assert [pr.number for pr in prs] == [101, 103]
+    assert prs[0].pr_id == "PR-101"
+    assert prs[0].branch == "pr-101-shipped-work"
+    assert prs[1].pr_id is None
+    assert prs[1].is_cross_repository is True
 
 
 def test_is_codex_user_matches_bot_logins() -> None:

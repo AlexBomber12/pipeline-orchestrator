@@ -177,11 +177,8 @@ def get_open_prs(
     return prs
 
 
-def get_merged_prs(
-    repo: str,
-    limit: int = 1000,
-) -> list[PRInfo]:
-    """Return recently merged PRs for ``repo``.
+def get_merged_prs(repo: str) -> list[PRInfo]:
+    """Return merged PRs for ``repo``.
 
     This is a best-effort fallback used by queue status derivation when
     merged work can no longer be inferred from local git history alone
@@ -190,40 +187,33 @@ def get_merged_prs(
     their local heuristics.
     """
     try:
-        raw = run_gh(
-            [
-                "pr",
-                "list",
-                "--state",
-                "merged",
-                "--limit",
-                str(limit),
-                "--json",
-                "number,title,headRefName,mergedAt,isCrossRepository",
-            ],
-            repo=repo,
+        raw = _gh_api_paginated(
+            f"repos/{repo}/pulls?state=closed&per_page=100"
         )
     except Exception:
         return []
 
-    if not isinstance(raw, list):
+    if raw is None:
         return []
 
     prs: list[PRInfo] = []
     for entry in raw:
+        if entry.get("merged_at") in (None, ""):
+            continue
         number = int(entry.get("number", 0))
         if not number:
             continue
         title = entry.get("title", "")
+        head = entry.get("head") or {}
         prs.append(
             PRInfo(
                 number=number,
-                branch=entry.get("headRefName", ""),
+                branch=head.get("ref", ""),
                 title=title,
                 pr_id=extract_queue_pr_id(title),
                 url="",
-                is_cross_repository=bool(entry.get("isCrossRepository", False)),
-                last_activity=_parse_iso(entry.get("mergedAt")),
+                is_cross_repository=bool(head.get("repo", {}).get("fork", False)),
+                last_activity=_parse_iso(entry.get("merged_at")),
             )
         )
     return prs

@@ -141,7 +141,6 @@ def _run_merged_pr_probe(
             repo_path,
             "log",
             target_ref,
-            "--max-count=2048",
             "--format=%s",
         ],
         capture_output=True,

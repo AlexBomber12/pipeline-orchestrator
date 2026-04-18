@@ -102,7 +102,7 @@ def test_get_merged_pr_ids(monkeypatch) -> None:
         "PR-084",
         "PR-085",
     }
-    assert "--max-count=2048" in calls[0]
+    assert "--max-count=2048" not in calls[0]
 
 
 def test_get_merged_pr_ids_returns_empty_set_on_timeout(
