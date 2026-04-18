@@ -31,6 +31,13 @@ class CodingMixin:
         coder_name, plugin = self._get_coder()
         self.log_event(f"[{coder_name}] Starting PLANNED PR")
 
+        model = (
+            self.app_config.daemon.codex_model
+            if coder_name == "codex"
+            else self.app_config.daemon.claude_model
+        )
+        self._start_current_run_record(coder_name, model)
+
         target_branch = (
             self.state.current_task.branch if self.state.current_task else None
         )
@@ -39,17 +46,12 @@ class CodingMixin:
             self.state.error_message = (
                 "Current task has no branch; cannot identify PR"
             )
+            await self._save_current_run_record("error")
             self.log_event(self.state.error_message)
             return
 
         breach_dir, breach_run_id = self._breach_env()
         breach_flag: dict[str, bool] = {"breached": False}
-
-        model = (
-            self.app_config.daemon.codex_model
-            if coder_name == "codex"
-            else self.app_config.daemon.claude_model
-        )
 
         heartbeat = asyncio.create_task(self._publish_while_waiting("CODING"))
         coder_kwargs: dict[str, object] = {
@@ -107,6 +109,7 @@ class CodingMixin:
                         await asyncio.sleep(5)
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
+            await self._save_current_run_record("rate_limit")
             self.log_event(
                 f"CODING aborted: in-flight rate limit breach, "
                 f"paused until {self.state.rate_limited_until}"
@@ -146,6 +149,7 @@ class CodingMixin:
                         await asyncio.sleep(5)
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
+            await self._save_current_run_record("rate_limit")
             self.log_event(
                 f"CODING paused: late in-flight rate limit breach, "
                 f"paused until {self.state.rate_limited_until}"
@@ -157,6 +161,7 @@ class CodingMixin:
             if self.state.rate_limited_until is not None:
                 self.state.state = PipelineState.PAUSED
                 self.state.error_message = None
+                await self._save_current_run_record("rate_limit")
                 self.log_event(
                     f"Rate limit pause active until "
                     f"{self.state.rate_limited_until.isoformat()}"
@@ -164,6 +169,7 @@ class CodingMixin:
                 return
             self.state.state = PipelineState.ERROR
             self.state.error_message = stderr.strip() or f"{coder_name} exit {code}"
+            await self._save_current_run_record("error")
             self.log_event(f"[{coder_name}] CLI failed: {self.state.error_message}")
             return
 
@@ -177,6 +183,7 @@ class CodingMixin:
             except Exception as exc:
                 self.state.state = PipelineState.ERROR
                 self.state.error_message = f"get_open_prs failed: {exc}"
+                await self._save_current_run_record("error")
                 self.log_event(str(exc))
                 return
             candidate = next(
@@ -196,11 +203,13 @@ class CodingMixin:
             self.state.error_message = (
                 f"Claude CLI succeeded but no PR found for branch {target_branch!r}"
             )
+            await self._save_current_run_record("error")
             self.log_event(self.state.error_message)
             return
 
         self.state.current_pr = candidate
         self.state.state = PipelineState.WATCH
         self._rehydrate_last_push_at(candidate)
+        await self._save_current_run_record("coding_complete")
         self.log_event(f"Opened PR #{candidate.number} -> WATCH")
         self._post_codex_review(candidate.number)

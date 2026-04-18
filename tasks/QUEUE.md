@@ -472,7 +472,7 @@
 - Branch: pr-080-run-record-schema
 
 ## PR-081: Capture metrics in coding handler
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-081.md
 - Branch: pr-081-coding-metrics
 - Depends on: PR-080

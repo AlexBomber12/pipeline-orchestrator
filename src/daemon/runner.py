@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -49,6 +50,7 @@ from src.daemon.preflight import PreflightMixin
 from src.daemon.rate_limit import RateLimitMixin
 from src.daemon.recovery import RecoveryMixin
 from src.daemon.repo_ops import RepoOpsMixin
+from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
 from src.usage import UsageProvider
 from src.utils import repo_slug_from_url
@@ -172,6 +174,8 @@ class PipelineRunner(
         self._usage_degraded_logged = False
         self._claude_usage_provider = claude_usage_provider
         self._codex_usage_provider = codex_usage_provider
+        self._metrics_store = MetricsStore(redis_client)
+        self._current_run_record: RunRecord | None = None
 
     @property
     def app_config(self) -> AppConfig:
@@ -197,6 +201,75 @@ class PipelineRunner(
             coder.value if isinstance(coder, CoderType) else str(coder)
         )
         return coder_name, self._registry.get(coder_name)
+
+    def _load_current_task_metadata(self) -> tuple[str, str]:
+        """Return ``(task_type, complexity)`` for the active task if available."""
+        task = self.state.current_task
+        if task is None or not task.task_file:
+            return ("unknown", "unknown")
+        task_path = Path(self.repo_path) / task.task_file
+        try:
+            lines = task_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return ("unknown", "unknown")
+
+        task_type = "unknown"
+        complexity = "unknown"
+        for raw_line in lines:
+            line = raw_line.strip()
+            lower = line.lower()
+            if lower.startswith("- type:"):
+                value = line.split(":", 1)[1].strip()
+                if value:
+                    task_type = value
+            elif lower.startswith("- complexity:"):
+                value = line.split(":", 1)[1].strip()
+                if value:
+                    complexity = value
+        return (task_type, complexity)
+
+    def _start_current_run_record(self, coder_name: str, model: str) -> None:
+        """Initialize the in-memory run record for the current CODING pass."""
+        task = self.state.current_task
+        if task is None:
+            self._current_run_record = None
+            return
+        task_type, complexity = self._load_current_task_metadata()
+        self._current_run_record = RunRecord(
+            run_id=str(uuid.uuid4()),
+            task_id=task.pr_id,
+            profile_id=f"{coder_name}:{model}:container",
+            task_type=task_type,
+            complexity=complexity,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            ended_at=None,
+            duration_ms=None,
+            fix_iterations=0,
+            tokens_in=0,
+            tokens_out=0,
+            exit_reason="",
+            operator_intervention=False,
+            repo_name=self.name,
+        )
+
+    async def _save_current_run_record(self, exit_reason: str) -> None:
+        """Finalize and persist the active run record."""
+        record = self._current_run_record
+        if record is None:
+            return
+        ended_at = datetime.now(timezone.utc)
+        record.ended_at = ended_at.isoformat()
+        try:
+            started_at = datetime.fromisoformat(record.started_at)
+        except ValueError:
+            record.duration_ms = None
+        else:
+            record.duration_ms = max(
+                int((ended_at - started_at).total_seconds() * 1000),
+                0,
+            )
+        record.exit_reason = exit_reason
+        await self._metrics_store.save(record)
 
     async def publish_state(self) -> None:
         """Serialize ``self.state`` and write it to Redis."""

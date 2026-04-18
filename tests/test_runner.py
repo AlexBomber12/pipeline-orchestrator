@@ -60,6 +60,7 @@ class _FakeRedis:
         self.writes: list[tuple[str, str]] = []
         self.store: dict[str, str] = {}
         self.deleted: list[str] = []
+        self.lists: dict[str, list[str]] = {}
 
     async def set(self, key: str, value: str, ex: int | None = None) -> None:
         self.writes.append((key, value))
@@ -83,6 +84,32 @@ class _FakeRedis:
             del self.store[key]
             return 1
         return 0
+
+    async def lpush(self, key: str, value: str) -> int:
+        bucket = self.lists.setdefault(key, [])
+        bucket.insert(0, value)
+        return len(bucket)
+
+    async def lrem(self, key: str, count: int, value: str) -> int:
+        values = self.lists.setdefault(key, [])
+        if count != 0:
+            raise NotImplementedError("test fake only supports removing all matches")
+        kept = [item for item in values if item != value]
+        removed = len(values) - len(kept)
+        self.lists[key] = kept
+        return removed
+
+    async def lrange(self, key: str, start: int, stop: int) -> list[str]:
+        values = self.lists.get(key, [])
+        if stop < 0:
+            stop = len(values) + stop
+        return values[start:stop + 1]
+
+    async def ltrim(self, key: str, start: int, stop: int) -> None:
+        values = self.lists.get(key, [])
+        if stop < 0:
+            stop = len(values) + stop
+        self.lists[key] = values[start:stop + 1]
 
 
 class _FakeCompletedProcess:
@@ -575,6 +602,131 @@ def test_handle_coding_errors_when_no_pr_found(
 
     assert runner.state.state == PipelineState.ERROR
     assert "no PR found" in (runner.state.error_message or "")
+
+
+def test_handle_coding_creates_run_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        _async_cli_result(0, "ok", ""),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [PRInfo(number=42, branch="pr-001")],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+
+    task_file = tmp_path / "tasks" / "PR-001.md"
+    task_file.parent.mkdir(parents=True)
+    task_file.write_text(
+        "# PR-001: Sample\n\n"
+        "Branch: pr-001\n"
+        "- Type: feature\n"
+        "- Complexity: low\n",
+        encoding="utf-8",
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    record = runner._current_run_record
+    assert record is not None
+    assert record.task_id == "PR-001"
+    assert record.profile_id == "claude:opus:container"
+    assert record.task_type == "feature"
+    assert record.complexity == "low"
+
+
+def test_handle_coding_saves_record_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        _async_cli_result(0, "ok", ""),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [PRInfo(number=42, branch="pr-001")],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+
+    assert len(recent) == 1
+    assert recent[0].run_id == runner._current_run_record.run_id
+    assert recent[0].exit_reason == "coding_complete"
+    assert recent[0].ended_at is not None
+    assert recent[0].duration_ms is not None
+
+
+def test_handle_coding_saves_record_on_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        _async_cli_result(1, "", "build failed"),
+    )
+
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert len(recent) == 1
+    assert recent[0].exit_reason == "error"
+    assert recent[0].ended_at is not None
+    assert recent[0].duration_ms is not None
 
 
 def test_handle_coding_rejects_unmatched_branch(
@@ -5134,6 +5286,15 @@ def test_handle_coding_sets_paused_on_rate_limit(
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.error_message is None
     assert runner.state.rate_limited_until is not None
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-099",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+    assert len(recent) == 1
+    assert recent[0].exit_reason == "rate_limit"
 
 
 def test_handle_fix_sets_paused_on_rate_limit(
