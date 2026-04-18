@@ -27,6 +27,7 @@ from src.models import (
     ReviewStatus,
     TaskStatus,
 )
+from src.queue_parser import QueueValidationError
 
 claude_cli = claude_plugin_module.claude_cli
 _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG = idle_module.IdleMixin._select_next_task_from_dag
@@ -1177,6 +1178,41 @@ def test_select_next_task_from_dag_prefers_doing_task(
     assert task is not None
     assert task.pr_id == "PR-001"
     assert task.status == TaskStatus.DOING
+
+
+def test_select_next_task_from_dag_rejects_header_filename_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-999: Wrong task\n\n"
+        "Branch: pr-999-wrong-task\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+
+    with pytest.raises(QueueValidationError) as excinfo:
+        asyncio.run(runner._select_next_task_from_dag())
+
+    assert excinfo.value.issues == [
+        f"{tasks_dir / 'PR-001.md'}: header PR ID 'PR-999' does not match task file 'PR-001'"
+    ]
 
 
 def test_handle_idle_attaches_to_existing_pr_instead_of_coding(

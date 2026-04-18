@@ -35,6 +35,17 @@ class IdleMixin:
     """Handle IDLE state: sync, pick next task, dispatch to CODING."""
 
     @staticmethod
+    def _validate_task_file_header_match(task_file: Path, header_pr_id: str) -> None:
+        expected_pr_id = task_file.stem
+        if header_pr_id != expected_pr_id:
+            raise QueueValidationError(
+                [
+                    f"{task_file}: header PR ID {header_pr_id!r} "
+                    f"does not match task file {expected_pr_id!r}"
+                ]
+            )
+
+    @staticmethod
     def _is_missing_task_header_error(exc: QueueValidationError) -> bool:
         return bool(exc.issues) and all(
             "missing task header like '# PR-123: Title'" in issue
@@ -113,6 +124,7 @@ class IdleMixin:
                     raise
                 skipped_legacy_pr_ids.add(task_file.stem)
                 continue
+            self._validate_task_file_header_match(task_file, header.pr_id)
             headers.append(header)
             task_files[header.pr_id] = task_file.relative_to(repo_root).as_posix()
 
