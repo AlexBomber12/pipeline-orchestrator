@@ -115,6 +115,7 @@ class RecoveryMixin:
             )
             if matching is not None:
                 self.state.current_pr = matching
+                await self._restore_current_run_record()
                 self.state.state = PipelineState.WATCH
                 self._rehydrate_last_push_at(matching)
                 self.log_event(
@@ -159,6 +160,7 @@ class RecoveryMixin:
             matched_pr, matched_task = recoverable
             self.state.current_pr = matched_pr
             self.state.current_task = matched_task
+            await self._restore_current_run_record()
             self.state.state = PipelineState.WATCH
             self._rehydrate_last_push_at(matched_pr)
             self.log_event(

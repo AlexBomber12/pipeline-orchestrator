@@ -252,6 +252,36 @@ class PipelineRunner(
             repo_name=self.name,
         )
 
+    async def _checkpoint_current_run_record(self) -> None:
+        """Persist the active run record without finalizing it."""
+        record = self._current_run_record
+        if record is None:
+            return
+        await self._metrics_store.save(record)
+
+    async def _restore_current_run_record(self) -> None:
+        """Reload the latest persisted record for the active task."""
+        task = self.state.current_task
+        if task is None:
+            self._current_run_record = None
+            return
+        try:
+            recent = await self._metrics_store.recent(
+                task_id=task.pr_id,
+                limit=20,
+                repo_name=self.name,
+            )
+        except Exception as exc:
+            self._current_run_record = None
+            self.log_event(
+                f"restore_current_run_record failed for {task.pr_id}: {exc}"
+            )
+            return
+        self._current_run_record = next(
+            (record for record in recent if record.task_id == task.pr_id),
+            None,
+        )
+
     async def _save_current_run_record(self, exit_reason: str) -> None:
         """Finalize and persist the active run record."""
         record = self._current_run_record

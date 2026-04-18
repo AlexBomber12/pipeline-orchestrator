@@ -478,7 +478,7 @@
 - Depends on: PR-080
 
 ## PR-082: Capture metrics in fix and merge handlers
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-082.md
 - Branch: pr-082-fix-merge-metrics
 - Depends on: PR-081
