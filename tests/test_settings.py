@@ -742,6 +742,29 @@ def test_put_daemon_error_oob_refreshes_coder_controls(
     )
 
 
+def test_put_daemon_does_not_probe_auth_status(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    def fail_if_called(
+        cmd: list[str], *args: object, **kwargs: object
+    ) -> _FakeCompleted:
+        calls.append(cmd)
+        raise AssertionError(f"unexpected auth probe during daemon PUT: {cmd}")
+
+    monkeypatch.setattr(web_app.subprocess, "run", fail_if_called)
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"poll_interval_sec": "45"},
+        )
+
+    assert response.status_code == 200
+    assert calls == []
+
+
 # ---------------------------------------------------------------------------
 # Auth status
 # ---------------------------------------------------------------------------

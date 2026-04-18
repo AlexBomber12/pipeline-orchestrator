@@ -822,11 +822,36 @@ async def settings_page(request: Request) -> HTMLResponse:
     )
 
 
+def _default_auth_status() -> dict[str, dict[str, str]]:
+    """Return placeholder auth status entries when no cached probe exists."""
+    unavailable = {"status": "error", "detail": "Status unavailable"}
+    return {
+        "claude": dict(unavailable),
+        "codex": dict(unavailable),
+        "gh": dict(unavailable),
+    }
+
+
+_AUTH_STATUS_CACHE: dict[str, dict[str, str]] | None = None
+
+
+def _get_cached_auth_status() -> dict[str, dict[str, str]]:
+    """Return the last collected auth status, if available."""
+    source = _AUTH_STATUS_CACHE or _default_auth_status()
+    return {key: dict(value) for key, value in source.items()}
+
+
 async def _settings_daemon_template_context(
     request: Request,
+    *,
+    use_cached_auth: bool = False,
 ) -> dict[str, Any]:
     cfg = load_config(CONFIG_PATH)
-    auth = await _collect_auth_status()
+    auth = (
+        _get_cached_auth_status()
+        if use_cached_auth
+        else await _collect_auth_status()
+    )
     return {
         "daemon": cfg.daemon,
         "coders": _build_coder_rows(cfg, auth),
@@ -845,14 +870,16 @@ async def _render_settings_daemon_response(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
         request,
         "components/settings_daemon_response.html",
-        await _settings_daemon_template_context(request),
+        await _settings_daemon_template_context(request, use_cached_auth=True),
     )
 
 
 async def _render_settings_daemon_error(
     request: Request, message: str, status_code: int
 ) -> HTMLResponse:
-    context = await _settings_daemon_template_context(request)
+    context = await _settings_daemon_template_context(
+        request, use_cached_auth=True
+    )
     return templates.TemplateResponse(
         request,
         "components/settings_daemon_error.html",
@@ -1079,7 +1106,9 @@ async def _collect_auth_status() -> dict[str, dict[str, str]]:
         asyncio.to_thread(_check_codex_auth),
         asyncio.to_thread(_check_gh_auth),
     )
-    return {"claude": claude, "codex": codex, "gh": gh}
+    global _AUTH_STATUS_CACHE
+    _AUTH_STATUS_CACHE = {"claude": claude, "codex": codex, "gh": gh}
+    return _get_cached_auth_status()
 
 
 @app.get("/api/auth-status")
