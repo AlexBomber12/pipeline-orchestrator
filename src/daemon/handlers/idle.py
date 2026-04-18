@@ -68,6 +68,7 @@ class IdleMixin:
         queue commit.
         """
         queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
+        self._idle_generated_queue_needs_resync = False
         content = self._generate_queue_md(headers, statuses)
         existing = (
             queue_path.read_text(encoding="utf-8")
@@ -107,6 +108,57 @@ class IdleMixin:
                     raise exc
             return result
 
+        def _rollback_generated_queue_commit() -> None:
+            local_base = "HEAD~1"
+            remote_base = f"refs/remotes/origin/{self.repo_config.branch}"
+            try:
+                fetch = git_ops._git(
+                    self.repo_path,
+                    "fetch",
+                    "origin",
+                    self.repo_config.branch,
+                    timeout=60,
+                    check=False,
+                )
+                local_base_sha = git_ops._git(
+                    self.repo_path,
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    local_base,
+                    check=False,
+                )
+                remote_base_sha = git_ops._git(
+                    self.repo_path,
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    remote_base,
+                    check=False,
+                )
+                if (
+                    fetch.returncode == 0
+                    and local_base_sha.returncode == 0
+                    and remote_base_sha.returncode == 0
+                    and local_base_sha.stdout.strip() != remote_base_sha.stdout.strip()
+                ):
+                    self._idle_generated_queue_needs_resync = True
+                    git_ops._git(
+                        self.repo_path,
+                        "reset",
+                        "--hard",
+                        remote_base,
+                    )
+                    return
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            git_ops._git(
+                self.repo_path,
+                "reset",
+                "--hard",
+                local_base,
+            )
+
         try:
             push_result = retry_transient(
                 _push_queue_md,
@@ -115,22 +167,12 @@ class IdleMixin:
         except RuntimeError as exc:
             if not is_transient_error(exc) and not is_transient_error(exc.__cause__):
                 raise
-            git_ops._git(
-                self.repo_path,
-                "reset",
-                "--hard",
-                "HEAD~1",
-            )
+            _rollback_generated_queue_commit()
             return False
         if push_result.returncode == 0:
             return True
 
-        git_ops._git(
-            self.repo_path,
-            "reset",
-            "--hard",
-            "HEAD~1",
-        )
+        _rollback_generated_queue_commit()
         return False
 
     @staticmethod
@@ -526,6 +568,12 @@ class IdleMixin:
                     "QUEUE.md auto-generation push rejected; "
                     "continuing without publishing"
                 )
+                if getattr(self, "_idle_generated_queue_needs_resync", False):
+                    self.log_event(
+                        "QUEUE.md auto-generation refreshed origin state; "
+                        "retrying task selection next cycle"
+                    )
+                    return
         if task is None:
             self.log_event("No tasks available")
             if prs:

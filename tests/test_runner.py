@@ -4976,6 +4976,87 @@ def test_handle_idle_continues_when_queue_regeneration_push_is_rejected(
     )
 
 
+def test_handle_idle_stops_after_queue_regeneration_push_rejection_that_needs_resync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    dag_task = QueueTask(
+        pr_id="PR-123",
+        title="Structured in-flight task",
+        status=TaskStatus.DOING,
+        task_file="tasks/PR-123.md",
+        branch="pr-123-structured",
+    )
+
+    async def fake_select(self):
+        self._idle_dag_tasks = [dag_task]
+        self._idle_dag_headers = [
+            TaskHeader(
+                pr_id=dag_task.pr_id,
+                title=dag_task.title,
+                branch=dag_task.branch or "",
+                task_type="feature",
+                complexity="low",
+                depends_on=[],
+                priority=1,
+                coder="any",
+            )
+        ]
+        self._idle_dag_statuses = {dag_task.pr_id: dag_task.status}
+        return dag_task
+
+    monkeypatch.setattr(idle_module.IdleMixin, "_select_next_task_from_dag", fake_select)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
+    monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda tasks, repo_path, base_branch, prs, merged_prs=(): tasks,
+    )
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    coding_called = {"v": False}
+
+    async def fake_handle_coding() -> None:
+        coding_called["v"] = True
+        return None
+
+    def fake_write_generated_queue_md(
+        self,
+        headers: list[TaskHeader],
+        statuses: dict[str, TaskStatus],
+    ) -> bool:
+        self._idle_generated_queue_needs_resync = True
+        return False
+
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_write_generated_queue_md",
+        fake_write_generated_queue_md,
+    )
+
+    runner = _make_runner()
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    asyncio.run(runner.handle_idle())
+
+    assert coding_called["v"] is False
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert any(
+        "QUEUE.md auto-generation refreshed origin state" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
 def test_handle_idle_does_not_promote_structured_queue_task_when_dag_blocks_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5370,6 +5451,60 @@ def test_write_generated_queue_md_recovers_after_exhausted_transient_push_retrie
     assert push_attempts["count"] == 3
     assert queue_path.read_text(encoding="utf-8") == original
     assert ["git", "reset", "--hard", "HEAD~1"] in git_calls
+
+
+def test_write_generated_queue_md_marks_resync_when_origin_moved_after_push_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "QUEUE.md"
+    original = "# Task Queue\n\n## PR-000: Existing\n"
+    queue_path.write_text(original, encoding="utf-8")
+    headers = [
+        TaskHeader(
+            pr_id="PR-001",
+            title="Project bootstrap",
+            branch="pr-001-bootstrap",
+            task_type="feature",
+            complexity="low",
+            depends_on=[],
+            priority=1,
+            coder="any",
+        )
+    ]
+    statuses = {"PR-001": TaskStatus.DONE}
+
+    git_calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append(cmd)
+        if cmd[:2] == ["git", "push"]:
+            queue_path.write_text("generated queue", encoding="utf-8")
+            return _FakeCompletedProcess(args=cmd, returncode=1, stderr="rejected")
+        if cmd[:2] == ["git", "fetch"]:
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        if cmd[:2] == ["git", "rev-parse"] and cmd[-1] == "HEAD~1":
+            return _FakeCompletedProcess(args=cmd, returncode=0, stdout="local-base\n")
+        if cmd[:2] == ["git", "rev-parse"] and cmd[-1] == "refs/remotes/origin/main":
+            return _FakeCompletedProcess(args=cmd, returncode=0, stdout="remote-base\n")
+        if cmd[:2] == ["git", "reset"]:
+            queue_path.write_text(original, encoding="utf-8")
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(git_ops_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+
+    published = runner._write_generated_queue_md(headers, statuses)
+
+    assert published is False
+    assert runner._idle_generated_queue_needs_resync is True
+    assert queue_path.read_text(encoding="utf-8") == original
+    assert ["git", "reset", "--hard", "refs/remotes/origin/main"] in git_calls
 
 
 def test_select_next_task_from_dag_skips_merged_probe_without_structured_headers(
