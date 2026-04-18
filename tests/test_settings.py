@@ -1394,6 +1394,25 @@ def test_claude_model_setting_saves(
     assert cfg.daemon.claude_model == "sonnet"
 
 
+def test_claude_model_setting_empty_uses_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text("daemon:\n  claude_model: sonnet\n", encoding="utf-8")
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"claude_model": ""},
+        )
+
+    assert response.status_code == 200
+    cfg = load_config(str(cfg_path))
+    assert cfg.daemon.claude_model == "opus"
+
+
 def test_repo_coder_override_saves(
     one_repo_config: Path,
     monkeypatch: pytest.MonkeyPatch,

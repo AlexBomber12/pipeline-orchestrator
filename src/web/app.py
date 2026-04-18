@@ -27,6 +27,7 @@ from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
 from src.config import (
     AppConfig,
+    DaemonConfig,
     RepoConfig,
     add_repository,
     load_config,
@@ -218,11 +219,17 @@ def _build_coder_rows(
 
 
 def _validate_coder_model(
-    model: str, *, field_name: str, plugin: ClaudePlugin | CodexPlugin
+    model: str,
+    *,
+    field_name: str,
+    plugin: ClaudePlugin | CodexPlugin,
+    default_model: str | None = None,
 ) -> str:
-    """Return ``model`` when it is empty or supported by ``plugin``."""
+    """Return a supported model value for ``plugin``."""
+    if model == "":
+        return default_model if default_model is not None else model
     allowed_models = {candidate for candidate in plugin.models if candidate != ""}
-    if model != "" and model not in allowed_models:
+    if model not in allowed_models:
         raise ValueError(
             f"{field_name} must be one of: {', '.join(sorted(allowed_models))}"
         )
@@ -1010,6 +1017,7 @@ async def put_settings_daemon(
                 claude_model,
                 field_name="claude_model",
                 plugin=ClaudePlugin(),
+                default_model=DaemonConfig().claude_model,
             )
         if codex_model is not None:
             updates["codex_model"] = _validate_coder_model(
