@@ -7,6 +7,7 @@ import re
 import subprocess
 import time
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 from src.models import CIStatus, PRInfo, ReviewStatus
 from src.retry import retry_transient
@@ -199,9 +200,14 @@ def get_merged_prs(repo: str, base_branch: str | None = None) -> list[PRInfo]:
     if cached is not None and (now - cached[0]) < _MERGED_PRS_CACHE_TTL_SECONDS:
         return list(cached[1])
 
-    raw = _gh_api_paginated(
-        f"repos/{repo}/pulls?state=closed&per_page=100"
-    )
+    path = f"repos/{repo}/pulls?state=closed&per_page=100"
+    if base_branch:
+        path = (
+            f"repos/{repo}/pulls?state=closed"
+            f"&base={quote(base_branch, safe='')}&per_page=100"
+        )
+
+    raw = _gh_api_paginated(path)
     if raw is None:
         raise RuntimeError(
             f"gh api repos/{repo}/pulls returned unexpected payload"

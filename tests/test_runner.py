@@ -3308,8 +3308,14 @@ def test_handle_idle_merged_pr_check_survives_github_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_subprocess(monkeypatch)
-    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
-    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
+    task = QueueTask(
+        pr_id="PR-123",
+        title="Keep dispatching",
+        branch="pr-123-keep-dispatching",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-123.md",
+    )
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
     monkeypatch.setattr(
         runner_module.github_client,
         "get_open_prs",
@@ -3320,13 +3326,21 @@ def test_handle_idle_merged_pr_check_survives_github_failure(
         "get_merged_prs",
         lambda repo, branch: (_ for _ in ()).throw(RuntimeError("API down")),
     )
+    monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda tasks, repo_path, base_branch, prs, merged_prs=(): tasks,
+    )
+    async def fake_handle_coding() -> None:
+        return None
 
     runner = _make_runner()
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
     runner.state.current_pr = PRInfo(number=5, branch="stale")
     asyncio.run(runner.handle_idle())
 
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.current_pr is None
+    assert runner.state.state == PipelineState.CODING
+    assert runner.state.current_task == task
     assert any("merged PR check failed" in e["event"] for e in runner.state.history)
 
 

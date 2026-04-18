@@ -169,7 +169,7 @@ def test_get_merged_prs_filters_by_base_branch(
 ) -> None:
     clear_merged_prs_cache()
     def fake_paginated(path: str) -> list[dict[str, Any]]:
-        assert path == "repos/owner/name/pulls?state=closed&per_page=100"
+        assert path == "repos/owner/name/pulls?state=closed&base=main&per_page=100"
         return [
             {
                 "number": 101,
@@ -198,6 +198,23 @@ def test_get_merged_prs_filters_by_base_branch(
     prs = get_merged_prs("owner/name", base_branch="main")
 
     assert [pr.number for pr in prs] == [101]
+
+
+def test_get_merged_prs_url_encodes_base_branch_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_merged_prs_cache()
+
+    def fake_paginated(path: str) -> list[dict[str, Any]]:
+        assert (
+            path
+            == "repos/owner/name/pulls?state=closed&base=release%2F2026.04&per_page=100"
+        )
+        return []
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    assert get_merged_prs("owner/name", base_branch="release/2026.04") == []
 
 
 def test_get_merged_prs_handles_deleted_head_repo(
@@ -252,7 +269,7 @@ def test_get_merged_prs_uses_cache_within_ttl(
     def fake_paginated(path: str) -> list[dict[str, Any]]:
         nonlocal calls
         calls += 1
-        assert path == "repos/owner/name/pulls?state=closed&per_page=100"
+        assert path == "repos/owner/name/pulls?state=closed&base=main&per_page=100"
         return [
             {
                 "number": 101,
