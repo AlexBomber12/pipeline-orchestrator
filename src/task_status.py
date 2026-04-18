@@ -6,7 +6,11 @@ import subprocess
 from pathlib import Path
 
 from src.models import QueueTask, TaskStatus
-from src.queue_parser import TaskHeader, parse_task_header
+from src.queue_parser import (
+    QueueValidationError,
+    TaskHeader,
+    parse_task_header,
+)
 
 
 def derive_task_status(
@@ -91,7 +95,10 @@ def _load_task_header(task: QueueTask, repo_path: str) -> TaskHeader:
     if task.task_file:
         task_path = Path(repo_path) / task.task_file
         if task_path.is_file():
-            return parse_task_header(task_path)
+            try:
+                return parse_task_header(task_path)
+            except QueueValidationError:
+                pass
 
     return TaskHeader(
         pr_id=task.pr_id,

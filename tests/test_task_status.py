@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
+from src.models import QueueTask
 from src.models import TaskStatus
 from src.queue_parser import TaskHeader
-from src.task_status import derive_task_status, get_merged_branches
+from src.task_status import (
+    _load_task_header,
+    derive_task_status,
+    get_merged_branches,
+)
 
 
 def _header(branch: str) -> TaskHeader:
@@ -70,3 +76,36 @@ def test_get_merged_branches(monkeypatch) -> None:
         "pr-084-task-header-parser",
         "pr-085-status-from-git",
     }
+
+
+def test_load_task_header_falls_back_for_legacy_task_files(
+    tmp_path: Path,
+) -> None:
+    task_file = tmp_path / "tasks" / "PR-001.md"
+    task_file.parent.mkdir()
+    task_file.write_text(
+        "# PR-001: Legacy task\n\n"
+        "Branch: pr-001-legacy-task\n",
+        encoding="utf-8",
+    )
+    task = QueueTask(
+        pr_id="PR-001",
+        title="Legacy task",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-001.md",
+        depends_on=["PR-000"],
+        branch="pr-001-legacy-task",
+    )
+
+    header = _load_task_header(task, str(tmp_path))
+
+    assert header == TaskHeader(
+        pr_id="PR-001",
+        title="Legacy task",
+        branch="pr-001-legacy-task",
+        task_type="feature",
+        complexity="medium",
+        depends_on=["PR-000"],
+        priority=3,
+        coder="any",
+    )
