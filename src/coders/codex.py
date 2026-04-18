@@ -79,21 +79,31 @@ class CodexPlugin:
     ]
 
     async def run_planned_pr(
-        self, repo_path: str, model: str | None, timeout: int
+        self,
+        repo_path: str,
+        model: str | None,
+        timeout: int,
+        **kwargs: Any,
     ) -> tuple[int, str, str]:
         return await codex_cli.run_planned_pr_async(
             repo_path,
             model=model or None,
             timeout=timeout,
+            **kwargs,
         )
 
     async def fix_review(
-        self, repo_path: str, model: str | None, timeout: int | None
+        self,
+        repo_path: str,
+        model: str | None,
+        timeout: int | None,
+        **kwargs: Any,
     ) -> tuple[int, str, str]:
         return await codex_cli.fix_review_async(
             repo_path,
             model=model or None,
             timeout=timeout,
+            **kwargs,
         )
 
     def check_auth(self, *, config_path: str = CONFIG_PATH) -> dict[str, str]:

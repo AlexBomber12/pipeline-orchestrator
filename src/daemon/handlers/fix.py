@@ -77,7 +77,7 @@ class FixMixin(BreachMixin):
         if not await self._check_rate_limit():
             return
 
-        coder_name, coder_module = self._get_coder()
+        coder_name, plugin = self._get_coder()
 
         if (
             self.state.current_pr is not None
@@ -148,7 +148,15 @@ class FixMixin(BreachMixin):
         )
 
         heartbeat = asyncio.create_task(self._publish_while_waiting("FIX"))
-        fix_kwargs: dict[str, object] = {"model": model}
+        fix_timeout = getattr(
+            self.app_config.daemon,
+            "fix_review_timeout_sec",
+            self.app_config.daemon.fix_idle_timeout_sec,
+        )
+        fix_kwargs: dict[str, object] = {
+            "model": model,
+            "timeout": fix_timeout,
+        }
         if coder_name == "claude":
             fix_kwargs.update(
                 breach_dir=breach_dir,
@@ -157,7 +165,7 @@ class FixMixin(BreachMixin):
                 weekly_threshold=self.app_config.daemon.rate_limit_weekly_pause_percent,
             )
         claude_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
-            coder_module.fix_review_async(
+            plugin.fix_review(
                 self.repo_path,
                 **fix_kwargs,
             )

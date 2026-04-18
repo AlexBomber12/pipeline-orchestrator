@@ -19,11 +19,19 @@ class CoderPlugin(Protocol):
     def models(self) -> list[str]: ...
 
     async def run_planned_pr(
-        self, repo_path: str, model: str | None, timeout: int
+        self,
+        repo_path: str,
+        model: str | None,
+        timeout: int,
+        **kwargs: Any,
     ) -> tuple[int, str, str]: ...
 
     async def fix_review(
-        self, repo_path: str, model: str | None, timeout: int | None
+        self,
+        repo_path: str,
+        model: str | None,
+        timeout: int | None,
+        **kwargs: Any,
     ) -> tuple[int, str, str]: ...
 
     def check_auth(self) -> dict[str, str]: ...

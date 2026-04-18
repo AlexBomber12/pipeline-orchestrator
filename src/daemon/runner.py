@@ -29,7 +29,9 @@ from pathlib import Path
 
 import redis.asyncio as aioredis
 
-from src import claude_cli, codex_cli, github_client  # noqa: F401 — tests reference runner_module.github_client
+from src import github_client  # noqa: F401 — tests reference runner_module.github_client
+from src.coder_registry import CoderPlugin, CoderRegistry
+from src.coders import build_coder_registry
 from src.config import AppConfig, CoderType, RepoConfig
 from src.daemon import (
     git_ops,
@@ -87,10 +89,12 @@ class PipelineRunner(
         redis_client: aioredis.Redis,
         claude_usage_provider: UsageProvider,
         codex_usage_provider: UsageProvider,
+        registry: CoderRegistry | None = None,
     ) -> None:
         self.repo_config = repo_config
         self._app_config = app_config
         self.redis = redis_client
+        self._registry = registry or build_coder_registry()
         self.name = repo_slug_from_url(repo_config.url)
         self.owner_repo = repo_owner_from_url(repo_config.url)
         self.repo_path = f"/data/repos/{self.name}"
@@ -186,16 +190,13 @@ class PipelineRunner(
         self._claude_usage_provider = claude_usage_provider
         self._codex_usage_provider = codex_usage_provider
 
-    def _get_coder(self) -> tuple[str, object]:
-        """Return ``(coder_name, coder_module)`` for the active coder.
-
-        Per-repo ``coder`` overrides the daemon-level default.  Returns
-        either ``("claude", claude_cli)`` or ``("codex", codex_cli)``.
-        """
+    def _get_coder(self) -> tuple[str, CoderPlugin]:
+        """Return ``(coder_name, coder_plugin)`` for the active coder."""
         coder = self.repo_config.coder or self.app_config.daemon.coder
-        if coder == CoderType.CODEX:
-            return "codex", codex_cli
-        return "claude", claude_cli
+        coder_name = (
+            coder.value if isinstance(coder, CoderType) else str(coder)
+        )
+        return coder_name, self._registry.get(coder_name)
 
     async def publish_state(self) -> None:
         """Serialize ``self.state`` and write it to Redis."""
