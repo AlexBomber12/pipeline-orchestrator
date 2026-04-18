@@ -53,13 +53,9 @@ Definitions
 - Codex bot: any GitHub user or app whose login contains `codex` (case-insensitive), for example `chatgpt-codex-conn`.
 - Review anchor comment: the most recent PR conversation comment authored by the PR author that matches at least one:
   - contains `@codex review`
-  - contains `Artifacts` and at least one `artifacts/` path
-  - contains any `artifacts/` path
   If none exist, use the first PR author comment in the conversation.
 
-The daemon posts `@codex review` after PR creation and after every fix
-push. Codex Automatic Reviews should be configured for PR creation only
-(not every push) to avoid duplicate reviews.
+In `PLANNED PR` and `MICRO PR` flows, the coder posts `@codex review` as a PR comment immediately after PR creation AND after every push in the Fix loop. The comment body MUST be exactly the string `@codex review` with no prefix, no escape characters, no artifact list, no summary, and no trailing text. Artifact filenames belong in the PR description only, never in the trigger comment. The daemon deduplicates: if a valid `@codex review` trigger from the PR author already exists for the current HEAD SHA, the daemon skips its own post; if not, the daemon posts one as a safety net.
 
 Fix loop (used in `FIX REVIEW` mode)
 1. Fetch PR comments, reviews, and reactions via GitHub CLI (`gh`). No screenshots.
@@ -72,7 +68,8 @@ Fix loop (used in `FIX REVIEW` mode)
 6. Extract actionable items and fix them. Treat `P1` as mandatory; treat `P2` as mandatory unless the user explicitly waives them.
 7. Run `scripts/ci.sh` until exit code 0 and generate required review artifacts.
 8. Commit and push to the same PR branch.
-9. Poll the PR for up to 15 minutes:
+9. Post `@codex review` as a new PR comment; the comment body must be exactly `@codex review` with no other text, prefix, or artifact list.
+10. Poll the PR for up to 15 minutes:
    - if a non-stale thumbs up appears, stop
    - if a new Codex feedback comment appears after the push, repeat the loop
 
@@ -163,9 +160,10 @@ Artifacts are generated for Codex review but excluded from commits by .gitignore
 - [ ] Commit message: `<PR_ID>: <short summary>`
 - [ ] Pushed branch
 - [ ] Created PR via GitHub CLI (`gh`) or provided manual PR steps
+- [ ] Posted `@codex review` comment on the PR (body must be exactly `@codex review`, no other text, prefix, or artifact list)
 - [ ] Final report prepared (see below)
 
-### Final report (PR description or final message)
+### Final report (PR description only)
 - PR_ID
 - TASK_FILE
 - Branch
@@ -198,6 +196,7 @@ If any condition fails, MICRO is not allowed. Use PLANNED PR.
 - [ ] Ran `scripts/ci.sh` to exit 0
 - [ ] Generated review artifacts (not committed, excluded by .gitignore)
 - [ ] Commit: `MICRO: <short summary>`
+- [ ] Posted `@codex review` comment on the PR (body must be exactly `@codex review`, no other text, prefix, or artifact list)
 - [ ] Pushed branch and opened PR
 
 ## REVIEW FIX runbook (existing PR branch)

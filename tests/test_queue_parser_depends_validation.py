@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from src.queue_parser import QueueValidationError, parse_task_header
 
 

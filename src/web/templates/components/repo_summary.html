@@ -33,20 +33,9 @@
     <span class="text-xs font-medium px-2 py-0.5 rounded border {{ style.badge }}">
         {{ repo.state.value }}
     </span>
-    <label class="flex items-center gap-2 text-xs text-gray-400">
-        <span>Coder</span>
-        <select name="coder"
-                class="bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
-                hx-put="/settings/repo/{{ repo.name }}"
-                hx-trigger="change"
-                hx-target="closest div[hx-get]"
-                hx-swap="innerHTML">
-            <option value="" {% if repo_config and repo_config.coder is none %}selected{% endif %}>Inherit ({{ inherit_coder|capitalize }})</option>
-            {% for coder in coders %}
-            <option value="{{ coder.name }}" {% if repo_config and repo_config.coder and repo_config.coder.value == coder.name %}selected{% endif %}>{{ coder.display_name }}</option>
-            {% endfor %}
-        </select>
-    </label>
+    <span class="text-xs font-medium px-2 py-0.5 rounded border border-white/10 bg-surface-3 text-gray-300 font-mono">
+        Coder: {% for c in coders %}{% if c.name == effective_coder %}{{ c.display_name }}{% endif %}{% endfor %}
+    </span>
     <span class="ml-auto font-mono text-xs text-gray-500">
         updated <span data-ts="{{ repo.last_updated.isoformat() if repo.last_updated else '' }}">{{ repo.last_updated.strftime('%Y-%m-%d %H:%M:%S') }}</span>
     </span>
