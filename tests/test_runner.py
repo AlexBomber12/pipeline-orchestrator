@@ -5098,6 +5098,60 @@ def test_handle_fix_sets_paused_on_rate_limit(
     assert runner.state.rate_limited_until is not None
 
 
+def test_handle_coding_success_ignores_rate_limit_text_in_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Successful coding runs must not convert informational stderr into PAUSED."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "run_planned_pr_async",
+        _async_cli_result(0, "ok", "Error: 429 Too Many Requests"),
+    )
+    pr = PRInfo(number=42, branch="pr-001")
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+
+    runner = _make_runner()
+    runner._post_codex_review = lambda _pr_number: True  # type: ignore[method-assign]
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="test", branch="pr-001", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.error_message is None
+    assert runner.state.rate_limited_until is None
+
+
+def test_handle_fix_success_ignores_rate_limit_text_in_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Successful fix runs must not convert informational stderr into PAUSED."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.claude_cli,
+        "fix_review_async",
+        _async_cli_result(0, "ok", "Error: 429 Too Many Requests"),
+    )
+
+    runner = _make_runner()
+    runner._post_codex_review = lambda _pr_number: True  # type: ignore[method-assign]
+    runner.state.state = PipelineState.FIX
+    runner.state.current_pr = PRInfo(number=50, branch="pr-050")
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.error_message is None
+    assert runner.state.rate_limited_until is None
+
+
 def test_handle_paused_waits_when_window_active(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

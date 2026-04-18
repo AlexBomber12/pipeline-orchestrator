@@ -152,8 +152,8 @@ class CodingMixin:
             )
             return
         await self._save_cli_log(stdout, stderr, f"PLANNED PR output [{coder_name}]")
-        self._detect_rate_limit(stderr, coder_name=coder_name)
         if code != 0:
+            self._detect_rate_limit(stderr, coder_name=coder_name)
             if self.state.rate_limited_until is not None:
                 self.state.state = PipelineState.PAUSED
                 self.state.error_message = None
