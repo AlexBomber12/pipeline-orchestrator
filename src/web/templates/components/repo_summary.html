@@ -41,7 +41,7 @@
                 hx-trigger="change"
                 hx-target="closest div[hx-get]"
                 hx-swap="innerHTML">
-            <option value="" {% if repo_config and repo_config.coder is none %}selected{% endif %}>Inherit ({{ effective_coder|capitalize }})</option>
+            <option value="" {% if repo_config and repo_config.coder is none %}selected{% endif %}>Inherit ({{ inherit_coder|capitalize }})</option>
             {% for coder in coders %}
             <option value="{{ coder.name }}" {% if repo_config and repo_config.coder and repo_config.coder.value == coder.name %}selected{% endif %}>{{ coder.display_name }}</option>
             {% endfor %}

@@ -136,6 +136,11 @@ def _effective_coder_name(
     return config.daemon.coder.value
 
 
+def _daemon_default_coder_name(config: AppConfig) -> str:
+    """Return the daemon-level default coder name."""
+    return config.daemon.coder.value
+
+
 async def get_all_repo_states(
     redis_client: aioredis.Redis | None,
     config_path: str = CONFIG_PATH,
@@ -225,6 +230,7 @@ async def _repo_template_context(
         "daemon": config.daemon,
         "coders": build_coder_registry().list_coders(),
         "effective_coder": _effective_coder_name(repo_config, config),
+        "inherit_coder": _daemon_default_coder_name(config),
     }
 
 

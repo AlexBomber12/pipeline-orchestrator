@@ -1385,6 +1385,32 @@ def test_repo_detail_coder_dropdown_renders(
     assert "Codex CLI" in body
 
 
+def test_repo_detail_inherit_label_uses_daemon_default(
+    one_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    one_repo_config.write_text(
+        "daemon:\n"
+        "  coder: claude\n"
+        "repositories:\n"
+        "  - url: https://github.com/example/alpha.git\n"
+        "    branch: main\n"
+        "    auto_merge: true\n"
+        "    review_timeout_min: 60\n"
+        "    coder: codex\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(one_repo_config))
+
+    with TestClient(app) as client:
+        response = client.get("/repo/example__alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "Inherit (Claude)" in body
+    assert "Inherit (Codex)" not in body
+
+
 def test_repo_coder_change_saves_to_config(
     one_repo_config: Path,
     monkeypatch: pytest.MonkeyPatch,
