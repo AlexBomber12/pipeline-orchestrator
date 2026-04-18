@@ -66,6 +66,14 @@ def _is_plus_one(reaction: dict) -> bool:
     return _is_reaction_content(reaction, "+1")
 
 
+def extract_queue_pr_id(subject: str) -> str | None:
+    """Return the canonical queue PR id from a title/subject prefix."""
+    match = re.match(r"^(PR-[A-Za-z0-9_.-]+):(?:\s|$)", subject.strip())
+    if match is None:
+        return None
+    return match.group(1)
+
+
 def run_gh(
     args: list[str],
     repo: str | None = None,
@@ -129,7 +137,7 @@ def get_open_prs(
             "--state",
             "open",
             "--json",
-            "number,headRefName,headRefOid,statusCheckRollup,url,updatedAt,commits,author,isCrossRepository",
+            "number,title,headRefName,headRefOid,statusCheckRollup,url,updatedAt,commits,author,isCrossRepository",
         ],
         repo=repo,
     )
@@ -143,10 +151,13 @@ def get_open_prs(
             continue
         commits = entry.get("commits") or []
         head_sha = entry.get("headRefOid", "")
+        title = entry.get("title", "")
         prs.append(
             PRInfo(
                 number=number,
                 branch=entry.get("headRefName", ""),
+                title=title,
+                pr_id=extract_queue_pr_id(title),
                 ci_status=_ci_status_from_rollup(
                     entry.get("statusCheckRollup"),
                     empty_is_success=allow_merge_without_checks,

@@ -467,6 +467,7 @@ def test_handle_idle_attaches_to_existing_pr_instead_of_coding(
     existing_pr = PRInfo(
         number=99,
         branch="pr-042-sample",
+        title="PR-042: Sample",
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.PENDING,
     )

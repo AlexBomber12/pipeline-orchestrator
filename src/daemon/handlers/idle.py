@@ -15,7 +15,7 @@ from pathlib import Path
 from src import github_client
 from src.models import PipelineState, TaskStatus
 from src.queue_parser import QueueValidationError, get_next_task, parse_queue
-from src.task_status import derive_queue_task_statuses
+from src.task_status import derive_queue_task_statuses, find_matching_open_pr
 
 
 class IdleMixin:
@@ -82,7 +82,7 @@ class IdleMixin:
                 tasks,
                 self.repo_path,
                 self.repo_config.branch,
-                {pr.branch for pr in prs if pr.branch},
+                prs,
             )
         except (
             OSError,
@@ -121,8 +121,10 @@ class IdleMixin:
         task_branch = task.branch
 
         if task_branch:
-            existing = next(
-                (p for p in prs if p.branch == task_branch), None
+            existing = find_matching_open_pr(
+                task.pr_id,
+                task_branch,
+                prs,
             )
 
             if existing is not None:
