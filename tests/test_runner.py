@@ -3576,6 +3576,41 @@ def test_handle_coding_uses_configured_timeout(
     assert captured.get("timeout") == 1234
 
 
+def test_handle_fix_does_not_forward_idle_timeout_as_cli_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FIX REVIEW should stay uncapped while the idle monitor enforces no-push timeouts."""
+    _patch_subprocess(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    async def fake_fix(
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+    ) -> tuple[int, str, str]:
+        captured["timeout"] = timeout
+        return (0, "", "")
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = PipelineRunner(
+        _repo_cfg(),
+        AppConfig(
+            repositories=[],
+            daemon=DaemonConfig(fix_idle_timeout_sec=5),
+        ),
+        _FakeRedis(),
+        *_usage_providers(),
+    )
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    asyncio.run(runner.handle_fix())
+    assert captured.get("timeout") is None
+
+
 def test_fix_idle_timeout_kills_on_no_push(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

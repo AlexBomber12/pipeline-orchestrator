@@ -65,7 +65,7 @@ class ClaudePlugin:
         self,
         repo_path: str,
         model: str | None,
-        timeout: int | None,
+        timeout: int | None = None,
         **kwargs: Any,
     ) -> tuple[int, str, str]:
         return await claude_cli.fix_review_async(

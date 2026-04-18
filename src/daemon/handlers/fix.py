@@ -148,14 +148,8 @@ class FixMixin(BreachMixin):
         )
 
         heartbeat = asyncio.create_task(self._publish_while_waiting("FIX"))
-        fix_timeout = getattr(
-            self.app_config.daemon,
-            "fix_review_timeout_sec",
-            self.app_config.daemon.fix_idle_timeout_sec,
-        )
         fix_kwargs: dict[str, object] = {
             "model": model,
-            "timeout": fix_timeout,
         }
         if coder_name == "claude":
             fix_kwargs.update(
