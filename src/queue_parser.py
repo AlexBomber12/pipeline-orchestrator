@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from src.models import QueueTask, TaskStatus
@@ -23,10 +24,27 @@ class QueueValidationError(ValueError):
 
 
 _HEADER_RE = re.compile(r"^##\s+(PR-[A-Za-z0-9_.-]+):\s*(.+?)\s*$")
+_TASK_HEADER_RE = re.compile(r"^#\s+(PR-[A-Za-z0-9_.-]+):\s*(.+?)\s*$")
 _FIELD_RE = re.compile(r"^-\s*([A-Za-z ]+?)\s*:\s*(.*?)\s*$")
+_TASK_BRANCH_RE = re.compile(r"^Branch\s*:\s*(.*?)\s*$")
 _STATUS_LINE_RE = re.compile(
     r"^(-\s*status\s*:\s*)(\S*)(.*)$", re.IGNORECASE
 )
+_TASK_TYPE_VALUES = {"bugfix", "feature", "architecture", "refactor", "docs"}
+_COMPLEXITY_VALUES = {"low", "medium", "high"}
+_CODER_VALUES = {"claude", "codex", "any"}
+
+
+@dataclass(frozen=True)
+class TaskHeader:
+    pr_id: str
+    title: str
+    branch: str
+    task_type: str
+    complexity: str
+    depends_on: list[str]
+    priority: int
+    coder: str
 
 
 def parse_queue(
@@ -122,6 +140,111 @@ def parse_queue_text(
         validate_queue(tasks, _extra_issues=strict_issues)
 
     return tasks
+
+
+def parse_task_header(path: str | Path) -> TaskHeader:
+    """Parse structured metadata from a task file header."""
+    task_path = Path(path)
+    lines = task_path.read_text(encoding="utf-8").splitlines()
+    issues: list[str] = []
+    header_match: re.Match[str] | None = None
+    fields: dict[str, str] = {}
+
+    for raw_line in lines:
+        line = raw_line.rstrip()
+        if header_match is None:
+            header_match = _TASK_HEADER_RE.match(line)
+            continue
+
+        branch_match = _TASK_BRANCH_RE.match(line)
+        if branch_match:
+            fields["branch"] = branch_match.group(1).strip()
+            continue
+
+        field_match = _FIELD_RE.match(line)
+        if not field_match:
+            continue
+        key = field_match.group(1).strip().lower()
+        fields[key] = field_match.group(2).strip()
+
+    if header_match is None:
+        raise QueueValidationError(
+            [f"{task_path}: missing task header like '# PR-123: Title'"]
+        )
+
+    pr_id = header_match.group(1)
+    title = header_match.group(2)
+
+    branch = fields.get("branch")
+    if not branch:
+        issues.append(f"{task_path}: missing Branch")
+
+    task_type = fields.get("type")
+    if not task_type:
+        issues.append(f"{task_path}: missing Type")
+    elif task_type not in _TASK_TYPE_VALUES:
+        issues.append(
+            f"{task_path}: invalid Type {task_type!r}; expected one of "
+            f"{sorted(_TASK_TYPE_VALUES)}"
+        )
+
+    complexity = fields.get("complexity")
+    if not complexity:
+        issues.append(f"{task_path}: missing Complexity")
+    elif complexity not in _COMPLEXITY_VALUES:
+        issues.append(
+            f"{task_path}: invalid Complexity {complexity!r}; expected one of "
+            f"{sorted(_COMPLEXITY_VALUES)}"
+        )
+
+    depends_raw = fields.get("depends on")
+    if depends_raw is None:
+        issues.append(f"{task_path}: missing Depends on")
+        depends_on: list[str] = []
+    elif depends_raw.lower() == "none":
+        depends_on = []
+    else:
+        depends_on = [
+            dep.strip() for dep in depends_raw.split(",") if dep.strip()
+        ]
+
+    priority_raw = fields.get("priority")
+    if priority_raw in {None, ""}:
+        priority = 3
+    else:
+        try:
+            priority = int(priority_raw)
+        except ValueError:
+            issues.append(
+                f"{task_path}: invalid Priority {priority_raw!r}; expected integer"
+            )
+            priority = 3
+        else:
+            if not 1 <= priority <= 5:
+                issues.append(
+                    f"{task_path}: invalid Priority {priority}; expected 1-5"
+                )
+
+    coder = fields.get("coder") or "any"
+    if coder not in _CODER_VALUES:
+        issues.append(
+            f"{task_path}: invalid Coder {coder!r}; expected one of "
+            f"{sorted(_CODER_VALUES)}"
+        )
+
+    if issues:
+        raise QueueValidationError(issues)
+
+    return TaskHeader(
+        pr_id=pr_id,
+        title=title,
+        branch=branch,
+        task_type=task_type,
+        complexity=complexity,
+        depends_on=depends_on,
+        priority=priority,
+        coder=coder,
+    )
 
 
 def get_next_task(tasks: list[QueueTask]) -> QueueTask | None:

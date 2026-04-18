@@ -490,7 +490,7 @@
 - Depends on: PR-082
 
 ## PR-084: Task file header parser
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-084.md
 - Branch: pr-084-task-header-parser
 
