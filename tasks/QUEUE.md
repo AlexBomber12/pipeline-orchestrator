@@ -495,7 +495,7 @@
 - Branch: pr-084-task-header-parser
 
 ## PR-085: Status derivation from git
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-085.md
 - Branch: pr-085-status-from-git
 - Depends on: PR-084

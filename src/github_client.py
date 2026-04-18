@@ -7,6 +7,7 @@ import re
 import subprocess
 import time
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 from src.models import CIStatus, PRInfo, ReviewStatus
 from src.retry import retry_transient
@@ -22,6 +23,8 @@ _review_status_cache: dict[str, "ReviewStatus"] = {}
 _review_status_cache_cycle: int | None = None
 
 _last_known_sha: dict[str, str] = {}
+_merged_prs_cache: dict[tuple[str, str], tuple[float, list["PRInfo"]]] = {}
+_MERGED_PRS_CACHE_TTL_SECONDS = 60.0
 
 
 def _cache_key(repo: str, pr_number: int, head_sha: str) -> str:
@@ -33,6 +36,11 @@ def clear_review_status_cache() -> None:
     global _review_status_cache_cycle
     _review_status_cache.clear()
     _review_status_cache_cycle = None
+
+
+def clear_merged_prs_cache() -> None:
+    """Clear merged PR lookup cache (used in tests)."""
+    _merged_prs_cache.clear()
 
 
 def _begin_review_cache_cycle() -> None:
@@ -64,6 +72,14 @@ def _is_reaction_content(reaction: dict, content: str) -> bool:
 def _is_plus_one(reaction: dict) -> bool:
     """Return True if the reaction is exactly +1 from a Codex user."""
     return _is_reaction_content(reaction, "+1")
+
+
+def extract_queue_pr_id(subject: str) -> str | None:
+    """Return the canonical queue PR id from a title/subject prefix."""
+    match = re.match(r"^(PR-[A-Za-z0-9_.-]+):(?:\s|$)", subject.strip())
+    if match is None:
+        return None
+    return match.group(1)
 
 
 def run_gh(
@@ -129,7 +145,7 @@ def get_open_prs(
             "--state",
             "open",
             "--json",
-            "number,headRefName,headRefOid,statusCheckRollup,url,updatedAt,commits,author,isCrossRepository",
+            "number,title,headRefName,headRefOid,statusCheckRollup,url,updatedAt,commits,author,isCrossRepository",
         ],
         repo=repo,
     )
@@ -143,10 +159,13 @@ def get_open_prs(
             continue
         commits = entry.get("commits") or []
         head_sha = entry.get("headRefOid", "")
+        title = entry.get("title", "")
         prs.append(
             PRInfo(
                 number=number,
                 branch=entry.get("headRefName", ""),
+                title=title,
+                pr_id=extract_queue_pr_id(title),
                 ci_status=_ci_status_from_rollup(
                     entry.get("statusCheckRollup"),
                     empty_is_success=allow_merge_without_checks,
@@ -164,6 +183,73 @@ def get_open_prs(
             )
         )
     return prs
+
+
+def get_merged_prs(
+    repo: str,
+    base_branch: str | None = None,
+    *,
+    refresh: bool = False,
+) -> list[PRInfo]:
+    """Return merged PRs for ``repo``.
+
+    This is a best-effort fallback used by queue status derivation when
+    merged work can no longer be inferred from local git history alone
+    (for example after squash-merging with a custom title). If GitHub
+    cannot be queried, return an empty list and let callers fall back to
+    their local heuristics.
+    """
+    cache_key = (repo, base_branch or "")
+    cached = _merged_prs_cache.get(cache_key)
+    now = time.monotonic()
+    if (
+        not refresh
+        and cached is not None
+        and (now - cached[0]) < _MERGED_PRS_CACHE_TTL_SECONDS
+    ):
+        return list(cached[1])
+
+    path = f"repos/{repo}/pulls?state=closed&per_page=100"
+    if base_branch:
+        path = (
+            f"repos/{repo}/pulls?state=closed"
+            f"&base={quote(base_branch, safe='')}&per_page=100"
+        )
+
+    raw = _gh_api_paginated(path)
+    if raw is None:
+        raise RuntimeError(
+            f"gh api repos/{repo}/pulls returned unexpected payload"
+        )
+
+    prs: list[PRInfo] = []
+    for entry in raw:
+        if entry.get("merged_at") in (None, ""):
+            continue
+        base = entry.get("base") or {}
+        if base_branch and base.get("ref") != base_branch:
+            continue
+        number = int(entry.get("number", 0))
+        if not number:
+            continue
+        title = entry.get("title", "")
+        head = entry.get("head") or {}
+        head_repo = head.get("repo")
+        if not isinstance(head_repo, dict):
+            head_repo = {}
+        prs.append(
+            PRInfo(
+                number=number,
+                branch=head.get("ref", ""),
+                title=title,
+                pr_id=extract_queue_pr_id(title),
+                url="",
+                is_cross_repository=bool(head_repo.get("fork", False)),
+                last_activity=_parse_iso(entry.get("merged_at")),
+            )
+        )
+    _merged_prs_cache[cache_key] = (now, prs)
+    return list(prs)
 
 
 def get_pr_review_status(

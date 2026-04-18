@@ -57,6 +57,8 @@ class QueueTask(BaseModel):
 class PRInfo(BaseModel):
     number: int
     branch: str
+    title: str = ""
+    pr_id: str | None = None
     ci_status: CIStatus = CIStatus.PENDING
     review_status: ReviewStatus = ReviewStatus.PENDING
     push_count: int = 0

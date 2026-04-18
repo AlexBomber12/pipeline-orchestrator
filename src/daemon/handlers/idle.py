@@ -7,6 +7,7 @@ Mixin methods:
 
 from __future__ import annotations
 
+import inspect
 import re
 import subprocess
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ from pathlib import Path
 from src import github_client
 from src.models import PipelineState, TaskStatus
 from src.queue_parser import QueueValidationError, get_next_task, parse_queue
+from src.task_status import derive_queue_task_statuses, find_matching_open_pr
 
 
 class IdleMixin:
@@ -65,6 +67,54 @@ class IdleMixin:
             self.state.error_message = str(exc)
             self.log_event(f"Queue validation failed: {exc}")
             return
+        try:
+            prs = github_client.get_open_prs(
+                self.owner_repo,
+                allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+            )
+        except Exception as exc:
+            self.log_event(
+                f"IDLE: open PR check failed: {exc}; deferring task dispatch"
+            )
+            self.state.current_pr = None
+            self.state.current_task = None
+            return
+        try:
+            merged_prs = github_client.get_merged_prs(
+                self.owner_repo,
+                self.repo_config.branch,
+                refresh=True,
+            )
+        except Exception as exc:
+            self.log_event(
+                f"IDLE: merged PR check failed: {exc}; "
+                "continuing with local merged-status heuristics"
+            )
+            merged_prs = []
+        try:
+            derive_args = (
+                tasks,
+                self.repo_path,
+                self.repo_config.branch,
+                prs,
+            )
+            if len(inspect.signature(derive_queue_task_statuses).parameters) >= 5:
+                tasks = derive_queue_task_statuses(
+                    *derive_args,
+                    merged_prs,
+                )
+            else:
+                tasks = derive_queue_task_statuses(*derive_args)
+        except (
+            OSError,
+            RuntimeError,
+            QueueValidationError,
+            subprocess.TimeoutExpired,
+        ) as exc:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = f"Task status derivation failed: {exc}"
+            self.log_event(f"Task status derivation failed: {exc}")
+            return
         self.state.queue_done = sum(
             1 for t in tasks if t.status == TaskStatus.DONE
         )
@@ -72,15 +122,6 @@ class IdleMixin:
         task = get_next_task(tasks)
         if task is None:
             self.log_event("No tasks available")
-            try:
-                prs = github_client.get_open_prs(
-                    self.owner_repo,
-                    allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
-                )
-            except Exception as exc:
-                self.log_event(f"IDLE: open PR check failed: {exc}")
-                self.state.current_pr = None
-                return
             if prs:
                 done_branches = {
                     t.branch for t in tasks
@@ -101,20 +142,11 @@ class IdleMixin:
         task_branch = task.branch
 
         if task_branch:
-            try:
-                prs = github_client.get_open_prs(
-                    self.owner_repo,
-                    allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
-                )
-                existing = next(
-                    (p for p in prs if p.branch == task_branch), None
-                )
-            except Exception as exc:
-                self.log_event(
-                    f"IDLE: open PR check failed: {exc}; deferring task dispatch"
-                )
-                self.state.current_task = None
-                return
+            existing = find_matching_open_pr(
+                task.pr_id,
+                task_branch,
+                prs,
+            )
 
             if existing is not None:
                 self.state.current_pr = existing

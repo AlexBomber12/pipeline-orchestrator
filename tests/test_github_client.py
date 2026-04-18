@@ -12,7 +12,9 @@ from src.github_client import (
     _ci_status_from_rollup,
     _is_codex_user,
     _is_plus_one,
+    clear_merged_prs_cache,
     clear_review_status_cache,
+    get_merged_prs,
     get_pr_author,
     get_pr_head_commit_iso,
     get_pr_metadata,
@@ -107,6 +109,259 @@ def test_run_gh_returns_raw_string_when_not_json(
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert run_gh(["auth", "status"]) == "ok"
+
+
+def test_get_merged_prs_paginates_closed_prs_without_fixed_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_merged_prs_cache()
+    captured: dict[str, str] = {}
+
+    def fake_paginated(path: str) -> list[dict[str, Any]]:
+        captured["path"] = path
+        return [
+            {
+                "number": 101,
+                "title": "PR-101: shipped work",
+                "merged_at": "2026-04-18T10:00:00Z",
+                "head": {
+                    "ref": "pr-101-shipped-work",
+                    "repo": {"fork": False},
+                },
+                "base": {"ref": "main"},
+            },
+            {
+                "number": 102,
+                "title": "closed without merge",
+                "merged_at": None,
+                "head": {
+                    "ref": "pr-102-closed",
+                    "repo": {"fork": False},
+                },
+                "base": {"ref": "main"},
+            },
+            {
+                "number": 103,
+                "title": "custom squash title",
+                "merged_at": "2026-04-18T11:00:00Z",
+                "head": {
+                    "ref": "pr-103-custom-title",
+                    "repo": {"fork": True},
+                },
+                "base": {"ref": "release"},
+            },
+        ]
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    prs = get_merged_prs("owner/name")
+
+    assert captured["path"] == "repos/owner/name/pulls?state=closed&per_page=100"
+    assert [pr.number for pr in prs] == [101, 103]
+    assert prs[0].pr_id == "PR-101"
+    assert prs[0].branch == "pr-101-shipped-work"
+    assert prs[1].pr_id is None
+    assert prs[1].is_cross_repository is True
+
+
+def test_get_merged_prs_filters_by_base_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_merged_prs_cache()
+    def fake_paginated(path: str) -> list[dict[str, Any]]:
+        assert path == "repos/owner/name/pulls?state=closed&base=main&per_page=100"
+        return [
+            {
+                "number": 101,
+                "title": "PR-101: shipped work",
+                "merged_at": "2026-04-18T10:00:00Z",
+                "head": {
+                    "ref": "pr-101-shipped-work",
+                    "repo": {"fork": False},
+                },
+                "base": {"ref": "main"},
+            },
+            {
+                "number": 102,
+                "title": "PR-102: merged elsewhere",
+                "merged_at": "2026-04-18T11:00:00Z",
+                "head": {
+                    "ref": "pr-102-release-work",
+                    "repo": {"fork": False},
+                },
+                "base": {"ref": "release"},
+            },
+        ]
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    prs = get_merged_prs("owner/name", base_branch="main")
+
+    assert [pr.number for pr in prs] == [101]
+
+
+def test_get_merged_prs_url_encodes_base_branch_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_merged_prs_cache()
+
+    def fake_paginated(path: str) -> list[dict[str, Any]]:
+        assert (
+            path
+            == "repos/owner/name/pulls?state=closed&base=release%2F2026.04&per_page=100"
+        )
+        return []
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    assert get_merged_prs("owner/name", base_branch="release/2026.04") == []
+
+
+def test_get_merged_prs_handles_deleted_head_repo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_merged_prs_cache()
+    def fake_paginated(path: str) -> list[dict[str, Any]]:
+        assert path == "repos/owner/name/pulls?state=closed&per_page=100"
+        return [
+            {
+                "number": 104,
+                "title": "PR-104: merged from deleted fork",
+                "merged_at": "2026-04-18T12:00:00Z",
+                "head": {
+                    "ref": "pr-104-deleted-fork",
+                    "repo": None,
+                },
+                "base": {"ref": "main"},
+            }
+        ]
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    prs = get_merged_prs("owner/name")
+
+    assert len(prs) == 1
+    assert prs[0].number == 104
+    assert prs[0].branch == "pr-104-deleted-fork"
+    assert prs[0].is_cross_repository is False
+
+
+def test_get_merged_prs_raises_when_github_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_merged_prs_cache()
+
+    def fake_paginated(path: str) -> list[dict[str, Any]]:
+        raise RuntimeError(f"boom: {path}")
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        get_merged_prs("owner/name", base_branch="main")
+
+
+def test_get_merged_prs_uses_cache_within_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_merged_prs_cache()
+    calls = 0
+
+    def fake_paginated(path: str) -> list[dict[str, Any]]:
+        nonlocal calls
+        calls += 1
+        assert path == "repos/owner/name/pulls?state=closed&base=main&per_page=100"
+        return [
+            {
+                "number": 101,
+                "title": "PR-101: shipped work",
+                "merged_at": "2026-04-18T10:00:00Z",
+                "head": {
+                    "ref": "pr-101-shipped-work",
+                    "repo": {"fork": False},
+                },
+                "base": {"ref": "main"},
+            }
+        ]
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    first = get_merged_prs("owner/name", base_branch="main")
+    second = get_merged_prs("owner/name", base_branch="main")
+
+    assert calls == 1
+    assert [pr.number for pr in first] == [101]
+    assert [pr.number for pr in second] == [101]
+
+
+def test_clear_merged_prs_cache_forces_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_merged_prs_cache()
+    calls = 0
+
+    def fake_paginated(path: str) -> list[dict[str, Any]]:
+        nonlocal calls
+        calls += 1
+        return [
+            {
+                "number": 100 + calls,
+                "title": f"PR-{100 + calls}: shipped work",
+                "merged_at": "2026-04-18T10:00:00Z",
+                "head": {
+                    "ref": f"pr-{100 + calls}-shipped-work",
+                    "repo": {"fork": False},
+                },
+                "base": {"ref": "main"},
+            }
+        ]
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    first = get_merged_prs("owner/name", base_branch="main")
+    clear_merged_prs_cache()
+    second = get_merged_prs("owner/name", base_branch="main")
+
+    assert calls == 2
+    assert [pr.number for pr in first] == [101]
+    assert [pr.number for pr in second] == [102]
+
+
+def test_get_merged_prs_refresh_bypasses_cache_and_replaces_cached_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_merged_prs_cache()
+    calls = 0
+
+    def fake_paginated(path: str) -> list[dict[str, Any]]:
+        nonlocal calls
+        calls += 1
+        return [
+            {
+                "number": 100 + calls,
+                "title": f"PR-{100 + calls}: shipped work",
+                "merged_at": "2026-04-18T10:00:00Z",
+                "head": {
+                    "ref": f"pr-{100 + calls}-shipped-work",
+                    "repo": {"fork": False},
+                },
+                "base": {"ref": "main"},
+            }
+        ]
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    first = get_merged_prs("owner/name", base_branch="main")
+    refreshed = get_merged_prs(
+        "owner/name",
+        base_branch="main",
+        refresh=True,
+    )
+    cached = get_merged_prs("owner/name", base_branch="main")
+
+    assert calls == 2
+    assert [pr.number for pr in first] == [101]
+    assert [pr.number for pr in refreshed] == [102]
+    assert [pr.number for pr in cached] == [102]
 
 
 def test_is_codex_user_matches_bot_logins() -> None:

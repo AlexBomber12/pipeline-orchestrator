@@ -304,6 +304,9 @@ def test_handle_idle_no_tasks_leaves_state_idle(
     calls = _patch_subprocess(monkeypatch)
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(
+        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
+    )
 
     runner = _make_runner()
     asyncio.run(runner.handle_idle())
@@ -383,6 +386,9 @@ def test_handle_idle_picks_task_and_drives_coding(
         _get_open_prs,
     )
     monkeypatch.setattr(
+        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
+    )
+    monkeypatch.setattr(
         runner_module.github_client,
         "post_comment",
         lambda repo, number, body: None,
@@ -413,6 +419,11 @@ def test_handle_idle_sets_queue_counters_with_mixed_statuses(
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: tasks)
     monkeypatch.setattr(idle_module, "get_next_task", lambda t: tasks[2])
     monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda tasks, repo_path, base_branch, open_pr_branches: tasks,
+    )
+    monkeypatch.setattr(
         claude_cli,
         "run_planned_pr_async",
         _async_cli_result(0, "ok", ""),
@@ -430,6 +441,9 @@ def test_handle_idle_sets_queue_counters_with_mixed_statuses(
         runner_module.github_client,
         "get_open_prs",
         _get_open_prs,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -462,6 +476,7 @@ def test_handle_idle_attaches_to_existing_pr_instead_of_coding(
     existing_pr = PRInfo(
         number=99,
         branch="pr-042-sample",
+        title="PR-042: Sample",
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.PENDING,
     )
@@ -469,6 +484,9 @@ def test_handle_idle_attaches_to_existing_pr_instead_of_coding(
         runner_module.github_client,
         "get_open_prs",
         lambda repo, **kw: [existing_pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -519,6 +537,9 @@ def test_handle_idle_proceeds_to_coding_when_no_matching_pr(
 
     monkeypatch.setattr(runner_module.github_client, "get_open_prs", _get_open_prs)
     monkeypatch.setattr(
+        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
+    )
+    monkeypatch.setattr(
         claude_cli,
         "run_planned_pr_async",
         _async_cli_result(0, "ok", ""),
@@ -567,11 +588,57 @@ def test_handle_idle_defers_on_gh_failure(
     monkeypatch.setattr(runner_module.PipelineRunner, "handle_coding", spy_handle_coding)
 
     runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-999",
+        title="Stale task",
+        status=TaskStatus.DOING,
+        branch="pr-999-stale-task",
+    )
     asyncio.run(runner.handle_idle())
 
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert not coding_called["v"], "handle_coding should NOT be called on GH failure"
+
+
+def test_handle_idle_sets_error_when_task_status_derivation_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    task = QueueTask(
+        pr_id="PR-042",
+        title="Sample",
+        status=TaskStatus.TODO,
+        branch="pr-042-sample",
+    )
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
+    )
+
+    def _timed_out(*args: Any, **kwargs: Any) -> list[QueueTask]:
+        raise subprocess.TimeoutExpired(cmd=["git", "branch", "--merged"], timeout=10)
+
+    monkeypatch.setattr(idle_module, "derive_queue_task_statuses", _timed_out)
+
+    coding_called = {"v": False}
+
+    async def spy_handle_coding(self):
+        coding_called["v"] = True
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "handle_coding", spy_handle_coding)
+
+    runner = _make_runner()
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "Task status derivation failed" in (runner.state.error_message or "")
+    assert not coding_called["v"], "handle_coding should NOT be called on timeout"
 
 
 def test_handle_coding_errors_when_no_pr_found(
@@ -3166,6 +3233,9 @@ def test_handle_idle_no_tasks_but_open_pr_sets_current_pr(
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo, **kw: [open_pr]
     )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
+    )
 
     runner = _make_runner()
     asyncio.run(runner.handle_idle())
@@ -3184,6 +3254,9 @@ def test_handle_idle_no_tasks_no_open_prs_clears_current_pr(
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo, **kw: []
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
     )
 
     runner = _make_runner()
@@ -3235,6 +3308,103 @@ def test_handle_idle_open_pr_check_survives_github_failure(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is None
     assert any("open PR check failed" in e["event"] for e in runner.state.history)
+
+
+def test_handle_idle_falls_back_when_merged_pr_check_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    task = QueueTask(
+        pr_id="PR-123",
+        title="Keep dispatching",
+        branch="pr-123-keep-dispatching",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-123.md",
+    )
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: (_ for _ in ()).throw(RuntimeError("API down")),
+    )
+    derived_calls: list[list[PRInfo]] = []
+    monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda tasks, repo_path, base_branch, prs, merged_prs=(): (
+            derived_calls.append(list(merged_prs)) or tasks
+        ),
+    )
+    coding_called = {"v": False}
+
+    async def fake_handle_coding() -> None:
+        coding_called["v"] = True
+        return None
+
+    runner = _make_runner()
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    runner.state.current_pr = PRInfo(number=5, branch="stale")
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.CODING
+    assert runner.state.current_task == task
+    assert runner.state.current_pr.number == 5
+    assert coding_called["v"] is True
+    assert derived_calls == [[]]
+    assert any("merged PR check failed" in e["event"] for e in runner.state.history)
+
+
+def test_handle_idle_requests_fresh_merged_prs_for_status_derivation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    task = QueueTask(
+        pr_id="PR-123",
+        title="Refresh merged PRs",
+        branch="pr-123-refresh-merged-prs",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-123.md",
+    )
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    refresh_calls: list[bool] = []
+
+    def fake_get_merged_prs(
+        repo: str,
+        branch: str,
+        refresh: bool = False,
+    ) -> list[PRInfo]:
+        refresh_calls.append(refresh)
+        return []
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        fake_get_merged_prs,
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda tasks, repo_path, base_branch, prs, merged_prs=(): tasks,
+    )
+
+    async def fake_handle_coding() -> None:
+        return None
+
+    runner = _make_runner()
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    asyncio.run(runner.handle_idle())
+
+    assert refresh_calls == [True]
 
 
 # ------------------------------------------------------------------
