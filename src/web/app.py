@@ -192,16 +192,20 @@ def _build_coder_rows(
     """Return coder rows for the settings table and JSON API."""
     rows: list[dict[str, Any]] = []
     for plugin in build_coder_registry().list_coders():
+        selected_model = (
+            config.daemon.claude_model
+            if plugin.name == "claude"
+            else config.daemon.codex_model
+        )
+        model_options = list(plugin.models)
+        if selected_model not in model_options:
+            model_options.append(selected_model)
         rows.append(
             {
                 "name": plugin.name,
                 "display_name": plugin.display_name,
-                "models": plugin.models,
-                "selected_model": (
-                    config.daemon.claude_model
-                    if plugin.name == "claude"
-                    else config.daemon.codex_model
-                ),
+                "models": model_options,
+                "selected_model": selected_model,
                 "auth": auth.get(
                     plugin.name,
                     {
@@ -894,6 +898,16 @@ async def partial_settings_daemon(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
         request,
         "components/settings_daemon_response.html",
+        context,
+    )
+
+
+@app.get("/partials/settings/coders", response_class=HTMLResponse)
+async def partial_settings_coders(request: Request) -> HTMLResponse:
+    context = await _settings_daemon_template_context(request)
+    return templates.TemplateResponse(
+        request,
+        "components/settings_coders_wrapper.html",
         context,
     )
 

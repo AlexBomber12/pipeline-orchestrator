@@ -6,6 +6,10 @@
   response is wiped as the form re-renders in the happy path.
 #}
 <div id="settings-daemon-error" hx-swap-oob="innerHTML"></div>
-<div id="settings-coders" hx-swap-oob="outerHTML">
+<div id="settings-coders"
+     hx-get="/partials/settings/coders"
+     hx-trigger="every 30s"
+     hx-swap="outerHTML"
+     hx-swap-oob="outerHTML">
     {% include "components/settings_coders.html" %}
 </div>

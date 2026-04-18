@@ -555,6 +555,19 @@ def test_partial_daemon_returns_fragment(empty_config: Path) -> None:
     assert 'hx-swap-oob="innerHTML"' in body
 
 
+def test_partial_coders_returns_polling_fragment(empty_config: Path) -> None:
+    with TestClient(app) as client:
+        response = client.get("/partials/settings/coders")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "<!DOCTYPE" not in body
+    assert 'id="settings-coders"' in body
+    assert 'hx-get="/partials/settings/coders"' in body
+    assert 'hx-trigger="every 30s"' in body
+    assert 'hx-swap="outerHTML"' in body
+
+
 def test_put_daemon_updates_numeric_fields(empty_config: Path) -> None:
     with TestClient(app) as client:
         response = client.put(
@@ -1390,6 +1403,38 @@ def test_coders_table_shows_auth_status(
     assert "Authorized" in body
     assert "codex not authenticated" in body
     assert "GitHub CLI" in body
+
+
+def test_coders_table_polls_for_auth_refresh(empty_config: Path) -> None:
+    with TestClient(app) as client:
+        response = client.get("/settings")
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'id="settings-coders"' in body
+    assert 'hx-get="/partials/settings/coders"' in body
+    assert 'hx-trigger="every 30s"' in body
+
+
+def test_coders_table_includes_unknown_selected_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n  coder: codex\n  codex_model: custom-model\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+
+    with TestClient(app) as client:
+        response = client.get("/settings")
+
+    assert response.status_code == 200
+    body = response.text
+    assert (
+        '<option value="custom-model" selected>'
+        in body
+    )
 
 
 def test_repo_detail_coder_dropdown_renders(
