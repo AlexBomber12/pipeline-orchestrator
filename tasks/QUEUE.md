@@ -467,7 +467,7 @@
 - Depends on: PR-078
 
 ## PR-080: RunRecord schema and storage
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-080.md
 - Branch: pr-080-run-record-schema
 

@@ -1,0 +1,105 @@
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from src.metrics import MetricsStore, RunRecord
+
+
+class _FakeRedis:
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+        self.ttls: dict[str, int] = {}
+        self.lists: dict[str, list[str]] = {}
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
+        self.store[key] = value
+        if ex is not None:
+            self.ttls[key] = ex
+
+    async def get(self, key: str) -> str | None:
+        return self.store.get(key)
+
+    async def lpush(self, key: str, value: str) -> int:
+        bucket = self.lists.setdefault(key, [])
+        bucket.insert(0, value)
+        return len(bucket)
+
+    async def lrange(self, key: str, start: int, stop: int) -> list[str]:
+        values = self.lists.get(key, [])
+        if stop < 0:
+            stop = len(values) + stop
+        return values[start:stop + 1]
+
+
+def _record(run_id: str, **overrides: Any) -> RunRecord:
+    base: dict[str, Any] = {
+        "run_id": run_id,
+        "task_id": "PR-080",
+        "profile_id": "claude:opus:container",
+        "task_type": "feature",
+        "complexity": "medium",
+        "started_at": "2026-04-18T10:00:00+00:00",
+        "ended_at": "2026-04-18T10:05:00+00:00",
+        "duration_ms": 300000,
+        "fix_iterations": 0,
+        "tokens_in": 1200,
+        "tokens_out": 800,
+        "exit_reason": "success_merged",
+        "operator_intervention": False,
+    }
+    base.update(overrides)
+    return RunRecord(**base)
+
+
+async def test_save_and_get_record() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+    record = _record("run-1")
+
+    await store.save(record)
+
+    saved = await store.get("run-1")
+
+    assert saved == record
+    assert redis.ttls["metrics:run:run-1"] == 90 * 86400
+    assert redis.lists["metrics:repo:PR"] == ["run-1"]
+
+
+async def test_recent_returns_latest() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+
+    await store.save(_record("run-1", started_at="2026-04-18T10:00:00+00:00"))
+    await store.save(_record("run-2", started_at="2026-04-18T11:00:00+00:00"))
+    await store.save(_record("run-3", started_at="2026-04-18T12:00:00+00:00"))
+
+    recent = await store.recent(limit=2)
+
+    assert [record.run_id for record in recent] == ["run-3", "run-2"]
+
+
+async def test_record_serialization() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+    record = _record("run-serialized", ended_at=None, duration_ms=None)
+
+    await store.save(record)
+
+    payload = json.loads(redis.store["metrics:run:run-serialized"])
+
+    assert payload == {
+        "complexity": "medium",
+        "duration_ms": None,
+        "ended_at": None,
+        "exit_reason": "success_merged",
+        "fix_iterations": 0,
+        "operator_intervention": False,
+        "profile_id": "claude:opus:container",
+        "run_id": "run-serialized",
+        "started_at": "2026-04-18T10:00:00+00:00",
+        "task_id": "PR-080",
+        "task_type": "feature",
+        "tokens_in": 1200,
+        "tokens_out": 800,
+    }
