@@ -484,7 +484,7 @@
 - Depends on: PR-081
 
 ## PR-083: Dashboard per-PR metrics panel
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-083.md
 - Branch: pr-083-metrics-dashboard
 - Depends on: PR-082

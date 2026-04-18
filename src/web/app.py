@@ -13,6 +13,7 @@ import hashlib
 import os
 import subprocess
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -35,6 +36,7 @@ from src.config import (
     update_daemon_config,
     update_repository,
 )
+from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
 from src.queue_parser import QueueValidationError, parse_queue_text
 from src.utils import repo_slug_from_url
@@ -46,6 +48,8 @@ REPOS_DIR = "/data/repos"
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 templates.env.globals["utcnow"] = lambda: datetime.now(timezone.utc)
+_METRICS_PANEL_LIMIT = 20
+_METRICS_SCAN_LIMIT = 100
 
 
 def _default_repo_state(
@@ -252,7 +256,113 @@ async def _repo_template_context(
         "coders": build_coder_registry().list_coders(),
         "effective_coder": _effective_coder_name(repo_config, config),
         "inherit_coder": _daemon_default_coder_name(config),
+        "metrics_records": await _recent_repo_metrics_payload(name, redis_client),
+        "repo_name": name,
     }
+
+
+def _parse_iso8601(value: str | None) -> datetime | None:
+    """Return an aware datetime for an ISO-8601 string when possible."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _format_duration_ms(duration_ms: int | None) -> str:
+    """Render a short human-readable duration for the metrics table."""
+    if duration_ms is None:
+        return "—"
+    total_seconds = duration_ms // 1000
+    if total_seconds <= 0:
+        return "<1s"
+    if total_seconds < 60:
+        return f"{total_seconds}s"
+    minutes, seconds = divmod(total_seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m" if seconds == 0 else f"{minutes}m {seconds}s"
+    hours, remaining_minutes = divmod(minutes, 60)
+    if remaining_minutes == 0:
+        return f"{hours}h"
+    return f"{hours}h {remaining_minutes}m"
+
+
+def _profile_parts(profile_id: str) -> tuple[str, str]:
+    """Split ``coder:model:...`` into displayable coder/model fields."""
+    parts = profile_id.split(":")
+    coder = parts[0] if parts and parts[0] else "unknown"
+    model = parts[1] if len(parts) > 1 and parts[1] else "unknown"
+    return coder, model
+
+
+def _exit_reason_label(exit_reason: str) -> str:
+    """Normalize stored exit reasons into concise UI labels."""
+    labels = {
+        "success_merged": "merged",
+        "rate_limit": "rate limit",
+        "error": "error",
+    }
+    return labels.get(exit_reason, exit_reason.replace("_", " ") or "unknown")
+
+
+def _exit_reason_classes(exit_reason: str) -> str:
+    """Return badge classes for the exit reason column."""
+    if "merged" in exit_reason:
+        return "bg-ok/15 text-ok border-ok/30"
+    if "rate_limit" in exit_reason:
+        return "bg-warn/15 text-warn border-warn/30"
+    if "error" in exit_reason:
+        return "bg-fail/15 text-fail border-fail/30"
+    return "bg-white/5 text-gray-300 border-white/10"
+
+
+def _serialize_run_record(record: RunRecord) -> dict[str, Any]:
+    """Return one run record payload for JSON and Jinja rendering."""
+    coder, model = _profile_parts(record.profile_id)
+    payload = asdict(record)
+    payload.update(
+        {
+            "coder": coder,
+            "model": model,
+            "duration_text": _format_duration_ms(record.duration_ms),
+            "exit_reason_label": _exit_reason_label(record.exit_reason),
+            "exit_reason_classes": _exit_reason_classes(record.exit_reason),
+        }
+    )
+    return payload
+
+
+async def _recent_repo_metrics_payload(
+    name: str,
+    redis_client: aioredis.Redis | None,
+) -> list[dict[str, Any]]:
+    """Return the latest completed PR run records for one repo."""
+    if redis_client is None:
+        return []
+    store = MetricsStore(redis_client)
+    try:
+        records = await store.recent(
+            task_id="PR",
+            limit=_METRICS_SCAN_LIMIT,
+            repo_name=name,
+        )
+    except Exception:
+        return []
+    completed = [record for record in records if record.ended_at is not None]
+    completed.sort(
+        key=lambda record: _parse_iso8601(record.started_at)
+        or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    return [
+        _serialize_run_record(record)
+        for record in completed[:_METRICS_PANEL_LIMIT]
+    ]
 
 
 _MERGE_EVENT_MARKER = "Merged PR"
@@ -713,6 +823,12 @@ async def repo_detail(request: Request, name: str) -> HTMLResponse:
     )
 
 
+@app.get("/repo/{name}/metrics")
+async def repo_metrics(request: Request, name: str) -> JSONResponse:
+    redis_client = getattr(request.app.state, "redis", None)
+    return JSONResponse(await _recent_repo_metrics_payload(name, redis_client))
+
+
 @app.get("/partials/repo/{name}", response_class=HTMLResponse)
 async def partial_repo_detail(request: Request, name: str) -> HTMLResponse:
     """Return ONLY the repo summary cards for the 5s HTMX poll.
@@ -728,6 +844,24 @@ async def partial_repo_detail(request: Request, name: str) -> HTMLResponse:
         request,
         "components/repo_summary.html",
         context,
+    )
+
+
+@app.get(
+    "/partials/repo/{name}/metrics",
+    response_class=HTMLResponse,
+)
+async def partial_repo_metrics(request: Request, name: str) -> HTMLResponse:
+    redis_client = getattr(request.app.state, "redis", None)
+    return templates.TemplateResponse(
+        request,
+        "components/pr_metrics.html",
+        {
+            "repo_name": name,
+            "metrics_records": await _recent_repo_metrics_payload(
+                name, redis_client
+            ),
+        },
     )
 
 
