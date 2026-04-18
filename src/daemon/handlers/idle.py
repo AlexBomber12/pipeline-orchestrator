@@ -128,6 +128,9 @@ class IdleMixin:
             headers.append(header)
             task_files[header.pr_id] = task_file.relative_to(repo_root).as_posix()
 
+        if not headers:
+            return None
+
         merged_pr_ids = get_merged_pr_ids(
             self.repo_path,
             self.repo_config.branch,
@@ -297,7 +300,7 @@ class IdleMixin:
         try:
             tasks = parse_queue(queue_path, strict=strict)
         except QueueValidationError as exc:
-            if dag_task is None:
+            if dag_tasks is None:
                 self.state.state = PipelineState.ERROR
                 self.state.error_message = str(exc)
                 self.log_event(f"Queue validation failed: {exc}")

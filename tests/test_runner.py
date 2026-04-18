@@ -4240,6 +4240,59 @@ def test_handle_idle_keeps_dag_task_when_queue_validation_fails(
     )
 
 
+def test_handle_idle_keeps_dag_state_when_queue_validation_fails_without_dag_pick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    dag_tasks = [
+        QueueTask(
+            pr_id="PR-123",
+            title="Structured task",
+            status=TaskStatus.DONE,
+            task_file="tasks/PR-123.md",
+            branch="pr-123-structured",
+        )
+    ]
+
+    async def fake_select(self):
+        self._idle_dag_tasks = dag_tasks
+        return None
+
+    monkeypatch.setattr(idle_module.IdleMixin, "_select_next_task_from_dag", fake_select)
+    monkeypatch.setattr(
+        idle_module,
+        "parse_queue",
+        lambda path, **kw: (_ for _ in ()).throw(
+            idle_module.QueueValidationError(
+                ["Queue validation failed:\n- malformed queue"]
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    runner = _make_runner()
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None
+    assert runner.state.current_task is None
+    assert runner.state.queue_done == 1
+    assert runner.state.queue_total == 1
+    assert any(
+        "Queue validation failed after DAG selection" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
 def test_handle_idle_keeps_doing_dag_task_over_legacy_queue_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4346,6 +4399,33 @@ def test_handle_idle_requests_fresh_merged_prs_for_status_derivation(
     asyncio.run(runner.handle_idle())
 
     assert refresh_calls == [True]
+
+
+def test_select_next_task_from_dag_skips_merged_probe_without_structured_headers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# Legacy task without structured metadata\n\n"
+        "Some older task body.\n",
+        encoding="utf-8",
+    )
+
+    def fail_get_merged_pr_ids(*args, **kwargs):
+        raise AssertionError("get_merged_pr_ids should not be called")
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", fail_get_merged_pr_ids)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is None
+    assert runner._idle_dag_tasks is None
 
 
 # ------------------------------------------------------------------
