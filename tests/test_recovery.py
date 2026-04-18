@@ -48,7 +48,18 @@ def _make_runner() -> PipelineRunner:
         _repo_cfg(),
         AppConfig(repositories=[], daemon=DaemonConfig()),
         _FakeRedis(),
+        _FakeUsageProvider(),
+        _FakeUsageProvider(),
     )
+
+
+class _FakeUsageProvider:
+    def fetch(self) -> None:
+        return None
+
+    @property
+    def consecutive_failures(self) -> int:
+        return 0
 
 
 def _doing_task() -> QueueTask:
@@ -1052,6 +1063,8 @@ def test_parse_base_queue_respects_non_default_configured_branch(
         _repo_cfg(branch="release/2026.04"),
         AppConfig(repositories=[], daemon=DaemonConfig()),
         _FakeRedis(),
+        _FakeUsageProvider(),
+        _FakeUsageProvider(),
     )
     runner._parse_base_queue()
 

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from src import codex_cli
-from src.config import load_config
+from src.config import AppConfig, load_config
 from src.usage import OpenAIUsageProvider, UsageProvider
 
 CONFIG_PATH = "config.yml"
@@ -134,7 +134,10 @@ class CodexPlugin:
         return {"status": "error", "detail": f"{installed_detail}; {base_detail}"}
 
     def create_usage_provider(self, **kwargs: Any) -> UsageProvider:
-        cfg = load_config(kwargs.pop("config_path", CONFIG_PATH))
+        cfg = kwargs.pop("config", None)
+        if cfg is None:
+            cfg = load_config(kwargs.pop("config_path", CONFIG_PATH))
+        assert isinstance(cfg, AppConfig)
         credentials_path = kwargs.pop(
             "credentials_path",
             str(Path(cfg.auth.codex_home_dir) / ".codex" / "auth.json"),

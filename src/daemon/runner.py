@@ -48,7 +48,7 @@ from src.daemon.rate_limit import RateLimitMixin
 from src.daemon.recovery import RecoveryMixin
 from src.daemon.repo_ops import RepoOpsMixin
 from src.models import PipelineState, RepoState
-from src.usage import OAuthUsageProvider, OpenAIUsageProvider
+from src.usage import UsageProvider
 from src.utils import repo_slug_from_url
 
 logger = logging.getLogger(__name__)
@@ -85,6 +85,8 @@ class PipelineRunner(
         repo_config: RepoConfig,
         app_config: AppConfig,
         redis_client: aioredis.Redis,
+        claude_usage_provider: UsageProvider,
+        codex_usage_provider: UsageProvider,
     ) -> None:
         self.repo_config = repo_config
         self._app_config = app_config
@@ -164,20 +166,8 @@ class PipelineRunner(
         self._last_codex_review_pr: int | None = None
         self._last_codex_review_head_sha: str | None = None
         self._usage_degraded_logged = False
-        self._claude_usage_provider = OAuthUsageProvider(
-            credentials_path=str(
-                Path(self.app_config.auth.claude_config_dir) / ".credentials.json"
-            ),
-            user_agent=self.app_config.daemon.usage_api_user_agent,
-            beta_header=self.app_config.daemon.usage_api_beta_header,
-            cache_ttl_sec=self._app_config.daemon.usage_api_cache_ttl_sec,
-        )
-        self._codex_usage_provider = OpenAIUsageProvider(
-            credentials_path=str(
-                Path(self.app_config.auth.codex_home_dir) / ".codex" / "auth.json"
-            ),
-            cache_ttl_sec=self._app_config.daemon.usage_api_cache_ttl_sec,
-        )
+        self._claude_usage_provider = claude_usage_provider
+        self._codex_usage_provider = codex_usage_provider
 
     @property
     def app_config(self) -> AppConfig:
@@ -185,32 +175,16 @@ class PipelineRunner(
 
     @app_config.setter
     def app_config(self, value: AppConfig) -> None:
-        old = self._app_config
         self._app_config = value
-        if (
-            value.daemon.usage_api_user_agent != old.daemon.usage_api_user_agent
-            or value.daemon.usage_api_beta_header != old.daemon.usage_api_beta_header
-            or value.daemon.usage_api_cache_ttl_sec != old.daemon.usage_api_cache_ttl_sec
-            or value.auth.claude_config_dir != old.auth.claude_config_dir
-        ):
-            self._claude_usage_provider = OAuthUsageProvider(
-                credentials_path=str(
-                    Path(value.auth.claude_config_dir) / ".credentials.json"
-                ),
-                user_agent=value.daemon.usage_api_user_agent,
-                beta_header=value.daemon.usage_api_beta_header,
-                cache_ttl_sec=value.daemon.usage_api_cache_ttl_sec,
-            )
-        if (
-            value.daemon.usage_api_cache_ttl_sec != old.daemon.usage_api_cache_ttl_sec
-            or value.auth.codex_home_dir != old.auth.codex_home_dir
-        ):
-            self._codex_usage_provider = OpenAIUsageProvider(
-                credentials_path=str(
-                    Path(value.auth.codex_home_dir) / ".codex" / "auth.json"
-                ),
-                cache_ttl_sec=value.daemon.usage_api_cache_ttl_sec,
-            )
+
+    def set_usage_providers(
+        self,
+        claude_usage_provider: UsageProvider,
+        codex_usage_provider: UsageProvider,
+    ) -> None:
+        """Swap in the shared daemon-level usage providers."""
+        self._claude_usage_provider = claude_usage_provider
+        self._codex_usage_provider = codex_usage_provider
 
     def _get_coder(self) -> tuple[str, object]:
         """Return ``(coder_name, coder_module)`` for the active coder.

@@ -135,13 +135,19 @@ def _app_cfg(**daemon_overrides: Any) -> AppConfig:
     return AppConfig(repositories=[], daemon=DaemonConfig(**daemon_overrides))
 
 
+def _usage_providers() -> tuple[_FakeUsageProvider, _FakeUsageProvider]:
+    return _FakeUsageProvider(), _FakeUsageProvider()
+
+
 def _make_runner(**repo_overrides: Any) -> PipelineRunner:
-    runner = PipelineRunner(_repo_cfg(**repo_overrides), _app_cfg(), _FakeRedis())
-    # Replace the real usage providers with no-op stubs so tests
-    # don't make real HTTP requests or block the event loop.
-    runner._claude_usage_provider = _FakeUsageProvider()
-    runner._codex_usage_provider = _FakeUsageProvider()
-    return runner
+    claude_provider, codex_provider = _usage_providers()
+    return PipelineRunner(
+        _repo_cfg(**repo_overrides),
+        _app_cfg(),
+        _FakeRedis(),
+        claude_provider,
+        codex_provider,
+    )
 
 
 def _patch_subprocess(
@@ -1403,7 +1409,12 @@ def test_handle_watch_falls_back_to_daemon_review_timeout(
     app_cfg = AppConfig(
         repositories=[], daemon=DaemonConfig(review_timeout_min=30)
     )
-    runner = PipelineRunner(repo_cfg, app_cfg, _FakeRedis())
+    runner = PipelineRunner(
+        repo_cfg,
+        app_cfg,
+        _FakeRedis(),
+        *_usage_providers(),
+    )
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=7, branch="pr-002")
     asyncio.run(runner.handle_watch())
@@ -1445,7 +1456,12 @@ def test_handle_watch_repo_timeout_override_wins_over_daemon_default(
     app_cfg = AppConfig(
         repositories=[], daemon=DaemonConfig(review_timeout_min=30)
     )
-    runner = PipelineRunner(repo_cfg, app_cfg, _FakeRedis())
+    runner = PipelineRunner(
+        repo_cfg,
+        app_cfg,
+        _FakeRedis(),
+        *_usage_providers(),
+    )
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=8, branch="pr-003")
     asyncio.run(runner.handle_watch())
@@ -1538,6 +1554,7 @@ def test_handle_hung_preserves_context_when_fallback_disabled(
             daemon=DaemonConfig(hung_fallback_codex_review=False),
         ),
         _FakeRedis(),
+        *_usage_providers(),
     )
     runner.state.state = PipelineState.HUNG
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
@@ -1572,6 +1589,7 @@ def test_handle_hung_transitions_to_idle_when_pr_resolved(
             daemon=DaemonConfig(hung_fallback_codex_review=False),
         ),
         _FakeRedis(),
+        *_usage_providers(),
     )
     runner.state.state = PipelineState.HUNG
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
@@ -3546,6 +3564,7 @@ def test_handle_coding_uses_configured_timeout(
             daemon=DaemonConfig(planned_pr_timeout_sec=1234),
         ),
         _FakeRedis(),
+        *_usage_providers(),
     )
     runner.state.current_task = QueueTask(
         pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
@@ -3594,6 +3613,7 @@ def test_fix_idle_timeout_kills_on_no_push(
             daemon=DaemonConfig(fix_idle_timeout_sec=5),
         ),
         _FakeRedis(),
+        *_usage_providers(),
     )
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
@@ -3628,6 +3648,7 @@ def test_fix_idle_timeout_resets_on_push(
             daemon=DaemonConfig(fix_idle_timeout_sec=1800),
         ),
         _FakeRedis(),
+        *_usage_providers(),
     )
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
@@ -3676,6 +3697,7 @@ def test_fix_idle_timeout_monitor_resets_on_push(
             daemon=DaemonConfig(fix_idle_timeout_sec=1800),
         ),
         _FakeRedis(),
+        *_usage_providers(),
     )
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
