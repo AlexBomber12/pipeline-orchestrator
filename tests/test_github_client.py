@@ -159,6 +159,33 @@ def test_get_merged_prs_paginates_closed_prs_without_fixed_limit(
     assert prs[1].is_cross_repository is True
 
 
+def test_get_merged_prs_handles_deleted_head_repo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_paginated(path: str) -> list[dict[str, Any]]:
+        assert path == "repos/owner/name/pulls?state=closed&per_page=100"
+        return [
+            {
+                "number": 104,
+                "title": "PR-104: merged from deleted fork",
+                "merged_at": "2026-04-18T12:00:00Z",
+                "head": {
+                    "ref": "pr-104-deleted-fork",
+                    "repo": None,
+                },
+            }
+        ]
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    prs = get_merged_prs("owner/name")
+
+    assert len(prs) == 1
+    assert prs[0].number == 104
+    assert prs[0].branch == "pr-104-deleted-fork"
+    assert prs[0].is_cross_repository is False
+
+
 def test_is_codex_user_matches_bot_logins() -> None:
     assert _is_codex_user({"login": "codex"}) is True
     assert _is_codex_user({"login": "chatgpt-codex-conn"}) is True

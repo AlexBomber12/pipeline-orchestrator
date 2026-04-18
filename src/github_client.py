@@ -205,6 +205,9 @@ def get_merged_prs(repo: str) -> list[PRInfo]:
             continue
         title = entry.get("title", "")
         head = entry.get("head") or {}
+        head_repo = head.get("repo")
+        if not isinstance(head_repo, dict):
+            head_repo = {}
         prs.append(
             PRInfo(
                 number=number,
@@ -212,7 +215,7 @@ def get_merged_prs(repo: str) -> list[PRInfo]:
                 title=title,
                 pr_id=extract_queue_pr_id(title),
                 url="",
-                is_cross_repository=bool(head.get("repo", {}).get("fork", False)),
+                is_cross_repository=bool(head_repo.get("fork", False)),
                 last_activity=_parse_iso(entry.get("merged_at")),
             )
         )
