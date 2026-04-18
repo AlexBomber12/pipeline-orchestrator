@@ -110,6 +110,14 @@ def derive_queue_task_statuses(
 
     for task in tasks:
         header = _load_task_header(task, repo_path)
+        if header.pr_id != task.pr_id:
+            task_ref = task.task_file or task.pr_id
+            raise QueueValidationError(
+                [
+                    f"{task_ref}: header PR ID {header.pr_id!r} "
+                    f"does not match queue entry {task.pr_id!r}"
+                ]
+            )
         status = derive_task_status(header, merged_pr_ids, open_prs)
         derived.append(
             task.model_copy(update={"status": status, "branch": header.branch})

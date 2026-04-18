@@ -3,8 +3,10 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from src.models import PRInfo, QueueTask, TaskStatus
-from src.queue_parser import TaskHeader
+from src.queue_parser import QueueValidationError, TaskHeader
 from src.task_status import (
     _load_task_header,
     derive_task_status,
@@ -234,3 +236,39 @@ def test_derive_queue_task_statuses_marks_done_from_merged_pr_history(
     )
 
     assert derived[0].status == TaskStatus.DONE
+
+
+def test_derive_queue_task_statuses_rejects_mismatched_task_file_pr_id(
+    monkeypatch,
+) -> None:
+    task = QueueTask(
+        pr_id="PR-001",
+        title="Queued task",
+        status=TaskStatus.TODO,
+        branch="pr-001-queued-task",
+        task_file="tasks/PR-999.md",
+    )
+
+    monkeypatch.setattr(
+        "src.task_status.get_merged_pr_ids",
+        lambda repo_path, base_branch: set(),
+    )
+    monkeypatch.setattr(
+        "src.task_status._load_task_header",
+        lambda current_task, repo_path: _header(
+            "pr-999-other-task",
+            pr_id="PR-999",
+        ),
+    )
+
+    with pytest.raises(QueueValidationError) as excinfo:
+        derive_queue_task_statuses(
+            [task],
+            "/repo",
+            "main",
+            set(),
+        )
+
+    assert excinfo.value.issues == [
+        "tasks/PR-999.md: header PR ID 'PR-999' does not match queue entry 'PR-001'"
+    ]
