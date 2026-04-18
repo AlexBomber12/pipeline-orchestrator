@@ -80,18 +80,16 @@ class IdleMixin:
             self.state.current_task = None
             return
         try:
-            github_client.clear_merged_prs_cache()
             merged_prs = github_client.get_merged_prs(
                 self.owner_repo,
                 self.repo_config.branch,
             )
         except Exception as exc:
             self.log_event(
-                f"IDLE: merged PR check failed: {exc}; deferring task dispatch"
+                f"IDLE: merged PR check failed: {exc}; "
+                "continuing with git-only status derivation"
             )
-            self.state.current_pr = None
-            self.state.current_task = None
-            return
+            merged_prs = []
         try:
             derive_args = (
                 tasks,

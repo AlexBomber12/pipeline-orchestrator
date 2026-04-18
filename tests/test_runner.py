@@ -3310,7 +3310,7 @@ def test_handle_idle_open_pr_check_survives_github_failure(
     assert any("open PR check failed" in e["event"] for e in runner.state.history)
 
 
-def test_handle_idle_defers_on_merged_pr_check_failure(
+def test_handle_idle_continues_on_merged_pr_check_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_subprocess(monkeypatch)
@@ -3332,12 +3332,18 @@ def test_handle_idle_defers_on_merged_pr_check_failure(
         "get_merged_prs",
         lambda repo, branch: (_ for _ in ()).throw(RuntimeError("API down")),
     )
+    derived_calls: list[list[PRInfo]] = []
     monkeypatch.setattr(
         idle_module,
         "derive_queue_task_statuses",
-        lambda tasks, repo_path, base_branch, prs, merged_prs=(): tasks,
+        lambda tasks, repo_path, base_branch, prs, merged_prs=(): (
+            derived_calls.append(list(merged_prs)) or tasks
+        ),
     )
+    coding_called = {"v": False}
+
     async def fake_handle_coding() -> None:
+        coding_called["v"] = True
         return None
 
     runner = _make_runner()
@@ -3345,13 +3351,14 @@ def test_handle_idle_defers_on_merged_pr_check_failure(
     runner.state.current_pr = PRInfo(number=5, branch="stale")
     asyncio.run(runner.handle_idle())
 
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.current_pr is None
-    assert runner.state.current_task is None
+    assert runner.state.state == PipelineState.CODING
+    assert runner.state.current_task == task
+    assert coding_called["v"] is True
+    assert derived_calls == [[]]
     assert any("merged PR check failed" in e["event"] for e in runner.state.history)
 
 
-def test_handle_idle_clears_merged_pr_cache_before_lookup(
+def test_handle_idle_reads_merged_prs_without_clearing_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_subprocess(monkeypatch)
@@ -3370,18 +3377,10 @@ def test_handle_idle_clears_merged_pr_cache_before_lookup(
     )
     calls: list[str] = []
 
-    def fake_clear_merged_prs_cache() -> None:
-        calls.append("clear")
-
     def fake_get_merged_prs(repo: str, branch: str) -> list[PRInfo]:
         calls.append("get")
         return []
 
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "clear_merged_prs_cache",
-        fake_clear_merged_prs_cache,
-    )
     monkeypatch.setattr(
         runner_module.github_client,
         "get_merged_prs",
@@ -3400,7 +3399,7 @@ def test_handle_idle_clears_merged_pr_cache_before_lookup(
     runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
     asyncio.run(runner.handle_idle())
 
-    assert calls[:2] == ["clear", "get"]
+    assert calls == ["get"]
 
 
 # ------------------------------------------------------------------
