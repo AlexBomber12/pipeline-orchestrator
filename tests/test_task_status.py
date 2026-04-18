@@ -173,8 +173,35 @@ def test_get_merged_pr_ids_limits_probe_to_requested_candidates(
 
     assert get_merged_pr_ids("/repo", "main", {"PR-085", "PR-099"}) == {"PR-085"}
     assert "--extended-regexp" in calls[0]
-    assert "--max-count=2" in calls[0]
+    assert not any(arg.startswith("--max-count=") for arg in calls[0])
     assert any(arg.startswith("--grep=^(") for arg in calls[0])
+
+
+def test_get_merged_pr_ids_candidate_probe_does_not_cap_duplicate_matches(
+    monkeypatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(*args, **kwargs) -> subprocess.CompletedProcess[str]:
+        calls.append(args[0])
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout=(
+                "PR-085: first merge\n"
+                "PR-085: reland\n"
+                "PR-099: separate task\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("src.task_status.subprocess.run", fake_run)
+
+    assert get_merged_pr_ids("/repo", "main", {"PR-085", "PR-099"}) == {
+        "PR-085",
+        "PR-099",
+    }
+    assert not any(arg.startswith("--max-count=") for arg in calls[0])
 
 
 def test_find_matching_open_pr_rejects_conflicting_pr_identity() -> None:

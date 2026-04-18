@@ -194,7 +194,6 @@ def _scan_candidate_merged_pr_ids(
             "--format=%s",
             "--extended-regexp",
             f"--grep=^({pattern}):",
-            f"--max-count={len(candidate_pr_ids)}",
         ],
         capture_output=True,
         text=True,
