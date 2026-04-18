@@ -426,7 +426,7 @@
 - Branch: pr-072-review-dedup-by-pr
 
 ## PR-073: CoderPlugin protocol and registry
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-073.md
 - Branch: pr-073-coder-plugin-protocol
 
