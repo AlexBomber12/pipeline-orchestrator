@@ -9,10 +9,12 @@ import pytest
 from src.models import TaskStatus
 from src.queue_parser import (
     QueueValidationError,
+    TaskHeader,
     get_next_task,
     mark_task_done,
     parse_queue,
     parse_queue_text,
+    parse_task_header,
 )
 
 SAMPLE_QUEUE = """## PR-001: Bootstrap
@@ -44,6 +46,12 @@ def _write_queue(tmp_path: Path, content: str = SAMPLE_QUEUE) -> str:
     queue_path = tmp_path / "QUEUE.md"
     queue_path.write_text(content, encoding="utf-8")
     return str(queue_path)
+
+
+def _write_task_file(tmp_path: Path, content: str) -> Path:
+    task_path = tmp_path / "PR-999.md"
+    task_path.write_text(content, encoding="utf-8")
+    return task_path
 
 
 def test_parse_queue_missing_file_returns_empty(tmp_path: Path) -> None:
@@ -82,6 +90,179 @@ def test_parse_queue_extracts_fields(tmp_path: Path) -> None:
     assert pr3.task_file == "tasks/PR-003.md"
     assert pr3.branch == "pr-003-parser"
     assert pr3.depends_on == ["PR-002"]
+
+
+def test_parse_task_header_complete(tmp_path: Path) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: feature
+- Complexity: medium
+- Depends on: PR-063, PR-065
+- Priority: 2
+- Coder: codex
+""",
+    )
+
+    header = parse_task_header(task_path)
+
+    assert header == TaskHeader(
+        pr_id="PR-084",
+        title="Task file header parser",
+        branch="pr-084-task-header-parser",
+        task_type="feature",
+        complexity="medium",
+        depends_on=["PR-063", "PR-065"],
+        priority=2,
+        coder="codex",
+    )
+
+
+def test_parse_task_header_depends_on_none(tmp_path: Path) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: feature
+- Complexity: medium
+- Depends on: none
+""",
+    )
+
+    header = parse_task_header(task_path)
+
+    assert header.depends_on == []
+
+
+def test_parse_task_header_depends_on_missing_raises(
+    tmp_path: Path,
+) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: feature
+- Complexity: medium
+""",
+    )
+
+    with pytest.raises(QueueValidationError, match="missing Depends on"):
+        parse_task_header(task_path)
+
+
+def test_parse_task_header_depends_on_empty_raises(tmp_path: Path) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: feature
+- Complexity: medium
+- Depends on:
+""",
+    )
+
+    with pytest.raises(QueueValidationError, match="invalid Depends on"):
+        parse_task_header(task_path)
+
+
+def test_parse_task_header_allows_existing_repo_task_types(
+    tmp_path: Path,
+) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: config
+- Complexity: low
+- Depends on: none
+""",
+    )
+
+    header = parse_task_header(task_path)
+
+    assert header.task_type == "config"
+
+
+def test_parse_task_header_ignores_metadata_like_bullets_after_header(
+    tmp_path: Path,
+) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: feature
+- Complexity: medium
+- Depends on: none
+
+## Notes
+
+- Depends on: PR-999
+- Type: docs
+""",
+    )
+
+    header = parse_task_header(task_path)
+
+    assert header.depends_on == []
+    assert header.task_type == "feature"
+
+def test_parse_task_header_priority_default(tmp_path: Path) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: feature
+- Complexity: medium
+- Depends on: none
+""",
+    )
+
+    header = parse_task_header(task_path)
+
+    assert header.priority == 3
+
+
+def test_parse_task_header_coder_default(tmp_path: Path) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: feature
+- Complexity: medium
+- Depends on: none
+- Priority: 4
+""",
+    )
+
+    header = parse_task_header(task_path)
+
+    assert header.coder == "any"
+
+
+def test_parse_task_header_multiple_deps(tmp_path: Path) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: feature
+- Complexity: medium
+- Depends on: PR-063, PR-065
+""",
+    )
+
+    header = parse_task_header(task_path)
+
+    assert header.depends_on == ["PR-063", "PR-065"]
 
 
 def test_get_next_task_returns_first_todo_no_deps(tmp_path: Path) -> None:
