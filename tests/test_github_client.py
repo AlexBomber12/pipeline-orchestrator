@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from datetime import datetime, timedelta
 from datetime import timezone as _tz
@@ -10,6 +11,8 @@ from typing import Any
 import pytest
 from src.github_client import (
     _ci_status_from_rollup,
+    _compute_review_status,
+    _get_codex_issue_reactions,
     _is_codex_user,
     _is_plus_one,
     clear_merged_prs_cache,
@@ -1387,6 +1390,120 @@ def test_get_pr_review_status_propagates_error_on_pr_404(
 
     with pytest.raises(RuntimeError, match="403"):
         get_pr_review_status("owner/name", 404)
+
+
+def test_get_codex_issue_reactions_returns_empty_on_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_paginated(path: str) -> list[dict]:
+        raise RuntimeError("net/http: TLS handshake timeout")
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    assert _get_codex_issue_reactions("owner/name", 42) == []
+
+
+def test_get_codex_issue_reactions_logs_warning_on_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def fake_paginated(path: str) -> list[dict]:
+        raise RuntimeError("net/http: TLS handshake timeout")
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    caplog.set_level(logging.WARNING)
+
+    assert _get_codex_issue_reactions("owner/name", 42) == []
+    assert any(
+        record.levelno == logging.WARNING
+        and record.getMessage()
+        == (
+            "Reactions fetch degraded for PR 42 in owner/name: "
+            "net/http: TLS handshake timeout"
+        )
+        for record in caplog.records
+    )
+
+
+def test_compute_review_status_propagates_non_transient_body_reactions_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/42/reactions"):
+            raise RuntimeError("HTTP 403 rate limit exceeded")
+        if path.endswith("/issues/42/comments"):
+            return [
+                {
+                    "id": 10,
+                    "user": {"login": "author"},
+                    "body": "@codex review",
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ]
+        if path.endswith("/pulls/42/comments"):
+            return []
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    with pytest.raises(RuntimeError, match="403"):
+        _compute_review_status("owner/name", 42, "author", "")
+
+
+def test_compute_review_status_degrades_when_anchor_reactions_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/42/reactions"):
+            return []
+        if path.endswith("/issues/42/comments"):
+            return [
+                {
+                    "id": 10,
+                    "user": {"login": "author"},
+                    "body": "@codex review",
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ]
+        if path.endswith("/pulls/42/comments"):
+            return []
+        if path.endswith("/issues/comments/10/reactions"):
+            raise RuntimeError("i/o timeout")
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    assert (
+        _compute_review_status("owner/name", 42, "author", "")
+        == ReviewStatus.PENDING
+    )
+
+
+def test_compute_review_status_propagates_non_transient_anchor_reactions_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/42/reactions"):
+            return []
+        if path.endswith("/issues/42/comments"):
+            return [
+                {
+                    "id": 10,
+                    "user": {"login": "author"},
+                    "body": "@codex review",
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ]
+        if path.endswith("/pulls/42/comments"):
+            return []
+        if path.endswith("/issues/comments/10/reactions"):
+            raise RuntimeError("HTTP 403 rate limit exceeded")
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    with pytest.raises(RuntimeError, match="403"):
+        _compute_review_status("owner/name", 42, "author", "")
 
 
 def _is_commits_path(cmd: list[str]) -> bool:
