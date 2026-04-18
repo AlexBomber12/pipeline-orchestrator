@@ -53,6 +53,40 @@ class IdleMixin:
             for issue in exc.issues
         )
 
+    @staticmethod
+    def _filter_dag_headers_with_available_dependencies(
+        headers: list,
+        skipped_legacy_pr_ids: set[str],
+        task_dir: Path,
+    ) -> list:
+        blocked_pr_ids: set[str] = set()
+        structured_pr_ids = {header.pr_id for header in headers}
+
+        changed = True
+        while changed:
+            changed = False
+            available_pr_ids = structured_pr_ids - blocked_pr_ids
+            for header in headers:
+                if header.pr_id in blocked_pr_ids:
+                    continue
+                for dependency in header.depends_on:
+                    if dependency in available_pr_ids:
+                        continue
+                    if dependency in blocked_pr_ids:
+                        blocked_pr_ids.add(header.pr_id)
+                        changed = True
+                        break
+                    if dependency in skipped_legacy_pr_ids:
+                        blocked_pr_ids.add(header.pr_id)
+                        changed = True
+                        break
+                    if not (task_dir / f"{dependency}.md").exists():
+                        blocked_pr_ids.add(header.pr_id)
+                        changed = True
+                        break
+
+        return [header for header in headers if header.pr_id not in blocked_pr_ids]
+
     async def _select_next_task_from_dag(self) -> QueueTask | None:
         """Pick the next eligible task from structured task headers."""
         self._idle_dag_tasks = None
@@ -78,18 +112,13 @@ class IdleMixin:
             headers.append(header)
             task_files[header.pr_id] = task_file.relative_to(repo_root).as_posix()
 
+        headers = self._filter_dag_headers_with_available_dependencies(
+            headers,
+            skipped_legacy_pr_ids,
+            task_dir,
+        )
         if not headers:
             return None
-
-        structured_pr_ids = {header.pr_id for header in headers}
-        for header in headers:
-            for dependency in header.depends_on:
-                if dependency in structured_pr_ids:
-                    continue
-                if dependency in skipped_legacy_pr_ids:
-                    return None
-                if not (task_dir / f"{dependency}.md").exists():
-                    return None
 
         try:
             merged_pr_ids = get_merged_pr_ids(
