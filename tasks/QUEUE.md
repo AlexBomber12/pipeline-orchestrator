@@ -455,7 +455,7 @@
 - Depends on: PR-074, PR-075, PR-076
 
 ## PR-078: Unified coder settings table
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-078.md
 - Branch: pr-078-coder-settings-table
 - Depends on: PR-077

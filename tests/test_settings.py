@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import threading
 from pathlib import Path
@@ -29,6 +30,27 @@ class _StubAioredis:
     @staticmethod
     def from_url(url: str, decode_responses: bool = True) -> _StubAioredisClient:
         return _StubAioredisClient()
+
+
+@pytest.fixture(autouse=True)
+def _stub_auth_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(
+        cmd: list[str], *args: object, **kwargs: object
+    ) -> _FakeCompleted:
+        if cmd and cmd[0] == "claude":
+            return _FakeCompleted(0, stdout="claude 1.2.3\n")
+        if cmd and cmd[0] == "codex":
+            if cmd[1:] == ["--version"]:
+                return _FakeCompleted(0, stdout="codex-cli 0.121.0\n")
+            return _FakeCompleted(0, stdout="Logged in with ChatGPT\n")
+        if cmd and cmd[0] == "gh":
+            return _FakeCompleted(
+                0,
+                stderr="github.com\n  ✓ Logged in to github.com as octocat (oauth_token)\n",
+            )
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(web_app.subprocess, "run", fake_run)
 
 
 @pytest.fixture
@@ -517,8 +539,8 @@ def test_settings_page_renders_daemon_section(empty_config: Path) -> None:
     assert 'name="review_timeout_min"' in body
     assert 'name="hung_fallback_codex_review"' in body
     assert 'name="error_handler_use_ai"' in body
-    assert "Auth Status" in body
-    assert 'id="settings-auth-status"' in body
+    assert "Coders" in body
+    assert "GitHub CLI" in body
 
 
 def test_partial_daemon_returns_fragment(empty_config: Path) -> None:
@@ -531,6 +553,19 @@ def test_partial_daemon_returns_fragment(empty_config: Path) -> None:
     assert 'name="poll_interval_sec"' in body
     assert 'id="settings-daemon-error"' in body
     assert 'hx-swap-oob="innerHTML"' in body
+
+
+def test_partial_coders_returns_polling_fragment(empty_config: Path) -> None:
+    with TestClient(app) as client:
+        response = client.get("/partials/settings/coders")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "<!DOCTYPE" not in body
+    assert 'id="settings-coders"' in body
+    assert 'hx-get="/partials/settings/coders"' in body
+    assert 'hx-trigger="every 30s"' in body
+    assert 'hx-swap="outerHTML"' in body
 
 
 def test_put_daemon_updates_numeric_fields(empty_config: Path) -> None:
@@ -687,6 +722,60 @@ def test_put_daemon_success_oob_clears_stale_error(empty_config: Path) -> None:
     body = response.text
     assert 'id="settings-daemon-error"' in body
     assert 'hx-swap-oob="innerHTML"' in body
+    assert 'id="settings-coders"' in body
+    assert 'hx-swap-oob="outerHTML"' in body
+
+
+def test_put_daemon_error_oob_refreshes_coder_controls(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(src_config, "save_config", _raise_permission_error)
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 503
+    body = response.text
+    assert 'id="settings-coders"' in body
+    assert 'hx-swap-oob="outerHTML"' in body
+    assert re.search(
+        r'name="coder"[\s\S]*value="claude"[\s\S]*checked',
+        body,
+    )
+    assert re.search(
+        r'name="coder"[\s\S]*value="codex"',
+        body,
+    )
+    assert not re.search(
+        r'name="coder"[\s\S]*value="codex"[\s\S]*checked',
+        body,
+    )
+
+
+def test_put_daemon_does_not_probe_auth_status(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    def fail_if_called(
+        cmd: list[str], *args: object, **kwargs: object
+    ) -> _FakeCompleted:
+        calls.append(cmd)
+        raise AssertionError(f"unexpected auth probe during daemon PUT: {cmd}")
+
+    monkeypatch.setattr(web_app.subprocess, "run", fail_if_called)
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"poll_interval_sec": "45"},
+        )
+
+    assert response.status_code == 200
+    assert calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -1176,9 +1265,10 @@ def test_coder_dropdown_renders_with_current_value(
         response = client.get("/settings")
 
     assert response.status_code == 200
-    assert "Coder" in response.text
+    assert "Coders" in response.text
     assert "Claude Code" in response.text
     assert "Codex CLI" in response.text
+    assert 'type="radio"' in response.text
 
 
 def test_coder_setting_saves_and_reloads(
@@ -1213,6 +1303,42 @@ def test_codex_model_setting_saves(
     assert response.status_code == 200
     cfg = load_config(str(empty_config))
     assert cfg.daemon.codex_model == "o4-mini"
+
+
+def test_codex_model_setting_clears_to_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text("daemon:\n  codex_model: o4-mini\n", encoding="utf-8")
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"codex_model": ""},
+        )
+
+    assert response.status_code == 200
+    cfg = load_config(str(cfg_path))
+    assert cfg.daemon.codex_model == ""
+
+
+def test_claude_model_setting_saves(
+    empty_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(empty_config))
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"claude_model": "sonnet"},
+        )
+
+    assert response.status_code == 200
+    cfg = load_config(str(empty_config))
+    assert cfg.daemon.claude_model == "sonnet"
 
 
 def test_repo_coder_override_saves(
@@ -1254,3 +1380,118 @@ def test_repo_coder_override_clear(
     assert response.status_code == 200
     cfg = load_config(str(one_repo_config))
     assert cfg.repositories[0].coder is None
+
+
+def test_coders_table_shows_auth_status(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_fake_subprocess(
+        monkeypatch,
+        claude=_FakeCompleted(0, stdout="claude 1.2.3\n"),
+        gh=_FakeCompleted(
+            0, stderr="github.com\n  ✓ Logged in to github.com as octocat\n"
+        ),
+        codex=_FakeCompleted(1, stderr="codex not authenticated"),
+        codex_version=_FakeCompleted(0, stdout="codex-cli 0.121.0\n"),
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/settings")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "Authorized" in body
+    assert "codex not authenticated" in body
+    assert "GitHub CLI" in body
+
+
+def test_coders_table_polls_for_auth_refresh(empty_config: Path) -> None:
+    with TestClient(app) as client:
+        response = client.get("/settings")
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'id="settings-coders"' in body
+    assert 'hx-get="/partials/settings/coders"' in body
+    assert 'hx-trigger="every 30s"' in body
+
+
+def test_coders_table_includes_unknown_selected_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n  coder: codex\n  codex_model: custom-model\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+
+    with TestClient(app) as client:
+        response = client.get("/settings")
+
+    assert response.status_code == 200
+    body = response.text
+    assert (
+        '<option value="custom-model" selected>'
+        in body
+    )
+
+
+def test_repo_detail_coder_dropdown_renders(
+    one_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(one_repo_config))
+
+    with TestClient(app) as client:
+        response = client.get("/repo/example__alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'hx-put="/settings/repo/example__alpha"' in body
+    assert "Inherit (Claude)" in body
+    assert "Codex CLI" in body
+
+
+def test_repo_detail_inherit_label_uses_daemon_default(
+    one_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    one_repo_config.write_text(
+        "daemon:\n"
+        "  coder: claude\n"
+        "repositories:\n"
+        "  - url: https://github.com/example/alpha.git\n"
+        "    branch: main\n"
+        "    auto_merge: true\n"
+        "    review_timeout_min: 60\n"
+        "    coder: codex\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(one_repo_config))
+
+    with TestClient(app) as client:
+        response = client.get("/repo/example__alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "Inherit (Claude)" in body
+    assert "Inherit (Codex)" not in body
+
+
+def test_repo_coder_change_saves_to_config(
+    one_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(one_repo_config))
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/repo/example__alpha",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 200
+    cfg = load_config(str(one_repo_config))
+    assert cfg.repositories[0].coder is not None
+    assert cfg.repositories[0].coder.value == "codex"

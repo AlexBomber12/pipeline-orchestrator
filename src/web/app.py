@@ -22,9 +22,12 @@ from fastapi import FastAPI, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
+from src.coders import build_coder_registry
 from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
 from src.config import (
+    AppConfig,
+    RepoConfig,
     add_repository,
     load_config,
     remove_repository,
@@ -114,6 +117,30 @@ async def get_repo_state(
     return _default_repo_state(name, url)
 
 
+def _find_repo_config_by_name(
+    config: AppConfig, name: str
+) -> RepoConfig | None:
+    """Return the configured repo whose slug matches ``name``."""
+    for repo in config.repositories:
+        if repo_slug_from_url(repo.url) == name:
+            return repo
+    return None
+
+
+def _effective_coder_name(
+    repo_config: RepoConfig | None, config: AppConfig
+) -> str:
+    """Return the effective coder name for a repo."""
+    if repo_config is not None and repo_config.coder is not None:
+        return repo_config.coder.value
+    return config.daemon.coder.value
+
+
+def _daemon_default_coder_name(config: AppConfig) -> str:
+    """Return the daemon-level default coder name."""
+    return config.daemon.coder.value
+
+
 async def get_all_repo_states(
     redis_client: aioredis.Redis | None,
     config_path: str = CONFIG_PATH,
@@ -157,6 +184,58 @@ async def get_all_repo_states(
         states.append(state)
 
     return states, redis_warning
+
+
+def _build_coder_rows(
+    config: AppConfig, auth: dict[str, dict[str, str]]
+) -> list[dict[str, Any]]:
+    """Return coder rows for the settings table and JSON API."""
+    rows: list[dict[str, Any]] = []
+    for plugin in build_coder_registry().list_coders():
+        selected_model = (
+            config.daemon.claude_model
+            if plugin.name == "claude"
+            else config.daemon.codex_model
+        )
+        model_options = list(plugin.models)
+        if selected_model not in model_options:
+            model_options.append(selected_model)
+        rows.append(
+            {
+                "name": plugin.name,
+                "display_name": plugin.display_name,
+                "models": model_options,
+                "selected_model": selected_model,
+                "auth": auth.get(
+                    plugin.name,
+                    {
+                        "status": "error",
+                        "detail": f"{plugin.display_name} unavailable",
+                    },
+                ),
+                "is_default": config.daemon.coder.value == plugin.name,
+            }
+        )
+    return rows
+
+
+async def _repo_template_context(
+    name: str,
+    redis_client: aioredis.Redis | None,
+    config_path: str = CONFIG_PATH,
+) -> dict[str, Any]:
+    """Return template context for repo detail renders."""
+    config = load_config(config_path)
+    state = await get_repo_state(name, redis_client, config_path=config_path)
+    repo_config = _find_repo_config_by_name(config, name)
+    return {
+        "repo": state,
+        "repo_config": repo_config,
+        "daemon": config.daemon,
+        "coders": build_coder_registry().list_coders(),
+        "effective_coder": _effective_coder_name(repo_config, config),
+        "inherit_coder": _daemon_default_coder_name(config),
+    }
 
 
 _MERGE_EVENT_MARKER = "Merged PR"
@@ -605,14 +684,14 @@ async def partial_alerts(request: Request) -> HTMLResponse:
 @app.get("/repo/{name}", response_class=HTMLResponse)
 async def repo_detail(request: Request, name: str) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
-    state = await get_repo_state(name, redis_client)
+    context = await _repo_template_context(name, redis_client)
     return templates.TemplateResponse(
         request,
         "repo.html",
         {
             "title": name,
-            "repo": state,
-            "events": list(state.history),
+            **context,
+            "events": list(context["repo"].history),
         },
     )
 
@@ -627,11 +706,11 @@ async def partial_repo_detail(request: Request, name: str) -> HTMLResponse:
     would otherwise wipe the log and reset its scroll on every tick).
     """
     redis_client = getattr(request.app.state, "redis", None)
-    state = await get_repo_state(name, redis_client)
+    context = await _repo_template_context(name, redis_client)
     return templates.TemplateResponse(
         request,
         "components/repo_summary.html",
-        {"repo": state},
+        context,
     )
 
 
@@ -732,6 +811,8 @@ def _render_settings_error(
 @app.get("/settings", response_class=HTMLResponse)
 async def settings_page(request: Request) -> HTMLResponse:
     cfg = load_config(CONFIG_PATH)
+    auth = await _collect_auth_status()
+    coder_rows = _build_coder_rows(cfg, auth)
     return templates.TemplateResponse(
         request,
         "settings.html",
@@ -739,42 +820,96 @@ async def settings_page(request: Request) -> HTMLResponse:
             "title": "Settings",
             "repos": cfg.repositories,
             "daemon": cfg.daemon,
+            "coders": coder_rows,
+            "auth": auth,
         },
     )
 
 
-def _render_settings_daemon(request: Request) -> HTMLResponse:
-    """Render the daemon settings form for a successful response.
+def _default_auth_status() -> dict[str, dict[str, str]]:
+    """Return placeholder auth status entries when no cached probe exists."""
+    unavailable = {"status": "error", "detail": "Status unavailable"}
+    return {
+        "claude": dict(unavailable),
+        "codex": dict(unavailable),
+        "gh": dict(unavailable),
+    }
 
-    Uses ``settings_daemon_response.html`` rather than the bare
-    ``settings_daemon.html`` partial so HTMX also receives an OOB clear
-    of ``#settings-daemon-error`` — otherwise an error banner left over
-    from a prior 422/503 PUT would keep hanging around after a subsequent
-    successful mutation.
-    """
+
+_AUTH_STATUS_CACHE: dict[str, dict[str, str]] | None = None
+
+
+def _get_cached_auth_status() -> dict[str, dict[str, str]]:
+    """Return the last collected auth status, if available."""
+    source = _AUTH_STATUS_CACHE or _default_auth_status()
+    return {key: dict(value) for key, value in source.items()}
+
+
+async def _settings_daemon_template_context(
+    request: Request,
+    *,
+    use_cached_auth: bool = False,
+) -> dict[str, Any]:
     cfg = load_config(CONFIG_PATH)
+    auth = (
+        _get_cached_auth_status()
+        if use_cached_auth
+        else await _collect_auth_status()
+    )
+    return {
+        "daemon": cfg.daemon,
+        "coders": _build_coder_rows(cfg, auth),
+        "auth": auth,
+    }
+
+
+async def _render_settings_daemon_response(request: Request) -> HTMLResponse:
+    """Render the daemon settings form for a successful mutation response.
+
+    Successful PUTs re-render both the daemon form and the coder controls.
+    The coder block is sent as an out-of-band swap so HTMX resets any
+    radio/select state that the browser changed optimistically before the
+    server accepted the update.
+    """
     return templates.TemplateResponse(
         request,
         "components/settings_daemon_response.html",
-        {"daemon": cfg.daemon},
+        await _settings_daemon_template_context(request, use_cached_auth=True),
     )
 
 
-def _render_settings_daemon_error(
+async def _render_settings_daemon_error(
     request: Request, message: str, status_code: int
 ) -> HTMLResponse:
-    cfg = load_config(CONFIG_PATH)
+    context = await _settings_daemon_template_context(
+        request, use_cached_auth=True
+    )
     return templates.TemplateResponse(
         request,
         "components/settings_daemon_error.html",
-        {"daemon": cfg.daemon, "message": message},
+        {**context, "message": message},
         status_code=status_code,
     )
 
 
 @app.get("/partials/settings/daemon", response_class=HTMLResponse)
 async def partial_settings_daemon(request: Request) -> HTMLResponse:
-    return _render_settings_daemon(request)
+    context = await _settings_daemon_template_context(request)
+    return templates.TemplateResponse(
+        request,
+        "components/settings_daemon_response.html",
+        context,
+    )
+
+
+@app.get("/partials/settings/coders", response_class=HTMLResponse)
+async def partial_settings_coders(request: Request) -> HTMLResponse:
+    context = await _settings_daemon_template_context(request)
+    return templates.TemplateResponse(
+        request,
+        "components/settings_coders_wrapper.html",
+        context,
+    )
 
 
 @app.put("/settings/daemon", response_class=HTMLResponse)
@@ -789,6 +924,7 @@ async def put_settings_daemon(
     rate_limit_session_pause_percent: str | None = Form(None),
     rate_limit_weekly_pause_percent: str | None = Form(None),
     coder: str | None = Form(None),
+    claude_model: str | None = Form(None),
     codex_model: str | None = Form(None),
 ) -> HTMLResponse:
     """Update daemon settings.
@@ -859,20 +995,22 @@ async def put_settings_daemon(
             if coder not in ("claude", "codex"):
                 raise ValueError("coder must be 'claude' or 'codex'")
             updates["coder"] = coder
-        if codex_model is not None and codex_model != "":
+        if claude_model is not None and claude_model != "":
+            updates["claude_model"] = claude_model
+        if codex_model is not None:
             updates["codex_model"] = codex_model
     except ValueError as exc:
-        return _render_settings_daemon_error(request, str(exc), 422)
+        return await _render_settings_daemon_error(request, str(exc), 422)
 
     try:
         update_daemon_config(path=CONFIG_PATH, **updates)
     except ValueError as exc:
-        return _render_settings_daemon_error(request, str(exc), 422)
+        return await _render_settings_daemon_error(request, str(exc), 422)
     except OSError as exc:
-        return _render_settings_daemon_error(
+        return await _render_settings_daemon_error(
             request, f"Failed to write config.yml: {exc}", 503
         )
-    return _render_settings_daemon(request)
+    return await _render_settings_daemon_response(request)
 
 
 _AUTH_CHECK_TIMEOUT_SEC = 5
@@ -982,12 +1120,21 @@ async def _collect_auth_status() -> dict[str, dict[str, str]]:
         asyncio.to_thread(_check_codex_auth),
         asyncio.to_thread(_check_gh_auth),
     )
-    return {"claude": claude, "codex": codex, "gh": gh}
+    global _AUTH_STATUS_CACHE
+    _AUTH_STATUS_CACHE = {"claude": claude, "codex": codex, "gh": gh}
+    return _get_cached_auth_status()
 
 
 @app.get("/api/auth-status")
 async def api_auth_status() -> JSONResponse:
     return JSONResponse(await _collect_auth_status())
+
+
+@app.get("/api/coders")
+async def api_coders() -> JSONResponse:
+    cfg = load_config(CONFIG_PATH)
+    auth = await _collect_auth_status()
+    return JSONResponse({"coders": _build_coder_rows(cfg, auth)})
 
 
 @app.get("/partials/settings/auth-status", response_class=HTMLResponse)
@@ -1162,6 +1309,43 @@ async def put_settings_repo(
     except OSError as exc:
         return _render_config_write_error(request, exc)
     return _render_settings_repo_list(request)
+
+
+@app.put("/settings/repo/{name}", response_class=HTMLResponse)
+async def put_repo_detail_coder(
+    request: Request,
+    name: str,
+    coder: str | None = Form(None),
+) -> HTMLResponse:
+    cfg = load_config(CONFIG_PATH)
+    repo = _find_repo_config_by_name(cfg, name)
+    if repo is None:
+        return HTMLResponse("Repository not found", status_code=404)
+
+    updates: dict[str, object | None] = {}
+    if coder is not None:
+        if coder == "":
+            updates["coder"] = None
+        elif coder in ("claude", "codex"):
+            updates["coder"] = coder
+        else:
+            return HTMLResponse(
+                "coder must be 'claude', 'codex', or empty",
+                status_code=422,
+            )
+
+    try:
+        update_repository(repo.url, path=CONFIG_PATH, **updates)
+    except OSError as exc:
+        return HTMLResponse(f"Failed to write config.yml: {exc}", status_code=503)
+
+    redis_client = getattr(request.app.state, "redis", None)
+    context = await _repo_template_context(name, redis_client)
+    return templates.TemplateResponse(
+        request,
+        "components/repo_summary.html",
+        context,
+    )
 
 
 # ---------------------------------------------------------------------------
