@@ -1059,6 +1059,8 @@ def test_handle_idle_keeps_structured_task_when_legacy_dependency_is_already_don
     assert runner.state.queue_done == 0
     assert runner.state.queue_total == 1
     assert runner.state.error_message is None
+    assert runner._idle_dag_headers[0].depends_on == []
+    assert runner._idle_dag_tasks[0].depends_on == []
 
 
 def test_handle_idle_prefers_legacy_queue_task_over_dag_task(

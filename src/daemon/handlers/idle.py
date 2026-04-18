@@ -294,11 +294,11 @@ class IdleMixin:
         except ValueError as exc:
             raise QueueValidationError([str(exc)]) from exc
 
-        self._idle_dag_headers = list(headers)
+        self._idle_dag_headers = list(dag_headers)
         self._idle_dag_statuses = dict(statuses)
         self._idle_dag_tasks = [
             self._queue_task_from_header(header, statuses[header.pr_id], task_files)
-            for header in headers
+            for header in dag_headers
         ]
         doing_tasks = [
             task for task in self._idle_dag_tasks if task.status == TaskStatus.DOING
