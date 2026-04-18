@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 _TTL_SECONDS = 90 * 86400
+_RECENT_INDEX_LIMIT = 200
 
 
 @dataclass
@@ -35,8 +36,10 @@ class MetricsStore:
     async def save(self, record: RunRecord) -> None:
         key = self._record_key(record.run_id)
         payload = json.dumps(asdict(record), sort_keys=True)
+        recent_key = self._recent_key(record.task_id)
         await self._redis.set(key, payload, ex=_TTL_SECONDS)
-        await self._redis.lpush(self._recent_key(record.task_id), record.run_id)
+        await self._redis.lpush(recent_key, record.run_id)
+        await self._redis.ltrim(recent_key, 0, _RECENT_INDEX_LIMIT - 1)
 
     async def get(self, run_id: str) -> RunRecord | None:
         raw = await self._redis.get(self._record_key(run_id))
@@ -44,10 +47,10 @@ class MetricsStore:
             return None
         return RunRecord(**json.loads(raw))
 
-    async def recent(self, limit: int = 20) -> list[RunRecord]:
+    async def recent(self, task_id: str = "PR", limit: int = 20) -> list[RunRecord]:
         if limit <= 0:
             return []
-        run_ids = await self._redis.lrange("metrics:repo:PR", 0, limit - 1)
+        run_ids = await self._redis.lrange(self._recent_key(task_id), 0, limit - 1)
         records: list[RunRecord] = []
         for run_id in run_ids:
             record = await self.get(run_id)

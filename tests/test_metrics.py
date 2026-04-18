@@ -31,6 +31,12 @@ class _FakeRedis:
             stop = len(values) + stop
         return values[start:stop + 1]
 
+    async def ltrim(self, key: str, start: int, stop: int) -> None:
+        values = self.lists.get(key, [])
+        if stop < 0:
+            stop = len(values) + stop
+        self.lists[key] = values[start:stop + 1]
+
 
 def _record(run_id: str, **overrides: Any) -> RunRecord:
     base: dict[str, Any] = {
@@ -77,6 +83,32 @@ async def test_recent_returns_latest() -> None:
     recent = await store.recent(limit=2)
 
     assert [record.run_id for record in recent] == ["run-3", "run-2"]
+
+
+async def test_recent_reads_from_requested_task_namespace() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+
+    await store.save(_record("pr-run", task_id="PR-080"))
+    await store.save(_record("ops-run", task_id="OPS-001"))
+
+    recent = await store.recent(task_id="OPS-001", limit=5)
+
+    assert [record.run_id for record in recent] == ["ops-run"]
+
+
+async def test_save_trims_recent_index() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+
+    for index in range(205):
+        await store.save(_record(f"run-{index}"))
+
+    recent_ids = redis.lists["metrics:repo:PR"]
+
+    assert len(recent_ids) == 200
+    assert recent_ids[0] == "run-204"
+    assert recent_ids[-1] == "run-5"
 
 
 async def test_record_serialization() -> None:
