@@ -58,8 +58,14 @@ class IdleMixin:
         self,
         headers: list[TaskHeader],
         statuses: dict[str, TaskStatus],
-    ) -> None:
-        """Write and publish QUEUE.md only when the generated report changed."""
+    ) -> bool:
+        """Write and publish QUEUE.md only when the generated report changed.
+
+        Returns ``True`` when the generated queue is synchronized locally
+        after the call. A rejected push is treated as recoverable: the
+        helper resets back to ``origin/<base>`` and returns ``False`` so
+        IDLE can continue without carrying a stray local queue commit.
+        """
         queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
         content = self._generate_queue_md(headers, statuses)
         existing = (
@@ -68,7 +74,7 @@ class IdleMixin:
             else None
         )
         if existing == content:
-            return
+            return True
 
         queue_path.parent.mkdir(parents=True, exist_ok=True)
         queue_path.write_text(content, encoding="utf-8")
@@ -79,16 +85,36 @@ class IdleMixin:
             "-m",
             "AUTO: regenerate QUEUE.md from DAG",
         )
-        retry_transient(
+        push_result = retry_transient(
             lambda: git_ops._git(
                 self.repo_path,
                 "push",
                 "origin",
                 self.repo_config.branch,
                 timeout=60,
+                check=False,
             ),
             operation_name=f"git push origin {self.repo_config.branch}",
         )
+        if push_result.returncode == 0:
+            return True
+
+        retry_transient(
+            lambda: git_ops._git(
+                self.repo_path,
+                "fetch",
+                "origin",
+                self.repo_config.branch,
+            ),
+            operation_name=f"git fetch origin {self.repo_config.branch}",
+        )
+        git_ops._git(
+            self.repo_path,
+            "reset",
+            "--hard",
+            f"origin/{self.repo_config.branch}",
+        )
+        return False
 
     @staticmethod
     def _validate_task_file_header_match(task_file: Path, header_pr_id: str) -> None:
@@ -439,7 +465,7 @@ class IdleMixin:
             and not has_legacy_queue_tasks
         ):
             try:
-                self._write_generated_queue_md(
+                published_queue = self._write_generated_queue_md(
                     generated_headers,
                     generated_statuses,
                 )
@@ -454,6 +480,11 @@ class IdleMixin:
                 self.state.error_message = message
                 self.log_event(message)
                 return
+            if not published_queue:
+                self.log_event(
+                    "QUEUE.md auto-generation push rejected; "
+                    "continuing without publishing"
+                )
         if task is None:
             self.log_event("No tasks available")
             if prs:
