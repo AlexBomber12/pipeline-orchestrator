@@ -430,7 +430,11 @@ class IdleMixin:
         self.state.queue_total = len(queue_tasks)
         generated_headers = getattr(self, "_idle_dag_headers", None)
         generated_statuses = getattr(self, "_idle_dag_statuses", None)
-        if generated_headers and generated_statuses:
+        if (
+            generated_headers
+            and generated_statuses
+            and not has_legacy_queue_tasks
+        ):
             try:
                 self._write_generated_queue_md(
                     generated_headers,
