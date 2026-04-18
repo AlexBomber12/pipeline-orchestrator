@@ -14,13 +14,91 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from src import github_client
-from src.models import PipelineState, TaskStatus
-from src.queue_parser import QueueValidationError, get_next_task, parse_queue
-from src.task_status import derive_queue_task_statuses, find_matching_open_pr
+from src.dag import get_eligible_tasks
+from src.models import PipelineState, QueueTask, TaskStatus
+from src.queue_parser import (
+    QueueValidationError,
+    get_next_task,
+    parse_queue,
+    parse_task_header,
+)
+from src.task_status import (
+    derive_queue_task_statuses,
+    derive_task_status,
+    find_matching_open_pr,
+    get_merged_pr_ids,
+)
 
 
 class IdleMixin:
     """Handle IDLE state: sync, pick next task, dispatch to CODING."""
+
+    async def _select_next_task_from_dag(self) -> QueueTask | None:
+        """Pick the next eligible task from structured task headers."""
+        self._idle_dag_tasks = None
+        task_dir = Path(self.repo_path) / "tasks"
+        if not task_dir.is_dir():
+            return None
+
+        headers = []
+        task_files: dict[str, str] = {}
+        repo_root = Path(self.repo_path)
+        for task_file in sorted(task_dir.glob("PR-*.md")):
+            try:
+                header = parse_task_header(task_file)
+            except QueueValidationError:
+                continue
+            headers.append(header)
+            task_files[header.pr_id] = task_file.relative_to(repo_root).as_posix()
+
+        if not headers:
+            return None
+
+        try:
+            merged_pr_ids = get_merged_pr_ids(
+                self.repo_path,
+                self.repo_config.branch,
+                (header.pr_id for header in headers),
+            )
+            open_prs = list(getattr(self, "_idle_open_prs", ()))
+            merged_prs = list(getattr(self, "_idle_merged_prs", ()))
+            statuses = {
+                header.pr_id: derive_task_status(
+                    header,
+                    merged_pr_ids,
+                    open_prs,
+                    merged_prs,
+                )
+                for header in headers
+            }
+            eligible = get_eligible_tasks(headers, statuses)
+        except ValueError as exc:
+            raise QueueValidationError([str(exc)]) from exc
+
+        self._idle_dag_tasks = [
+            self._queue_task_from_header(header, statuses[header.pr_id], task_files)
+            for header in headers
+        ]
+        if not eligible:
+            return None
+
+        picked = eligible[0]
+        return self._queue_task_from_header(picked, TaskStatus.TODO, task_files)
+
+    def _queue_task_from_header(
+        self,
+        header,
+        status: TaskStatus,
+        task_files: dict[str, str],
+    ) -> QueueTask:
+        return QueueTask(
+            pr_id=header.pr_id,
+            title=header.title,
+            status=status,
+            task_file=task_files[header.pr_id],
+            depends_on=list(header.depends_on),
+            branch=header.branch,
+        )
 
     async def handle_idle(self) -> None:
         """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
@@ -58,15 +136,6 @@ class IdleMixin:
                 self.log_event(f"sync_to_main after upload failed: {exc}")
                 return
 
-        queue_path = str(Path(self.repo_path) / "tasks" / "QUEUE.md")
-        strict = self.app_config.daemon.strict_queue_validation
-        try:
-            tasks = parse_queue(queue_path, strict=strict)
-        except QueueValidationError as exc:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = str(exc)
-            self.log_event(f"Queue validation failed: {exc}")
-            return
         try:
             prs = github_client.get_open_prs(
                 self.owner_repo,
@@ -91,20 +160,16 @@ class IdleMixin:
                 "continuing with local merged-status heuristics"
             )
             merged_prs = []
+
+        queue_path = str(Path(self.repo_path) / "tasks" / "QUEUE.md")
+        strict = self.app_config.daemon.strict_queue_validation
+        dag_task = None
+        dag_tasks = None
+        self._idle_open_prs = prs
+        self._idle_merged_prs = merged_prs
         try:
-            derive_args = (
-                tasks,
-                self.repo_path,
-                self.repo_config.branch,
-                prs,
-            )
-            if len(inspect.signature(derive_queue_task_statuses).parameters) >= 5:
-                tasks = derive_queue_task_statuses(
-                    *derive_args,
-                    merged_prs,
-                )
-            else:
-                tasks = derive_queue_task_statuses(*derive_args)
+            dag_task = await self._select_next_task_from_dag()
+            dag_tasks = self._idle_dag_tasks
         except (
             OSError,
             RuntimeError,
@@ -112,19 +177,59 @@ class IdleMixin:
             subprocess.TimeoutExpired,
         ) as exc:
             self.state.state = PipelineState.ERROR
-            self.state.error_message = f"Task status derivation failed: {exc}"
-            self.log_event(f"Task status derivation failed: {exc}")
+            self.state.error_message = f"Task selection failed: {exc}"
+            self.log_event(f"Task selection failed: {exc}")
             return
+        finally:
+            self._idle_open_prs = []
+            self._idle_merged_prs = []
+
+        tasks = dag_tasks
+        task = dag_task
+        if task is None:
+            try:
+                tasks = parse_queue(queue_path, strict=strict)
+            except QueueValidationError as exc:
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = str(exc)
+                self.log_event(f"Queue validation failed: {exc}")
+                return
+            try:
+                derive_args = (
+                    tasks,
+                    self.repo_path,
+                    self.repo_config.branch,
+                    prs,
+                )
+                if len(inspect.signature(derive_queue_task_statuses).parameters) >= 5:
+                    tasks = derive_queue_task_statuses(
+                        *derive_args,
+                        merged_prs,
+                    )
+                else:
+                    tasks = derive_queue_task_statuses(*derive_args)
+            except (
+                OSError,
+                RuntimeError,
+                QueueValidationError,
+                subprocess.TimeoutExpired,
+            ) as exc:
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = f"Task status derivation failed: {exc}"
+                self.log_event(f"Task status derivation failed: {exc}")
+                return
+            task = get_next_task(tasks)
+
+        queue_tasks = dag_tasks if dag_tasks is not None else tasks
         self.state.queue_done = sum(
-            1 for t in tasks if t.status == TaskStatus.DONE
+            1 for t in queue_tasks if t.status == TaskStatus.DONE
         )
-        self.state.queue_total = len(tasks)
-        task = get_next_task(tasks)
+        self.state.queue_total = len(queue_tasks)
         if task is None:
             self.log_event("No tasks available")
             if prs:
                 done_branches = {
-                    t.branch for t in tasks
+                    t.branch for t in queue_tasks
                     if t.status == TaskStatus.DONE and t.branch
                 }
                 match = next(

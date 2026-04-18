@@ -507,7 +507,7 @@
 - Depends on: PR-085
 
 ## PR-087: Auto-queue integration in handle_idle
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-087.md
 - Branch: pr-087-auto-queue-idle
 - Depends on: PR-086
