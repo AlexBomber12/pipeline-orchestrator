@@ -7,6 +7,7 @@ Mixin methods:
 
 from __future__ import annotations
 
+import inspect
 import re
 import subprocess
 from datetime import datetime, timezone
@@ -77,13 +78,21 @@ class IdleMixin:
             )
             self.state.current_pr = None
             return
+        merged_prs = github_client.get_merged_prs(self.owner_repo)
         try:
-            tasks = derive_queue_task_statuses(
+            derive_args = (
                 tasks,
                 self.repo_path,
                 self.repo_config.branch,
                 prs,
             )
+            if len(inspect.signature(derive_queue_task_statuses).parameters) >= 5:
+                tasks = derive_queue_task_statuses(
+                    *derive_args,
+                    merged_prs,
+                )
+            else:
+                tasks = derive_queue_task_statuses(*derive_args)
         except (
             OSError,
             RuntimeError,

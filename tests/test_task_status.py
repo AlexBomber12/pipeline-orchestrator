@@ -4,13 +4,12 @@ import subprocess
 from pathlib import Path
 
 import pytest
-
 from src.models import PRInfo, QueueTask, TaskStatus
 from src.queue_parser import QueueValidationError, TaskHeader
 from src.task_status import (
     _load_task_header,
-    derive_task_status,
     derive_queue_task_statuses,
+    derive_task_status,
     find_matching_open_pr,
     get_merged_pr_ids,
 )
@@ -48,6 +47,22 @@ def test_derive_doing_when_open_pr() -> None:
                 number=109,
                 branch="pr-085-status-from-git",
                 title="PR-085: Status derivation from git",
+            )
+        ],
+    )
+
+    assert status == TaskStatus.DOING
+
+
+def test_derive_doing_when_open_pr_title_loses_queue_prefix() -> None:
+    status = derive_task_status(
+        _header("pr-085-status-from-git"),
+        set(),
+        [
+            PRInfo(
+                number=109,
+                branch="pr-085-status-from-git",
+                title="status derivation follow-up",
             )
         ],
     )
@@ -125,7 +140,7 @@ def test_get_merged_pr_ids_accepts_full_queue_pr_id_grammar(
     assert get_merged_pr_ids("/repo", "main") == {"PR-abc_1.2"}
 
 
-def test_find_matching_open_pr_requires_pr_identity() -> None:
+def test_find_matching_open_pr_rejects_conflicting_pr_identity() -> None:
     match = find_matching_open_pr(
         "PR-085",
         "pr-085-status-from-git",
@@ -133,12 +148,45 @@ def test_find_matching_open_pr_requires_pr_identity() -> None:
             PRInfo(
                 number=110,
                 branch="pr-085-status-from-git",
-                title="docs: unrelated work",
+                title="PR-999: unrelated work",
             )
         ],
     )
 
     assert match is None
+
+
+def test_find_matching_open_pr_allows_same_branch_when_pr_id_is_unavailable() -> None:
+    match = find_matching_open_pr(
+        "PR-085",
+        "pr-085-status-from-git",
+        [
+            PRInfo(
+                number=109,
+                branch="pr-085-status-from-git",
+                title="docs: no queue prefix anymore",
+            )
+        ],
+    )
+
+    assert match is not None
+
+
+def test_derive_done_when_merged_pr_branch_matches_without_queue_prefix() -> None:
+    status = derive_task_status(
+        _header("pr-085-status-from-git"),
+        set(),
+        [],
+        [
+            PRInfo(
+                number=109,
+                branch="pr-085-status-from-git",
+                title="custom squash title",
+            )
+        ],
+    )
+
+    assert status == TaskStatus.DONE
 
 
 def test_load_task_header_falls_back_for_legacy_task_files(

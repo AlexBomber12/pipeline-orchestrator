@@ -24,9 +24,19 @@ def derive_task_status(
     task_header: TaskHeader,
     merged_pr_ids: set[str],
     open_prs: Iterable[PRInfo],
+    merged_prs: Iterable[PRInfo] = (),
 ) -> TaskStatus:
     """Derive task status from git state."""
     if task_header.pr_id in merged_pr_ids:
+        return TaskStatus.DONE
+    if (
+        find_matching_merged_pr(
+            task_header.pr_id,
+            task_header.branch,
+            merged_prs,
+        )
+        is not None
+    ):
         return TaskStatus.DONE
     if find_matching_open_pr(
         task_header.pr_id,
@@ -47,12 +57,44 @@ def find_matching_open_pr(
         return None
 
     for pr in open_prs:
-        if pr.branch != branch:
-            continue
-        open_pr_id = pr.pr_id or extract_queue_pr_id(pr.title)
-        if open_pr_id == pr_id:
+        if _branch_matches_task_pr(pr, pr_id, branch):
             return pr
     return None
+
+
+def find_matching_merged_pr(
+    pr_id: str,
+    branch: str,
+    merged_prs: Iterable[PRInfo],
+) -> PRInfo | None:
+    """Return the matching merged PR for a queue task, if one exists."""
+    for pr in merged_prs:
+        if _branch_matches_task_pr(pr, pr_id, branch):
+            return pr
+
+    if branch:
+        return None
+
+    for pr in merged_prs:
+        merged_pr_id = pr.pr_id or extract_queue_pr_id(pr.title)
+        if merged_pr_id == pr_id:
+            return pr
+    return None
+
+
+def _branch_matches_task_pr(
+    pr: PRInfo,
+    pr_id: str,
+    branch: str,
+) -> bool:
+    """Return True when a same-repo PR branch can be attributed to a task."""
+    if not branch or pr.branch != branch or pr.is_cross_repository:
+        return False
+
+    candidate_pr_id = pr.pr_id or extract_queue_pr_id(pr.title)
+    if candidate_pr_id is None:
+        return True
+    return candidate_pr_id == pr_id
 
 
 def get_merged_pr_ids(repo_path: str, base_branch: str) -> set[str]:
@@ -102,10 +144,12 @@ def derive_queue_task_statuses(
     repo_path: str,
     base_branch: str,
     open_prs: Iterable[PRInfo],
+    merged_prs: Iterable[PRInfo] = (),
 ) -> list[QueueTask]:
     """Return queue tasks with status refreshed from git/GitHub state."""
     merged_pr_ids = get_merged_pr_ids(repo_path, base_branch)
     open_prs = list(open_prs)
+    merged_prs = list(merged_prs)
     derived: list[QueueTask] = []
 
     for task in tasks:
@@ -118,7 +162,7 @@ def derive_queue_task_statuses(
                     f"does not match queue entry {task.pr_id!r}"
                 ]
             )
-        status = derive_task_status(header, merged_pr_ids, open_prs)
+        status = derive_task_status(header, merged_pr_ids, open_prs, merged_prs)
         derived.append(
             task.model_copy(update={"status": status, "branch": header.branch})
         )

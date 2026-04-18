@@ -177,6 +177,58 @@ def get_open_prs(
     return prs
 
 
+def get_merged_prs(
+    repo: str,
+    limit: int = 1000,
+) -> list[PRInfo]:
+    """Return recently merged PRs for ``repo``.
+
+    This is a best-effort fallback used by queue status derivation when
+    merged work can no longer be inferred from local git history alone
+    (for example after squash-merging with a custom title). If GitHub
+    cannot be queried, return an empty list and let callers fall back to
+    their local heuristics.
+    """
+    try:
+        raw = run_gh(
+            [
+                "pr",
+                "list",
+                "--state",
+                "merged",
+                "--limit",
+                str(limit),
+                "--json",
+                "number,title,headRefName,mergedAt,isCrossRepository",
+            ],
+            repo=repo,
+        )
+    except Exception:
+        return []
+
+    if not isinstance(raw, list):
+        return []
+
+    prs: list[PRInfo] = []
+    for entry in raw:
+        number = int(entry.get("number", 0))
+        if not number:
+            continue
+        title = entry.get("title", "")
+        prs.append(
+            PRInfo(
+                number=number,
+                branch=entry.get("headRefName", ""),
+                title=title,
+                pr_id=extract_queue_pr_id(title),
+                url="",
+                is_cross_repository=bool(entry.get("isCrossRepository", False)),
+                last_activity=_parse_iso(entry.get("mergedAt")),
+            )
+        )
+    return prs
+
+
 def get_pr_review_status(
     repo: str,
     pr_number: int,
