@@ -94,6 +94,7 @@ class FixMixin(BreachMixin):
         await self.publish_state()
         if self._current_run_record is not None:
             self._current_run_record.fix_iterations += 1
+            await self._checkpoint_current_run_record()
 
         if (
             self.state.current_pr is not None

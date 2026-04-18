@@ -907,6 +907,117 @@ def test_fix_increments_iterations(monkeypatch: pytest.MonkeyPatch) -> None:
     assert runner._current_run_record.fix_iterations == 1
 
 
+def test_fix_iterations_survive_recovery_until_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue_text = (
+        "## PR-001: t\n"
+        "- Status: DOING\n"
+        "- Tasks file: tasks/PR-001.md\n"
+        "- Branch: pr-001\n"
+    )
+
+    def fake_git(repo_path: str, *args: str, **kw: Any) -> Any:
+        if args[0] == "show":
+            return _FakeCompletedProcess(
+                args=["git", "show"],
+                stdout=queue_text,
+                returncode=0,
+            )
+        if args[:2] == ("rev-parse", "HEAD"):
+            return _FakeCompletedProcess(
+                args=["git", "rev-parse", "HEAD"],
+                stdout="abc123\n",
+                returncode=0,
+            )
+        if args[0] == "merge" and len(args) > 1 and args[1].startswith("origin/"):
+            return _FakeCompletedProcess(
+                args=["git", *args],
+                stdout="Already up to date.\n",
+                returncode=0,
+            )
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", _async_cli_result(0, "", "")
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [PRInfo(number=77, branch="pr-001")],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: {
+            "author": "",
+            "head_sha": "",
+            "head_commit_date": "2026-04-18T12:00:00Z",
+        },
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "merge_pr", lambda repo, num: None
+    )
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+
+    redis = _FakeRedis()
+    claude_provider, codex_provider = _usage_providers()
+    runner = PipelineRunner(
+        _repo_cfg(),
+        _app_cfg(),
+        redis,
+        claude_provider,
+        codex_provider,
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner.state.current_pr = PRInfo(number=77, branch="pr-001")
+    runner.state.state = PipelineState.WATCH
+    runner._start_current_run_record("claude", "opus")
+    asyncio.run(runner._save_current_run_record("coding_complete"))
+
+    asyncio.run(runner.handle_fix())
+
+    recovered = PipelineRunner(
+        _repo_cfg(),
+        _app_cfg(),
+        redis,
+        *_usage_providers(),
+    )
+    asyncio.run(recovered.recover_state())
+
+    assert recovered.state.state == PipelineState.WATCH
+    assert recovered._current_run_record is not None
+    assert recovered._current_run_record.fix_iterations == 1
+
+    asyncio.run(recovered.handle_merge())
+
+    recent = asyncio.run(
+        recovered._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=recovered.name,
+        )
+    )
+
+    assert len(recent) == 1
+    assert recent[0].fix_iterations == 1
+    assert recent[0].exit_reason == "success_merged"
+
+
 def test_handle_fix_errors_when_post_comment_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
