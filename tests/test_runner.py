@@ -304,6 +304,9 @@ def test_handle_idle_no_tasks_leaves_state_idle(
     calls = _patch_subprocess(monkeypatch)
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(
+        runner_module.github_client, "get_merged_prs", lambda repo, branch: []
+    )
 
     runner = _make_runner()
     asyncio.run(runner.handle_idle())
@@ -383,6 +386,9 @@ def test_handle_idle_picks_task_and_drives_coding(
         _get_open_prs,
     )
     monkeypatch.setattr(
+        runner_module.github_client, "get_merged_prs", lambda repo, branch: []
+    )
+    monkeypatch.setattr(
         runner_module.github_client,
         "post_comment",
         lambda repo, number, body: None,
@@ -437,6 +443,9 @@ def test_handle_idle_sets_queue_counters_with_mixed_statuses(
         _get_open_prs,
     )
     monkeypatch.setattr(
+        runner_module.github_client, "get_merged_prs", lambda repo, branch: []
+    )
+    monkeypatch.setattr(
         runner_module.github_client,
         "post_comment",
         lambda repo, number, body: None,
@@ -475,6 +484,9 @@ def test_handle_idle_attaches_to_existing_pr_instead_of_coding(
         runner_module.github_client,
         "get_open_prs",
         lambda repo, **kw: [existing_pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_merged_prs", lambda repo, branch: []
     )
     monkeypatch.setattr(
         runner_module.github_client,
@@ -524,6 +536,9 @@ def test_handle_idle_proceeds_to_coding_when_no_matching_pr(
         return [PRInfo(number=17, branch="pr-042-sample")]
 
     monkeypatch.setattr(runner_module.github_client, "get_open_prs", _get_open_prs)
+    monkeypatch.setattr(
+        runner_module.github_client, "get_merged_prs", lambda repo, branch: []
+    )
     monkeypatch.setattr(
         claude_cli,
         "run_planned_pr_async",
@@ -595,6 +610,9 @@ def test_handle_idle_sets_error_when_task_status_derivation_times_out(
         runner_module.github_client,
         "get_open_prs",
         lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_merged_prs", lambda repo, branch: []
     )
 
     def _timed_out(*args: Any, **kwargs: Any) -> list[QueueTask]:
@@ -3209,6 +3227,9 @@ def test_handle_idle_no_tasks_but_open_pr_sets_current_pr(
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo, **kw: [open_pr]
     )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_merged_prs", lambda repo, branch: []
+    )
 
     runner = _make_runner()
     asyncio.run(runner.handle_idle())
@@ -3227,6 +3248,9 @@ def test_handle_idle_no_tasks_no_open_prs_clears_current_pr(
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo, **kw: []
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_merged_prs", lambda repo, branch: []
     )
 
     runner = _make_runner()
@@ -3278,6 +3302,32 @@ def test_handle_idle_open_pr_check_survives_github_failure(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is None
     assert any("open PR check failed" in e["event"] for e in runner.state.history)
+
+
+def test_handle_idle_merged_pr_check_survives_github_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch: (_ for _ in ()).throw(RuntimeError("API down")),
+    )
+
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=5, branch="stale")
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+    assert any("merged PR check failed" in e["event"] for e in runner.state.history)
 
 
 # ------------------------------------------------------------------

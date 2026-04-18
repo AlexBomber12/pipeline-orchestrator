@@ -22,6 +22,8 @@ _review_status_cache: dict[str, "ReviewStatus"] = {}
 _review_status_cache_cycle: int | None = None
 
 _last_known_sha: dict[str, str] = {}
+_merged_prs_cache: dict[tuple[str, str], tuple[float, list["PRInfo"]]] = {}
+_MERGED_PRS_CACHE_TTL_SECONDS = 60.0
 
 
 def _cache_key(repo: str, pr_number: int, head_sha: str) -> str:
@@ -33,6 +35,11 @@ def clear_review_status_cache() -> None:
     global _review_status_cache_cycle
     _review_status_cache.clear()
     _review_status_cache_cycle = None
+
+
+def clear_merged_prs_cache() -> None:
+    """Clear merged PR lookup cache (used in tests)."""
+    _merged_prs_cache.clear()
 
 
 def _begin_review_cache_cycle() -> None:
@@ -186,15 +193,19 @@ def get_merged_prs(repo: str, base_branch: str | None = None) -> list[PRInfo]:
     cannot be queried, return an empty list and let callers fall back to
     their local heuristics.
     """
-    try:
-        raw = _gh_api_paginated(
-            f"repos/{repo}/pulls?state=closed&per_page=100"
-        )
-    except Exception:
-        return []
+    cache_key = (repo, base_branch or "")
+    cached = _merged_prs_cache.get(cache_key)
+    now = time.monotonic()
+    if cached is not None and (now - cached[0]) < _MERGED_PRS_CACHE_TTL_SECONDS:
+        return list(cached[1])
 
+    raw = _gh_api_paginated(
+        f"repos/{repo}/pulls?state=closed&per_page=100"
+    )
     if raw is None:
-        return []
+        raise RuntimeError(
+            f"gh api repos/{repo}/pulls returned unexpected payload"
+        )
 
     prs: list[PRInfo] = []
     for entry in raw:
@@ -222,7 +233,8 @@ def get_merged_prs(repo: str, base_branch: str | None = None) -> list[PRInfo]:
                 last_activity=_parse_iso(entry.get("merged_at")),
             )
         )
-    return prs
+    _merged_prs_cache[cache_key] = (now, prs)
+    return list(prs)
 
 
 def get_pr_review_status(

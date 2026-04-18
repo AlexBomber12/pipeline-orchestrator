@@ -78,10 +78,17 @@ class IdleMixin:
             )
             self.state.current_pr = None
             return
-        merged_prs = github_client.get_merged_prs(
-            self.owner_repo,
-            self.repo_config.branch,
-        )
+        try:
+            merged_prs = github_client.get_merged_prs(
+                self.owner_repo,
+                self.repo_config.branch,
+            )
+        except Exception as exc:
+            self.log_event(
+                f"IDLE: merged PR check failed: {exc}; deferring task dispatch"
+            )
+            self.state.current_pr = None
+            return
         try:
             derive_args = (
                 tasks,
