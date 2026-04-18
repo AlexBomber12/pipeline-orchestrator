@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import re
 import subprocess
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -58,6 +59,7 @@ class IdleMixin:
         headers: list,
         skipped_legacy_pr_ids: set[str],
         task_dir: Path,
+        merged_pr_ids: set[str],
     ) -> list:
         blocked_pr_ids: set[str] = set()
         structured_pr_ids = {header.pr_id for header in headers}
@@ -71,6 +73,8 @@ class IdleMixin:
                     continue
                 for dependency in header.depends_on:
                     if dependency in available_pr_ids:
+                        continue
+                    if dependency in merged_pr_ids:
                         continue
                     if dependency in blocked_pr_ids:
                         blocked_pr_ids.add(header.pr_id)
@@ -112,20 +116,39 @@ class IdleMixin:
             headers.append(header)
             task_files[header.pr_id] = task_file.relative_to(repo_root).as_posix()
 
+        merged_pr_ids = get_merged_pr_ids(
+            self.repo_path,
+            self.repo_config.branch,
+            {
+                pr_id
+                for header in headers
+                for pr_id in (header.pr_id, *header.depends_on)
+            },
+        )
         headers = self._filter_dag_headers_with_available_dependencies(
             headers,
             skipped_legacy_pr_ids,
             task_dir,
+            merged_pr_ids,
         )
         if not headers:
             return None
 
         try:
-            merged_pr_ids = get_merged_pr_ids(
-                self.repo_path,
-                self.repo_config.branch,
-                (header.pr_id for header in headers),
-            )
+            dag_headers = [
+                replace(
+                    header,
+                    depends_on=[
+                        dependency
+                        for dependency in header.depends_on
+                        if dependency not in merged_pr_ids
+                    ],
+                )
+                for header in headers
+            ]
+            merged_pr_ids = {
+                pr_id for pr_id in merged_pr_ids if pr_id in {header.pr_id for header in headers}
+            }
             open_prs = list(getattr(self, "_idle_open_prs", ()))
             merged_prs = list(getattr(self, "_idle_merged_prs", ()))
             statuses = {
@@ -137,7 +160,7 @@ class IdleMixin:
                 )
                 for header in headers
             }
-            eligible = get_eligible_tasks(headers, statuses)
+            eligible = get_eligible_tasks(dag_headers, statuses)
         except ValueError as exc:
             raise QueueValidationError([str(exc)]) from exc
 

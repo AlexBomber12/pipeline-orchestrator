@@ -999,6 +999,66 @@ def test_handle_idle_keeps_independent_dag_task_when_other_dependency_file_missi
     assert runner.state.error_message is None
 
 
+def test_handle_idle_keeps_structured_task_when_legacy_dependency_is_already_done(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-002.md").write_text(
+        "# PR-002: Structured task\n\n"
+        "Branch: pr-002-structured\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: PR-001\n",
+        encoding="utf-8",
+    )
+
+    def fake_get_merged_pr_ids(repo_path: str, base_branch: str, candidate_pr_ids=None) -> set[str]:
+        assert repo_path == str(tmp_path)
+        assert base_branch == "main"
+        assert set(candidate_pr_ids or ()) == {"PR-001", "PR-002"}
+        return {"PR-001"}
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", fake_get_merged_pr_ids)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    coding_called = {"v": False}
+
+    async def fake_handle_coding() -> None:
+        coding_called["v"] = True
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    asyncio.run(runner.handle_idle())
+
+    assert coding_called["v"] is True
+    assert runner.state.state == PipelineState.CODING
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == "PR-002"
+    assert runner.state.current_task.branch == "pr-002-structured"
+    assert runner.state.queue_done == 0
+    assert runner.state.queue_total == 1
+    assert runner.state.error_message is None
+
+
 def test_handle_idle_prefers_legacy_queue_task_over_dag_task(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
