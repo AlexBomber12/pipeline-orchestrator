@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import subprocess
 import time
@@ -11,6 +12,8 @@ from urllib.parse import quote
 
 from src.models import CIStatus, PRInfo, ReviewStatus
 from src.retry import retry_transient
+
+logger = logging.getLogger(__name__)
 
 _REPO_URL_RE = re.compile(
     r"github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"
@@ -25,6 +28,10 @@ _review_status_cache_cycle: int | None = None
 _last_known_sha: dict[str, str] = {}
 _merged_prs_cache: dict[tuple[str, str], tuple[float, list["PRInfo"]]] = {}
 _MERGED_PRS_CACHE_TTL_SECONDS = 60.0
+
+
+def _is_http_404_error(exc: RuntimeError) -> bool:
+    return ("HTTP" + " 404") in str(exc)
 
 
 def _cache_key(repo: str, pr_number: int, head_sha: str) -> str:
@@ -289,8 +296,14 @@ def _get_codex_issue_reactions(
             f"repos/{repo}/issues/{pr_number}/reactions"
         )
     except RuntimeError as exc:
-        if "HTTP 404" not in str(exc):
-            raise
+        if "HTTP 404" in str(exc):
+            return []
+        logger.warning(
+            "Reactions fetch degraded for PR %s in %s: %s",
+            pr_number,
+            repo,
+            exc,
+        )
         return []
     if not reactions:
         return []
@@ -359,19 +372,19 @@ def _compute_review_status(
                 body_eyes = True
                 return ReviewStatus.EYES
     except RuntimeError as exc:
-        if "HTTP 404" not in str(exc):
+        if not _is_http_404_error(exc):
             raise
 
     try:
         issue_comments = _gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
     except RuntimeError as exc:
-        if "HTTP 404" not in str(exc):
+        if not _is_http_404_error(exc):
             raise
         issue_comments = []
     try:
         review_comments = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments") or []
     except RuntimeError as exc:
-        if "HTTP 404" not in str(exc):
+        if not _is_http_404_error(exc):
             raise
         review_comments = []
 
@@ -402,8 +415,15 @@ def _compute_review_status(
                     ):
                         anchor_eyes = True
             except RuntimeError as exc:
-                if "HTTP 404" not in str(exc):
-                    raise
+                if "HTTP 404" in str(exc):
+                    pass
+                else:
+                    logger.warning(
+                        "Anchor comment reactions fetch degraded for comment %s in %s: %s",
+                        cid,
+                        repo,
+                        exc,
+                    )
 
     if body_eyes or anchor_eyes:
         return ReviewStatus.EYES
@@ -658,7 +678,7 @@ def has_recent_codex_review_request(
             f"repos/{repo}/issues/{pr_number}/comments"
         ) or []
     except RuntimeError as exc:
-        if "HTTP 404" in str(exc):
+        if _is_http_404_error(exc):
             return False
         raise
     now = datetime.now(timezone.utc)
@@ -741,7 +761,7 @@ def _get_codex_review_signals(
     try:
         reviews = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/reviews")
     except RuntimeError as exc:
-        if "HTTP 404" not in str(exc):
+        if not _is_http_404_error(exc):
             raise
         return {
             "latest_sha": "",
