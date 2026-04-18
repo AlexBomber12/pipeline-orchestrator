@@ -19,6 +19,7 @@ from src.queue_parser import (
 _PR_ID_PATTERN = _PR_ID_RE.pattern.removeprefix("^").removesuffix("$")
 _MERGED_SUBJECT_RE = re.compile(rf"^(?P<pr_id>{_PR_ID_PATTERN}):(?:\s|$)")
 _LEGACY_FALLBACK_SUFFIXES = {
+    ": missing Branch",
     ": missing Type",
     ": missing Complexity",
     ": missing Depends on",
@@ -299,7 +300,11 @@ def _load_legacy_task_header(
         if line.startswith("#") or line.startswith("- "):
             break
 
-    if header_match is None or not branch:
+    if header_match is None:
+        return None
+
+    branch = branch or task.branch
+    if not branch:
         return None
 
     header_pr_id = header_match.group(1)
