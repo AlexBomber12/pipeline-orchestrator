@@ -151,7 +151,14 @@ class IdleMixin:
                     )
                     return
             except (OSError, subprocess.TimeoutExpired):
-                pass
+                self._idle_generated_queue_needs_resync = True
+            else:
+                if (
+                    fetch.returncode != 0
+                    or local_base_sha.returncode != 0
+                    or remote_base_sha.returncode != 0
+                ):
+                    self._idle_generated_queue_needs_resync = True
             git_ops._git(
                 self.repo_path,
                 "reset",

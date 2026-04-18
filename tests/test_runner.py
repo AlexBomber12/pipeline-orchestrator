@@ -5507,6 +5507,56 @@ def test_write_generated_queue_md_marks_resync_when_origin_moved_after_push_reje
     assert ["git", "reset", "--hard", "refs/remotes/origin/main"] in git_calls
 
 
+def test_write_generated_queue_md_marks_resync_when_probe_cannot_verify_remote_tip(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "QUEUE.md"
+    original = "# Task Queue\n\n## PR-000: Existing\n"
+    queue_path.write_text(original, encoding="utf-8")
+    headers = [
+        TaskHeader(
+            pr_id="PR-001",
+            title="Project bootstrap",
+            branch="pr-001-bootstrap",
+            task_type="feature",
+            complexity="low",
+            depends_on=[],
+            priority=1,
+            coder="any",
+        )
+    ]
+    statuses = {"PR-001": TaskStatus.DONE}
+
+    git_calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append(cmd)
+        if cmd[:2] == ["git", "push"]:
+            queue_path.write_text("generated queue", encoding="utf-8")
+            return _FakeCompletedProcess(args=cmd, returncode=1, stderr="rejected")
+        if cmd[:2] == ["git", "fetch"]:
+            return _FakeCompletedProcess(args=cmd, returncode=1, stderr="temporary failure")
+        if cmd[:2] == ["git", "reset"]:
+            queue_path.write_text(original, encoding="utf-8")
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(git_ops_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+
+    published = runner._write_generated_queue_md(headers, statuses)
+
+    assert published is False
+    assert runner._idle_generated_queue_needs_resync is True
+    assert queue_path.read_text(encoding="utf-8") == original
+    assert ["git", "reset", "--hard", "HEAD~1"] in git_calls
+
+
 def test_select_next_task_from_dag_skips_merged_probe_without_structured_headers(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
