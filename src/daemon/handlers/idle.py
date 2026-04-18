@@ -84,7 +84,12 @@ class IdleMixin:
                 self.repo_config.branch,
                 {pr.branch for pr in prs if pr.branch},
             )
-        except (OSError, RuntimeError, QueueValidationError) as exc:
+        except (
+            OSError,
+            RuntimeError,
+            QueueValidationError,
+            subprocess.TimeoutExpired,
+        ) as exc:
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"Task status derivation failed: {exc}"
             self.log_event(f"Task status derivation failed: {exc}")

@@ -83,6 +83,12 @@ def derive_queue_task_statuses(
     for task in tasks:
         header = _load_task_header(task, repo_path)
         status = derive_task_status(header, merged_branches, open_pr_branches)
+        if (
+            status == TaskStatus.TODO
+            and task.status == TaskStatus.DONE
+            and header.branch not in open_pr_branches
+        ):
+            status = TaskStatus.DONE
         derived.append(
             task.model_copy(update={"status": status, "branch": header.branch})
         )

@@ -579,6 +579,43 @@ def test_handle_idle_defers_on_gh_failure(
     assert not coding_called["v"], "handle_coding should NOT be called on GH failure"
 
 
+def test_handle_idle_sets_error_when_task_status_derivation_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    task = QueueTask(
+        pr_id="PR-042",
+        title="Sample",
+        status=TaskStatus.TODO,
+        branch="pr-042-sample",
+    )
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+
+    def _timed_out(*args: Any, **kwargs: Any) -> list[QueueTask]:
+        raise subprocess.TimeoutExpired(cmd=["git", "branch", "--merged"], timeout=10)
+
+    monkeypatch.setattr(idle_module, "derive_queue_task_statuses", _timed_out)
+
+    coding_called = {"v": False}
+
+    async def spy_handle_coding(self):
+        coding_called["v"] = True
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "handle_coding", spy_handle_coding)
+
+    runner = _make_runner()
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "Task status derivation failed" in (runner.state.error_message or "")
+    assert not coding_called["v"], "handle_coding should NOT be called on timeout"
+
+
 def test_handle_coding_errors_when_no_pr_found(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

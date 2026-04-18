@@ -9,6 +9,7 @@ from src.queue_parser import TaskHeader
 from src.task_status import (
     _load_task_header,
     derive_task_status,
+    derive_queue_task_statuses,
     get_merged_branches,
 )
 
@@ -109,3 +110,32 @@ def test_load_task_header_falls_back_for_legacy_task_files(
         priority=3,
         coder="any",
     )
+
+
+def test_derive_queue_task_statuses_preserves_done_without_remote_branch(
+    monkeypatch,
+) -> None:
+    task = QueueTask(
+        pr_id="PR-001",
+        title="Completed task",
+        status=TaskStatus.DONE,
+        branch="pr-001-completed",
+    )
+
+    monkeypatch.setattr(
+        "src.task_status.get_merged_branches",
+        lambda repo_path, base_branch: set(),
+    )
+    monkeypatch.setattr(
+        "src.task_status._load_task_header",
+        lambda current_task, repo_path: _header("pr-001-completed"),
+    )
+
+    derived = derive_queue_task_statuses(
+        [task],
+        "/repo",
+        "main",
+        set(),
+    )
+
+    assert derived[0].status == TaskStatus.DONE
