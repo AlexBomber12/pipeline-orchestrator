@@ -529,10 +529,10 @@
 - Tasks file: tasks/PR-090.md
 - Branch: pr-090-error-classification
 
-## PR-091: Auto-fallback chain on rate limit
+## PR-091: Coder fallback policy with eligibility and priority
 - Status: TODO
 - Tasks file: tasks/PR-091.md
-- Branch: pr-091-auto-fallback
+- Branch: pr-091-fallback-policy
 - Depends on: PR-077
 
 ## PR-092: DESIGN.md
@@ -540,3 +540,9 @@
 - Tasks file: tasks/PR-092.md
 - Branch: pr-092-design-doc
 - Depends on: PR-077, PR-087
+
+## PR-093: Capture merged-PR metrics via WATCH handler hook
+- Status: TODO
+- Tasks file: tasks/PR-093.md
+- Branch: pr-093-watch-merge-capture
+- Depends on: PR-080
