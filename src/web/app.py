@@ -361,7 +361,7 @@ async def _recent_repo_metrics_payload(
         return []
     completed = [record for record in records if record.ended_at is not None]
     completed.sort(
-        key=lambda record: _parse_iso8601(record.started_at)
+        key=lambda record: _parse_iso8601(record.ended_at)
         or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
     )

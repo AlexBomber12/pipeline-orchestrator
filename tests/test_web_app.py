@@ -381,6 +381,7 @@ def _metrics_record(
     *,
     task_id: str,
     started_at: str,
+    ended_at: str = "2026-04-18T10:05:00+00:00",
     duration_ms: int,
     fix_iterations: int,
     exit_reason: str,
@@ -395,7 +396,7 @@ def _metrics_record(
             "task_type": "feature",
             "complexity": "medium",
             "started_at": started_at,
-            "ended_at": "2026-04-18T10:05:00+00:00",
+            "ended_at": ended_at,
             "duration_ms": duration_ms,
             "fix_iterations": fix_iterations,
             "tokens_in": 1200,
@@ -415,6 +416,7 @@ def test_metrics_endpoint_returns_records(
                 "older",
                 task_id="PR-081",
                 started_at="2026-04-18T09:00:00+00:00",
+                ended_at="2026-04-18T11:05:00+00:00",
                 duration_ms=61000,
                 fix_iterations=1,
                 exit_reason="rate_limit",
@@ -424,6 +426,7 @@ def test_metrics_endpoint_returns_records(
                 "newer",
                 task_id="PR-082",
                 started_at="2026-04-18T11:00:00+00:00",
+                ended_at="2026-04-18T10:05:00+00:00",
                 duration_ms=300000,
                 fix_iterations=2,
                 exit_reason="success_merged",
@@ -438,14 +441,14 @@ def test_metrics_endpoint_returns_records(
 
     assert response.status_code == 200
     payload = response.json()
-    assert [record["task_id"] for record in payload] == ["PR-082", "PR-081"]
-    assert payload[0]["coder"] == "claude"
-    assert payload[0]["model"] == "opus"
-    assert payload[0]["duration_text"] == "5m"
-    assert payload[0]["exit_reason_label"] == "merged"
-    assert payload[1]["coder"] == "codex"
-    assert payload[1]["model"] == "gpt-5.4"
-    assert payload[1]["exit_reason_label"] == "rate limit"
+    assert [record["task_id"] for record in payload] == ["PR-081", "PR-082"]
+    assert payload[0]["coder"] == "codex"
+    assert payload[0]["model"] == "gpt-5.4"
+    assert payload[0]["duration_text"] == "1m 1s"
+    assert payload[0]["exit_reason_label"] == "rate limit"
+    assert payload[1]["coder"] == "claude"
+    assert payload[1]["model"] == "opus"
+    assert payload[1]["exit_reason_label"] == "merged"
 
 
 def test_metrics_panel_renders(
