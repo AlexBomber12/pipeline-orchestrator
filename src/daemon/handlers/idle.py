@@ -214,43 +214,52 @@ class IdleMixin:
             self._idle_open_prs = []
             self._idle_merged_prs = []
 
+        tasks: list[QueueTask] = []
+        queue_task = None
+        structured_pr_ids = {queued.pr_id for queued in dag_tasks or []}
+        has_legacy_queue_tasks = False
         try:
             tasks = parse_queue(queue_path, strict=strict)
         except QueueValidationError as exc:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = str(exc)
-            self.log_event(f"Queue validation failed: {exc}")
-            return
-        try:
-            derive_args = (
-                tasks,
-                self.repo_path,
-                self.repo_config.branch,
-                prs,
+            if dag_task is None:
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = str(exc)
+                self.log_event(f"Queue validation failed: {exc}")
+                return
+            self.log_event(
+                "Queue validation failed after DAG selection; "
+                f"continuing with DAG task: {exc}"
             )
-            if len(inspect.signature(derive_queue_task_statuses).parameters) >= 5:
-                tasks = derive_queue_task_statuses(
-                    *derive_args,
-                    merged_prs,
+        else:
+            try:
+                derive_args = (
+                    tasks,
+                    self.repo_path,
+                    self.repo_config.branch,
+                    prs,
                 )
-            else:
-                tasks = derive_queue_task_statuses(*derive_args)
-        except (
-            OSError,
-            RuntimeError,
-            QueueValidationError,
-            subprocess.TimeoutExpired,
-        ) as exc:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = f"Task status derivation failed: {exc}"
-            self.log_event(f"Task status derivation failed: {exc}")
-            return
+                if len(inspect.signature(derive_queue_task_statuses).parameters) >= 5:
+                    tasks = derive_queue_task_statuses(
+                        *derive_args,
+                        merged_prs,
+                    )
+                else:
+                    tasks = derive_queue_task_statuses(*derive_args)
+            except (
+                OSError,
+                RuntimeError,
+                QueueValidationError,
+                subprocess.TimeoutExpired,
+            ) as exc:
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = f"Task status derivation failed: {exc}"
+                self.log_event(f"Task status derivation failed: {exc}")
+                return
 
-        queue_task = get_next_task(tasks)
-        structured_pr_ids = {queued.pr_id for queued in dag_tasks or []}
-        has_legacy_queue_tasks = any(
-            queued.pr_id not in structured_pr_ids for queued in tasks
-        )
+            queue_task = get_next_task(tasks)
+            has_legacy_queue_tasks = any(
+                queued.pr_id not in structured_pr_ids for queued in tasks
+            )
 
         task = dag_task
         if queue_task is not None and (

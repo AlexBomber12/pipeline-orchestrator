@@ -3864,6 +3864,66 @@ def test_handle_idle_uses_fallback_queue_counters_when_dag_picks_nothing(
     assert runner.state.queue_total == 1
 
 
+def test_handle_idle_keeps_dag_task_when_queue_validation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    dag_task = QueueTask(
+        pr_id="PR-123",
+        title="Structured task",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-123.md",
+        branch="pr-123-structured",
+    )
+    dag_tasks = [dag_task]
+
+    async def fake_select(self):
+        self._idle_dag_tasks = dag_tasks
+        return dag_task
+
+    monkeypatch.setattr(idle_module.IdleMixin, "_select_next_task_from_dag", fake_select)
+    monkeypatch.setattr(
+        idle_module,
+        "parse_queue",
+        lambda path, **kw: (_ for _ in ()).throw(
+            idle_module.QueueValidationError(
+                ["Queue validation failed:\n- malformed queue"]
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    coding_called = {"v": False}
+
+    async def fake_handle_coding() -> None:
+        coding_called["v"] = True
+        return None
+
+    runner = _make_runner()
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    asyncio.run(runner.handle_idle())
+
+    assert coding_called["v"] is True
+    assert runner.state.state == PipelineState.CODING
+    assert runner.state.current_task == dag_task
+    assert runner.state.error_message is None
+    assert runner.state.queue_done == 0
+    assert runner.state.queue_total == 1
+    assert any(
+        "Queue validation failed after DAG selection" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
 def test_handle_idle_requests_fresh_merged_prs_for_status_derivation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
