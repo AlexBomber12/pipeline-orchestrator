@@ -357,6 +357,7 @@ class IdleMixin:
         queue_task = None
         structured_pr_ids = {queued.pr_id for queued in dag_tasks or []}
         has_legacy_queue_tasks = False
+        legacy_queue_check_succeeded = False
         try:
             tasks = parse_queue(queue_path, strict=strict)
         except QueueValidationError as exc:
@@ -407,6 +408,7 @@ class IdleMixin:
                 has_legacy_queue_tasks = any(
                     queued.pr_id not in structured_pr_ids for queued in tasks
                 )
+                legacy_queue_check_succeeded = True
 
         task = dag_task
         if queue_task is not None:
@@ -433,6 +435,7 @@ class IdleMixin:
         if (
             generated_headers
             and generated_statuses
+            and legacy_queue_check_succeeded
             and not has_legacy_queue_tasks
         ):
             try:
@@ -446,7 +449,11 @@ class IdleMixin:
                 subprocess.CalledProcessError,
                 subprocess.TimeoutExpired,
             ) as exc:
-                self.log_event(f"QUEUE.md auto-generation failed: {exc}")
+                message = f"QUEUE.md auto-generation failed: {exc}"
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = message
+                self.log_event(message)
+                return
         if task is None:
             self.log_event("No tasks available")
             if prs:
