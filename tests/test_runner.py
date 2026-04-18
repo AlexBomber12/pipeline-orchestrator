@@ -3924,6 +3924,66 @@ def test_handle_idle_keeps_dag_task_when_queue_validation_fails(
     )
 
 
+def test_handle_idle_keeps_doing_dag_task_over_legacy_queue_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    dag_task = QueueTask(
+        pr_id="PR-123",
+        title="Structured in-flight task",
+        status=TaskStatus.DOING,
+        task_file="tasks/PR-123.md",
+        branch="pr-123-structured",
+    )
+    dag_tasks = [dag_task]
+    legacy_queue_task = QueueTask(
+        pr_id="PR-001",
+        title="Legacy queue task",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-001.md",
+        branch="pr-001-legacy",
+    )
+
+    async def fake_select(self):
+        self._idle_dag_tasks = dag_tasks
+        return dag_task
+
+    monkeypatch.setattr(idle_module.IdleMixin, "_select_next_task_from_dag", fake_select)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [legacy_queue_task])
+    monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda tasks, repo_path, base_branch, prs, merged_prs=(): tasks,
+    )
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: legacy_queue_task)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    coding_called = {"v": False}
+
+    async def fake_handle_coding() -> None:
+        coding_called["v"] = True
+        return None
+
+    runner = _make_runner()
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    asyncio.run(runner.handle_idle())
+
+    assert coding_called["v"] is True
+    assert runner.state.state == PipelineState.CODING
+    assert runner.state.current_task == dag_task
+    assert runner.state.queue_done == 0
+    assert runner.state.queue_total == 1
+
+
 def test_handle_idle_requests_fresh_merged_prs_for_status_derivation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -262,10 +262,14 @@ class IdleMixin:
             )
 
         task = dag_task
-        if queue_task is not None and (
-            task is None or queue_task.pr_id not in structured_pr_ids
-        ):
-            task = queue_task
+        if queue_task is not None:
+            if task is None:
+                task = queue_task
+            elif (
+                task.status != TaskStatus.DOING
+                and queue_task.pr_id not in structured_pr_ids
+            ):
+                task = queue_task
 
         if has_legacy_queue_tasks or dag_tasks is None:
             queue_tasks = tasks
