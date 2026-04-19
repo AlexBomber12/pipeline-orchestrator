@@ -187,6 +187,7 @@ class ErrorMixin:
                             head_before,
                             check=False,
                         )
+                        git_ops._git(self.repo_path, "clean", "-fd", check=False)
                         logger.warning("diagnose_error made uncommittable changes, reset")
                     verdict = "ESCALATE"
         elif dirty:
@@ -208,6 +209,7 @@ class ErrorMixin:
                     head_before,
                     check=False,
                 )
+                git_ops._git(self.repo_path, "clean", "-fd", check=False)
         if verdict == "SKIP":
             self.state.current_task = None
             self.state.current_pr = None

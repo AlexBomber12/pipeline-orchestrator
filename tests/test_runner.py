@@ -3442,6 +3442,7 @@ def test_handle_error_resets_when_push_fails_and_escalates(
 
     assert runner.state.state == PipelineState.ERROR
     assert any(cmd[:3] == ("reset", "--hard", "abc123") for cmd in calls)
+    assert any(cmd[:2] == ("clean", "-fd") for cmd in calls)
     assert warnings == ["diagnose_error made uncommittable changes, reset"]
 
 
@@ -3468,7 +3469,13 @@ def test_handle_error_escalates_dirty_tree_when_branch_mismatches_pr(
     )
 
     assert runner.state.state == PipelineState.ERROR
-    assert [cmd[0] for cmd in calls] == ["status", "rev-parse", "rev-parse", "reset"]
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "rev-parse",
+        "rev-parse",
+        "reset",
+        "clean",
+    ]
     assert warnings == ["diagnose_error made uncommittable changes, reset"]
     assert any(
         "diagnose_error: active branch mismatch ('main' != "
@@ -3486,7 +3493,7 @@ def test_handle_error_discards_dirty_tree_for_non_fix_verdict(
     )
 
     assert runner.state.state == PipelineState.ERROR
-    assert [cmd[0] for cmd in calls] == ["status", "rev-parse", "reset"]
+    assert [cmd[0] for cmd in calls] == ["status", "rev-parse", "reset", "clean"]
     assert warnings == []
 
 
