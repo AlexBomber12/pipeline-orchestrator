@@ -120,6 +120,20 @@ Branch: pr-084-task-header-parser
     )
 
 
+def test_parse_task_header_rejects_missing_header(tmp_path: Path) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """Branch: pr-084-task-header-parser
+- Type: feature
+- Complexity: medium
+- Depends on: none
+""",
+    )
+
+    with pytest.raises(QueueValidationError, match="missing task header"):
+        parse_task_header(task_path)
+
+
 def test_parse_task_header_depends_on_none(tmp_path: Path) -> None:
     task_path = _write_task_file(
         tmp_path,
@@ -170,6 +184,52 @@ Branch: pr-084-task-header-parser
         parse_task_header(task_path)
 
 
+def test_parse_task_header_rejects_missing_branch_field(tmp_path: Path) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+- Type: feature
+- Complexity: medium
+- Depends on: none
+""",
+    )
+
+    with pytest.raises(QueueValidationError, match="missing Branch"):
+        parse_task_header(task_path)
+
+
+def test_parse_task_header_rejects_missing_type_field(tmp_path: Path) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Complexity: medium
+- Depends on: none
+""",
+    )
+
+    with pytest.raises(QueueValidationError, match="missing Type"):
+        parse_task_header(task_path)
+
+
+def test_parse_task_header_rejects_invalid_type_value(tmp_path: Path) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: chore
+- Complexity: medium
+- Depends on: none
+""",
+    )
+
+    with pytest.raises(QueueValidationError, match="invalid Type 'chore'"):
+        parse_task_header(task_path)
+
+
 def test_parse_task_header_allows_existing_repo_task_types(
     tmp_path: Path,
 ) -> None:
@@ -187,6 +247,37 @@ Branch: pr-084-task-header-parser
     header = parse_task_header(task_path)
 
     assert header.task_type == "config"
+
+
+def test_parse_task_header_rejects_invalid_complexity(tmp_path: Path) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: feature
+- Complexity: extreme
+- Depends on: none
+""",
+    )
+
+    with pytest.raises(QueueValidationError, match="invalid Complexity"):
+        parse_task_header(task_path)
+
+
+def test_parse_task_header_rejects_missing_complexity(tmp_path: Path) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: feature
+- Depends on: none
+""",
+    )
+
+    with pytest.raises(QueueValidationError, match="missing Complexity"):
+        parse_task_header(task_path)
 
 
 def test_parse_task_header_ignores_metadata_like_bullets_after_header(
@@ -213,6 +304,7 @@ Branch: pr-084-task-header-parser
     assert header.depends_on == []
     assert header.task_type == "feature"
 
+
 def test_parse_task_header_priority_default(tmp_path: Path) -> None:
     task_path = _write_task_file(
         tmp_path,
@@ -228,6 +320,40 @@ Branch: pr-084-task-header-parser
     header = parse_task_header(task_path)
 
     assert header.priority == 3
+
+
+def test_parse_task_header_rejects_non_integer_priority(tmp_path: Path) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: feature
+- Complexity: medium
+- Depends on: none
+- Priority: high
+""",
+    )
+
+    with pytest.raises(QueueValidationError, match="invalid Priority 'high'"):
+        parse_task_header(task_path)
+
+
+def test_parse_task_header_rejects_out_of_range_priority(tmp_path: Path) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: feature
+- Complexity: medium
+- Depends on: none
+- Priority: 6
+""",
+    )
+
+    with pytest.raises(QueueValidationError, match="expected 1-5"):
+        parse_task_header(task_path)
 
 
 def test_parse_task_header_coder_default(tmp_path: Path) -> None:
@@ -246,6 +372,23 @@ Branch: pr-084-task-header-parser
     header = parse_task_header(task_path)
 
     assert header.coder == "any"
+
+
+def test_parse_task_header_rejects_invalid_coder(tmp_path: Path) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: feature
+- Complexity: medium
+- Depends on: none
+- Coder: cursor
+""",
+    )
+
+    with pytest.raises(QueueValidationError, match="invalid Coder"):
+        parse_task_header(task_path)
 
 
 def test_parse_task_header_multiple_deps(tmp_path: Path) -> None:
@@ -505,6 +648,18 @@ def test_mark_task_done_stops_at_next_header() -> None:
     assert mark_task_done(content, "PR-001") is None
 
 
+def test_mark_task_done_preserves_crlf_line_endings() -> None:
+    content = "## PR-001: first\r\n- Status: TODO\r\n"
+    updated = mark_task_done(content, "PR-001")
+    assert updated == "## PR-001: first\r\n- Status: DONE\r\n"
+
+
+def test_mark_task_done_handles_status_without_trailing_newline() -> None:
+    content = "## PR-001: first\n- Status: TODO"
+    updated = mark_task_done(content, "PR-001")
+    assert updated == "## PR-001: first\n- Status: DONE"
+
+
 def test_unknown_status_defaults_to_todo_with_warning(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -585,6 +740,20 @@ def test_validate_rejects_duplicate_branch() -> None:
         parse_queue_text(content, strict=True)
 
 
+def test_validate_ignores_tasks_with_blank_branch_for_duplicate_check() -> None:
+    content = """\
+## PR-001: First
+- Status: DONE
+- Branch:
+
+## PR-002: Second
+- Status: TODO
+- Branch:
+"""
+    tasks = parse_queue_text(content, strict=True)
+    assert [task.branch for task in tasks] == [None, None]
+
+
 def test_validate_rejects_missing_dependency() -> None:
     content = """\
 ## PR-001: First
@@ -635,6 +804,41 @@ def test_validate_rejects_longer_cycle() -> None:
 """
     with pytest.raises(QueueValidationError, match="dependency cycle"):
         parse_queue_text(content, strict=True)
+
+
+def test_validate_accepts_shared_dependency_without_cycle() -> None:
+    content = """\
+## PR-A: First
+- Status: DONE
+- Branch: pr-a
+
+## PR-B: Second
+- Status: TODO
+- Branch: pr-b
+- Depends on: PR-A
+
+## PR-C: Third
+- Status: TODO
+- Branch: pr-c
+- Depends on: PR-A
+"""
+    tasks = parse_queue_text(content, strict=True)
+    assert [task.pr_id for task in tasks] == ["PR-A", "PR-B", "PR-C"]
+
+
+def test_validate_accepts_reverse_dependency_order_without_cycle() -> None:
+    content = """\
+## PR-A: First
+- Status: TODO
+- Branch: pr-a
+- Depends on: PR-B
+
+## PR-B: Second
+- Status: DONE
+- Branch: pr-b
+"""
+    tasks = parse_queue_text(content, strict=True)
+    assert [task.pr_id for task in tasks] == ["PR-A", "PR-B"]
 
 
 def test_parse_queue_strict_rejects_unknown_status(tmp_path: Path) -> None:
