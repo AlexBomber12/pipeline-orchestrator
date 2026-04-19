@@ -168,8 +168,11 @@ class TestOAuthProviderConsecutiveFailures:
         provider = _make_provider(tmp_path, creds={"accessToken": "tok"}, cache_ttl_sec=60)
         provider._consecutive_failures = 2
         provider._last_failure_at = 1_000.0
-        with patch("src.usage.time.time", return_value=1_030.0):
+        with patch("src.usage.time.time", return_value=1_030.0), patch.object(
+            httpx, "get"
+        ) as mock_get:
             assert provider.fetch() is None
+        mock_get.assert_not_called()
 
 
 class TestOAuthProviderTokenReading:
@@ -478,8 +481,11 @@ class TestOpenAIProviderConsecutiveFailures:
         )
         provider._consecutive_failures = 3
         provider._last_failure_at = 2_000.0
-        with patch("src.usage.time.time", return_value=2_050.0):
+        with patch("src.usage.time.time", return_value=2_050.0), patch.object(
+            httpx, "get"
+        ) as mock_get:
             assert provider.fetch() is None
+        mock_get.assert_not_called()
 
 
 class TestOpenAIProviderTokenReading:
