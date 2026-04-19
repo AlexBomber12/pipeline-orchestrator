@@ -12,10 +12,12 @@ from src.claude_cli import (
     diagnose_error,
     diagnose_error_async,
     fix_review,
+    fix_review_async,
     parse_diagnosis,
     run_claude,
     run_claude_async,
     run_planned_pr,
+    run_planned_pr_async,
 )
 
 
@@ -349,6 +351,66 @@ async def test_run_claude_async_success(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 @pytest.mark.asyncio
+async def test_run_claude_async_forwards_model_and_breach_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    fake_proc = _make_fake_proc(returncode=0)
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        captured["cmd"] = list(args)
+        captured["kwargs"] = kwargs
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setenv("NODE_OPTIONS", "--use-openssl-ca")
+
+    await run_claude_async(
+        "do a thing",
+        "/data/repos/demo",
+        model="sonnet",
+        breach_dir="/tmp/breach",
+        breach_run_id="run-123",
+        session_threshold=12,
+        weekly_threshold=34,
+    )
+
+    cmd = captured["cmd"]
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "sonnet"
+    assert "--append-system-prompt-file" in cmd
+    assert cmd[cmd.index("--append-system-prompt-file") + 1] == "CLAUDE.md"
+    assert captured["kwargs"]["env"]["NODE_OPTIONS"] == (
+        "--use-openssl-ca --max-old-space-size=4096"
+    )
+    assert captured["kwargs"]["env"]["PIPELINE_BREACH_DIR"] == "/tmp/breach"
+    assert captured["kwargs"]["env"]["PIPELINE_RUN_ID"] == "run-123"
+    assert captured["kwargs"]["env"]["PIPELINE_SESSION_THRESHOLD"] == "12"
+    assert captured["kwargs"]["env"]["PIPELINE_WEEKLY_THRESHOLD"] == "34"
+
+
+@pytest.mark.asyncio
+async def test_run_claude_async_generates_breach_run_id_when_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    fake_proc = _make_fake_proc(returncode=0)
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        captured["kwargs"] = kwargs
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setattr("src.claude_cli.uuid.uuid4", lambda: MagicMock(hex="abcdef1234567890"))
+
+    await run_claude_async("do a thing", "/data/repos/demo", breach_dir="/tmp/breach")
+
+    assert captured["kwargs"]["env"]["PIPELINE_RUN_ID"] == "abcdef123456"
+    assert "PIPELINE_SESSION_THRESHOLD" not in captured["kwargs"]["env"]
+    assert "PIPELINE_WEEKLY_THRESHOLD" not in captured["kwargs"]["env"]
+
+
+@pytest.mark.asyncio
 async def test_run_claude_async_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_proc = _make_fake_proc()
     fake_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError)
@@ -365,6 +427,25 @@ async def test_run_claude_async_timeout(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 @pytest.mark.asyncio
+async def test_run_claude_async_timeout_ignores_missing_process_on_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_proc = _make_fake_proc()
+    fake_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError)
+    fake_proc.kill.side_effect = ProcessLookupError
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    result = await run_claude_async("prompt", "/tmp", timeout=5)
+
+    assert result == (-1, "", "Timeout after 5s")
+    fake_proc.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_run_claude_async_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
         raise FileNotFoundError(2, "No such file or directory", "claude")
@@ -374,6 +455,20 @@ async def test_run_claude_async_not_found(monkeypatch: pytest.MonkeyPatch) -> No
     result = await run_claude_async("prompt", "/tmp")
 
     assert result == (-1, "", "claude CLI not found")
+
+
+@pytest.mark.asyncio
+async def test_run_claude_async_not_found_missing_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        raise FileNotFoundError(2, "No such file or directory", "/tmp/missing")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    result = await run_claude_async("prompt", "/tmp/missing")
+
+    assert result == (-1, "", "cwd not found: /tmp/missing")
 
 
 @pytest.mark.asyncio
@@ -395,6 +490,44 @@ async def test_run_claude_async_bare_flags(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 @pytest.mark.asyncio
+async def test_run_claude_async_cancelled_kills_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_proc = _make_fake_proc()
+    fake_proc.communicate = AsyncMock(side_effect=asyncio.CancelledError)
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_claude_async("prompt", "/tmp")
+
+    fake_proc.kill.assert_called_once()
+    fake_proc.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_claude_async_cancelled_ignores_missing_process_on_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_proc = _make_fake_proc()
+    fake_proc.communicate = AsyncMock(side_effect=asyncio.CancelledError)
+    fake_proc.kill.side_effect = ProcessLookupError
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_claude_async("prompt", "/tmp")
+
+    fake_proc.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_diagnose_error_async_skips_system_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
     fake_proc = _make_fake_proc(stdout=b"FIX\nretry", returncode=0)
@@ -412,3 +545,73 @@ async def test_diagnose_error_async_skips_system_prompt(monkeypatch: pytest.Monk
     cmd = captured["cmd"]
     assert "--append-system-prompt-file" not in cmd
     assert "CLAUDE.md" not in cmd
+
+
+@pytest.mark.asyncio
+async def test_run_planned_pr_async_forwards_to_run_claude_async(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_run_claude_async(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return (0, "ok", "")
+
+    monkeypatch.setattr("src.claude_cli.run_claude_async", fake_run_claude_async)
+
+    result = await run_planned_pr_async(
+        "/data/repos/demo",
+        model="sonnet",
+        timeout=111,
+        breach_dir="/tmp/breach",
+        breach_run_id="run-123",
+        session_threshold=12,
+        weekly_threshold=34,
+    )
+
+    assert result == (0, "ok", "")
+    assert captured["args"] == ("PLANNED PR", "/data/repos/demo")
+    assert captured["kwargs"] == {
+        "timeout": 111,
+        "model": "sonnet",
+        "breach_dir": "/tmp/breach",
+        "breach_run_id": "run-123",
+        "session_threshold": 12,
+        "weekly_threshold": 34,
+    }
+
+
+@pytest.mark.asyncio
+async def test_fix_review_async_forwards_to_run_claude_async(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_run_claude_async(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return (0, "ok", "")
+
+    monkeypatch.setattr("src.claude_cli.run_claude_async", fake_run_claude_async)
+
+    result = await fix_review_async(
+        "/data/repos/demo",
+        model="opus",
+        timeout=None,
+        breach_dir="/tmp/breach",
+        breach_run_id="run-456",
+        session_threshold=56,
+        weekly_threshold=78,
+    )
+
+    assert result == (0, "ok", "")
+    assert captured["args"] == ("FIX REVIEW", "/data/repos/demo")
+    assert captured["kwargs"] == {
+        "timeout": None,
+        "model": "opus",
+        "breach_dir": "/tmp/breach",
+        "breach_run_id": "run-456",
+        "session_threshold": 56,
+        "weekly_threshold": 78,
+    }
