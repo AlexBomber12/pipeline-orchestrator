@@ -61,7 +61,10 @@ def _classify_error(context: str) -> ErrorCategory:
         return ErrorCategory.STALE_BRANCH
     if "not found" in lowered and "cli" in lowered:
         return ErrorCategory.CLI_NOT_FOUND
-    if re.search(r"\bgit\b", lowered) and ("error" in lowered or "fail" in lowered):
+    if (
+        re.search(r"\bgit\b", lowered)
+        and ("error" in lowered or "fail" in lowered)
+    ) or lowered.startswith("fatal:"):
         return ErrorCategory.GIT_ERROR
     return ErrorCategory.OTHER
 

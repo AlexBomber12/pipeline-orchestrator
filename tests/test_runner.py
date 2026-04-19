@@ -8330,6 +8330,13 @@ def test_classify_git_error_requires_git_token() -> None:
     assert _classify_error("GitHub API request failed") == ErrorCategory.OTHER
 
 
+def test_classify_git_error_for_fatal_stderr() -> None:
+    assert (
+        _classify_error("fatal: could not resolve host: github.com")
+        == ErrorCategory.GIT_ERROR
+    )
+
+
 def test_handle_error_timeout_has_distinct_log(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
