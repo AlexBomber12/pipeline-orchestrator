@@ -148,6 +148,16 @@ def test_pinned_without_fallback_returns_only_pinned() -> None:
     assert eligible_coders(ctx) == ["codex"]
 
 
+def test_unpinned_without_fallback_returns_only_daemon_default() -> None:
+    ctx = _ctx(
+        auto_fallback=False,
+        daemon_coder=CoderType.CODEX,
+        limited={"codex"},
+    )
+
+    assert eligible_coders(ctx) == ["codex"]
+
+
 def test_pinned_with_fallback_returns_pinned_first_then_others() -> None:
     ctx = _ctx(auto_fallback=True, repo_coder=CoderType.CODEX)
 

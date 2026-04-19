@@ -171,6 +171,9 @@ class RateLimitMixin:
                         self.state.state = PipelineState.WATCH
                     else:
                         self.state.state = PipelineState.IDLE
+                self.state.rate_limited_until = None
+                self.state.rate_limit_reactive = False
+                self.state.rate_limit_reactive_coder = None
                 self.log_event(
                     f"{effective_coder.capitalize()} active while "
                     f"{pause_coder} remains rate-limited until "

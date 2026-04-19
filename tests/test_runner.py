@@ -9194,13 +9194,15 @@ def test_check_rate_limit_codex_clears_proactive_claude_pause(
     runner.state.rate_limit_reactive = False
     runner.state.rate_limit_reactive_coder = "claude"
     runner.state.rate_limited_coders.add("claude")
+    runner.state.rate_limited_coder_until["claude"] = runner.state.rate_limited_until
     runner.state.state = PipelineState.PAUSED
 
     result = asyncio.run(runner._check_rate_limit())
     assert result is True
-    assert runner.state.rate_limited_until is not None
-    assert runner.state.rate_limit_reactive_coder == "claude"
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive_coder is None
     assert "claude" in runner.state.rate_limited_coders
+    assert runner.state.rate_limited_coder_until.get("claude") is not None
     assert runner.state.state == PipelineState.IDLE
 
 
@@ -9235,14 +9237,16 @@ def test_check_rate_limit_codex_clears_reactive_claude_pause(
     runner.state.rate_limit_reactive = True
     runner.state.rate_limit_reactive_coder = "claude"
     runner.state.rate_limited_coders.add("claude")
+    runner.state.rate_limited_coder_until["claude"] = runner.state.rate_limited_until
     runner.state.state = PipelineState.PAUSED
 
     result = asyncio.run(runner._check_rate_limit())
     assert result is True
-    assert runner.state.rate_limited_until is not None
-    assert runner.state.rate_limit_reactive is True
-    assert runner.state.rate_limit_reactive_coder == "claude"
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive is False
+    assert runner.state.rate_limit_reactive_coder is None
     assert "claude" in runner.state.rate_limited_coders
+    assert runner.state.rate_limited_coder_until.get("claude") is not None
     assert runner.state.state == PipelineState.IDLE
 
 

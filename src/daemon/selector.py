@@ -29,8 +29,9 @@ class SelectionContext:
 def eligible_coders(ctx: SelectionContext) -> list[str]:
     """Return the currently runnable coder names in preference order."""
     pinned = ctx.repo_config.coder
-    if pinned is not None and not ctx.app_config.daemon.auto_fallback:
-        return [pinned.value]
+    preferred = pinned or ctx.app_config.daemon.coder
+    if not ctx.app_config.daemon.auto_fallback:
+        return [preferred.value]
 
     result: list[str] = []
     for name in ctx.registry.coder_names():
