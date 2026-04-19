@@ -251,7 +251,7 @@
 - Branch: pr-111-coverage-scaffolder
 
 ## PR-112: 100% coverage for src/daemon/repo_ops.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-112.md
 - Branch: pr-112-coverage-repo-ops
 
