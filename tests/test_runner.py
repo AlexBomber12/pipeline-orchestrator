@@ -66,6 +66,14 @@ def _async_cli_capture_path(collector: list, *result: object):
     return _fn
 
 
+def _raise_runtime_error(message: str):
+    raise RuntimeError(message)
+
+
+def _raise_cycle_detected(headers: object, statuses: object):
+    raise ValueError("cycle detected")
+
+
 @pytest.fixture(autouse=True)
 def _disable_dag_selection_by_default(
     monkeypatch: pytest.MonkeyPatch,
@@ -1482,6 +1490,124 @@ def test_handle_idle_sets_error_when_task_status_derivation_times_out(
     assert runner.state.state == PipelineState.ERROR
     assert "Task status derivation failed" in (runner.state.error_message or "")
     assert not coding_called["v"], "handle_coding should NOT be called on timeout"
+
+
+def test_handle_idle_waits_for_pending_queue_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    sync_calls: list[str] = []
+
+    def fake_resolve() -> bool:
+        sync_calls.append("pending")
+        return False
+
+    runner = _make_runner()
+    runner.state.pending_queue_sync_branch = "queue-sync/pr-120"
+    runner._resolve_pending_queue_sync = fake_resolve  # type: ignore[method-assign]
+
+    asyncio.run(runner.handle_idle())
+
+    assert sync_calls == ["pending"]
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+
+
+def test_handle_idle_sets_error_when_initial_sync_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner.sync_to_main = lambda: (_ for _ in ()).throw(RuntimeError("sync broke"))  # type: ignore[method-assign]
+
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "sync_to_main failed: sync broke"
+    assert any("sync_to_main failed: sync broke" in e["event"] for e in runner.state.history)
+
+
+def test_handle_idle_stops_when_pending_upload_processing_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+
+    async def fake_uploads() -> None:
+        return None
+
+    runner.process_pending_uploads = fake_uploads  # type: ignore[method-assign]
+
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert any(
+        "Pending upload failed; skipping task dispatch to retry next cycle" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_idle_sets_error_when_sync_after_upload_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    sync_calls = {"count": 0}
+
+    def fake_sync() -> None:
+        sync_calls["count"] += 1
+        if sync_calls["count"] == 2:
+            raise RuntimeError("resync broke")
+
+    async def fake_uploads() -> bool:
+        return True
+
+    runner.sync_to_main = fake_sync  # type: ignore[method-assign]
+    runner.process_pending_uploads = fake_uploads  # type: ignore[method-assign]
+
+    asyncio.run(runner.handle_idle())
+
+    assert sync_calls["count"] == 2
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "sync_to_main after upload failed: resync broke"
+    assert any(
+        "sync_to_main after upload failed: resync broke" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_idle_sets_error_when_queue_validation_fails_without_dag_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "parse_queue",
+        lambda path, **kw: (_ for _ in ()).throw(
+            QueueValidationError(["tasks/QUEUE.md: malformed status"])
+        ),
+    )
+
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == (
+        "Queue validation failed:\n"
+        "  - tasks/QUEUE.md: malformed status"
+    )
+    assert any("Queue validation failed:" in e["event"] for e in runner.state.history)
+    assert any("tasks/QUEUE.md: malformed status" in e["event"] for e in runner.state.history)
 
 
 def test_handle_coding_errors_when_no_pr_found(
@@ -7476,6 +7602,226 @@ def test_write_generated_queue_md_marks_resync_when_probe_cannot_verify_remote_t
     assert ["git", "reset", "--hard", "HEAD~1"] in git_calls
 
 
+def test_write_generated_queue_md_marks_resync_when_probe_raises_oserror(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "QUEUE.md"
+    original = "# Task Queue\n\n## PR-000: Existing\n"
+    queue_path.write_text(original, encoding="utf-8")
+    headers = [
+        TaskHeader(
+            pr_id="PR-001",
+            title="Project bootstrap",
+            branch="pr-001-bootstrap",
+            task_type="feature",
+            complexity="low",
+            depends_on=[],
+            priority=1,
+            coder="any",
+        )
+    ]
+    statuses = {"PR-001": TaskStatus.DONE}
+
+    git_calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append(cmd)
+        if cmd[:2] == ["git", "push"]:
+            queue_path.write_text("generated queue", encoding="utf-8")
+            return _FakeCompletedProcess(args=cmd, returncode=1, stderr="rejected")
+        if cmd[:2] == ["git", "fetch"]:
+            raise OSError("fetch unavailable")
+        if cmd[:2] == ["git", "reset"]:
+            queue_path.write_text(original, encoding="utf-8")
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(git_ops_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+
+    published = runner._write_generated_queue_md(headers, statuses)
+
+    assert published is False
+    assert runner._idle_generated_queue_needs_resync is True
+    assert queue_path.read_text(encoding="utf-8") == original
+    assert ["git", "reset", "--hard", "HEAD~1"] in git_calls
+
+
+def test_write_generated_queue_md_reraises_non_transient_retry_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    headers = [
+        TaskHeader(
+            pr_id="PR-001",
+            title="Project bootstrap",
+            branch="pr-001-bootstrap",
+            task_type="feature",
+            complexity="low",
+            depends_on=[],
+            priority=1,
+            coder="any",
+        )
+    ]
+    statuses = {"PR-001": TaskStatus.DONE}
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+
+    monkeypatch.setattr(
+        git_ops_module.subprocess,
+        "run",
+        lambda cmd, **kwargs: _FakeCompletedProcess(args=cmd, returncode=0),
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "retry_transient",
+        lambda operation, operation_name=None: _raise_runtime_error(
+            "permanent push failure"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="permanent push failure"):
+        runner._write_generated_queue_md(headers, statuses)
+
+
+def test_select_next_task_from_dag_returns_none_when_tasks_dir_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is None
+
+
+def test_filter_dag_headers_blocks_tasks_with_transitively_blocked_dependencies(
+    tmp_path: Path,
+) -> None:
+    headers = [
+        TaskHeader(
+            pr_id="PR-001",
+            title="Base",
+            branch="pr-001-base",
+            task_type="feature",
+            complexity="low",
+            depends_on=["PR-LEGACY"],
+            priority=1,
+            coder="any",
+        ),
+        TaskHeader(
+            pr_id="PR-002",
+            title="Blocked by blocked task",
+            branch="pr-002-blocked",
+            task_type="feature",
+            complexity="low",
+            depends_on=["PR-001"],
+            priority=2,
+            coder="any",
+        ),
+    ]
+
+    filtered = idle_module.IdleMixin._filter_dag_headers_with_available_dependencies(
+        headers,
+        {"PR-LEGACY"},
+        tmp_path,
+        set(),
+    )
+
+    assert filtered == []
+
+
+def test_select_next_task_from_dag_wraps_dag_cycle_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Cyclic\n\n"
+        "Branch: pr-001-cyclic\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(idle_module, "get_eligible_tasks", _raise_cycle_detected)
+
+    with pytest.raises(QueueValidationError, match="cycle detected"):
+        asyncio.run(runner._select_next_task_from_dag())
+
+
+def test_select_next_task_from_dag_returns_none_when_nothing_is_eligible(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Waiting\n\n"
+        "Branch: pr-001-waiting\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(
+        idle_module,
+        "derive_task_status",
+        lambda header, merged_pr_ids, open_prs, merged_prs: TaskStatus.DONE,
+    )
+    monkeypatch.setattr(idle_module, "get_eligible_tasks", lambda headers, statuses: [])
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is None
+
+
 def test_select_next_task_from_dag_skips_merged_probe_without_structured_headers(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -10938,6 +11284,37 @@ def test_handle_paused_waits_when_window_active(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.rate_limited_until is None
     assert "claude" in runner.state.rate_limited_coders
+
+
+def test_handle_paused_clearable_rate_limit_error_resumes_to_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.PAUSED
+    pause_until = datetime.now(timezone.utc) + timedelta(minutes=20)
+    runner.state.rate_limited_until = pause_until
+    runner.state.rate_limit_reactive_coder = "codex"
+    runner.state.rate_limited_coders.add("codex")
+    runner.state.error_message = "Codex hit rate limit 429"
+    runner.state.current_pr = PRInfo(number=50, branch="pr-050")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-050",
+        title="test",
+        branch="pr-050",
+        status=TaskStatus.DOING,
+    )
+    runner._select_coder = (  # type: ignore[method-assign]
+        lambda allow_exploration=True: ("claude", runner._registry.get("claude"))
+    )
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.error_message is None
+    assert any("cleared legacy rate-limit error" in e["event"] for e in runner.state.history)
+    assert any("-> WATCH" in e["event"] for e in runner.state.history)
 
 
 def test_handle_paused_clears_other_coder_from_rate_limited_set(
