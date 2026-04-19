@@ -171,7 +171,7 @@
 - Branch: pr-100-coverage-git-ops
 
 ## PR-101: 100% coverage for src/daemon/handlers/error.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-101.md
 - Branch: pr-101-coverage-handler-error
 
