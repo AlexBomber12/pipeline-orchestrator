@@ -68,7 +68,7 @@
                       hx-encoding="multipart/form-data"
                       hx-target="#upload-error-{{ repo.name }}"
                       hx-swap="innerHTML">
-                    <input type="file" name="files" multiple accept=".md"
+                    <input type="file" name="files" multiple accept=".md,.zip,application/zip,application/x-zip-compressed"
                            onchange="this.form.requestSubmit()"
                            class="hidden" id="upload-{{ repo.name }}">
                     <label for="upload-{{ repo.name }}"
