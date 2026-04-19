@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from src.utils import repo_slug_from_url
+from src.utils import repo_name_from_url, repo_slug_from_url
 
 
 def test_repo_slug_from_url_github() -> None:
@@ -31,3 +31,17 @@ def test_repo_slug_from_url_ssh() -> None:
 
 def test_repo_slug_from_url_without_git_suffix() -> None:
     assert repo_slug_from_url("https://github.com/example/beta") == "example__beta"
+
+
+def test_repo_slug_from_url_handles_bare_name() -> None:
+    assert repo_slug_from_url("myrepo") == "myrepo"
+
+
+def test_repo_slug_from_url_handles_single_segment_with_colon() -> None:
+    assert repo_slug_from_url("git@github.com:myrepo") == "myrepo"
+
+
+def test_repo_name_from_url_delegates_to_slug() -> None:
+    url = "https://github.com/example/omega.git"
+
+    assert repo_name_from_url(url) == repo_slug_from_url(url)

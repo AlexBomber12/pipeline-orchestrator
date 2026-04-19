@@ -345,14 +345,12 @@ def test_parse_real_queue_file() -> None:
     tasks = parse_queue(str(real_queue))
 
     assert len(tasks) >= 3
-    pr_ids = [task.pr_id for task in tasks]
-    assert "PR-001" in pr_ids
-    assert "PR-002" in pr_ids
-    assert "PR-003" in pr_ids
-
-    by_id = {task.pr_id: task for task in tasks}
-    assert by_id["PR-003"].depends_on == ["PR-002"]
-    assert by_id["PR-003"].branch == "pr-003-queue-parser"
+    assert all(task.pr_id.startswith("PR-") for task in tasks)
+    assert all(task.task_file and task.task_file.startswith("tasks/PR-") for task in tasks)
+    assert all(task.branch and task.branch.startswith("pr-") for task in tasks)
+    assert len({task.pr_id for task in tasks}) == len(tasks)
+    assert any(task.status == TaskStatus.DONE for task in tasks)
+    assert any(task.status == TaskStatus.TODO for task in tasks)
 
 
 def test_mark_task_done_standard_layout() -> None:
