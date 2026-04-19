@@ -181,7 +181,7 @@
 - Branch: pr-102-coverage-queue-parser
 
 ## PR-103: 100% coverage for src/daemon/handlers/hung.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-103.md
 - Branch: pr-103-coverage-handler-hung
 
