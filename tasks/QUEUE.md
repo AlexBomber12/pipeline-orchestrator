@@ -276,7 +276,7 @@
 - Branch: pr-116-coverage-codex-cli
 
 ## PR-117: 100% coverage for src/daemon/handlers/breach.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-117.md
 - Branch: pr-117-coverage-handler-breach
 
