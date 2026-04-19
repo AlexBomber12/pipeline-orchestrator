@@ -11,11 +11,19 @@ Module-level:
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
+import subprocess
+from datetime import datetime, timezone
 from enum import Enum
 
 from src import claude_cli
+from src.daemon import git_ops
 from src.models import PipelineState
+from src.retry import retry_transient
+
+logger = logging.getLogger(__name__)
+_CLAUDE_CLI_COAUTHOR = "Co-authored-by: Claude CLI <noreply@anthropic.com>"
 
 
 class ErrorCategory(Enum):
@@ -125,6 +133,13 @@ class ErrorMixin:
                 "diagnose_error: max attempts (3) reached, staying ERROR"
             )
             return
+        dirty_before = ""
+        try:
+            dirty_before = git_ops._git(
+                self.repo_path, "status", "--porcelain"
+            ).stdout.strip()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            pass
         code, stdout, stderr = await claude_cli.diagnose_error_async(
             self.repo_path, context, model=self.app_config.daemon.claude_model
         )
@@ -143,7 +158,140 @@ class ErrorMixin:
             )
             return
 
+        summary = stdout.strip().splitlines()[-1] if stdout.strip() else ""
         verdict = claude_cli.parse_diagnosis(stdout)
+        dirty = ""
+        try:
+            dirty = git_ops._git(self.repo_path, "status", "--porcelain").stdout.strip()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            pass
+        if dirty_before and dirty:
+            verdict = "ESCALATE"
+            self.log_event(
+                "diagnose_error: pre-existing dirty tree blocks "
+                "automatic cleanup/publish"
+            )
+            dirty = ""
+        if dirty and verdict == "FIX":
+            try:
+                head_before = git_ops._git(
+                    self.repo_path, "rev-parse", "HEAD"
+                ).stdout.strip()
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+            ):
+                head_before = ""
+            branch = None
+            if self.state.current_pr is not None:
+                if not self.state.current_pr.is_cross_repository:
+                    branch = self.state.current_pr.branch
+            elif (
+                self.state.current_task is not None
+                and self.state.current_task.branch
+                and self.state.current_task.branch != self.repo_config.branch
+            ):
+                branch = self.state.current_task.branch
+            if branch is None:
+                if head_before:
+                    git_ops._git(
+                        self.repo_path,
+                        "reset",
+                        "--hard",
+                        head_before,
+                        check=False,
+                    )
+                    git_ops._git(self.repo_path, "clean", "-fd", check=False)
+                verdict = "ESCALATE"
+                self.log_event(
+                    "diagnose_error: dirty tree without active PR/task branch"
+                )
+            else:
+                checked_out_branch = ""
+                try:
+                    checked_out_branch = git_ops._git(
+                        self.repo_path, "rev-parse", "--abbrev-ref", "HEAD"
+                    ).stdout.strip()
+                    if checked_out_branch != branch:
+                        verdict = "ESCALATE"
+                        self.log_event(
+                            "diagnose_error: active branch mismatch "
+                            f"({checked_out_branch!r} != {branch!r})"
+                        )
+                        raise RuntimeError("diagnose_error branch mismatch")
+                    git_ops._git(self.repo_path, "add", "-A")
+                    git_ops._git(
+                        self.repo_path,
+                        "commit",
+                        "-m",
+                        f"diagnose_error auto-fix: {(summary or 'no summary')[:80]}",
+                        "-m",
+                        _CLAUDE_CLI_COAUTHOR,
+                    )
+                    retry_transient(
+                        lambda: git_ops._git(
+                            self.repo_path,
+                            "push",
+                            "origin",
+                            f"HEAD:{branch}",
+                            timeout=60,
+                        ),
+                        operation_name=f"git push origin HEAD:{branch}",
+                    )
+                    if self.state.current_pr is not None:
+                        push_time = datetime.now(timezone.utc)
+                        self._last_push_at = push_time
+                        self._last_push_at_pr_number = self.state.current_pr.number
+                        self.state.current_pr.push_count += 1
+                        self.state.current_pr.last_activity = push_time
+                        if not self._post_codex_review(self.state.current_pr.number):
+                            self.state.state = PipelineState.ERROR
+                            self.state.error_message = (
+                                f"Failed to post @codex review on PR "
+                                f"#{self.state.current_pr.number} after "
+                                "diagnose_error fix push; manual review "
+                                "trigger required to avoid fix/push loop"
+                            )
+                            self.log_event(self.state.error_message)
+                            return
+                except (
+                    subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired,
+                    OSError,
+                    RuntimeError,
+                ):
+                    if head_before:
+                        git_ops._git(
+                            self.repo_path,
+                            "reset",
+                            "--hard",
+                            head_before,
+                            check=False,
+                        )
+                        git_ops._git(self.repo_path, "clean", "-fd", check=False)
+                        logger.warning("diagnose_error made uncommittable changes, reset")
+                    verdict = "ESCALATE"
+        elif dirty:
+            try:
+                head_before = git_ops._git(
+                    self.repo_path, "rev-parse", "HEAD"
+                ).stdout.strip()
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+            ):
+                head_before = ""
+            if head_before:
+                git_ops._git(
+                    self.repo_path,
+                    "reset",
+                    "--hard",
+                    head_before,
+                    check=False,
+                )
+                git_ops._git(self.repo_path, "clean", "-fd", check=False)
         if verdict == "SKIP":
             self.state.current_task = None
             self.state.current_pr = None
@@ -155,7 +303,6 @@ class ErrorMixin:
             self.state.error_message = None
             self.state.state = PipelineState.IDLE
             self._error_diagnose_count = 0
-            summary = stdout.strip().splitlines()[-1] if stdout.strip() else ""
             self.log_event(f"diagnose_error: FIX -> IDLE ({summary[:80]})")
         else:  # ESCALATE
             self.log_event("diagnose_error: ESCALATE, keeping ERROR state")
