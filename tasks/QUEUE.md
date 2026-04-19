@@ -291,7 +291,7 @@
 - Branch: pr-119-coverage-web-app
 
 ## PR-120: 100% coverage for src/daemon/handlers/idle.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-120.md
 - Branch: pr-120-coverage-handler-idle
 
