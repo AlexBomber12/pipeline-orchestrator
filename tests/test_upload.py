@@ -370,6 +370,15 @@ def test_upload_zip_total_raw_size_enforced_across_archives(
     assert calls["count"] == 1
 
 
+def test_upload_empty_zip_rejected(
+    one_repo_config: Path,
+    repo_dir: Path,
+) -> None:
+    resp = _post_upload([_zip_file({})])
+    assert resp.status_code == 422
+    assert "does not contain any task files" in resp.text
+
+
 def test_upload_zip_total_extracted_size_enforced(
     one_repo_config: Path,
     repo_dir: Path,

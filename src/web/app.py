@@ -1756,6 +1756,7 @@ async def upload_tasks(
                 zip_chunks.append(chunk)
             try:
                 with zipfile.ZipFile(io.BytesIO(b"".join(zip_chunks))) as archive:
+                    extracted_file_count = 0
                     for entry in archive.infolist():
                         entry_name = entry.filename
                         if entry.is_dir():
@@ -1809,6 +1810,14 @@ async def upload_tasks(
                             )
                         staged_size += entry_size
                         file_contents.append((entry_name, b''.join(chunks)))
+                        extracted_file_count += 1
+                    if extracted_file_count == 0:
+                        return _render_upload_error(
+                            request,
+                            f"Uploaded zip '{fname}' does not contain any task files.",
+                            422,
+                            repo_name=name,
+                        )
             except zipfile.BadZipFile:
                 return _render_upload_error(
                     request, f"Uploaded zip '{fname}' is corrupt or unreadable.", 400, repo_name=name
