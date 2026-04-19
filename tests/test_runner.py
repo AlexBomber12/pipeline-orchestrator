@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from src import retry as retry_module
 from src.coders import claude as claude_plugin_module
 from src.coder_registry import CoderRegistry
 from src.config import AppConfig, DaemonConfig, RepoConfig
@@ -19,9 +20,9 @@ from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
 from src.daemon import selector as selector_module
 from src.daemon.handlers import breach as breach_module
+from src.daemon.handlers import error as error_module
 from src.daemon.handlers import idle as idle_module
 from src.daemon.runner import ErrorCategory, PipelineRunner, _classify_error
-from src import retry as retry_module
 from src.models import (
     CIStatus,
     FeedbackCheckResult,
@@ -245,6 +246,64 @@ def _patch_subprocess(
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     return calls
+
+
+def _run_dirty_diagnose(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    push_exc: Exception | None = None,
+    with_pr: bool = True,
+    head_branch: str = "fix/diagnose-error-commits-fixes",
+    diagnosis_stdout: str = "FIX\nrepair broken config",
+    review_post_ok: bool = True,
+    preexisting_dirty: str = "",
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    changed = repo / "fix.txt"
+    calls = []
+    warnings = []
+    review_requests = []
+    head_before = "abc123\n"
+
+    async def fake_diag(*args: object, **kwargs: object):
+        changed.write_text("fixed\n")
+        return (0, diagnosis_stdout, "")
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any):
+        calls.append(args)
+        if args[:2] == ("status", "--porcelain"):
+            status = preexisting_dirty
+            if changed.exists() and "fix.txt" not in preexisting_dirty:
+                status += " M fix.txt\n"
+            return _FakeCompletedProcess(stdout=status)
+        if args[:3] == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return _FakeCompletedProcess(stdout=f"{head_branch}\n")
+        if args[:2] == ("rev-parse", "HEAD"):
+            return _FakeCompletedProcess(stdout=head_before)
+        if push_exc and args[:2] == ("push", "origin"):
+            raise push_exc
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake_diag)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(error_module, "retry_transient", lambda op, **_: op())
+    monkeypatch.setattr(error_module.logger, "warning", lambda msg: warnings.append(msg))
+    runner = _make_runner()
+    monkeypatch.setattr(
+        runner,
+        "_post_codex_review",
+        lambda pr_number: review_requests.append(pr_number) or review_post_ok,
+    )
+    runner.repo_path = str(repo)
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+    if with_pr:
+        runner.state.current_pr = PRInfo(
+            number=119, branch="fix/diagnose-error-commits-fixes"
+        )
+    asyncio.run(runner.handle_error())
+    return runner, calls, warnings, review_requests
 
 
 def test_preflight_returns_true_on_clean_repo(
@@ -3373,6 +3432,175 @@ def test_handle_error_escalate_keeps_error(monkeypatch: pytest.MonkeyPatch) -> N
     assert runner.state.error_message == "boom"
 
 
+def test_handle_error_commits_and_pushes_diagnose_fixes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, _, review_requests = _run_dirty_diagnose(monkeypatch, tmp_path)
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.push_count == 1
+    assert runner.state.current_pr.last_activity is not None
+    assert runner._last_push_at is not None
+    assert runner._last_push_at_pr_number == 119
+    assert review_requests == [119]
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "status",
+        "rev-parse",
+        "rev-parse",
+        "add",
+        "commit",
+        "push",
+    ]
+    assert calls[-1] == (
+        "push",
+        "origin",
+        "HEAD:fix/diagnose-error-commits-fixes",
+    )
+
+
+def test_handle_error_resets_when_push_fails_and_escalates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, warnings, _ = _run_dirty_diagnose(
+        monkeypatch, tmp_path, push_exc=RuntimeError("push failed")
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "status",
+        "rev-parse",
+        "rev-parse",
+        "add",
+        "commit",
+        "push",
+        "reset",
+        "clean",
+    ]
+    assert any(cmd[:3] == ("reset", "--hard", "abc123") for cmd in calls)
+    assert any(cmd[:2] == ("clean", "-fd") for cmd in calls)
+    assert warnings == ["diagnose_error made uncommittable changes, reset"]
+
+
+def test_handle_error_errors_when_review_trigger_fails_after_diagnose_push(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, _, review_requests = _run_dirty_diagnose(
+        monkeypatch, tmp_path, review_post_ok=False
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.push_count == 1
+    assert runner._last_push_at is not None
+    assert runner._last_push_at_pr_number == 119
+    assert review_requests == [119]
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "status",
+        "rev-parse",
+        "rev-parse",
+        "add",
+        "commit",
+        "push",
+    ]
+    assert (
+        runner.state.error_message
+        == "Failed to post @codex review on PR #119 after "
+        "diagnose_error fix push; manual review trigger required "
+        "to avoid fix/push loop"
+    )
+    assert any(
+        e["event"] == runner.state.error_message for e in runner.state.history
+    )
+
+
+def test_handle_error_escalates_dirty_tree_without_active_pr_branch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, _warnings, _ = _run_dirty_diagnose(
+        monkeypatch, tmp_path, with_pr=False
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "status",
+        "rev-parse",
+        "reset",
+        "clean",
+    ]
+    assert any(
+        e["event"] == "diagnose_error: dirty tree without active PR/task branch"
+        for e in runner.state.history
+    )
+
+
+def test_handle_error_escalates_dirty_tree_when_branch_mismatches_pr(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, warnings, _ = _run_dirty_diagnose(
+        monkeypatch, tmp_path, head_branch="main"
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "status",
+        "rev-parse",
+        "rev-parse",
+        "reset",
+        "clean",
+    ]
+    assert warnings == ["diagnose_error made uncommittable changes, reset"]
+    assert any(
+        "diagnose_error: active branch mismatch ('main' != "
+        "'fix/diagnose-error-commits-fixes')"
+        == e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_error_discards_dirty_tree_for_non_fix_verdict(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, warnings, _ = _run_dirty_diagnose(
+        monkeypatch, tmp_path, diagnosis_stdout="ESCALATE\nhuman help"
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "status",
+        "rev-parse",
+        "reset",
+        "clean",
+    ]
+    assert warnings == []
+
+
+def test_handle_error_escalates_without_publishing_preexisting_dirty_tree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, warnings, review_requests = _run_dirty_diagnose(
+        monkeypatch,
+        tmp_path,
+        preexisting_dirty=" M unrelated.txt\n",
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert [cmd[0] for cmd in calls] == ["status", "status"]
+    assert warnings == []
+    assert review_requests == []
+    assert any(
+        e["event"]
+        == "diagnose_error: pre-existing dirty tree blocks automatic cleanup/publish"
+        for e in runner.state.history
+    )
+
+
 def test_publish_state_writes_to_redis() -> None:
     runner = _make_runner()
     asyncio.run(runner.publish_state())
@@ -5426,7 +5654,6 @@ def test_write_generated_queue_md_retries_transient_push_failure(
 ) -> None:
     queue_dir = tmp_path / "tasks"
     queue_dir.mkdir()
-    queue_path = queue_dir / "QUEUE.md"
     headers = [
         TaskHeader(
             pr_id="PR-001",
