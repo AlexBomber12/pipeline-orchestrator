@@ -9699,6 +9699,419 @@ def test_handle_fix_error_on_rev_parse_after_failure(
     assert "rev-parse after fix" in (runner.state.error_message or "")
 
 
+def test_handle_fix_ignores_initial_rev_parse_failure_and_logs_iteration_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-fix rev-parse failure must not block a successful FIX run."""
+    rev_parse_calls = {"count": 0}
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_calls["count"] += 1
+            if rev_parse_calls["count"] == 1:
+                raise subprocess.CalledProcessError(
+                    128, ["git", *args], stderr="fatal: bad object HEAD"
+                )
+            return _FakeCompletedProcess(
+                args=["git", *args], stdout="bbb222\n", returncode=0
+            )
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def no_idle_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    async def no_breach_monitor(
+        self: object,
+        breach_dir: str,
+        run_id: str,
+        claude_task: asyncio.Task,  # type: ignore[type-arg]
+        breach_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", _async_cli_result(0, "ok", "")
+    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is None
+    assert any("Fix pushed, iteration #0" in e["event"] for e in runner.state.history)
+
+
+def test_handle_fix_sets_error_when_breach_cancel_review_post_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A breach-cancelled fix with a real HEAD change must surface review-post failure."""
+    rev_parse_calls = {"count": 0}
+    rehydrated: list[int] = []
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_calls["count"] += 1
+            sha = "aaa111\n" if rev_parse_calls["count"] == 1 else "bbb222\n"
+            return _FakeCompletedProcess(args=["git", *args], stdout=sha, returncode=0)
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        await asyncio.Future()
+        return (0, "", "")
+
+    async def no_idle_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    async def breach_cancel_monitor(
+        self: PipelineRunner,
+        breach_dir: str,
+        run_id: str,
+        claude_task: asyncio.Task,  # type: ignore[type-arg]
+        breach_flag: dict[str, bool],
+    ) -> None:
+        self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        breach_flag["breached"] = True
+        await asyncio.sleep(0)
+        claude_task.cancel()
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_inflight_breach", breach_cancel_monitor
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=42, branch="pr-042-fix")
+    monkeypatch.setattr(
+        runner, "_rehydrate_last_push_at", lambda pr: rehydrated.append(pr.number)
+    )
+    monkeypatch.setattr(runner, "_post_codex_review", lambda pr_number: False)
+
+    asyncio.run(runner.handle_fix())
+
+    assert rehydrated == [42]
+    assert runner.state.state == PipelineState.ERROR
+    assert "breach-cancel fix push" in (runner.state.error_message or "")
+
+
+def test_handle_fix_pauses_when_breach_cancel_rev_parse_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A breach-cancelled fix still pauses cleanly if HEAD cannot be re-read."""
+    rev_parse_calls = {"count": 0}
+    rehydrated: list[int] = []
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_calls["count"] += 1
+            if rev_parse_calls["count"] == 1:
+                return _FakeCompletedProcess(
+                    args=["git", *args], stdout="aaa111\n", returncode=0
+                )
+            raise RuntimeError("rev-parse lost HEAD")
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        await asyncio.Future()
+        return (0, "", "")
+
+    async def no_idle_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    async def breach_cancel_monitor(
+        self: PipelineRunner,
+        breach_dir: str,
+        run_id: str,
+        claude_task: asyncio.Task,  # type: ignore[type-arg]
+        breach_flag: dict[str, bool],
+    ) -> None:
+        self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        breach_flag["breached"] = True
+        await asyncio.sleep(0)
+        claude_task.cancel()
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_inflight_breach", breach_cancel_monitor
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=42, branch="pr-042-fix")
+    monkeypatch.setattr(
+        runner, "_rehydrate_last_push_at", lambda pr: rehydrated.append(pr.number)
+    )
+    monkeypatch.setattr(
+        runner,
+        "_post_codex_review",
+        lambda pr_number: pytest.fail("review post should not run when HEAD read fails"),
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    assert rehydrated == [42]
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.error_message is None
+    assert any("FIX aborted: in-flight rate limit breach" in e["event"] for e in runner.state.history)
+
+
+def test_handle_fix_reraises_unexpected_cancelled_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only breach and idle cancellations are swallowed by handle_fix."""
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(args=["git", *args], stdout="aaa111\n", returncode=0)
+
+    async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        raise asyncio.CancelledError
+
+    async def no_idle_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    async def no_breach_monitor(
+        self: object,
+        breach_dir: str,
+        run_id: str,
+        claude_task: asyncio.Task,  # type: ignore[type-arg]
+        breach_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(runner.handle_fix())
+
+
+def test_handle_fix_sets_error_when_late_breach_review_post_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late breach with a changed HEAD must surface review-post failure."""
+    rev_parse_calls = {"count": 0}
+    rehydrated: list[int] = []
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_calls["count"] += 1
+            sha = "aaa111\n" if rev_parse_calls["count"] == 1 else "bbb222\n"
+            return _FakeCompletedProcess(args=["git", *args], stdout=sha, returncode=0)
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def no_idle_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    async def no_breach_monitor(
+        self: object,
+        breach_dir: str,
+        run_id: str,
+        claude_task: asyncio.Task,  # type: ignore[type-arg]
+        breach_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    def fake_late_breach(
+        self: PipelineRunner,
+        breach_dir: str,
+        run_id: str,
+        breach_flag: dict[str, bool],
+    ) -> None:
+        self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        breach_flag["breached"] = True
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", _async_cli_result(0, "ok", "")
+    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
+    )
+    monkeypatch.setattr(PipelineRunner, "_check_late_breach", fake_late_breach)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=42, branch="pr-042-fix")
+    monkeypatch.setattr(
+        runner, "_rehydrate_last_push_at", lambda pr: rehydrated.append(pr.number)
+    )
+    monkeypatch.setattr(runner, "_post_codex_review", lambda pr_number: False)
+
+    asyncio.run(runner.handle_fix())
+
+    assert rehydrated == [42]
+    assert runner.state.state == PipelineState.ERROR
+    assert "late-breach fix push" in (runner.state.error_message or "")
+
+
+def test_handle_fix_pauses_when_late_breach_rev_parse_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late breach still pauses cleanly if HEAD cannot be re-read."""
+    rev_parse_calls = {"count": 0}
+    rehydrated: list[int] = []
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_calls["count"] += 1
+            if rev_parse_calls["count"] == 1:
+                return _FakeCompletedProcess(
+                    args=["git", *args], stdout="aaa111\n", returncode=0
+                )
+            raise RuntimeError("rev-parse lost HEAD")
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def no_idle_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    async def no_breach_monitor(
+        self: object,
+        breach_dir: str,
+        run_id: str,
+        claude_task: asyncio.Task,  # type: ignore[type-arg]
+        breach_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    def fake_late_breach(
+        self: PipelineRunner,
+        breach_dir: str,
+        run_id: str,
+        breach_flag: dict[str, bool],
+    ) -> None:
+        self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        breach_flag["breached"] = True
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", _async_cli_result(0, "ok", "")
+    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
+    )
+    monkeypatch.setattr(PipelineRunner, "_check_late_breach", fake_late_breach)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=42, branch="pr-042-fix")
+    monkeypatch.setattr(
+        runner, "_rehydrate_last_push_at", lambda pr: rehydrated.append(pr.number)
+    )
+    monkeypatch.setattr(
+        runner,
+        "_post_codex_review",
+        lambda pr_number: pytest.fail("review post should not run when HEAD read fails"),
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    assert rehydrated == [42]
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.error_message is None
+    assert any("FIX paused: late in-flight rate limit breach" in e["event"] for e in runner.state.history)
+
+
+def test_handle_fix_sets_error_on_non_rate_limit_cli_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-rate-limit CLI failures must surface as ERROR with stderr text."""
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(args=["git", *args], stdout="aaa111\n", returncode=0)
+
+    async def no_idle_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    async def no_breach_monitor(
+        self: object,
+        breach_dir: str,
+        run_id: str,
+        claude_task: asyncio.Task,  # type: ignore[type-arg]
+        breach_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", _async_cli_result(7, "", "plain failure")
+    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "plain failure"
+    assert any("[claude] fix_review failed: plain failure" in e["event"] for e in runner.state.history)
+
+
 # ── PAUSED state tests ──────────────────────────────────────────────
 
 
