@@ -3467,8 +3467,8 @@ def test_handle_error_escalates_dirty_tree_when_branch_mismatches_pr(
     )
 
     assert runner.state.state == PipelineState.ERROR
-    assert [cmd[0] for cmd in calls] == ["status", "rev-parse"]
-    assert warnings == []
+    assert [cmd[0] for cmd in calls] == ["status", "rev-parse", "rev-parse", "reset"]
+    assert warnings == ["diagnose_error made uncommittable changes, reset"]
     assert any(
         "diagnose_error: active branch mismatch ('main' != "
         "'fix/diagnose-error-commits-fixes')"

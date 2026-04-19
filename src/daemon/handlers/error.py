@@ -141,6 +141,9 @@ class ErrorMixin:
                 checked_out_branch = ""
                 head_before = ""
                 try:
+                    head_before = git_ops._git(
+                        self.repo_path, "rev-parse", "HEAD"
+                    ).stdout.strip()
                     checked_out_branch = git_ops._git(
                         self.repo_path, "rev-parse", "--abbrev-ref", "HEAD"
                     ).stdout.strip()
@@ -151,9 +154,6 @@ class ErrorMixin:
                             f"({checked_out_branch!r} != {branch!r})"
                         )
                         raise RuntimeError("diagnose_error branch mismatch")
-                    head_before = git_ops._git(
-                        self.repo_path, "rev-parse", "HEAD"
-                    ).stdout.strip()
                     git_ops._git(self.repo_path, "add", "-A")
                     git_ops._git(
                         self.repo_path,
