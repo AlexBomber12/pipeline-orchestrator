@@ -151,7 +151,7 @@
 - Branch: pr-096-coverage-selector
 
 ## PR-097: 100% coverage for src/coders/claude.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-097.md
 - Branch: pr-097-coverage-coders-claude
 
