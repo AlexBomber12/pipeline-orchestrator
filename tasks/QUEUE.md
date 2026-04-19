@@ -211,7 +211,7 @@
 - Branch: pr-107b-coverage-merge-mark-queue-done
 
 ## PR-107c: 100% coverage for merge queue-sync helpers
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-107c.md
 - Branch: pr-107c-coverage-merge-queue-sync
 
