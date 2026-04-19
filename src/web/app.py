@@ -1760,13 +1760,33 @@ async def upload_tasks(
                                 422,
                                 repo_name=name,
                             )
-                        content = archive.read(entry)
-                        total_size += len(content)
-                        if total_size > _UPLOAD_MAX_TOTAL_BYTES:
+                        if total_size + entry.file_size > _UPLOAD_MAX_TOTAL_BYTES:
                             return _render_upload_error(
                                 request, "Total upload size exceeds 1 MB", 422, repo_name=name
                             )
-                        file_contents.append((entry_name, content))
+                        try:
+                            chunks: list[bytes] = []
+                            entry_size = 0
+                            with archive.open(entry) as zipped_file:
+                                while True:
+                                    chunk = zipped_file.read(_CHUNK)
+                                    if not chunk:
+                                        break
+                                    entry_size += len(chunk)
+                                    if total_size + entry_size > _UPLOAD_MAX_TOTAL_BYTES:
+                                        return _render_upload_error(
+                                            request, "Total upload size exceeds 1 MB", 422, repo_name=name
+                                        )
+                                    chunks.append(chunk)
+                        except (NotImplementedError, OSError, RuntimeError):
+                            return _render_upload_error(
+                                request,
+                                f"Uploaded zip '{fname}' contains encrypted, unsupported, or unreadable entries.",
+                                400,
+                                repo_name=name,
+                            )
+                        total_size += entry_size
+                        file_contents.append((entry_name, b''.join(chunks)))
             except zipfile.BadZipFile:
                 return _render_upload_error(
                     request, f"Uploaded zip '{fname}' is corrupt or unreadable.", 400, repo_name=name

@@ -291,13 +291,45 @@ test_upload_zip_with_non_md_entries_rejected = _make_zip_error_test([_zip_file({
 test_upload_zip_corrupt_returns_400 = _make_zip_error_test([("files", ("broken.zip", b"not-a-zip", "application/zip"))], 400, "corrupt or unreadable")  # noqa: E501
 
 
+def test_upload_zip_entry_read_error_returns_400(
+    one_repo_config: Path,
+    repo_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zip_upload = _zip_file({"PR-001.md": _task_bytes()})
+    original_open = zipfile.ZipFile.open
+
+    def _raising_open(self, name, mode="r", pwd=None, *, force_zip64=False):
+        if mode == "r":
+            raise RuntimeError("password required")
+        return original_open(
+            self, name, mode=mode, pwd=pwd, force_zip64=force_zip64
+        )
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", _raising_open)
+    resp = _post_upload([zip_upload])
+    assert resp.status_code == 400
+    assert "encrypted, unsupported, or unreadable entries" in resp.text
+
+
 def test_upload_zip_total_extracted_size_enforced(
     one_repo_config: Path,
     repo_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    zip_upload = _zip_file({"PR-001.md": b"a" * 250})
+    original_open = zipfile.ZipFile.open
+
+    def _unexpected_open(self, name, mode="r", pwd=None, *, force_zip64=False):
+        if mode == "r":
+            raise AssertionError("zip entry should not be opened when size limit already fails")
+        return original_open(
+            self, name, mode=mode, pwd=pwd, force_zip64=force_zip64
+        )
+
     monkeypatch.setattr(web_app, "_UPLOAD_MAX_TOTAL_BYTES", 200)
-    resp = _post_upload([_zip_file({"PR-001.md": b"a" * 150, "PR-002.md": b"b" * 150})])
+    monkeypatch.setattr(zipfile.ZipFile, "open", _unexpected_open)
+    resp = _post_upload([zip_upload])
     assert resp.status_code == 422 and "Total upload size exceeds 1 MB" in resp.text
 
 
