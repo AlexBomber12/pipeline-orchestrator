@@ -2394,6 +2394,31 @@ def test_restore_current_run_record_clears_state_without_task() -> None:
     assert runner._current_run_record is None
 
 
+def test_restore_current_run_record_logs_metrics_lookup_failure() -> None:
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+
+    async def fake_recent(**kwargs: Any) -> list[object]:
+        raise RuntimeError("metrics unavailable")
+
+    runner._metrics_store.recent = fake_recent  # type: ignore[method-assign]
+
+    asyncio.run(runner._restore_current_run_record())
+
+    assert runner._current_run_record is None
+    assert any(
+        "restore_current_run_record failed for PR-001: metrics unavailable"
+        in entry["event"]
+        for entry in runner.state.history
+    )
+
+
 def test_save_current_run_record_sets_duration_none_for_invalid_started_at() -> None:
     runner = _make_runner()
     runner.state.current_task = QueueTask(
@@ -5095,6 +5120,25 @@ def test_publish_state_migrates_owned_legacy_upload_key() -> None:
     assert f"pipeline:{runner.name}" in runner.redis.store
     assert "upload:demo:pending" not in runner.redis.store
     assert runner.redis.store[f"upload:{runner.name}:pending"] == "pending"
+
+
+def test_publish_state_ignores_legacy_upload_migration_error() -> None:
+    class _BrokenRenameRedis(_FakeRedis):
+        async def exists(self, key: str) -> int:
+            raise RuntimeError("rename failed")
+
+    runner = _make_runner(url="https://github.com/octo/demo-renamed.git")
+    runner.redis = _BrokenRenameRedis()
+    runner._old_basename = "demo"
+    runner.redis.store["pipeline:demo"] = json.dumps(
+        {"url": "https://github.com/octo/demo-renamed.git"}
+    )
+    runner.redis.store["upload:demo:pending"] = "pending"
+
+    asyncio.run(runner.publish_state())
+
+    assert runner.redis.store[f"pipeline:{runner.name}"]
+    assert runner.redis.store["upload:demo:pending"] == "pending"
 
 
 def test_run_cycle_resets_stale_transient_state(
@@ -7949,6 +7993,31 @@ def test_save_cli_log_includes_stderr() -> None:
     assert "err text" in stored
     assert "=== STDOUT ===" in stored
     assert "=== STDERR ===" in stored
+
+
+def test_save_cli_log_truncates_and_warns_on_redis_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FailingRedis(_FakeRedis):
+        async def set(self, key: str, value: str, ex: int | None = None) -> None:
+            raise OSError("disk full")
+
+    warnings: list[str] = []
+    events: list[str] = []
+    runner = _make_runner()
+    runner.redis = _FailingRedis()
+    runner.log_event = events.append  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        runner_module.logger,
+        "warning",
+        lambda msg, *args: warnings.append(msg % args),
+    )
+
+    asyncio.run(runner._save_cli_log("x" * (70 * 1024), "err text", "LABEL"))
+
+    assert warnings == [f"Failed to save CLI log for {runner.name}"]
+    assert events and events[0].startswith("LABEL: [truncated]")
+    assert len(events[0]) <= 207
 
 
 def test_handle_watch_skips_fix_no_new_feedback(
@@ -10926,6 +10995,299 @@ def test_legacy_error_with_rate_limited_until_converts_to_paused(
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.error_message == "some real error"
     assert any("Legacy ERROR" in e["event"] for e in runner.state.history)
+
+
+def test_publish_while_waiting_handles_publish_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warnings: list[str] = []
+    sleep_calls = {"count": 0}
+    runner = _make_runner()
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls["count"] += 1
+        if sleep_calls["count"] > 1:
+            raise asyncio.CancelledError()
+
+    async def fake_publish_state() -> None:
+        raise RuntimeError("redis offline")
+
+    monkeypatch.setattr(runner_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+    monkeypatch.setattr(
+        runner_module.logger,
+        "warning",
+        lambda msg, *args: warnings.append(msg % args),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(runner._publish_while_waiting("heartbeat"))
+
+    assert warnings == [f"[{runner.name}] heartbeat publish failed, will retry"]
+
+
+def test_run_cycle_handles_ensure_repo_cloned_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publishes: list[str] = []
+    runner = _make_runner()
+
+    async def fake_ensure_repo_cloned() -> None:
+        raise RuntimeError("clone failed")
+
+    async def fake_publish_state() -> None:
+        publishes.append("published")
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+
+    asyncio.run(runner.run_cycle())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "clone failed"
+    assert publishes == ["published"]
+    assert any(
+        "ensure_repo_cloned failed: clone failed" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+@pytest.mark.parametrize(
+    ("head_ref", "expect_checkout"),
+    [
+        ("main", False),
+        ("feature/work", True),
+    ],
+)
+def test_run_cycle_processes_pending_uploads_from_recovery_when_on_or_off_base(
+    monkeypatch: pytest.MonkeyPatch,
+    head_ref: str,
+    expect_checkout: bool,
+) -> None:
+    publishes: list[str] = []
+    upload_calls: list[bool] = []
+    git_calls: list[tuple[str, ...]] = []
+    runner = _make_runner()
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_recover_state() -> bool:
+        return False
+
+    async def fake_publish_state() -> None:
+        publishes.append("published")
+
+    async def fake_process_pending_uploads(*, _safe: bool) -> None:
+        upload_calls.append(_safe)
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append(args)
+        if args == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return _FakeCompletedProcess(stdout=f"{head_ref}\n")
+        if args == ("checkout", runner.repo_config.branch):
+            return _FakeCompletedProcess(stdout="")
+        raise AssertionError(f"unexpected git call: {args}")
+
+    runner.redis.store[f"upload:{runner.name}:pending"] = "pending"
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "recover_state", fake_recover_state)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+    monkeypatch.setattr(runner, "process_pending_uploads", fake_process_pending_uploads)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+
+    asyncio.run(runner.run_cycle())
+
+    assert publishes == ["published"]
+    assert upload_calls == [True]
+    if expect_checkout:
+        assert ("checkout", runner.repo_config.branch) in git_calls
+    else:
+        assert ("checkout", runner.repo_config.branch) not in git_calls
+
+
+def test_run_cycle_skips_pending_uploads_when_git_probe_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publishes: list[str] = []
+    upload_calls: list[bool] = []
+    runner = _make_runner()
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_recover_state() -> bool:
+        return False
+
+    async def fake_publish_state() -> None:
+        publishes.append("published")
+
+    async def fake_process_pending_uploads(*, _safe: bool) -> None:
+        upload_calls.append(_safe)
+
+    runner.redis.store[f"upload:{runner.name}:pending"] = "pending"
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "recover_state", fake_recover_state)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+    monkeypatch.setattr(runner, "process_pending_uploads", fake_process_pending_uploads)
+    monkeypatch.setattr(
+        git_ops_module,
+        "_git",
+        lambda repo_path, *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("rev-parse failed")
+        ),
+    )
+
+    asyncio.run(runner.run_cycle())
+
+    assert publishes == ["published"]
+    assert upload_calls == []
+
+
+def test_run_cycle_ignores_pending_upload_probe_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publishes: list[str] = []
+    runner = _make_runner()
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_recover_state() -> bool:
+        return False
+
+    async def fake_publish_state() -> None:
+        publishes.append("published")
+
+    async def fake_get(key: str) -> str | None:
+        raise RuntimeError("redis unavailable")
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "recover_state", fake_recover_state)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+    monkeypatch.setattr(runner.redis, "get", fake_get)
+
+    asyncio.run(runner.run_cycle())
+
+    assert publishes == ["published"]
+
+
+def test_run_cycle_marks_recovery_complete_and_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publishes: list[str] = []
+    runner = _make_runner()
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_recover_state() -> bool:
+        return True
+
+    async def fake_publish_state() -> None:
+        publishes.append("published")
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "recover_state", fake_recover_state)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+
+    asyncio.run(runner.run_cycle())
+
+    assert runner._recovered is True
+    assert publishes == ["published"]
+
+
+def test_run_cycle_returns_after_preflight_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publishes: list[str] = []
+    runner = _make_runner()
+    runner._recovered = True
+    runner._scaffolded = True
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_publish_state() -> None:
+        publishes.append("published")
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", lambda: False)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+
+    asyncio.run(runner.run_cycle())
+
+    assert publishes == ["published"]
+
+
+@pytest.mark.parametrize(
+    ("state", "handler_name"),
+    [
+        (PipelineState.WATCH, "handle_watch"),
+        (PipelineState.HUNG, "handle_hung"),
+    ],
+)
+def test_run_cycle_dispatches_watch_and_hung_handlers(
+    monkeypatch: pytest.MonkeyPatch,
+    state: PipelineState,
+    handler_name: str,
+) -> None:
+    calls: list[str] = []
+    publishes: list[str] = []
+    runner = _make_runner()
+    runner._recovered = True
+    runner._scaffolded = True
+    runner.state.state = state
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_handler() -> None:
+        calls.append(handler_name)
+
+    async def fake_publish_state() -> None:
+        publishes.append("published")
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", lambda: True)
+    monkeypatch.setattr(runner, handler_name, fake_handler)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+
+    asyncio.run(runner.run_cycle())
+
+    assert calls == [handler_name]
+    assert publishes == ["published"]
+
+
+def test_run_cycle_dispatches_error_handler_when_ai_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    publishes: list[str] = []
+    runner = _make_runner()
+    runner._recovered = True
+    runner._scaffolded = True
+    runner.state.state = PipelineState.ERROR
+    runner.state.rate_limited_until = None
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_handle_error() -> None:
+        calls.append("handle_error")
+
+    async def fake_publish_state() -> None:
+        publishes.append("published")
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", lambda: True)
+    monkeypatch.setattr(runner, "handle_error", fake_handle_error)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+
+    asyncio.run(runner.run_cycle())
+
+    assert calls == ["handle_error"]
+    assert publishes == ["published"]
 
 
 # ── ErrorCategory / _classify_error ──────────────────────────────────
