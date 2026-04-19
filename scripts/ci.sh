@@ -7,8 +7,8 @@ echo "==> ruff check src/"
 python -m ruff check src/
 
 if [ -d tests ]; then
-    echo "==> pytest -q"
-    python -m pytest -q
+    echo "==> pytest --cov=src --cov-report=term-missing --cov-fail-under=86 -q"
+    python -m pytest --cov=src --cov-report=term-missing --cov-fail-under=86 -q
 else
     echo "==> tests/ directory not present, skipping pytest"
 fi
