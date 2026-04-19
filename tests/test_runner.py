@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import random
 import subprocess
 import time
+import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,7 @@ from src.daemon import runner as runner_module
 from src.daemon import selector as selector_module
 from src.daemon.handlers import breach as breach_module
 from src.daemon.handlers import error as error_module
+from src.daemon.handlers import fix as fix_module
 from src.daemon.handlers import hung as hung_module
 from src.daemon.handlers import idle as idle_module
 from src.daemon.handlers import merge as merge_module
@@ -7939,6 +7942,253 @@ def test_fix_idle_timeout_monitor_resets_on_push(
     asyncio.run(runner.handle_fix())
     assert runner.state.state == PipelineState.WATCH
     assert push_detected[0]
+
+
+def test_monitor_fix_idle_times_out_without_push_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_monitor_fix_idle should tolerate missing push history and still time out."""
+    runner = _make_runner()
+    events: list[str] = []
+    monkeypatch.setattr(runner, "log_event", events.append)
+
+    branch_results: list[object] = [
+        fix_module.github_client.GitHubPollError("bootstrap failed"),
+        None,
+    ]
+
+    def fake_branch_last_push(repo: str, pr_number: int) -> float | None:
+        result = branch_results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    async def fake_to_thread(func: Any, *args: object, **kwargs: object) -> Any:
+        return func(*args, **kwargs)
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    monotonic_values = iter([100.0, 105.0])
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "get_branch_last_push_time",
+        fake_branch_last_push,
+    )
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, pr: None,
+    )
+    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        fix_module,
+        "time",
+        types.SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+    )
+
+    async def run_monitor() -> tuple[dict[str, bool], asyncio.Task[None]]:
+        idle_flag = {"timed_out": False}
+        blocker: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+        async def wait_forever() -> None:
+            await blocker
+
+        target = asyncio.create_task(wait_forever())
+        await runner._monitor_fix_idle(5, 5, target, idle_flag)
+        return idle_flag, target
+
+    idle_flag, target = asyncio.run(run_monitor())
+    assert idle_flag["timed_out"] is True
+    assert target.cancelled() is True
+    assert events == ["FIX: idle timeout (5s since last push), killing"]
+
+
+def test_monitor_fix_idle_backdates_elapsed_time_from_head_age(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Head age should backdate the idle deadline before the first poll."""
+    runner = _make_runner()
+
+    async def fake_to_thread(func: Any, *args: object, **kwargs: object) -> Any:
+        return func(*args, **kwargs)
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    monotonic_values = iter([100.0, 250.0])
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "get_branch_last_push_time",
+        lambda repo, pr: None,
+    )
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, pr: 30.0,
+    )
+    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        fix_module,
+        "time",
+        types.SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+    )
+
+    async def run_monitor() -> tuple[dict[str, bool], asyncio.Task[None]]:
+        idle_flag = {"timed_out": False}
+        blocker: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+        async def wait_forever() -> None:
+            await blocker
+
+        target = asyncio.create_task(wait_forever())
+        await runner._monitor_fix_idle(5, 120, target, idle_flag)
+        return idle_flag, target
+
+    idle_flag, target = asyncio.run(run_monitor())
+    assert idle_flag["timed_out"] is True
+    assert target.cancelled() is True
+
+
+def test_monitor_fix_idle_resets_timer_on_detected_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newly detected push should reset the timer without cancelling the target."""
+    runner = _make_runner()
+    events: list[str] = []
+    monkeypatch.setattr(runner, "log_event", events.append)
+
+    class _StopMonitor(Exception):
+        pass
+
+    branch_results: list[object] = [
+        fix_module.github_client.GitHubPollError("bootstrap failed"),
+        50.0,
+        220.0,
+    ]
+
+    def fake_branch_last_push(repo: str, pr_number: int) -> float | None:
+        result = branch_results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    sleep_calls = 0
+
+    async def fake_sleep(delay: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 3:
+            raise _StopMonitor
+
+    async def fake_to_thread(func: Any, *args: object, **kwargs: object) -> Any:
+        return func(*args, **kwargs)
+
+    monotonic_values = iter([100.0, 150.0, 230.0, 250.0])
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "get_branch_last_push_time",
+        fake_branch_last_push,
+    )
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, pr: None,
+    )
+    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        fix_module,
+        "time",
+        types.SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+    )
+    idle_flag = {"timed_out": False}
+    target_holder: dict[str, asyncio.Task[None]] = {}
+
+    async def run_monitor() -> None:
+        blocker: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+        async def wait_forever() -> None:
+            await blocker
+
+        target = asyncio.create_task(wait_forever())
+        target_holder["task"] = target
+        try:
+            await runner._monitor_fix_idle(5, 100, target, idle_flag)
+        finally:
+            target.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await target
+
+    with pytest.raises(_StopMonitor):
+        asyncio.run(run_monitor())
+
+    assert idle_flag["timed_out"] is False
+    assert target_holder["task"].cancelled() is True
+    assert "FIX: Claude pushed, resetting idle timer" in events
+
+
+def test_monitor_fix_idle_logs_poll_failures_before_timing_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub poll failures should preserve the deadline and be logged."""
+    runner = _make_runner()
+    events: list[str] = []
+    monkeypatch.setattr(runner, "log_event", events.append)
+
+    def fake_branch_last_push(repo: str, pr_number: int) -> float | None:
+        if fake_branch_last_push.calls == 0:
+            fake_branch_last_push.calls += 1
+            return None
+        raise fix_module.github_client.GitHubPollError("poll failed")
+
+    fake_branch_last_push.calls = 0
+
+    async def fake_to_thread(func: Any, *args: object, **kwargs: object) -> Any:
+        return func(*args, **kwargs)
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    monotonic_values = iter([100.0, 130.0])
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "get_branch_last_push_time",
+        fake_branch_last_push,
+    )
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, pr: None,
+    )
+    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        fix_module,
+        "time",
+        types.SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+    )
+
+    async def run_monitor() -> tuple[dict[str, bool], asyncio.Task[None]]:
+        idle_flag = {"timed_out": False}
+        blocker: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+        async def wait_forever() -> None:
+            await blocker
+
+        target = asyncio.create_task(wait_forever())
+        await runner._monitor_fix_idle(5, 30, target, idle_flag)
+        return idle_flag, target
+
+    idle_flag, target = asyncio.run(run_monitor())
+    assert idle_flag["timed_out"] is True
+    assert target.cancelled() is True
+    assert events == [
+        "FIX: GitHub API poll failed, preserving deadline",
+        "FIX: idle timeout (30s since last push), killing",
+    ]
 
 
 def test_handle_watch_stale_feedback_still_times_out(
