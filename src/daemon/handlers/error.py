@@ -122,29 +122,57 @@ class ErrorMixin:
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             pass
         if dirty:
-            try:
-                branch = git_ops._git(
-                    self.repo_path, "rev-parse", "--abbrev-ref", "HEAD"
-                ).stdout.strip()
-                git_ops._git(self.repo_path, "add", "-A")
-                git_ops._git(
-                    self.repo_path,
-                    "commit",
-                    "-m",
-                    f"diagnose_error auto-fix: {(summary or 'no summary')[:80]}",
-                    "-m",
-                    _CLAUDE_CLI_COAUTHOR,
-                )
-                retry_transient(
-                    lambda: git_ops._git(
-                        self.repo_path, "push", "origin", branch, timeout=60
-                    ),
-                    operation_name=f"git push origin {branch}",
-                )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError):
-                git_ops._git(self.repo_path, "reset", "--hard", "HEAD", check=False)
-                logger.warning("diagnose_error made uncommittable changes, reset")
+            branch = None
+            if self.state.current_pr is not None:
+                if not self.state.current_pr.is_cross_repository:
+                    branch = self.state.current_pr.branch
+            elif (
+                self.state.current_task is not None
+                and self.state.current_task.branch
+                and self.state.current_task.branch != self.repo_config.branch
+            ):
+                branch = self.state.current_task.branch
+            if branch is None:
                 verdict = "ESCALATE"
+                self.log_event(
+                    "diagnose_error: dirty tree without active PR/task branch"
+                )
+            else:
+                head_before = ""
+                try:
+                    head_before = git_ops._git(
+                        self.repo_path, "rev-parse", "HEAD"
+                    ).stdout.strip()
+                    git_ops._git(self.repo_path, "add", "-A")
+                    git_ops._git(
+                        self.repo_path,
+                        "commit",
+                        "-m",
+                        f"diagnose_error auto-fix: {(summary or 'no summary')[:80]}",
+                        "-m",
+                        _CLAUDE_CLI_COAUTHOR,
+                    )
+                    retry_transient(
+                        lambda: git_ops._git(
+                            self.repo_path, "push", "origin", branch, timeout=60
+                        ),
+                        operation_name=f"git push origin {branch}",
+                    )
+                except (
+                    subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired,
+                    OSError,
+                    RuntimeError,
+                ):
+                    git_ops._git(
+                        self.repo_path,
+                        "reset",
+                        "--hard",
+                        head_before or "HEAD",
+                        check=False,
+                    )
+                    logger.warning("diagnose_error made uncommittable changes, reset")
+                    verdict = "ESCALATE"
         if verdict == "SKIP":
             self.state.current_task = None
             self.state.current_pr = None

@@ -240,13 +240,17 @@ def _patch_subprocess(
 
 
 def _run_dirty_diagnose(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, push_exc: Exception | None = None
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    push_exc: Exception | None = None,
+    with_pr: bool = True,
 ):
     repo = tmp_path / "repo"
     repo.mkdir()
     changed = repo / "fix.txt"
     calls = []
     warnings = []
+    head_before = "abc123\n"
 
     async def fake_diag(*args: object, **kwargs: object):
         changed.write_text("fixed\n")
@@ -256,8 +260,8 @@ def _run_dirty_diagnose(
         calls.append(args)
         if args[:2] == ("status", "--porcelain"):
             return _FakeCompletedProcess(stdout=" M fix.txt\n" if changed.exists() else "")
-        if args[:3] == ("rev-parse", "--abbrev-ref", "HEAD"):
-            return _FakeCompletedProcess(stdout="fix/diagnose-error-commits-fixes\n")
+        if args[:2] == ("rev-parse", "HEAD"):
+            return _FakeCompletedProcess(stdout=head_before)
         if push_exc and args[:2] == ("push", "origin"):
             raise push_exc
         return _FakeCompletedProcess()
@@ -270,6 +274,10 @@ def _run_dirty_diagnose(
     runner.repo_path = str(repo)
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "boom"
+    if with_pr:
+        runner.state.current_pr = PRInfo(
+            number=119, branch="fix/diagnose-error-commits-fixes"
+        )
     asyncio.run(runner.handle_error())
     return runner, calls, warnings
 
@@ -3417,8 +3425,23 @@ def test_handle_error_resets_when_push_fails_and_escalates(
     )
 
     assert runner.state.state == PipelineState.ERROR
-    assert any(cmd[:3] == ("reset", "--hard", "HEAD") for cmd in calls)
+    assert any(cmd[:3] == ("reset", "--hard", "abc123") for cmd in calls)
     assert warnings == ["diagnose_error made uncommittable changes, reset"]
+
+
+def test_handle_error_escalates_dirty_tree_without_active_pr_branch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, _warnings = _run_dirty_diagnose(
+        monkeypatch, tmp_path, with_pr=False
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert [cmd[0] for cmd in calls] == ["status"]
+    assert any(
+        e["event"] == "diagnose_error: dirty tree without active PR/task branch"
+        for e in runner.state.history
+    )
 
 
 def test_publish_state_writes_to_redis() -> None:
