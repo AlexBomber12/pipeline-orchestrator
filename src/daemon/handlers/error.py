@@ -33,6 +33,7 @@ class ErrorCategory(Enum):
 
 def _classify_error(context: str) -> ErrorCategory:
     lowered = context.lower()
+    has_ci_token = re.search(r"\bci\b", lowered) is not None
     if "rate limit" in lowered or re.search(r"\b429\b", lowered):
         return ErrorCategory.RATE_LIMIT
     if "timeout" in lowered:
@@ -45,10 +46,19 @@ def _classify_error(context: str) -> ErrorCategory:
         return ErrorCategory.OOM
     if "auth" in lowered or "unauthorized" in lowered or "401" in lowered:
         return ErrorCategory.AUTH_FAILURE
-    if "ci" in lowered and "fail" in lowered:
+    if has_ci_token and "fail" in lowered:
         return ErrorCategory.CI_FAILURE
     if "ghost push" in lowered or "head sha" in lowered:
         return ErrorCategory.GHOST_PUSH
+    if (
+        "stale branch" in lowered
+        or "non-fast-forward" in lowered
+        or "non fast forward" in lowered
+        or "branch drift" in lowered
+        or "needs rebase" in lowered
+        or "need rebase" in lowered
+    ):
+        return ErrorCategory.STALE_BRANCH
     if "not found" in lowered and "cli" in lowered:
         return ErrorCategory.CLI_NOT_FOUND
     if "git" in lowered and ("error" in lowered or "fail" in lowered):

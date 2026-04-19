@@ -8284,6 +8284,22 @@ def test_classify_ci_failure(msg: str) -> None:
 
 @pytest.mark.parametrize(
     "msg",
+    [
+        "Push rejected: non-fast-forward update required",
+        "Branch drift detected; needs rebase before retry",
+        "stale branch state blocks merge",
+    ],
+)
+def test_classify_stale_branch(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.STALE_BRANCH
+
+
+def test_classify_ci_failure_requires_ci_word_boundary() -> None:
+    assert _classify_error("decision failed during merge") == ErrorCategory.OTHER
+
+
+@pytest.mark.parametrize(
+    "msg",
     ["ghost push detected", "HEAD SHA changed unexpectedly"],
 )
 def test_classify_ghost_push(msg: str) -> None:
