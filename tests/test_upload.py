@@ -379,6 +379,21 @@ def test_upload_empty_zip_rejected(
     assert "does not contain any task files" in resp.text
 
 
+def test_upload_zip_unicode_decode_error_returns_400(
+    one_repo_config: Path,
+    repo_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _BrokenZipFile:
+        def __init__(self, *args, **kwargs) -> None:
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(web_app.zipfile, "ZipFile", _BrokenZipFile)
+    resp = _post_upload([("files", ("broken.zip", b"zip-bytes", "application/zip"))])
+    assert resp.status_code == 400
+    assert "corrupt or unreadable" in resp.text
+
+
 def test_upload_zip_total_extracted_size_enforced(
     one_repo_config: Path,
     repo_dir: Path,

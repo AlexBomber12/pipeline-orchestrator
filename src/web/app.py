@@ -1818,7 +1818,7 @@ async def upload_tasks(
                             422,
                             repo_name=name,
                         )
-            except zipfile.BadZipFile:
+            except (UnicodeDecodeError, zipfile.BadZipFile):
                 return _render_upload_error(
                     request, f"Uploaded zip '{fname}' is corrupt or unreadable.", 400, repo_name=name
                 )
