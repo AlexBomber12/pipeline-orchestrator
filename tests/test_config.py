@@ -40,6 +40,16 @@ def test_daemon_config_claude_model_default() -> None:
     assert DaemonConfig().claude_model == "opus"
 
 
+def test_daemon_config_selector_defaults() -> None:
+    from src.config import DaemonConfig
+
+    cfg = DaemonConfig()
+
+    assert cfg.auto_fallback is True
+    assert cfg.coder_priority == {"codex": 81, "claude": 76}
+    assert cfg.exploration_epsilon == 0.15
+
+
 def test_load_config_valid_yaml(tmp_path: Path) -> None:
     yaml_text = """
 repositories:
@@ -98,6 +108,7 @@ def test_repo_config_defaults() -> None:
     # UI without a custom timeout inherits whatever PR-016's daemon
     # control is set to.
     assert repo.review_timeout_min is None
+    assert repo.disabled_coders is None
 
 
 def test_normalize_repo_url_strips_git_and_slash() -> None:
@@ -301,6 +312,32 @@ def test_update_daemon_config_updates_fields(tmp_path: Path) -> None:
     reloaded = load_config(str(path))
     assert reloaded.daemon.poll_interval_sec == 120
     assert reloaded.daemon.error_handler_use_ai is False
+
+
+def test_update_daemon_config_selector_fields(tmp_path: Path) -> None:
+    path = tmp_path / "config.yml"
+    save_config(AppConfig(), str(path))
+
+    cfg = update_daemon_config(
+        str(path),
+        auto_fallback=False,
+        exploration_epsilon=0.25,
+        coder_priority={"claude": 10, "codex": 20},
+    )
+
+    assert cfg.daemon.auto_fallback is False
+    assert cfg.daemon.exploration_epsilon == 0.25
+    assert cfg.daemon.coder_priority == {"claude": 10, "codex": 20}
+
+
+def test_daemon_config_rejects_exploration_epsilon_out_of_range() -> None:
+    from pydantic import ValidationError
+    from src.config import DaemonConfig
+
+    with pytest.raises(ValidationError):
+        DaemonConfig(exploration_epsilon=-0.01)
+    with pytest.raises(ValidationError):
+        DaemonConfig(exploration_epsilon=0.51)
 
 
 def test_update_daemon_config_rejects_unknown_field(tmp_path: Path) -> None:

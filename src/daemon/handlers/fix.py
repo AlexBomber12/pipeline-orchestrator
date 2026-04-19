@@ -132,7 +132,11 @@ class FixMixin(BreachMixin):
             head_before = git_ops._git(
                 self.repo_path, "rev-parse", "HEAD"
             ).stdout.strip()
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ):
             pass
 
         idle_limit = self.app_config.daemon.fix_idle_timeout_sec

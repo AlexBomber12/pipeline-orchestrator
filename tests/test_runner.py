@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 from src.coders import claude as claude_plugin_module
+from src.coder_registry import CoderRegistry
 from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
@@ -8803,6 +8804,73 @@ def test_get_coder_repo_override_takes_precedence() -> None:
     name, plugin = runner._get_coder()
     assert name == "codex"
     assert plugin.name == "codex"
+
+
+def test_get_coder_uses_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    codex = runner._registry.get("codex")
+    seen = []
+
+    def fake_select(ctx: object) -> tuple[str, object]:
+        seen.append(ctx)
+        return ("codex", codex)
+
+    monkeypatch.setattr(runner_module, "select_coder", fake_select)
+
+    name, plugin = runner._get_coder()
+
+    assert seen
+    assert name == "codex"
+    assert plugin is codex
+
+
+def test_get_coder_falls_through_to_default_when_selector_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    monkeypatch.setattr(runner_module, "select_coder", lambda ctx: None)
+
+    name, plugin = runner._get_coder()
+
+    assert name == "claude"
+    assert plugin.name == "claude"
+
+
+def test_get_coder_auto_fallback_switches_on_rate_limit_via_selector() -> None:
+    runner = _make_runner()
+
+    runner.state.rate_limited_coders.add("claude")
+
+    name, plugin = runner._get_coder()
+
+    assert name == "codex"
+    assert plugin.name == "codex"
+
+
+def test_get_coder_exploration_occasionally_picks_non_greedy() -> None:
+    registry = CoderRegistry()
+    registry.register(runner_module.build_coder_registry().get("claude"))
+    registry.register(runner_module.build_coder_registry().get("codex"))
+    runner = PipelineRunner(
+        _repo_cfg(),
+        _app_cfg(
+            auto_fallback=True,
+            coder_priority={"claude": 10, "codex": 20},
+            exploration_epsilon=0.15,
+        ),
+        _FakeRedis(),
+        _FakeUsageProvider(),
+        _FakeUsageProvider(),
+        registry=registry,
+    )
+    runner._selector_rng.seed(9)
+
+    picks = [runner._get_coder()[0] for _ in range(200)]
+    non_greedy = sum(1 for pick in picks if pick != "claude")
+
+    assert 15 <= non_greedy <= 45
 
 
 def test_handle_coding_uses_codex_cli_when_coder_is_codex(

@@ -530,7 +530,7 @@
 - Branch: pr-090-error-classification
 
 ## PR-091: Coder fallback policy with eligibility and priority
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-091.md
 - Branch: pr-091-fallback-policy
 - Depends on: PR-077

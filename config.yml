@@ -6,11 +6,16 @@ repositories:
 daemon:
   poll_interval_sec: 60
   review_timeout_min: 60
+  auto_fallback: true
   hung_fallback_codex_review: true
   error_handler_use_ai: true
   claude_model: opus
   fix_idle_timeout_sec: 1800
   planned_pr_timeout_sec: 900
+  coder_priority:
+    codex: 81
+    claude: 76
+  exploration_epsilon: 0.15
   rate_limit_pause_percent: 90
 web:
   host: 0.0.0.0

@@ -539,6 +539,8 @@ def test_settings_page_renders_daemon_section(empty_config: Path) -> None:
     assert 'id="settings-daemon"' in body
     assert 'name="poll_interval_sec"' in body
     assert 'name="review_timeout_min"' in body
+    assert 'name="auto_fallback"' in body
+    assert 'name="exploration_epsilon"' in body
     assert 'name="hung_fallback_codex_review"' in body
     assert 'name="error_handler_use_ai"' in body
     assert "Coders" in body
@@ -553,6 +555,7 @@ def test_partial_daemon_returns_fragment(empty_config: Path) -> None:
     body = response.text
     assert "<!DOCTYPE" not in body
     assert 'name="poll_interval_sec"' in body
+    assert 'name="exploration_epsilon"' in body
     assert 'id="settings-daemon-error"' in body
     assert 'hx-swap-oob="innerHTML"' in body
 
@@ -592,6 +595,7 @@ def test_put_daemon_updates_boolean_fields(empty_config: Path) -> None:
         response = client.put(
             "/settings/daemon",
             data={
+                "auto_fallback": "false",
                 "hung_fallback_codex_review": "false",
                 "error_handler_use_ai": "false",
             },
@@ -599,8 +603,21 @@ def test_put_daemon_updates_boolean_fields(empty_config: Path) -> None:
 
     assert response.status_code == 200
     cfg = load_config(str(empty_config))
+    assert cfg.daemon.auto_fallback is False
     assert cfg.daemon.hung_fallback_codex_review is False
     assert cfg.daemon.error_handler_use_ai is False
+
+
+def test_put_daemon_updates_exploration_epsilon(empty_config: Path) -> None:
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"exploration_epsilon": "0.25"},
+        )
+
+    assert response.status_code == 200
+    cfg = load_config(str(empty_config))
+    assert cfg.daemon.exploration_epsilon == 0.25
 
 
 def test_model_save_rejects_unknown_model(empty_config: Path) -> None:
@@ -739,6 +756,21 @@ def test_put_daemon_invalid_bool_returns_422_html(empty_config: Path) -> None:
     assert "hung_fallback_codex_review" in response.text
     cfg = load_config(str(empty_config))
     assert cfg.daemon.hung_fallback_codex_review is True
+
+
+def test_put_daemon_invalid_exploration_epsilon_returns_422_html(
+    empty_config: Path,
+) -> None:
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"exploration_epsilon": "0.75"},
+        )
+
+    assert response.status_code == 422
+    assert "exploration_epsilon" in response.text
+    cfg = load_config(str(empty_config))
+    assert cfg.daemon.exploration_epsilon == 0.15
 
 
 def test_put_daemon_handles_readonly_config(

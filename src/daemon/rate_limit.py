@@ -62,6 +62,7 @@ class RateLimitMixin:
             return True
         self.state.rate_limited_until = datetime.fromtimestamp(resets_at, tz=timezone.utc)
         self.state.rate_limit_reactive_coder = coder_name
+        self.state.rate_limited_coders.add(coder_name)
         # Only preserve error_message when pausing from ERROR state so
         # handle_paused correctly resumes to ERROR; clear stale error
         # context from non-ERROR states to avoid incorrect ERROR resume.
@@ -81,8 +82,12 @@ class RateLimitMixin:
         *proactive_coder* is forwarded to ``_proactive_usage_check`` so
         callers that always invoke a specific CLI can check the right quota.
         """
-        coder = self.repo_config.coder or self.app_config.daemon.coder
-        effective_coder = proactive_coder or coder.value
+        if proactive_coder is not None:
+            effective_coder = proactive_coder
+        elif self.repo_config.coder is not None:
+            effective_coder = self.repo_config.coder.value
+        else:
+            effective_coder = self._get_coder()[0]
         if self.state.rate_limited_until is not None:
             # Legacy pauses (pre-PR-066) have no coder attribution;
             # treat them as Claude since that was the only coder.
@@ -118,7 +123,7 @@ class RateLimitMixin:
                     else:
                         self.state.state = PipelineState.IDLE
                 self.log_event(
-                    f"{coder.value.capitalize()} active, clearing other-coder rate-limit pause"
+                    f"{effective_coder.capitalize()} active, clearing other-coder rate-limit pause"
                 )
                 # Fall through so the proactive usage check still runs
                 # to avoid launching work that exceeds usage thresholds.
@@ -129,6 +134,7 @@ class RateLimitMixin:
                 self.log_event(f"Rate limited, resuming in {int(remaining)}s")
                 return False
             else:
+                self.state.rate_limited_coders.discard(pause_coder)
                 self.state.rate_limited_until = None
                 self.state.rate_limit_reactive = False
                 self.state.rate_limit_reactive_coder = None
@@ -242,6 +248,7 @@ class RateLimitMixin:
             self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=pause_min)
             self.state.rate_limit_reactive = True
             self.state.rate_limit_reactive_coder = coder_name
+            self.state.rate_limited_coders.add(coder_name)
             self.log_event(
                 f"[{coder_name}] Rate limit detected ({limit_type}), "
                 f"pausing for {pause_min} min"

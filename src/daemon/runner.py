@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import subprocess
 import uuid
 from datetime import datetime, timezone
@@ -50,6 +51,7 @@ from src.daemon.preflight import PreflightMixin
 from src.daemon.rate_limit import RateLimitMixin
 from src.daemon.recovery import RecoveryMixin
 from src.daemon.repo_ops import RepoOpsMixin
+from src.daemon.selector import SelectionContext, select_coder
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
 from src.usage import UsageProvider
@@ -176,6 +178,7 @@ class PipelineRunner(
         self._codex_usage_provider = codex_usage_provider
         self._metrics_store = MetricsStore(redis_client)
         self._current_run_record: RunRecord | None = None
+        self._selector_rng = random.Random(0)
 
     @property
     def app_config(self) -> AppConfig:
@@ -196,10 +199,21 @@ class PipelineRunner(
 
     def _get_coder(self) -> tuple[str, CoderPlugin]:
         """Return ``(coder_name, coder_plugin)`` for the active coder."""
-        coder = self.repo_config.coder or self.app_config.daemon.coder
-        coder_name = (
-            coder.value if isinstance(coder, CoderType) else str(coder)
+        if self.repo_config.coder is not None:
+            coder_name = self.repo_config.coder.value
+            return coder_name, self._registry.get(coder_name)
+        ctx = SelectionContext(
+            registry=self._registry,
+            repo_config=self.repo_config,
+            app_config=self.app_config,
+            state=self.state,
+            rng=self._selector_rng,
         )
+        result = select_coder(ctx)
+        if result is not None:
+            return result
+        coder = self.repo_config.coder or self.app_config.daemon.coder
+        coder_name = coder.value if isinstance(coder, CoderType) else str(coder)
         return coder_name, self._registry.get(coder_name)
 
     def _load_current_task_metadata(self) -> tuple[str, str]:

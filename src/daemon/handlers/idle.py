@@ -635,7 +635,10 @@ class IdleMixin:
             self.log_event("PAUSED without rate_limited_until -> IDLE")
             self.state.state = PipelineState.IDLE
             return
-        coder = self.repo_config.coder or self.app_config.daemon.coder
+        if self.repo_config.coder is not None:
+            coder_name = self.repo_config.coder.value
+        else:
+            coder_name = self._get_coder()[0]
         pause_coder = self.state.rate_limit_reactive_coder or "claude"
         diagnosis_pause = (
             self.state.error_message is not None
@@ -643,7 +646,7 @@ class IdleMixin:
         )
         other_coder = (
             not diagnosis_pause
-            and pause_coder != coder.value
+            and pause_coder != coder_name
         )
         clearable = other_coder
         if clearable:
@@ -653,7 +656,7 @@ class IdleMixin:
             self._claude_usage_provider.invalidate_cache()
             self._codex_usage_provider.invalidate_cache()
             self._error_diagnose_count = 0
-            label = f"{coder.value.capitalize()} active, clearing other-coder pause"
+            label = f"{coder_name.capitalize()} active, clearing other-coder pause"
             if self.state.error_message:
                 lowered = self.state.error_message.lower()
                 is_rate_limit_msg = (
@@ -684,6 +687,7 @@ class IdleMixin:
             self.log_event(f"Paused, resuming in {int(remaining)}s")
             return
         # Window expired: resume to appropriate state
+        self.state.rate_limited_coders.discard(pause_coder)
         self.state.rate_limited_until = None
         self.state.rate_limit_reactive = False
         self.state.rate_limit_reactive_coder = None
