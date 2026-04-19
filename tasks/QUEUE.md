@@ -166,7 +166,7 @@
 - Branch: pr-099-coverage-coders-codex
 
 ## PR-100: 100% coverage for src/daemon/git_ops.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-100.md
 - Branch: pr-100-coverage-git-ops
 
