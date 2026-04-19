@@ -21,6 +21,7 @@ from src.daemon import runner as runner_module
 from src.daemon import selector as selector_module
 from src.daemon.handlers import breach as breach_module
 from src.daemon.handlers import error as error_module
+from src.daemon.handlers import hung as hung_module
 from src.daemon.handlers import idle as idle_module
 from src.daemon.runner import ErrorCategory, PipelineRunner, _classify_error
 from src.models import (
@@ -2943,6 +2944,26 @@ def test_handle_hung_posts_codex_review_and_returns_to_watch(
     assert runner.state.current_pr.last_activity is not None
 
 
+def test_handle_hung_sets_error_when_fallback_post_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(repo: str, number: int, body: str) -> None:
+        raise RuntimeError("gh unavailable")
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", boom)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    asyncio.run(runner.handle_hung())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "post_comment failed: gh unavailable"
+    assert any(
+        entry["event"] == "gh unavailable" for entry in runner.state.history
+    )
+
+
 def test_handle_hung_preserves_context_when_fallback_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2974,6 +2995,39 @@ def test_handle_hung_preserves_context_when_fallback_disabled(
     assert runner.state.current_pr.number == 5
     assert runner.state.current_task is not None
     assert runner.state.current_task.pr_id == "PR-001"
+
+
+def test_handle_hung_stays_hung_when_pr_state_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(*args: object, **kwargs: object) -> dict[str, str]:
+        raise RuntimeError("gh view failed")
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", boom)
+    runner = PipelineRunner(
+        _repo_cfg(),
+        AppConfig(
+            repositories=[],
+            daemon=DaemonConfig(hung_fallback_codex_review=False),
+        ),
+        _FakeRedis(),
+        *_usage_providers(),
+    )
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_hung())
+
+    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.current_pr is not None
+    assert runner.state.current_task is not None
+    assert any(
+        "hung: failed to check PR state: gh view failed; staying HUNG"
+        in entry["event"]
+        for entry in runner.state.history
+    )
 
 
 @pytest.mark.parametrize("pr_state", ["MERGED", "CLOSED"])
@@ -6846,6 +6900,54 @@ def test_codex_review_metadata_failure_posts_without_pr_author_dedup(
     assert any(
         "failed to load PR metadata for @codex review dedup" in e["event"]
         for e in runner.state.history
+    )
+
+
+def test_author_already_requested_review_fails_open_on_lookup_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        hung_module.github_client,
+        "has_recent_codex_review_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    assert (
+        hung_module._author_already_requested_review(
+            "octo/demo",
+            42,
+            "alice",
+            "2026-04-17T23:14:11Z",
+        )
+        is False
+    )
+
+
+def test_codex_review_post_failure_clears_cached_dedup_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(repo: str, number: int, body: str) -> None:
+        raise RuntimeError("gh rate limited")
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", boom)
+    monkeypatch.setattr(
+        git_ops_module,
+        "_git",
+        lambda *args, **kwargs: _FakeCompletedProcess(
+            args=list(args), stdout="head-1\n", returncode=0
+        ),
+    )
+
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
+
+    assert runner._post_codex_review(42) is False
+    assert runner._last_codex_review_pr is None
+    assert runner._last_codex_review_head_sha is None
+    assert any(
+        "Warning: failed to post @codex review on PR #42: gh rate limited"
+        in entry["event"]
+        for entry in runner.state.history
     )
 
 
