@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import random
+import re
 import subprocess
 import time
 import types
@@ -1932,6 +1933,286 @@ def test_start_current_run_record_sets_stage_coder() -> None:
 
     assert runner._current_run_record is not None
     assert runner._current_run_record.stage == "coder"
+
+
+def test_start_current_run_record_clears_record_without_task() -> None:
+    runner = _make_runner()
+    runner._current_run_record = object()  # type: ignore[assignment]
+
+    runner._start_current_run_record("claude", "opus")
+
+    assert runner._current_run_record is None
+
+
+def test_app_config_setter_and_usage_provider_swap() -> None:
+    runner = _make_runner()
+    new_config = _app_cfg(poll_interval_sec=120)
+    claude_provider = _FakeUsageProvider(snapshot={"name": "claude"})
+    codex_provider = _FakeUsageProvider(snapshot={"name": "codex"})
+
+    runner.app_config = new_config
+    runner.set_usage_providers(claude_provider, codex_provider)
+
+    assert runner.app_config is new_config
+    assert runner._claude_usage_provider is claude_provider
+    assert runner._codex_usage_provider is codex_provider
+
+
+def test_refresh_auth_status_cache_returns_early_when_cache_is_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    runner._auth_status_cache = {"claude": {"status": "ok"}}
+    runner._auth_status_cache_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
+
+    async def fail_to_thread(*args: object, **kwargs: object) -> object:
+        raise AssertionError("asyncio.to_thread should not be called")
+
+    monkeypatch.setattr(runner_module.asyncio, "to_thread", fail_to_thread)
+
+    asyncio.run(runner._refresh_auth_status_cache())
+
+    assert runner._auth_status_cache == {"claude": {"status": "ok"}}
+
+
+def test_refresh_auth_status_cache_marks_plugin_probe_errors() -> None:
+    class _Plugin:
+        display_name = "fake"
+        models: list[str] = []
+
+        def __init__(self, name: str, status: dict[str, str] | Exception) -> None:
+            self.name = name
+            self._status = status
+
+        async def run_planned_pr(self, *args: object, **kwargs: object) -> tuple[int, str, str]:
+            return (0, "", "")
+
+        async def fix_review(self, *args: object, **kwargs: object) -> tuple[int, str, str]:
+            return (0, "", "")
+
+        def check_auth(self) -> dict[str, str]:
+            if isinstance(self._status, Exception):
+                raise self._status
+            return self._status
+
+        def create_usage_provider(self, **kwargs: object) -> None:
+            return None
+
+        def rate_limit_patterns(self) -> list[re.Pattern[str]]:
+            return []
+
+    registry = CoderRegistry()
+    registry.register(_Plugin("claude", {"status": "ok", "detail": "ready"}))
+    registry.register(_Plugin("codex", RuntimeError("boom")))
+    claude_provider, codex_provider = _usage_providers()
+    runner = PipelineRunner(
+        _repo_cfg(),
+        _app_cfg(),
+        _FakeRedis(),
+        claude_provider,
+        codex_provider,
+        registry=registry,
+    )
+
+    asyncio.run(runner._refresh_auth_status_cache())
+
+    assert runner._auth_status_cache == {
+        "claude": {"status": "ok", "detail": "ready"},
+        "codex": {"status": "error"},
+    }
+    assert runner._auth_status_cache_expires_at is not None
+    assert runner._auth_status_cache_expires_at > datetime.now(timezone.utc)
+
+
+def test_init_migrates_legacy_clone_when_origin_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_name = f"runner-init-migrate-{time.time_ns()}"
+    old_path = Path("/data/repos") / repo_name
+    new_path = Path("/data/repos") / f"octo__{repo_name}"
+    old_path.mkdir(parents=True)
+    (old_path / ".git").mkdir()
+    info_logs: list[tuple[object, ...]] = []
+    run_calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        run_calls.append(cmd)
+        assert cmd in (
+            ["git", "-C", str(old_path), "remote", "get-url", "origin"],
+            ["git", "-C", str(new_path), "remote", "get-url", "origin"],
+        )
+        return _FakeCompletedProcess(args=cmd, stdout=f"https://github.com/octo/{repo_name}.git\n")
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        runner_module.logger,
+        "info",
+        lambda *args: info_logs.append(args),
+    )
+
+    try:
+        runner = _make_runner(url=f"https://github.com/octo/{repo_name}.git")
+        assert runner.repo_path == str(new_path)
+        assert new_path.exists()
+        assert not old_path.exists()
+        assert run_calls == [
+            ["git", "-C", str(old_path), "remote", "get-url", "origin"],
+            ["git", "-C", str(new_path), "remote", "get-url", "origin"],
+        ]
+        assert info_logs
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            import shutil
+            shutil.rmtree(new_path)
+        with contextlib.suppress(FileNotFoundError):
+            import shutil
+            shutil.rmtree(old_path)
+
+
+def test_init_skips_legacy_clone_migration_when_origin_mismatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_name = f"runner-init-skip-{time.time_ns()}"
+    old_path = Path("/data/repos") / repo_name
+    new_path = Path("/data/repos") / f"octo__{repo_name}"
+    old_path.mkdir(parents=True)
+    warnings: list[tuple[object, ...]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(args=cmd, stdout="https://github.com/octo/other.git\n")
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        runner_module.logger,
+        "warning",
+        lambda *args: warnings.append(args),
+    )
+
+    try:
+        _make_runner(url=f"https://github.com/octo/{repo_name}.git")
+        assert old_path.exists()
+        assert not new_path.exists()
+        assert any("Legacy clone" in str(args[0]) for args in warnings)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            import shutil
+            shutil.rmtree(new_path)
+        with contextlib.suppress(FileNotFoundError):
+            import shutil
+            shutil.rmtree(old_path)
+
+
+def test_init_skips_legacy_clone_migration_when_origin_probe_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_name = f"runner-init-error-{time.time_ns()}"
+    old_path = Path("/data/repos") / repo_name
+    new_path = Path("/data/repos") / f"octo__{repo_name}"
+    old_path.mkdir(parents=True)
+    warnings: list[tuple[object, ...]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        raise RuntimeError("git unavailable")
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        runner_module.logger,
+        "warning",
+        lambda *args: warnings.append(args),
+    )
+
+    try:
+        _make_runner(url=f"https://github.com/octo/{repo_name}.git")
+        assert old_path.exists()
+        assert not new_path.exists()
+        assert any("Could not verify origin for %s — skipping migration" in str(args[0]) for args in warnings)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            import shutil
+            shutil.rmtree(new_path)
+        with contextlib.suppress(FileNotFoundError):
+            import shutil
+            shutil.rmtree(old_path)
+
+
+def test_init_removes_non_git_directory_at_new_clone_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_name = f"runner-init-nongit-{time.time_ns()}"
+    new_path = Path("/data/repos") / f"octo__{repo_name}"
+    new_path.mkdir(parents=True)
+    warnings: list[tuple[object, ...]] = []
+
+    monkeypatch.setattr(
+        runner_module.logger,
+        "warning",
+        lambda *args: warnings.append(args),
+    )
+
+    try:
+        _make_runner(url=f"https://github.com/octo/{repo_name}.git")
+        assert not new_path.exists()
+        assert any("Removing non-git directory %s" in str(args[0]) for args in warnings)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            import shutil
+            shutil.rmtree(new_path)
+
+
+def test_init_removes_stale_clone_when_origin_mismatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_name = f"runner-init-stale-{time.time_ns()}"
+    new_path = Path("/data/repos") / f"octo__{repo_name}"
+    (new_path / ".git").mkdir(parents=True)
+    warnings: list[tuple[object, ...]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(args=cmd, stdout="https://github.com/octo/other.git\n")
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        runner_module.logger,
+        "warning",
+        lambda *args: warnings.append(args),
+    )
+
+    try:
+        _make_runner(url=f"https://github.com/octo/{repo_name}.git")
+        assert not new_path.exists()
+        assert any("removing stale clone" in str(args[0]).lower() for args in warnings)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            import shutil
+            shutil.rmtree(new_path)
+
+
+def test_init_logs_when_new_clone_origin_probe_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_name = f"runner-init-new-error-{time.time_ns()}"
+    new_path = Path("/data/repos") / f"octo__{repo_name}"
+    (new_path / ".git").mkdir(parents=True)
+    warnings: list[tuple[object, ...]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        raise RuntimeError("git unavailable")
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        runner_module.logger,
+        "warning",
+        lambda *args: warnings.append(args),
+    )
+
+    try:
+        _make_runner(url=f"https://github.com/octo/{repo_name}.git")
+        assert new_path.exists()
+        assert any("Could not verify origin for %s" == str(args[0]) for args in warnings)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            import shutil
+            shutil.rmtree(new_path)
 
 
 def test_compute_diff_stats_returns_populated_fields_on_clean_diff(
