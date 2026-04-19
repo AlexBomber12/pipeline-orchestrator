@@ -216,7 +216,7 @@
 - Branch: pr-107c-coverage-merge-queue-sync
 
 ## PR-108a: 100% coverage for fix._monitor_fix_idle
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-108a.md
 - Branch: pr-108a-coverage-fix-monitor
 
