@@ -8266,6 +8266,10 @@ def test_classify_oom(msg: str) -> None:
     assert _classify_error(msg) == ErrorCategory.OOM
 
 
+def test_classify_oom_requires_token_boundary() -> None:
+    assert _classify_error("No room left on device") == ErrorCategory.OTHER
+
+
 @pytest.mark.parametrize(
     "msg",
     ["auth failed", "401 Unauthorized", "unauthorized request"],
@@ -8320,6 +8324,10 @@ def test_classify_cli_not_found(msg: str) -> None:
 )
 def test_classify_git_error(msg: str) -> None:
     assert _classify_error(msg) == ErrorCategory.GIT_ERROR
+
+
+def test_classify_git_error_requires_git_token() -> None:
+    assert _classify_error("GitHub API request failed") == ErrorCategory.OTHER
 
 
 def test_handle_error_timeout_has_distinct_log(

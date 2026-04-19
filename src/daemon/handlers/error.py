@@ -39,7 +39,7 @@ def _classify_error(context: str) -> ErrorCategory:
     if "timeout" in lowered:
         return ErrorCategory.TIMEOUT
     if (
-        "oom" in lowered
+        re.search(r"\boom\b", lowered)
         or "out of memory" in lowered
         or "killed" in lowered
     ):
@@ -61,7 +61,7 @@ def _classify_error(context: str) -> ErrorCategory:
         return ErrorCategory.STALE_BRANCH
     if "not found" in lowered and "cli" in lowered:
         return ErrorCategory.CLI_NOT_FOUND
-    if "git" in lowered and ("error" in lowered or "fail" in lowered):
+    if re.search(r"\bgit\b", lowered) and ("error" in lowered or "fail" in lowered):
         return ErrorCategory.GIT_ERROR
     return ErrorCategory.OTHER
 
