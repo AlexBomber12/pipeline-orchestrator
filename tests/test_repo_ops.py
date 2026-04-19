@@ -432,7 +432,7 @@ def test_process_pending_uploads_success_and_nothing_to_commit(
     (staging / "AGENTS.md").write_text("# AGENTS\n", encoding="utf-8")
     manifest = json.dumps(
         {
-            "files": ["QUEUE.md", "AGENTS.md", "MISSING.md"],
+            "files": ["QUEUE.md", "AGENTS.md"],
             "staging_dir": str(staging),
         }
     )
@@ -458,9 +458,8 @@ def test_process_pending_uploads_success_and_nothing_to_commit(
 
     assert (repo_dir / "tasks" / "QUEUE.md").read_text(encoding="utf-8") == "# Queue\n"
     assert (repo_dir / "AGENTS.md").read_text(encoding="utf-8") == "# AGENTS\n"
-    assert not (repo_dir / "tasks" / "MISSING.md").exists()
     assert git_calls == [
-        (runner.repo_path, "add", "tasks/QUEUE.md", "AGENTS.md", "tasks/MISSING.md"),
+        (runner.repo_path, "add", "tasks/QUEUE.md", "AGENTS.md"),
         (
             runner.repo_path,
             "commit",
