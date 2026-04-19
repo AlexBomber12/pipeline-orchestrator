@@ -342,15 +342,21 @@ def test_get_next_task_returns_todo_when_dependency_done(tmp_path: Path) -> None
 def test_parse_real_queue_file() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     real_queue = repo_root / "tasks" / "QUEUE.md"
+    queue_text = real_queue.read_text(encoding="utf-8")
     tasks = parse_queue(str(real_queue))
+    status_lines = [
+        line.split(":", 1)[1].strip()
+        for line in queue_text.splitlines()
+        if line.startswith("- Status:")
+    ]
 
     assert len(tasks) >= 3
     assert all(task.pr_id.startswith("PR-") for task in tasks)
     assert all(task.task_file and task.task_file.startswith("tasks/PR-") for task in tasks)
     assert all(task.branch and task.branch.startswith("pr-") for task in tasks)
     assert len({task.pr_id for task in tasks}) == len(tasks)
-    assert any(task.status == TaskStatus.DONE for task in tasks)
-    assert any(task.status == TaskStatus.TODO for task in tasks)
+    assert len(status_lines) == len(tasks)
+    assert [task.status.value for task in tasks] == status_lines
 
 
 def test_mark_task_done_standard_layout() -> None:
