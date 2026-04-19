@@ -271,7 +271,7 @@
 - Branch: pr-115-coverage-claude-cli
 
 ## PR-116: 100% coverage for src/codex_cli.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-116.md
 - Branch: pr-116-coverage-codex-cli
 
