@@ -281,7 +281,7 @@
 - Branch: pr-117-coverage-handler-breach
 
 ## PR-118: 100% coverage for src/dag.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-118.md
 - Branch: pr-118-coverage-dag
 
