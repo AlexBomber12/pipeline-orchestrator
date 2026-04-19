@@ -178,7 +178,7 @@ class PipelineRunner(
         self._codex_usage_provider = codex_usage_provider
         self._metrics_store = MetricsStore(redis_client)
         self._current_run_record: RunRecord | None = None
-        self._selector_rng = random.Random(0)
+        self._selector_rng = random.Random()
         self._auth_status_cache: dict[str, dict[str, str]] = {}
         self._auth_status_cache_expires_at: datetime | None = None
 

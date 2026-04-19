@@ -140,9 +140,18 @@ class RateLimitMixin:
                 if self.state.rate_limit_reactive_coder is None:
                     self.state.rate_limited_until = None
                     self.state.rate_limit_reactive = False
+                effective_until = self._rate_limit_until_for(effective_coder)
                 self._claude_usage_provider.invalidate_cache()
                 self._codex_usage_provider.invalidate_cache()
                 self.log_event("Rate limit window expired, resuming")
+                if effective_until is not None:
+                    self.state.rate_limited_until = effective_until
+                    self.state.rate_limit_reactive_coder = effective_coder
+                    if self.state.state != PipelineState.PAUSED:
+                        self.state.state = PipelineState.PAUSED
+                    remaining = (effective_until - now).total_seconds()
+                    self.log_event(f"Rate limited, resuming in {int(remaining)}s")
+                    return False
                 return await self._proactive_usage_check(proactive_coder=proactive_coder)
             # A pause from a *different* effective coder doesn't apply.
             # When proactive_coder is set (e.g. "claude" for merge/diagnosis),

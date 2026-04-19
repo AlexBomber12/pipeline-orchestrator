@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
@@ -191,13 +192,15 @@ def _usage_providers() -> tuple[_FakeUsageProvider, _FakeUsageProvider]:
 
 def _make_runner(**repo_overrides: Any) -> PipelineRunner:
     claude_provider, codex_provider = _usage_providers()
-    return PipelineRunner(
+    runner = PipelineRunner(
         _repo_cfg(**repo_overrides),
         _app_cfg(),
         _FakeRedis(),
         claude_provider,
         codex_provider,
     )
+    runner._selector_rng.seed(0)
+    return runner
 
 
 def _allow_all_coder_auth(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -9381,6 +9384,58 @@ def test_check_rate_limit_preserves_per_coder_expiry_windows() -> None:
     assert "codex" not in runner.state.rate_limited_coders
     assert runner.state.rate_limited_coder_until.get("claude") == claude_until
     assert selector_module._is_rate_limited("claude", runner.state) is True
+
+
+def test_check_rate_limit_reapplies_effective_coder_pause_after_other_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    now = datetime.now(timezone.utc)
+    codex_until = now + timedelta(minutes=5)
+    runner.state.rate_limited_until = now - timedelta(minutes=1)
+    runner.state.rate_limit_reactive = True
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders.update({"claude", "codex"})
+    runner.state.rate_limited_coder_until = {
+        "claude": now - timedelta(minutes=1),
+        "codex": codex_until,
+    }
+    runner.state.state = PipelineState.PAUSED
+
+    result = asyncio.run(runner._check_rate_limit(proactive_coder="codex"))
+
+    assert result is False
+    assert "claude" not in runner.state.rate_limited_coders
+    assert runner.state.rate_limited_until == codex_until
+    assert runner.state.rate_limit_reactive_coder == "codex"
+    assert runner.state.state == PipelineState.PAUSED
+
+
+def test_runner_initializes_selector_rng_without_fixed_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_args: list[tuple[object, ...]] = []
+    real_random = runner_module.random.Random
+
+    def fake_random(*args: object, **kwargs: object) -> random.Random:
+        assert not kwargs
+        captured_args.append(args)
+        return real_random(*args)
+
+    monkeypatch.setattr(runner_module.random, "Random", fake_random)
+
+    PipelineRunner(
+        _repo_cfg(),
+        _app_cfg(),
+        _FakeRedis(),
+        _FakeUsageProvider(),
+        _FakeUsageProvider(),
+    )
+
+    assert captured_args == [()]
 
 
 # ---------- Codex-specific rate limit detection tests ----------
