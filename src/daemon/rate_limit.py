@@ -180,6 +180,9 @@ class RateLimitMixin:
                         self.state.state = PipelineState.WATCH
                     else:
                         self.state.state = PipelineState.IDLE
+                if pause_coder not in self.state.rate_limited_coder_until:
+                    self.state.rate_limited_coders.add(pause_coder)
+                    self.state.rate_limited_coder_until[pause_coder] = pause_until
                 self.state.rate_limited_until = None
                 self.state.rate_limit_reactive = False
                 self.state.rate_limit_reactive_coder = None

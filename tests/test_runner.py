@@ -3384,6 +3384,20 @@ def test_publish_state_writes_to_redis() -> None:
     assert runner.name in payload
 
 
+def test_publish_state_keeps_selected_fallback_coder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _allow_all_coder_auth(monkeypatch)
+    runner = _make_runner()
+    runner.state.rate_limited_coders.add("claude")
+
+    name, _plugin = runner._get_coder()
+    asyncio.run(runner.publish_state())
+
+    assert name == "codex"
+    assert runner.state.coder == "codex"
+
+
 def test_run_cycle_resets_stale_transient_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9412,6 +9426,26 @@ def test_check_rate_limit_reapplies_effective_coder_pause_after_other_expires(
     assert runner.state.rate_limited_until == codex_until
     assert runner.state.rate_limit_reactive_coder == "codex"
     assert runner.state.state == PipelineState.PAUSED
+
+
+def test_check_rate_limit_preserves_legacy_pause_for_other_coder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    pause_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limited_until = pause_until
+    runner.state.rate_limit_reactive = True
+    runner.state.state = PipelineState.PAUSED
+
+    result = asyncio.run(runner._check_rate_limit(proactive_coder="codex"))
+
+    assert result is True
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive is False
+    assert runner.state.rate_limit_reactive_coder is None
+    assert "claude" in runner.state.rate_limited_coders
+    assert runner.state.rate_limited_coder_until["claude"] == pause_until
 
 
 def test_runner_initializes_selector_rng_without_fixed_seed(

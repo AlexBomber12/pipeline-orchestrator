@@ -215,9 +215,11 @@ class PipelineRunner(
         """Return ``(coder_name, coder_plugin)`` for the active coder."""
         result = self._select_coder()
         if result is not None:
+            self.state.coder = result[0]
             return result
         coder = self.repo_config.coder or self.app_config.daemon.coder
         coder_name = coder.value if isinstance(coder, CoderType) else str(coder)
+        self.state.coder = coder_name
         return coder_name, self._registry.get(coder_name)
 
     async def _refresh_auth_status_cache(self) -> None:
@@ -345,12 +347,13 @@ class PipelineRunner(
         """Serialize ``self.state`` and write it to Redis."""
         self.state.active = self.repo_config.active
         self.state.last_updated = datetime.now(timezone.utc)
-        coder = self.repo_config.coder or self.app_config.daemon.coder
-        self.state.coder = coder.value
+        configured_coder = self.repo_config.coder or self.app_config.daemon.coder
+        active_coder = self.state.coder or configured_coder.value
+        self.state.coder = active_coder
         if self.repo_config.active:
             provider = (
                 self._claude_usage_provider
-                if coder != CoderType.CODEX
+                if active_coder != CoderType.CODEX.value
                 else self._codex_usage_provider
             )
             snap = await asyncio.to_thread(provider.fetch)
