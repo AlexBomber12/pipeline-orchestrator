@@ -8252,10 +8252,89 @@ def test_classify_error_timeout(msg: str) -> None:
 
 @pytest.mark.parametrize(
     "msg",
-    ["git push failed", "file not found", "Unknown error"],
+    ["file not found", "Unknown error"],
 )
 def test_classify_error_other(msg: str) -> None:
     assert _classify_error(msg) == ErrorCategory.OTHER
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["OOM killer invoked", "process killed: out of memory", "worker oom"],
+)
+def test_classify_oom(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.OOM
+
+
+def test_classify_oom_requires_token_boundary() -> None:
+    assert _classify_error("No room left on device") == ErrorCategory.OTHER
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["auth failed", "401 Unauthorized", "unauthorized request"],
+)
+def test_classify_auth_failure(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.AUTH_FAILURE
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["CI failed on main", "ci job fail", "CI checks failing"],
+)
+def test_classify_ci_failure(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.CI_FAILURE
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "Push rejected: non-fast-forward update required",
+        "Branch drift detected; needs rebase before retry",
+        "stale branch state blocks merge",
+    ],
+)
+def test_classify_stale_branch(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.STALE_BRANCH
+
+
+def test_classify_ci_failure_requires_ci_word_boundary() -> None:
+    assert _classify_error("decision failed during merge") == ErrorCategory.OTHER
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["ghost push detected", "HEAD SHA changed unexpectedly"],
+)
+def test_classify_ghost_push(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.GHOST_PUSH
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["codex cli not found", "CLI executable not found"],
+)
+def test_classify_cli_not_found(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.CLI_NOT_FOUND
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["git push failed", "git error: detached head"],
+)
+def test_classify_git_error(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.GIT_ERROR
+
+
+def test_classify_git_error_requires_git_token() -> None:
+    assert _classify_error("GitHub API request failed") == ErrorCategory.OTHER
+
+
+def test_classify_git_error_for_fatal_stderr() -> None:
+    assert (
+        _classify_error("fatal: could not resolve host: github.com")
+        == ErrorCategory.GIT_ERROR
+    )
 
 
 def test_handle_error_timeout_has_distinct_log(
