@@ -8,6 +8,7 @@ from src.coder_registry import CoderRegistry
 from src.config import AppConfig, CoderType, DaemonConfig, RepoConfig
 from src.daemon.selector import (
     SelectionContext,
+    _auth_failed,
     eligible_coders,
     rank_coders,
     select_coder,
@@ -188,16 +189,38 @@ def test_priority_ranks_higher_first_when_no_exploration() -> None:
     ]
 
 
-def test_disabled_for_repo_excluded() -> None:
-    ctx = _ctx(disabled_coders=["gemini"])
+def test_disabled_coder_in_repo_config_excluded_from_eligible() -> None:
+    ctx = _ctx(disabled_coders=["claude"])
 
-    assert "gemini" not in eligible_coders(ctx)
+    assert "claude" not in eligible_coders(ctx)
+
+
+def test_auth_failed_returns_true_when_check_auth_raises() -> None:
+    ctx = _ctx()
+    ctx.registry.get("claude")._status = "raise"
+
+    assert _auth_failed("claude", ctx.registry, None) is True
 
 
 def test_no_eligible_returns_none() -> None:
     ctx = _ctx(limited={"claude", "codex", "gemini"})
 
     assert select_coder(ctx) is None
+
+
+def test_select_coder_returns_top_ranked_plugin() -> None:
+    ctx = _ctx(
+        daemon_coder=CoderType.CODEX,
+        priorities={"claude": 50, "codex": 90},
+        epsilon=0.0,
+    )
+
+    selected = select_coder(ctx)
+
+    assert selected is not None
+    name, plugin = selected
+    assert name == "codex"
+    assert plugin is ctx.registry.get("codex")
 
 
 def test_selector_ignores_plugins_without_runtime_support() -> None:
@@ -246,6 +269,13 @@ def test_epsilon_one_explores_when_pinned_coder_is_unavailable() -> None:
 
     orders = [rank_coders(["claude", "gemini"], ctx) for _ in range(10)]
     assert all(order[0] == "claude" for order in orders)
+
+
+def test_reactive_rate_limit_blocks_named_coder() -> None:
+    ctx = _ctx()
+    ctx.state.rate_limit_reactive_coder = "codex"
+
+    assert "codex" not in eligible_coders(ctx)
 
 
 def test_unpinned_preferred_can_explore_away_when_healthy() -> None:
