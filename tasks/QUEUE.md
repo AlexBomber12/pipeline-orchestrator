@@ -176,7 +176,7 @@
 - Branch: pr-101-coverage-handler-error
 
 ## PR-102: 100% coverage for src/queue_parser.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-102.md
 - Branch: pr-102-coverage-queue-parser
 
