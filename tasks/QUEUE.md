@@ -221,7 +221,7 @@
 - Branch: pr-108a-coverage-fix-monitor
 
 ## PR-108b: 100% coverage for fix.handle_fix
-- Status: TODO
+- Status: DOING
 - Tasks file: tasks/PR-108b.md
 - Branch: pr-108b-coverage-fix-handle
 
