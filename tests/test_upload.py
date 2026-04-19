@@ -87,6 +87,24 @@ def _bad_file() -> tuple[str, tuple[str, bytes, str]]:
     return ("files", ("README.md", b"# Readme\n", "text/markdown"))
 
 
+def _task_file(
+    name: str = "PR-001.md",
+    *,
+    depends_on: str | None = "none",
+) -> tuple[str, tuple[str, bytes, str]]:
+    header = [
+        "# PR-001: Example task",
+        "",
+        "Branch: pr-001-example-task",
+        "- Type: feature",
+        "- Complexity: low",
+    ]
+    if depends_on is not None:
+        header.append(f"- Depends on: {depends_on}")
+    header.extend(["- Priority: 1", "- Coder: any", ""])
+    return ("files", (name, "\n".join(header).encode("utf-8"), "text/markdown"))
+
+
 def test_upload_nonexistent_repo(
     one_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -179,7 +197,7 @@ def test_upload_stages_files_and_sets_redis_key(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file(), _pr_file()],
+            files=[_queue_file(), _task_file()],
         )
 
     assert resp.status_code == 200
@@ -192,6 +210,67 @@ def test_upload_stages_files_and_sets_redis_key(
     assert (staging / "QUEUE.md").exists()
     assert (staging / "PR-001.md").exists()
     assert (staging / "QUEUE.md").read_bytes() == b"# Task Queue\n"
+
+
+def test_upload_rejects_task_without_depends_on(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_queue_file(), _task_file(depends_on=None)],
+        )
+
+    assert resp.status_code == 400
+    assert "Task file missing required field: Depends on." in resp.text
+    assert "Depends on: none" in resp.text
+
+
+def test_upload_accepts_task_with_depends_on_none(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_queue_file(), _task_file(depends_on="none")],
+        )
+
+    assert resp.status_code == 200
+
+
+def test_upload_accepts_task_with_dependencies(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_queue_file(), _task_file(depends_on="PR-001, PR-002")],
+        )
+
+    assert resp.status_code == 200
+
+
+def test_upload_allows_non_task_files_without_validation(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    queue = ("files", ("QUEUE.md", b"# Task Queue\n", "text/markdown"))
+    agents = ("files", ("AGENTS.md", b"# AGENTS\n", "text/markdown"))
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[queue, agents],
+        )
+
+    assert resp.status_code == 200
 
 
 def test_upload_writes_redis_manifest(
@@ -220,7 +299,7 @@ def test_upload_writes_redis_manifest(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file(), _pr_file("PR-002.md")],
+            files=[_queue_file(), _task_file(name="PR-002.md")],
         )
 
     assert resp.status_code == 200

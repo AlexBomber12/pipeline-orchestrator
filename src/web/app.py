@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import os
 import subprocess
+import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -38,7 +39,7 @@ from src.config import (
 )
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
-from src.queue_parser import QueueValidationError, parse_queue_text
+from src.queue_parser import QueueValidationError, parse_queue_text, parse_task_header
 from src.utils import repo_slug_from_url
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
@@ -1529,7 +1530,7 @@ async def put_repo_detail_coder(
 # ---------------------------------------------------------------------------
 
 _UPLOAD_MAX_TOTAL_BYTES = 1_000_000  # 1 MB
-_ALLOWED_TASK_PATTERN = r"^(QUEUE\.md|PR-[A-Za-z0-9._-]+\.md)$"
+_ALLOWED_TASK_PATTERN = r"^(QUEUE\.md|AGENTS\.md|CLAUDE\.md|PR-[A-Za-z0-9._-]+\.md)$"
 UPLOADS_DIR = "/data/uploads"
 
 import json as _json  # noqa: E402 — kept near usage
@@ -1691,7 +1692,8 @@ async def upload_tasks(
         if not _re.match(_ALLOWED_TASK_PATTERN, fname):
             return _render_upload_error(
                 request,
-                f"Invalid file name: '{fname}'. Only QUEUE.md and PR-*.md allowed.",
+                f"Invalid file name: '{fname}'. Only QUEUE.md, AGENTS.md, "
+                "CLAUDE.md, and PR-*.md allowed.",
                 422,
                 repo_name=name,
             )
@@ -1743,6 +1745,39 @@ async def upload_tasks(
             400,
             repo_name=name,
         )
+
+    for fname, content in file_contents:
+        if not _re.fullmatch(r"PR-\d+\.md", fname):
+            continue
+        try:
+            task_text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            return _render_upload_error(
+                request,
+                f"{fname} is not valid UTF-8",
+                400,
+                repo_name=name,
+            )
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".md") as tmp:
+            tmp.write(task_text)
+            tmp.flush()
+            try:
+                parse_task_header(tmp.name)
+            except QueueValidationError as exc:
+                if any("missing Depends on" in issue for issue in exc.issues):
+                    return _render_upload_error(
+                        request,
+                        "Task file missing required field: Depends on. "
+                        "Use 'Depends on: none' for tasks with no dependencies.",
+                        400,
+                        repo_name=name,
+                    )
+                return _render_upload_error(
+                    request,
+                    "\n".join(exc.issues),
+                    400,
+                    repo_name=name,
+                )
 
     # Stage files to /data/uploads/{repo}/ and enqueue for daemon processing.
     # Git write operations are handled by the daemon to preserve the
