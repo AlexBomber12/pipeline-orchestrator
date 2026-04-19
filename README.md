@@ -7,9 +7,11 @@ of pre-planned PRs against one or more GitHub repositories.
 
 Three components share a single `/data` runtime root:
 
-- **daemon** — stateless pipeline state machine. Reads `tasks/QUEUE.md` and the
-  GitHub API on every tick and decides what to do next. Recoverable from a cold
-  restart because no state lives in process memory.
+- **daemon** — stateless pipeline state machine. Reads structured headers from
+  `tasks/PR-*.md` files, derives statuses from git state via `task_status.py`,
+  and queries the GitHub API on every tick to decide what to do next.
+  Recoverable from a cold restart because runtime state is rebuilt from
+  `tasks/QUEUE.md` and GitHub rather than process memory.
 - **web** — FastAPI dashboard (Jinja2 + HTMX). Renders the current state of
   repositories and PRs. Provides settings UI for managing repos and daemon
   configuration, and supports uploading task files and pushing them to repos.
@@ -18,7 +20,10 @@ Three components share a single `/data` runtime root:
 
 Sources of truth:
 
-- `tasks/QUEUE.md` and `tasks/PR-*.md` for what work to do.
+- `tasks/PR-*.md` files for what work to do (one file per PR, with structured
+  headers). `tasks/QUEUE.md` is a derived artifact that the daemon
+  auto-generates during eligible IDLE cycles for human readability, and it
+  remains a daemon recovery input on startup today.
 - GitHub (via `gh` CLI) for PR status, reviews, and Codex reactions.
 - `config.yml` for which repositories the daemon manages.
 
