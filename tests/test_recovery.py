@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
 from src.config import AppConfig, DaemonConfig, RepoConfig
+from src.daemon import recovery as recovery_module
 from src.daemon import runner as runner_module
 from src.daemon.runner import PipelineRunner
 from src.models import (
@@ -159,6 +161,60 @@ def test_recover_state_sets_queue_counters(
 
     assert runner.state.queue_done == 1
     assert runner.state.queue_total == 3
+
+
+def test_recover_state_restores_pending_queue_sync_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery should restore pending queue-sync metadata before going IDLE."""
+    pending_sync = PRInfo(
+        number=301,
+        branch="queue-done-20260419",
+        last_activity=datetime(2026, 4, 19, 12, 0, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pending_sync]
+    )
+
+    runner = _make_runner()
+    runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
+
+    result = asyncio.run(runner.recover_state())
+
+    assert result is True
+    assert runner.state.pending_queue_sync_branch == "queue-done-20260419"
+    assert runner.state.pending_queue_sync_started_at == pending_sync.last_activity
+    assert runner.state.state == PipelineState.IDLE
+    assert any(
+        "Recovered pending queue-sync branch: queue-done-20260419" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_recover_state_pending_queue_sync_uses_now_when_last_activity_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Queue-sync recovery should fall back to current UTC time when needed."""
+    pending_sync = PRInfo(number=302, branch="queue-done-20260419")
+    frozen_now = datetime(2026, 4, 19, 13, 30, tzinfo=timezone.utc)
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            assert tz is timezone.utc
+            return frozen_now
+
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pending_sync]
+    )
+    monkeypatch.setattr(recovery_module, "datetime", _FrozenDateTime)
+
+    runner = _make_runner()
+    runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
+
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.pending_queue_sync_started_at == frozen_now
 
 
 def test_recover_doing_task_without_pr_rerun_coding(
@@ -409,6 +465,54 @@ def test_recover_aborts_when_preserve_push_fails(
     assert any(
         "Failed to preserve unpushed commits on pr-042-inflight"
         in e["event"]
+        for e in runner.state.history
+    )
+
+
+@pytest.mark.parametrize(
+    ("exc", "message_fragment"),
+    [
+        (subprocess.TimeoutExpired(["git"], 10), "Command '['git']' timed out"),
+        (OSError("probe unavailable"), "probe unavailable"),
+    ],
+)
+def test_recover_aborts_when_branch_probe_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    exc: Exception,
+    message_fragment: str,
+) -> None:
+    """A failed local-branch probe must stop recovery before CODING reruns."""
+    task = _doing_task()
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
+    )
+
+    coding_ran: list[bool] = []
+
+    async def fake_coding() -> None:
+        coding_ran.append(True)
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
+            raise exc
+        raise AssertionError(f"unexpected subprocess call: {cmd}")
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner.handle_coding = fake_coding  # type: ignore[method-assign]
+
+    asyncio.run(runner.recover_state())
+
+    assert coding_ran == []
+    assert runner.state.state == PipelineState.ERROR
+    assert "could not preserve crashed-run commits on 'pr-042-inflight'" in (
+        runner.state.error_message or ""
+    )
+    assert any(
+        "Could not probe local branch pr-042-inflight" in e["event"]
+        and message_fragment in e["event"]
         for e in runner.state.history
     )
 
@@ -1153,3 +1257,101 @@ def test_recover_validation_error_returns_false() -> None:
     assert runner.state.state == PipelineState.ERROR
     assert "queue validation failed" in (runner.state.error_message or "")
     assert "duplicate pr_id" in (runner.state.error_message or "")
+
+
+def test_rehydrate_last_push_at_ignores_metadata_failure_for_new_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Metadata fetch failures should still bind the PR number without a timestamp."""
+    pr = PRInfo(number=17, branch="pr-042-inflight")
+
+    def boom(repo: str, number: int) -> dict[str, str]:
+        raise RuntimeError("gh unavailable")
+
+    monkeypatch.setattr(runner_module.github_client, "get_pr_metadata", boom)
+
+    runner = _make_runner()
+    runner._last_push_at = datetime(2026, 4, 18, 12, 0, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 3
+
+    runner._rehydrate_last_push_at(pr)
+
+    assert runner._last_push_at is None
+    assert runner._last_push_at_pr_number == 17
+
+
+def test_rehydrate_last_push_at_adds_utc_to_naive_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Naive commit timestamps from metadata should be normalized to UTC."""
+    pr = PRInfo(number=17, branch="pr-042-inflight")
+    parsed = datetime(2026, 4, 19, 10, 15)
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: {"head_commit_date": "2026-04-19T10:15:00"},
+    )
+    monkeypatch.setattr(runner_module.github_client, "_parse_iso", lambda iso: parsed)
+
+    runner = _make_runner()
+
+    runner._rehydrate_last_push_at(pr)
+
+    assert runner._last_push_at == parsed.replace(tzinfo=timezone.utc)
+    assert runner._last_push_at_pr_number == 17
+
+
+def test_rehydrate_last_push_at_keeps_existing_timestamp_when_metadata_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """For the same PR, a missing commit timestamp must not clear a known baseline."""
+    pr = PRInfo(number=17, branch="pr-042-inflight")
+    existing = datetime(2026, 4, 19, 9, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: {"head_commit_date": ""},
+    )
+
+    runner = _make_runner()
+    runner._last_push_at = existing
+    runner._last_push_at_pr_number = 17
+
+    runner._rehydrate_last_push_at(pr)
+
+    assert runner._last_push_at == existing
+    assert runner._last_push_at_pr_number == 17
+
+
+def test_rehydrate_last_push_at_updates_only_when_newer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """For the same PR, only newer commit timestamps should advance the baseline."""
+    pr = PRInfo(number=17, branch="pr-042-inflight")
+    older = datetime(2026, 4, 19, 8, 0, tzinfo=timezone.utc)
+    newer = datetime(2026, 4, 19, 11, 0, tzinfo=timezone.utc)
+
+    runner = _make_runner()
+    runner._last_push_at_pr_number = 17
+    runner._last_push_at = newer
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: {"head_commit_date": "2026-04-19T08:00:00+00:00"},
+    )
+    monkeypatch.setattr(runner_module.github_client, "_parse_iso", lambda iso: older)
+    runner._rehydrate_last_push_at(pr)
+    assert runner._last_push_at == newer
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: {"head_commit_date": "2026-04-19T12:00:00+00:00"},
+    )
+    monkeypatch.setattr(runner_module.github_client, "_parse_iso", lambda iso: newer)
+    runner._last_push_at = older
+    runner._rehydrate_last_push_at(pr)
+    assert runner._last_push_at == newer
