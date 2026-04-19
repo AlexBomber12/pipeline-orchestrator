@@ -186,7 +186,7 @@
 - Branch: pr-103-coverage-handler-hung
 
 ## PR-104: 100% coverage for src/daemon/main.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-104.md
 - Branch: pr-104-coverage-daemon-main
 
