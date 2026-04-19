@@ -519,7 +519,7 @@
 - Depends on: PR-087
 
 ## PR-089: Upload validation for task file headers
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-089.md
 - Branch: pr-089-upload-header-validation
 - Depends on: PR-084

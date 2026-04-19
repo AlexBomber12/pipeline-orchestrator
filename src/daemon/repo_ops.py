@@ -29,6 +29,13 @@ from src.retry import retry_transient
 logger = logging.getLogger(__name__)
 
 
+def _uploaded_repo_path(filename: str) -> Path:
+    """Return the repository-relative path for an uploaded dashboard file."""
+    if filename in {"AGENTS.md", "CLAUDE.md"}:
+        return Path(filename)
+    return Path("tasks") / filename
+
+
 class RepoOpsMixin:
     """Repository clone, fetch, scaffold, sync, queue parsing, and uploads."""
 
@@ -276,12 +283,14 @@ return 0
             for fname in filenames:
                 src = staging_dir / fname
                 if src.is_file():
-                    shutil.copy2(str(src), str(tasks_dir / fname))
+                    dest = Path(self.repo_path) / _uploaded_repo_path(fname)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(src), str(dest))
 
             git_ops._git(
                 self.repo_path,
                 "add",
-                *[f"tasks/{fn}" for fn in filenames],
+                *[str(_uploaded_repo_path(fn)) for fn in filenames],
             )
             commit_result = git_ops._git(
                 self.repo_path,

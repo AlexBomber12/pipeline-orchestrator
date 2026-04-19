@@ -5749,6 +5749,41 @@ def test_process_pending_uploads_cas_delete_skips_newer_manifest(
     assert staging.is_dir(), "staging dir must survive when CAS delete skips newer manifest"
 
 
+def test_process_pending_uploads_routes_root_instruction_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+
+    staging = tmp_path.parent / "uploads" / runner.name / "rootfiles"
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "QUEUE.md").write_text("# Task Queue\n", encoding="utf-8")
+    (staging / "AGENTS.md").write_text("# AGENTS\n", encoding="utf-8")
+    (staging / "CLAUDE.md").write_text("Read AGENTS.md\n", encoding="utf-8")
+    (tmp_path / "tasks").mkdir(exist_ok=True)
+
+    manifest = json.dumps(
+        {
+            "files": ["QUEUE.md", "AGENTS.md", "CLAUDE.md"],
+            "staging_dir": str(staging),
+        }
+    )
+    key = f"upload:{runner.name}:pending"
+    asyncio.run(runner.redis.set(key, manifest))
+
+    result = asyncio.run(runner.process_pending_uploads())
+
+    assert result is True
+    assert (tmp_path / "tasks" / "QUEUE.md").read_text(encoding="utf-8") == "# Task Queue\n"
+    assert (tmp_path / "AGENTS.md").read_text(encoding="utf-8") == "# AGENTS\n"
+    assert (tmp_path / "CLAUDE.md").read_text(encoding="utf-8") == "Read AGENTS.md\n"
+    assert not (tmp_path / "tasks" / "AGENTS.md").exists()
+    assert not (tmp_path / "tasks" / "CLAUDE.md").exists()
+
+
 def test_process_pending_uploads_redis_error_blocks_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
