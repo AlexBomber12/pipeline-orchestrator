@@ -11,14 +11,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from src import retry as retry_module
 from src.coders import claude as claude_plugin_module
 from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
 from src.daemon.handlers import breach as breach_module
+from src.daemon.handlers import error as error_module
 from src.daemon.handlers import idle as idle_module
 from src.daemon.runner import ErrorCategory, PipelineRunner, _classify_error
-from src import retry as retry_module
 from src.models import (
     CIStatus,
     FeedbackCheckResult,
@@ -236,6 +237,41 @@ def _patch_subprocess(
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     return calls
+
+
+def _run_dirty_diagnose(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, push_exc: Exception | None = None
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    changed = repo / "fix.txt"
+    calls = []
+    warnings = []
+
+    async def fake_diag(*args: object, **kwargs: object):
+        changed.write_text("fixed\n")
+        return (0, "FIX\nrepair broken config", "")
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any):
+        calls.append(args)
+        if args[:2] == ("status", "--porcelain"):
+            return _FakeCompletedProcess(stdout=" M fix.txt\n" if changed.exists() else "")
+        if args[:3] == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return _FakeCompletedProcess(stdout="fix/diagnose-error-commits-fixes\n")
+        if push_exc and args[:2] == ("push", "origin"):
+            raise push_exc
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake_diag)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(error_module, "retry_transient", lambda op, **_: op())
+    monkeypatch.setattr(error_module.logger, "warning", lambda msg: warnings.append(msg))
+    runner = _make_runner()
+    runner.repo_path = str(repo)
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+    asyncio.run(runner.handle_error())
+    return runner, calls, warnings
 
 
 def test_preflight_returns_true_on_clean_repo(
@@ -3364,6 +3400,27 @@ def test_handle_error_escalate_keeps_error(monkeypatch: pytest.MonkeyPatch) -> N
     assert runner.state.error_message == "boom"
 
 
+def test_handle_error_commits_and_pushes_diagnose_fixes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, _ = _run_dirty_diagnose(monkeypatch, tmp_path)
+
+    assert runner.state.state == PipelineState.IDLE
+    assert [cmd[0] for cmd in calls] == ["status", "rev-parse", "add", "commit", "push"]
+
+
+def test_handle_error_resets_when_push_fails_and_escalates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, warnings = _run_dirty_diagnose(
+        monkeypatch, tmp_path, push_exc=RuntimeError("push failed")
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert any(cmd[:3] == ("reset", "--hard", "HEAD") for cmd in calls)
+    assert warnings == ["diagnose_error made uncommittable changes, reset"]
+
+
 def test_publish_state_writes_to_redis() -> None:
     runner = _make_runner()
     asyncio.run(runner.publish_state())
@@ -5403,7 +5460,6 @@ def test_write_generated_queue_md_retries_transient_push_failure(
 ) -> None:
     queue_dir = tmp_path / "tasks"
     queue_dir.mkdir()
-    queue_path = queue_dir / "QUEUE.md"
     headers = [
         TaskHeader(
             pr_id="PR-001",

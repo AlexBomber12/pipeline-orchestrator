@@ -11,11 +11,18 @@ Module-level:
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
+import subprocess
 from enum import Enum
 
 from src import claude_cli
+from src.daemon import git_ops
 from src.models import PipelineState
+from src.retry import retry_transient
+
+logger = logging.getLogger(__name__)
+_CLAUDE_CLI_COAUTHOR = "Co-authored-by: Claude CLI <noreply@anthropic.com>"
 
 
 class ErrorCategory(Enum):
@@ -107,7 +114,37 @@ class ErrorMixin:
             )
             return
 
+        summary = stdout.strip().splitlines()[-1] if stdout.strip() else ""
         verdict = claude_cli.parse_diagnosis(stdout)
+        dirty = ""
+        try:
+            dirty = git_ops._git(self.repo_path, "status", "--porcelain").stdout.strip()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            pass
+        if dirty:
+            try:
+                branch = git_ops._git(
+                    self.repo_path, "rev-parse", "--abbrev-ref", "HEAD"
+                ).stdout.strip()
+                git_ops._git(self.repo_path, "add", "-A")
+                git_ops._git(
+                    self.repo_path,
+                    "commit",
+                    "-m",
+                    f"diagnose_error auto-fix: {(summary or 'no summary')[:80]}",
+                    "-m",
+                    _CLAUDE_CLI_COAUTHOR,
+                )
+                retry_transient(
+                    lambda: git_ops._git(
+                        self.repo_path, "push", "origin", branch, timeout=60
+                    ),
+                    operation_name=f"git push origin {branch}",
+                )
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError):
+                git_ops._git(self.repo_path, "reset", "--hard", "HEAD", check=False)
+                logger.warning("diagnose_error made uncommittable changes, reset")
+                verdict = "ESCALATE"
         if verdict == "SKIP":
             self.state.current_task = None
             self.state.current_pr = None
@@ -119,7 +156,6 @@ class ErrorMixin:
             self.state.error_message = None
             self.state.state = PipelineState.IDLE
             self._error_diagnose_count = 0
-            summary = stdout.strip().splitlines()[-1] if stdout.strip() else ""
             self.log_event(f"diagnose_error: FIX -> IDLE ({summary[:80]})")
         else:  # ESCALATE
             self.log_event("diagnose_error: ESCALATE, keeping ERROR state")
