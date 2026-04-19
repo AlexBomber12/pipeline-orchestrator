@@ -164,6 +164,13 @@ class TestOAuthProviderConsecutiveFailures:
             provider.fetch()
         assert provider.consecutive_failures == 0
 
+    def test_returns_none_during_backoff_window(self, tmp_path: Path) -> None:
+        provider = _make_provider(tmp_path, creds={"accessToken": "tok"}, cache_ttl_sec=60)
+        provider._consecutive_failures = 2
+        provider._last_failure_at = 1_000.0
+        with patch("src.usage.time.time", return_value=1_030.0):
+            assert provider.fetch() is None
+
 
 class TestOAuthProviderTokenReading:
     def test_reads_flat_access_token(self, tmp_path: Path) -> None:
@@ -195,6 +202,30 @@ class TestOAuthProviderTokenReading:
             provider.fetch()
         auth_header = mock_get.call_args.kwargs.get("headers", {}).get("Authorization")
         assert auth_header == "Bearer nested-snake-tok"
+
+    def test_returns_none_for_invalid_json_credentials(self, tmp_path: Path) -> None:
+        creds = tmp_path / "bad.json"
+        creds.write_text("{not-json", encoding="utf-8")
+        provider = OAuthUsageProvider(
+            credentials_path=str(creds),
+            user_agent="test-agent/1.0",
+            beta_header="oauth-2025-04-20",
+        )
+        assert provider._read_token() is None
+
+    def test_returns_none_for_non_utf8_credentials(self, tmp_path: Path) -> None:
+        creds = tmp_path / "bad-bytes.json"
+        creds.write_bytes(b"\xff\xfe\x00")
+        provider = OAuthUsageProvider(
+            credentials_path=str(creds),
+            user_agent="test-agent/1.0",
+            beta_header="oauth-2025-04-20",
+        )
+        assert provider._read_token() is None
+
+    def test_returns_none_when_nested_token_is_missing(self, tmp_path: Path) -> None:
+        provider = _make_provider(tmp_path, creds={"claudeAiOauth": {"refreshToken": "x"}})
+        assert provider._read_token() is None
 
 
 # ---------- OpenAI Usage Provider tests ----------
@@ -321,6 +352,38 @@ class TestOpenAIProviderReturnsNone:
             assert provider.fetch() is None
         assert provider.consecutive_failures == 1
 
+    def test_on_missing_reset_at(self, tmp_path: Path) -> None:
+        provider = _make_openai_provider(
+            tmp_path, creds={"tokens": {"access_token": "tok"}}
+        )
+        partial_data = {
+            "rate_limit": {
+                "primary_window": {"used_percent": 12},
+                "secondary_window": {"used_percent": 34},
+            }
+        }
+        with patch.object(
+            httpx, "get", return_value=_mock_openai_response(json_data=partial_data)
+        ):
+            assert provider.fetch() is None
+        assert provider.consecutive_failures == 1
+
+    def test_on_unexpected_top_level_shape(self, tmp_path: Path) -> None:
+        provider = _make_openai_provider(
+            tmp_path, creds={"tokens": {"access_token": "tok"}}
+        )
+        with patch.object(
+            httpx,
+            "get",
+            return_value=httpx.Response(
+                status_code=200,
+                text="not-json-object",
+                request=httpx.Request("GET", "https://example.com"),
+            ),
+        ):
+            assert provider.fetch() is None
+        assert provider.consecutive_failures == 1
+
 
 class TestOpenAIProviderCache:
     def test_caches_within_ttl(self, tmp_path: Path) -> None:
@@ -407,6 +470,17 @@ class TestOpenAIProviderConsecutiveFailures:
             provider.fetch()
         assert provider.consecutive_failures == 0
 
+    def test_returns_none_during_backoff_window(self, tmp_path: Path) -> None:
+        provider = _make_openai_provider(
+            tmp_path,
+            creds={"tokens": {"access_token": "tok"}},
+            cache_ttl_sec=60,
+        )
+        provider._consecutive_failures = 3
+        provider._last_failure_at = 2_000.0
+        with patch("src.usage.time.time", return_value=2_050.0):
+            assert provider.fetch() is None
+
 
 class TestOpenAIProviderTokenReading:
     def test_reads_token_from_nested_tokens_key(self, tmp_path: Path) -> None:
@@ -419,3 +493,47 @@ class TestOpenAIProviderTokenReading:
             provider.fetch()
         auth_header = mock_get.call_args.kwargs.get("headers", {}).get("Authorization")
         assert auth_header == "Bearer codex-tok"
+
+    def test_includes_account_id_header_when_present(self, tmp_path: Path) -> None:
+        provider = _make_openai_provider(
+            tmp_path,
+            creds={
+                "tokens": {"access_token": "codex-tok"},
+                "account_id": "acct-123",
+            },
+        )
+        with patch.object(
+            httpx, "get", return_value=_mock_openai_response()
+        ) as mock_get:
+            provider.fetch()
+        headers = mock_get.call_args.kwargs.get("headers", {})
+        assert headers["ChatGPT-Account-Id"] == "acct-123"
+
+    def test_returns_none_for_invalid_json_credentials(self, tmp_path: Path) -> None:
+        creds = tmp_path / "bad-auth.json"
+        creds.write_text("{not-json", encoding="utf-8")
+        provider = OpenAIUsageProvider(credentials_path=str(creds))
+        assert provider._read_credentials() == (None, None)
+
+    def test_returns_none_for_non_utf8_credentials(self, tmp_path: Path) -> None:
+        creds = tmp_path / "bad-auth-bytes.json"
+        creds.write_bytes(b"\xff\xfe\x00")
+        provider = OpenAIUsageProvider(credentials_path=str(creds))
+        assert provider._read_credentials() == (None, None)
+
+    def test_returns_none_for_invalid_nested_access_token(self, tmp_path: Path) -> None:
+        provider = _make_openai_provider(
+            tmp_path,
+            creds={"tokens": {"access_token": 123}, "account_id": "acct-123"},
+        )
+        assert provider._read_credentials() == (None, "acct-123")
+
+    def test_read_token_returns_first_tuple_item(self, tmp_path: Path) -> None:
+        provider = _make_openai_provider(
+            tmp_path,
+            creds={
+                "tokens": {"access_token": "codex-tok"},
+                "account_id": "acct-123",
+            },
+        )
+        assert provider._read_token() == "codex-tok"
