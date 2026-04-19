@@ -3454,7 +3454,7 @@ def test_handle_error_escalates_dirty_tree_without_active_pr_branch(
     )
 
     assert runner.state.state == PipelineState.ERROR
-    assert [cmd[0] for cmd in calls] == ["status"]
+    assert [cmd[0] for cmd in calls] == ["status", "rev-parse", "reset", "clean"]
     assert any(
         e["event"] == "diagnose_error: dirty tree without active PR/task branch"
         for e in runner.state.history

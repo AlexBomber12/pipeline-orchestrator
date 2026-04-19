@@ -122,6 +122,16 @@ class ErrorMixin:
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             pass
         if dirty and verdict == "FIX":
+            try:
+                head_before = git_ops._git(
+                    self.repo_path, "rev-parse", "HEAD"
+                ).stdout.strip()
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+            ):
+                head_before = ""
             branch = None
             if self.state.current_pr is not None:
                 if not self.state.current_pr.is_cross_repository:
@@ -133,17 +143,22 @@ class ErrorMixin:
             ):
                 branch = self.state.current_task.branch
             if branch is None:
+                if head_before:
+                    git_ops._git(
+                        self.repo_path,
+                        "reset",
+                        "--hard",
+                        head_before,
+                        check=False,
+                    )
+                    git_ops._git(self.repo_path, "clean", "-fd", check=False)
                 verdict = "ESCALATE"
                 self.log_event(
                     "diagnose_error: dirty tree without active PR/task branch"
                 )
             else:
                 checked_out_branch = ""
-                head_before = ""
                 try:
-                    head_before = git_ops._git(
-                        self.repo_path, "rev-parse", "HEAD"
-                    ).stdout.strip()
                     checked_out_branch = git_ops._git(
                         self.repo_path, "rev-parse", "--abbrev-ref", "HEAD"
                     ).stdout.strip()
