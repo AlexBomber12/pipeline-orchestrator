@@ -261,7 +261,7 @@
 - Branch: pr-113-coverage-task-status
 
 ## PR-114: 100% coverage for src/usage.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-114.md
 - Branch: pr-114-coverage-usage
 
