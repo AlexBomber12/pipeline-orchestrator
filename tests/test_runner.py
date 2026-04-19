@@ -3515,6 +3515,184 @@ def test_mark_queue_done_resets_repo_before_reraising(
     ]
 
 
+def test_resolve_pending_queue_sync_returns_true_without_branch() -> None:
+    runner = _make_runner()
+
+    assert runner._resolve_pending_queue_sync() is True
+
+
+def test_resolve_pending_queue_sync_continues_when_pr_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    escalations: list[str] = []
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda cmd, **kwargs: {"state": "open", "mergedAt": None},
+    )
+
+    runner = _make_runner()
+    runner.state.pending_queue_sync_branch = "queue-done-pr-001"
+    runner.state.pending_queue_sync_started_at = datetime.now(timezone.utc)
+    monkeypatch.setattr(
+        runner,
+        "_escalate_queue_sync_if_expired",
+        lambda branch: escalations.append(branch),
+    )
+
+    assert runner._resolve_pending_queue_sync() is False
+    assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
+    assert escalations == ["queue-done-pr-001"]
+
+
+def test_resolve_pending_queue_sync_clears_state_when_pr_merged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda cmd, **kwargs: {
+            "state": "merged",
+            "mergedAt": "2026-04-19T18:00:00Z",
+        },
+    )
+
+    runner = _make_runner()
+    runner.state.pending_queue_sync_branch = "queue-done-pr-001"
+    runner.state.pending_queue_sync_started_at = datetime.now(timezone.utc)
+    events: list[str] = []
+    monkeypatch.setattr(runner, "log_event", events.append)
+
+    assert runner._resolve_pending_queue_sync() is True
+    assert runner.state.pending_queue_sync_branch is None
+    assert runner.state.pending_queue_sync_started_at is None
+    assert events == ["Queue-sync PR merged (queue-done-pr-001)"]
+
+
+def test_resolve_pending_queue_sync_clears_state_when_pr_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda cmd, **kwargs: {"state": "closed", "mergedAt": None},
+    )
+
+    runner = _make_runner()
+    runner.state.pending_queue_sync_branch = "queue-done-pr-001"
+    runner.state.pending_queue_sync_started_at = datetime.now(timezone.utc)
+    events: list[str] = []
+    monkeypatch.setattr(runner, "log_event", events.append)
+
+    assert runner._resolve_pending_queue_sync() is False
+    assert runner.state.pending_queue_sync_branch is None
+    assert runner.state.pending_queue_sync_started_at is None
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == (
+        "queue-sync PR queue-done-pr-001 closed without merging"
+    )
+    assert events == [runner.state.error_message]
+
+
+def test_resolve_pending_queue_sync_handles_missing_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    escalations: list[str] = []
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda cmd, **kwargs: None,
+    )
+
+    runner = _make_runner()
+    runner.state.pending_queue_sync_branch = "queue-done-pr-001"
+    monkeypatch.setattr(
+        runner,
+        "_escalate_queue_sync_if_expired",
+        lambda branch: escalations.append(branch),
+    )
+
+    assert runner._resolve_pending_queue_sync() is False
+    assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
+    assert escalations == ["queue-done-pr-001"]
+
+
+def test_resolve_pending_queue_sync_logs_and_escalates_on_view_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    escalations: list[str] = []
+
+    def fail_run_gh(cmd: list[str], **kwargs: Any) -> None:
+        raise RuntimeError("gh unavailable")
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", fail_run_gh)
+
+    runner = _make_runner()
+    runner.state.pending_queue_sync_branch = "queue-done-pr-001"
+    events: list[str] = []
+    monkeypatch.setattr(runner, "log_event", events.append)
+    monkeypatch.setattr(
+        runner,
+        "_escalate_queue_sync_if_expired",
+        lambda branch: escalations.append(branch),
+    )
+
+    assert runner._resolve_pending_queue_sync() is False
+    assert events == ["queue-sync PR queue-done-pr-001 view failed: gh unavailable"]
+    assert escalations == ["queue-done-pr-001"]
+
+
+def test_escalate_queue_sync_no_op_when_started_at_missing() -> None:
+    runner = _make_runner()
+    runner.state.pending_queue_sync_branch = "queue-done-pr-001"
+
+    runner._escalate_queue_sync_if_expired("queue-done-pr-001")
+
+    assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
+    assert runner.state.pending_queue_sync_started_at is None
+    assert runner.state.state == PipelineState.IDLE
+
+
+def test_escalate_queue_sync_no_op_when_not_expired() -> None:
+    runner = _make_runner()
+    runner.state.pending_queue_sync_branch = "queue-done-pr-001"
+    runner.state.pending_queue_sync_started_at = (
+        datetime.now(timezone.utc) - timedelta(minutes=5)
+    )
+
+    runner._escalate_queue_sync_if_expired("queue-done-pr-001")
+
+    assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
+    assert runner.state.pending_queue_sync_started_at is not None
+    assert runner.state.state == PipelineState.IDLE
+
+
+def test_escalate_queue_sync_transitions_to_error_when_expired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    runner.state.pending_queue_sync_branch = "queue-done-pr-001"
+    runner.state.pending_queue_sync_started_at = (
+        datetime.now(timezone.utc) - timedelta(hours=2)
+    )
+    events: list[str] = []
+    monkeypatch.setattr(runner, "log_event", events.append)
+
+    runner._escalate_queue_sync_if_expired("queue-done-pr-001")
+
+    assert runner.state.pending_queue_sync_branch is None
+    assert runner.state.pending_queue_sync_started_at is None
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message is not None
+    assert "queue-sync PR queue-done-pr-001 unresolved after " in (
+        runner.state.error_message
+    )
+    assert f"(max {merge_module._QUEUE_SYNC_MAX_WAIT_SEC}s)" in (
+        runner.state.error_message
+    )
+    assert events == [runner.state.error_message]
+
+
 def test_handle_merge_failure_sets_error(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_subprocess(monkeypatch)
 
