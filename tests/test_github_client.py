@@ -24,6 +24,7 @@ from src.github_client import (
     get_pr_review_status,
     get_repo_full_name,
     has_recent_codex_review_request,
+    is_pr_merged,
     merge_pr,
     run_gh,
 )
@@ -261,6 +262,69 @@ def test_get_merged_prs_raises_when_github_lookup_fails(
 
     with pytest.raises(RuntimeError, match="boom"):
         get_merged_prs("owner/name", base_branch="main")
+
+
+def test_is_pr_merged_true_when_merged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.github_client.run_gh",
+        lambda args: {"state": "closed", "merged": True},
+    )
+
+    assert is_pr_merged("owner/name", 12) is True
+
+
+def test_is_pr_merged_false_when_closed_unmerged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.github_client.run_gh",
+        lambda args: {"state": "closed", "merged": False},
+    )
+
+    assert is_pr_merged("owner/name", 12) is False
+
+
+def test_is_pr_merged_none_on_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str]) -> dict[str, object]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+
+    assert is_pr_merged("owner/name", 12) is None
+
+
+def test_is_pr_merged_none_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str]) -> dict[str, object]:
+        raise subprocess.TimeoutExpired(cmd=args, timeout=30)
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+
+    assert is_pr_merged("owner/name", 12) is None
+
+
+def test_is_pr_merged_none_on_oserror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str]) -> dict[str, object]:
+        raise OSError("gh not found")
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+
+    assert is_pr_merged("owner/name", 12) is None
+
+
+def test_is_pr_merged_none_on_malformed_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.github_client.run_gh", lambda args: "{not-json")
+
+    assert is_pr_merged("owner/name", 12) is None
 
 
 def test_get_merged_prs_uses_cache_within_ttl(

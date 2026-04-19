@@ -463,11 +463,28 @@ def test_metrics_endpoint_returns_records(
     assert all(record["exit_reason"] != "coding_complete" for record in payload)
     assert payload[0]["coder"] == "codex"
     assert payload[0]["model"] == "gpt-5.4"
+    assert payload[0]["stage"] == "coder"
+    assert payload[0]["files_touched_count"] == 0
+    assert payload[0]["languages_touched"] == []
+    assert payload[0]["diff_lines_added"] == 0
+    assert payload[0]["diff_lines_deleted"] == 0
+    assert payload[0]["test_file_ratio"] == 0.0
+    assert payload[0]["had_merge_conflict"] is False
+    assert payload[0]["base_branch"] == ""
     assert payload[0]["duration_text"] == "1m 1s"
     assert payload[0]["exit_reason_label"] == "rate limit"
     assert payload[1]["coder"] == "claude"
     assert payload[1]["model"] == "opus"
     assert payload[1]["exit_reason_label"] == "merged"
+
+
+def test_exit_reason_classes_treats_closed_unmerged_as_failure() -> None:
+    assert (
+        web_app._exit_reason_classes("closed_unmerged")
+        == "bg-fail/15 text-fail border-fail/30"
+    )
+    assert web_app._exit_reason_label("closed_unmerged") == "closed without merge"
+
 
 def test_partial_repo_detail_returns_html_fragment(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch

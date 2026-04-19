@@ -263,6 +263,35 @@ def get_merged_prs(
     return list(prs)
 
 
+def is_pr_merged(repo: str, pr_number: int) -> bool | None:
+    """Return True if PR is merged, False if closed without merge, None on lookup failure."""
+    try:
+        raw = run_gh(
+            [
+                "api",
+                f"repos/{repo}/pulls/{pr_number}",
+                "--jq",
+                "{state: .state, merged: .merged}",
+            ]
+        )
+    except (RuntimeError, subprocess.TimeoutExpired, OSError):
+        return None
+    if isinstance(raw, dict):
+        parsed = raw
+    elif isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    else:
+        return None
+    if parsed.get("merged") is True:
+        return True
+    if parsed.get("state") == "closed":
+        return False
+    return None
+
+
 def get_pr_review_status(
     repo: str,
     pr_number: int,

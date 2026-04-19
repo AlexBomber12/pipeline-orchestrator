@@ -73,6 +73,8 @@ class MergeMixin:
                         self.log_event(
                             "Merge conflict with main, resolving..."
                         )
+                        if self._current_run_record is not None:
+                            self._current_run_record.had_merge_conflict = True
                         code, _stdout, _stderr = await claude_cli.run_claude_async(
                             "Resolve all merge conflicts in the working "
                             "tree. Keep both sides where possible. "
@@ -142,6 +144,7 @@ class MergeMixin:
                 self.log_event(self.state.error_message)
                 return
 
+        merged_diff_stats = self._compute_diff_stats(base)
         self.log_event(f"Merging PR #{number}")
         try:
             github_client.merge_pr(self.owner_repo, number)
@@ -157,7 +160,11 @@ class MergeMixin:
         except Exception as exc:
             self.log_event(f"Warning: queue-sync step failed: {exc}")
 
-        await self._save_current_run_record("success_merged")
+        await self._save_current_run_record(
+            "success_merged",
+            diff_stats=merged_diff_stats,
+            base_branch=base,
+        )
         self._current_run_record = None
         self.state.current_pr = None
         self.state.current_task = None

@@ -40,7 +40,20 @@ class WatchMixin:
         current_number = self.state.current_pr.number
         found = next((p for p in prs if p.number == current_number), None)
         if found is None:
-            self.log_event(f"PR #{current_number} no longer open -> IDLE")
+            merged = github_client.is_pr_merged(self.owner_repo, current_number)
+            if merged is True:
+                await self._save_current_run_record("success_merged")
+                self.log_event(f"PR #{current_number} merged externally -> IDLE")
+            elif merged is False:
+                await self._save_current_run_record("closed_unmerged")
+                self.log_event(
+                    f"PR #{current_number} closed without merge -> IDLE"
+                )
+            else:
+                self.log_event(
+                    f"PR #{current_number} no longer open (state unknown) -> IDLE"
+                )
+            self._current_run_record = None
             self.state.current_pr = None
             self.state.current_task = None
             self.state.state = PipelineState.IDLE

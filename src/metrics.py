@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 _TTL_SECONDS = 90 * 86400
@@ -26,6 +26,17 @@ class RunRecord:
     exit_reason: str
     operator_intervention: bool
     repo_name: str = ""
+    # Pipeline stage that produced this record. Current values: 'coder'.
+    # Reserved for future: 'planner', 'reviewer', 'qa'. PR-level cost
+    # aggregation sums across all stages for one (task_id, repo_name) bundle.
+    stage: str = "coder"
+    files_touched_count: int = 0
+    languages_touched: list[str] = field(default_factory=list)
+    diff_lines_added: int = 0
+    diff_lines_deleted: int = 0
+    test_file_ratio: float = 0.0
+    had_merge_conflict: bool = False
+    base_branch: str = ""
 
 
 class MetricsStore:

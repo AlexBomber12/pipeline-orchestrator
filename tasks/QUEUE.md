@@ -542,7 +542,7 @@
 - Depends on: PR-077, PR-087
 
 ## PR-093: Capture merged-PR metrics with enriched RunRecord
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-093.md
 - Branch: pr-093-watch-merge-capture
 - Depends on: PR-080

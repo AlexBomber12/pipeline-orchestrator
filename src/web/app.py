@@ -310,6 +310,7 @@ def _profile_parts(profile_id: str) -> tuple[str, str]:
 def _exit_reason_label(exit_reason: str) -> str:
     """Normalize stored exit reasons into concise UI labels."""
     labels = {
+        "closed_unmerged": "closed without merge",
         "success_merged": "merged",
         "rate_limit": "rate limit",
         "error": "error",
@@ -319,6 +320,8 @@ def _exit_reason_label(exit_reason: str) -> str:
 
 def _exit_reason_classes(exit_reason: str) -> str:
     """Return badge classes for the exit reason column."""
+    if exit_reason == "closed_unmerged":
+        return "bg-fail/15 text-fail border-fail/30"
     if "merged" in exit_reason:
         return "bg-ok/15 text-ok border-ok/30"
     if "rate_limit" in exit_reason:
@@ -379,7 +382,9 @@ async def _recent_repo_metrics_payload(
 
 _MERGE_EVENT_MARKER = "Merged PR"
 _ITERATION_EVENT_MARKER = "Fix pushed, iteration"
-_TERMINAL_METRICS_EXIT_REASONS = frozenset({"error", "rate_limit", "success_merged"})
+_TERMINAL_METRICS_EXIT_REASONS = frozenset(
+    {"error", "rate_limit", "success_merged", "closed_unmerged"}
+)
 _ACTIVE_STATES = frozenset(
     {PipelineState.CODING, PipelineState.WATCH, PipelineState.FIX}
 )
