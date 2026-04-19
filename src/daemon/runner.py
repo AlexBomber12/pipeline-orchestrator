@@ -199,21 +199,31 @@ class PipelineRunner(
         self._claude_usage_provider = claude_usage_provider
         self._codex_usage_provider = codex_usage_provider
 
-    def _select_coder(self) -> tuple[str, CoderPlugin] | None:
+    def _select_coder(
+        self, *, allow_exploration: bool = True
+    ) -> tuple[str, CoderPlugin] | None:
         """Return the active selector choice without default fallback."""
+        app_config = self.app_config
+        if not allow_exploration and app_config.daemon.exploration_epsilon != 0:
+            daemon_config = app_config.daemon.model_copy(
+                update={"exploration_epsilon": 0.0}
+            )
+            app_config = app_config.model_copy(update={"daemon": daemon_config})
         ctx = SelectionContext(
             registry=self._registry,
             repo_config=self.repo_config,
-            app_config=self.app_config,
+            app_config=app_config,
             state=self.state,
             rng=self._selector_rng,
             auth_statuses=self._auth_status_cache or None,
         )
         return select_coder(ctx)
 
-    def _get_coder(self) -> tuple[str, CoderPlugin]:
+    def _get_coder(
+        self, *, allow_exploration: bool = True
+    ) -> tuple[str, CoderPlugin]:
         """Return ``(coder_name, coder_plugin)`` for the active coder."""
-        result = self._select_coder()
+        result = self._select_coder(allow_exploration=allow_exploration)
         if result is not None:
             self.state.coder = result[0]
             return result

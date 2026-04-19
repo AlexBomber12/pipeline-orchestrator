@@ -7647,6 +7647,28 @@ def test_handle_paused_clearable_error_drops_top_level_pause_fields(
     assert runner.state.rate_limit_reactive_coder is None
 
 
+def test_handle_paused_invalidates_usage_caches_when_switching_coders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    claude_provider = _FakeUsageProvider(snapshot=None)
+    codex_provider = _FakeUsageProvider(snapshot=None)
+    runner._claude_usage_provider = claude_provider
+    runner._codex_usage_provider = codex_provider
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=20)
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders.add("claude")
+    runner.state.rate_limited_coder_until["claude"] = runner.state.rate_limited_until
+
+    asyncio.run(runner.handle_paused())
+
+    assert claude_provider._invalidated is True
+    assert codex_provider._invalidated is True
+
+
 def test_detect_rate_limit_sets_pause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -8383,7 +8405,9 @@ def test_handle_coding_reuses_selected_coder_for_rate_limit(
     runner.state.current_task = QueueTask(
         pr_id="PR-099", title="test", branch="pr-099-test", status=TaskStatus.TODO
     )
-    runner._get_coder = lambda: ("codex", runner._registry.get("codex"))  # type: ignore[method-assign]
+    runner._get_coder = (  # type: ignore[method-assign]
+        lambda **kwargs: ("codex", runner._registry.get("codex"))
+    )
     seen: list[str | None] = []
 
     async def fake_check_rate_limit(
@@ -8407,7 +8431,9 @@ def test_handle_fix_reuses_selected_coder_for_rate_limit(
     runner = _make_runner()
     runner.state.state = PipelineState.FIX
     runner.state.current_pr = PRInfo(number=50, branch="pr-050")
-    runner._get_coder = lambda: ("codex", runner._registry.get("codex"))  # type: ignore[method-assign]
+    runner._get_coder = (  # type: ignore[method-assign]
+        lambda **kwargs: ("codex", runner._registry.get("codex"))
+    )
     seen: list[str | None] = []
 
     async def fake_check_rate_limit(
@@ -9336,7 +9362,7 @@ def test_get_coder_repo_override_uses_selector_for_fallback(
     assert plugin.name == "claude"
 
 
-def test_get_coder_does_not_explore_away_from_healthy_preferred(
+def test_get_coder_exploration_occasionally_picks_non_greedy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _allow_all_coder_auth(monkeypatch)
@@ -9358,7 +9384,9 @@ def test_get_coder_does_not_explore_away_from_healthy_preferred(
     runner._selector_rng.seed(9)
 
     picks = [runner._get_coder()[0] for _ in range(200)]
-    assert all(pick == "claude" for pick in picks)
+    non_greedy = sum(1 for pick in picks if pick != "claude")
+
+    assert 15 <= non_greedy <= 45
 
 
 def test_handle_coding_uses_codex_cli_when_coder_is_codex(

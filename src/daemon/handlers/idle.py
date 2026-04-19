@@ -650,6 +650,8 @@ class IdleMixin:
         clearable = other_coder
         if clearable:
             self._error_diagnose_count = 0
+            self._claude_usage_provider.invalidate_cache()
+            self._codex_usage_provider.invalidate_cache()
             label = (
                 f"{coder_name.capitalize()} active while {pause_coder} remains "
                 f"rate-limited until {self.state.rate_limited_until.isoformat()}"

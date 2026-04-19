@@ -219,8 +219,9 @@ def test_epsilon_zero_always_greedy() -> None:
     assert all(order[0] == "codex" for order in orders)
 
 
-def test_preferred_coder_never_explores_away_when_eligible() -> None:
+def test_pinned_coder_never_explores_away_when_eligible() -> None:
     ctx = _ctx(
+        repo_coder=CoderType.CODEX,
         daemon_coder=CoderType.CODEX,
         priorities={"claude": 20, "codex": 90, "gemini": 30},
         epsilon=0.5,
@@ -232,8 +233,9 @@ def test_preferred_coder_never_explores_away_when_eligible() -> None:
     assert all(order[0] == "codex" for order in orders)
 
 
-def test_epsilon_one_explores_when_preferred_is_unavailable() -> None:
+def test_epsilon_one_explores_when_pinned_coder_is_unavailable() -> None:
     ctx = _ctx(
+        repo_coder=CoderType.CODEX,
         daemon_coder=CoderType.CODEX,
         priorities={"claude": 20, "codex": 90, "gemini": 30},
         epsilon=0.5,
@@ -244,6 +246,19 @@ def test_epsilon_one_explores_when_preferred_is_unavailable() -> None:
 
     orders = [rank_coders(["claude", "gemini"], ctx) for _ in range(10)]
     assert all(order[0] == "claude" for order in orders)
+
+
+def test_unpinned_preferred_can_explore_away_when_healthy() -> None:
+    ctx = _ctx(
+        daemon_coder=CoderType.CODEX,
+        priorities={"claude": 20, "codex": 90, "gemini": 30},
+        epsilon=0.5,
+        seed=2,
+    )
+    ctx.app_config.daemon.exploration_epsilon = 1.0
+
+    orders = [rank_coders(["claude", "codex", "gemini"], ctx) for _ in range(10)]
+    assert all(order[0] != "codex" for order in orders)
 
 
 def test_epsilon_seed_deterministic() -> None:
