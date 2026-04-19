@@ -191,7 +191,7 @@
 - Branch: pr-104-coverage-daemon-main
 
 ## PR-105: 100% coverage for src/daemon/rate_limit.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-105.md
 - Branch: pr-105-coverage-rate-limit
 
