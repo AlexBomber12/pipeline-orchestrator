@@ -9202,6 +9202,29 @@ def test_check_rate_limit_codex_clears_reactive_claude_pause(
     assert runner.state.state == PipelineState.IDLE
 
 
+def test_check_rate_limit_expires_other_coder_pause_before_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expired pause metadata is cleared even when another coder is active."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+    runner.state.rate_limit_reactive = True
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders.add("claude")
+    runner.state.state = PipelineState.PAUSED
+
+    result = asyncio.run(runner._check_rate_limit())
+
+    assert result is True
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive is False
+    assert runner.state.rate_limit_reactive_coder is None
+    assert "claude" not in runner.state.rate_limited_coders
+
+
 def test_check_rate_limit_codex_honors_reactive_pause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

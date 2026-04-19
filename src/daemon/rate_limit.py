@@ -99,6 +99,15 @@ class RateLimitMixin:
                 self.state.error_message is not None
                 and pause_coder == "claude"
             )
+            if now >= self.state.rate_limited_until:
+                self.state.rate_limited_coders.discard(pause_coder)
+                self.state.rate_limited_until = None
+                self.state.rate_limit_reactive = False
+                self.state.rate_limit_reactive_coder = None
+                self._claude_usage_provider.invalidate_cache()
+                self._codex_usage_provider.invalidate_cache()
+                self.log_event("Rate limit window expired, resuming")
+                return await self._proactive_usage_check(proactive_coder=proactive_coder)
             # A pause from a *different* effective coder doesn't apply.
             # When proactive_coder is set (e.g. "claude" for merge/diagnosis),
             # only pauses matching that coder block; otherwise the repo's
@@ -130,13 +139,6 @@ class RateLimitMixin:
                 remaining = (self.state.rate_limited_until - now).total_seconds()
                 self.log_event(f"Rate limited, resuming in {int(remaining)}s")
                 return False
-            self.state.rate_limited_coders.discard(pause_coder)
-            self.state.rate_limited_until = None
-            self.state.rate_limit_reactive = False
-            self.state.rate_limit_reactive_coder = None
-            self._claude_usage_provider.invalidate_cache()
-            self._codex_usage_provider.invalidate_cache()
-            self.log_event("Rate limit window expired, resuming")
         return await self._proactive_usage_check(proactive_coder=proactive_coder)
 
     def _detect_rate_limit(self, stderr: str, coder_name: str | None = None) -> None:
