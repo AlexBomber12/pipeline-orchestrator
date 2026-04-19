@@ -226,7 +226,7 @@
 - Branch: pr-108b-coverage-fix-handle
 
 ## PR-109a: 100% coverage for runner __init__ and setup helpers
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-109a.md
 - Branch: pr-109a-coverage-runner-init
 
