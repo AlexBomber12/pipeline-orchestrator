@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import src.config as config_module
 from src.config import (
     AppConfig,
     RepoConfig,
@@ -171,6 +172,47 @@ def test_save_config_atomic_overwrites_existing(tmp_path: Path) -> None:
     assert siblings == ["config.yml"], siblings
 
 
+def test_save_config_cleans_up_temp_file_on_os_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.yml"
+
+    def fail_replace(src: str, dst: Path) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(config_module.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        save_config(AppConfig(), str(path))
+
+    assert not list(tmp_path.glob("config.yml.*.tmp"))
+
+
+def test_save_config_cleanup_handles_missing_tmp_file_gracefully(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.yml"
+    attempted_unlinks: list[str] = []
+    original_unlink = config_module.os.unlink
+
+    def fail_replace(src: str, dst: Path) -> None:
+        original_unlink(src)
+        raise OSError("replace failed")
+
+    def missing_unlink(path_to_unlink: str) -> None:
+        attempted_unlinks.append(path_to_unlink)
+        raise FileNotFoundError(path_to_unlink)
+
+    monkeypatch.setattr(config_module.os, "replace", fail_replace)
+    monkeypatch.setattr(config_module.os, "unlink", missing_unlink)
+
+    with pytest.raises(OSError, match="replace failed"):
+        save_config(AppConfig(), str(path))
+
+    assert attempted_unlinks
+    assert not list(tmp_path.glob("config.yml.*.tmp"))
+
+
 def test_add_repository_appends_and_persists(tmp_path: Path) -> None:
     path = tmp_path / "config.yml"
     save_config(AppConfig(), str(path))
@@ -269,6 +311,14 @@ def test_update_repository_raises_on_unknown_field(tmp_path: Path) -> None:
         update_repository(
             "https://github.com/octo/alpha.git", str(path), bogus=1
         )
+
+
+def test_update_repository_raises_on_missing_repo(tmp_path: Path) -> None:
+    path = tmp_path / "config.yml"
+    save_config(AppConfig(), str(path))
+
+    with pytest.raises(ValueError, match="Repository not found"):
+        update_repository("https://github.com/octo/missing.git", str(path))
 
 
 def test_update_repository_validates_patch_types(tmp_path: Path) -> None:
@@ -479,8 +529,44 @@ def test_deprecated_rate_limit_pause_percent(tmp_path: Path) -> None:
     assert cfg.daemon.rate_limit_weekly_pause_percent == 100
 
 
+def test_load_config_migrates_fix_review_timeout_sec_to_fix_idle_timeout_sec(
+    tmp_path: Path,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n  fix_review_timeout_sec: 120\n", encoding="utf-8"
+    )
+
+    cfg = load_config(str(cfg_path))
+
+    assert cfg.daemon.fix_idle_timeout_sec == 120
+
+
+def test_load_config_does_not_override_existing_fix_idle_timeout_sec(
+    tmp_path: Path,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  fix_review_timeout_sec: 120\n"
+        "  fix_idle_timeout_sec: 240\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(str(cfg_path))
+
+    assert cfg.daemon.fix_idle_timeout_sec == 240
+
+
 def test_repo_poll_interval_default() -> None:
     repo = RepoConfig(url="https://github.com/example/repo")
+    assert repo.poll_interval_sec == 60
+
+
+def test_poll_interval_validator_defaults_to_60_when_none() -> None:
+    repo = RepoConfig(
+        url="https://github.com/example/repo", poll_interval_sec=None
+    )
     assert repo.poll_interval_sec == 60
 
 
