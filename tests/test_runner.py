@@ -12612,3 +12612,106 @@ def test_proactive_check_uses_claude_provider_when_coder_is_claude(
     assert result is False
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.rate_limit_reactive_coder == "claude"
+
+
+def test_monitor_inflight_breach_retries_bad_marker_then_uses_default_reset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Bad marker JSON should be retried before defaulting to a 30-minute pause."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(breach_module, "_BREACH_POLL_SEC", 0.05)
+
+    breach_run_id = "test-breach-bad-json"
+
+    async def _run() -> None:
+        runner = _make_runner()
+
+        async def fake_cli_forever() -> tuple[int, str, str]:
+            await asyncio.sleep(999)
+            return (0, "", "")
+
+        task = asyncio.create_task(fake_cli_forever())
+        breach_flag: dict[str, bool] = {"breached": False}
+        monitor = asyncio.create_task(
+            runner._monitor_inflight_breach(
+                str(tmp_path), breach_run_id, task, breach_flag,
+            )
+        )
+
+        marker = tmp_path / f"{breach_run_id}.breach"
+        marker.write_text("{not-json")
+        await asyncio.sleep(0.1)
+        marker.write_text(json.dumps({
+            "type": "session",
+            "resets_at": 0,
+            "session_pct": 99,
+        }))
+
+        await asyncio.sleep(0.2)
+
+        assert breach_flag["breached"] is True
+        assert runner.state.rate_limited_until is not None
+        remaining = runner.state.rate_limited_until - datetime.now(timezone.utc)
+        assert timedelta(minutes=29) <= remaining <= timedelta(minutes=31)
+
+        monitor.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_run())
+
+
+def test_check_late_breach_returns_after_retry_exhaustion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Late breach detection should stop after repeated marker read failures."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(breach_module.time, "sleep", lambda _seconds: None)
+
+    runner = _make_runner()
+    breach_flag = {"breached": False}
+    marker = tmp_path / "retry-exhausted.breach"
+    marker.write_text("{not-json")
+
+    runner._check_late_breach(str(tmp_path), "retry-exhausted", breach_flag)
+
+    assert breach_flag["breached"] is False
+    assert runner.state.rate_limited_until is None
+
+
+def test_check_late_breach_uses_resets_at_timestamp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Late breach detection should use the marker reset timestamp when present."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    breach_flag = {"breached": False}
+    resets_at = 1800000000
+    marker = tmp_path / "late-reset.breach"
+    marker.write_text(json.dumps({
+        "type": "weekly",
+        "resets_at": resets_at,
+        "weekly_pct": 101,
+    }))
+
+    runner._check_late_breach(str(tmp_path), "late-reset", breach_flag)
+
+    assert breach_flag["breached"] is True
+    assert runner.state.rate_limited_until is not None
+    assert int(runner.state.rate_limited_until.timestamp()) == resets_at
+
+
+def test_cleanup_breach_marker_ignores_unlink_oserror(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Cleanup should swallow filesystem unlink failures."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+
+    def fake_unlink(self: Path, missing_ok: bool = False) -> None:
+        raise OSError("simulated unlink failure")
+
+    monkeypatch.setattr(Path, "unlink", fake_unlink)
+
+    runner._cleanup_breach_marker(str(tmp_path), "cleanup-oserror")
