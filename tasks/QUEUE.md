@@ -296,7 +296,7 @@
 - Branch: pr-120-coverage-handler-idle
 
 ## PR-121: 100% coverage for src/daemon/handlers/coding.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-121.md
 - Branch: pr-121-coverage-handler-coding
 
