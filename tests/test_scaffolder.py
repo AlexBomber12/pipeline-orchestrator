@@ -69,6 +69,25 @@ def _init_empty_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _init_scaffolded_repo(tmp_path: Path) -> Path:
+    """Create a repo with the baseline scaffolding already present."""
+    repo = _init_empty_repo(tmp_path)
+    (repo / "AGENTS.md").write_text("# AGENTS\n")
+    (repo / "CLAUDE.md").write_text("Read and follow AGENTS.md in this repository.\n")
+    (repo / "tasks").mkdir()
+    (repo / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "ci.sh").write_text("#!/usr/bin/env bash\n")
+    (repo / "scripts" / "ci.sh").chmod(0o755)
+    (repo / "scripts" / "make-review-artifacts.sh").write_text(
+        "#!/usr/bin/env bash\n"
+    )
+    (repo / "scripts" / "make-review-artifacts.sh").chmod(0o755)
+    (repo / "artifacts").mkdir()
+    (repo / ".gitignore").write_text("artifacts/\n")
+    return repo
+
+
 def test_scaffold_repo_creates_all_files_when_empty(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -185,6 +204,138 @@ def test_scaffold_repo_accepts_claude_md_as_agents(
 
     assert not (repo / "AGENTS.md").exists()
     assert "AGENTS.md" not in actions
+
+
+def test_ensure_claude_md_returns_false_for_missing_repo(tmp_path: Path) -> None:
+    missing = tmp_path / "missing-repo"
+
+    assert scaffolder.ensure_claude_md(str(missing), "main") is False
+
+
+def test_ensure_claude_md_skips_when_remote_already_has_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_empty_repo(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run_git(repo_path: str, *args: str, timeout: int = 30) -> _FakeCompletedProcess:
+        del repo_path, timeout
+        calls.append(args)
+        return _FakeCompletedProcess(args=["git", *args])
+
+    monkeypatch.setattr(scaffolder, "_run_git", fake_run_git)
+
+    assert scaffolder.ensure_claude_md(str(repo), "main") is False
+    assert calls == [("cat-file", "-e", "origin/main:CLAUDE.md")]
+    assert not (repo / "CLAUDE.md").exists()
+
+
+def test_ensure_claude_md_skips_when_file_already_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_empty_repo(tmp_path)
+    (repo / "CLAUDE.md").write_text("existing\n")
+
+    def fail_run_git(repo_path: str, *args: str, timeout: int = 30) -> _FakeCompletedProcess:
+        raise AssertionError(f"_run_git should not be called: {repo_path} {args} {timeout}")
+
+    monkeypatch.setattr(scaffolder, "_run_git", fail_run_git)
+
+    assert scaffolder.ensure_claude_md(str(repo), "main") is False
+
+
+def test_ensure_claude_md_creates_and_pushes_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_empty_repo(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run_git(repo_path: str, *args: str, timeout: int = 30) -> _FakeCompletedProcess:
+        del timeout
+        calls.append(args)
+        if args[:2] == ("cat-file", "-e"):
+            raise subprocess.CalledProcessError(1, ["git", *args])
+        if args[:3] == ("reset", "--hard", "origin/main"):
+            assert repo_path == str(repo)
+        return _FakeCompletedProcess(args=["git", *args])
+
+    monkeypatch.setattr(scaffolder, "_run_git", fake_run_git)
+
+    assert scaffolder.ensure_claude_md(str(repo), "main") is True
+    assert (repo / "CLAUDE.md").exists()
+    assert calls == [
+        ("cat-file", "-e", "origin/main:CLAUDE.md"),
+        ("checkout", "main"),
+        ("reset", "--hard", "origin/main"),
+        ("add", "CLAUDE.md"),
+        ("commit", "-m", "chore: backfill CLAUDE.md"),
+        ("push", "origin", "main"),
+    ]
+
+
+def test_ensure_claude_md_returns_false_when_reset_restores_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_empty_repo(tmp_path)
+
+    def fake_run_git(repo_path: str, *args: str, timeout: int = 30) -> _FakeCompletedProcess:
+        del timeout
+        if args[:2] == ("cat-file", "-e"):
+            raise subprocess.CalledProcessError(1, ["git", *args])
+        if args[:3] == ("reset", "--hard", "origin/main"):
+            Path(repo_path, "CLAUDE.md").write_text("restored from origin\n")
+        return _FakeCompletedProcess(args=["git", *args])
+
+    monkeypatch.setattr(scaffolder, "_run_git", fake_run_git)
+
+    assert scaffolder.ensure_claude_md(str(repo), "main") is False
+    assert (repo / "CLAUDE.md").read_text() == "restored from origin\n"
+
+
+def test_ensure_claude_md_uses_unborn_head_fallback_and_resets_on_push_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_empty_repo(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run_git(repo_path: str, *args: str, timeout: int = 30) -> _FakeCompletedProcess:
+        del repo_path, timeout
+        calls.append(args)
+        if args[:2] == ("cat-file", "-e"):
+            raise subprocess.CalledProcessError(1, ["git", *args])
+        if args[:2] == ("checkout", "main"):
+            raise subprocess.CalledProcessError(1, ["git", *args])
+        if args[:2] == ("push", "origin"):
+            raise subprocess.TimeoutExpired(["git", *args], scaffolder._PUSH_GIT_TIMEOUT)
+        return _FakeCompletedProcess(args=["git", *args])
+
+    monkeypatch.setattr(scaffolder, "_run_git", fake_run_git)
+    monkeypatch.setattr(scaffolder, "_head_is_unborn", lambda repo_path: True)
+
+    assert scaffolder.ensure_claude_md(str(repo), "main") is False
+    assert (repo / "CLAUDE.md").exists()
+    assert ("symbolic-ref", "HEAD", "refs/heads/main") in calls
+    assert calls[-1] == ("reset", "--hard", "origin/main")
+
+
+def test_ensure_claude_md_reraises_checkout_failure_when_head_is_born(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_empty_repo(tmp_path)
+
+    def fake_run_git(repo_path: str, *args: str, timeout: int = 30) -> _FakeCompletedProcess:
+        del repo_path, timeout
+        if args[:2] == ("cat-file", "-e"):
+            raise subprocess.CalledProcessError(1, ["git", *args])
+        if args[:2] == ("checkout", "main"):
+            raise subprocess.CalledProcessError(1, ["git", *args])
+        return _FakeCompletedProcess(args=["git", *args])
+
+    monkeypatch.setattr(scaffolder, "_run_git", fake_run_git)
+    monkeypatch.setattr(scaffolder, "_head_is_unborn", lambda repo_path: False)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        scaffolder.ensure_claude_md(str(repo), "main")
 
 
 def test_scaffold_repo_preserves_existing_queue(
@@ -493,22 +644,7 @@ def test_scaffold_repo_pushes_when_rev_list_probe_fails(
     Pushing an already-synced branch is a cheap "Everything up-to-
     date" no-op, so erring on the side of True is safe.
     """
-    repo = _init_empty_repo(tmp_path)
-    # Fully provision locally so ``to_stage`` is empty and scaffold
-    # goes through the retry/no-commit branch that calls
-    # ``_local_has_unpushed_commits``.
-    (repo / "AGENTS.md").write_text("# AGENTS\n")
-    (repo / "tasks").mkdir()
-    (repo / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
-    (repo / "scripts").mkdir()
-    (repo / "scripts" / "ci.sh").write_text("#!/usr/bin/env bash\n")
-    (repo / "scripts" / "ci.sh").chmod(0o755)
-    (repo / "scripts" / "make-review-artifacts.sh").write_text(
-        "#!/usr/bin/env bash\n"
-    )
-    (repo / "scripts" / "make-review-artifacts.sh").chmod(0o755)
-    (repo / "artifacts").mkdir()
-    (repo / ".gitignore").write_text("artifacts/\n")
+    repo = _init_scaffolded_repo(tmp_path)
 
     calls: list[list[str]] = []
 
@@ -534,6 +670,28 @@ def test_scaffold_repo_pushes_when_rev_list_probe_fails(
     assert push_cmds == [["git", "push", "origin", "main"]]
 
 
+def test_scaffold_repo_pushes_when_rev_list_probe_is_not_an_integer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_scaffolded_repo(tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        if cmd[:2] == ["git", "rev-list"]:
+            return _FakeCompletedProcess(args=cmd, returncode=0, stdout="nope\n")
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+
+    assert scaffolder.scaffold_repo(str(repo), "main") == []
+    assert [cmd for cmd in calls if cmd[:2] == ["git", "push"]] == [
+        ["git", "push", "origin", "main"]
+    ]
+
+
 def test_scaffold_repo_pushes_when_rev_list_probe_times_out(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -544,21 +702,7 @@ def test_scaffold_repo_pushes_when_rev_list_probe_times_out(
     before push would keep a previously stranded scaffolding commit
     unpublished until manual intervention.
     """
-    repo = _init_empty_repo(tmp_path)
-    # Fully provision locally so ``to_stage`` is empty and the
-    # retry/no-commit branch calls ``_local_has_unpushed_commits``.
-    (repo / "AGENTS.md").write_text("# AGENTS\n")
-    (repo / "tasks").mkdir()
-    (repo / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
-    (repo / "scripts").mkdir()
-    (repo / "scripts" / "ci.sh").write_text("#!/usr/bin/env bash\n")
-    (repo / "scripts" / "ci.sh").chmod(0o755)
-    (repo / "scripts" / "make-review-artifacts.sh").write_text(
-        "#!/usr/bin/env bash\n"
-    )
-    (repo / "scripts" / "make-review-artifacts.sh").chmod(0o755)
-    (repo / "artifacts").mkdir()
-    (repo / ".gitignore").write_text("artifacts/\n")
+    repo = _init_scaffolded_repo(tmp_path)
 
     calls: list[list[str]] = []
 
@@ -635,6 +779,48 @@ def test_scaffold_repo_retries_stranded_push_with_no_new_commit(
     # previous cycle is exactly what's being re-pushed.
     assert not any(cmd[:2] == ["git", "add"] for cmd in calls)
     assert not any(cmd[:2] == ["git", "commit"] for cmd in calls)
+
+
+def test_scaffold_repo_reraises_git_commit_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_empty_repo(tmp_path)
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "commit"]:
+            raise subprocess.CalledProcessError(1, cmd, stderr="commit blocked")
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            ref = cmd[-1]
+            if ref.startswith("refs/remotes/origin/"):
+                return _FakeCompletedProcess(args=cmd, returncode=1)
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        scaffolder.scaffold_repo(str(repo), "main")
+
+
+def test_scaffold_repo_reraises_git_commit_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_empty_repo(tmp_path)
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "commit"]:
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            ref = cmd[-1]
+            if ref.startswith("refs/remotes/origin/"):
+                return _FakeCompletedProcess(args=cmd, returncode=1)
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        scaffolder.scaffold_repo(str(repo), "main")
 
 
 def test_scaffold_repo_propagates_git_push_timeout(
