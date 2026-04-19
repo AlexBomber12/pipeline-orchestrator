@@ -70,6 +70,26 @@ async def test_run_codex_async_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_codex_async_timeout_ignores_missing_process_on_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_proc = _make_fake_proc()
+    fake_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError)
+    fake_proc.kill.side_effect = ProcessLookupError
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    result = await run_codex_async("prompt", "/tmp", timeout=5)
+
+    assert result == (-1, "", "Timeout after 5s")
+    fake_proc.kill.assert_called_once()
+    fake_proc.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_run_codex_async_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
         raise FileNotFoundError(2, "No such file or directory", "codex")
@@ -174,3 +194,35 @@ async def test_run_codex_async_cwd_not_found(
 
     result = await run_codex_async("prompt", "/data/repos/missing")
     assert result == (-1, "", "cwd not found: /data/repos/missing")
+
+
+@pytest.mark.asyncio
+async def test_run_codex_async_cancellation_kills_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    fake_proc = _make_fake_proc()
+    fake_proc.kill.side_effect = ProcessLookupError
+
+    async def fake_communicate() -> tuple[bytes, bytes]:
+        started.set()
+        await release.wait()
+        return (b"", b"")
+
+    fake_proc.communicate = AsyncMock(side_effect=fake_communicate)
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    task = asyncio.create_task(run_codex_async("prompt", "/tmp", timeout=5))
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    fake_proc.kill.assert_called_once()
+    fake_proc.wait.assert_awaited_once()
