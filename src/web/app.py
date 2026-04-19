@@ -1749,9 +1749,12 @@ async def upload_tasks(
             repo_name=name,
         )
 
+    task_uploads: dict[str, bytes] = {}
     for fname, content in file_contents:
-        if not _re.fullmatch(_TASK_UPLOAD_PATTERN, fname):
-            continue
+        if _re.fullmatch(_TASK_UPLOAD_PATTERN, fname):
+            task_uploads[fname] = content
+
+    for fname, content in task_uploads.items():
         try:
             task_text = content.decode("utf-8")
         except UnicodeDecodeError:
@@ -1761,13 +1764,16 @@ async def upload_tasks(
                 400,
                 repo_name=name,
             )
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".md") as tmp:
-            tmp.write(task_text)
-            tmp.flush()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task_path = Path(tmpdir) / fname
+            task_path.write_text(task_text, encoding="utf-8")
             try:
-                parse_task_header(tmp.name)
+                parse_task_header(task_path)
             except QueueValidationError as exc:
-                if any("missing Depends on" in issue for issue in exc.issues):
+                issues = [
+                    issue.replace(str(task_path), fname) for issue in exc.issues
+                ]
+                if any("missing Depends on" in issue for issue in issues):
                     return _render_upload_error(
                         request,
                         "Task file missing required field: Depends on. "
@@ -1777,7 +1783,7 @@ async def upload_tasks(
                     )
                 return _render_upload_error(
                     request,
-                    "\n".join(exc.issues),
+                    "\n".join(issues),
                     400,
                     repo_name=name,
                 )

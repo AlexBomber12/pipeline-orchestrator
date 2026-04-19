@@ -248,6 +248,43 @@ def test_upload_rejects_non_numeric_task_without_depends_on(
     assert "Depends on: none" in resp.text
 
 
+def test_upload_validates_only_last_duplicate_task_copy(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[
+                _queue_file(),
+                _task_file(depends_on=None),
+                _task_file(depends_on="none"),
+            ],
+        )
+
+    assert resp.status_code == 200
+
+
+def test_upload_task_validation_errors_reference_uploaded_filename(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[
+                _queue_file(),
+                _task_file(name="PR-ABC.md", pr_id="PR-ABC", depends_on="PR-001, nope"),
+            ],
+        )
+
+    assert resp.status_code == 400
+    assert "PR-ABC.md: invalid Depends on" in resp.text
+    assert "/tmp/" not in resp.text
+
+
 def test_upload_accepts_task_with_depends_on_none(
     one_repo_config: Path,
     repo_dir: Path,
