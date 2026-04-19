@@ -1730,6 +1730,7 @@ async def upload_tasks(
 
     # Validate file names and sizes (stream chunks to enforce limit early)
     total_size = 0
+    staged_size = 0
     file_contents: list[tuple[str, bytes]] = []
     _CHUNK = 64 * 1024
     for f in files:
@@ -1746,7 +1747,8 @@ async def upload_tasks(
                 if not chunk:
                     break
                 zip_size += len(chunk)
-                if zip_size > _UPLOAD_MAX_TOTAL_BYTES:
+                total_size += len(chunk)
+                if zip_size > _UPLOAD_MAX_TOTAL_BYTES or total_size > _UPLOAD_MAX_TOTAL_BYTES:
                     return _render_upload_error(
                         request, "Total upload size exceeds 1 MB", 422, repo_name=name
                     )
@@ -1772,7 +1774,7 @@ async def upload_tasks(
                                 422,
                                 repo_name=name,
                             )
-                        if total_size + entry.file_size > _UPLOAD_MAX_TOTAL_BYTES:
+                        if staged_size + entry.file_size > _UPLOAD_MAX_TOTAL_BYTES:
                             return _render_upload_error(
                                 request, "Total upload size exceeds 1 MB", 422, repo_name=name
                             )
@@ -1785,7 +1787,7 @@ async def upload_tasks(
                                     if not chunk:
                                         break
                                     entry_size += len(chunk)
-                                    if total_size + entry_size > _UPLOAD_MAX_TOTAL_BYTES:
+                                    if staged_size + entry_size > _UPLOAD_MAX_TOTAL_BYTES:
                                         return _render_upload_error(
                                             request, "Total upload size exceeds 1 MB", 422, repo_name=name
                                         )
@@ -1797,7 +1799,7 @@ async def upload_tasks(
                                 400,
                                 repo_name=name,
                             )
-                        total_size += entry_size
+                        staged_size += entry_size
                         file_contents.append((entry_name, b''.join(chunks)))
             except zipfile.BadZipFile:
                 return _render_upload_error(
@@ -1822,7 +1824,8 @@ async def upload_tasks(
             if not chunk:
                 break
             total_size += len(chunk)
-            if total_size > _UPLOAD_MAX_TOTAL_BYTES:
+            staged_size += len(chunk)
+            if total_size > _UPLOAD_MAX_TOTAL_BYTES or staged_size > _UPLOAD_MAX_TOTAL_BYTES:
                 return _render_upload_error(
                     request, "Total upload size exceeds 1 MB", 422, repo_name=name
                 )

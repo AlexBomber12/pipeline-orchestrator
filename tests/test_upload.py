@@ -327,6 +327,33 @@ def test_upload_zip_raw_size_enforced_before_parse(
     assert resp.status_code == 422 and "Total upload size exceeds 1 MB" in resp.text
 
 
+def test_upload_zip_total_raw_size_enforced_across_archives(
+    one_repo_config: Path,
+    repo_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zip_one = _zip_file({"PR-001.md": b"a" * 20}, name="one.zip")
+    zip_two = _zip_file({"PR-002.md": b"b" * 20}, name="two.zip")
+    original_zipfile = web_app.zipfile.ZipFile
+    calls = {"count": 0}
+
+    class _CountingZipFile(original_zipfile):
+        def __init__(self, *args, **kwargs) -> None:
+            calls["count"] += 1
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(
+        web_app,
+        "_UPLOAD_MAX_TOTAL_BYTES",
+        len(zip_one[1][1]) + len(zip_two[1][1]) - 1,
+    )
+    monkeypatch.setattr(web_app.zipfile, "ZipFile", _CountingZipFile)
+    resp = _post_upload([zip_one, zip_two])
+    assert resp.status_code == 422
+    assert "Total upload size exceeds 1 MB" in resp.text
+    assert calls["count"] == 1
+
+
 def test_upload_zip_total_extracted_size_enforced(
     one_repo_config: Path,
     repo_dir: Path,
