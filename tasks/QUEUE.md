@@ -246,7 +246,7 @@
 - Branch: pr-110-coverage-github-client
 
 ## PR-111: 100% coverage for src/daemon/scaffolder.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-111.md
 - Branch: pr-111-coverage-scaffolder
 
