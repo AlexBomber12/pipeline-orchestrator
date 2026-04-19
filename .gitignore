@@ -10,3 +10,6 @@ artifacts/
 *:Zone.Identifier
 artifacts/
 *.patch
+.coverage
+.coverage.*
+htmlcov/
