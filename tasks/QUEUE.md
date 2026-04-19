@@ -536,7 +536,7 @@
 - Depends on: PR-077
 
 ## PR-092: DESIGN.md
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-092.md
 - Branch: pr-092-design-doc
 - Depends on: PR-077, PR-087
