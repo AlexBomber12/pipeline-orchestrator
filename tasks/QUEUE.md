@@ -301,6 +301,6 @@
 - Branch: pr-121-coverage-handler-coding
 
 ## PR-122: 100% coverage for src/daemon/handlers/watch.py
-- Status: DOING
+- Status: DONE
 - Tasks file: tasks/PR-122.md
 - Branch: pr-122-coverage-handler-watch
