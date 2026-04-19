@@ -286,7 +286,7 @@
 - Branch: pr-118-coverage-dag
 
 ## PR-119: 100% coverage for src/web/app.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-119.md
 - Branch: pr-119-coverage-web-app
 
