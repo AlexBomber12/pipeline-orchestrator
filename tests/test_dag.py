@@ -123,3 +123,77 @@ def test_no_cycle_in_valid_dag() -> None:
         "PR-003": ["PR-002"],
     }
     assert detect_cycle(dag) is None
+
+
+def test_build_task_dag_rejects_duplicate_task_ids() -> None:
+    headers = [
+        _header("PR-001"),
+        _header("PR-001"),
+    ]
+
+    try:
+        build_task_dag(headers)
+    except ValueError as exc:
+        assert str(exc) == "duplicate task id: PR-001"
+    else:
+        raise AssertionError("expected duplicate task id to raise ValueError")
+
+
+def test_build_task_dag_rejects_unknown_dependencies() -> None:
+    headers = [
+        _header("PR-001", depends_on=["PR-999"]),
+    ]
+
+    try:
+        build_task_dag(headers)
+    except ValueError as exc:
+        assert str(exc) == "PR-001 depends on unknown task PR-999"
+    else:
+        raise AssertionError("expected unknown dependency to raise ValueError")
+
+
+def test_build_task_dag_rejects_dependency_cycles() -> None:
+    headers = [
+        _header("PR-001", depends_on=["PR-002"]),
+        _header("PR-002", depends_on=["PR-001"]),
+    ]
+
+    try:
+        build_task_dag(headers)
+    except ValueError as exc:
+        assert str(exc) == "dependency cycle: PR-001 -> PR-002 -> PR-001"
+    else:
+        raise AssertionError("expected dependency cycle to raise ValueError")
+
+
+def test_detect_cycle_skips_already_visited_components() -> None:
+    dag = {
+        "PR-003": ["PR-002"],
+        "PR-002": ["PR-001"],
+        "PR-001": [],
+    }
+
+    assert detect_cycle(dag) is None
+
+
+def test_eligible_sorts_non_standard_pr_ids_after_standard_ones() -> None:
+    headers = [
+        _header("PR-010", priority=1),
+        _header("TASK-002", priority=1),
+        _header("PR-002", priority=1),
+    ]
+
+    eligible = get_eligible_tasks(
+        headers,
+        {
+            "PR-010": TaskStatus.TODO,
+            "TASK-002": TaskStatus.TODO,
+            "PR-002": TaskStatus.TODO,
+        },
+    )
+
+    assert [header.pr_id for header in eligible] == [
+        "PR-002",
+        "PR-010",
+        "TASK-002",
+    ]
