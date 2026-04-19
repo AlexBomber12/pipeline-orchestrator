@@ -170,10 +170,42 @@ def test_upload_without_queue_md(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_pr_file()],
+            files=[_task_file()],
         )
-    assert resp.status_code == 422
-    assert "QUEUE.md is required" in resp.text
+    assert resp.status_code == 200
+    assert "queued" in resp.text.lower()
+
+    repo_upload_dir = uploads_dir / "example__alpha"
+    subdirs = list(repo_upload_dir.iterdir())
+    assert len(subdirs) == 1
+    staging = subdirs[0]
+    assert not (staging / "QUEUE.md").exists()
+    assert (staging / "PR-001.md").exists()
+
+
+def test_upload_rejects_malformed_queue_md(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    malformed_queue = (
+        "files",
+        (
+            "QUEUE.md",
+            b"## PR-001: First\n- Status: TODO\n- Tasks file: PR-001.md\n- Branch: same\n"
+            b"## PR-001: Duplicate\n- Status: TODO\n- Tasks file: PR-002.md\n- Branch: same\n",
+            "text/markdown",
+        ),
+    )
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[malformed_queue, _task_file()],
+        )
+
+    assert resp.status_code == 400
+    assert "QUEUE.md validation failed" in resp.text
 
 
 def test_upload_invalid_filename(
