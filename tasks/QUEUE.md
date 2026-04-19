@@ -161,7 +161,7 @@
 - Branch: pr-098-coverage-config
 
 ## PR-099: 100% coverage for src/coders/codex.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-099.md
 - Branch: pr-099-coverage-coders-codex
 
