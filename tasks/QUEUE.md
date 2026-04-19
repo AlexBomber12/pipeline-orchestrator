@@ -156,7 +156,7 @@
 - Branch: pr-097-coverage-coders-claude
 
 ## PR-098: 100% coverage for src/config.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-098.md
 - Branch: pr-098-coverage-config
 
