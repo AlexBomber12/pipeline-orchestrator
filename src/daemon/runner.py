@@ -385,6 +385,20 @@ class PipelineRunner(
             "test_file_ratio": round(ratio, 3),
         }
 
+    @staticmethod
+    def _apply_diff_stats(
+        record: RunRecord,
+        stats: dict[str, object],
+        base_branch: str,
+    ) -> None:
+        """Copy diff-enrichment fields onto a run record."""
+        record.files_touched_count = int(stats.get("files_touched_count", 0))
+        record.languages_touched = list(stats.get("languages_touched", []))
+        record.diff_lines_added = int(stats.get("diff_lines_added", 0))
+        record.diff_lines_deleted = int(stats.get("diff_lines_deleted", 0))
+        record.test_file_ratio = float(stats.get("test_file_ratio", 0.0))
+        record.base_branch = base_branch
+
     async def _checkpoint_current_run_record(self) -> None:
         """Persist the active run record without finalizing it."""
         record = self._current_run_record
@@ -415,7 +429,13 @@ class PipelineRunner(
             None,
         )
 
-    async def _save_current_run_record(self, exit_reason: str) -> None:
+    async def _save_current_run_record(
+        self,
+        exit_reason: str,
+        *,
+        diff_stats: dict[str, object] | None = None,
+        base_branch: str | None = None,
+    ) -> None:
         """Finalize and persist the active run record."""
         record = self._current_run_record
         if record is None:
@@ -433,14 +453,11 @@ class PipelineRunner(
             )
         record.exit_reason = exit_reason
         if exit_reason in ("success_merged", "coding_complete", "closed_unmerged"):
-            base_branch = self.repo_config.branch or "main"
-            stats = self._compute_diff_stats(base_branch)
-            record.files_touched_count = int(stats.get("files_touched_count", 0))
-            record.languages_touched = list(stats.get("languages_touched", []))
-            record.diff_lines_added = int(stats.get("diff_lines_added", 0))
-            record.diff_lines_deleted = int(stats.get("diff_lines_deleted", 0))
-            record.test_file_ratio = float(stats.get("test_file_ratio", 0.0))
-            record.base_branch = base_branch
+            resolved_base_branch = base_branch or self.repo_config.branch or "main"
+            stats = diff_stats
+            if stats is None:
+                stats = self._compute_diff_stats(resolved_base_branch)
+            self._apply_diff_stats(record, stats, resolved_base_branch)
         await self._metrics_store.save(record)
 
     async def publish_state(self) -> None:

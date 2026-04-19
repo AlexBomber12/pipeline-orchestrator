@@ -297,6 +297,28 @@ def test_is_pr_merged_none_on_runtime_error(
     assert is_pr_merged("owner/name", 12) is None
 
 
+def test_is_pr_merged_none_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str]) -> dict[str, object]:
+        raise subprocess.TimeoutExpired(cmd=args, timeout=30)
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+
+    assert is_pr_merged("owner/name", 12) is None
+
+
+def test_is_pr_merged_none_on_oserror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str]) -> dict[str, object]:
+        raise OSError("gh not found")
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+
+    assert is_pr_merged("owner/name", 12) is None
+
+
 def test_is_pr_merged_none_on_malformed_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

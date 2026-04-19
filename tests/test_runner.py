@@ -3291,6 +3291,69 @@ def test_handle_merge_syncs_with_main(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def test_handle_merge_captures_success_stats_before_queue_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return _FakeCompletedProcess(
+                args=cmd, stdout="Already up to date.\n", returncode=0
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+    monkeypatch.setattr(
+        runner_module.github_client, "merge_pr", lambda repo, num: None
+    )
+
+    call_order: list[str] = []
+
+    def fake_compute(base_branch: str) -> dict[str, object]:
+        call_order.append(f"compute:{base_branch}")
+        return {
+            "files_touched_count": 7,
+            "languages_touched": ["python"],
+            "diff_lines_added": 11,
+            "diff_lines_deleted": 3,
+            "test_file_ratio": 0.286,
+        }
+
+    def fake_mark(self: runner_module.PipelineRunner) -> None:
+        call_order.append("queue")
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    runner._start_current_run_record("claude", "opus")
+    monkeypatch.setattr(runner, "_compute_diff_stats", fake_compute)
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", fake_mark
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+
+    assert call_order == ["compute:main", "queue"]
+    assert len(recent) == 1
+    assert recent[0].exit_reason == "success_merged"
+    assert recent[0].files_touched_count == 7
+    assert recent[0].languages_touched == ["python"]
+    assert recent[0].diff_lines_added == 11
+    assert recent[0].diff_lines_deleted == 3
+    assert recent[0].test_file_ratio == 0.286
+    assert recent[0].base_branch == "main"
+
+
 def test_handle_merge_returns_to_watch_after_sync_push(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

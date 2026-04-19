@@ -274,7 +274,7 @@ def is_pr_merged(repo: str, pr_number: int) -> bool | None:
                 "{state: .state, merged: .merged}",
             ]
         )
-    except RuntimeError:
+    except (RuntimeError, subprocess.TimeoutExpired, OSError):
         return None
     if isinstance(raw, dict):
         parsed = raw
