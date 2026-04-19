@@ -9336,7 +9336,7 @@ def test_get_coder_repo_override_uses_selector_for_fallback(
     assert plugin.name == "claude"
 
 
-def test_get_coder_exploration_occasionally_picks_non_greedy(
+def test_get_coder_does_not_explore_away_from_healthy_preferred(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _allow_all_coder_auth(monkeypatch)
@@ -9358,9 +9358,7 @@ def test_get_coder_exploration_occasionally_picks_non_greedy(
     runner._selector_rng.seed(9)
 
     picks = [runner._get_coder()[0] for _ in range(200)]
-    non_greedy = sum(1 for pick in picks if pick != "claude")
-
-    assert 15 <= non_greedy <= 45
+    assert all(pick == "claude" for pick in picks)
 
 
 def test_handle_coding_uses_codex_cli_when_coder_is_codex(

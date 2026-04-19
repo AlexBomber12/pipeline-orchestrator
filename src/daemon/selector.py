@@ -58,6 +58,9 @@ def rank_coders(eligible: list[str], ctx: SelectionContext) -> list[str]:
         return list(eligible)
 
     greedy = _greedy_order(eligible, ctx)
+    if _preferred_coder_name(ctx) in eligible:
+        return greedy
+
     epsilon = ctx.app_config.daemon.exploration_epsilon
     if epsilon <= 0:
         return greedy
@@ -91,16 +94,18 @@ def _sort_by_priority(eligible: list[str], ctx: SelectionContext) -> list[str]:
 
 
 def _greedy_order(eligible: list[str], ctx: SelectionContext) -> list[str]:
-    preferred = ctx.repo_config.coder
-    preferred_name = (
-        preferred.value
-        if preferred is not None
-        else ctx.app_config.daemon.coder.value
-    )
+    preferred_name = _preferred_coder_name(ctx)
     if preferred_name in eligible:
         remainder = [name for name in eligible if name != preferred_name]
         return [preferred_name, *_sort_by_priority(remainder, ctx)]
     return _sort_by_priority(eligible, ctx)
+
+
+def _preferred_coder_name(ctx: SelectionContext) -> str:
+    preferred = ctx.repo_config.coder
+    if preferred is not None:
+        return preferred.value
+    return ctx.app_config.daemon.coder.value
 
 
 def _is_rate_limited(name: str, state: RepoState) -> bool:
