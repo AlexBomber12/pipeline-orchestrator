@@ -90,12 +90,13 @@ def _bad_file() -> tuple[str, tuple[str, bytes, str]]:
 def _task_file(
     name: str = "PR-001.md",
     *,
+    pr_id: str = "PR-001",
     depends_on: str | None = "none",
 ) -> tuple[str, tuple[str, bytes, str]]:
     header = [
-        "# PR-001: Example task",
+        f"# {pr_id}: Example task",
         "",
-        "Branch: pr-001-example-task",
+        f"Branch: {pr_id.lower()}-example-task",
         "- Type: feature",
         "- Complexity: low",
     ]
@@ -221,6 +222,25 @@ def test_upload_rejects_task_without_depends_on(
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
             files=[_queue_file(), _task_file(depends_on=None)],
+        )
+
+    assert resp.status_code == 400
+    assert "Task file missing required field: Depends on." in resp.text
+    assert "Depends on: none" in resp.text
+
+
+def test_upload_rejects_non_numeric_task_without_depends_on(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[
+                _queue_file(),
+                _task_file(name="PR-ABC.md", pr_id="PR-ABC", depends_on=None),
+            ],
         )
 
     assert resp.status_code == 400

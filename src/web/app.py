@@ -1530,7 +1530,10 @@ async def put_repo_detail_coder(
 # ---------------------------------------------------------------------------
 
 _UPLOAD_MAX_TOTAL_BYTES = 1_000_000  # 1 MB
-_ALLOWED_TASK_PATTERN = r"^(QUEUE\.md|AGENTS\.md|CLAUDE\.md|PR-[A-Za-z0-9._-]+\.md)$"
+_TASK_UPLOAD_PATTERN = r"^PR-[A-Za-z0-9._-]+\.md$"
+_ALLOWED_TASK_PATTERN = (
+    rf"^(QUEUE\.md|AGENTS\.md|CLAUDE\.md|{_TASK_UPLOAD_PATTERN[1:-1]})$"
+)
 UPLOADS_DIR = "/data/uploads"
 
 import json as _json  # noqa: E402 — kept near usage
@@ -1747,7 +1750,7 @@ async def upload_tasks(
         )
 
     for fname, content in file_contents:
-        if not _re.fullmatch(r"PR-\d+\.md", fname):
+        if not _re.fullmatch(_TASK_UPLOAD_PATTERN, fname):
             continue
         try:
             task_text = content.decode("utf-8")
