@@ -141,7 +141,7 @@
 - Branch: pr-094-coverage-metrics
 
 ## PR-095: 100% coverage for src/utils.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-095.md
 - Branch: pr-095-coverage-utils
 
