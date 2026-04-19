@@ -195,7 +195,16 @@ class ErrorMixin:
                         self._last_push_at_pr_number = self.state.current_pr.number
                         self.state.current_pr.push_count += 1
                         self.state.current_pr.last_activity = push_time
-                        self._post_codex_review(self.state.current_pr.number)
+                        if not self._post_codex_review(self.state.current_pr.number):
+                            self.state.state = PipelineState.ERROR
+                            self.state.error_message = (
+                                f"Failed to post @codex review on PR "
+                                f"#{self.state.current_pr.number} after "
+                                "diagnose_error fix push; manual review "
+                                "trigger required to avoid fix/push loop"
+                            )
+                            self.log_event(self.state.error_message)
+                            return
                 except (
                     subprocess.CalledProcessError,
                     subprocess.TimeoutExpired,

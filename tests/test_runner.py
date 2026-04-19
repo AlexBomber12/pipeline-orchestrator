@@ -246,6 +246,7 @@ def _run_dirty_diagnose(
     with_pr: bool = True,
     head_branch: str = "fix/diagnose-error-commits-fixes",
     diagnosis_stdout: str = "FIX\nrepair broken config",
+    review_post_ok: bool = True,
 ):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -279,7 +280,7 @@ def _run_dirty_diagnose(
     monkeypatch.setattr(
         runner,
         "_post_codex_review",
-        lambda pr_number: review_requests.append(pr_number) or True,
+        lambda pr_number: review_requests.append(pr_number) or review_post_ok,
     )
     runner.repo_path = str(repo)
     runner.state.state = PipelineState.ERROR
@@ -3456,6 +3457,38 @@ def test_handle_error_resets_when_push_fails_and_escalates(
     assert any(cmd[:3] == ("reset", "--hard", "abc123") for cmd in calls)
     assert any(cmd[:2] == ("clean", "-fd") for cmd in calls)
     assert warnings == ["diagnose_error made uncommittable changes, reset"]
+
+
+def test_handle_error_errors_when_review_trigger_fails_after_diagnose_push(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, _, review_requests = _run_dirty_diagnose(
+        monkeypatch, tmp_path, review_post_ok=False
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.push_count == 1
+    assert runner._last_push_at is not None
+    assert runner._last_push_at_pr_number == 119
+    assert review_requests == [119]
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "rev-parse",
+        "rev-parse",
+        "add",
+        "commit",
+        "push",
+    ]
+    assert (
+        runner.state.error_message
+        == "Failed to post @codex review on PR #119 after "
+        "diagnose_error fix push; manual review trigger required "
+        "to avoid fix/push loop"
+    )
+    assert any(
+        e["event"] == runner.state.error_message for e in runner.state.history
+    )
 
 
 def test_handle_error_escalates_dirty_tree_without_active_pr_branch(
