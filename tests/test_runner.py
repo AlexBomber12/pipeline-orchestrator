@@ -3820,6 +3820,111 @@ def test_handle_error_escalates_dirty_tree_without_active_pr_branch(
     )
 
 
+def test_handle_error_head_before_defaults_empty_when_rev_parse_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    changed = repo / "fix.txt"
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_diag(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        changed.write_text("fixed\n")
+        return (0, "FIX\nrepair broken config", "")
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(args)
+        if args[:2] == ("status", "--porcelain"):
+            status = ""
+            if changed.exists():
+                status = " M fix.txt\n"
+            return _FakeCompletedProcess(stdout=status)
+        if args[:2] == ("rev-parse", "HEAD"):
+            raise subprocess.CalledProcessError(128, ["git", *args], "boom")
+        if args[:3] == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return _FakeCompletedProcess(stdout="fix/diagnose-error-commits-fixes\n")
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake_diag)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(error_module, "retry_transient", lambda op, **_: op())
+    runner = _make_runner()
+    monkeypatch.setattr(runner, "_post_codex_review", lambda pr_number: True)
+    runner.repo_path = str(repo)
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+    runner.state.current_pr = PRInfo(
+        number=119, branch="fix/diagnose-error-commits-fixes"
+    )
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "status",
+        "rev-parse",
+        "rev-parse",
+        "add",
+        "commit",
+        "push",
+    ]
+    assert not any(cmd[:1] == ("reset",) for cmd in calls)
+    assert not any(cmd[:1] == ("clean",) for cmd in calls)
+
+
+def test_handle_error_uses_current_task_branch_when_no_current_pr_and_task_branch_differs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    changed = repo / "fix.txt"
+    calls: list[tuple[str, ...]] = []
+    review_requests: list[int] = []
+
+    async def fake_diag(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        changed.write_text("fixed\n")
+        return (0, "FIX\nrepair broken config", "")
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(args)
+        if args[:2] == ("status", "--porcelain"):
+            status = ""
+            if changed.exists():
+                status = " M fix.txt\n"
+            return _FakeCompletedProcess(stdout=status)
+        if args[:3] == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return _FakeCompletedProcess(stdout="feature-x\n")
+        if args[:2] == ("rev-parse", "HEAD"):
+            return _FakeCompletedProcess(stdout="abc123\n")
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake_diag)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(error_module, "retry_transient", lambda op, **_: op())
+    runner = _make_runner()
+    monkeypatch.setattr(
+        runner,
+        "_post_codex_review",
+        lambda pr_number: review_requests.append(pr_number) or True,
+    )
+    runner.repo_path = str(repo)
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+    runner.state.current_task = QueueTask(
+        pr_id="PR-101",
+        title="t",
+        branch="feature-x",
+        status=TaskStatus.DOING,
+    )
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert review_requests == []
+    assert calls[-1] == ("push", "origin", "HEAD:feature-x")
+
+
 def test_handle_error_escalates_dirty_tree_when_branch_mismatches_pr(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3861,6 +3966,50 @@ def test_handle_error_discards_dirty_tree_for_non_fix_verdict(
         "clean",
     ]
     assert warnings == []
+
+
+def test_handle_error_non_fix_dirty_tree_skips_cleanup_when_head_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    changed = repo / "fix.txt"
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_diag(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        changed.write_text("dirty\n")
+        return (0, "SKIP\nskip this task", "")
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(args)
+        if args[:2] == ("status", "--porcelain"):
+            status = ""
+            if changed.exists():
+                status = " M fix.txt\n"
+            return _FakeCompletedProcess(stdout=status)
+        if args[:2] == ("rev-parse", "HEAD"):
+            raise subprocess.CalledProcessError(128, ["git", *args], "boom")
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake_diag)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    runner = _make_runner()
+    runner.repo_path = str(repo)
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+    runner.state.current_task = QueueTask(
+        pr_id="PR-101", title="t", branch="feature-x", status=TaskStatus.DOING
+    )
+    runner.state.current_pr = PRInfo(number=119, branch="feature-x")
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.current_pr is None
+    assert [cmd[0] for cmd in calls] == ["status", "status", "rev-parse"]
+    assert not any(cmd[:1] == ("reset",) for cmd in calls)
+    assert not any(cmd[:1] == ("clean",) for cmd in calls)
 
 
 def test_handle_error_escalates_without_publishing_preexisting_dirty_tree(
@@ -7716,6 +7865,37 @@ def test_handle_error_skips_ai_diagnosis_when_claude_weekly_is_limited(
     )
 
 
+def test_handle_error_proceeds_when_usage_snapshot_fetch_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli_calls: list[str] = []
+    _patch_subprocess(monkeypatch)
+
+    def raise_fetch() -> object:
+        raise RuntimeError("usage fetch failed")
+
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        _async_cli_result_with_side_effect(
+            cli_calls, "diagnose", 0, "ESCALATE", ""
+        ),
+    )
+    runner = _make_runner()
+    runner._claude_usage_provider.fetch = raise_fetch  # type: ignore[method-assign]
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Build failed: missing dependency X"
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == ["diagnose"]
+    assert runner.state.state == PipelineState.ERROR
+    assert not any(
+        e["event"] == "Skipping AI diagnosis: Claude rate limited"
+        for e in runner.state.history
+    )
+
+
 def test_handle_error_soft_skip_caps_repeated_codex_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7757,6 +7937,29 @@ def test_handle_error_soft_skip_caps_repeated_codex_retries(
     assert runner.state.error_message == "sync_to_main failed: auth denied"
     assert any(
         "max soft-skip retries (3) reached" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_error_logs_and_returns_when_diagnose_cli_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        _async_cli_result(1, "", "boom"),
+    )
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Build failed: missing dependency X"
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "Build failed: missing dependency X"
+    assert any(
+        e["event"] == "diagnose_error CLI failed: boom"
         for e in runner.state.history
     )
 
@@ -8209,6 +8412,7 @@ def test_handle_fix_publishes_heartbeat(
     """publish_state is called during FIX REVIEW via heartbeat task."""
     _patch_subprocess(monkeypatch)
     heartbeat_publishes: list[str] = []
+    two_heartbeats = asyncio.Event()
 
     original_publish = PipelineRunner.publish_state
 
@@ -8237,6 +8441,8 @@ def test_handle_fix_publishes_heartbeat(
             await asyncio.sleep(0.01)
             self.log_event(f"{label}...")
             heartbeat_publishes.append(label)
+            if len(heartbeat_publishes) >= 2:
+                two_heartbeats.set()
             await self.publish_state()
 
     monkeypatch.setattr(
@@ -8247,7 +8453,7 @@ def test_handle_fix_publishes_heartbeat(
         runner = _make_runner()
         runner.state.current_pr = PRInfo(number=10, branch="pr-001")
         task = asyncio.create_task(runner.handle_fix())
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(two_heartbeats.wait(), timeout=1)
         cli_done.set_result(None)
         await task
 
