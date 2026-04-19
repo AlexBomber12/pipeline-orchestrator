@@ -247,6 +247,7 @@ def _run_dirty_diagnose(
     head_branch: str = "fix/diagnose-error-commits-fixes",
     diagnosis_stdout: str = "FIX\nrepair broken config",
     review_post_ok: bool = True,
+    preexisting_dirty: str = "",
 ):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -263,7 +264,10 @@ def _run_dirty_diagnose(
     def fake_git(repo_path: str, *args: str, **kwargs: Any):
         calls.append(args)
         if args[:2] == ("status", "--porcelain"):
-            return _FakeCompletedProcess(stdout=" M fix.txt\n" if changed.exists() else "")
+            status = preexisting_dirty
+            if changed.exists() and "fix.txt" not in preexisting_dirty:
+                status += " M fix.txt\n"
+            return _FakeCompletedProcess(stdout=status)
         if args[:3] == ("rev-parse", "--abbrev-ref", "HEAD"):
             return _FakeCompletedProcess(stdout=f"{head_branch}\n")
         if args[:2] == ("rev-parse", "HEAD"):
@@ -3433,6 +3437,7 @@ def test_handle_error_commits_and_pushes_diagnose_fixes(
     assert review_requests == [119]
     assert [cmd[0] for cmd in calls] == [
         "status",
+        "status",
         "rev-parse",
         "rev-parse",
         "add",
@@ -3454,6 +3459,17 @@ def test_handle_error_resets_when_push_fails_and_escalates(
     )
 
     assert runner.state.state == PipelineState.ERROR
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "status",
+        "rev-parse",
+        "rev-parse",
+        "add",
+        "commit",
+        "push",
+        "reset",
+        "clean",
+    ]
     assert any(cmd[:3] == ("reset", "--hard", "abc123") for cmd in calls)
     assert any(cmd[:2] == ("clean", "-fd") for cmd in calls)
     assert warnings == ["diagnose_error made uncommittable changes, reset"]
@@ -3473,6 +3489,7 @@ def test_handle_error_errors_when_review_trigger_fails_after_diagnose_push(
     assert runner._last_push_at_pr_number == 119
     assert review_requests == [119]
     assert [cmd[0] for cmd in calls] == [
+        "status",
         "status",
         "rev-parse",
         "rev-parse",
@@ -3499,7 +3516,13 @@ def test_handle_error_escalates_dirty_tree_without_active_pr_branch(
     )
 
     assert runner.state.state == PipelineState.ERROR
-    assert [cmd[0] for cmd in calls] == ["status", "rev-parse", "reset", "clean"]
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "status",
+        "rev-parse",
+        "reset",
+        "clean",
+    ]
     assert any(
         e["event"] == "diagnose_error: dirty tree without active PR/task branch"
         for e in runner.state.history
@@ -3515,6 +3538,7 @@ def test_handle_error_escalates_dirty_tree_when_branch_mismatches_pr(
 
     assert runner.state.state == PipelineState.ERROR
     assert [cmd[0] for cmd in calls] == [
+        "status",
         "status",
         "rev-parse",
         "rev-parse",
@@ -3538,8 +3562,34 @@ def test_handle_error_discards_dirty_tree_for_non_fix_verdict(
     )
 
     assert runner.state.state == PipelineState.ERROR
-    assert [cmd[0] for cmd in calls] == ["status", "rev-parse", "reset", "clean"]
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "status",
+        "rev-parse",
+        "reset",
+        "clean",
+    ]
     assert warnings == []
+
+
+def test_handle_error_escalates_without_publishing_preexisting_dirty_tree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, warnings, review_requests = _run_dirty_diagnose(
+        monkeypatch,
+        tmp_path,
+        preexisting_dirty=" M unrelated.txt\n",
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert [cmd[0] for cmd in calls] == ["status", "status"]
+    assert warnings == []
+    assert review_requests == []
+    assert any(
+        e["event"]
+        == "diagnose_error: pre-existing dirty tree blocks automatic cleanup/publish"
+        for e in runner.state.history
+    )
 
 
 def test_publish_state_writes_to_redis() -> None:

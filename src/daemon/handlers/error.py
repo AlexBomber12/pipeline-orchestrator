@@ -97,6 +97,13 @@ class ErrorMixin:
                 "diagnose_error: max attempts (3) reached, staying ERROR"
             )
             return
+        dirty_before = ""
+        try:
+            dirty_before = git_ops._git(
+                self.repo_path, "status", "--porcelain"
+            ).stdout.strip()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            pass
         code, stdout, stderr = await claude_cli.diagnose_error_async(
             self.repo_path, context, model=self.app_config.daemon.claude_model
         )
@@ -122,6 +129,13 @@ class ErrorMixin:
             dirty = git_ops._git(self.repo_path, "status", "--porcelain").stdout.strip()
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             pass
+        if dirty_before and dirty:
+            verdict = "ESCALATE"
+            self.log_event(
+                "diagnose_error: pre-existing dirty tree blocks "
+                "automatic cleanup/publish"
+            )
+            dirty = ""
         if dirty and verdict == "FIX":
             try:
                 head_before = git_ops._git(
