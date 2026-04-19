@@ -107,7 +107,7 @@ def _auth_failed(name: str, registry: CoderRegistry) -> bool:
         status = registry.get(name).check_auth()
     except Exception:
         return True
-    return status.get("status") == "failed"
+    return status.get("status") != "ok"
 
 
 def _is_disabled_for_repo(name: str, repo_config: RepoConfig) -> bool:

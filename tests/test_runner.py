@@ -16,6 +16,7 @@ from src.coder_registry import CoderRegistry
 from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
+from src.daemon import selector as selector_module
 from src.daemon.handlers import breach as breach_module
 from src.daemon.handlers import idle as idle_module
 from src.daemon.runner import ErrorCategory, PipelineRunner, _classify_error
@@ -197,6 +198,10 @@ def _make_runner(**repo_overrides: Any) -> PipelineRunner:
         claude_provider,
         codex_provider,
     )
+
+
+def _allow_all_coder_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(selector_module, "_auth_failed", lambda *args, **kwargs: False)
 
 
 def _patch_subprocess(
@@ -7331,6 +7336,27 @@ def test_handle_paused_clears_legacy_rate_limit_error_message(
     assert any("cleared legacy rate-limit" in e["event"] for e in runner.state.history)
 
 
+def test_handle_paused_resumes_with_other_coder_while_preserving_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=20)
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders.add("claude")
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "claude"
+    assert "claude" in runner.state.rate_limited_coders
+
+
 def test_detect_rate_limit_sets_pause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -8194,8 +8220,8 @@ def test_handle_paused_clears_other_coder_from_rate_limited_set(
 
     asyncio.run(runner.handle_paused())
 
-    assert "claude" not in runner.state.rate_limited_coders
-    assert runner.state.rate_limited_until is None
+    assert "claude" in runner.state.rate_limited_coders
+    assert runner.state.rate_limited_until is not None
     assert runner.state.state == PipelineState.IDLE
 
 
@@ -8853,15 +8879,22 @@ def test_handle_coding_pauses_on_inflight_breach(
 # -----------------------------------------------------------------------
 
 
-def test_get_coder_returns_claude_by_default() -> None:
+def test_get_coder_returns_claude_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _allow_all_coder_auth(monkeypatch)
     runner = _make_runner()
     name, plugin = runner._get_coder()
     assert name == "claude"
     assert plugin.name == "claude"
 
 
-def test_get_coder_returns_codex_when_configured() -> None:
+def test_get_coder_returns_codex_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from src.config import CoderType
+
+    _allow_all_coder_auth(monkeypatch)
     runner = _make_runner()
     runner._app_config = _app_cfg(coder=CoderType.CODEX)
     name, plugin = runner._get_coder()
@@ -8869,8 +8902,12 @@ def test_get_coder_returns_codex_when_configured() -> None:
     assert plugin.name == "codex"
 
 
-def test_get_coder_repo_override_takes_precedence() -> None:
+def test_get_coder_repo_override_takes_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from src.config import CoderType
+
+    _allow_all_coder_auth(monkeypatch)
     runner = _make_runner(coder=CoderType.CODEX)
     # Daemon default is claude, repo override is codex
     name, plugin = runner._get_coder()
@@ -8901,6 +8938,7 @@ def test_get_coder_uses_selector(
 def test_get_coder_falls_through_to_default_when_selector_returns_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _allow_all_coder_auth(monkeypatch)
     runner = _make_runner()
     monkeypatch.setattr(runner_module, "select_coder", lambda ctx: None)
 
@@ -8910,7 +8948,10 @@ def test_get_coder_falls_through_to_default_when_selector_returns_none(
     assert plugin.name == "claude"
 
 
-def test_get_coder_auto_fallback_switches_on_rate_limit_via_selector() -> None:
+def test_get_coder_auto_fallback_switches_on_rate_limit_via_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _allow_all_coder_auth(monkeypatch)
     runner = _make_runner()
 
     runner.state.rate_limited_coders.add("claude")
@@ -8921,9 +8962,12 @@ def test_get_coder_auto_fallback_switches_on_rate_limit_via_selector() -> None:
     assert plugin.name == "codex"
 
 
-def test_get_coder_repo_override_uses_selector_for_fallback() -> None:
+def test_get_coder_repo_override_uses_selector_for_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from src.config import CoderType
 
+    _allow_all_coder_auth(monkeypatch)
     runner = _make_runner(coder=CoderType.CODEX)
     runner.state.rate_limited_coders.add("codex")
 
@@ -8933,7 +8977,10 @@ def test_get_coder_repo_override_uses_selector_for_fallback() -> None:
     assert plugin.name == "claude"
 
 
-def test_get_coder_exploration_occasionally_picks_non_greedy() -> None:
+def test_get_coder_exploration_occasionally_picks_non_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _allow_all_coder_auth(monkeypatch)
     registry = CoderRegistry()
     registry.register(runner_module.build_coder_registry().get("claude"))
     registry.register(runner_module.build_coder_registry().get("codex"))
@@ -9094,7 +9141,7 @@ def test_check_rate_limit_runs_proactive_for_codex(
 def test_check_rate_limit_codex_clears_proactive_claude_pause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Codex clears a proactive Claude pause for general work."""
+    """Codex can proceed while Claude remains paused until the window expires."""
     from src.config import CoderType
 
     _patch_subprocess(monkeypatch)
@@ -9102,12 +9149,14 @@ def test_check_rate_limit_codex_clears_proactive_claude_pause(
     runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
     runner.state.rate_limit_reactive = False
     runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders.add("claude")
     runner.state.state = PipelineState.PAUSED
 
     result = asyncio.run(runner._check_rate_limit())
     assert result is True
-    assert runner.state.rate_limited_until is None
-    assert "claude" not in runner.state.rate_limited_coders
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "claude"
+    assert "claude" in runner.state.rate_limited_coders
     assert runner.state.state == PipelineState.IDLE
 
 
@@ -9133,7 +9182,7 @@ def test_check_rate_limit_honors_claude_pause_with_proactive_coder(
 def test_check_rate_limit_codex_clears_reactive_claude_pause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Codex clears a reactive (stderr-detected) Claude pause."""
+    """Codex can proceed while a reactive Claude pause remains active."""
     from src.config import CoderType
 
     _patch_subprocess(monkeypatch)
@@ -9146,9 +9195,10 @@ def test_check_rate_limit_codex_clears_reactive_claude_pause(
 
     result = asyncio.run(runner._check_rate_limit())
     assert result is True
-    assert runner.state.rate_limited_until is None
-    assert runner.state.rate_limit_reactive is False
-    assert "claude" not in runner.state.rate_limited_coders
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive is True
+    assert runner.state.rate_limit_reactive_coder == "claude"
+    assert "claude" in runner.state.rate_limited_coders
     assert runner.state.state == PipelineState.IDLE
 
 

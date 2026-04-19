@@ -650,14 +650,11 @@ class IdleMixin:
         )
         clearable = other_coder
         if clearable:
-            self.state.rate_limited_coders.discard(pause_coder)
-            self.state.rate_limited_until = None
-            self.state.rate_limit_reactive = False
-            self.state.rate_limit_reactive_coder = None
-            self._claude_usage_provider.invalidate_cache()
-            self._codex_usage_provider.invalidate_cache()
             self._error_diagnose_count = 0
-            label = f"{coder_name.capitalize()} active, clearing other-coder pause"
+            label = (
+                f"{coder_name.capitalize()} active while {pause_coder} remains "
+                f"rate-limited until {self.state.rate_limited_until.isoformat()}"
+            )
             if self.state.error_message:
                 lowered = self.state.error_message.lower()
                 is_rate_limit_msg = (

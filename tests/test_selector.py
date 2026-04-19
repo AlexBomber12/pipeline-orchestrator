@@ -106,6 +106,12 @@ def test_auth_failed_excluded() -> None:
     assert "codex" not in eligible_coders(ctx)
 
 
+def test_auth_error_excluded() -> None:
+    ctx = _ctx(auth={"codex": "error"})
+
+    assert "codex" not in eligible_coders(ctx)
+
+
 def test_pinned_without_fallback_returns_only_pinned() -> None:
     ctx = _ctx(auto_fallback=False, repo_coder=CoderType.CODEX, limited={"codex"})
 

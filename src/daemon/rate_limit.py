@@ -92,6 +92,7 @@ class RateLimitMixin:
             # Legacy pauses (pre-PR-066) have no coder attribution;
             # treat them as Claude since that was the only coder.
             pause_coder = self.state.rate_limit_reactive_coder or "claude"
+            now = datetime.now(timezone.utc)
             # Diagnosis pauses always use Claude — honour regardless of
             # the repo's configured coder.
             diagnosis_pause = (
@@ -108,12 +109,6 @@ class RateLimitMixin:
             )
             clearable = other_coder
             if clearable:
-                self.state.rate_limited_coders.discard(pause_coder)
-                self.state.rate_limited_until = None
-                self.state.rate_limit_reactive = False
-                self.state.rate_limit_reactive_coder = None
-                self._claude_usage_provider.invalidate_cache()
-                self._codex_usage_provider.invalidate_cache()
                 if self.state.state == PipelineState.PAUSED:
                     if (
                         self.state.current_pr is not None
@@ -124,24 +119,24 @@ class RateLimitMixin:
                     else:
                         self.state.state = PipelineState.IDLE
                 self.log_event(
-                    f"{effective_coder.capitalize()} active, clearing other-coder rate-limit pause"
+                    f"{effective_coder.capitalize()} active while "
+                    f"{pause_coder} remains rate-limited until "
+                    f"{self.state.rate_limited_until.isoformat()}"
                 )
-                # Fall through so the proactive usage check still runs
-                # to avoid launching work that exceeds usage thresholds.
-            elif datetime.now(timezone.utc) < self.state.rate_limited_until:
+                return await self._proactive_usage_check(proactive_coder=proactive_coder)
+            if now < self.state.rate_limited_until:
                 if self.state.state != PipelineState.PAUSED:
                     self.state.state = PipelineState.PAUSED
-                remaining = (self.state.rate_limited_until - datetime.now(timezone.utc)).total_seconds()
+                remaining = (self.state.rate_limited_until - now).total_seconds()
                 self.log_event(f"Rate limited, resuming in {int(remaining)}s")
                 return False
-            else:
-                self.state.rate_limited_coders.discard(pause_coder)
-                self.state.rate_limited_until = None
-                self.state.rate_limit_reactive = False
-                self.state.rate_limit_reactive_coder = None
-                self._claude_usage_provider.invalidate_cache()
-                self._codex_usage_provider.invalidate_cache()
-                self.log_event("Rate limit window expired, resuming")
+            self.state.rate_limited_coders.discard(pause_coder)
+            self.state.rate_limited_until = None
+            self.state.rate_limit_reactive = False
+            self.state.rate_limit_reactive_coder = None
+            self._claude_usage_provider.invalidate_cache()
+            self._codex_usage_provider.invalidate_cache()
+            self.log_event("Rate limit window expired, resuming")
         return await self._proactive_usage_check(proactive_coder=proactive_coder)
 
     def _detect_rate_limit(self, stderr: str, coder_name: str | None = None) -> None:
