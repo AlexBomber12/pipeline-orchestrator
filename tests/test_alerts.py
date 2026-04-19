@@ -358,6 +358,21 @@ def test_build_alerts_error_card_carries_message_and_repo_link() -> None:
     assert alert["duration_text"] == "3 min"
 
 
+def test_build_alerts_normalizes_naive_since_timestamp() -> None:
+    naive_since = datetime.now()
+    err = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.ERROR,
+        error_message="boom",
+        last_updated=naive_since,
+    )
+
+    [alert] = _build_alerts([err])
+
+    assert alert["since_iso"].endswith("+00:00")
+
+
 # ---- HTTP handlers --------------------------------------------------------
 
 
