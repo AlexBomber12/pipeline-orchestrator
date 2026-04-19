@@ -196,7 +196,7 @@
 - Branch: pr-105-coverage-rate-limit
 
 ## PR-106: 100% coverage for src/daemon/recovery.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-106.md
 - Branch: pr-106-coverage-recovery
 
