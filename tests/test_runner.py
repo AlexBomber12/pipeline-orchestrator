@@ -2033,9 +2033,14 @@ def test_init_migrates_legacy_clone_when_origin_matches(
     old_path.mkdir(parents=True)
     (old_path / ".git").mkdir()
     info_logs: list[tuple[object, ...]] = []
+    run_calls: list[list[str]] = []
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        assert cmd == ["git", "-C", str(old_path), "remote", "get-url", "origin"]
+        run_calls.append(cmd)
+        assert cmd in (
+            ["git", "-C", str(old_path), "remote", "get-url", "origin"],
+            ["git", "-C", str(new_path), "remote", "get-url", "origin"],
+        )
         return _FakeCompletedProcess(args=cmd, stdout=f"https://github.com/octo/{repo_name}.git\n")
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
@@ -2050,6 +2055,10 @@ def test_init_migrates_legacy_clone_when_origin_matches(
         assert runner.repo_path == str(new_path)
         assert new_path.exists()
         assert not old_path.exists()
+        assert run_calls == [
+            ["git", "-C", str(old_path), "remote", "get-url", "origin"],
+            ["git", "-C", str(new_path), "remote", "get-url", "origin"],
+        ]
         assert info_logs
     finally:
         with contextlib.suppress(FileNotFoundError):
