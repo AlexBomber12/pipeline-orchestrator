@@ -161,7 +161,7 @@ def test_unpinned_without_fallback_returns_only_daemon_default() -> None:
 def test_pinned_with_fallback_returns_pinned_first_then_others() -> None:
     ctx = _ctx(auto_fallback=True, repo_coder=CoderType.CODEX)
 
-    assert eligible_coders(ctx) == ["codex", "claude", "gemini"]
+    assert eligible_coders(ctx) == ["codex", "claude"]
 
 
 def test_priority_ranks_higher_first_when_no_exploration() -> None:
@@ -190,12 +190,12 @@ def test_no_eligible_returns_none() -> None:
     assert select_coder(ctx) is None
 
 
-def test_new_plugin_added_without_selector_changes() -> None:
+def test_selector_ignores_plugins_without_runtime_support() -> None:
     ctx = _ctx()
     ctx.registry.register(_Plugin("qwen"))
     ctx.app_config.daemon.coder_priority["qwen"] = 75
 
-    assert "qwen" in eligible_coders(ctx)
+    assert "qwen" not in eligible_coders(ctx)
 
 
 def test_epsilon_zero_always_greedy() -> None:

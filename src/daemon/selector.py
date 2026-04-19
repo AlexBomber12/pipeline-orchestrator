@@ -12,8 +12,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from src.coder_registry import CoderPlugin, CoderRegistry
-from src.config import AppConfig, RepoConfig
+from src.config import AppConfig, CoderType, RepoConfig
 from src.models import RepoState
+
+_RUNTIME_SUPPORTED_CODERS = {coder.value for coder in CoderType}
 
 
 @dataclass
@@ -35,6 +37,8 @@ def eligible_coders(ctx: SelectionContext) -> list[str]:
 
     result: list[str] = []
     for name in ctx.registry.coder_names():
+        if not _supports_runtime(name):
+            continue
         if _is_rate_limited(name, ctx.state):
             continue
         if _auth_failed(name, ctx.registry, ctx.auth_statuses):
@@ -125,3 +129,7 @@ def _auth_failed(
 def _is_disabled_for_repo(name: str, repo_config: RepoConfig) -> bool:
     disabled = repo_config.disabled_coders or []
     return name in disabled
+
+
+def _supports_runtime(name: str) -> bool:
+    return name in _RUNTIME_SUPPORTED_CODERS

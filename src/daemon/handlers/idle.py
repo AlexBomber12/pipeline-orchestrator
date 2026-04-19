@@ -654,6 +654,11 @@ class IdleMixin:
                 f"{coder_name.capitalize()} active while {pause_coder} remains "
                 f"rate-limited until {self.state.rate_limited_until.isoformat()}"
             )
+            if pause_coder not in self.state.rate_limited_coder_until:
+                self.state.rate_limited_coders.add(pause_coder)
+                self.state.rate_limited_coder_until[pause_coder] = (
+                    self.state.rate_limited_until
+                )
             self.state.rate_limited_until = None
             self.state.rate_limit_reactive = False
             self.state.rate_limit_reactive_coder = None
