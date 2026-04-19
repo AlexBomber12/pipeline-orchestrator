@@ -369,5 +369,5 @@ async def main() -> None:
         await asyncio.sleep(max(tick, 1))
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover  # entry point invoked via python -m
     asyncio.run(main())

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import subprocess
 from typing import Any
@@ -505,6 +506,22 @@ def test_setup_git_auth_does_not_crash_on_error() -> None:
         main_module._setup_git_auth()
 
 
+def test_setup_git_auth_logs_warning_on_nonzero_exit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with patch.object(main_module.subprocess, "run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["gh", "auth", "setup-git"],
+            returncode=1,
+            stdout="",
+            stderr="bad token\n",
+        )
+        with caplog.at_level(logging.WARNING, logger=main_module.logger.name):
+            main_module._setup_git_auth()
+
+    assert any("gh auth setup-git exited 1: bad token" in rec.getMessage() for rec in caplog.records)
+
+
 def test_setup_git_auth_handles_timeout() -> None:
     """_setup_git_auth must not raise on TimeoutExpired."""
     with patch.object(main_module.subprocess, "run") as mock_run:
@@ -721,7 +738,6 @@ def test_install_statusline_hook_creates_settings(tmp_path: Any) -> None:
 
 def test_install_statusline_hook_preserves_existing_keys(tmp_path: Any) -> None:
     """Hook installer merges into existing settings without clobbering."""
-    import json
     existing = {"theme": "dark", "someKey": True}
     (tmp_path / "settings.json").write_text(json.dumps(existing))
 
@@ -737,7 +753,6 @@ def test_install_statusline_hook_respects_operator_override(
     tmp_path: Any,
 ) -> None:
     """Hook installer does not overwrite a non-default statusLine command."""
-    import json
     existing = {
         "statusLine": {
             "type": "command",
@@ -751,6 +766,15 @@ def test_install_statusline_hook_respects_operator_override(
 
     settings = json.loads((tmp_path / "settings.json").read_text())
     assert settings["statusLine"]["command"] == "ccusage --custom"
+
+
+def test_install_statusline_hook_recovers_from_invalid_json(tmp_path: Any) -> None:
+    (tmp_path / "settings.json").write_text("{not valid json")
+
+    main_module._install_statusline_hook(str(tmp_path))
+
+    settings = json.loads((tmp_path / "settings.json").read_text())
+    assert settings["statusLine"]["type"] == "command"
 
 
 def test_clean_breach_dir_removes_stale_markers(tmp_path: Any) -> None:
@@ -769,3 +793,161 @@ def test_clean_breach_dir_removes_stale_markers(tmp_path: Any) -> None:
         assert not list((tmp_path / "breach").glob("*.breach"))
     finally:
         main_module._BREACH_DIR = original
+
+
+def test_clean_breach_dir_unlinks_file_marker(tmp_path: Any) -> None:
+    breach_file = tmp_path / "breach-file"
+    breach_file.write_text("stale")
+
+    original = main_module._BREACH_DIR
+    main_module._BREACH_DIR = str(breach_file)
+    try:
+        main_module._clean_breach_dir()
+        assert breach_file.is_dir()
+    finally:
+        main_module._BREACH_DIR = original
+
+
+def test_build_runner_passes_registry_when_supported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    repo = config.repositories[0]
+    seen: dict[str, Any] = {}
+
+    class _RunnerWithRegistry:
+        def __init__(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            redis_client: Any,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+            registry: Any,
+        ) -> None:
+            seen["repo"] = repo_config
+            seen["config"] = app_config
+            seen["redis_client"] = redis_client
+            seen["claude"] = claude_usage_provider
+            seen["codex"] = codex_usage_provider
+            seen["registry"] = registry
+
+    monkeypatch.setattr(main_module, "PipelineRunner", _RunnerWithRegistry)
+    registry = object()
+    redis_client = object()
+
+    runner = main_module._build_runner(
+        repo,
+        config,
+        redis_client,
+        "claude-provider",
+        "codex-provider",
+        registry,
+    )
+
+    assert isinstance(runner, _RunnerWithRegistry)
+    assert seen == {
+        "repo": repo,
+        "config": config,
+        "redis_client": redis_client,
+        "claude": "claude-provider",
+        "codex": "codex-provider",
+        "registry": registry,
+    }
+
+
+def test_main_logs_error_when_no_auth_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    _patch_main(monkeypatch, config)
+    monkeypatch.setattr(
+        main_module, "_validate_auth", lambda: {"claude": False, "gh": False}
+    )
+
+    with caplog.at_level(logging.ERROR, logger=main_module.logger.name):
+        with pytest.raises(_StopLoop):
+            asyncio.run(main_module.main())
+
+    assert any("No auth configured" in rec.getMessage() for rec in caplog.records)
+
+
+def test_main_logs_warning_when_statusline_install_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1, install_statusline_hook=True),
+    )
+    _patch_main(monkeypatch, config)
+    monkeypatch.setattr(
+        main_module,
+        "_install_statusline_hook",
+        lambda _path: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=main_module.logger.name):
+        with pytest.raises(_StopLoop):
+            asyncio.run(main_module.main())
+
+    assert any("Failed to install statusline hook" in rec.getMessage() for rec in caplog.records)
+
+
+def test_main_logs_reload_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    _patch_main(monkeypatch, config, sleep_iterations=3)
+    monkeypatch.setattr(main_module, "CONFIG_RELOAD_CYCLES", 1)
+    load_calls = {"count": 0}
+
+    def fake_load_config() -> AppConfig:
+        load_calls["count"] += 1
+        if load_calls["count"] == 1:
+            return config
+        raise RuntimeError("reload boom")
+
+    monkeypatch.setattr(main_module, "load_config", fake_load_config)
+
+    with caplog.at_level(logging.ERROR, logger=main_module.logger.name):
+        with pytest.raises(_StopLoop):
+            asyncio.run(main_module.main())
+
+    assert any("Failed to reload config.yml" in rec.getMessage() for rec in caplog.records)
+
+
+def test_main_logs_publish_state_failures_for_inactive_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _InactiveFailingRunner(_FakeRunner):
+        async def publish_state(self) -> None:
+            raise RuntimeError("publish boom")
+
+    config = AppConfig(
+        repositories=[
+            _repo("https://github.com/octo/alpha.git", active=False),
+        ],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    _patch_main(monkeypatch, config, runner_cls=_InactiveFailingRunner)
+
+    with caplog.at_level(logging.ERROR, logger=main_module.logger.name):
+        with pytest.raises(_StopLoop):
+            asyncio.run(main_module.main())
+
+    runner = _FakeRunner.instances[0]
+    assert runner.cycles == 0
+    assert any("publish paused state failed for octo__alpha" in rec.getMessage() for rec in caplog.records)
