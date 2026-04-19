@@ -256,7 +256,7 @@
 - Branch: pr-112-coverage-repo-ops
 
 ## PR-113: 100% coverage for src/task_status.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-113.md
 - Branch: pr-113-coverage-task-status
 
