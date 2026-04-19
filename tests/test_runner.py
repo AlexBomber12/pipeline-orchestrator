@@ -23,6 +23,7 @@ from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
 from src.daemon import selector as selector_module
 from src.daemon.handlers import breach as breach_module
+from src.daemon.handlers import coding as coding_module
 from src.daemon.handlers import error as error_module
 from src.daemon.handlers import fix as fix_module
 from src.daemon.handlers import hung as hung_module
@@ -12322,6 +12323,176 @@ def test_handle_coding_pauses_on_inflight_breach(
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.rate_limited_until is not None
     assert runner.state.error_message is None
+
+
+def test_handle_coding_reraises_cancelled_error_without_breach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelled CLI runs re-raise when no breach marker was detected."""
+    from src import codex_cli
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+
+    async def fake_run_planned_pr(path: str, **kwargs: object) -> tuple[int, str, str]:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(codex_cli, "run_planned_pr_async", fake_run_planned_pr)
+
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001",
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(runner.handle_coding())
+
+
+def test_handle_coding_records_pr_before_breach_cancel_pause(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """In-flight breach cancellation still records the just-opened PR."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(breach_module, "_BREACH_DIR", str(tmp_path))
+    monkeypatch.setattr(breach_module, "_BREACH_POLL_SEC", 0.05)
+
+    async def fake_planned_hangs(
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+    ) -> tuple[int, str, str]:
+        run_id = kwargs.get("breach_run_id", "")
+        if run_id:
+            marker = tmp_path / f"{run_id}.breach"
+            marker.write_text(json.dumps({
+                "type": "session",
+                "resets_at": 1700000000,
+                "session_pct": 98,
+                "weekly_pct": 30,
+                "detected_at": 1234567890.0,
+            }))
+        await asyncio.sleep(999)
+        return (0, "", "")
+
+    pr = PRInfo(
+        number=42,
+        url="https://github.com/octo/demo/pull/42",
+        branch="pr-001",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+    )
+    gh_calls = {"count": 0}
+    original_sleep = asyncio.sleep
+
+    def fake_get_open_prs(*args: object, **kwargs: object) -> list[PRInfo]:
+        gh_calls["count"] += 1
+        if gh_calls["count"] == 1:
+            raise RuntimeError("temporary gh failure")
+        return [pr]
+
+    async def fast_sleep(seconds: float) -> None:
+        await original_sleep(0)
+
+    monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_planned_hangs)
+    monkeypatch.setattr(runner_module.github_client, "get_open_prs", fake_get_open_prs)
+    monkeypatch.setattr(coding_module.asyncio, "sleep", fast_sleep)
+
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001",
+    )
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.current_pr == pr
+    assert any(
+        "Recorded PR #42 before breach-cancel pause" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_coding_records_pr_before_late_breach_pause(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Late breach pauses still attach the matching PR before returning."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(breach_module, "_BREACH_DIR", str(tmp_path))
+
+    async def fake_planned(
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+    ) -> tuple[int, str, str]:
+        return (0, "ok", "")
+
+    pr = PRInfo(
+        number=42,
+        url="https://github.com/octo/demo/pull/42",
+        branch="pr-001",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+    )
+    gh_calls = {"count": 0}
+    original_sleep = asyncio.sleep
+
+    def fake_get_open_prs(*args: object, **kwargs: object) -> list[PRInfo]:
+        gh_calls["count"] += 1
+        if gh_calls["count"] == 1:
+            raise RuntimeError("temporary gh failure")
+        return [pr]
+
+    def fake_check_late_breach(
+        breach_dir: str, breach_run_id: str, breach_flag: dict[str, bool],
+    ) -> None:
+        breach_flag["breached"] = True
+        runner.state.rate_limited_until = datetime.fromtimestamp(
+            1700000000, tz=timezone.utc,
+        )
+
+    async def fast_sleep(seconds: float) -> None:
+        await original_sleep(0)
+
+    monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_planned)
+    monkeypatch.setattr(runner_module.github_client, "get_open_prs", fake_get_open_prs)
+    monkeypatch.setattr(coding_module.asyncio, "sleep", fast_sleep)
+
+    runner = _make_runner()
+    monkeypatch.setattr(runner, "_check_late_breach", fake_check_late_breach)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001",
+    )
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.current_pr == pr
+    assert any(
+        "Recorded PR #42 before late-breach pause" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_coding_errors_when_get_open_prs_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub list failures after a successful CLI run surface as ERROR."""
+    from src import codex_cli
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        codex_cli, "run_planned_pr_async", _async_cli_result(0, "ok", ""),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda *args, **kwargs: _raise_runtime_error("gh unavailable"),
+    )
+
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001",
+    )
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "get_open_prs failed: gh unavailable"
+    assert any("gh unavailable" == entry["event"] for entry in runner.state.history)
 
 
 # -----------------------------------------------------------------------
