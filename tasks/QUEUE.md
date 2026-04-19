@@ -231,7 +231,7 @@
 - Branch: pr-109a-coverage-runner-init
 
 ## PR-109b: 100% coverage for runner diff-stats, state mgmt, publish_state
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-109b.md
 - Branch: pr-109b-coverage-runner-state
 
