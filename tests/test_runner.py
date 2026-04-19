@@ -245,6 +245,7 @@ def _run_dirty_diagnose(
     push_exc: Exception | None = None,
     with_pr: bool = True,
     head_branch: str = "fix/diagnose-error-commits-fixes",
+    diagnosis_stdout: str = "FIX\nrepair broken config",
 ):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -255,7 +256,7 @@ def _run_dirty_diagnose(
 
     async def fake_diag(*args: object, **kwargs: object):
         changed.write_text("fixed\n")
-        return (0, "FIX\nrepair broken config", "")
+        return (0, diagnosis_stdout, "")
 
     def fake_git(repo_path: str, *args: str, **kwargs: Any):
         calls.append(args)
@@ -3475,6 +3476,18 @@ def test_handle_error_escalates_dirty_tree_when_branch_mismatches_pr(
         == e["event"]
         for e in runner.state.history
     )
+
+
+def test_handle_error_discards_dirty_tree_for_non_fix_verdict(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, warnings = _run_dirty_diagnose(
+        monkeypatch, tmp_path, diagnosis_stdout="ESCALATE\nhuman help"
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert [cmd[0] for cmd in calls] == ["status", "rev-parse", "reset"]
+    assert warnings == []
 
 
 def test_publish_state_writes_to_redis() -> None:

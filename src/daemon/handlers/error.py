@@ -121,7 +121,7 @@ class ErrorMixin:
             dirty = git_ops._git(self.repo_path, "status", "--porcelain").stdout.strip()
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             pass
-        if dirty:
+        if dirty and verdict == "FIX":
             branch = None
             if self.state.current_pr is not None:
                 if not self.state.current_pr.is_cross_repository:
@@ -189,6 +189,25 @@ class ErrorMixin:
                         )
                         logger.warning("diagnose_error made uncommittable changes, reset")
                     verdict = "ESCALATE"
+        elif dirty:
+            try:
+                head_before = git_ops._git(
+                    self.repo_path, "rev-parse", "HEAD"
+                ).stdout.strip()
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+            ):
+                head_before = ""
+            if head_before:
+                git_ops._git(
+                    self.repo_path,
+                    "reset",
+                    "--hard",
+                    head_before,
+                    check=False,
+                )
         if verdict == "SKIP":
             self.state.current_task = None
             self.state.current_pr = None
