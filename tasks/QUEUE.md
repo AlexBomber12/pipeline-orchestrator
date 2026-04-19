@@ -146,7 +146,7 @@
 - Branch: pr-095-coverage-utils
 
 ## PR-096: 100% coverage for src/daemon/selector.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-096.md
 - Branch: pr-096-coverage-selector
 
