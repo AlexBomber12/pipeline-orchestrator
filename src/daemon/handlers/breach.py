@@ -44,15 +44,10 @@ class BreachMixin:
                     continue
                 resets_at = data.get("resets_at", 0)
                 if resets_at:
-                    self.state.rate_limited_until = datetime.fromtimestamp(
-                        resets_at, tz=timezone.utc
-                    )
+                    until = datetime.fromtimestamp(resets_at, tz=timezone.utc)
                 else:
-                    self.state.rate_limited_until = (
-                        datetime.now(timezone.utc) + timedelta(minutes=30)
-                    )
-                self.state.rate_limit_reactive = True
-                self.state.rate_limit_reactive_coder = "claude"
+                    until = datetime.now(timezone.utc) + timedelta(minutes=30)
+                self._record_rate_limit("claude", until, reactive=True)
                 breach_type = data.get("type", "session")
                 pct_key = "session_pct" if breach_type == "session" else "weekly_pct"
                 pct_val = data.get(pct_key, "?")
@@ -92,15 +87,10 @@ class BreachMixin:
             return
         resets_at = data.get("resets_at", 0)
         if resets_at:
-            self.state.rate_limited_until = datetime.fromtimestamp(
-                resets_at, tz=timezone.utc
-            )
+            until = datetime.fromtimestamp(resets_at, tz=timezone.utc)
         else:
-            self.state.rate_limited_until = (
-                datetime.now(timezone.utc) + timedelta(minutes=30)
-            )
-        self.state.rate_limit_reactive = True
-        self.state.rate_limit_reactive_coder = "claude"
+            until = datetime.now(timezone.utc) + timedelta(minutes=30)
+        self._record_rate_limit("claude", until, reactive=True)
         breach_type = data.get("type", "session")
         pct_key = "session_pct" if breach_type == "session" else "weekly_pct"
         pct_val = data.get(pct_key, "?")

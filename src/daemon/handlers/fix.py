@@ -74,10 +74,10 @@ class FixMixin(BreachMixin):
 
     async def handle_fix(self) -> None:
         """Run ``FIX REVIEW`` via the active coder CLI and return to WATCH."""
-        if not await self._check_rate_limit():
+        await self._refresh_auth_status_cache()
+        coder_name, plugin = self._get_coder(allow_exploration=False)
+        if not await self._check_rate_limit(proactive_coder=coder_name):
             return
-
-        coder_name, plugin = self._get_coder()
 
         if (
             self.state.current_pr is not None
@@ -132,7 +132,11 @@ class FixMixin(BreachMixin):
             head_before = git_ops._git(
                 self.repo_path, "rev-parse", "HEAD"
             ).stdout.strip()
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ):
             pass
 
         idle_limit = self.app_config.daemon.fix_idle_timeout_sec

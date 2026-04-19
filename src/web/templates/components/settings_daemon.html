@@ -69,6 +69,26 @@
     <div class="mt-3">
         <label class="flex items-center gap-3 text-sm">
             <input type="checkbox"
+                   name="auto_fallback"
+                   value="true"
+                   {% if daemon.auto_fallback %}checked{% endif %}
+                   class="accent-accent"
+                   hx-put="/settings/daemon"
+                   hx-trigger="change"
+                   hx-target="#settings-daemon"
+                   hx-swap="innerHTML"
+                   hx-vals='{"auto_fallback": "{{ "false" if daemon.auto_fallback else "true" }}"}'>
+            <span>
+                <span class="text-gray-200">Auto fallback across eligible coders</span>
+                <span class="block text-xs text-gray-500">
+                    When the preferred coder is unavailable, let the selector pick another eligible coder.
+                </span>
+            </span>
+        </label>
+    </div>
+    <div class="mt-3">
+        <label class="flex items-center gap-3 text-sm">
+            <input type="checkbox"
                    name="hung_fallback_codex_review"
                    value="true"
                    {% if daemon.hung_fallback_codex_review %}checked{% endif %}
@@ -86,6 +106,28 @@
             </span>
         </label>
     </div>
+</div>
+
+<!-- Coder selection -->
+<div class="mb-6 pt-4 border-t border-white/5">
+    <h3 class="text-sm font-semibold text-gray-300 uppercase tracking-wide mb-3">Coder selection</h3>
+    <label class="flex flex-col gap-1 text-sm">
+        <span class="text-gray-400">Exploration epsilon</span>
+        <input type="number"
+               name="exploration_epsilon"
+               value="{{ daemon.exploration_epsilon }}"
+               min="0"
+               max="0.5"
+               step="0.01"
+               class="w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+               hx-put="/settings/daemon"
+               hx-trigger="change"
+               hx-target="#settings-daemon"
+               hx-swap="innerHTML">
+        <span class="text-xs text-gray-500">
+            Probability 0-0.5 that selector picks a non-top eligible coder to accumulate comparison data. Default 0.15 (roughly 1 in 7 selections). Set to 0 to disable exploration.
+        </span>
+    </label>
 </div>
 
 <!-- Rate limits -->

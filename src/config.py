@@ -28,6 +28,7 @@ _REPO_FIELDS = {
     "poll_interval_sec",
     "allow_merge_without_checks",
     "coder",
+    "disabled_coders",
 }
 
 _DAEMON_FIELDS = {
@@ -46,6 +47,9 @@ _DAEMON_FIELDS = {
     "usage_api_beta_header",
     "usage_api_cache_ttl_sec",
     "install_statusline_hook",
+    "auto_fallback",
+    "coder_priority",
+    "exploration_epsilon",
     "coder",
     "codex_model",
 }
@@ -66,6 +70,7 @@ class RepoConfig(BaseModel):
     poll_interval_sec: int = 60
     allow_merge_without_checks: bool = False
     coder: CoderType | None = None
+    disabled_coders: list[str] | None = None
 
     @field_validator("poll_interval_sec", mode="before")
     @classmethod
@@ -95,6 +100,14 @@ class DaemonConfig(BaseModel):
     usage_api_beta_header: str = "oauth-2025-04-20"
     usage_api_cache_ttl_sec: int = Field(default=60, ge=5, le=3600)
     install_statusline_hook: bool = True
+    auto_fallback: bool = True
+    coder_priority: dict[str, int] = Field(
+        default_factory=lambda: {
+            "codex": 81,
+            "claude": 76,
+        }
+    )
+    exploration_epsilon: float = Field(default=0.15, ge=0.0, le=0.5)
     coder: CoderType = CoderType.CLAUDE
     codex_model: str = ""
 

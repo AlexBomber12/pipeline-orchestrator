@@ -1085,10 +1085,12 @@ async def put_settings_daemon(
     request: Request,
     poll_interval_sec: str | None = Form(None),
     review_timeout_min: str | None = Form(None),
+    auto_fallback: str | None = Form(None),
     hung_fallback_codex_review: str | None = Form(None),
     error_handler_use_ai: str | None = Form(None),
     planned_pr_timeout_sec: str | None = Form(None),
     fix_idle_timeout_sec: str | None = Form(None),
+    exploration_epsilon: str | None = Form(None),
     rate_limit_session_pause_percent: str | None = Form(None),
     rate_limit_weekly_pause_percent: str | None = Form(None),
     coder: str | None = Form(None),
@@ -1115,6 +1117,13 @@ async def put_settings_daemon(
                 review_timeout_min, "review_timeout_min", min_value=1
             )
         if (
+            auto_fallback is not None
+            and auto_fallback != ""
+        ):
+            updates["auto_fallback"] = _coerce_bool(
+                auto_fallback, "auto_fallback"
+            )
+        if (
             hung_fallback_codex_review is not None
             and hung_fallback_codex_review != ""
         ):
@@ -1138,6 +1147,16 @@ async def put_settings_daemon(
         ):
             updates["fix_idle_timeout_sec"] = _coerce_int(
                 fix_idle_timeout_sec, "fix_idle_timeout_sec", min_value=1
+            )
+        if (
+            exploration_epsilon is not None
+            and exploration_epsilon != ""
+        ):
+            updates["exploration_epsilon"] = _coerce_float(
+                exploration_epsilon,
+                "exploration_epsilon",
+                min_value=0.0,
+                max_value=0.5,
             )
         if (
             rate_limit_session_pause_percent is not None
@@ -1411,6 +1430,23 @@ def _coerce_int(
         parsed = int(value.strip())
     except ValueError as exc:
         raise ValueError(f"{field} must be an integer") from exc
+    if min_value is not None and parsed < min_value:
+        raise ValueError(f"{field} must be at least {min_value}")
+    if max_value is not None and parsed > max_value:
+        raise ValueError(f"{field} must be at most {max_value}")
+    return parsed
+
+
+def _coerce_float(
+    value: str,
+    field: str,
+    min_value: float | None = None,
+    max_value: float | None = None,
+) -> float:
+    try:
+        parsed = float(value.strip())
+    except ValueError as exc:
+        raise ValueError(f"{field} must be a number") from exc
     if min_value is not None and parsed < min_value:
         raise ValueError(f"{field} must be at least {min_value}")
     if max_value is not None and parsed > max_value:

@@ -23,9 +23,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import subprocess
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import redis.asyncio as aioredis
@@ -50,6 +51,7 @@ from src.daemon.preflight import PreflightMixin
 from src.daemon.rate_limit import RateLimitMixin
 from src.daemon.recovery import RecoveryMixin
 from src.daemon.repo_ops import RepoOpsMixin
+from src.daemon.selector import SelectionContext, select_coder
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
 from src.usage import UsageProvider
@@ -176,6 +178,9 @@ class PipelineRunner(
         self._codex_usage_provider = codex_usage_provider
         self._metrics_store = MetricsStore(redis_client)
         self._current_run_record: RunRecord | None = None
+        self._selector_rng = random.Random()
+        self._auth_status_cache: dict[str, dict[str, str]] = {}
+        self._auth_status_cache_expires_at: datetime | None = None
 
     @property
     def app_config(self) -> AppConfig:
@@ -194,13 +199,60 @@ class PipelineRunner(
         self._claude_usage_provider = claude_usage_provider
         self._codex_usage_provider = codex_usage_provider
 
-    def _get_coder(self) -> tuple[str, CoderPlugin]:
-        """Return ``(coder_name, coder_plugin)`` for the active coder."""
-        coder = self.repo_config.coder or self.app_config.daemon.coder
-        coder_name = (
-            coder.value if isinstance(coder, CoderType) else str(coder)
+    def _select_coder(
+        self, *, allow_exploration: bool = True
+    ) -> tuple[str, CoderPlugin] | None:
+        """Return the active selector choice without default fallback."""
+        app_config = self.app_config
+        if not allow_exploration and app_config.daemon.exploration_epsilon != 0:
+            daemon_config = app_config.daemon.model_copy(
+                update={"exploration_epsilon": 0.0}
+            )
+            app_config = app_config.model_copy(update={"daemon": daemon_config})
+        ctx = SelectionContext(
+            registry=self._registry,
+            repo_config=self.repo_config,
+            app_config=app_config,
+            state=self.state,
+            rng=self._selector_rng,
+            auth_statuses=self._auth_status_cache or None,
         )
+        return select_coder(ctx)
+
+    def _get_coder(
+        self, *, allow_exploration: bool = True
+    ) -> tuple[str, CoderPlugin]:
+        """Return ``(coder_name, coder_plugin)`` for the active coder."""
+        result = self._select_coder(allow_exploration=allow_exploration)
+        if result is not None:
+            self.state.coder = result[0]
+            return result
+        coder = self.repo_config.coder or self.app_config.daemon.coder
+        coder_name = coder.value if isinstance(coder, CoderType) else str(coder)
+        self.state.coder = coder_name
         return coder_name, self._registry.get(coder_name)
+
+    async def _refresh_auth_status_cache(self) -> None:
+        """Refresh cached coder auth state off the event loop."""
+        now = datetime.now(timezone.utc)
+        if (
+            self._auth_status_cache
+            and self._auth_status_cache_expires_at is not None
+            and now < self._auth_status_cache_expires_at
+        ):
+            return
+
+        def _probe() -> dict[str, dict[str, str]]:
+            statuses: dict[str, dict[str, str]] = {}
+            for name in self._registry.coder_names():
+                try:
+                    statuses[name] = self._registry.get(name).check_auth()
+                except Exception:
+                    statuses[name] = {"status": "error"}
+            return statuses
+
+        self._auth_status_cache = await asyncio.to_thread(_probe)
+        self._auth_status_cache_expires_at = now + timedelta(minutes=5)
 
     def _load_current_task_metadata(self) -> tuple[str, str]:
         """Return ``(task_type, complexity)`` for the active task if available."""
@@ -305,12 +357,13 @@ class PipelineRunner(
         """Serialize ``self.state`` and write it to Redis."""
         self.state.active = self.repo_config.active
         self.state.last_updated = datetime.now(timezone.utc)
-        coder = self.repo_config.coder or self.app_config.daemon.coder
-        self.state.coder = coder.value
+        configured_coder = self.repo_config.coder or self.app_config.daemon.coder
+        active_coder = self.state.coder or configured_coder.value
+        self.state.coder = active_coder
         if self.repo_config.active:
             provider = (
                 self._claude_usage_provider
-                if coder != CoderType.CODEX
+                if active_coder != CoderType.CODEX.value
                 else self._codex_usage_provider
             )
             snap = await asyncio.to_thread(provider.fetch)

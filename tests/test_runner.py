@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
@@ -13,9 +14,11 @@ from typing import Any
 import pytest
 from src import retry as retry_module
 from src.coders import claude as claude_plugin_module
+from src.coder_registry import CoderRegistry
 from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
+from src.daemon import selector as selector_module
 from src.daemon.handlers import breach as breach_module
 from src.daemon.handlers import error as error_module
 from src.daemon.handlers import idle as idle_module
@@ -190,13 +193,19 @@ def _usage_providers() -> tuple[_FakeUsageProvider, _FakeUsageProvider]:
 
 def _make_runner(**repo_overrides: Any) -> PipelineRunner:
     claude_provider, codex_provider = _usage_providers()
-    return PipelineRunner(
+    runner = PipelineRunner(
         _repo_cfg(**repo_overrides),
         _app_cfg(),
         _FakeRedis(),
         claude_provider,
         codex_provider,
     )
+    runner._selector_rng.seed(0)
+    return runner
+
+
+def _allow_all_coder_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(selector_module, "_auth_failed", lambda *args, **kwargs: False)
 
 
 def _patch_subprocess(
@@ -3603,6 +3612,20 @@ def test_publish_state_writes_to_redis() -> None:
     assert runner.name in payload
 
 
+def test_publish_state_keeps_selected_fallback_coder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _allow_all_coder_auth(monkeypatch)
+    runner = _make_runner()
+    runner.state.rate_limited_coders.add("claude")
+
+    name, _plugin = runner._get_coder()
+    asyncio.run(runner.publish_state())
+
+    assert name == "codex"
+    assert runner.state.coder == "codex"
+
+
 def test_run_cycle_resets_stale_transient_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6647,7 +6670,10 @@ def test_handle_coding_uses_configured_timeout(
         _repo_cfg(),
         AppConfig(
             repositories=[],
-            daemon=DaemonConfig(planned_pr_timeout_sec=1234),
+            daemon=DaemonConfig(
+                planned_pr_timeout_sec=1234,
+                auto_fallback=False,
+            ),
         ),
         _FakeRedis(),
         *_usage_providers(),
@@ -7181,12 +7207,13 @@ def test_rehydrate_clears_stale_on_mismatch_when_fetch_fails(
 def test_check_rate_limit_blocks_when_limited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """_check_rate_limit returns False when _rate_limited_until is in future."""
+    """_check_rate_limit blocks when the proactive coder is still paused."""
     _patch_subprocess(monkeypatch)
     runner = _make_runner()
     runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limit_reactive_coder = "claude"
 
-    assert asyncio.run(runner._check_rate_limit()) is False
+    assert asyncio.run(runner._check_rate_limit(proactive_coder="claude")) is False
     assert runner.state.rate_limited_until is not None
 
 
@@ -7555,6 +7582,91 @@ def test_handle_paused_clears_legacy_rate_limit_error_message(
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.error_message is None
     assert any("cleared legacy rate-limit" in e["event"] for e in runner.state.history)
+
+
+def test_handle_paused_resumes_with_other_coder_while_preserving_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=20)
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders.add("claude")
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive_coder is None
+    assert "claude" in runner.state.rate_limited_coders
+
+
+def test_handle_paused_uses_selector_for_pinned_repo_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=20)
+    runner.state.rate_limit_reactive_coder = "codex"
+    runner.state.rate_limited_coders.add("codex")
+    runner.state.rate_limited_coder_until["codex"] = runner.state.rate_limited_until
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive_coder is None
+    assert "codex" in runner.state.rate_limited_coders
+
+
+def test_handle_paused_clearable_error_drops_top_level_pause_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=20)
+    runner.state.rate_limit_reactive_coder = "codex"
+    runner.state.rate_limited_coders.add("codex")
+    runner.state.rate_limited_coder_until["codex"] = runner.state.rate_limited_until
+    runner.state.error_message = "Build failed: missing dependency X"
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive_coder is None
+
+
+def test_handle_paused_invalidates_usage_caches_when_switching_coders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    claude_provider = _FakeUsageProvider(snapshot=None)
+    codex_provider = _FakeUsageProvider(snapshot=None)
+    runner._claude_usage_provider = claude_provider
+    runner._codex_usage_provider = codex_provider
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=20)
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders.add("claude")
+    runner.state.rate_limited_coder_until["claude"] = runner.state.rate_limited_until
+
+    asyncio.run(runner.handle_paused())
+
+    assert claude_provider._invalidated is True
+    assert codex_provider._invalidated is True
 
 
 def test_detect_rate_limit_sets_pause(
@@ -8237,7 +8349,9 @@ def test_handle_coding_saves_record_on_proactive_rate_limit(
         pr_id="PR-099", title="test", branch="pr-099-test", status=TaskStatus.TODO
     )
 
-    async def fake_check_rate_limit() -> bool:
+    async def fake_check_rate_limit(
+        proactive_coder: str | None = None,
+    ) -> bool:
         runner.state.state = PipelineState.PAUSED
         runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
         return False
@@ -8281,6 +8395,60 @@ def test_handle_fix_sets_paused_on_rate_limit(
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.error_message is None
     assert runner.state.rate_limited_until is not None
+
+
+def test_handle_coding_reuses_selected_coder_for_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = QueueTask(
+        pr_id="PR-099", title="test", branch="pr-099-test", status=TaskStatus.TODO
+    )
+    runner._get_coder = (  # type: ignore[method-assign]
+        lambda **kwargs: ("codex", runner._registry.get("codex"))
+    )
+    seen: list[str | None] = []
+
+    async def fake_check_rate_limit(
+        proactive_coder: str | None = None,
+    ) -> bool:
+        seen.append(proactive_coder)
+        runner.state.state = PipelineState.PAUSED
+        runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+        return False
+
+    monkeypatch.setattr(runner, "_check_rate_limit", fake_check_rate_limit)
+
+    asyncio.run(runner.handle_coding())
+
+    assert seen == ["codex"]
+
+
+def test_handle_fix_reuses_selected_coder_for_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    runner.state.state = PipelineState.FIX
+    runner.state.current_pr = PRInfo(number=50, branch="pr-050")
+    runner._get_coder = (  # type: ignore[method-assign]
+        lambda **kwargs: ("codex", runner._registry.get("codex"))
+    )
+    seen: list[str | None] = []
+
+    async def fake_check_rate_limit(
+        proactive_coder: str | None = None,
+    ) -> bool:
+        seen.append(proactive_coder)
+        runner.state.state = PipelineState.PAUSED
+        runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+        return False
+
+    monkeypatch.setattr(runner, "_check_rate_limit", fake_check_rate_limit)
+
+    asyncio.run(runner.handle_fix())
+
+    assert seen == ["codex"]
 
 
 def test_handle_coding_success_ignores_rate_limit_text_in_stderr(
@@ -8340,12 +8508,76 @@ def test_handle_fix_success_ignores_rate_limit_text_in_stderr(
 def test_handle_paused_waits_when_window_active(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """rate_limited_until in future -> state stays PAUSED."""
+    """Legacy unattributed pause yields to an available fallback coder."""
     _patch_subprocess(monkeypatch)
 
     runner = _make_runner()
     runner.state.state = PipelineState.PAUSED
     runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=20)
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.rate_limited_until is None
+    assert "claude" in runner.state.rate_limited_coders
+
+
+def test_handle_paused_clears_other_coder_from_rate_limited_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=20)
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders.add("claude")
+
+    asyncio.run(runner.handle_paused())
+
+    assert "claude" in runner.state.rate_limited_coders
+    assert runner.state.rate_limited_until is None
+    assert runner.state.state == PipelineState.IDLE
+
+
+def test_handle_paused_preserves_legacy_pause_for_other_coder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner(coder=CoderType.CODEX)
+    pause_until = datetime.now(timezone.utc) + timedelta(minutes=20)
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = pause_until
+    runner.state.rate_limit_reactive_coder = "claude"
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive_coder is None
+    assert "claude" in runner.state.rate_limited_coders
+    assert runner.state.rate_limited_coder_until["claude"] == pause_until
+    assert runner.state.state == PipelineState.IDLE
+
+
+def test_handle_paused_stays_paused_when_no_alternate_coder_is_runnable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=20)
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders.update({"claude", "codex"})
+    runner.state.rate_limited_coder_until = {
+        "claude": datetime.now(timezone.utc) + timedelta(minutes=20),
+        "codex": datetime.now(timezone.utc) + timedelta(minutes=10),
+    }
 
     asyncio.run(runner.handle_paused())
 
@@ -8408,7 +8640,7 @@ def test_handle_paused_handles_missing_rate_limited_until(
 def test_paused_not_reset_by_transient_states(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """run_cycle with state=PAUSED does not reset to IDLE via transient check."""
+    """run_cycle preserves PAUSED handling instead of transient-reset logic."""
     _patch_subprocess(monkeypatch)
 
     runner = _make_runner()
@@ -8419,20 +8651,22 @@ def test_paused_not_reset_by_transient_states(
 
     asyncio.run(runner.run_cycle())
 
-    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.state == PipelineState.IDLE
+    assert "claude" in runner.state.rate_limited_coders
 
 
 def test_check_rate_limit_transitions_to_paused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """rate_limited_until set, state was CODING -> transitions to PAUSED on check."""
+    """Current-coder pauses still transition CODING -> PAUSED on check."""
     _patch_subprocess(monkeypatch)
 
     runner = _make_runner()
     runner.state.state = PipelineState.CODING
     runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limit_reactive_coder = "claude"
 
-    result = asyncio.run(runner._check_rate_limit())
+    result = asyncio.run(runner._check_rate_limit(proactive_coder="claude"))
 
     assert result is False
     assert runner.state.state == PipelineState.PAUSED
@@ -9007,15 +9241,22 @@ def test_handle_coding_pauses_on_inflight_breach(
 # -----------------------------------------------------------------------
 
 
-def test_get_coder_returns_claude_by_default() -> None:
+def test_get_coder_returns_claude_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _allow_all_coder_auth(monkeypatch)
     runner = _make_runner()
     name, plugin = runner._get_coder()
     assert name == "claude"
     assert plugin.name == "claude"
 
 
-def test_get_coder_returns_codex_when_configured() -> None:
+def test_get_coder_returns_codex_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from src.config import CoderType
+
+    _allow_all_coder_auth(monkeypatch)
     runner = _make_runner()
     runner._app_config = _app_cfg(coder=CoderType.CODEX)
     name, plugin = runner._get_coder()
@@ -9023,13 +9264,129 @@ def test_get_coder_returns_codex_when_configured() -> None:
     assert plugin.name == "codex"
 
 
-def test_get_coder_repo_override_takes_precedence() -> None:
+def test_get_coder_repo_override_takes_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from src.config import CoderType
+
+    _allow_all_coder_auth(monkeypatch)
     runner = _make_runner(coder=CoderType.CODEX)
     # Daemon default is claude, repo override is codex
     name, plugin = runner._get_coder()
     assert name == "codex"
     assert plugin.name == "codex"
+
+
+def test_get_coder_uses_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    codex = runner._registry.get("codex")
+    seen = []
+
+    def fake_select(ctx: object) -> tuple[str, object]:
+        seen.append(ctx)
+        return ("codex", codex)
+
+    monkeypatch.setattr(runner_module, "select_coder", fake_select)
+
+    name, plugin = runner._get_coder()
+
+    assert seen
+    assert name == "codex"
+    assert plugin is codex
+
+
+def test_get_coder_uses_cached_auth_statuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _allow_all_coder_auth(monkeypatch)
+    runner = _make_runner()
+    runner._auth_status_cache = {
+        "claude": {"status": "ok"},
+        "codex": {"status": "error"},
+    }
+    seen: list[object] = []
+
+    def fake_select(ctx: object) -> tuple[str, object]:
+        seen.append(ctx)
+        return ("claude", runner._registry.get("claude"))
+
+    monkeypatch.setattr(runner_module, "select_coder", fake_select)
+
+    runner._get_coder()
+
+    assert seen
+    assert getattr(seen[0], "auth_statuses") == runner._auth_status_cache
+
+
+def test_get_coder_falls_through_to_default_when_selector_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _allow_all_coder_auth(monkeypatch)
+    runner = _make_runner()
+    monkeypatch.setattr(runner_module, "select_coder", lambda ctx: None)
+
+    name, plugin = runner._get_coder()
+
+    assert name == "claude"
+    assert plugin.name == "claude"
+
+
+def test_get_coder_auto_fallback_switches_on_rate_limit_via_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _allow_all_coder_auth(monkeypatch)
+    runner = _make_runner()
+
+    runner.state.rate_limited_coders.add("claude")
+
+    name, plugin = runner._get_coder()
+
+    assert name == "codex"
+    assert plugin.name == "codex"
+
+
+def test_get_coder_repo_override_uses_selector_for_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.config import CoderType
+
+    _allow_all_coder_auth(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.rate_limited_coders.add("codex")
+
+    name, plugin = runner._get_coder()
+
+    assert name == "claude"
+    assert plugin.name == "claude"
+
+
+def test_get_coder_exploration_occasionally_picks_non_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _allow_all_coder_auth(monkeypatch)
+    registry = CoderRegistry()
+    registry.register(runner_module.build_coder_registry().get("claude"))
+    registry.register(runner_module.build_coder_registry().get("codex"))
+    runner = PipelineRunner(
+        _repo_cfg(),
+        _app_cfg(
+            auto_fallback=True,
+            coder_priority={"claude": 10, "codex": 20},
+            exploration_epsilon=0.15,
+        ),
+        _FakeRedis(),
+        _FakeUsageProvider(),
+        _FakeUsageProvider(),
+        registry=registry,
+    )
+    runner._selector_rng.seed(9)
+
+    picks = [runner._get_coder()[0] for _ in range(200)]
+    non_greedy = sum(1 for pick in picks if pick != "claude")
+
+    assert 15 <= non_greedy <= 45
 
 
 def test_handle_coding_uses_codex_cli_when_coder_is_codex(
@@ -9169,7 +9526,7 @@ def test_check_rate_limit_runs_proactive_for_codex(
 def test_check_rate_limit_codex_clears_proactive_claude_pause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Codex clears a proactive Claude pause for general work."""
+    """Codex can proceed while Claude remains paused until the window expires."""
     from src.config import CoderType
 
     _patch_subprocess(monkeypatch)
@@ -9177,11 +9534,16 @@ def test_check_rate_limit_codex_clears_proactive_claude_pause(
     runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
     runner.state.rate_limit_reactive = False
     runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders.add("claude")
+    runner.state.rate_limited_coder_until["claude"] = runner.state.rate_limited_until
     runner.state.state = PipelineState.PAUSED
 
     result = asyncio.run(runner._check_rate_limit())
     assert result is True
     assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive_coder is None
+    assert "claude" in runner.state.rate_limited_coders
+    assert runner.state.rate_limited_coder_until.get("claude") is not None
     assert runner.state.state == PipelineState.IDLE
 
 
@@ -9207,7 +9569,7 @@ def test_check_rate_limit_honors_claude_pause_with_proactive_coder(
 def test_check_rate_limit_codex_clears_reactive_claude_pause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Codex clears a reactive (stderr-detected) Claude pause."""
+    """Codex can proceed while a reactive Claude pause remains active."""
     from src.config import CoderType
 
     _patch_subprocess(monkeypatch)
@@ -9215,13 +9577,92 @@ def test_check_rate_limit_codex_clears_reactive_claude_pause(
     runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
     runner.state.rate_limit_reactive = True
     runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders.add("claude")
+    runner.state.rate_limited_coder_until["claude"] = runner.state.rate_limited_until
     runner.state.state = PipelineState.PAUSED
 
     result = asyncio.run(runner._check_rate_limit())
     assert result is True
     assert runner.state.rate_limited_until is None
     assert runner.state.rate_limit_reactive is False
+    assert runner.state.rate_limit_reactive_coder is None
+    assert "claude" in runner.state.rate_limited_coders
+    assert runner.state.rate_limited_coder_until.get("claude") is not None
     assert runner.state.state == PipelineState.IDLE
+
+
+def test_check_rate_limit_invalidates_cache_before_fallback_proactive_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fallback resumes with fresh usage snapshots instead of cached values."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    claude_provider = _FakeUsageProvider(snapshot=None)
+    codex_provider = _FakeUsageProvider(snapshot=None)
+    runner._claude_usage_provider = claude_provider
+    runner._codex_usage_provider = codex_provider
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limit_reactive = True
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders.add("claude")
+    runner.state.rate_limited_coder_until["claude"] = runner.state.rate_limited_until
+    runner.state.state = PipelineState.PAUSED
+
+    result = asyncio.run(runner._check_rate_limit())
+
+    assert result is True
+    assert claude_provider._invalidated is True
+    assert codex_provider._invalidated is True
+
+
+def test_check_rate_limit_honors_effective_coder_pause_before_proactive_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limit_reactive = True
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders.update({"claude", "codex"})
+    runner.state.rate_limited_coder_until = {
+        "claude": datetime.now(timezone.utc) + timedelta(minutes=10),
+        "codex": datetime.now(timezone.utc) + timedelta(minutes=5),
+    }
+    runner.state.state = PipelineState.PAUSED
+
+    result = asyncio.run(runner._check_rate_limit(proactive_coder="codex"))
+
+    assert result is False
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "codex"
+    assert runner.state.state == PipelineState.PAUSED
+
+
+def test_check_rate_limit_expires_other_coder_pause_before_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expired pause metadata is cleared even when another coder is active."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+    runner.state.rate_limit_reactive = True
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders.add("claude")
+    runner.state.state = PipelineState.PAUSED
+
+    result = asyncio.run(runner._check_rate_limit())
+
+    assert result is True
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive is False
+    assert runner.state.rate_limit_reactive_coder is None
+    assert "claude" not in runner.state.rate_limited_coders
 
 
 def test_check_rate_limit_codex_honors_reactive_pause(
@@ -9239,6 +9680,104 @@ def test_check_rate_limit_codex_honors_reactive_pause(
     result = asyncio.run(runner._check_rate_limit())
     assert result is False
     assert runner.state.rate_limited_until is not None
+
+
+def test_check_rate_limit_preserves_per_coder_expiry_windows() -> None:
+    runner = _make_runner()
+    now = datetime.now(timezone.utc)
+    claude_until = now + timedelta(minutes=20)
+    codex_until = now + timedelta(minutes=5)
+    runner.state.rate_limited_coders.update({"claude", "codex"})
+    runner.state.rate_limited_coder_until = {
+        "claude": claude_until,
+        "codex": codex_until,
+    }
+    runner.state.rate_limited_until = codex_until
+    runner.state.rate_limit_reactive_coder = "codex"
+    runner.state.rate_limit_reactive = False
+
+    assert selector_module._is_rate_limited("claude", runner.state) is True
+    assert selector_module._is_rate_limited("codex", runner.state) is True
+
+    runner.state.rate_limited_coder_until["codex"] = now - timedelta(minutes=1)
+    result = asyncio.run(runner._check_rate_limit(proactive_coder="codex"))
+
+    assert result is True
+    assert "codex" not in runner.state.rate_limited_coders
+    assert runner.state.rate_limited_coder_until.get("claude") == claude_until
+    assert selector_module._is_rate_limited("claude", runner.state) is True
+
+
+def test_check_rate_limit_reapplies_effective_coder_pause_after_other_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    now = datetime.now(timezone.utc)
+    codex_until = now + timedelta(minutes=5)
+    runner.state.rate_limited_until = now - timedelta(minutes=1)
+    runner.state.rate_limit_reactive = True
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders.update({"claude", "codex"})
+    runner.state.rate_limited_coder_until = {
+        "claude": now - timedelta(minutes=1),
+        "codex": codex_until,
+    }
+    runner.state.state = PipelineState.PAUSED
+
+    result = asyncio.run(runner._check_rate_limit(proactive_coder="codex"))
+
+    assert result is False
+    assert "claude" not in runner.state.rate_limited_coders
+    assert runner.state.rate_limited_until == codex_until
+    assert runner.state.rate_limit_reactive_coder == "codex"
+    assert runner.state.state == PipelineState.PAUSED
+
+
+def test_check_rate_limit_preserves_legacy_pause_for_other_coder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    pause_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limited_until = pause_until
+    runner.state.rate_limit_reactive = True
+    runner.state.state = PipelineState.PAUSED
+
+    result = asyncio.run(runner._check_rate_limit(proactive_coder="codex"))
+
+    assert result is True
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive is False
+    assert runner.state.rate_limit_reactive_coder is None
+    assert "claude" in runner.state.rate_limited_coders
+    assert runner.state.rate_limited_coder_until["claude"] == pause_until
+
+
+def test_runner_initializes_selector_rng_without_fixed_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_args: list[tuple[object, ...]] = []
+    real_random = runner_module.random.Random
+
+    def fake_random(*args: object, **kwargs: object) -> random.Random:
+        assert not kwargs
+        captured_args.append(args)
+        return real_random(*args)
+
+    monkeypatch.setattr(runner_module.random, "Random", fake_random)
+
+    PipelineRunner(
+        _repo_cfg(),
+        _app_cfg(),
+        _FakeRedis(),
+        _FakeUsageProvider(),
+        _FakeUsageProvider(),
+    )
+
+    assert captured_args == [()]
 
 
 # ---------- Codex-specific rate limit detection tests ----------

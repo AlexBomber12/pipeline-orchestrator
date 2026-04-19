@@ -69,6 +69,7 @@ def test_repo_state_json_round_trip() -> None:
         error_message=None,
         last_updated=now,
         history=[{"event": "started", "at": now.isoformat()}],
+        rate_limited_coders={"claude", "codex"},
     )
 
     payload = state.model_dump_json()
