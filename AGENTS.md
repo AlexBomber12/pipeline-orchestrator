@@ -205,3 +205,12 @@ If any condition fails, MICRO is not allowed. Use PLANNED PR.
 - `tasks/PR-*.md` files are the source of truth; `tasks/QUEUE.md` is a derived artifact.
 - Do not rewrite tasks retroactively during a PR.
 - If the user updates `tasks/` while you are working, stop and ask for explicit direction: continue as-is, incorporate changes, or revert.
+
+## Coverage sprint conventions (PR-094 through PR-123)
+- These conventions apply to coverage sprint PRs in this range, including sprint 9 coverage work.
+- Handler tests for coding, fix, watch, merge, idle, hung, error, and breach handlers live in `tests/test_runner.py`. Extend that file and do not create separate `tests/test_<handler>_handler.py` files.
+- For non-handler modules, use the existing `tests/test_<module>.py` when present. Check `ls tests/` before creating a new test file.
+- Each coverage PR must satisfy `--cov-fail-under=100` for its target module only, not overall repository coverage.
+- Legitimately uncoverable branches must use `# pragma: no cover` with an inline rationale comment on the same line. Use no more than 2 such pragmas per PR unless the PR description explicitly discusses them.
+- If a task file says `Tests to add in tests/test_X.py` and that file does not exist for a handler module, extend `tests/test_runner.py` instead.
+- If that instruction targets a non-handler module and the file does not exist, use the closest existing test file or create `tests/test_<module>.py` only as a last resort.
