@@ -266,7 +266,7 @@
 - Branch: pr-114-coverage-usage
 
 ## PR-115: 100% coverage for src/claude_cli.py
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-115.md
 - Branch: pr-115-coverage-claude-cli
 
