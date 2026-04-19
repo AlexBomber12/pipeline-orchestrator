@@ -5,7 +5,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from src.coder_registry import CoderRegistry
-from src.config import AppConfig, DaemonConfig, RepoConfig, CoderType
+from src.config import AppConfig, CoderType, DaemonConfig, RepoConfig
 from src.daemon.selector import (
     SelectionContext,
     eligible_coders,

@@ -1727,7 +1727,6 @@ async def upload_tasks(
         return _render_upload_error(request, "No files uploaded", 422, repo_name=name)
 
     # Validate file names and sizes (stream chunks to enforce limit early)
-    has_queue = False
     total_size = 0
     file_contents: list[tuple[str, bytes]] = []
     _CHUNK = 64 * 1024
@@ -1754,13 +1753,6 @@ async def upload_tasks(
             chunks.append(chunk)
         content = b"".join(chunks)
         file_contents.append((fname, content))
-        if fname == "QUEUE.md":
-            has_queue = True
-
-    if not has_queue:
-        return _render_upload_error(
-            request, "QUEUE.md is required in the upload", 422, repo_name=name
-        )
 
     # Validate the *last* uploaded QUEUE.md with strict mode before staging.
     # Staging writes every file in order, so if multiple QUEUE.md parts are
@@ -1769,26 +1761,26 @@ async def upload_tasks(
     for fname, content in file_contents:
         if fname == "QUEUE.md":
             queue_bytes = content
-    assert queue_bytes is not None  # has_queue guard above
-    try:
-        queue_text = queue_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        return _render_upload_error(
-            request,
-            "QUEUE.md is not valid UTF-8",
-            400,
-            repo_name=name,
-        )
-    try:
-        parse_queue_text(queue_text, strict=True)
-    except QueueValidationError as exc:
-        issues_text = "\n".join(exc.issues)
-        return _render_upload_error(
-            request,
-            f"QUEUE.md validation failed:\n{issues_text}",
-            400,
-            repo_name=name,
-        )
+    if queue_bytes is not None:
+        try:
+            queue_text = queue_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return _render_upload_error(
+                request,
+                "QUEUE.md is not valid UTF-8",
+                400,
+                repo_name=name,
+            )
+        try:
+            parse_queue_text(queue_text, strict=True)
+        except QueueValidationError as exc:
+            issues_text = "\n".join(exc.issues)
+            return _render_upload_error(
+                request,
+                f"QUEUE.md validation failed:\n{issues_text}",
+                400,
+                repo_name=name,
+            )
 
     task_uploads: dict[str, bytes] = {}
     for fname, content in file_contents:

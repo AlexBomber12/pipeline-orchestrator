@@ -13,8 +13,8 @@ from typing import Any
 
 import pytest
 from src import retry as retry_module
-from src.coders import claude as claude_plugin_module
 from src.coder_registry import CoderRegistry
+from src.coders import claude as claude_plugin_module
 from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
