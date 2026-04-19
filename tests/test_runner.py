@@ -2853,6 +2853,39 @@ def test_handle_watch_approved_and_green_merges(
     assert runner.state.current_task is None
 
 
+def test_handle_watch_without_current_pr_returns_to_idle() -> None:
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.history[-1]["event"] == "WATCH without current_pr -> IDLE"
+
+
+def test_handle_watch_open_pr_lookup_failure_sets_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+
+    def _raise(repo: str, **kwargs: Any) -> list[PRInfo]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        _raise,
+    )
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "get_open_prs failed: boom"
+    assert runner.state.history[-1]["event"] == "boom"
+
+
 def test_handle_watch_green_but_auto_merge_disabled_stays_watching(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3070,6 +3103,31 @@ def test_handle_watch_within_timeout_stays_watching(
     asyncio.run(runner.handle_watch())
 
     assert runner.state.state == PipelineState.WATCH
+
+
+def test_handle_watch_naive_last_activity_is_treated_as_utc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recent = datetime.now(timezone.utc) - timedelta(minutes=2)
+    pr = PRInfo(
+        number=5,
+        branch="pr-001",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=recent.replace(tzinfo=None),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
+    )
+
+    runner = _make_runner(review_timeout_min=30)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert any("2/30m" in e["event"] for e in runner.state.history)
 
 
 def test_handle_watch_approved_but_ci_pending_applies_timeout(
@@ -9871,6 +9929,19 @@ def test_handle_fix_publishes_heartbeat(
 # --- _has_new_codex_feedback_since_last_push tests ---
 
 
+def test_has_new_feedback_returns_none_without_current_pr() -> None:
+    runner = _make_runner()
+
+    assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.NONE
+
+
+def test_has_new_feedback_returns_true_without_last_push_timestamp() -> None:
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
+
+    assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.NEW
+
+
 def test_has_new_feedback_returns_true_for_any_codex_comment_after_push(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9917,6 +9988,27 @@ def test_has_new_feedback_returns_false_for_old_comments(
     assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.NONE
 
 
+def test_has_new_feedback_normalizes_naive_timestamps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
+    runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0)
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [
+            {
+                "user": {"login": "chatgpt-codex-bot"},
+                "created_at": "2026-01-01T00:05:00",
+            },
+        ],
+    )
+
+    assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.NEW
+
+
 def test_has_new_feedback_ignores_non_codex_users(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9933,6 +10025,27 @@ def test_has_new_feedback_ignores_non_codex_users(
                 "user": {"login": "some-reviewer"},
                 "body": "Please fix this",
                 "created_at": "2026-01-01T00:05:00Z",
+            },
+        ],
+    )
+
+    assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.NONE
+
+
+def test_has_new_feedback_skips_unparseable_codex_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
+    runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [
+            {
+                "user": {"login": "chatgpt-codex-bot"},
+                "created_at": "not-a-date",
             },
         ],
     )
