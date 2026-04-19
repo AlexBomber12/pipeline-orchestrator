@@ -7352,9 +7352,51 @@ def test_handle_paused_resumes_with_other_coder_while_preserving_pause(
     asyncio.run(runner.handle_paused())
 
     assert runner.state.state == PipelineState.IDLE
-    assert runner.state.rate_limited_until is not None
-    assert runner.state.rate_limit_reactive_coder == "claude"
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive_coder is None
     assert "claude" in runner.state.rate_limited_coders
+
+
+def test_handle_paused_uses_selector_for_pinned_repo_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=20)
+    runner.state.rate_limit_reactive_coder = "codex"
+    runner.state.rate_limited_coders.add("codex")
+    runner.state.rate_limited_coder_until["codex"] = runner.state.rate_limited_until
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive_coder is None
+    assert "codex" in runner.state.rate_limited_coders
+
+
+def test_handle_paused_clearable_error_drops_top_level_pause_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=20)
+    runner.state.rate_limit_reactive_coder = "codex"
+    runner.state.rate_limited_coders.add("codex")
+    runner.state.rate_limited_coder_until["codex"] = runner.state.rate_limited_until
+    runner.state.error_message = "Build failed: missing dependency X"
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive_coder is None
 
 
 def test_detect_rate_limit_sets_pause(
@@ -8221,7 +8263,7 @@ def test_handle_paused_clears_other_coder_from_rate_limited_set(
     asyncio.run(runner.handle_paused())
 
     assert "claude" in runner.state.rate_limited_coders
-    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limited_until is None
     assert runner.state.state == PipelineState.IDLE
 
 

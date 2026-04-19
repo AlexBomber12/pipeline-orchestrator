@@ -636,12 +636,9 @@ class IdleMixin:
             self.state.state = PipelineState.IDLE
             return
         pause_coder = self.state.rate_limit_reactive_coder or "claude"
-        if self.repo_config.coder is not None:
-            coder_name = self.repo_config.coder.value
-        else:
-            await self._refresh_auth_status_cache()
-            selected = self._select_coder()
-            coder_name = selected[0] if selected is not None else pause_coder
+        await self._refresh_auth_status_cache()
+        selected = self._select_coder()
+        coder_name = selected[0] if selected is not None else pause_coder
         diagnosis_pause = (
             self.state.error_message is not None
             and pause_coder == "claude"
@@ -657,6 +654,9 @@ class IdleMixin:
                 f"{coder_name.capitalize()} active while {pause_coder} remains "
                 f"rate-limited until {self.state.rate_limited_until.isoformat()}"
             )
+            self.state.rate_limited_until = None
+            self.state.rate_limit_reactive = False
+            self.state.rate_limit_reactive_coder = None
             if self.state.error_message:
                 lowered = self.state.error_message.lower()
                 is_rate_limit_msg = (
