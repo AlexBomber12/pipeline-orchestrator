@@ -7,9 +7,11 @@ import pytest
 from src.models import PRInfo, QueueTask, TaskStatus
 from src.queue_parser import QueueValidationError, TaskHeader
 from src.task_status import (
+    _load_legacy_task_header,
     _load_task_header,
     derive_queue_task_statuses,
     derive_task_status,
+    find_matching_merged_pr,
     find_matching_open_pr,
     get_merged_pr_ids,
 )
@@ -221,6 +223,22 @@ def test_find_matching_open_pr_rejects_conflicting_pr_identity() -> None:
     assert match is None
 
 
+def test_find_matching_open_pr_returns_none_without_branch() -> None:
+    match = find_matching_open_pr(
+        "PR-085",
+        "",
+        [
+            PRInfo(
+                number=109,
+                branch="pr-085-status-from-git",
+                title="PR-085: Status derivation from git",
+            )
+        ],
+    )
+
+    assert match is None
+
+
 def test_find_matching_open_pr_allows_same_branch_when_pr_id_is_unavailable() -> None:
     match = find_matching_open_pr(
         "PR-085",
@@ -271,6 +289,38 @@ def test_derive_done_when_merged_pr_branch_matches_without_queue_prefix() -> Non
     assert status == TaskStatus.DONE
 
 
+def test_find_matching_merged_pr_matches_by_identity_when_branch_is_missing() -> None:
+    match = find_matching_merged_pr(
+        "PR-085",
+        "",
+        [
+            PRInfo(
+                number=109,
+                branch="different-branch",
+                title="PR-085: Status derivation from git",
+            )
+        ],
+    )
+
+    assert match is not None
+
+
+def test_find_matching_merged_pr_ignores_mismatched_identity_when_branch_is_missing() -> None:
+    match = find_matching_merged_pr(
+        "PR-085",
+        "",
+        [
+            PRInfo(
+                number=109,
+                branch="different-branch",
+                title="PR-999: Unrelated work",
+            )
+        ],
+    )
+
+    assert match is None
+
+
 def test_load_task_header_falls_back_for_legacy_task_files(
     tmp_path: Path,
 ) -> None:
@@ -296,6 +346,52 @@ def test_load_task_header_falls_back_for_legacy_task_files(
         pr_id="PR-001",
         title="Legacy task",
         branch="pr-001-legacy-task",
+        task_type="feature",
+        complexity="medium",
+        depends_on=["PR-000"],
+        priority=3,
+        coder="any",
+    )
+
+
+def test_load_task_header_raises_nonlegacy_validation_errors(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    task_file = tmp_path / "tasks" / "PR-001.md"
+    task_file.parent.mkdir()
+    task_file.write_text("# PR-001: Legacy task\n", encoding="utf-8")
+    task = QueueTask(
+        pr_id="PR-001",
+        title="Legacy task",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-001.md",
+        depends_on=[],
+        branch="pr-001-legacy-task",
+    )
+    error = QueueValidationError(["tasks/PR-001.md: unsupported header problem"])
+
+    monkeypatch.setattr("src.task_status.parse_task_header", lambda path: (_ for _ in ()).throw(error))
+
+    with pytest.raises(QueueValidationError) as excinfo:
+        _load_task_header(task, str(tmp_path))
+
+    assert excinfo.value is error
+
+
+def test_load_task_header_falls_back_to_queue_metadata_without_task_file() -> None:
+    task = QueueTask(
+        pr_id="PR-001",
+        title="Queued task",
+        status=TaskStatus.TODO,
+        depends_on=["PR-000"],
+        branch="pr-001-queued-task",
+    )
+
+    assert _load_task_header(task, "/repo") == TaskHeader(
+        pr_id="PR-001",
+        title="Queued task",
+        branch="pr-001-queued-task",
         task_type="feature",
         complexity="medium",
         depends_on=["PR-000"],
@@ -361,6 +457,91 @@ def test_load_task_header_rejects_mismatched_legacy_task_files(
     assert excinfo.value.issues == [
         "tasks/PR-999.md: header PR ID 'PR-999' does not match queue entry 'PR-001'"
     ]
+
+
+def test_load_legacy_task_header_returns_none_for_nonlegacy_issues(
+    tmp_path: Path,
+) -> None:
+    task_file = tmp_path / "tasks" / "PR-001.md"
+    task_file.parent.mkdir()
+    task_file.write_text(
+        "# PR-001: Legacy task\n\n"
+        "Branch: pr-001-legacy-task\n",
+        encoding="utf-8",
+    )
+    task = QueueTask(
+        pr_id="PR-001",
+        title="Legacy task",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-001.md",
+        depends_on=[],
+        branch="pr-001-legacy-task",
+    )
+
+    header = _load_legacy_task_header(
+        task,
+        task_file,
+        QueueValidationError(["tasks/PR-001.md: header missing Priority"]),
+    )
+
+    assert header is None
+
+
+def test_load_legacy_task_header_returns_none_when_branch_is_interrupted_by_section(
+    tmp_path: Path,
+) -> None:
+    task_file = tmp_path / "tasks" / "PR-001.md"
+    task_file.parent.mkdir()
+    task_file.write_text(
+        "# PR-001: Legacy task\n\n"
+        "## Notes\n"
+        "Branch: pr-001-legacy-task\n",
+        encoding="utf-8",
+    )
+    task = QueueTask(
+        pr_id="PR-001",
+        title="Legacy task",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-001.md",
+        depends_on=[],
+        branch="",
+    )
+
+    header = _load_legacy_task_header(
+        task,
+        task_file,
+        QueueValidationError(["tasks/PR-001.md: missing Branch"]),
+    )
+
+    assert header is None
+
+
+def test_load_legacy_task_header_returns_none_without_matching_header_line(
+    tmp_path: Path,
+) -> None:
+    task_file = tmp_path / "tasks" / "PR-001.md"
+    task_file.parent.mkdir()
+    task_file.write_text(
+        "PR-001: Legacy task\n\n"
+        "Branch: pr-001-legacy-task\n",
+        encoding="utf-8",
+    )
+    task = QueueTask(
+        pr_id="PR-001",
+        title="Legacy task",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-001.md",
+        depends_on=[],
+        branch="pr-001-legacy-task",
+    )
+
+    header = _load_legacy_task_header(
+        task,
+        task_file,
+        QueueValidationError(["tasks/PR-001.md: missing Branch"]),
+    )
+
+    assert header is None
 
 
 def test_derive_queue_task_statuses_does_not_trust_stale_done_queue_status(
@@ -472,3 +653,127 @@ def test_derive_queue_task_statuses_rejects_mismatched_task_file_pr_id(
     assert excinfo.value.issues == [
         "tasks/PR-999.md: header PR ID 'PR-999' does not match queue entry 'PR-001'"
     ]
+
+
+def test_get_merged_pr_ids_falls_back_when_candidate_origin_ref_is_ambiguous(
+    monkeypatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(*args, **kwargs) -> subprocess.CompletedProcess[str]:
+        calls.append(args[0])
+        target_ref = args[0][4]
+        if target_ref == "origin/main":
+            return subprocess.CompletedProcess(
+                args=args[0],
+                returncode=128,
+                stdout="",
+                stderr="fatal: ambiguous argument 'origin/main': unknown revision or path not in the working tree.",
+            )
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout="PR-085: queue subject\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("src.task_status.subprocess.run", fake_run)
+
+    assert get_merged_pr_ids("/repo", "main", {"PR-085"}) == {"PR-085"}
+    assert [call[4] for call in calls[:2]] == ["origin/main", "main"]
+
+
+def test_get_merged_pr_ids_raises_when_candidate_probe_fails_nonambiguously(
+    monkeypatch,
+) -> None:
+    def fake_run(*args, **kwargs) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=1,
+            stdout="",
+            stderr="fatal: permissions failure",
+        )
+
+    monkeypatch.setattr("src.task_status.subprocess.run", fake_run)
+
+    with pytest.raises(RuntimeError, match="permissions failure"):
+        get_merged_pr_ids("/repo", "main", {"PR-085"})
+
+
+def test_get_merged_pr_ids_falls_back_to_local_base_branch_probe(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_probe(repo_path: str, target_ref: str) -> subprocess.CompletedProcess[str]:
+        calls.append(target_ref)
+        if target_ref == "origin/main":
+            return subprocess.CompletedProcess(
+                args=["git"],
+                returncode=1,
+                stdout="",
+                stderr="fatal: bad revision 'origin/main'",
+            )
+        return subprocess.CompletedProcess(
+            args=["git"],
+            returncode=0,
+            stdout="PR-085: queue subject\n\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("src.task_status._run_merged_pr_probe", fake_probe)
+
+    assert get_merged_pr_ids("/repo", "main") == {"PR-085"}
+    assert calls == ["origin/main", "main"]
+
+
+def test_get_merged_pr_ids_raises_when_all_probes_fail(
+    monkeypatch,
+) -> None:
+    def fake_probe(repo_path: str, target_ref: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=["git"],
+            returncode=1,
+            stdout="",
+            stderr=f"fatal: bad revision '{target_ref}'",
+        )
+
+    monkeypatch.setattr("src.task_status._run_merged_pr_probe", fake_probe)
+
+    with pytest.raises(RuntimeError, match="fatal: bad revision 'main'"):
+        get_merged_pr_ids("/repo", "main")
+
+
+def test_get_merged_pr_ids_skips_blank_subject_lines_in_full_probe(
+    monkeypatch,
+) -> None:
+    def fake_probe(repo_path: str, target_ref: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=["git"],
+            returncode=0,
+            stdout="PR-085: queue subject\n   \nPR-099: another subject\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("src.task_status._run_merged_pr_probe", fake_probe)
+
+    assert get_merged_pr_ids("/repo", "main") == {"PR-085", "PR-099"}
+
+
+def test_get_merged_pr_ids_skips_blank_subject_lines_in_candidate_probe(
+    monkeypatch,
+) -> None:
+    def fake_run(*args, **kwargs) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout="PR-085: queue subject\n \nPR-099: another subject\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("src.task_status.subprocess.run", fake_run)
+
+    assert get_merged_pr_ids("/repo", "main", {"PR-085", "PR-099"}) == {
+        "PR-085",
+        "PR-099",
+    }
