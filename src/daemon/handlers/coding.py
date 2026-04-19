@@ -32,7 +32,7 @@ class CodingMixin:
             else self.app_config.daemon.claude_model
         )
         self._start_current_run_record(coder_name, model)
-        if not await self._check_rate_limit():
+        if not await self._check_rate_limit(proactive_coder=coder_name):
             await self._save_current_run_record("rate_limit")
             return
 

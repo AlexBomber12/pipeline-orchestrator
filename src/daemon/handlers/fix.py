@@ -74,10 +74,9 @@ class FixMixin(BreachMixin):
 
     async def handle_fix(self) -> None:
         """Run ``FIX REVIEW`` via the active coder CLI and return to WATCH."""
-        if not await self._check_rate_limit():
-            return
-
         coder_name, plugin = self._get_coder()
+        if not await self._check_rate_limit(proactive_coder=coder_name):
+            return
 
         if (
             self.state.current_pr is not None
