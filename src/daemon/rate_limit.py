@@ -186,6 +186,8 @@ class RateLimitMixin:
                 self.state.rate_limited_until = None
                 self.state.rate_limit_reactive = False
                 self.state.rate_limit_reactive_coder = None
+                self._claude_usage_provider.invalidate_cache()
+                self._codex_usage_provider.invalidate_cache()
                 self.log_event(
                     f"{effective_coder.capitalize()} active while "
                     f"{pause_coder} remains rate-limited until "

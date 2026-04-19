@@ -9565,6 +9565,32 @@ def test_check_rate_limit_codex_clears_reactive_claude_pause(
     assert runner.state.state == PipelineState.IDLE
 
 
+def test_check_rate_limit_invalidates_cache_before_fallback_proactive_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fallback resumes with fresh usage snapshots instead of cached values."""
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    claude_provider = _FakeUsageProvider(snapshot=None)
+    codex_provider = _FakeUsageProvider(snapshot=None)
+    runner._claude_usage_provider = claude_provider
+    runner._codex_usage_provider = codex_provider
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limit_reactive = True
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders.add("claude")
+    runner.state.rate_limited_coder_until["claude"] = runner.state.rate_limited_until
+    runner.state.state = PipelineState.PAUSED
+
+    result = asyncio.run(runner._check_rate_limit())
+
+    assert result is True
+    assert claude_provider._invalidated is True
+    assert codex_provider._invalidated is True
+
+
 def test_check_rate_limit_honors_effective_coder_pause_before_proactive_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
