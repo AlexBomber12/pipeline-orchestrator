@@ -525,7 +525,7 @@
 - Depends on: PR-084
 
 ## PR-090: Expanded error classification
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-090.md
 - Branch: pr-090-error-classification
 

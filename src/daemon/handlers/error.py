@@ -21,6 +21,13 @@ from src.models import PipelineState
 class ErrorCategory(Enum):
     RATE_LIMIT = "rate_limit"
     TIMEOUT = "timeout"
+    OOM = "oom"
+    AUTH_FAILURE = "auth_failure"
+    CI_FAILURE = "ci_failure"
+    GHOST_PUSH = "ghost_push"
+    STALE_BRANCH = "stale_branch"
+    CLI_NOT_FOUND = "cli_not_found"
+    GIT_ERROR = "git_error"
     OTHER = "other"
 
 
@@ -30,6 +37,22 @@ def _classify_error(context: str) -> ErrorCategory:
         return ErrorCategory.RATE_LIMIT
     if "timeout" in lowered:
         return ErrorCategory.TIMEOUT
+    if (
+        "oom" in lowered
+        or "out of memory" in lowered
+        or "killed" in lowered
+    ):
+        return ErrorCategory.OOM
+    if "auth" in lowered or "unauthorized" in lowered or "401" in lowered:
+        return ErrorCategory.AUTH_FAILURE
+    if "ci" in lowered and "fail" in lowered:
+        return ErrorCategory.CI_FAILURE
+    if "ghost push" in lowered or "head sha" in lowered:
+        return ErrorCategory.GHOST_PUSH
+    if "not found" in lowered and "cli" in lowered:
+        return ErrorCategory.CLI_NOT_FOUND
+    if "git" in lowered and ("error" in lowered or "fail" in lowered):
+        return ErrorCategory.GIT_ERROR
     return ErrorCategory.OTHER
 
 

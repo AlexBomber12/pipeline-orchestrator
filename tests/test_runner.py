@@ -8252,10 +8252,58 @@ def test_classify_error_timeout(msg: str) -> None:
 
 @pytest.mark.parametrize(
     "msg",
-    ["git push failed", "file not found", "Unknown error"],
+    ["file not found", "Unknown error"],
 )
 def test_classify_error_other(msg: str) -> None:
     assert _classify_error(msg) == ErrorCategory.OTHER
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["OOM killer invoked", "process killed: out of memory", "worker oom"],
+)
+def test_classify_oom(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.OOM
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["auth failed", "401 Unauthorized", "unauthorized request"],
+)
+def test_classify_auth_failure(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.AUTH_FAILURE
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["CI failed on main", "ci job fail", "CI checks failing"],
+)
+def test_classify_ci_failure(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.CI_FAILURE
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["ghost push detected", "HEAD SHA changed unexpectedly"],
+)
+def test_classify_ghost_push(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.GHOST_PUSH
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["codex cli not found", "CLI executable not found"],
+)
+def test_classify_cli_not_found(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.CLI_NOT_FOUND
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["git push failed", "git error: detached head"],
+)
+def test_classify_git_error(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.GIT_ERROR
 
 
 def test_handle_error_timeout_has_distinct_log(
