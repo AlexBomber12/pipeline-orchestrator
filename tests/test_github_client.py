@@ -9,15 +9,24 @@ from datetime import timezone as _tz
 from typing import Any
 
 import pytest
+import src.github_client as github_client
 from src.github_client import (
     _ci_status_from_rollup,
     _compute_review_status,
     _get_codex_issue_reactions,
+    _get_codex_review_signals,
+    _get_latest_codex_review_info,
     _is_codex_user,
     _is_plus_one,
+    _is_reaction_content,
+    _parse_iso,
+    clear_last_known_sha,
     clear_merged_prs_cache,
     clear_review_status_cache,
+    get_branch_last_push_time,
+    get_last_push_age_seconds,
     get_merged_prs,
+    get_open_prs,
     get_pr_author,
     get_pr_head_commit_iso,
     get_pr_metadata,
@@ -26,6 +35,7 @@ from src.github_client import (
     has_recent_codex_review_request,
     is_pr_merged,
     merge_pr,
+    post_comment,
     run_gh,
 )
 from src.models import CIStatus, ReviewStatus
@@ -2325,3 +2335,513 @@ def test_gh_api_paginated_fails_after_retries(monkeypatch: pytest.MonkeyPatch) -
 
     with pytest.raises(RuntimeError, match="failed after 3 attempts"):
         _gh_api_paginated("repos/test/owner/issues/1/comments")
+
+
+def test_begin_review_cache_cycle_initializes_and_increments() -> None:
+    clear_review_status_cache()
+
+    github_client._begin_review_cache_cycle()
+    assert github_client._review_status_cache_cycle == 1
+
+    github_client._begin_review_cache_cycle()
+    assert github_client._review_status_cache_cycle == 2
+
+
+def test_is_reaction_content_rejects_non_dict() -> None:
+    assert _is_reaction_content(None, "+1") is False
+
+
+def test_get_open_prs_returns_prinfo_objects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = [
+        {"number": 0},
+        {
+            "number": 42,
+            "title": "PR-110: Add coverage",
+            "headRefName": "feature-branch",
+            "headRefOid": "abc123",
+            "statusCheckRollup": [],
+            "url": "https://example.test/pr/42",
+            "updatedAt": "2026-04-18T11:22:33Z",
+            "commits": [{}, {}],
+            "author": {"login": "alice"},
+            "isCrossRepository": True,
+        },
+    ]
+    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: raw)
+    monkeypatch.setattr(
+        "src.github_client.get_pr_review_status",
+        lambda repo, number, pr_author, head_sha: ReviewStatus.APPROVED,
+    )
+
+    prs = get_open_prs("owner/name", allow_merge_without_checks=True)
+
+    assert [pr.number for pr in prs] == [42]
+    assert prs[0].branch == "feature-branch"
+    assert prs[0].pr_id == "PR-110"
+    assert prs[0].ci_status == CIStatus.SUCCESS
+    assert prs[0].review_status == ReviewStatus.APPROVED
+    assert prs[0].push_count == 2
+    assert prs[0].url == "https://example.test/pr/42"
+    assert prs[0].last_activity == datetime(2026, 4, 18, 11, 22, 33, tzinfo=_tz.utc)
+    assert prs[0].is_cross_repository is True
+
+
+def test_get_open_prs_returns_empty_for_non_list_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: {"items": []})
+    assert get_open_prs("owner/name") == []
+
+
+def test_get_merged_prs_raises_on_unexpected_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_merged_prs_cache()
+    monkeypatch.setattr("src.github_client._gh_api_paginated", lambda path: None)
+
+    with pytest.raises(RuntimeError, match="unexpected payload"):
+        get_merged_prs("owner/name", refresh=True)
+
+
+def test_get_merged_prs_skips_zero_number_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_merged_prs_cache()
+    monkeypatch.setattr(
+        "src.github_client._gh_api_paginated",
+        lambda path: [
+            {
+                "number": 0,
+                "title": "PR-000: skip me",
+                "merged_at": "2026-04-18T00:00:00Z",
+                "base": {"ref": "main"},
+                "head": {"ref": "branch", "repo": {"fork": False}},
+            }
+        ],
+    )
+
+    assert get_merged_prs("owner/name", refresh=True) == []
+
+
+def test_is_pr_merged_returns_none_for_non_string_non_dict_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: ["bad"])
+    assert is_pr_merged("owner/name", 42) is None
+
+
+def test_is_pr_merged_returns_none_for_open_unmerged_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.github_client.run_gh",
+        lambda *args, **kwargs: {"state": "open", "merged": False},
+    )
+    assert is_pr_merged("owner/name", 42) is None
+
+
+def test_get_pr_review_status_propagates_issue_comment_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/42/reactions"):
+            return []
+        if path.endswith("/issues/42/comments"):
+            raise RuntimeError("boom")
+        return []
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        get_pr_review_status("owner/name", 42, pr_author="author")
+
+
+def test_get_pr_review_status_propagates_review_comment_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/42/reactions"):
+            return []
+        if path.endswith("/issues/42/comments"):
+            return []
+        if path.endswith("/pulls/42/comments"):
+            raise RuntimeError("boom")
+        return []
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        get_pr_review_status("owner/name", 42, pr_author="author")
+
+
+def test_get_pr_review_status_ignores_anchor_reaction_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchor = {
+        "id": 99,
+        "body": "@codex review",
+        "created_at": "2026-04-18T00:00:00Z",
+        "user": {"login": "author"},
+    }
+
+    def fake_paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/42/reactions"):
+            return []
+        if path.endswith("/issues/42/comments"):
+            return [anchor]
+        if path.endswith("/pulls/42/comments"):
+            return []
+        if path.endswith("/issues/comments/99/reactions"):
+            raise RuntimeError("HTTP 404 not found")
+        return []
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.PENDING
+
+
+def test_post_comment_uses_pr_comment_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[list[str], str | None]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, timeout: int = 30) -> str:
+        calls.append((args, repo))
+        return ""
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+
+    post_comment("owner/name", 42, "hello")
+
+    assert calls == [(["pr", "comment", "42", "--body", "hello"], "owner/name")]
+
+
+def test_get_pr_author_returns_empty_for_non_string_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: {"login": "alice"})
+    assert get_pr_author("owner/name", 42) == ""
+
+
+def test_get_pr_head_commit_iso_returns_empty_when_head_sha_missing_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: {"sha": "abc"})
+    assert get_pr_head_commit_iso("owner/name", 42) == ""
+
+
+def test_get_pr_head_commit_iso_returns_empty_when_commit_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str], repo: str | None = None, timeout: int = 30) -> str:
+        if args[-1] == ".head.sha":
+            return "abc123"
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+
+    assert get_pr_head_commit_iso("owner/name", 42) == ""
+
+
+def test_get_pr_metadata_returns_empty_on_invalid_json_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: "{not-json")
+
+    assert get_pr_metadata("owner/name", 42) == {
+        "author": "",
+        "head_sha": "",
+        "head_commit_date": "",
+    }
+
+
+def test_get_pr_metadata_parses_json_string_without_commit_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.github_client.run_gh",
+        lambda *args, **kwargs: '{"author": "alice", "head_sha": ""}',
+    )
+
+    assert get_pr_metadata("owner/name", 42) == {
+        "author": "alice",
+        "head_sha": "",
+        "head_commit_date": "",
+    }
+
+
+def test_get_pr_metadata_returns_empty_on_non_mapping_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: ["bad"])
+
+    assert get_pr_metadata("owner/name", 42) == {
+        "author": "",
+        "head_sha": "",
+        "head_commit_date": "",
+    }
+
+
+def test_get_pr_metadata_ignores_commit_date_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str], repo: str | None = None, timeout: int = 30) -> dict:
+        if "/pulls/" in args[1]:
+            return {"author": "alice", "head_sha": "abc123"}
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+
+    assert get_pr_metadata("owner/name", 42) == {
+        "author": "alice",
+        "head_sha": "abc123",
+        "head_commit_date": "",
+    }
+
+
+def test_get_branch_last_push_time_tracks_new_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_last_known_sha()
+    shas = iter(["sha1", "sha1", "sha2"])
+    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: next(shas))
+    monkeypatch.setattr("src.github_client.time.monotonic", lambda: 123.45)
+
+    assert get_branch_last_push_time("owner/name", 42) is None
+    assert get_branch_last_push_time("owner/name", 42) is None
+    assert get_branch_last_push_time("owner/name", 42) == 123.45
+
+
+def test_get_branch_last_push_time_returns_none_for_empty_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: "")
+    assert get_branch_last_push_time("owner/name", 42) is None
+
+
+def test_get_branch_last_push_time_propagates_poll_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.github_client.run_gh",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    with pytest.raises(github_client.GitHubPollError, match="boom"):
+        get_branch_last_push_time("owner/name", 42)
+
+
+def test_clear_last_known_sha_resets_tracking() -> None:
+    github_client._last_known_sha["owner/name#42"] = "sha1"
+    clear_last_known_sha()
+    assert github_client._last_known_sha == {}
+
+
+def test_get_last_push_age_seconds_returns_none_without_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: "")
+    assert get_last_push_age_seconds("owner/name", 42) is None
+
+
+def test_get_last_push_age_seconds_returns_computed_age(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz: _tz | None = None) -> datetime:
+            return cls(2026, 4, 19, 12, 0, 0, tzinfo=tz)
+
+    responses = iter(["feature-branch", "2026-04-19T11:59:30Z"])
+    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr("src.github_client.datetime", _FakeDateTime)
+
+    assert get_last_push_age_seconds("owner/name", 42) == 30.0
+
+
+def test_get_last_push_age_seconds_returns_none_for_empty_push_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = iter(["feature-branch", ""])
+    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: next(responses))
+    assert get_last_push_age_seconds("owner/name", 42) is None
+
+
+def test_get_last_push_age_seconds_returns_none_on_parse_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = iter(["feature-branch", "not-a-date"])
+    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: next(responses))
+    assert get_last_push_age_seconds("owner/name", 42) is None
+
+
+def test_has_recent_codex_review_request_returns_false_on_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_paginated(path: str) -> list[dict]:
+        raise RuntimeError("HTTP 404 not found")
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    assert has_recent_codex_review_request("owner/name", 42, "author") is False
+
+
+def test_has_recent_codex_review_request_propagates_non_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_paginated(path: str) -> list[dict]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        has_recent_codex_review_request("owner/name", 42, "author")
+
+
+def test_has_recent_codex_review_request_skips_invalid_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.github_client._gh_api_paginated",
+        lambda path: [
+            {
+                "user": {"login": "author"},
+                "body": "@codex review",
+                "created_at": "not-a-date",
+            }
+        ],
+    )
+
+    assert has_recent_codex_review_request("owner/name", 42, "author") is False
+
+
+def test_has_recent_codex_review_request_handles_naive_datetime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz: _tz | None = None) -> datetime:
+            return cls(2026, 4, 19, 12, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(
+        "src.github_client._gh_api_paginated",
+        lambda path: [
+            {
+                "user": {"login": "author"},
+                "body": "@codex review",
+                "created_at": "2026-04-19T11:59:30",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "src.github_client._parse_iso",
+        lambda value: datetime(2026, 4, 19, 11, 59, 30),
+    )
+    monkeypatch.setattr("src.github_client.datetime", _FakeDateTime)
+
+    assert has_recent_codex_review_request("owner/name", 42, "author") is True
+
+
+def test_gh_api_paginated_returns_none_for_non_list_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.github_client import _gh_api_paginated
+
+    monkeypatch.setattr(
+        "src.github_client.retry_transient",
+        lambda func, operation_name=None: {"items": []},
+    )
+
+    assert _gh_api_paginated("repos/test/owner/issues/1/comments") is None
+
+
+def test_get_codex_review_signals_returns_empty_on_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_paginated(path: str) -> list[dict]:
+        raise RuntimeError("HTTP 404 not found")
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    assert _get_codex_review_signals("owner/name", 42) == {
+        "latest_sha": "",
+        "latest_time": None,
+        "latest_state": "",
+    }
+
+
+def test_get_codex_review_signals_skips_non_codex_and_invalid_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.github_client._gh_api_paginated",
+        lambda path: [
+            {
+                "user": {"login": "alice"},
+                "commit_id": "sha1",
+                "submitted_at": "2026-04-19T11:59:00Z",
+                "state": "approved",
+            },
+            {
+                "user": {"login": "chatgpt-codex-connector"},
+                "commit_id": "sha2",
+                "submitted_at": "bad-timestamp",
+                "state": "approved",
+            },
+        ],
+    )
+
+    assert _get_codex_review_signals("owner/name", 42) == {
+        "latest_sha": "",
+        "latest_time": None,
+        "latest_state": "",
+    }
+
+
+def test_get_latest_codex_review_info_returns_tuple(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    submitted_at = datetime(2026, 4, 19, 11, 0, 0, tzinfo=_tz.utc)
+    monkeypatch.setattr(
+        "src.github_client._get_codex_review_signals",
+        lambda repo, pr_number: {
+            "latest_sha": "sha123",
+            "latest_time": submitted_at,
+            "latest_state": "APPROVED",
+        },
+    )
+
+    assert _get_latest_codex_review_info("owner/name", 42) == ("sha123", submitted_at)
+
+
+def test_ci_status_failure_states_take_precedence() -> None:
+    assert _ci_status_from_rollup(
+        [
+            "ignore-me",
+            {"conclusion": "failure"},
+            {"state": "success"},
+        ]
+    ) == CIStatus.FAILURE
+
+
+def test_ci_status_success_requires_all_states_success_like() -> None:
+    assert _ci_status_from_rollup(
+        [
+            {"state": "completed"},
+            {"status": "skipped"},
+            {"conclusion": "neutral"},
+        ]
+    ) == CIStatus.SUCCESS
+
+
+def test_ci_status_pending_when_states_missing_or_mixed() -> None:
+    assert _ci_status_from_rollup([{}, {"status": ""}]) == CIStatus.PENDING
+    assert _ci_status_from_rollup(
+        [{"state": "success"}, {"status": "in_progress"}]
+    ) == CIStatus.PENDING
+
+
+def test_parse_iso_returns_none_for_invalid_string() -> None:
+    assert _parse_iso("not-a-date") is None
