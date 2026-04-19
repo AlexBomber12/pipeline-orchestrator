@@ -97,12 +97,21 @@ class _FakeRedis:
     async def get(self, key: str) -> str | None:
         return self.store.get(key)
 
+    async def exists(self, key: str) -> int:
+        return int(key in self.store)
+
     async def delete(self, key: str) -> int:
         self.deleted.append(key)
         if key in self.store:
             del self.store[key]
             return 1
         return 0
+
+    async def renamenx(self, old: str, new: str) -> int:
+        if old not in self.store or new in self.store:
+            return 0
+        self.store[new] = self.store.pop(old)
+        return 1
 
     async def eval(self, script: str, numkeys: int, *args: Any) -> int:
         key = args[0]
@@ -2252,6 +2261,34 @@ def test_compute_diff_stats_returns_empty_dict_on_git_failure(
     assert runner._compute_diff_stats("main") == {}
 
 
+def test_compute_diff_stats_skips_malformed_and_invalid_numstat_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(
+            args=cmd,
+            stdout="bad row\nbogus\t1\tsrc/broken.py\n2\t4\tsrc/app.py\n",
+            returncode=0,
+        )
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    runner = _make_runner()
+
+    stats = runner._compute_diff_stats("main")
+
+    assert stats == {
+        "files_touched_count": 1,
+        "languages_touched": ["python"],
+        "diff_lines_added": 2,
+        "diff_lines_deleted": 4,
+        "test_file_ratio": 0.0,
+    }
+
+
+def test_ext_to_language_returns_none_for_unknown_extension() -> None:
+    assert PipelineRunner._ext_to_language("notes.unknown") is None
+
+
 def test_save_populates_enriched_fields_on_success_merged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2330,6 +2367,64 @@ def test_save_skips_enriched_fields_on_error_exit(
     assert recent[0].files_touched_count == 0
     assert recent[0].languages_touched == []
     assert recent[0].base_branch == ""
+
+
+def test_checkpoint_current_run_record_skips_save_without_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    save_calls: list[object] = []
+
+    async def fake_save(record: object) -> None:
+        save_calls.append(record)
+
+    monkeypatch.setattr(runner._metrics_store, "save", fake_save)
+
+    asyncio.run(runner._checkpoint_current_run_record())
+
+    assert save_calls == []
+
+
+def test_restore_current_run_record_clears_state_without_task() -> None:
+    runner = _make_runner()
+    runner._current_run_record = object()  # type: ignore[assignment]
+
+    asyncio.run(runner._restore_current_run_record())
+
+    assert runner._current_run_record is None
+
+
+def test_save_current_run_record_sets_duration_none_for_invalid_started_at() -> None:
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._start_current_run_record("claude", "opus")
+    assert runner._current_run_record is not None
+    runner._current_run_record.started_at = "not-an-iso-timestamp"
+
+    asyncio.run(
+        runner._save_current_run_record(
+            "coding_complete",
+            diff_stats={},
+            base_branch="main",
+        )
+    )
+
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+
+    assert len(recent) == 1
+    assert recent[0].duration_ms is None
 
 
 def test_handle_fix_errors_when_post_comment_fails(
@@ -4948,6 +5043,58 @@ def test_publish_state_keeps_selected_fallback_coder(
 
     assert name == "codex"
     assert runner.state.coder == "codex"
+
+
+def test_publish_state_copies_usage_snapshot_to_state() -> None:
+    from src.usage import UsageSnapshot
+
+    runner = _make_runner()
+    runner._claude_usage_provider = _FakeUsageProvider(
+        snapshot=UsageSnapshot(
+            session_percent=90,
+            session_resets_at=123,
+            weekly_percent=10,
+            weekly_resets_at=456,
+            fetched_at=0,
+        )
+    )
+
+    asyncio.run(runner.publish_state())
+
+    assert runner.state.usage_session_percent == 90
+    assert runner.state.usage_session_resets_at == 123
+    assert runner.state.usage_weekly_percent == 10
+    assert runner.state.usage_weekly_resets_at == 456
+
+
+def test_publish_state_for_inactive_repo_forces_idle_payload() -> None:
+    runner = _make_runner(active=False)
+    runner.state.state = PipelineState.ERROR
+
+    asyncio.run(runner.publish_state())
+
+    assert runner.redis.writes
+    _key, payload = runner.redis.writes[-1]
+    state = json.loads(payload)
+    assert state["state"] == PipelineState.IDLE.value
+    assert runner.state.state == PipelineState.ERROR
+
+
+def test_publish_state_migrates_owned_legacy_upload_key() -> None:
+    runner = _make_runner(url="https://github.com/octo/demo-renamed.git")
+    assert isinstance(runner.redis, _FakeRedis)
+    runner._old_basename = "demo"
+    runner.redis.store["pipeline:demo"] = json.dumps(
+        {"url": "https://github.com/octo/demo-renamed.git"}
+    )
+    runner.redis.store["upload:demo:pending"] = "pending"
+
+    asyncio.run(runner.publish_state())
+
+    assert "pipeline:demo" not in runner.redis.store
+    assert f"pipeline:{runner.name}" in runner.redis.store
+    assert "upload:demo:pending" not in runner.redis.store
+    assert runner.redis.store[f"upload:{runner.name}:pending"] == "pending"
 
 
 def test_run_cycle_resets_stale_transient_state(
