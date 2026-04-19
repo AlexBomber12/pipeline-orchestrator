@@ -234,7 +234,6 @@
 - Status: TODO
 - Tasks file: tasks/PR-109b.md
 - Branch: pr-109b-coverage-runner-state
-- Depends on: PR-109a
 
 ## PR-109c: 100% coverage for runner CLI log, waiting, run_cycle
 - Status: TODO
