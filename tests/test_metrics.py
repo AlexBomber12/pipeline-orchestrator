@@ -82,6 +82,15 @@ async def test_save_and_get_record() -> None:
     assert redis.lists["metrics:repo:AlexBomber12__pipeline-orchestrator:PR"] == ["run-1"]
 
 
+async def test_get_returns_none_when_redis_has_no_record() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+
+    saved = await store.get("missing-run")
+
+    assert saved is None
+
+
 async def test_recent_returns_latest() -> None:
     redis = _FakeRedis()
     store = MetricsStore(redis)
@@ -108,6 +117,34 @@ async def test_recent_reads_from_requested_task_namespace() -> None:
     recent = await store.recent(task_id="OPS-001", limit=5, repo_name="ops__repo")
 
     assert [record.run_id for record in recent] == ["ops-run"]
+
+
+async def test_recent_returns_empty_list_when_limit_is_zero() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+
+    async def _unexpected_lrange(*args: Any, **kwargs: Any) -> list[str]:
+        raise AssertionError("lrange should not be called when limit is zero")
+
+    redis.lrange = _unexpected_lrange  # type: ignore[method-assign]
+
+    recent = await store.recent(task_id="PR", limit=0)
+
+    assert recent == []
+
+
+async def test_recent_returns_empty_list_when_limit_is_negative() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+
+    async def _unexpected_lrange(*args: Any, **kwargs: Any) -> list[str]:
+        raise AssertionError("lrange should not be called when limit is negative")
+
+    redis.lrange = _unexpected_lrange  # type: ignore[method-assign]
+
+    recent = await store.recent(task_id="PR", limit=-1)
+
+    assert recent == []
 
 
 async def test_recent_isolated_by_repository_scope() -> None:
