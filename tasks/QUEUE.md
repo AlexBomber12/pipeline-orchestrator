@@ -201,7 +201,7 @@
 - Branch: pr-106-coverage-recovery
 
 ## PR-107a: 100% coverage for merge.handle_merge
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-107a.md
 - Branch: pr-107a-coverage-merge-handle
 
