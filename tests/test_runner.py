@@ -252,6 +252,7 @@ def _run_dirty_diagnose(
     changed = repo / "fix.txt"
     calls = []
     warnings = []
+    review_requests = []
     head_before = "abc123\n"
 
     async def fake_diag(*args: object, **kwargs: object):
@@ -275,6 +276,11 @@ def _run_dirty_diagnose(
     monkeypatch.setattr(error_module, "retry_transient", lambda op, **_: op())
     monkeypatch.setattr(error_module.logger, "warning", lambda msg: warnings.append(msg))
     runner = _make_runner()
+    monkeypatch.setattr(
+        runner,
+        "_post_codex_review",
+        lambda pr_number: review_requests.append(pr_number) or True,
+    )
     runner.repo_path = str(repo)
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "boom"
@@ -283,7 +289,7 @@ def _run_dirty_diagnose(
             number=119, branch="fix/diagnose-error-commits-fixes"
         )
     asyncio.run(runner.handle_error())
-    return runner, calls, warnings
+    return runner, calls, warnings, review_requests
 
 
 def test_preflight_returns_true_on_clean_repo(
@@ -3415,9 +3421,15 @@ def test_handle_error_escalate_keeps_error(monkeypatch: pytest.MonkeyPatch) -> N
 def test_handle_error_commits_and_pushes_diagnose_fixes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    runner, calls, _ = _run_dirty_diagnose(monkeypatch, tmp_path)
+    runner, calls, _, review_requests = _run_dirty_diagnose(monkeypatch, tmp_path)
 
     assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.push_count == 1
+    assert runner.state.current_pr.last_activity is not None
+    assert runner._last_push_at is not None
+    assert runner._last_push_at_pr_number == 119
+    assert review_requests == [119]
     assert [cmd[0] for cmd in calls] == [
         "status",
         "rev-parse",
@@ -3436,7 +3448,7 @@ def test_handle_error_commits_and_pushes_diagnose_fixes(
 def test_handle_error_resets_when_push_fails_and_escalates(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    runner, calls, warnings = _run_dirty_diagnose(
+    runner, calls, warnings, _ = _run_dirty_diagnose(
         monkeypatch, tmp_path, push_exc=RuntimeError("push failed")
     )
 
@@ -3449,7 +3461,7 @@ def test_handle_error_resets_when_push_fails_and_escalates(
 def test_handle_error_escalates_dirty_tree_without_active_pr_branch(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    runner, calls, _warnings = _run_dirty_diagnose(
+    runner, calls, _warnings, _ = _run_dirty_diagnose(
         monkeypatch, tmp_path, with_pr=False
     )
 
@@ -3464,7 +3476,7 @@ def test_handle_error_escalates_dirty_tree_without_active_pr_branch(
 def test_handle_error_escalates_dirty_tree_when_branch_mismatches_pr(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    runner, calls, warnings = _run_dirty_diagnose(
+    runner, calls, warnings, _ = _run_dirty_diagnose(
         monkeypatch, tmp_path, head_branch="main"
     )
 
@@ -3488,7 +3500,7 @@ def test_handle_error_escalates_dirty_tree_when_branch_mismatches_pr(
 def test_handle_error_discards_dirty_tree_for_non_fix_verdict(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    runner, calls, warnings = _run_dirty_diagnose(
+    runner, calls, warnings, _ = _run_dirty_diagnose(
         monkeypatch, tmp_path, diagnosis_stdout="ESCALATE\nhuman help"
     )
 

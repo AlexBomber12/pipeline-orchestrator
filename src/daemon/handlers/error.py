@@ -14,6 +14,7 @@ import asyncio
 import logging
 import re
 import subprocess
+from datetime import datetime, timezone
 from enum import Enum
 
 from src import claude_cli
@@ -188,6 +189,13 @@ class ErrorMixin:
                         ),
                         operation_name=f"git push origin HEAD:{branch}",
                     )
+                    if self.state.current_pr is not None:
+                        push_time = datetime.now(timezone.utc)
+                        self._last_push_at = push_time
+                        self._last_push_at_pr_number = self.state.current_pr.number
+                        self.state.current_pr.push_count += 1
+                        self.state.current_pr.last_activity = push_time
+                        self._post_codex_review(self.state.current_pr.number)
                 except (
                     subprocess.CalledProcessError,
                     subprocess.TimeoutExpired,
