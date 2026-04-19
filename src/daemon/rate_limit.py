@@ -108,6 +108,7 @@ class RateLimitMixin:
             )
             clearable = other_coder
             if clearable:
+                self.state.rate_limited_coders.discard(pause_coder)
                 self.state.rate_limited_until = None
                 self.state.rate_limit_reactive = False
                 self.state.rate_limit_reactive_coder = None

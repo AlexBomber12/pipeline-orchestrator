@@ -8849,6 +8849,18 @@ def test_get_coder_auto_fallback_switches_on_rate_limit_via_selector() -> None:
     assert plugin.name == "codex"
 
 
+def test_get_coder_repo_override_uses_selector_for_fallback() -> None:
+    from src.config import CoderType
+
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.rate_limited_coders.add("codex")
+
+    name, plugin = runner._get_coder()
+
+    assert name == "claude"
+    assert plugin.name == "claude"
+
+
 def test_get_coder_exploration_occasionally_picks_non_greedy() -> None:
     registry = CoderRegistry()
     registry.register(runner_module.build_coder_registry().get("claude"))
@@ -9023,6 +9035,7 @@ def test_check_rate_limit_codex_clears_proactive_claude_pause(
     result = asyncio.run(runner._check_rate_limit())
     assert result is True
     assert runner.state.rate_limited_until is None
+    assert "claude" not in runner.state.rate_limited_coders
     assert runner.state.state == PipelineState.IDLE
 
 
@@ -9056,12 +9069,14 @@ def test_check_rate_limit_codex_clears_reactive_claude_pause(
     runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
     runner.state.rate_limit_reactive = True
     runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders.add("claude")
     runner.state.state = PipelineState.PAUSED
 
     result = asyncio.run(runner._check_rate_limit())
     assert result is True
     assert runner.state.rate_limited_until is None
     assert runner.state.rate_limit_reactive is False
+    assert "claude" not in runner.state.rate_limited_coders
     assert runner.state.state == PipelineState.IDLE
 
 

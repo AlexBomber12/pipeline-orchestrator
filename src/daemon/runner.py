@@ -199,9 +199,6 @@ class PipelineRunner(
 
     def _get_coder(self) -> tuple[str, CoderPlugin]:
         """Return ``(coder_name, coder_plugin)`` for the active coder."""
-        if self.repo_config.coder is not None:
-            coder_name = self.repo_config.coder.value
-            return coder_name, self._registry.get(coder_name)
         ctx = SelectionContext(
             registry=self._registry,
             repo_config=self.repo_config,
