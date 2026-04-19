@@ -1739,8 +1739,20 @@ async def upload_tasks(
             "application/zip",
             "application/x-zip-compressed",
         }:
+            zip_chunks: list[bytes] = []
+            zip_size = 0
+            while True:
+                chunk = await f.read(_CHUNK)
+                if not chunk:
+                    break
+                zip_size += len(chunk)
+                if zip_size > _UPLOAD_MAX_TOTAL_BYTES:
+                    return _render_upload_error(
+                        request, "Total upload size exceeds 1 MB", 422, repo_name=name
+                    )
+                zip_chunks.append(chunk)
             try:
-                with zipfile.ZipFile(io.BytesIO(await f.read())) as archive:
+                with zipfile.ZipFile(io.BytesIO(b"".join(zip_chunks))) as archive:
                     for entry in archive.infolist():
                         entry_name = entry.filename
                         if entry.is_dir():

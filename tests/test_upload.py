@@ -312,6 +312,21 @@ def test_upload_zip_entry_read_error_returns_400(
     assert "encrypted, unsupported, or unreadable entries" in resp.text
 
 
+def test_upload_zip_raw_size_enforced_before_parse(
+    one_repo_config: Path,
+    repo_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _UnexpectedZipFile:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("zip parser should not run for oversized uploads")
+
+    monkeypatch.setattr(web_app, "_UPLOAD_MAX_TOTAL_BYTES", 200)
+    monkeypatch.setattr(web_app.zipfile, "ZipFile", _UnexpectedZipFile)
+    resp = _post_upload([("files", ("tasks.zip", b"x" * 250, "application/zip"))])
+    assert resp.status_code == 422 and "Total upload size exceeds 1 MB" in resp.text
+
+
 def test_upload_zip_total_extracted_size_enforced(
     one_repo_config: Path,
     repo_dir: Path,
