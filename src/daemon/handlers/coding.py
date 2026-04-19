@@ -25,6 +25,7 @@ class CodingMixin:
         for the PR; because the list API is eventually consistent, we
         retry a few times before surfacing an ERROR.
         """
+        await self._refresh_auth_status_cache()
         coder_name, plugin = self._get_coder()
         model = (
             self.app_config.daemon.codex_model

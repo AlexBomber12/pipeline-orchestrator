@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from src.coder_registry import CoderPlugin, CoderRegistry
 from src.config import AppConfig, RepoConfig
@@ -22,6 +23,7 @@ class SelectionContext:
     app_config: AppConfig
     state: RepoState
     rng: random.Random
+    auth_statuses: dict[str, dict[str, str]] | None = None
 
 
 def eligible_coders(ctx: SelectionContext) -> list[str]:
@@ -34,7 +36,7 @@ def eligible_coders(ctx: SelectionContext) -> list[str]:
     for name in ctx.registry.coder_names():
         if _is_rate_limited(name, ctx.state):
             continue
-        if _auth_failed(name, ctx.registry):
+        if _auth_failed(name, ctx.registry, ctx.auth_statuses):
             continue
         if _is_disabled_for_repo(name, ctx.repo_config):
             continue
@@ -97,12 +99,21 @@ def _greedy_order(eligible: list[str], ctx: SelectionContext) -> list[str]:
 
 
 def _is_rate_limited(name: str, state: RepoState) -> bool:
+    until = state.rate_limited_coder_until.get(name)
+    if until is not None:
+        return until > datetime.now(timezone.utc)
     if state.rate_limit_reactive_coder == name:
         return True
     return name in state.rate_limited_coders
 
 
-def _auth_failed(name: str, registry: CoderRegistry) -> bool:
+def _auth_failed(
+    name: str,
+    registry: CoderRegistry,
+    auth_statuses: dict[str, dict[str, str]] | None = None,
+) -> bool:
+    if auth_statuses is not None and name in auth_statuses:
+        return auth_statuses[name].get("status") != "ok"
     try:
         status = registry.get(name).check_auth()
     except Exception:

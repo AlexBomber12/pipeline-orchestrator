@@ -8935,6 +8935,29 @@ def test_get_coder_uses_selector(
     assert plugin is codex
 
 
+def test_get_coder_uses_cached_auth_statuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _allow_all_coder_auth(monkeypatch)
+    runner = _make_runner()
+    runner._auth_status_cache = {
+        "claude": {"status": "ok"},
+        "codex": {"status": "error"},
+    }
+    seen: list[object] = []
+
+    def fake_select(ctx: object) -> tuple[str, object]:
+        seen.append(ctx)
+        return ("claude", runner._registry.get("claude"))
+
+    monkeypatch.setattr(runner_module, "select_coder", fake_select)
+
+    runner._get_coder()
+
+    assert seen
+    assert getattr(seen[0], "auth_statuses") == runner._auth_status_cache
+
+
 def test_get_coder_falls_through_to_default_when_selector_returns_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9240,6 +9263,32 @@ def test_check_rate_limit_codex_honors_reactive_pause(
     result = asyncio.run(runner._check_rate_limit())
     assert result is False
     assert runner.state.rate_limited_until is not None
+
+
+def test_check_rate_limit_preserves_per_coder_expiry_windows() -> None:
+    runner = _make_runner()
+    now = datetime.now(timezone.utc)
+    claude_until = now + timedelta(minutes=20)
+    codex_until = now + timedelta(minutes=5)
+    runner.state.rate_limited_coders.update({"claude", "codex"})
+    runner.state.rate_limited_coder_until = {
+        "claude": claude_until,
+        "codex": codex_until,
+    }
+    runner.state.rate_limited_until = codex_until
+    runner.state.rate_limit_reactive_coder = "codex"
+    runner.state.rate_limit_reactive = False
+
+    assert selector_module._is_rate_limited("claude", runner.state) is True
+    assert selector_module._is_rate_limited("codex", runner.state) is True
+
+    runner.state.rate_limited_coder_until["codex"] = now - timedelta(minutes=1)
+    result = asyncio.run(runner._check_rate_limit(proactive_coder="codex"))
+
+    assert result is True
+    assert "codex" not in runner.state.rate_limited_coders
+    assert runner.state.rate_limited_coder_until.get("claude") == claude_until
+    assert selector_module._is_rate_limited("claude", runner.state) is True
 
 
 # ---------- Codex-specific rate limit detection tests ----------

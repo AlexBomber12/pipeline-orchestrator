@@ -638,6 +638,7 @@ class IdleMixin:
         if self.repo_config.coder is not None:
             coder_name = self.repo_config.coder.value
         else:
+            await self._refresh_auth_status_cache()
             coder_name = self._get_coder()[0]
         pause_coder = self.state.rate_limit_reactive_coder or "claude"
         diagnosis_pause = (

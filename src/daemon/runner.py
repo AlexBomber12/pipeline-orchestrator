@@ -26,7 +26,7 @@ import logging
 import random
 import subprocess
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import redis.asyncio as aioredis
@@ -179,6 +179,8 @@ class PipelineRunner(
         self._metrics_store = MetricsStore(redis_client)
         self._current_run_record: RunRecord | None = None
         self._selector_rng = random.Random(0)
+        self._auth_status_cache: dict[str, dict[str, str]] = {}
+        self._auth_status_cache_expires_at: datetime | None = None
 
     @property
     def app_config(self) -> AppConfig:
@@ -205,6 +207,7 @@ class PipelineRunner(
             app_config=self.app_config,
             state=self.state,
             rng=self._selector_rng,
+            auth_statuses=self._auth_status_cache or None,
         )
         result = select_coder(ctx)
         if result is not None:
@@ -212,6 +215,28 @@ class PipelineRunner(
         coder = self.repo_config.coder or self.app_config.daemon.coder
         coder_name = coder.value if isinstance(coder, CoderType) else str(coder)
         return coder_name, self._registry.get(coder_name)
+
+    async def _refresh_auth_status_cache(self) -> None:
+        """Refresh cached coder auth state off the event loop."""
+        now = datetime.now(timezone.utc)
+        if (
+            self._auth_status_cache
+            and self._auth_status_cache_expires_at is not None
+            and now < self._auth_status_cache_expires_at
+        ):
+            return
+
+        def _probe() -> dict[str, dict[str, str]]:
+            statuses: dict[str, dict[str, str]] = {}
+            for name in self._registry.coder_names():
+                try:
+                    statuses[name] = self._registry.get(name).check_auth()
+                except Exception:
+                    statuses[name] = {"status": "error"}
+            return statuses
+
+        self._auth_status_cache = await asyncio.to_thread(_probe)
+        self._auth_status_cache_expires_at = now + timedelta(minutes=5)
 
     def _load_current_task_metadata(self) -> tuple[str, str]:
         """Return ``(task_type, complexity)`` for the active task if available."""

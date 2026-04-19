@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 import re
+from datetime import datetime, timedelta, timezone
 
 from src.coder_registry import CoderRegistry
 from src.config import AppConfig, DaemonConfig, RepoConfig, CoderType
@@ -100,6 +101,19 @@ def test_rate_limited_excluded() -> None:
     assert "codex" not in eligible_coders(ctx)
 
 
+def test_expired_per_coder_window_does_not_block_selection() -> None:
+    ctx = _ctx(limited={"claude", "codex"})
+    ctx.state.rate_limited_coder_until = {
+        "claude": datetime.now(timezone.utc) - timedelta(minutes=1),
+        "codex": datetime.now(timezone.utc) + timedelta(minutes=5),
+    }
+
+    eligible = eligible_coders(ctx)
+
+    assert "claude" in eligible
+    assert "codex" not in eligible
+
+
 def test_auth_failed_excluded() -> None:
     ctx = _ctx(auth={"codex": "failed"})
 
@@ -108,6 +122,22 @@ def test_auth_failed_excluded() -> None:
 
 def test_auth_error_excluded() -> None:
     ctx = _ctx(auth={"codex": "error"})
+
+    assert "codex" not in eligible_coders(ctx)
+
+
+def test_cached_auth_statuses_avoid_hot_path_probes() -> None:
+    ctx = _ctx()
+    ctx.auth_statuses = {
+        "claude": {"status": "ok"},
+        "codex": {"status": "error"},
+        "gemini": {"status": "ok"},
+    }
+
+    def boom() -> dict[str, str]:
+        raise AssertionError("selector should use cached auth status")
+
+    ctx.registry.get("codex").check_auth = boom  # type: ignore[method-assign]
 
     assert "codex" not in eligible_coders(ctx)
 

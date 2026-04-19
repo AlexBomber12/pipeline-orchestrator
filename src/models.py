@@ -91,6 +91,7 @@ class RepoState(BaseModel):
     rate_limit_reactive: bool = False
     rate_limit_reactive_coder: str | None = None
     rate_limited_coders: set[str] = Field(default_factory=set)
+    rate_limited_coder_until: dict[str, datetime] = Field(default_factory=dict)
     usage_session_percent: int | None = None
     usage_session_resets_at: int | None = None
     usage_weekly_percent: int | None = None
