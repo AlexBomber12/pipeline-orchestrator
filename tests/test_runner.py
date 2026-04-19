@@ -244,6 +244,7 @@ def _run_dirty_diagnose(
     tmp_path: Path,
     push_exc: Exception | None = None,
     with_pr: bool = True,
+    head_branch: str = "fix/diagnose-error-commits-fixes",
 ):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -260,6 +261,8 @@ def _run_dirty_diagnose(
         calls.append(args)
         if args[:2] == ("status", "--porcelain"):
             return _FakeCompletedProcess(stdout=" M fix.txt\n" if changed.exists() else "")
+        if args[:3] == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return _FakeCompletedProcess(stdout=f"{head_branch}\n")
         if args[:2] == ("rev-parse", "HEAD"):
             return _FakeCompletedProcess(stdout=head_before)
         if push_exc and args[:2] == ("push", "origin"):
@@ -3414,7 +3417,19 @@ def test_handle_error_commits_and_pushes_diagnose_fixes(
     runner, calls, _ = _run_dirty_diagnose(monkeypatch, tmp_path)
 
     assert runner.state.state == PipelineState.IDLE
-    assert [cmd[0] for cmd in calls] == ["status", "rev-parse", "add", "commit", "push"]
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "rev-parse",
+        "rev-parse",
+        "add",
+        "commit",
+        "push",
+    ]
+    assert calls[-1] == (
+        "push",
+        "origin",
+        "HEAD:fix/diagnose-error-commits-fixes",
+    )
 
 
 def test_handle_error_resets_when_push_fails_and_escalates(
@@ -3440,6 +3455,24 @@ def test_handle_error_escalates_dirty_tree_without_active_pr_branch(
     assert [cmd[0] for cmd in calls] == ["status"]
     assert any(
         e["event"] == "diagnose_error: dirty tree without active PR/task branch"
+        for e in runner.state.history
+    )
+
+
+def test_handle_error_escalates_dirty_tree_when_branch_mismatches_pr(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, warnings = _run_dirty_diagnose(
+        monkeypatch, tmp_path, head_branch="main"
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert [cmd[0] for cmd in calls] == ["status", "rev-parse"]
+    assert warnings == []
+    assert any(
+        "diagnose_error: active branch mismatch ('main' != "
+        "'fix/diagnose-error-commits-fixes')"
+        == e["event"]
         for e in runner.state.history
     )
 

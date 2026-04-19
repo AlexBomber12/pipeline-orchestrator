@@ -138,8 +138,19 @@ class ErrorMixin:
                     "diagnose_error: dirty tree without active PR/task branch"
                 )
             else:
+                checked_out_branch = ""
                 head_before = ""
                 try:
+                    checked_out_branch = git_ops._git(
+                        self.repo_path, "rev-parse", "--abbrev-ref", "HEAD"
+                    ).stdout.strip()
+                    if checked_out_branch != branch:
+                        verdict = "ESCALATE"
+                        self.log_event(
+                            "diagnose_error: active branch mismatch "
+                            f"({checked_out_branch!r} != {branch!r})"
+                        )
+                        raise RuntimeError("diagnose_error branch mismatch")
                     head_before = git_ops._git(
                         self.repo_path, "rev-parse", "HEAD"
                     ).stdout.strip()
@@ -154,9 +165,13 @@ class ErrorMixin:
                     )
                     retry_transient(
                         lambda: git_ops._git(
-                            self.repo_path, "push", "origin", branch, timeout=60
+                            self.repo_path,
+                            "push",
+                            "origin",
+                            f"HEAD:{branch}",
+                            timeout=60,
                         ),
-                        operation_name=f"git push origin {branch}",
+                        operation_name=f"git push origin HEAD:{branch}",
                     )
                 except (
                     subprocess.CalledProcessError,
@@ -164,14 +179,15 @@ class ErrorMixin:
                     OSError,
                     RuntimeError,
                 ):
-                    git_ops._git(
-                        self.repo_path,
-                        "reset",
-                        "--hard",
-                        head_before or "HEAD",
-                        check=False,
-                    )
-                    logger.warning("diagnose_error made uncommittable changes, reset")
+                    if head_before:
+                        git_ops._git(
+                            self.repo_path,
+                            "reset",
+                            "--hard",
+                            head_before,
+                            check=False,
+                        )
+                        logger.warning("diagnose_error made uncommittable changes, reset")
                     verdict = "ESCALATE"
         if verdict == "SKIP":
             self.state.current_task = None
