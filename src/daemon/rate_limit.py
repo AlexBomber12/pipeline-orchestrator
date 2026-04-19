@@ -154,6 +154,14 @@ class RateLimitMixin:
             )
             clearable = other_coder
             if clearable:
+                if effective_until is not None:
+                    self.state.rate_limited_until = effective_until
+                    self.state.rate_limit_reactive_coder = effective_coder
+                    if self.state.state != PipelineState.PAUSED:
+                        self.state.state = PipelineState.PAUSED
+                    remaining = (effective_until - now).total_seconds()
+                    self.log_event(f"Rate limited, resuming in {int(remaining)}s")
+                    return False
                 if self.state.state == PipelineState.PAUSED:
                     if (
                         self.state.current_pr is not None

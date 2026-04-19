@@ -199,8 +199,8 @@ class PipelineRunner(
         self._claude_usage_provider = claude_usage_provider
         self._codex_usage_provider = codex_usage_provider
 
-    def _get_coder(self) -> tuple[str, CoderPlugin]:
-        """Return ``(coder_name, coder_plugin)`` for the active coder."""
+    def _select_coder(self) -> tuple[str, CoderPlugin] | None:
+        """Return the active selector choice without default fallback."""
         ctx = SelectionContext(
             registry=self._registry,
             repo_config=self.repo_config,
@@ -209,7 +209,11 @@ class PipelineRunner(
             rng=self._selector_rng,
             auth_statuses=self._auth_status_cache or None,
         )
-        result = select_coder(ctx)
+        return select_coder(ctx)
+
+    def _get_coder(self) -> tuple[str, CoderPlugin]:
+        """Return ``(coder_name, coder_plugin)`` for the active coder."""
+        result = self._select_coder()
         if result is not None:
             return result
         coder = self.repo_config.coder or self.app_config.daemon.coder

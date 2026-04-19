@@ -8225,6 +8225,27 @@ def test_handle_paused_clears_other_coder_from_rate_limited_set(
     assert runner.state.state == PipelineState.IDLE
 
 
+def test_handle_paused_stays_paused_when_no_alternate_coder_is_runnable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=20)
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders.update({"claude", "codex"})
+    runner.state.rate_limited_coder_until = {
+        "claude": datetime.now(timezone.utc) + timedelta(minutes=20),
+        "codex": datetime.now(timezone.utc) + timedelta(minutes=10),
+    }
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.rate_limited_until is not None
+
+
 def test_handle_paused_resumes_to_watch_when_window_expires(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9223,6 +9244,31 @@ def test_check_rate_limit_codex_clears_reactive_claude_pause(
     assert runner.state.rate_limit_reactive_coder == "claude"
     assert "claude" in runner.state.rate_limited_coders
     assert runner.state.state == PipelineState.IDLE
+
+
+def test_check_rate_limit_honors_effective_coder_pause_before_proactive_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.config import CoderType
+
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner(coder=CoderType.CODEX)
+    runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limit_reactive = True
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders.update({"claude", "codex"})
+    runner.state.rate_limited_coder_until = {
+        "claude": datetime.now(timezone.utc) + timedelta(minutes=10),
+        "codex": datetime.now(timezone.utc) + timedelta(minutes=5),
+    }
+    runner.state.state = PipelineState.PAUSED
+
+    result = asyncio.run(runner._check_rate_limit(proactive_coder="codex"))
+
+    assert result is False
+    assert runner.state.rate_limited_until is not None
+    assert runner.state.rate_limit_reactive_coder == "codex"
+    assert runner.state.state == PipelineState.PAUSED
 
 
 def test_check_rate_limit_expires_other_coder_pause_before_fallback(
