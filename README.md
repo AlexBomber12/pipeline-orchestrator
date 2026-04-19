@@ -10,8 +10,8 @@ Three components share a single `/data` runtime root:
 - **daemon** — stateless pipeline state machine. Reads structured headers from
   `tasks/PR-*.md` files, derives statuses from git state via `task_status.py`,
   and queries the GitHub API on every tick to decide what to do next.
-  Recoverable from a cold restart because state lives in Redis and can be
-  reconstructed from GitHub.
+  Recoverable from a cold restart because runtime state is rebuilt from
+  `tasks/QUEUE.md` and GitHub rather than process memory.
 - **web** — FastAPI dashboard (Jinja2 + HTMX). Renders the current state of
   repositories and PRs. Provides settings UI for managing repos and daemon
   configuration, and supports uploading task files and pushing them to repos.
