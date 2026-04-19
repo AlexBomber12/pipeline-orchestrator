@@ -15,6 +15,7 @@ import os
 import subprocess
 import tempfile
 import zipfile
+import zlib
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -1792,10 +1793,17 @@ async def upload_tasks(
                                             request, "Total upload size exceeds 1 MB", 422, repo_name=name
                                         )
                                     chunks.append(chunk)
-                        except (NotImplementedError, OSError, RuntimeError):
+                        except (
+                            EOFError,
+                            NotImplementedError,
+                            OSError,
+                            RuntimeError,
+                            zlib.error,
+                        ):
                             return _render_upload_error(
                                 request,
-                                f"Uploaded zip '{fname}' contains encrypted, unsupported, or unreadable entries.",
+                                f"Uploaded zip '{fname}' contains corrupt, encrypted, "
+                                "unsupported, or unreadable entries.",
                                 400,
                                 repo_name=name,
                             )

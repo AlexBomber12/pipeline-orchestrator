@@ -309,7 +309,23 @@ def test_upload_zip_entry_read_error_returns_400(
     monkeypatch.setattr(zipfile.ZipFile, "open", _raising_open)
     resp = _post_upload([zip_upload])
     assert resp.status_code == 400
-    assert "encrypted, unsupported, or unreadable entries" in resp.text
+    assert "corrupt, encrypted, unsupported, or unreadable entries" in resp.text
+
+
+def test_upload_zip_entry_decompression_error_returns_400(
+    one_repo_config: Path,
+    repo_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zip_upload = _zip_file({"PR-001.md": _task_bytes()})
+
+    def _raising_read(self, n=-1):
+        raise EOFError("truncated payload")
+
+    monkeypatch.setattr(zipfile.ZipExtFile, "read", _raising_read)
+    resp = _post_upload([zip_upload])
+    assert resp.status_code == 400
+    assert "corrupt, encrypted, unsupported, or unreadable entries" in resp.text
 
 
 def test_upload_zip_raw_size_enforced_before_parse(
