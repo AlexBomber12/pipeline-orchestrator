@@ -206,10 +206,10 @@ def test_scaffold_repo_accepts_claude_md_as_agents(
     assert "AGENTS.md" not in actions
 
 
-def test_ensure_claude_md_returns_false_for_missing_repo() -> None:
-    missing = "/tmp/definitely-missing-scaffolder-repo"
+def test_ensure_claude_md_returns_false_for_missing_repo(tmp_path: Path) -> None:
+    missing = tmp_path / "missing-repo"
 
-    assert scaffolder.ensure_claude_md(missing, "main") is False
+    assert scaffolder.ensure_claude_md(str(missing), "main") is False
 
 
 def test_ensure_claude_md_skips_when_remote_already_has_file(
