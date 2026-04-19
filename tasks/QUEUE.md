@@ -239,7 +239,6 @@
 - Status: TODO
 - Tasks file: tasks/PR-109c.md
 - Branch: pr-109c-coverage-runner-cycle
-- Depends on: PR-109b
 
 ## PR-110: 100% coverage for src/github_client.py
 - Status: TODO
