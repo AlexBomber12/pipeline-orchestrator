@@ -164,18 +164,96 @@ async def test_record_serialization() -> None:
     payload = json.loads(redis.store["metrics:run:run-serialized"])
 
     assert payload == {
+        "base_branch": "",
         "complexity": "medium",
+        "diff_lines_added": 0,
+        "diff_lines_deleted": 0,
         "duration_ms": None,
         "ended_at": None,
         "exit_reason": "success_merged",
+        "files_touched_count": 0,
         "fix_iterations": 0,
+        "had_merge_conflict": False,
+        "languages_touched": [],
         "operator_intervention": False,
+        "stage": "coder",
         "profile_id": "claude:opus:container",
         "repo_name": "AlexBomber12__pipeline-orchestrator",
         "run_id": "run-serialized",
         "started_at": "2026-04-18T10:00:00+00:00",
         "task_id": "PR-080",
         "task_type": "feature",
+        "test_file_ratio": 0.0,
         "tokens_in": 1200,
         "tokens_out": 800,
     }
+
+
+async def test_runrecord_roundtrip_with_new_fields() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+    record = _record(
+        "run-new-fields",
+        stage="reviewer",
+        files_touched_count=3,
+        languages_touched=["python", "yaml"],
+        diff_lines_added=12,
+        diff_lines_deleted=4,
+        test_file_ratio=0.333,
+        had_merge_conflict=True,
+        base_branch="main",
+    )
+
+    await store.save(record)
+
+    saved = await store.get("run-new-fields")
+
+    assert saved == record
+
+
+async def test_runrecord_roundtrip_from_old_payload_sets_defaults() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+    old_payload = {
+        "run_id": "legacy-run",
+        "task_id": "PR-080",
+        "repo_name": "AlexBomber12__pipeline-orchestrator",
+        "profile_id": "claude:opus:container",
+        "task_type": "feature",
+        "complexity": "medium",
+        "started_at": "2026-04-18T10:00:00+00:00",
+        "ended_at": "2026-04-18T10:05:00+00:00",
+        "duration_ms": 300000,
+        "fix_iterations": 0,
+        "tokens_in": 1200,
+        "tokens_out": 800,
+        "exit_reason": "success_merged",
+        "operator_intervention": False,
+    }
+    redis.store["metrics:run:legacy-run"] = json.dumps(old_payload)
+
+    saved = await store.get("legacy-run")
+
+    assert saved is not None
+    assert saved.stage == "coder"
+    assert saved.files_touched_count == 0
+    assert saved.languages_touched == []
+    assert saved.diff_lines_added == 0
+    assert saved.diff_lines_deleted == 0
+    assert saved.test_file_ratio == 0.0
+    assert saved.had_merge_conflict is False
+    assert saved.base_branch == ""
+
+
+def test_runrecord_stage_default_is_coder() -> None:
+    record = _record("stage-default")
+
+    assert record.stage == "coder"
+
+
+def test_runrecord_stage_accepts_planner_reviewer() -> None:
+    planner = _record("stage-planner", stage="planner")
+    reviewer = _record("stage-reviewer", stage="reviewer")
+
+    assert planner.stage == "planner"
+    assert reviewer.stage == "reviewer"

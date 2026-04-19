@@ -73,6 +73,8 @@ class MergeMixin:
                         self.log_event(
                             "Merge conflict with main, resolving..."
                         )
+                        if self._current_run_record is not None:
+                            self._current_run_record.had_merge_conflict = True
                         code, _stdout, _stderr = await claude_cli.run_claude_async(
                             "Resolve all merge conflicts in the working "
                             "tree. Keep both sides where possible. "

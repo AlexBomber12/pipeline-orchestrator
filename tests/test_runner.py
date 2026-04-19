@@ -1913,6 +1913,139 @@ def test_fix_iterations_survive_recovery_until_merge(
     assert recent[0].exit_reason == "success_merged"
 
 
+def test_start_current_run_record_sets_stage_coder() -> None:
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+
+    runner._start_current_run_record("claude", "opus")
+
+    assert runner._current_run_record is not None
+    assert runner._current_run_record.stage == "coder"
+
+
+def test_compute_diff_stats_returns_populated_fields_on_clean_diff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        assert cmd == ["git", "diff", "--numstat", "origin/main...HEAD"]
+        return _FakeCompletedProcess(
+            args=cmd,
+            stdout="10\t2\tsrc/app.py\n3\t1\ttests/test_app.py\n-\t-\tassets/logo.png\n",
+            returncode=0,
+        )
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    runner = _make_runner()
+
+    stats = runner._compute_diff_stats("main")
+
+    assert stats == {
+        "files_touched_count": 3,
+        "languages_touched": ["python"],
+        "diff_lines_added": 13,
+        "diff_lines_deleted": 3,
+        "test_file_ratio": 0.333,
+    }
+
+
+def test_compute_diff_stats_returns_empty_dict_on_git_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(args=cmd, stderr="boom", returncode=1)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    runner = _make_runner()
+
+    assert runner._compute_diff_stats("main") == {}
+
+
+def test_save_populates_enriched_fields_on_success_merged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._start_current_run_record("claude", "opus")
+    monkeypatch.setattr(
+        runner,
+        "_compute_diff_stats",
+        lambda base_branch: {
+            "files_touched_count": 4,
+            "languages_touched": ["python", "yaml"],
+            "diff_lines_added": 20,
+            "diff_lines_deleted": 5,
+            "test_file_ratio": 0.25,
+        },
+    )
+
+    asyncio.run(runner._save_current_run_record("success_merged"))
+
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+
+    assert len(recent) == 1
+    assert recent[0].files_touched_count == 4
+    assert recent[0].languages_touched == ["python", "yaml"]
+    assert recent[0].diff_lines_added == 20
+    assert recent[0].diff_lines_deleted == 5
+    assert recent[0].test_file_ratio == 0.25
+    assert recent[0].base_branch == "main"
+
+
+def test_save_skips_enriched_fields_on_error_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._start_current_run_record("claude", "opus")
+    calls: list[str] = []
+
+    def fake_compute(base_branch: str) -> dict[str, object]:
+        calls.append(base_branch)
+        return {"files_touched_count": 99}
+
+    monkeypatch.setattr(runner, "_compute_diff_stats", fake_compute)
+
+    asyncio.run(runner._save_current_run_record("error"))
+
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+
+    assert calls == []
+    assert len(recent) == 1
+    assert recent[0].files_touched_count == 0
+    assert recent[0].languages_touched == []
+    assert recent[0].base_branch == ""
+
+
 def test_handle_fix_errors_when_post_comment_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2305,6 +2438,7 @@ def test_handle_watch_approved_and_green_merges(
     runner.state.current_task = QueueTask(
         pr_id="PR-001", title="t", status=TaskStatus.DOING
     )
+    runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_watch())
 
     assert merged == [(runner.owner_repo, 5)]
@@ -2339,6 +2473,7 @@ def test_handle_watch_green_but_auto_merge_disabled_stays_watching(
     runner.state.current_task = QueueTask(
         pr_id="PR-001", title="t", status=TaskStatus.DOING
     )
+    runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_watch())
 
     assert merged == []
@@ -2686,11 +2821,14 @@ def test_handle_watch_approved_ci_pending_within_timeout_waits(
     )
 
 
-def test_handle_watch_pr_closed_returns_to_idle(
+def test_handle_watch_captures_success_merged_on_external_merge(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo, **kw: []
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "is_pr_merged", lambda repo, number: True
     )
 
     runner = _make_runner()
@@ -2699,11 +2837,89 @@ def test_handle_watch_pr_closed_returns_to_idle(
     runner.state.current_task = QueueTask(
         pr_id="PR-001", title="t", status=TaskStatus.DOING
     )
+    runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_watch())
 
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is None
     assert runner.state.current_task is None
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+    assert len(recent) == 1
+    assert recent[0].exit_reason == "success_merged"
+
+
+def test_handle_watch_captures_closed_unmerged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "is_pr_merged", lambda repo, number: False
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    runner._start_current_run_record("claude", "opus")
+
+    asyncio.run(runner.handle_watch())
+
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+
+    assert runner.state.state == PipelineState.IDLE
+    assert len(recent) == 1
+    assert recent[0].exit_reason == "closed_unmerged"
+
+
+def test_handle_watch_unknown_merge_state_logs_but_does_not_save(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "is_pr_merged", lambda repo, number: None
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    runner._start_current_run_record("claude", "opus")
+
+    asyncio.run(runner.handle_watch())
+
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+
+    assert runner.state.state == PipelineState.IDLE
+    assert recent == []
+    assert any(
+        "state unknown" in entry["event"] for entry in runner.state.history
+    )
 
 
 def test_handle_hung_posts_codex_review_and_returns_to_watch(
@@ -3223,6 +3439,7 @@ def test_handle_merge_resolves_conflict(
     runner.state.current_task = QueueTask(
         pr_id="PR-001", title="t", status=TaskStatus.DOING
     )
+    runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_merge())
 
     assert runner.state.state == PipelineState.WATCH
@@ -3230,6 +3447,8 @@ def test_handle_merge_resolves_conflict(
     assert not merge_pr_calls, (
         "merge_pr must not run with stale gate results after sync push"
     )
+    assert runner._current_run_record is not None
+    assert runner._current_run_record.had_merge_conflict is True
     assert any(
         cmd[:2] == ["git", "push"] and "pr-001" in cmd for cmd in git_calls
     ), "conflict-resolved HEAD must be pushed to origin"

@@ -379,7 +379,9 @@ async def _recent_repo_metrics_payload(
 
 _MERGE_EVENT_MARKER = "Merged PR"
 _ITERATION_EVENT_MARKER = "Fix pushed, iteration"
-_TERMINAL_METRICS_EXIT_REASONS = frozenset({"error", "rate_limit", "success_merged"})
+_TERMINAL_METRICS_EXIT_REASONS = frozenset(
+    {"error", "rate_limit", "success_merged", "closed_unmerged"}
+)
 _ACTIVE_STATES = frozenset(
     {PipelineState.CODING, PipelineState.WATCH, PipelineState.FIX}
 )
