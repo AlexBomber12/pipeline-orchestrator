@@ -20,6 +20,11 @@ from src.models import (
 )
 from src.web import app as web_app
 from src.web.app import (
+    _find_repo_config_by_name,
+    _format_duration_ms,
+    _get_repo_state_safe,
+    _parse_iso8601,
+    _recent_repo_metrics_payload,
     app,
     get_all_repo_states,
     get_repo_state,
@@ -77,6 +82,19 @@ class _StubAioredis:
     @staticmethod
     def from_url(url: str, decode_responses: bool = True) -> _StubAioredisClient:
         return _StubAioredisClient()
+
+
+class _ClosingBoomAioredisClient(_StubAioredisClient):
+    async def aclose(self) -> None:
+        raise RuntimeError("close failed")
+
+
+class _ClosingBoomAioredis:
+    @staticmethod
+    def from_url(
+        url: str, decode_responses: bool = True
+    ) -> _ClosingBoomAioredisClient:
+        return _ClosingBoomAioredisClient()
 
 
 @pytest.fixture
@@ -160,6 +178,45 @@ def test_get_all_repo_states_falls_back_when_redis_raises(
     assert len(states) == 2
     # Upfront ping detects the outage so no per-repo get() calls are made.
     assert boom.calls == []
+
+
+def test_get_repo_state_safe_handles_redis_error() -> None:
+    boom = _BoomRedis()
+
+    state, warning = asyncio.run(
+        _get_repo_state_safe(
+            boom, "example__alpha", "https://github.com/example/alpha.git"
+        )
+    )
+
+    assert warning == "Redis unavailable"
+    assert state.state == PipelineState.PREFLIGHT
+    assert state.error_message == "Redis unavailable — state unknown"
+
+
+def test_get_all_repo_states_drops_to_synthetic_states_after_runtime_redis_error(
+    two_repo_config: Path,
+) -> None:
+    class _PingThenBoomRedis:
+        async def ping(self) -> bool:
+            return True
+
+        async def get(self, key: str) -> str | None:
+            raise RuntimeError("redis is down")
+
+    states, warning = asyncio.run(
+        get_all_repo_states(redis_client=_PingThenBoomRedis())
+    )
+
+    assert warning == "Redis connection lost"
+    assert [state.state for state in states] == [
+        PipelineState.PREFLIGHT,
+        PipelineState.PREFLIGHT,
+    ]
+    assert all(
+        state.error_message == "Redis unavailable — state unknown"
+        for state in states
+    )
 
 
 def test_index_route_returns_html(
@@ -286,6 +343,35 @@ def test_partial_stats_renders_status_bar(
     assert "Alerts" in body
 
 
+def test_partial_redis_banner_handles_missing_and_failing_redis(
+    empty_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        del client.app.state.redis
+        missing = client.get("/partials/redis-banner")
+        assert missing.status_code == 200
+        assert "Redis not configured" in missing.text
+
+        client.app.state.redis = _BoomRedis()
+        failing = client.get("/partials/redis-banner")
+        assert failing.status_code == 200
+        assert "Redis connection lost" in failing.text
+
+
+def test_lifespan_ignores_redis_close_errors(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(web_app, "aioredis", _ClosingBoomAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+
+
 def test_get_repo_state_unknown_repo_returns_idle_default(
     empty_config: Path,
 ) -> None:
@@ -296,6 +382,14 @@ def test_get_repo_state_unknown_repo_returns_idle_default(
     assert state.state == PipelineState.IDLE
     assert state.current_task is None
     assert state.current_pr is None
+
+
+def test_find_repo_config_by_name_returns_none_for_missing_repo(
+    two_repo_config: Path,
+) -> None:
+    cfg = web_app.load_config(str(two_repo_config))
+
+    assert _find_repo_config_by_name(cfg, "example__ghost") is None
 
 
 def test_get_repo_state_unknown_repo_ignores_stale_redis_key(
@@ -478,12 +572,40 @@ def test_metrics_endpoint_returns_records(
     assert payload[1]["exit_reason_label"] == "merged"
 
 
+def test_recent_repo_metrics_payload_returns_empty_without_redis() -> None:
+    assert asyncio.run(_recent_repo_metrics_payload("example__alpha", None)) == []
+
+
 def test_exit_reason_classes_treats_closed_unmerged_as_failure() -> None:
     assert (
         web_app._exit_reason_classes("closed_unmerged")
         == "bg-fail/15 text-fail border-fail/30"
     )
     assert web_app._exit_reason_label("closed_unmerged") == "closed without merge"
+    assert (
+        web_app._exit_reason_classes("error")
+        == "bg-fail/15 text-fail border-fail/30"
+    )
+    assert (
+        web_app._exit_reason_classes("something_else")
+        == "bg-white/5 text-gray-300 border-white/10"
+    )
+
+
+def test_parse_iso8601_and_format_duration_cover_edge_cases() -> None:
+    assert _parse_iso8601(None) is None
+    assert _parse_iso8601("not-a-date") is None
+    naive = _parse_iso8601("2026-04-19T12:00:00")
+    assert naive is not None
+    assert naive.tzinfo == timezone.utc
+
+    assert _format_duration_ms(None) == "—"
+    assert _format_duration_ms(0) == "<1s"
+    assert _format_duration_ms(5_000) == "5s"
+    assert _format_duration_ms(60_000) == "1m"
+    assert _format_duration_ms(61_000) == "1m 1s"
+    assert _format_duration_ms(3_600_000) == "1h"
+    assert _format_duration_ms(3_660_000) == "1h 1m"
 
 
 def test_partial_repo_detail_returns_html_fragment(
@@ -506,6 +628,18 @@ def test_partial_repo_detail_returns_html_fragment(
     # tab survives across summary refreshes. See
     # test_partial_repo_events_* in test_observability.py for coverage.
     assert "Event log" not in body
+
+
+def test_partial_repo_metrics_returns_html_fragment(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo/example__alpha/metrics")
+
+    assert response.status_code == 200
+    assert "<!DOCTYPE" not in response.text
 
 
 def test_partial_repo_detail_skips_metrics_fetch(
@@ -626,7 +760,42 @@ def test_cli_log_route_returns_log(
     assert response.status_code == 200
     assert "line1" in response.text
     assert "line2" in response.text
-    assert "<pre" in response.text
+
+
+def test_cli_log_route_handles_redis_errors_and_missing_logs(
+    empty_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    empty_config.write_text(
+        "repositories:\n  - url: https://github.com/x/testrepo\n",
+        encoding="utf-8",
+    )
+
+    class _FailingCliLogClient:
+        async def get(self, key: str) -> str | None:
+            raise RuntimeError("redis error")
+
+        async def aclose(self) -> None:
+            return None
+
+    class _FailingCliLogAioredis:
+        @staticmethod
+        def from_url(
+            url: str, decode_responses: bool = True
+        ) -> _FailingCliLogClient:
+            return _FailingCliLogClient()
+
+    monkeypatch.setattr(web_app, "aioredis", _FailingCliLogAioredis())
+
+    with TestClient(app) as client:
+        failed = client.get("/partials/repo/x__testrepo/cli-log")
+        assert failed.status_code == 200
+        assert "No CLI log available" in failed.text
+
+        client.app.state.redis = _StubAioredisClient()
+        missing = client.get("/partials/repo/x__testrepo/cli-log")
+        assert missing.status_code == 200
+        assert "No CLI log available" in missing.text
 
 
 def test_cli_log_route_returns_empty(

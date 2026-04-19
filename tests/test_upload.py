@@ -194,6 +194,91 @@ def test_upload_blocked_when_redis_key_absent(
     assert "no state recorded" in resp.text
 
 
+def test_upload_blocked_when_redis_is_unavailable(
+    one_repo_config: Path,
+    repo_dir: Path,
+) -> None:
+    with TestClient(app) as client:
+        client.app.state.redis = None
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_queue_file()],
+        )
+
+    assert resp.status_code == 503
+    assert "Redis unavailable" in resp.text
+
+
+def test_upload_blocked_when_redis_get_fails(
+    one_repo_config: Path,
+    repo_dir: Path,
+) -> None:
+    class _ExplodingRedis:
+        async def get(self, key: str) -> str | None:
+            raise RuntimeError("boom")
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(app) as client:
+        client.app.state.redis = _ExplodingRedis()
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_queue_file()],
+        )
+
+    assert resp.status_code == 503
+    assert "Redis error" in resp.text
+
+
+def test_upload_blocked_when_repo_state_is_corrupt_or_not_idle(
+    one_repo_config: Path,
+    repo_dir: Path,
+) -> None:
+    class _CorruptRedis:
+        async def get(self, key: str) -> str | None:
+            return "{not-json"
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(app) as client:
+        client.app.state.redis = _CorruptRedis()
+        corrupt = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_queue_file()],
+        )
+        assert corrupt.status_code == 503
+        assert "corrupt data" in corrupt.text
+
+        class _BusyRedis:
+            async def get(self, key: str) -> str | None:
+                return '{"url":"","name":"example__alpha","state":"CODING"}'
+
+            async def aclose(self) -> None:
+                return None
+
+        client.app.state.redis = _BusyRedis()
+        busy = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_queue_file()],
+        )
+
+    assert busy.status_code == 422
+    assert "while repo is CODING" in busy.text
+
+
+def test_upload_requires_files(
+    one_repo_config: Path,
+    repo_dir: Path,
+) -> None:
+    with TestClient(app) as client:
+        resp = client.post("/repos/example__alpha/upload-tasks")
+
+    assert resp.status_code == 422
+    assert "No files uploaded" in resp.text
+
+
 def test_upload_without_queue_md(
     one_repo_config: Path,
     repo_dir: Path,
@@ -238,6 +323,27 @@ def test_upload_rejects_malformed_queue_md(
 
     assert resp.status_code == 400
     assert "QUEUE.md validation failed" in resp.text
+
+
+def test_upload_rejects_non_utf8_queue_and_task_files(
+    one_repo_config: Path,
+    repo_dir: Path,
+) -> None:
+    with TestClient(app) as client:
+        queue_resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[("files", ("QUEUE.md", b"\xff", "text/markdown"))],
+        )
+        assert queue_resp.status_code == 400
+        assert "QUEUE.md is not valid UTF-8" in queue_resp.text
+
+        task_resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_queue_file(), ("files", ("PR-001.md", b"\xff", "text/markdown"))],
+        )
+
+    assert task_resp.status_code == 400
+    assert "PR-001.md is not valid UTF-8" in task_resp.text
 
 
 def test_upload_invalid_filename(
@@ -379,6 +485,25 @@ def test_upload_empty_zip_rejected(
     assert "does not contain any task files" in resp.text
 
 
+def test_upload_zip_directory_entries_are_skipped(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("folder/", b"")
+        archive.writestr("PR-001.md", _task_bytes())
+
+    resp = _post_upload(
+        [("files", ("tasks.zip", buffer.getvalue(), "application/zip"))]
+    )
+
+    assert resp.status_code == 200
+    staging = next((uploads_dir / "example__alpha").iterdir())
+    assert {path.name for path in staging.iterdir()} == {"PR-001.md"}
+
+
 def test_upload_zip_unicode_decode_error_returns_400(
     one_repo_config: Path,
     repo_dir: Path,
@@ -413,6 +538,84 @@ def test_upload_zip_total_extracted_size_enforced(
     monkeypatch.setattr(zipfile.ZipFile, "open", _unexpected_open)
     resp = _post_upload([zip_upload])
     assert resp.status_code == 422 and "Total upload size exceeds 1 MB" in resp.text
+
+
+def test_upload_zip_largezipfile_returns_400(
+    one_repo_config: Path,
+    repo_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _HugeZipFile:
+        def __init__(self, *args, **kwargs) -> None:
+            raise zipfile.LargeZipFile("too large")
+
+    monkeypatch.setattr(web_app.zipfile, "ZipFile", _HugeZipFile)
+    resp = _post_upload([("files", ("huge.zip", b"zip-bytes", "application/zip"))])
+    assert resp.status_code == 400
+    assert "too large to extract" in resp.text
+
+
+def test_upload_zip_staged_size_limit_from_metadata_and_streaming(
+    one_repo_config: Path,
+    repo_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zip_upload = ("files", ("tasks.zip", b"zip-bytes", "application/zip"))
+
+    class _FakeInfo:
+        def __init__(self, filename: str, file_size: int) -> None:
+            self.filename = filename
+            self.file_size = file_size
+
+        def is_dir(self) -> bool:
+            return False
+
+    class _ChunkyReader:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self._chunks = list(chunks)
+
+        def read(self, n: int = -1) -> bytes:
+            return self._chunks.pop(0) if self._chunks else b""
+
+        def __enter__(self) -> "_ChunkyReader":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+    monkeypatch.setattr(web_app, "_UPLOAD_MAX_TOTAL_BYTES", 10)
+
+    class _MetadataZipFile:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self) -> "_MetadataZipFile":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        def infolist(self) -> list[_FakeInfo]:
+            return [_FakeInfo("PR-001.md", 20)]
+
+    monkeypatch.setattr(web_app.zipfile, "ZipFile", _MetadataZipFile)
+    metadata_resp = _post_upload([zip_upload])
+    assert metadata_resp.status_code == 422
+    assert "Total upload size exceeds 1 MB" in metadata_resp.text
+
+    monkeypatch.setattr(web_app, "_UPLOAD_MAX_TOTAL_BYTES", 15)
+
+    class _StreamingZipFile(_MetadataZipFile):
+        def infolist(self) -> list[_FakeInfo]:
+            return [_FakeInfo("PR-001.md", 5)]
+
+        def open(self, entry: _FakeInfo) -> _ChunkyReader:
+            return _ChunkyReader([b"a" * 20, b""])
+
+    monkeypatch.setattr(web_app.zipfile, "ZipFile", _StreamingZipFile)
+    stream_resp = _post_upload([zip_upload])
+    assert stream_resp.status_code == 422
+    assert "Total upload size exceeds 1 MB" in stream_resp.text
 
 
 def test_upload_rejects_task_without_depends_on(
@@ -636,6 +839,144 @@ def test_upload_preserves_staging_on_success(
     assert (subdirs[0] / "QUEUE.md").exists()
 
 
+def test_upload_large_plain_file_is_rejected(
+    one_repo_config: Path,
+    repo_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "_UPLOAD_MAX_TOTAL_BYTES", 10)
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[("files", ("QUEUE.md", b"x" * 20, "text/markdown"))],
+        )
+
+    assert resp.status_code == 422
+    assert "Total upload size exceeds 1 MB" in resp.text
+
+
+def test_upload_merge_pending_manifest_and_ignore_scan_errors(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    old_staging = uploads_dir / "example__alpha" / "existing"
+    old_staging.mkdir(parents=True)
+    (old_staging / "AGENTS.md").write_text("# AGENTS\n", encoding="utf-8")
+
+    class _PendingRedis:
+        def __init__(self) -> None:
+            self.manifest: str | None = None
+
+        async def get(self, key: str) -> str | None:
+            if key == "pipeline:example__alpha":
+                return '{"url":"","name":"example__alpha","state":"IDLE"}'
+            if key == "upload:example__alpha:pending":
+                return json.dumps(
+                    {
+                        "repo": "example__alpha",
+                        "files": ["AGENTS.md"],
+                        "staging_dir": str(old_staging),
+                    }
+                )
+            if key == b"upload:active:pending":
+                return json.dumps({"staging_dir": str(old_staging)})
+            if key == b"upload:other:pending":
+                raise RuntimeError("ignore sweep lookup failure")
+            return None
+
+        async def set(self, key: str, value: str, **kwargs: object) -> None:
+            self.manifest = value
+
+        async def scan_iter(self, match: str):
+            yield b"upload:active:pending"
+            yield b"upload:other:pending"
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(app) as client:
+        client.app.state.redis = _PendingRedis()
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_queue_file()],
+        )
+        redis_client = client.app.state.redis
+
+    assert resp.status_code == 200
+    assert redis_client.manifest is not None
+    manifest = json.loads(redis_client.manifest)
+    assert set(manifest["files"]) == {"QUEUE.md", "AGENTS.md"}
+    assert (Path(manifest["staging_dir"]) / "AGENTS.md").read_text(
+        encoding="utf-8"
+    ) == "# AGENTS\n"
+
+
+def test_upload_ignores_pending_manifest_read_errors(
+    one_repo_config: Path,
+    repo_dir: Path,
+) -> None:
+    class _ManifestReadErrorRedis:
+        async def get(self, key: str) -> str | None:
+            if key == "pipeline:example__alpha":
+                return '{"url":"","name":"example__alpha","state":"IDLE"}'
+            if key == "upload:example__alpha:pending":
+                raise RuntimeError("manifest read failed")
+            return None
+
+        async def set(self, key: str, value: str, **kwargs: object) -> None:
+            return None
+
+        async def scan_iter(self, match: str):
+            if False:
+                yield ""
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(app) as client:
+        client.app.state.redis = _ManifestReadErrorRedis()
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_queue_file()],
+        )
+
+    assert resp.status_code == 200
+
+
+def test_upload_ignores_invalid_existing_manifest_payload(
+    one_repo_config: Path,
+    repo_dir: Path,
+) -> None:
+    class _BadExistingManifestRedis:
+        async def get(self, key: str) -> str | None:
+            if key == "pipeline:example__alpha":
+                return '{"url":"","name":"example__alpha","state":"IDLE"}'
+            if key == "upload:example__alpha:pending":
+                return "{bad-json"
+            return None
+
+        async def set(self, key: str, value: str, **kwargs: object) -> None:
+            return None
+
+        async def scan_iter(self, match: str):
+            if False:
+                yield ""
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(app) as client:
+        client.app.state.redis = _BadExistingManifestRedis()
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_queue_file()],
+        )
+
+    assert resp.status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # Sweep tests
 # ---------------------------------------------------------------------------
@@ -693,3 +1034,31 @@ def test_sweep_preserves_keyed_directories(tmp_path: Path) -> None:
     )
     assert removed == 0
     assert old.exists()
+
+
+def test_sweep_handles_missing_root_files_and_stat_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uploads = tmp_path / "uploads"
+    assert sweep_abandoned_staging(str(uploads), set(), max_age_hours=24) == 0
+
+    uploads.mkdir()
+    (uploads / "README.txt").write_text("note", encoding="utf-8")
+    repo_dir_s = uploads / "myrepo"
+    repo_dir_s.mkdir()
+    (repo_dir_s / "manifest.json").write_text("{}", encoding="utf-8")
+    broken = repo_dir_s / "broken"
+    broken.mkdir()
+
+    original_stat = Path.stat
+    calls = {"broken": 0}
+
+    def _broken_stat(self: Path, *args: object, **kwargs: object):
+        if self == broken:
+            calls["broken"] += 1
+            if calls["broken"] > 1:
+                raise OSError("no stat")
+        return original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", _broken_stat)
+    assert sweep_abandoned_staging(str(uploads), set(), max_age_hours=24) == 0

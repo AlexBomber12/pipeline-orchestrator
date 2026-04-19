@@ -25,6 +25,7 @@ from src.web.app import (
     _build_activity_feed,
     _compute_stats,
     _parse_history_time,
+    _repo_badge_abbrev,
     _repo_badge_style,
     app,
 )
@@ -125,6 +126,11 @@ def test_repo_badge_style_is_stable_and_in_palette() -> None:
     assert first == second
     assert "bg-" in first
     assert first != other or first == other  # palette collisions are OK
+
+
+def test_repo_badge_abbrev_handles_empty_names() -> None:
+    assert _repo_badge_abbrev("") == "???"
+    assert _repo_badge_abbrev("alpha") == "ALP"
 
 
 def test_compute_stats_counts_active_alerts_and_merges() -> None:

@@ -620,6 +620,24 @@ def test_put_daemon_updates_exploration_epsilon(empty_config: Path) -> None:
     assert cfg.daemon.exploration_epsilon == 0.25
 
 
+def test_put_daemon_updates_optional_timeout_fields(empty_config: Path) -> None:
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={
+                "planned_pr_timeout_sec": "1200",
+                "fix_idle_timeout_sec": "300",
+                "rate_limit_weekly_pause_percent": "90",
+            },
+        )
+
+    assert response.status_code == 200
+    cfg = load_config(str(empty_config))
+    assert cfg.daemon.planned_pr_timeout_sec == 1200
+    assert cfg.daemon.fix_idle_timeout_sec == 300
+    assert cfg.daemon.rate_limit_weekly_pause_percent == 90
+
+
 def test_model_save_rejects_unknown_model(empty_config: Path) -> None:
     with TestClient(app) as client:
         response = client.put(
@@ -773,6 +791,25 @@ def test_put_daemon_invalid_exploration_epsilon_returns_422_html(
     assert cfg.daemon.exploration_epsilon == 0.15
 
 
+def test_put_daemon_rejects_invalid_coder_and_update_validation_error(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with TestClient(app) as client:
+        invalid = client.put("/settings/daemon", data={"coder": "other"})
+    assert invalid.status_code == 422
+
+    def _raise_value_error(*args: object, **kwargs: object) -> None:
+        raise ValueError("update rejected")
+
+    monkeypatch.setattr(web_app, "update_daemon_config", _raise_value_error)
+
+    with TestClient(app) as client:
+        response = client.put("/settings/daemon", data={"poll_interval_sec": "45"})
+
+    assert response.status_code == 422
+    assert "update rejected" in response.text
+
+
 def test_put_daemon_handles_readonly_config(
     empty_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -838,6 +875,42 @@ def test_put_daemon_error_oob_refreshes_coder_controls(
         r'name="coder"[\s\S]*value="codex"[\s\S]*checked',
         body,
     )
+
+
+def test_put_daemon_rejects_values_above_maximums(empty_config: Path) -> None:
+    with TestClient(app) as client:
+        int_response = client.put(
+            "/settings/daemon",
+            data={"rate_limit_weekly_pause_percent": "101"},
+        )
+        float_response = client.put(
+            "/settings/daemon",
+            data={"exploration_epsilon": "0.51"},
+        )
+
+    assert int_response.status_code == 422
+    assert "at most 100" in int_response.text
+    assert float_response.status_code == 422
+    assert "at most 0.5" in float_response.text
+
+
+def test_put_daemon_rejects_invalid_and_too_small_exploration_epsilon(
+    empty_config: Path,
+) -> None:
+    with TestClient(app) as client:
+        invalid = client.put(
+            "/settings/daemon",
+            data={"exploration_epsilon": "abc"},
+        )
+        too_small = client.put(
+            "/settings/daemon",
+            data={"exploration_epsilon": "-0.1"},
+        )
+
+    assert invalid.status_code == 422
+    assert "must be a number" in invalid.text
+    assert too_small.status_code == 422
+    assert "at least 0.0" in too_small.text
 
 
 def test_put_daemon_does_not_probe_auth_status(
@@ -956,6 +1029,57 @@ def test_api_auth_status_reports_errors(
     assert "not logged" in payload["gh"]["detail"].lower()
 
 
+def test_default_auth_status_and_first_probe_line_helpers() -> None:
+    default = web_app._default_auth_status()
+    assert default["claude"] == {
+        "status": "error",
+        "detail": "Status unavailable",
+    }
+    assert default["codex"] == {
+        "status": "error",
+        "detail": "Status unavailable",
+    }
+    assert default["gh"] == {
+        "status": "error",
+        "detail": "Status unavailable",
+    }
+    assert web_app._first_probe_line("") == ""
+    assert (
+        web_app._first_probe_line("warning: noisy\n\nready\nnext")
+        == "ready"
+    )
+
+
+def test_run_auth_command_reports_missing_binary_and_permission_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise_missing(*args: object, **kwargs: object) -> None:
+        raise FileNotFoundError("missing")
+
+    monkeypatch.setattr(web_app.subprocess, "run", _raise_missing)
+    assert web_app._run_auth_command(["ghost"]) == (127, "", "ghost not found")
+
+    def _raise_permission(*args: object, **kwargs: object) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(web_app.subprocess, "run", _raise_permission)
+    assert web_app._run_auth_command(["ghost"]) == (126, "", "denied")
+
+
+def test_check_gh_auth_without_output_reports_not_configured(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        web_app,
+        "_run_auth_command",
+        lambda *args, **kwargs: (1, "", ""),
+    )
+
+    status = web_app._check_gh_auth()
+
+    assert status == {"status": "error", "detail": "gh CLI not configured"}
+
+
 def test_api_auth_status_handles_timeout(
     empty_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -974,6 +1098,16 @@ def test_api_auth_status_handles_timeout(
     assert "timed out" in payload["claude"]["detail"]
     assert payload["gh"]["status"] == "error"
     assert "timed out" in payload["gh"]["detail"]
+
+
+def test_api_coders_returns_rows(empty_config: Path) -> None:
+    with TestClient(app) as client:
+        response = client.get("/api/coders")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "coders" in payload
+    assert {row["name"] for row in payload["coders"]} == {"claude", "codex"}
 
 
 def test_auth_probes_inject_config_auth_dirs_into_env(
@@ -1226,6 +1360,18 @@ def test_put_repo_updates_allow_merge_without_checks(
     assert response.status_code == 200
     cfg = load_config(str(one_repo_config))
     assert cfg.repositories[0].allow_merge_without_checks is True
+
+
+def test_put_repo_rejects_invalid_coder_value(one_repo_config: Path) -> None:
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/repos",
+            params={"url": "https://github.com/example/alpha.git"},
+            data={"coder": "other"},
+        )
+
+    assert response.status_code == 422
+    assert "coder must be" in response.text
 
 
 # ---------------------------------------------------------------------------
@@ -1598,3 +1744,38 @@ def test_repo_coder_change_saves_to_config(
     cfg = load_config(str(one_repo_config))
     assert cfg.repositories[0].coder is not None
     assert cfg.repositories[0].coder.value == "codex"
+
+
+def test_put_repo_detail_coder_handles_missing_invalid_clear_and_write_error(
+    one_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(one_repo_config))
+
+    with TestClient(app) as client:
+        missing = client.put("/settings/repo/example__ghost", data={"coder": "codex"})
+        assert missing.status_code == 404
+        assert "Repository not found" in missing.text
+
+        invalid = client.put(
+            "/settings/repo/example__alpha",
+            data={"coder": "other"},
+        )
+        assert invalid.status_code == 422
+        assert "coder must be 'claude', 'codex', or empty" in invalid.text
+
+        cleared = client.put("/settings/repo/example__alpha", data={"coder": ""})
+        assert cleared.status_code == 200
+
+    cfg = load_config(str(one_repo_config))
+    assert cfg.repositories[0].coder is None
+
+    monkeypatch.setattr(src_config, "save_config", _raise_permission_error)
+    with TestClient(app) as client:
+        write_error = client.put(
+            "/settings/repo/example__alpha",
+            data={"coder": "codex"},
+        )
+
+    assert write_error.status_code == 503
+    assert "Failed to write config.yml" in write_error.text
