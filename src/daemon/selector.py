@@ -107,6 +107,12 @@ def _is_rate_limited(name: str, state: RepoState) -> bool:
     until = state.rate_limited_coder_until.get(name)
     if until is not None:
         return until > datetime.now(timezone.utc)
+    if (
+        state.rate_limited_until is not None
+        and state.rate_limit_reactive_coder is None
+        and name == "claude"
+    ):
+        return state.rate_limited_until > datetime.now(timezone.utc)
     if state.rate_limit_reactive_coder == name:
         return True
     return name in state.rate_limited_coders

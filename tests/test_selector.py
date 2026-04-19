@@ -114,6 +114,16 @@ def test_expired_per_coder_window_does_not_block_selection() -> None:
     assert "codex" not in eligible
 
 
+def test_legacy_global_pause_blocks_claude_only() -> None:
+    ctx = _ctx()
+    ctx.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+    eligible = eligible_coders(ctx)
+
+    assert "claude" not in eligible
+    assert "codex" in eligible
+
+
 def test_auth_failed_excluded() -> None:
     ctx = _ctx(auth={"codex": "failed"})
 

@@ -6443,7 +6443,10 @@ def test_handle_coding_uses_configured_timeout(
         _repo_cfg(),
         AppConfig(
             repositories=[],
-            daemon=DaemonConfig(planned_pr_timeout_sec=1234),
+            daemon=DaemonConfig(
+                planned_pr_timeout_sec=1234,
+                auto_fallback=False,
+            ),
         ),
         _FakeRedis(),
         *_usage_providers(),
@@ -6977,12 +6980,13 @@ def test_rehydrate_clears_stale_on_mismatch_when_fetch_fails(
 def test_check_rate_limit_blocks_when_limited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """_check_rate_limit returns False when _rate_limited_until is in future."""
+    """_check_rate_limit blocks when the proactive coder is still paused."""
     _patch_subprocess(monkeypatch)
     runner = _make_runner()
     runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limit_reactive_coder = "claude"
 
-    assert asyncio.run(runner._check_rate_limit()) is False
+    assert asyncio.run(runner._check_rate_limit(proactive_coder="claude")) is False
     assert runner.state.rate_limited_until is not None
 
 
@@ -8251,7 +8255,7 @@ def test_handle_fix_success_ignores_rate_limit_text_in_stderr(
 def test_handle_paused_waits_when_window_active(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """rate_limited_until in future -> state stays PAUSED."""
+    """Legacy unattributed pause yields to an available fallback coder."""
     _patch_subprocess(monkeypatch)
 
     runner = _make_runner()
@@ -8260,8 +8264,9 @@ def test_handle_paused_waits_when_window_active(
 
     asyncio.run(runner.handle_paused())
 
-    assert runner.state.state == PipelineState.PAUSED
-    assert runner.state.rate_limited_until is not None
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.rate_limited_until is None
+    assert "claude" in runner.state.rate_limited_coders
 
 
 def test_handle_paused_clears_other_coder_from_rate_limited_set(
@@ -8382,7 +8387,7 @@ def test_handle_paused_handles_missing_rate_limited_until(
 def test_paused_not_reset_by_transient_states(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """run_cycle with state=PAUSED does not reset to IDLE via transient check."""
+    """run_cycle preserves PAUSED handling instead of transient-reset logic."""
     _patch_subprocess(monkeypatch)
 
     runner = _make_runner()
@@ -8393,20 +8398,22 @@ def test_paused_not_reset_by_transient_states(
 
     asyncio.run(runner.run_cycle())
 
-    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.state == PipelineState.IDLE
+    assert "claude" in runner.state.rate_limited_coders
 
 
 def test_check_rate_limit_transitions_to_paused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """rate_limited_until set, state was CODING -> transitions to PAUSED on check."""
+    """Current-coder pauses still transition CODING -> PAUSED on check."""
     _patch_subprocess(monkeypatch)
 
     runner = _make_runner()
     runner.state.state = PipelineState.CODING
     runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limit_reactive_coder = "claude"
 
-    result = asyncio.run(runner._check_rate_limit())
+    result = asyncio.run(runner._check_rate_limit(proactive_coder="claude"))
 
     assert result is False
     assert runner.state.state == PipelineState.PAUSED
