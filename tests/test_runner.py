@@ -23,6 +23,7 @@ from src.daemon.handlers import breach as breach_module
 from src.daemon.handlers import error as error_module
 from src.daemon.handlers import hung as hung_module
 from src.daemon.handlers import idle as idle_module
+from src.daemon.handlers import merge as merge_module
 from src.daemon.runner import ErrorCategory, PipelineRunner, _classify_error
 from src.models import (
     CIStatus,
@@ -3085,6 +3086,16 @@ def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None
     assert runner.state.current_task is None
 
 
+def test_handle_merge_without_current_pr_sets_idle() -> None:
+    runner = _make_runner()
+    runner.state.state = PipelineState.MERGE
+
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+
+
 def test_merge_finalizes_record(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
@@ -3502,6 +3513,55 @@ def test_handle_merge_errors_when_codex_post_fails_after_sync_push(
     assert "stale approval" in (runner.state.error_message or "")
 
 
+def test_handle_merge_aborts_when_conflict_resolution_is_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_calls: list[tuple[str, ...]] = []
+
+    def fake_git(
+        repo_path: str,
+        *args: str,
+        **kwargs: Any,
+    ) -> _FakeCompletedProcess:
+        git_calls.append(args)
+        if args[:2] == ("merge", "origin/main"):
+            return _FakeCompletedProcess(
+                args=["git", *args],
+                returncode=1,
+                stdout="CONFLICT (content): merge conflict in foo",
+            )
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def fake_check_rate_limit(*args: Any, **kwargs: Any) -> bool:
+        return False
+
+    claude_calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_check_rate_limit",
+        fake_check_rate_limit,
+    )
+    monkeypatch.setattr(
+        claude_cli,
+        "run_claude_async",
+        lambda *args, **kwargs: claude_calls.append(args),
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert ("merge", "--abort") in git_calls
+    assert not claude_calls
+
+
 def test_handle_merge_resolves_conflict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3671,6 +3731,52 @@ def test_handle_merge_refreshes_pr_head_before_merge(
     )
 
 
+def test_handle_merge_sets_error_on_non_conflict_sync_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_git(
+        repo_path: str,
+        *args: str,
+        **kwargs: Any,
+    ) -> _FakeCompletedProcess:
+        if args[:2] == ("merge", "origin/main"):
+            return _FakeCompletedProcess(
+                args=["git", *args],
+                returncode=1,
+                stderr="fatal: unrelated histories",
+            )
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._start_current_run_record("claude", "opus")
+
+    asyncio.run(runner.handle_merge())
+
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "fatal: unrelated histories" in (runner.state.error_message or "")
+    assert len(recent) == 1
+    assert recent[0].exit_reason == "error"
+
+
 def test_handle_merge_aborts_on_unresolvable_conflict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3730,6 +3836,52 @@ def test_handle_merge_aborts_on_unresolvable_conflict(
         if cmd[:3] == ["git", "merge", "--abort"]
     ]
     assert abort_cmds, "git merge --abort must be invoked"
+
+
+def test_handle_merge_sets_error_when_pre_sync_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_retry_transient(op: Any, **kwargs: Any) -> _FakeCompletedProcess:
+        return op()
+
+    def fake_git(
+        repo_path: str,
+        *args: str,
+        **kwargs: Any,
+    ) -> _FakeCompletedProcess:
+        if args[:3] == ("fetch", "origin", "main"):
+            raise OSError("network down")
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    monkeypatch.setattr(merge_module, "retry_transient", fake_retry_transient)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._start_current_run_record("claude", "opus")
+
+    asyncio.run(runner.handle_merge())
+
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "Pre-merge sync failed: network down"
+    assert len(recent) == 1
+    assert recent[0].exit_reason == "error"
 
 
 def test_handle_error_skip_clears_state(monkeypatch: pytest.MonkeyPatch) -> None:
