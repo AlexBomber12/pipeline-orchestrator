@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import io
 import json
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -104,6 +106,36 @@ def _task_file(
         header.append(f"- Depends on: {depends_on}")
     header.extend(["- Priority: 1", "- Coder: any", ""])
     return ("files", (name, "\n".join(header).encode("utf-8"), "text/markdown"))
+
+
+def _zip_file(
+    entries: dict[str, bytes],
+    *,
+    name: str = "tasks.zip",
+) -> tuple[str, tuple[str, bytes, str]]:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for entry_name, content in entries.items():
+            archive.writestr(entry_name, content)
+    return ("files", (name, buffer.getvalue(), "application/zip"))
+
+
+def _task_bytes(name: str = "PR-001.md", *, pr_id: str = "PR-001") -> bytes:
+    return _task_file(name, pr_id=pr_id)[1][1]
+
+
+def _post_upload(files: list[tuple[str, tuple[str, bytes, str]]]):
+    with TestClient(app) as client:
+        return client.post("/repos/example__alpha/upload-tasks", files=files)
+
+
+def _make_zip_error_test(
+    files: list[tuple[str, tuple[str, bytes, str]]], status: int, text: str
+):
+    def _test(one_repo_config: Path, repo_dir: Path) -> None:
+        assert (resp := _post_upload(files)).status_code == status and text in resp.text
+
+    return _test
 
 
 def test_upload_nonexistent_repo(
@@ -243,6 +275,144 @@ def test_upload_stages_files_and_sets_redis_key(
     assert (staging / "QUEUE.md").exists()
     assert (staging / "PR-001.md").exists()
     assert (staging / "QUEUE.md").read_bytes() == b"# Task Queue\n"
+
+
+def test_upload_zip_with_pr_files_extracts_and_succeeds(
+    one_repo_config: Path, repo_dir: Path, uploads_dir: Path
+) -> None:
+    resp = _post_upload([_zip_file({"PR-001.md": _task_bytes(), "PR-002.md": _task_bytes("PR-002.md", pr_id="PR-002")})])  # noqa: E501
+    assert resp.status_code == 200
+    staging = next((uploads_dir / "example__alpha").iterdir())
+    assert {path.name for path in staging.iterdir()} == {"PR-001.md", "PR-002.md"}
+
+
+test_upload_zip_with_nested_directories_rejected = _make_zip_error_test([_zip_file({"nested/PR-001.md": _task_bytes()})], 422, "path separators")  # noqa: E501
+test_upload_zip_with_non_md_entries_rejected = _make_zip_error_test([_zip_file({"README.md": b"# nope\n"})], 422, "Invalid file name")  # noqa: E501
+test_upload_zip_corrupt_returns_400 = _make_zip_error_test([("files", ("broken.zip", b"not-a-zip", "application/zip"))], 400, "corrupt or unreadable")  # noqa: E501
+
+
+def test_upload_zip_entry_read_error_returns_400(
+    one_repo_config: Path,
+    repo_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zip_upload = _zip_file({"PR-001.md": _task_bytes()})
+    original_open = zipfile.ZipFile.open
+
+    def _raising_open(self, name, mode="r", pwd=None, *, force_zip64=False):
+        if mode == "r":
+            raise RuntimeError("password required")
+        return original_open(
+            self, name, mode=mode, pwd=pwd, force_zip64=force_zip64
+        )
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", _raising_open)
+    resp = _post_upload([zip_upload])
+    assert resp.status_code == 400
+    assert "corrupt, encrypted, unsupported, or unreadable entries" in resp.text
+
+
+def test_upload_zip_entry_decompression_error_returns_400(
+    one_repo_config: Path,
+    repo_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zip_upload = _zip_file({"PR-001.md": _task_bytes()})
+
+    def _raising_read(self, n=-1):
+        raise EOFError("truncated payload")
+
+    monkeypatch.setattr(zipfile.ZipExtFile, "read", _raising_read)
+    resp = _post_upload([zip_upload])
+    assert resp.status_code == 400
+    assert "corrupt, encrypted, unsupported, or unreadable entries" in resp.text
+
+
+def test_upload_zip_raw_size_enforced_before_parse(
+    one_repo_config: Path,
+    repo_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _UnexpectedZipFile:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("zip parser should not run for oversized uploads")
+
+    monkeypatch.setattr(web_app, "_UPLOAD_MAX_TOTAL_BYTES", 200)
+    monkeypatch.setattr(web_app.zipfile, "ZipFile", _UnexpectedZipFile)
+    resp = _post_upload([("files", ("tasks.zip", b"x" * 250, "application/zip"))])
+    assert resp.status_code == 422 and "Total upload size exceeds 1 MB" in resp.text
+
+
+def test_upload_zip_total_raw_size_enforced_across_archives(
+    one_repo_config: Path,
+    repo_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zip_one = _zip_file({"PR-001.md": b"a" * 20}, name="one.zip")
+    zip_two = _zip_file({"PR-002.md": b"b" * 20}, name="two.zip")
+    original_zipfile = web_app.zipfile.ZipFile
+    calls = {"count": 0}
+
+    class _CountingZipFile(original_zipfile):
+        def __init__(self, *args, **kwargs) -> None:
+            calls["count"] += 1
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(
+        web_app,
+        "_UPLOAD_MAX_TOTAL_BYTES",
+        len(zip_one[1][1]) + len(zip_two[1][1]) - 1,
+    )
+    monkeypatch.setattr(web_app.zipfile, "ZipFile", _CountingZipFile)
+    resp = _post_upload([zip_one, zip_two])
+    assert resp.status_code == 422
+    assert "Total upload size exceeds 1 MB" in resp.text
+    assert calls["count"] == 1
+
+
+def test_upload_empty_zip_rejected(
+    one_repo_config: Path,
+    repo_dir: Path,
+) -> None:
+    resp = _post_upload([_zip_file({})])
+    assert resp.status_code == 422
+    assert "does not contain any task files" in resp.text
+
+
+def test_upload_zip_unicode_decode_error_returns_400(
+    one_repo_config: Path,
+    repo_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _BrokenZipFile:
+        def __init__(self, *args, **kwargs) -> None:
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(web_app.zipfile, "ZipFile", _BrokenZipFile)
+    resp = _post_upload([("files", ("broken.zip", b"zip-bytes", "application/zip"))])
+    assert resp.status_code == 400
+    assert "corrupt or unreadable" in resp.text
+
+
+def test_upload_zip_total_extracted_size_enforced(
+    one_repo_config: Path,
+    repo_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zip_upload = _zip_file({"PR-001.md": b"a" * 250})
+    original_open = zipfile.ZipFile.open
+
+    def _unexpected_open(self, name, mode="r", pwd=None, *, force_zip64=False):
+        if mode == "r":
+            raise AssertionError("zip entry should not be opened when size limit already fails")
+        return original_open(
+            self, name, mode=mode, pwd=pwd, force_zip64=force_zip64
+        )
+
+    monkeypatch.setattr(web_app, "_UPLOAD_MAX_TOTAL_BYTES", 200)
+    monkeypatch.setattr(zipfile.ZipFile, "open", _unexpected_open)
+    resp = _post_upload([zip_upload])
+    assert resp.status_code == 422 and "Total upload size exceeds 1 MB" in resp.text
 
 
 def test_upload_rejects_task_without_depends_on(

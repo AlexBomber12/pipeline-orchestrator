@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import os
 import subprocess
 import tempfile
+import zipfile
+import zlib
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -1728,10 +1731,102 @@ async def upload_tasks(
 
     # Validate file names and sizes (stream chunks to enforce limit early)
     total_size = 0
+    staged_size = 0
     file_contents: list[tuple[str, bytes]] = []
     _CHUNK = 64 * 1024
     for f in files:
         fname = f.filename or ""
+        content_type = (f.content_type or "").lower()
+        if fname.lower().endswith(".zip") or content_type in {
+            "application/zip",
+            "application/x-zip-compressed",
+        }:
+            zip_chunks: list[bytes] = []
+            zip_size = 0
+            while True:
+                chunk = await f.read(_CHUNK)
+                if not chunk:
+                    break
+                zip_size += len(chunk)
+                total_size += len(chunk)
+                if zip_size > _UPLOAD_MAX_TOTAL_BYTES or total_size > _UPLOAD_MAX_TOTAL_BYTES:
+                    return _render_upload_error(
+                        request, "Total upload size exceeds 1 MB", 422, repo_name=name
+                    )
+                zip_chunks.append(chunk)
+            try:
+                with zipfile.ZipFile(io.BytesIO(b"".join(zip_chunks))) as archive:
+                    extracted_file_count = 0
+                    for entry in archive.infolist():
+                        entry_name = entry.filename
+                        if entry.is_dir():
+                            continue
+                        if "/" in entry_name or "\\" in entry_name:
+                            return _render_upload_error(
+                                request,
+                                f"Zip entry '{entry_name}' must not contain path separators.",
+                                422,
+                                repo_name=name,
+                            )
+                        if not _re.match(_ALLOWED_TASK_PATTERN, entry_name):
+                            return _render_upload_error(
+                                request,
+                                f"Invalid file name: '{entry_name}'. Only QUEUE.md, AGENTS.md, "
+                                "CLAUDE.md, and PR-*.md allowed.",
+                                422,
+                                repo_name=name,
+                            )
+                        if staged_size + entry.file_size > _UPLOAD_MAX_TOTAL_BYTES:
+                            return _render_upload_error(
+                                request, "Total upload size exceeds 1 MB", 422, repo_name=name
+                            )
+                        try:
+                            chunks: list[bytes] = []
+                            entry_size = 0
+                            with archive.open(entry) as zipped_file:
+                                while True:
+                                    chunk = zipped_file.read(_CHUNK)
+                                    if not chunk:
+                                        break
+                                    entry_size += len(chunk)
+                                    if staged_size + entry_size > _UPLOAD_MAX_TOTAL_BYTES:
+                                        return _render_upload_error(
+                                            request, "Total upload size exceeds 1 MB", 422, repo_name=name
+                                        )
+                                    chunks.append(chunk)
+                        except (
+                            EOFError,
+                            NotImplementedError,
+                            OSError,
+                            RuntimeError,
+                            zlib.error,
+                        ):
+                            return _render_upload_error(
+                                request,
+                                f"Uploaded zip '{fname}' contains corrupt, encrypted, "
+                                "unsupported, or unreadable entries.",
+                                400,
+                                repo_name=name,
+                            )
+                        staged_size += entry_size
+                        file_contents.append((entry_name, b''.join(chunks)))
+                        extracted_file_count += 1
+                    if extracted_file_count == 0:
+                        return _render_upload_error(
+                            request,
+                            f"Uploaded zip '{fname}' does not contain any task files.",
+                            422,
+                            repo_name=name,
+                        )
+            except (UnicodeDecodeError, zipfile.BadZipFile):
+                return _render_upload_error(
+                    request, f"Uploaded zip '{fname}' is corrupt or unreadable.", 400, repo_name=name
+                )
+            except zipfile.LargeZipFile:
+                return _render_upload_error(
+                    request, f"Uploaded zip '{fname}' is too large to extract.", 400, repo_name=name
+                )
+            continue
         if not _re.match(_ALLOWED_TASK_PATTERN, fname):
             return _render_upload_error(
                 request,
@@ -1746,7 +1841,8 @@ async def upload_tasks(
             if not chunk:
                 break
             total_size += len(chunk)
-            if total_size > _UPLOAD_MAX_TOTAL_BYTES:
+            staged_size += len(chunk)
+            if total_size > _UPLOAD_MAX_TOTAL_BYTES or staged_size > _UPLOAD_MAX_TOTAL_BYTES:
                 return _render_upload_error(
                     request, "Total upload size exceeds 1 MB", 422, repo_name=name
                 )
