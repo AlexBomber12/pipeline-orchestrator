@@ -216,12 +216,21 @@ def _sync_runners(
     # Add new runners and refresh configs on existing ones.
     for key, repo in desired.items():
         if key in runners:
-            runners[key].repo_config = repo
-            runners[key].app_config = config
-            runners[key].set_usage_providers(
-                claude_usage_provider,
-                codex_usage_provider,
-            )
+            runner = runners[key]
+            if hasattr(runner, "stage_config_reload"):
+                runner.stage_config_reload(
+                    repo,
+                    config,
+                    claude_usage_provider,
+                    codex_usage_provider,
+                )
+            else:
+                runner.repo_config = repo
+                runner.app_config = config
+                runner.set_usage_providers(
+                    claude_usage_provider,
+                    codex_usage_provider,
+                )
             continue
         runner = _build_runner(
             repo,
@@ -313,12 +322,6 @@ async def main() -> None:
                     )
                     config = new_config
                     claude_usage_provider, codex_usage_provider = _create_usage_providers(config)
-                    for runner in runners.values():
-                        new_repo_config = _find_repo_config(
-                            config, runner.repo_config.url
-                        )
-                        if new_repo_config is not None:
-                            runner.repo_config = new_repo_config
                     _sync_runners(
                         runners,
                         config,

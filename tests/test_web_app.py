@@ -800,8 +800,9 @@ def test_repo_detail_route_renders_full_page(
     assert 'hx-trigger="every 5s"' in body
     assert "Current Task" in body
     assert "Current PR" in body
-    assert "Coder: Claude Code" in body
-    assert 'name="coder"' not in body
+    assert 'hx-post="/repos/example__alpha/coder"' in body
+    assert 'name="coder"' in body
+    assert "Any (bandit picks per-PR)" in body
     assert "Recent PRs" not in body
     assert "Event log" in body
 

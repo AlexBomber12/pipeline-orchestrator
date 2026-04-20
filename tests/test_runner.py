@@ -19,7 +19,7 @@ from src import codex_cli
 from src import retry as retry_module
 from src.coder_registry import CoderRegistry
 from src.coders import claude as claude_plugin_module
-from src.config import AppConfig, DaemonConfig, RepoConfig
+from src.config import AppConfig, CoderType, DaemonConfig, RepoConfig
 from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
 from src.daemon import selector as selector_module
@@ -278,6 +278,132 @@ def _make_runner(**repo_overrides: Any) -> PipelineRunner:
         datetime.now(timezone.utc) + timedelta(minutes=5)
     )
     return runner
+
+
+def test_reload_repo_config_if_dirty_updates_coder_at_idle_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    runner.redis.store["control:octo__demo:config_dirty"] = "1"
+    runner.repo_config = RepoConfig.model_validate(
+        {**runner.repo_config.model_dump(), "coder": None}
+    )
+
+    reloaded = AppConfig(
+        repositories=[
+            RepoConfig.model_validate(
+                {**runner.repo_config.model_dump(), "coder": "codex"}
+            )
+        ],
+        daemon=runner.app_config.daemon,
+    )
+    monkeypatch.setattr(runner_module, "load_config", lambda path="config.yml": reloaded)
+
+    asyncio.run(runner.reload_repo_config_if_dirty())
+
+    assert runner.repo_config.coder == CoderType.CODEX
+    assert "control:octo__demo:config_dirty" not in runner.redis.store
+    assert runner.state.history[-1]["event"] == "Reloaded repo config from config.yml"
+
+
+def test_staged_config_reload_waits_until_idle_boundary() -> None:
+    runner = _make_runner()
+    original_coder = runner.repo_config.coder
+    next_repo_config = RepoConfig.model_validate(
+        {**runner.repo_config.model_dump(), "coder": "codex"}
+    )
+    next_app_config = AppConfig(
+        repositories=[next_repo_config],
+        daemon=runner.app_config.daemon,
+    )
+    next_claude = _FakeUsageProvider(snapshot="new-claude")
+    next_codex = _FakeUsageProvider(snapshot="new-codex")
+
+    runner.state.state = PipelineState.WATCH
+    runner.stage_config_reload(
+        next_repo_config,
+        next_app_config,
+        next_claude,
+        next_codex,
+    )
+
+    assert runner.repo_config.coder == original_coder
+    assert runner._pending_repo_config is not None
+
+    runner.state.state = PipelineState.IDLE
+    asyncio.run(runner.reload_repo_config_if_dirty())
+
+    assert runner.repo_config.coder == CoderType.CODEX
+    assert runner.app_config is next_app_config
+    assert runner._pending_repo_config is None
+    assert runner._claude_usage_provider is next_claude
+    assert runner._codex_usage_provider is next_codex
+
+
+def test_reload_repo_config_if_dirty_clears_missing_repo_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    runner.redis.store["control:octo__demo:config_dirty"] = "1"
+    next_repo_config = RepoConfig.model_validate(
+        {**runner.repo_config.model_dump(), "coder": "codex"}
+    )
+    next_app_config = AppConfig(
+        repositories=[next_repo_config],
+        daemon=runner.app_config.daemon,
+    )
+    runner.stage_config_reload(
+        next_repo_config,
+        next_app_config,
+        _FakeUsageProvider(snapshot="new-claude"),
+        _FakeUsageProvider(snapshot="new-codex"),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "load_config",
+        lambda path="config.yml": AppConfig(
+            repositories=[],
+            daemon=runner.app_config.daemon,
+        ),
+    )
+
+    asyncio.run(runner.reload_repo_config_if_dirty())
+
+    assert "control:octo__demo:config_dirty" not in runner.redis.store
+    assert runner.repo_config.coder == CoderType.CODEX
+
+
+def test_reload_repo_config_if_dirty_supports_redis_without_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+
+    class _GetOnlyRedis:
+        def __init__(self, store: dict[str, str]) -> None:
+            self.store = store
+
+        async def get(self, key: str) -> str | None:
+            return self.store.get(key)
+
+        async def delete(self, key: str) -> int:
+            existed = key in self.store
+            self.store.pop(key, None)
+            return int(existed)
+
+    runner.redis = _GetOnlyRedis({"control:octo__demo:config_dirty": "1"})  # type: ignore[assignment]
+    reloaded = AppConfig(
+        repositories=[
+            RepoConfig.model_validate(
+                {**runner.repo_config.model_dump(), "coder": "codex"}
+            )
+        ],
+        daemon=runner.app_config.daemon,
+    )
+    monkeypatch.setattr(runner_module, "load_config", lambda path="config.yml": reloaded)
+
+    asyncio.run(runner.reload_repo_config_if_dirty())
+
+    assert runner.repo_config.coder == CoderType.CODEX
 
 
 def _allow_all_coder_auth(monkeypatch: pytest.MonkeyPatch) -> None:
