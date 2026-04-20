@@ -394,3 +394,33 @@
 - Status: DONE
 - Tasks file: tasks/PR-141.md
 - Branch: pr-141-rate-limit-active-only
+
+## PR-142: Clear upload feedback lifecycle
+- Status: TODO
+- Tasks file: tasks/PR-142.md
+- Branch: pr-142-upload-feedback-lifecycle
+
+## PR-143: Remove IDLE-only upload guard, accept uploads during any state
+- Status: TODO
+- Tasks file: tasks/PR-143.md
+- Branch: pr-143-upload-no-idle-guard
+
+## PR-149: Coder-neutral log_event text in Python handlers
+- Status: TODO
+- Tasks file: tasks/PR-149.md
+- Branch: pr-149-coder-neutral-logs
+
+## PR-150: Event log state badges have consistent width
+- Status: TODO
+- Tasks file: tasks/PR-150.md
+- Branch: pr-150-state-badge-alignment
+
+## PR-151: Play/Pause/Stop buttons size responsive and subtle
+- Status: TODO
+- Tasks file: tasks/PR-151.md
+- Branch: pr-151-button-sizing
+
+## PR-152: Remove nonfunctional Start badge from repo cards
+- Status: TODO
+- Tasks file: tasks/PR-152.md
+- Branch: pr-152-remove-start-badge
