@@ -24,7 +24,7 @@ from typing import Any, AsyncIterator, Literal
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
 from src.coders import build_coder_registry
@@ -40,6 +40,7 @@ from src.config import (
     update_daemon_config,
     update_repository,
 )
+from src.events.sse import RepoEventsUnavailableError, stream_repo_events
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
 from src.queue_parser import QueueValidationError, parse_queue_text, parse_task_header
@@ -836,6 +837,25 @@ async def api_stats(request: Request) -> JSONResponse:
     redis_client = getattr(request.app.state, "redis", None)
     states, _warning = await get_all_repo_states(redis_client)
     return JSONResponse(_compute_stats(states))
+
+
+@app.get("/api/repos/{name}/events")
+async def api_repo_events(name: str, request: Request) -> Response:
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return Response("Redis unavailable", status_code=503)
+    try:
+        stream = await stream_repo_events(redis_client, name, request)
+    except RepoEventsUnavailableError:
+        return Response("Redis unavailable", status_code=503)
+    return StreamingResponse(
+        stream,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/partials/redis-banner", response_class=HTMLResponse)
