@@ -361,7 +361,7 @@
 - Branch: pr-134-hover-states
 
 ## PR-135: Redis Pub/Sub event bus and SSE endpoint infrastructure
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-135.md
 - Branch: pr-135-sse-pubsub-infra
 
