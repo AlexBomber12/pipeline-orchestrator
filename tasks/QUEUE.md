@@ -346,7 +346,7 @@
 - Branch: pr-131-active-state-pulse
 
 ## PR-132: Grey state label when daemon has no updates for 30 seconds
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-132.md
 - Branch: pr-132-stalled-state-grey
 
