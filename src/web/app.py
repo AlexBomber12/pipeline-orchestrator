@@ -1975,7 +1975,9 @@ def _task_upload_summary(task_filenames: list[str]) -> str:
     return ", ".join(labels)
 
 
-def _build_upload_success_message(filenames: list[str]) -> str:
+def _build_upload_success_message(
+    filenames: list[str], repo_state: PipelineState
+) -> str:
     task_filenames = _unique_filenames(
         [
             filename for filename in filenames if _re.fullmatch(_TASK_UPLOAD_PATTERN, filename)
@@ -2000,7 +2002,15 @@ def _build_upload_success_message(filenames: list[str]) -> str:
         lines.append(
             f"Also uploaded helper {helper_noun}: {', '.join(sorted(helper_filenames))}."
         )
-    lines.append("Daemon will commit and push after the next polling cycle.")
+    if repo_state == PipelineState.IDLE:
+        lines.append(
+            "Daemon will commit on the next poll cycle (up to 60 seconds)."
+        )
+    else:
+        lines.append(
+            "Daemon is currently "
+            f"{repo_state.value}. Files will be committed when it returns to IDLE."
+        )
     lines.append("Auto-dismissing in 30 seconds.")
     return "\n".join(lines)
 
@@ -2087,14 +2097,6 @@ async def upload_tasks(
             503,
             repo_name=name,
         )
-    if repo_state.state != PipelineState.IDLE:
-        return _render_upload_error(
-            request,
-            f"Cannot upload while repo is {repo_state.state.value}. Wait until IDLE.",
-            422,
-            repo_name=name,
-        )
-
     if not files:
         return _render_upload_error(request, "No files uploaded", 422, repo_name=name)
 
@@ -2371,6 +2373,6 @@ async def upload_tasks(
 
     return _render_upload_success(
         request,
-        _build_upload_success_message(uploaded_filenames),
+        _build_upload_success_message(uploaded_filenames, repo_state.state),
         repo_name=name,
     )

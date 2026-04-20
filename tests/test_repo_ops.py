@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -554,6 +555,45 @@ def test_process_pending_uploads_counts_unique_task_filenames_in_log_event(
     assert _run(runner.process_pending_uploads()) is True
     assert any(
         "Uploaded 2 task files to tasks/ and pushed to main" in event
+        for event in runner.events
+    )
+
+
+def test_process_pending_uploads_logs_overwrite_collision_hashes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = _Runner(tmp_path)
+    repo_dir = Path(runner.repo_path)
+    tasks_dir = repo_dir / "tasks"
+    tasks_dir.mkdir(parents=True)
+    existing = tasks_dir / "PR-001.md"
+    existing.write_text("# old\n", encoding="utf-8")
+
+    staging = tmp_path / "uploads" / "demo"
+    staging.mkdir(parents=True)
+    incoming = staging / "PR-001.md"
+    incoming.write_text("# new\n", encoding="utf-8")
+    key = f"upload:{runner.name}:pending"
+    runner.redis.store[key] = json.dumps(
+        {"files": ["PR-001.md"], "staging_dir": str(staging)}
+    )
+
+    monkeypatch.setattr(
+        repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess()
+    )
+    monkeypatch.setattr(
+        repo_ops, "retry_transient", lambda func, operation_name=None: func()
+    )
+    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
+
+    assert _run(runner.process_pending_uploads()) is True
+
+    old_hash = hashlib.sha256(b"# old\n").hexdigest()
+    new_hash = hashlib.sha256(b"# new\n").hexdigest()
+    assert any(
+        "Upload overwrite warning: tasks/PR-001.md "
+        f"existing_sha256={old_hash} new_sha256={new_hash}" in event
         for event in runner.events
     )
 

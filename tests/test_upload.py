@@ -244,7 +244,7 @@ def test_upload_blocked_when_redis_get_fails(
     assert "Redis error" in resp.text
 
 
-def test_upload_blocked_when_repo_state_is_corrupt_or_not_idle(
+def test_upload_handles_corrupt_state_and_accepts_busy_repos(
     one_repo_config: Path,
     repo_dir: Path,
 ) -> None:
@@ -268,6 +268,9 @@ def test_upload_blocked_when_repo_state_is_corrupt_or_not_idle(
             async def get(self, key: str) -> str | None:
                 return '{"url":"","name":"example__alpha","state":"CODING"}'
 
+            async def set(self, key: str, value: str, **kwargs: object) -> None:
+                return None
+
             async def aclose(self) -> None:
                 return None
 
@@ -277,8 +280,11 @@ def test_upload_blocked_when_repo_state_is_corrupt_or_not_idle(
             files=[_queue_file()],
         )
 
-    assert busy.status_code == 422
-    assert "while repo is CODING" in busy.text
+    assert busy.status_code == 200
+    assert (
+        "Daemon is currently CODING. Files will be committed when it returns to IDLE."
+        in busy.text
+    )
 
 
 def test_upload_requires_files(
@@ -304,7 +310,7 @@ def test_upload_without_queue_md(
         )
     assert resp.status_code == 200
     assert "Accepted 1 task file (PR-001)." in resp.text
-    assert "Daemon will commit and push after the next polling cycle." in resp.text
+    assert "Daemon will commit on the next poll cycle (up to 60 seconds)." in resp.text
     assert "Auto-dismissing in 30 seconds." in resp.text
 
     repo_upload_dir = uploads_dir / "example__alpha"
@@ -392,6 +398,7 @@ def test_upload_stages_files_and_sets_redis_key(
     assert resp.headers["HX-Retarget"] == "#upload-feedback-example__alpha"
     assert "Dismiss upload feedback" in resp.text
     assert "::load" in resp.text
+    assert "Daemon will commit on the next poll cycle (up to 60 seconds)." in resp.text
 
     repo_upload_dir = uploads_dir / "example__alpha"
     subdirs = list(repo_upload_dir.iterdir())
@@ -893,6 +900,45 @@ def test_upload_writes_redis_manifest(
     assert set(manifest["files"]) == {"QUEUE.md", "PR-002.md"}
     assert "staging_dir" in manifest
     assert "/example__alpha/" in manifest["staging_dir"]
+
+
+def test_upload_accepts_tasks_during_coding_state(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _CodingRedis:
+        async def get(self, key: str) -> str | None:
+            if key == "pipeline:example__alpha":
+                return '{"url":"","name":"example__alpha","state":"CODING"}'
+            return None
+
+        async def set(self, key: str, value: str, **kwargs: object) -> None:
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        web_app,
+        "aioredis",
+        type("R", (), {"from_url": staticmethod(lambda *a, **kw: _CodingRedis())})(),
+    )
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_queue_file(), _task_file()],
+        )
+
+    assert resp.status_code == 200
+    assert "Accepted 1 task file (PR-001)." in resp.text
+    assert (
+        "Daemon is currently CODING. Files will be committed when it returns to IDLE."
+        in resp.text
+    )
+    assert "Cannot upload while repo is" not in resp.text
 
 
 # ---------------------------------------------------------------------------
