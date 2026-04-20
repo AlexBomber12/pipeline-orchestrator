@@ -123,6 +123,18 @@ def test_message_timestamp_rejects_malformed_payloads() -> None:
     assert _message_timestamp('{"timestamp":"not-a-timestamp"}') is None
 
 
+def test_message_timestamp_normalizes_naive_values_to_utc() -> None:
+    assert _message_timestamp('{"timestamp":"2026-04-20T15:00:00"}') == datetime(
+        2026,
+        4,
+        20,
+        15,
+        0,
+        0,
+        tzinfo=timezone.utc,
+    )
+
+
 async def test_is_disconnected_defaults_to_false_and_supports_sync_checker() -> None:
     class _NoChecker:
         pass
@@ -401,6 +413,63 @@ async def test_stream_repo_events_orders_buffered_and_history_messages_by_timest
     assert await anext(stream) == format_sse_event(buffered_older)
     assert await anext(stream) == format_sse_event(newer_history)
     assert await anext(stream) == format_sse_event(newest_history)
+    assert await anext(stream) == b":keepalive\n\n"
+
+    request.disconnected = True
+    try:
+        await anext(stream)
+    except StopAsyncIteration:
+        pass
+    else:
+        raise AssertionError("stream should stop after disconnect")
+
+
+async def test_stream_repo_events_orders_mixed_naive_and_aware_replay_timestamps() -> None:
+    redis = _FakeRedis()
+    request = _Request()
+    naive_history = json.dumps(
+        {
+            "type": "progress_updated",
+            "repo": "example__repo",
+            "data": {"percent": 10},
+            "timestamp": "2026-04-20T15:00:00",
+        }
+    )
+    aware_history = json.dumps(
+        {
+            "type": "progress_updated",
+            "repo": "example__repo",
+            "data": {"percent": 30},
+            "timestamp": "2026-04-20T15:00:02Z",
+        }
+    )
+    buffered_aware = json.dumps(
+        {
+            "type": "progress_updated",
+            "repo": "example__repo",
+            "data": {"percent": 20},
+            "timestamp": "2026-04-20T15:00:01Z",
+        }
+    )
+
+    async def _racing_lrange(key: str, start: int, stop: int) -> list[str]:
+        await redis.publish("repo-events:example__repo", buffered_aware)
+        return [aware_history, naive_history]
+
+    redis.lrange = _racing_lrange  # type: ignore[method-assign]
+
+    stream = await stream_repo_events(
+        redis,
+        "example__repo",
+        request,
+        history_limit=2,
+        keepalive_interval=0.0,
+        poll_interval=0.01,
+    )
+
+    assert await anext(stream) == format_sse_event(naive_history)
+    assert await anext(stream) == format_sse_event(buffered_aware)
+    assert await anext(stream) == format_sse_event(aware_history)
     assert await anext(stream) == b":keepalive\n\n"
 
     request.disconnected = True
