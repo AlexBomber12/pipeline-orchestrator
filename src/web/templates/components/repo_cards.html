@@ -1,3 +1,4 @@
+{% from "components/_controls.html" import repo_controls %}
 {% set state_styles = {
     'IDLE':      {'dot': 'bg-gray-500',  'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30',  'pulse': false},
     'PREFLIGHT': {'dot': 'bg-gray-500',  'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30',  'pulse': false},
@@ -61,6 +62,7 @@
                 {% endif %}
             </div>
             <div class="flex items-center gap-2 shrink-0">
+                {{ repo_controls(repo) }}
                 {% if repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done %}
                 <span class="text-xs font-medium px-2 py-0.5 rounded border border-accent/30 text-accent">Start</span>
                 {% endif %}

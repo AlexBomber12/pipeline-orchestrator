@@ -1,3 +1,4 @@
+{% from "components/_controls.html" import repo_controls %}
 {# Repo header + current-task + current-PR cards.
 
    Rendered on its own by /partials/repo/{name} so the 5s polling
@@ -36,6 +37,7 @@
     <span class="text-xs font-medium px-2 py-0.5 rounded border border-white/10 bg-surface-3 text-gray-300 font-mono">
         Coder: {% for c in coders %}{% if c.name == effective_coder %}{{ c.display_name }}{% endif %}{% endfor %}
     </span>
+    {{ repo_controls(repo) }}
     <span class="ml-auto font-mono text-xs text-gray-500">
         updated <span data-ts="{{ repo.last_updated.isoformat() if repo.last_updated else '' }}">{{ repo.last_updated.strftime('%Y-%m-%d %H:%M:%S') }}</span>
     </span>

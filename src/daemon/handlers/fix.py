@@ -74,6 +74,7 @@ class FixMixin(BreachMixin):
 
     async def handle_fix(self) -> None:
         """Run ``FIX REVIEW`` via the active coder CLI and return to WATCH."""
+        self._stop_requested = False
         await self._refresh_auth_status_cache()
         coder_name, plugin = self._get_coder(allow_exploration=False)
         if not await self._check_rate_limit(proactive_coder=coder_name):
@@ -157,6 +158,7 @@ class FixMixin(BreachMixin):
         heartbeat = asyncio.create_task(self._publish_while_waiting("FIX"))
         fix_kwargs: dict[str, object] = {
             "model": model,
+            "on_process_start": self._track_current_coder_process,
         }
         if coder_name == "claude":
             fix_kwargs.update(
@@ -171,6 +173,7 @@ class FixMixin(BreachMixin):
                 **fix_kwargs,
             )
         )
+        stop_monitor = asyncio.create_task(self._monitor_stop_request(claude_task))
         idle_monitor = asyncio.create_task(
             self._monitor_fix_idle(pr_number, idle_limit, claude_task, idle_flag)
         )
@@ -181,10 +184,14 @@ class FixMixin(BreachMixin):
                     breach_dir, breach_run_id, claude_task, breach_flag,
                 )
             )
+        stop_cancelled = False
         try:
             code, stdout, stderr = await claude_task
         except asyncio.CancelledError:
-            if breach_flag["breached"]:
+            if self._stop_requested:
+                stop_cancelled = True
+                code, stdout, stderr = 1, "", ""
+            elif breach_flag["breached"]:
                 if self.state.current_pr is not None:
                     self._rehydrate_last_push_at(self.state.current_pr)
                     try:
@@ -213,14 +220,17 @@ class FixMixin(BreachMixin):
                     f"paused until {self.state.rate_limited_until}"
                 )
                 return
-            if not idle_flag["timed_out"]:
+            elif not idle_flag["timed_out"]:
                 raise
-            code, stdout, stderr = 1, "", ""
+            else:
+                code, stdout, stderr = 1, "", ""
         finally:
+            stop_monitor.cancel()
             if breach_monitor is not None:
                 breach_monitor.cancel()
             idle_monitor.cancel()
             heartbeat.cancel()
+            self._current_coder_process = None
             if coder_name == "claude":
                 self._check_late_breach(breach_dir, breach_run_id, breach_flag)
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
@@ -253,6 +263,128 @@ class FixMixin(BreachMixin):
                 f"paused until {self.state.rate_limited_until}"
             )
             return
+
+        stop_requested_after_exit = False
+
+        async def capture_stop_requested_after_exit() -> bool:
+            nonlocal stop_requested_after_exit
+            if stop_requested_after_exit:
+                return True
+            if self._stop_requested:
+                stop_requested_after_exit = True
+                return True
+            requested = await self._pop_stop_request()
+            if not requested:
+                return False
+            self._stop_requested = True
+            self.state.user_paused = True
+            stop_requested_after_exit = True
+            self.log_event(
+                "User stop requested after FIX exit; deferring pause "
+                "until FIX bookkeeping completes"
+            )
+            return True
+
+        async def pause_for_stop_after_bookkeeping() -> bool:
+            if not stop_requested_after_exit:
+                return False
+            self.state.state = PipelineState.PAUSED
+            self.state.error_message = None
+            self.log_event("FIX aborted: user stop requested")
+            return True
+
+        def read_head_after_fix() -> str | None:
+            try:
+                return git_ops._git(
+                    self.repo_path, "rev-parse", "HEAD"
+                ).stdout.strip()
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+            ) as exc:
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = f"rev-parse after fix failed: {exc}"
+                self.log_event(self.state.error_message)
+                return None
+
+        def remote_branch_contains_head(branch: str, head_after: str) -> bool:
+            try:
+                git_ops._git(
+                    self.repo_path,
+                    "fetch",
+                    "origin",
+                    f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+                    timeout=60,
+                )
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+            ) as exc:
+                self.log_event(f"fetch {branch} failed after FIX stop: {exc}")
+                return False
+            try:
+                remote_head = git_ops._git(
+                    self.repo_path,
+                    "rev-parse",
+                    f"origin/{branch}",
+                ).stdout.strip()
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+            ) as exc:
+                self.log_event(
+                    f"rev-parse origin/{branch} failed after FIX stop: {exc}"
+                )
+                return False
+            if remote_head == head_after:
+                return True
+            try:
+                is_ancestor = git_ops._git(
+                    self.repo_path,
+                    "merge-base",
+                    "--is-ancestor",
+                    head_after,
+                    remote_head,
+                    check=False,
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                self.log_event(
+                    f"merge-base ancestry check failed after FIX stop: {exc}"
+                )
+                return False
+            return is_ancestor.returncode == 0
+
+        def record_fix_push(head_after: str, failure_detail: str) -> bool:
+            if head_before and head_before == head_after:
+                return True
+
+            push_time = datetime.now(timezone.utc)
+            self._last_push_at = push_time
+            if self.state.current_pr is not None:
+                self._last_push_at_pr_number = self.state.current_pr.number
+                self.state.current_pr.push_count += 1
+                self.state.current_pr.last_activity = push_time
+                iteration = self.state.current_pr.push_count
+            else:
+                iteration = 0
+
+            self.log_event(f"Fix pushed, iteration #{iteration}")
+            if (
+                self.state.current_pr is not None
+                and not self._post_codex_review(self.state.current_pr.number)
+            ):
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = (
+                    f"Failed to post @codex review on PR "
+                    f"#{self.state.current_pr.number} {failure_detail}"
+                )
+                return False
+            return True
+
+        await capture_stop_requested_after_exit()
         if idle_flag["timed_out"]:
             self.state.state = PipelineState.ERROR
             self.state.error_message = (
@@ -260,8 +392,33 @@ class FixMixin(BreachMixin):
             )
             self.log_event(self.state.error_message)
             await self._save_cli_log("", "", "FIX idle timeout")
+            if await pause_for_stop_after_bookkeeping():
+                return
             return
         await self._save_cli_log(stdout, stderr, f"FIX REVIEW output [{coder_name}]")
+        await capture_stop_requested_after_exit()
+        if stop_cancelled:
+            head_after = read_head_after_fix()
+            if head_after is None:
+                return
+            branch = self.state.current_pr.branch if self.state.current_pr is not None else ""
+            if branch and remote_branch_contains_head(branch, head_after):
+                if not record_fix_push(
+                    head_after,
+                    "after stop-cancel fix push; manual review trigger "
+                    "required to avoid fix/push loop",
+                ):
+                    return
+            elif head_before and head_before != head_after:
+                self.log_event(
+                    "FIX stop-cancel left local HEAD outside the fetched remote branch; "
+                    "skipping push bookkeeping and @codex review"
+                )
+            if await pause_for_stop_after_bookkeeping():
+                return
+            self.state.state = PipelineState.PAUSED
+            self.state.error_message = None
+            return
         if code != 0:
             self._detect_rate_limit(stderr, coder_name=coder_name)
             if self.state.rate_limited_until is not None:
@@ -272,50 +429,34 @@ class FixMixin(BreachMixin):
                     f"{self.state.rate_limited_until.isoformat()}"
                 )
                 return
+            if await pause_for_stop_after_bookkeeping():
+                return
             self.state.state = PipelineState.ERROR
             self.state.error_message = stderr.strip() or f"{coder_name} exit {code}"
             self.log_event(f"[{coder_name}] fix_review failed: {self.state.error_message}")
             return
 
-        head_after = ""  # PR-050: verify HEAD moved
-        try:
-            head_after = git_ops._git(
-                self.repo_path, "rev-parse", "HEAD"
-            ).stdout.strip()
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = f"rev-parse after fix failed: {exc}"
-            self.log_event(self.state.error_message)
+        head_after = read_head_after_fix()
+        if head_after is None:
             return
 
         if head_before and head_before == head_after:
             self._last_push_at = datetime.now(timezone.utc)
-            self.state.state = PipelineState.WATCH
             self.log_event(
                 "FIX REVIEW exited 0 but HEAD unchanged; "
                 "no push, skipping @codex review"
             )
+            if await pause_for_stop_after_bookkeeping():
+                return
+            self.state.state = PipelineState.WATCH
             return
 
-        push_time = datetime.now(timezone.utc)
-        self._last_push_at = push_time
-        if self.state.current_pr is not None:
-            self._last_push_at_pr_number = self.state.current_pr.number
-            self.state.current_pr.push_count += 1
-            self.state.current_pr.last_activity = push_time
-            iteration = self.state.current_pr.push_count
-        else:
-            iteration = 0
-
-        self.state.state = PipelineState.WATCH
-        self.log_event(f"Fix pushed, iteration #{iteration}")
-        if (
-            self.state.current_pr is not None
-            and not self._post_codex_review(self.state.current_pr.number)
+        if not record_fix_push(
+            head_after,
+            "after fix push; manual review trigger required "
+            "to avoid fix/push loop",
         ):
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = (
-                f"Failed to post @codex review on PR "
-                f"#{self.state.current_pr.number} after fix push; "
-                "manual review trigger required to avoid fix/push loop"
-            )
+            return
+        if await pause_for_stop_after_bookkeeping():
+            return
+        self.state.state = PipelineState.WATCH
