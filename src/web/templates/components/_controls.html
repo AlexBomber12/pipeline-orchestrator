@@ -18,7 +18,7 @@
 
 {% macro repo_controls(repo, extra_classes='') -%}
 {% set active_states = ['CODING', 'WATCH', 'FIX', 'MERGE'] %}
-{% set stop_states = ['CODING', 'WATCH', 'FIX', 'MERGE'] %}
+{% set stop_states = ['CODING', 'FIX'] %}
 {% set show_play = repo.user_paused or (repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done) %}
 {% set show_pause = (repo.state.value in active_states) and not repo.user_paused %}
 {% set show_stop = repo.state.value in stop_states %}
