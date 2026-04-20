@@ -11782,6 +11782,7 @@ def test_run_cycle_short_circuits_idle_when_user_paused(
 ) -> None:
     publishes: list[str] = []
     idle_calls: list[str] = []
+    preflight_calls: list[str] = []
     runner = _make_runner()
     runner._recovered = True
     runner._scaffolded = True
@@ -11798,7 +11799,11 @@ def test_run_cycle_short_circuits_idle_when_user_paused(
         publishes.append("published")
 
     monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
-    monkeypatch.setattr(runner, "preflight", lambda: True)
+    monkeypatch.setattr(
+        runner,
+        "preflight",
+        lambda: preflight_calls.append("preflight") or True,
+    )
     monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
     monkeypatch.setattr(runner, "publish_state", fake_publish_state)
 
@@ -11806,6 +11811,7 @@ def test_run_cycle_short_circuits_idle_when_user_paused(
     asyncio.run(runner.run_cycle())
 
     assert idle_calls == []
+    assert preflight_calls == []
     assert publishes == ["published", "published"]
     assert sum(
         1
