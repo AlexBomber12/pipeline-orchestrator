@@ -1,0 +1,11 @@
+{% set state_styles = {
+    'IDLE':      {'dot': 'bg-gray-500',  'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30',  'pulse': false, 'detail_pulse': false},
+    'PREFLIGHT': {'dot': 'bg-gray-500',  'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30',  'pulse': false, 'detail_pulse': false},
+    'CODING':    {'dot': 'bg-accent',    'badge': 'bg-accent/10 text-accent border-accent/30',         'pulse': true,  'detail_pulse': true},
+    'WATCH':     {'dot': 'bg-warn',      'badge': 'bg-warn/10 text-warn border-warn/30',               'pulse': true,  'detail_pulse': true},
+    'FIX':       {'dot': 'bg-warn',      'badge': 'bg-warn/10 text-warn border-warn/30',               'pulse': true,  'detail_pulse': true},
+    'MERGE':     {'dot': 'bg-ok',        'badge': 'bg-ok/10 text-ok border-ok/30',                     'pulse': false, 'detail_pulse': true},
+    'HUNG':      {'dot': 'bg-hung',      'badge': 'bg-hung/10 text-hung border-hung/30',               'pulse': false, 'detail_pulse': false},
+    'ERROR':     {'dot': 'bg-fail',      'badge': 'bg-fail/10 text-fail border-fail/30',               'pulse': false, 'detail_pulse': false},
+    'PAUSED':    {'dot': 'bg-warn',      'badge': 'bg-warn/10 text-warn border-warn/30',               'pulse': false, 'detail_pulse': false},
+} %}
