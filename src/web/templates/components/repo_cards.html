@@ -31,6 +31,8 @@
     {% set style = repo_state.state_styles.get(repo.state.value, repo_state.state_styles['IDLE']) %}
     {% set is_error = repo.state.value == 'ERROR' and not is_synthetic %}
     <div class="rounded-lg border bg-surface-2 p-4 cursor-pointer hover:border-white/10 transition-colors {{ 'border-l-2 border-l-fail border-white/5' if is_error else ('border-l-2 border-l-warn border-white/5' if is_synthetic else 'border-white/5') }}"
+         data-repo-card
+         data-repo="{{ repo.name }}"
          onclick="if(!event.target.closest('label,input,button,a')){window.location='/repo/{{ repo.name }}'}">
         {# Header row #}
         <div class="flex items-center justify-between mb-3">
@@ -93,11 +95,11 @@
         <div class="grid grid-cols-2 gap-4 text-xs mb-2">
             <div>
                 <div class="text-gray-500 mb-1">Sprint progress</div>
-                <div class="text-gray-300 mb-1">{{ repo.queue_done }} / {{ repo.queue_total }} done</div>
+                <div class="text-gray-300 mb-1" data-progress-text>{{ repo.queue_done }} / {{ repo.queue_total }} done</div>
                 <div class="h-1 bg-surface-3 rounded-full overflow-hidden">
-                    {% if repo.queue_total > 0 %}
-                    <div class="h-full bg-ok rounded-full" style="width: {{ (repo.queue_done / repo.queue_total * 100)|round(1) }}%"></div>
-                    {% endif %}
+                    <div class="h-full bg-ok rounded-full"
+                         data-progress-bar
+                         style="width: {{ ((repo.queue_done / repo.queue_total * 100) if repo.queue_total > 0 else 0)|round(1) }}%"></div>
                 </div>
             </div>
             <div>

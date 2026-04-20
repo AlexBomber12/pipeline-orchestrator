@@ -639,6 +639,25 @@ def test_partial_repo_list_renders_queue_progress(
     body = response.text
     assert "4 / 10 done" in body
     assert "PR-005" in body
+    assert 'data-repo="example__alpha"' in body
+    assert "data-progress-text" in body
+    assert "data-progress-bar" in body
+    assert "width: 40.0%" in body
+
+
+def test_index_bootstraps_progress_sse_manager(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "window.repoProgressSSEManager" in body
+    assert "new EventSource('/api/repos/' + encodeURIComponent(repoName) + '/events')" in body
+    assert "const MAX_DELAY_MS = 10000;" in body
 
 
 def test_partial_stats_renders_status_bar(

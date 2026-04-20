@@ -84,10 +84,10 @@ class RecoveryMixin:
             self.state.error_message = f"recover_state: get_open_prs failed: {exc}"
             self.log_event(f"recover_state failed: {exc}")
             return False
-        self.state.queue_done = sum(
-            1 for t in tasks if t.status == TaskStatus.DONE
+        self._set_queue_progress(
+            sum(1 for t in tasks if t.status == TaskStatus.DONE),
+            len(tasks),
         )
-        self.state.queue_total = len(tasks)
 
         doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
 

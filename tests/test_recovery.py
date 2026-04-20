@@ -28,9 +28,24 @@ class _FakeRedis:
 
     def __init__(self) -> None:
         self.writes: list[tuple[str, str]] = []
+        self.lists: dict[str, list[str]] = {}
 
     async def set(self, key: str, value: str) -> None:
         self.writes.append((key, value))
+
+    async def lpush(self, key: str, value: str) -> int:
+        bucket = self.lists.setdefault(key, [])
+        bucket.insert(0, value)
+        return len(bucket)
+
+    async def ltrim(self, key: str, start: int, stop: int) -> None:
+        values = self.lists.get(key, [])
+        if stop < 0:
+            stop = len(values) + stop
+        self.lists[key] = values[start:stop + 1]
+
+    async def publish(self, key: str, value: str) -> int:
+        return 1
 
 
 def _repo_cfg(**overrides: Any) -> RepoConfig:
@@ -161,6 +176,58 @@ def test_recover_state_sets_queue_counters(
 
     assert runner.state.queue_done == 1
     assert runner.state.queue_total == 3
+
+
+def test_recover_state_publish_state_emits_progress_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery should emit one progress_updated event after state save."""
+    done_task = QueueTask(
+        pr_id="PR-001", title="Done", status=TaskStatus.DONE,
+        branch="pr-001-done",
+    )
+    doing_task = _doing_task()
+    todo_task = QueueTask(
+        pr_id="PR-043", title="Todo", status=TaskStatus.TODO,
+        branch="pr-043-todo",
+    )
+    matching_pr = PRInfo(
+        number=17,
+        branch="pr-042-inflight",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+    )
+    published: list[tuple[str, str, dict[str, int], object | None]] = []
+
+    async def _fake_publish_repo_event(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, int],
+        redis_client: object | None = None,
+    ) -> None:
+        published.append((repo_name, event_type, payload, redis_client))
+
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [matching_pr]
+    )
+    monkeypatch.setattr(runner_module, "publish_repo_event", _fake_publish_repo_event)
+
+    runner = _make_runner()
+    runner._parse_base_queue = lambda **_: [done_task, doing_task, todo_task]  # type: ignore[method-assign]
+    runner.handle_coding = lambda: None  # type: ignore[method-assign]
+
+    asyncio.run(runner.recover_state())
+    asyncio.run(runner.publish_state())
+    asyncio.run(runner.publish_state())
+
+    assert published == [
+        (
+            runner.name,
+            "progress_updated",
+            {"queue_done": 1, "queue_total": 3},
+            runner.redis,
+        )
+    ]
 
 
 def test_recover_state_restores_pending_queue_sync_branch(
