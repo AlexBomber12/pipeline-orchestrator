@@ -11,6 +11,7 @@ from redis.exceptions import RedisError
 KEEPALIVE_INTERVAL_SECONDS = 15.0
 HISTORY_REPLAY_LIMIT = 20
 POLL_INTERVAL_SECONDS = 0.1
+INITIAL_BUFFER_DRAIN_LIMIT = HISTORY_REPLAY_LIMIT
 
 
 class RepoEventsUnavailableError(Exception):
@@ -75,7 +76,7 @@ async def stream_repo_events(
             history_messages = list(reversed(history))
             replayed_messages = set(history_messages)
             buffered_messages: list[str] = []
-            while True:
+            while len(buffered_messages) < INITIAL_BUFFER_DRAIN_LIMIT:
                 message = await pubsub.get_message(
                     ignore_subscribe_messages=True,
                     timeout=0.0,
@@ -85,7 +86,9 @@ async def stream_repo_events(
                 data = message.get("data")
                 if isinstance(data, bytes):
                     data = data.decode("utf-8")
-                if isinstance(data, str) and data not in replayed_messages:
+                if isinstance(data, str):
+                    if data in replayed_messages:
+                        continue
                     buffered_messages.append(data)
 
             for message in history_messages:

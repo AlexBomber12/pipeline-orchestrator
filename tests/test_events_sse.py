@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from redis.exceptions import ConnectionError
 from src.events import publisher
 from src.events.sse import (
+    INITIAL_BUFFER_DRAIN_LIMIT,
     RepoEventsUnavailableError,
     _is_disconnected,
     format_sse_comment,
@@ -327,6 +328,64 @@ async def test_stream_repo_events_stops_before_buffered_messages_when_disconnect
     assert frames == []
     assert pubsub.unsubscribed == ["repo-events:example__repo"]
     assert pubsub.closed is True
+
+
+async def test_stream_repo_events_bounds_initial_buffer_drain_under_load() -> None:
+    request = _Request()
+
+    class _BusyPubSub(_FakePubSub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.index = 0
+
+        async def get_message(
+            self,
+            *,
+            ignore_subscribe_messages: bool = True,
+            timeout: float = 0.0,
+        ) -> dict[str, Any] | None:
+            if timeout <= 0:
+                payload = json.dumps(
+                    publisher.build_repo_event(
+                        "example__repo",
+                        "progress_updated",
+                        {"percent": self.index},
+                    )
+                )
+                self.index += 1
+                return {"data": payload}
+            return None
+
+    class _BusyRedis(_FakeRedis):
+        def __init__(self) -> None:
+            super().__init__()
+            self.busy_pubsub = _BusyPubSub()
+
+        def pubsub(self) -> _BusyPubSub:
+            self.pubsubs.append(self.busy_pubsub)
+            return self.busy_pubsub
+
+    redis = _BusyRedis()
+    stream = await stream_repo_events(
+        redis,
+        "example__repo",
+        request,
+        keepalive_interval=0.0,
+        poll_interval=0.01,
+    )
+
+    first_frame = await asyncio.wait_for(anext(stream), timeout=0.1)
+
+    assert b'"percent": 0' in first_frame
+    assert redis.busy_pubsub.index == INITIAL_BUFFER_DRAIN_LIMIT
+
+    request.disconnected = True
+    try:
+        await anext(stream)
+    except StopAsyncIteration:
+        pass
+    else:
+        raise AssertionError("stream should stop after disconnect")
 
 
 async def test_stream_repo_events_raises_unavailable_when_history_fetch_fails() -> None:
