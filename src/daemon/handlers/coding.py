@@ -167,23 +167,35 @@ class CodingMixin:
                 f"paused until {self.state.rate_limited_until}"
             )
             return
+
+        async def pause_for_stop_if_requested() -> bool:
+            if self._stop_requested:
+                requested = True
+            else:
+                requested = await self._pop_stop_request()
+                if requested:
+                    self._stop_requested = True
+                    self.state.user_paused = True
+                    self.log_event(
+                        "User stop requested after coder exit; honoring persisted stop"
+                    )
+            if not requested:
+                return False
+            self.state.state = PipelineState.PAUSED
+            self.state.error_message = None
+            await self._save_current_run_record("error")
+            self.log_event("CODING aborted: user stop requested")
+            return True
+
         await self._save_cli_log(stdout, stderr, f"PLANNED PR output [{coder_name}]")
-        if not self._stop_requested and await self._pop_stop_request():
-            self._stop_requested = True
-            self.state.user_paused = True
-            self.log_event("User stop requested after coder exit; honoring persisted stop")
-        if not self._stop_requested:
+        if not await pause_for_stop_if_requested():
             await self._refresh_user_paused_from_redis()
             if self.state.user_paused:
                 self.log_event(
                     "User pause persisted during coder exit; finishing current run "
                     "before honoring pause"
                 )
-        if self._stop_requested:
-            self.state.state = PipelineState.PAUSED
-            self.state.error_message = None
-            await self._save_current_run_record("error")
-            self.log_event("CODING aborted: user stop requested")
+        if await pause_for_stop_if_requested():
             return
         if code != 0:
             self._detect_rate_limit(stderr, coder_name=coder_name)
@@ -204,6 +216,8 @@ class CodingMixin:
 
         candidate = None
         for attempt in range(3):
+            if await pause_for_stop_if_requested():
+                return
             try:
                 prs = github_client.get_open_prs(
                     self.owner_repo,
@@ -227,6 +241,8 @@ class CodingMixin:
                 )
                 await asyncio.sleep(5)
 
+        if await pause_for_stop_if_requested():
+            return
         if candidate is None:
             self.state.state = PipelineState.ERROR
             self.state.error_message = (

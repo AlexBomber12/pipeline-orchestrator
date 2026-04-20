@@ -2185,6 +2185,62 @@ def test_handle_coding_finishes_success_path_when_pause_persists_during_exit(
     )
 
 
+def test_handle_coding_honors_stop_requested_during_pr_retry_after_cli_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        _async_cli_result(0, "ok", ""),
+    )
+
+    attempts = {"count": 0}
+
+    def fake_get_open_prs(repo: str, **kw: Any) -> list[PRInfo]:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            return []
+        return [PRInfo(number=127, branch="pr-127-control-endpoints-backend")]
+
+    async def stale_stop_monitor(
+        _cli_task: asyncio.Task[tuple[int, str, str]],
+    ) -> None:
+        return None
+
+    pop_calls = {"count": 0}
+
+    async def fake_pop_stop_request() -> bool:
+        pop_calls["count"] += 1
+        return pop_calls["count"] == 4
+
+    async def instant_sleep(_seconds: float) -> None:
+        return None
+
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-127",
+        title="Pause controls",
+        status=TaskStatus.DOING,
+        branch="pr-127-control-endpoints-backend",
+    )
+    monkeypatch.setattr(runner_module.github_client, "get_open_prs", fake_get_open_prs)
+    monkeypatch.setattr(runner, "_pop_stop_request", fake_pop_stop_request)
+    monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
+    monkeypatch.setattr(runner, "_monitor_stop_request", stale_stop_monitor)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.user_paused is True
+    assert runner.state.current_pr is None
+    assert attempts["count"] == 1
+    assert any(
+        "after coder exit" in entry["event"].lower()
+        for entry in runner.state.history
+    )
+
+
 def test_handle_fix_posts_codex_review_after_push(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
