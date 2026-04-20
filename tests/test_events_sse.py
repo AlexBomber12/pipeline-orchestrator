@@ -104,9 +104,13 @@ async def _wait_for_pubsub(redis: _FakeRedis) -> _FakePubSub:
 def test_format_sse_helpers() -> None:
     event = format_sse_event('{"type":"progress_updated","repo":"alpha","data":{}}')
     default_event = format_sse_event('{"repo":"alpha","data":{}}')
+    invalid_event = format_sse_event("not-json")
+    scalar_event = format_sse_event('"not-an-object"')
 
     assert event == b'event: progress_updated\ndata: {"type":"progress_updated","repo":"alpha","data":{}}\n\n'
     assert default_event == b'event: message\ndata: {"repo":"alpha","data":{}}\n\n'
+    assert invalid_event == b":invalid event payload\n\n"
+    assert scalar_event == b":invalid event payload\n\n"
     assert format_sse_comment("keepalive") == b":keepalive\n\n"
 
 
@@ -181,6 +185,42 @@ async def test_stream_repo_events_emits_keepalive_after_ignored_message() -> Non
     await pubsub.messages.put({"data": 123})
 
     assert await next_message == b":keepalive\n\n"
+
+    request.disconnected = True
+    try:
+        await anext(stream)
+    except StopAsyncIteration:
+        pass
+    else:
+        raise AssertionError("stream should stop after disconnect")
+
+
+async def test_stream_repo_events_sanitizes_invalid_history_and_live_messages() -> None:
+    redis = _FakeRedis()
+    request = _Request()
+    valid_message = json.dumps(
+        publisher.build_repo_event("example__repo", "progress_updated", {"percent": 50})
+    )
+    redis.lists["repo-events-history:example__repo"] = ["not-json"]
+
+    stream = await stream_repo_events(
+        redis,
+        "example__repo",
+        request,
+        keepalive_interval=60.0,
+        poll_interval=0.01,
+    )
+
+    assert await anext(stream) == b":invalid event payload\n\n"
+
+    next_message = asyncio.create_task(anext(stream))
+    pubsub = await _wait_for_pubsub(redis)
+    await pubsub.messages.put({"data": b"not-json"})
+    assert await next_message == b":invalid event payload\n\n"
+
+    next_message = asyncio.create_task(anext(stream))
+    await pubsub.messages.put({"data": valid_message.encode("utf-8")})
+    assert await next_message == format_sse_event(valid_message)
 
     request.disconnected = True
     try:

@@ -28,7 +28,12 @@ def _history_name(repo_name: str) -> str:
 
 def format_sse_event(message: str) -> bytes:
     """Serialize a JSON event message into SSE wire format."""
-    event = json.loads(message)
+    try:
+        event = json.loads(message)
+    except (TypeError, json.JSONDecodeError):
+        return format_sse_comment("invalid event payload")
+    if not isinstance(event, dict):
+        return format_sse_comment("invalid event payload")
     event_type = event.get("type", "message")
     return f"event: {event_type}\ndata: {message}\n\n".encode("utf-8")
 
