@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import subprocess
 from typing import Any
 from unittest.mock import patch
@@ -609,6 +610,24 @@ def test_main_calls_setup_git_auth_before_runners(
 
     assert call_order.index("setup_git_auth") < call_order.index("validate_auth")
     assert len(_FakeRunner.instances) == 1
+
+
+def test_main_maps_gh_config_dir_to_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """main() must mirror GH_CONFIG_DIR into GH_CONFIG_HOME for gh."""
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    _patch_main(monkeypatch, config)
+    monkeypatch.setenv("GH_CONFIG_DIR", "/tmp/custom-gh-config")
+    monkeypatch.delenv("GH_CONFIG_HOME", raising=False)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    assert os.environ["GH_CONFIG_HOME"] == "/tmp/custom-gh-config"
 
 
 def test_per_repo_poll_interval(

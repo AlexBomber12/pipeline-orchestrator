@@ -179,6 +179,14 @@ class _ClosingBoomAioredis:
         return _ClosingBoomAioredisClient()
 
 
+def _stub_aioredis_with_state(fake: object) -> object:
+    return type(
+        "_StubAioredisWithMutableState",
+        (),
+        {"from_url": staticmethod(lambda url, decode_responses=True: fake)},
+    )()
+
+
 @pytest.fixture
 def empty_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     cfg = tmp_path / "config.yml"
@@ -371,11 +379,7 @@ def test_pause_resume_stop_endpoints_update_repo_state(
         state=PipelineState.IDLE,
     )
     fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
-    monkeypatch.setattr(
-        web_app,
-        "aioredis",
-        type("_StubAioredisWithMutableState", (), {"from_url": staticmethod(lambda url, decode_responses=True: fake)})(),
-    )
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
 
     with TestClient(app) as client:
         pause = client.post("/repos/example__alpha/pause")
@@ -407,11 +411,7 @@ def test_pause_endpoint_is_idempotent(
         user_paused=True,
     )
     fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
-    monkeypatch.setattr(
-        web_app,
-        "aioredis",
-        type("_StubAioredisWithMutableState", (), {"from_url": staticmethod(lambda url, decode_responses=True: fake)})(),
-    )
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
 
     with TestClient(app) as client:
         first = client.post("/repos/example__alpha/pause")
@@ -434,11 +434,7 @@ def test_resume_endpoint_is_idempotent(
         user_paused=False,
     )
     fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
-    monkeypatch.setattr(
-        web_app,
-        "aioredis",
-        type("_StubAioredisWithMutableState", (), {"from_url": staticmethod(lambda url, decode_responses=True: fake)})(),
-    )
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
 
     with TestClient(app) as client:
         first = client.post("/repos/example__alpha/resume")
@@ -455,11 +451,7 @@ def test_pause_endpoint_does_not_persist_fallback_state_on_decode_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake = _FakeRedis({"pipeline:example__alpha": "{not-json"})
-    monkeypatch.setattr(
-        web_app,
-        "aioredis",
-        type("_StubAioredisWithMutableState", (), {"from_url": staticmethod(lambda url, decode_responses=True: fake)})(),
-    )
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
 
     with TestClient(app) as client:
         response = client.post("/repos/example__alpha/pause")
@@ -484,11 +476,7 @@ def test_resume_endpoint_reports_stop_key_delete_failure(
             "control:example__alpha:stop": "1",
         }
     )
-    monkeypatch.setattr(
-        web_app,
-        "aioredis",
-        type("_StubAioredisWithMutableState", (), {"from_url": staticmethod(lambda url, decode_responses=True: fake)})(),
-    )
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
 
     with TestClient(app) as client:
         response = client.post("/repos/example__alpha/resume")
@@ -1442,3 +1430,32 @@ def test_upload_rejects_queue_with_cycle(
         )
     assert response.status_code == 400
     assert "dependency cycle" in response.text
+
+
+def test_pause_endpoint_returns_404_for_unknown_repo(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeRedis()
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__missing/pause")
+
+    assert response.status_code == 404
+    assert response.text == "Repository not found"
+
+
+def test_pause_endpoint_returns_503_when_redis_is_unavailable(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _StubAioredisClient()
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
+
+    with TestClient(app) as client:
+        client.app.state.redis = None
+        response = client.post("/repos/example__alpha/pause")
+
+    assert response.status_code == 503
+    assert response.text == "Redis unavailable"
