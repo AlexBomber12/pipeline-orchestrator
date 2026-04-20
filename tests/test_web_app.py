@@ -54,11 +54,63 @@ class _FakeRedis:
         self.store.pop(key, None)
         return int(existed)
 
+    async def transaction(
+        self,
+        func,
+        *watches: str,
+        value_from_callable: bool = False,
+        **_kwargs: object,
+    ):
+        pipe = _FakePipeline(self)
+        func_value = func(pipe)
+        if asyncio.iscoroutine(func_value):
+            func_value = await func_value
+        exec_value = await pipe.execute()
+        if value_from_callable:
+            return func_value
+        return exec_value
+
+    async def _execute_pipeline(
+        self,
+        commands: list[tuple[str, tuple[object, ...], dict[str, object]]],
+    ) -> list[object]:
+        results: list[object] = []
+        for command, args, kwargs in commands:
+            if command == "set":
+                await self.set(args[0], args[1], **kwargs)
+                results.append(True)
+            elif command == "delete":
+                results.append(await self.delete(args[0]))
+        return results
+
     async def lrange(self, key: str, start: int, stop: int) -> list[str]:
         values = self.lists.get(key, [])
         if stop < 0:
             stop = len(values) + stop
         return values[start : stop + 1]
+
+
+class _FakePipeline:
+    def __init__(self, redis: _FakeRedis) -> None:
+        self.redis = redis
+        self.commands: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    async def get(self, key: str) -> str | None:
+        return self.redis.store.get(key)
+
+    def multi(self) -> None:
+        return None
+
+    def set(self, key: str, value: str, **kwargs: object) -> "_FakePipeline":
+        self.commands.append(("set", (key, value), kwargs))
+        return self
+
+    def delete(self, key: str) -> "_FakePipeline":
+        self.commands.append(("delete", (key,), {}))
+        return self
+
+    async def execute(self) -> list[object]:
+        return await self.redis._execute_pipeline(self.commands)
 
 
 class _BoomRedis:
@@ -74,8 +126,25 @@ class _BoomRedis:
 
 
 class _DeleteBoomRedis(_FakeRedis):
-    async def delete(self, key: str) -> int:
-        raise RuntimeError(f"failed to delete {key}")
+    async def _execute_pipeline(
+        self,
+        commands: list[tuple[str, tuple[object, ...], dict[str, object]]],
+    ) -> list[object]:
+        for command, args, _kwargs in commands:
+            if command == "delete":
+                raise RuntimeError(f"failed to delete {args[0]}")
+        return await super()._execute_pipeline(commands)
+
+
+class _StopSetBoomRedis(_FakeRedis):
+    async def _execute_pipeline(
+        self,
+        commands: list[tuple[str, tuple[object, ...], dict[str, object]]],
+    ) -> list[object]:
+        for command, args, _kwargs in commands:
+            if command == "set" and args[0] == "control:example__alpha:stop":
+                raise RuntimeError("failed to set stop control")
+        return await super()._execute_pipeline(commands)
 
 
 class _StubAioredisClient:
@@ -428,6 +497,36 @@ def test_resume_endpoint_reports_stop_key_delete_failure(
     state = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
     assert state.user_paused is True
     assert fake.store["control:example__alpha:stop"] == "1"
+
+
+def test_stop_endpoint_reports_atomic_stop_key_write_failure(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.CODING,
+        user_paused=False,
+    )
+    fake = _StopSetBoomRedis({"pipeline:example__alpha": stored.model_dump_json()})
+    monkeypatch.setattr(
+        web_app,
+        "aioredis",
+        type(
+            "_StubAioredisWithMutableState",
+            (),
+            {"from_url": staticmethod(lambda url, decode_responses=True: fake)},
+        )(),
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/stop")
+
+    assert response.status_code == 503
+    state = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+    assert state.user_paused is False
+    assert "control:example__alpha:stop" not in fake.store
 
 
 def test_partial_repo_list_renders_queue_progress(
