@@ -775,6 +775,40 @@ async def test_stream_repo_events_stops_cleanly_when_live_reads_fail() -> None:
     assert pubsub.closed is True
 
 
+async def test_stream_repo_events_stops_cleanly_when_initial_buffer_reads_fail() -> None:
+    redis = _FakeRedis()
+    request = _Request()
+    stream = await stream_repo_events(
+        redis,
+        "example__repo",
+        request,
+        keepalive_interval=60.0,
+        poll_interval=0.01,
+    )
+    pubsub = await _wait_for_pubsub(redis)
+
+    async def _failing_get_message(
+        *,
+        ignore_subscribe_messages: bool = True,
+        timeout: float = 0.0,
+    ) -> dict[str, Any] | None:
+        if timeout == 0.0:
+            raise ConnectionError("redis down")
+        return None
+
+    pubsub.get_message = _failing_get_message  # type: ignore[method-assign]
+
+    try:
+        await anext(stream)
+    except StopAsyncIteration:
+        pass
+    else:
+        raise AssertionError("stream should stop when initial buffer reads fail")
+
+    assert pubsub.unsubscribed == ["repo-events:example__repo"]
+    assert pubsub.closed is True
+
+
 async def test_stream_repo_events_closes_pubsub_when_subscribe_fails() -> None:
     redis = _FakeRedis()
     request = _Request()

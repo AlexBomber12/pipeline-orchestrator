@@ -117,10 +117,13 @@ async def stream_repo_events(
             history_messages = list(reversed(history))
             buffered_messages: list[str] = []
             while len(buffered_messages) < INITIAL_BUFFER_DRAIN_LIMIT:
-                message = await pubsub.get_message(
-                    ignore_subscribe_messages=True,
-                    timeout=0.0,
-                )
+                try:
+                    message = await pubsub.get_message(
+                        ignore_subscribe_messages=True,
+                        timeout=0.0,
+                    )
+                except RedisError:
+                    return
                 if message is None:
                     break
                 data = message.get("data")
