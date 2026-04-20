@@ -366,7 +366,7 @@
 - Branch: pr-135-sse-pubsub-infra
 
 ## PR-136: Sprint progress bar real-time updates via SSE
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-136.md
 - Branch: pr-136-progress-bar-sse
 
