@@ -1053,10 +1053,22 @@ async def post_repo_detail_coder(
                 refreshed = load_config(CONFIG_PATH)
                 refreshed_repo = _find_repo_config_by_name(refreshed, name)
                 if refreshed_repo is not None:
-                    state.coder = _effective_coder_name(
+                    effective_coder = _effective_coder_name(
                         refreshed_repo, refreshed
                     )
-                    await redis_client.set(state_key, state.model_dump_json())
+
+                    async def _transaction(pipe: Any) -> None:
+                        latest_raw = await pipe.get(state_key)
+                        if latest_raw is None:
+                            return
+                        latest_state = RepoState.model_validate_json(latest_raw)
+                        if latest_state.state in _DEFERRED_CODER_SWITCH_STATES:
+                            return
+                        latest_state.coder = effective_coder
+                        pipe.multi()
+                        pipe.set(state_key, latest_state.model_dump_json())
+
+                    await redis_client.transaction(_transaction, state_key)
         await publish_repo_event(
             name,
             "config_reloaded",

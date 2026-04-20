@@ -56,6 +56,46 @@ class _FakeRedis:
     async def exists(self, key: str) -> int:
         return int(key in self.store)
 
+    async def transaction(
+        self,
+        func,
+        *watches: str,
+        value_from_callable: bool = False,
+        **_kwargs: object,
+    ):
+        pipe = _FakePipeline(self)
+        func_value = func(pipe)
+        if hasattr(func_value, "__await__"):
+            func_value = await func_value
+        exec_value = await pipe.execute()
+        if value_from_callable:
+            return func_value
+        return exec_value
+
+
+class _FakePipeline:
+    def __init__(self, redis: _FakeRedis) -> None:
+        self.redis = redis
+        self.commands: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    async def get(self, key: str) -> str | None:
+        return self.redis.store.get(key)
+
+    def multi(self) -> None:
+        return None
+
+    def set(self, key: str, value: str, **kwargs: object) -> "_FakePipeline":
+        self.commands.append(("set", (key, value), kwargs))
+        return self
+
+    async def execute(self) -> list[object]:
+        results: list[object] = []
+        for command, args, kwargs in self.commands:
+            if command == "set":
+                await self.redis.set(args[0], args[1], **kwargs)
+                results.append(True)
+        return results
+
 
 @pytest.fixture(autouse=True)
 def _stub_auth_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
