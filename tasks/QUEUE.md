@@ -351,7 +351,7 @@
 - Branch: pr-132-stalled-state-grey
 
 ## PR-133: Light/dark theme toggle
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-133.md
 - Branch: pr-133-theme-toggle
 
