@@ -1592,3 +1592,32 @@ def test_pause_endpoint_returns_503_when_redis_is_unavailable(
 
     assert response.status_code == 503
     assert response.text == "Redis unavailable"
+
+
+def test_post_repo_detail_coder_returns_503_before_config_write_when_redis_ping_fails(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _PingBoomRedis(_FakeRedis):
+        async def ping(self) -> bool:
+            raise RuntimeError("redis is down")
+
+    write_attempted = False
+
+    def _fail_if_called(*args: object, **kwargs: object) -> None:
+        nonlocal write_attempted
+        write_attempted = True
+        raise AssertionError("update_repository should not be called")
+
+    monkeypatch.setattr(web_app, "update_repository", _fail_if_called)
+
+    with TestClient(app) as client:
+        client.app.state.redis = _PingBoomRedis()
+        response = client.post(
+            "/repos/example__alpha/coder",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 503
+    assert response.text == "Redis unavailable"
+    assert write_attempted is False

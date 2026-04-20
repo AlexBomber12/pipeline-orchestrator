@@ -406,6 +406,44 @@ def test_reload_repo_config_if_dirty_supports_redis_without_exists(
     assert runner.repo_config.coder == CoderType.CODEX
 
 
+def test_reload_repo_config_if_dirty_clears_staged_reload_after_disk_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    runner.redis.store["control:octo__demo:config_dirty"] = "1"
+    staged_repo_config = RepoConfig.model_validate(
+        {**runner.repo_config.model_dump(), "coder": "codex"}
+    )
+    runner.stage_config_reload(
+        staged_repo_config,
+        AppConfig(
+            repositories=[staged_repo_config],
+            daemon=runner.app_config.daemon,
+        ),
+        _FakeUsageProvider(snapshot="new-claude"),
+        _FakeUsageProvider(snapshot="new-codex"),
+    )
+    disk_repo_config = RepoConfig.model_validate(
+        {**runner.repo_config.model_dump(), "coder": "claude"}
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "load_config",
+        lambda path="config.yml": AppConfig(
+            repositories=[disk_repo_config],
+            daemon=runner.app_config.daemon,
+        ),
+    )
+
+    asyncio.run(runner.reload_repo_config_if_dirty())
+    asyncio.run(runner.reload_repo_config_if_dirty())
+
+    assert runner.repo_config.coder == CoderType.CLAUDE
+    assert runner._pending_repo_config is None
+    assert runner._pending_app_config is None
+    assert runner._pending_usage_providers is None
+
+
 def _allow_all_coder_auth(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(selector_module, "_auth_failed", lambda *args, **kwargs: False)
 

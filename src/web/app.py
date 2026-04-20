@@ -1020,14 +1020,19 @@ async def post_repo_detail_coder(
             status_code=422,
         )
 
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return HTMLResponse("Redis unavailable", status_code=503)
+    if hasattr(redis_client, "ping"):
+        try:
+            await redis_client.ping()
+        except Exception:
+            return HTMLResponse("Redis unavailable", status_code=503)
+
     try:
         update_repository(repo.url, path=CONFIG_PATH, coder=updated_coder)
     except OSError as exc:
         return HTMLResponse(f"Failed to write config.yml: {exc}", status_code=503)
-
-    redis_client = getattr(request.app.state, "redis", None)
-    if redis_client is None:
-        return HTMLResponse("Redis unavailable", status_code=503)
 
     dirty_key = f"control:{name}:config_dirty"
     state_key = f"pipeline:{name}"
