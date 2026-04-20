@@ -1351,7 +1351,7 @@ def test_repo_card_has_onclick(
     body = response.text
     assert "window.location='/repo/example__alpha'" in body
     assert "window.location='/repo/example__beta'" in body
-    assert "event.target.closest('label,input,button,a')" in body
+    assert "event.target.closest('form,label,input,button,a')" in body
     assert 'hx-target="#upload-feedback-example__alpha"' in body
     assert 'hx-indicator="#upload-indicator-example__alpha"' in body
     assert 'hx-disabled-elt="#upload-example__alpha"' in body

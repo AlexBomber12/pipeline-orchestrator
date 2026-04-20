@@ -36,7 +36,7 @@
     <div class="rounded-lg border bg-surface-2 p-4 cursor-pointer hover:border-white/10 transition-colors {{ 'border-l-2 border-l-fail border-white/5' if is_error else ('border-l-2 border-l-warn border-white/5' if is_synthetic else 'border-white/5') }}"
          data-repo-card
          data-repo="{{ repo.name }}"
-         onclick="if(!event.target.closest('label,input,button,a')){window.location='/repo/{{ repo.name }}'}">
+         onclick="if(!event.target.closest('form,label,input,button,a')){window.location='/repo/{{ repo.name }}'}">
         {# Header row #}
         <div class="mb-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div class="flex min-w-0 items-center gap-2">
