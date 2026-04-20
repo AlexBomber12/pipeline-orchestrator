@@ -20,8 +20,8 @@
 {% set style = repo_state.state_styles.get(repo.state.value, repo_state.state_styles['IDLE']) %}
 
 <section data-repo-summary>
-<header class="flex flex-wrap items-center gap-3 mb-6">
-    <h2 class="font-mono text-2xl text-gray-100 truncate">{{ repo.name }}</h2>
+<header class="mb-6 flex flex-col items-start gap-3 sm:flex-row sm:flex-wrap sm:items-center">
+    <h2 class="max-w-full truncate font-mono text-xl text-gray-100 sm:text-2xl">{{ repo.name }}</h2>
     <span class="inline-flex items-center gap-2"
           data-state-indicator
           data-updated-at="{{ repo.last_updated.isoformat() if repo.last_updated else '' }}">
@@ -34,11 +34,11 @@
     <form hx-post="/repos/{{ repo.name }}/coder"
           hx-target="closest [data-repo-summary]"
           hx-swap="outerHTML"
-          class="flex items-center gap-2 rounded border border-white/10 bg-surface-3 px-2 py-1 text-xs">
+          class="flex w-full flex-wrap items-center gap-2 rounded border border-white/10 bg-surface-3 px-2 py-1 text-xs sm:w-auto sm:flex-nowrap">
         <label for="repo-coder-{{ repo.name }}" class="font-mono text-gray-400">Coder</label>
         <select id="repo-coder-{{ repo.name }}"
                 name="coder"
-                class="bg-transparent text-gray-300 font-mono outline-none"
+                class="min-w-0 bg-transparent text-gray-300 font-mono outline-none"
                 onchange="this.form.requestSubmit()">
             <option value="any" {% if selected_repo_coder == 'any' %}selected{% endif %}>
                 Any (bandit picks per-PR)
@@ -55,8 +55,8 @@
         </span>
         {% endif %}
     </form>
-    {{ repo_controls(repo) }}
-    <span class="ml-auto font-mono text-xs text-gray-500">
+    {{ repo_controls(repo, 'w-full justify-start sm:w-auto') }}
+    <span class="font-mono text-xs text-gray-500 sm:ml-auto">
         updated <span data-ts="{{ repo.last_updated.isoformat() if repo.last_updated else '' }}">{{ repo.last_updated.strftime('%Y-%m-%d %H:%M:%S') }}</span>
     </span>
 </header>
@@ -106,23 +106,23 @@
 {% endif %}
 {% endif %}
 
-<div class="grid gap-4 sm:grid-cols-2 mb-6">
+<div class="mb-6 grid grid-cols-1 gap-4 lg:grid-cols-2">
     <section class="rounded-lg border border-white/5 bg-surface-2 p-5">
         <h3 class="text-sm font-semibold text-gray-300 mb-3">Current Task</h3>
         {% if repo.current_task %}
         <dl class="space-y-2 text-sm">
-            <div class="flex items-baseline justify-between gap-3">
+            <div class="flex flex-col items-start gap-1 sm:flex-row sm:items-baseline sm:justify-between sm:gap-3">
                 <dt class="text-gray-500">PR ID</dt>
                 <dd class="font-mono text-gray-200">{{ repo.current_task.pr_id }}</dd>
             </div>
-            <div class="flex items-baseline justify-between gap-3">
+            <div class="flex flex-col items-start gap-1 sm:flex-row sm:items-baseline sm:justify-between sm:gap-3">
                 <dt class="text-gray-500">Title</dt>
-                <dd class="text-gray-200 text-right">{{ repo.current_task.title }}</dd>
+                <dd class="break-words text-gray-200 sm:text-right">{{ repo.current_task.title }}</dd>
             </div>
             {% if repo.current_task.task_file %}
-            <div class="flex items-baseline justify-between gap-3">
+            <div class="flex flex-col items-start gap-1 sm:flex-row sm:items-baseline sm:justify-between sm:gap-3">
                 <dt class="text-gray-500">File</dt>
-                <dd class="font-mono text-xs text-gray-400 truncate">{{ repo.current_task.task_file }}</dd>
+                <dd class="max-w-full break-all font-mono text-xs text-gray-400 sm:max-w-[16rem] sm:text-right">{{ repo.current_task.task_file }}</dd>
             </div>
             {% endif %}
         </dl>
@@ -136,7 +136,7 @@
         {% if repo.current_pr %}
         {% set ci = ci_styles.get(repo.current_pr.ci_status.value, ci_styles['PENDING']) %}
         <dl class="space-y-2 text-sm">
-            <div class="flex items-baseline justify-between gap-3">
+            <div class="flex flex-col items-start gap-1 sm:flex-row sm:items-baseline sm:justify-between sm:gap-3">
                 <dt class="text-gray-500">Number</dt>
                 <dd class="font-mono text-gray-200">
                     {% if repo.current_pr.url %}
@@ -147,24 +147,24 @@
                     {% endif %}
                 </dd>
             </div>
-            <div class="flex items-baseline justify-between gap-3">
+            <div class="flex flex-col items-start gap-1 sm:flex-row sm:items-baseline sm:justify-between sm:gap-3">
                 <dt class="text-gray-500">Branch</dt>
-                <dd class="font-mono text-xs text-gray-400 truncate">{{ repo.current_pr.branch }}</dd>
+                <dd class="max-w-full break-all font-mono text-xs text-gray-400 sm:max-w-[16rem] sm:text-right">{{ repo.current_pr.branch }}</dd>
             </div>
-            <div class="flex items-center justify-between gap-3">
+            <div class="flex flex-col items-start gap-1 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
                 <dt class="text-gray-500">CI</dt>
                 <dd class="flex items-center gap-2 font-mono text-xs text-gray-300">
                     <span class="w-2.5 h-2.5 rounded-full {{ ci.dot }} {% if ci.pulse %}pulse-dot{% endif %}"></span>
                     {{ ci.label }}
                 </dd>
             </div>
-            <div class="flex items-center justify-between gap-3">
+            <div class="flex flex-col items-start gap-1 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
                 <dt class="text-gray-500">Review</dt>
                 <dd class="font-mono text-sm text-gray-300">
                     {{ review_emoji.get(repo.current_pr.review_status.value, '·') }}
                 </dd>
             </div>
-            <div class="flex items-baseline justify-between gap-3">
+            <div class="flex flex-col items-start gap-1 sm:flex-row sm:items-baseline sm:justify-between sm:gap-3">
                 <dt class="text-gray-500">Pushes</dt>
                 <dd class="font-mono text-gray-200">{{ repo.current_pr.push_count }}</dd>
             </div>

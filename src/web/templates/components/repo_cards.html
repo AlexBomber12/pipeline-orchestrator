@@ -35,8 +35,8 @@
          data-repo="{{ repo.name }}"
          onclick="if(!event.target.closest('label,input,button,a')){window.location='/repo/{{ repo.name }}'}">
         {# Header row #}
-        <div class="flex items-center justify-between mb-3">
-            <div class="flex items-center gap-2 min-w-0">
+        <div class="mb-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div class="flex min-w-0 items-center gap-2">
                 <a href="/repo/{{ repo.name }}" class="font-mono text-sm text-white truncate hover:text-accent transition-colors">{{ repo.name }}</a>
                 <span class="inline-flex items-center gap-2"
                       data-state-indicator
@@ -58,7 +58,7 @@
                     <span class="hidden text-[11px] font-medium uppercase tracking-wide text-gray-500" data-stalled-hint>stalled</span>
                 </span>
             </div>
-            <div class="flex items-center gap-2 shrink-0">
+            <div class="flex w-full flex-wrap items-center justify-between gap-2 sm:w-auto sm:justify-end">
                 {{ repo_controls(repo) }}
                 {% if repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done %}
                 <span class="text-xs font-medium px-2 py-0.5 rounded border border-accent/30 text-accent">Start</span>
@@ -71,7 +71,7 @@
                            onchange="this.form.requestSubmit()"
                            class="hidden" id="upload-{{ repo.name }}">
                     <label for="upload-{{ repo.name }}"
-                           class="primary-interactive text-xs font-medium px-2 py-0.5 rounded border border-white/10 text-gray-400 cursor-pointer">
+                           class="primary-interactive inline-flex min-h-11 items-center rounded border border-white/10 px-3 text-xs font-medium text-gray-400 cursor-pointer sm:min-h-0 sm:px-2 sm:py-0.5">
                         Upload tasks
                     </label>
                 </form>
@@ -92,7 +92,7 @@
         </div>
         {% else %}
         {# Body: 2-column grid #}
-        <div class="grid grid-cols-2 gap-4 text-xs mb-2">
+        <div class="mb-2 grid grid-cols-1 gap-4 text-xs sm:grid-cols-2">
             <div>
                 <div class="text-gray-500 mb-1">Sprint progress</div>
                 <div class="text-gray-300 mb-1" data-progress-text>{{ repo.queue_done }} / {{ repo.queue_total }} done</div>
@@ -116,7 +116,7 @@
         {% if repo.current_pr %}
         {% set ci = ci_styles.get(repo.current_pr.ci_status.value, ci_styles['PENDING']) %}
         {% set review_emoji = review_emojis.get(repo.current_pr.review_status.value, '') %}
-        <div class="flex items-center gap-2 text-xs text-gray-400 mt-2 pt-2 border-t border-white/5">
+        <div class="mt-2 flex flex-wrap items-center gap-2 border-t border-white/5 pt-2 text-xs text-gray-400">
             <a href="{{ repo.current_pr.url }}" class="secondary-interactive font-mono text-gray-300">#{{ repo.current_pr.number }}</a>
             <span class="w-2 h-2 rounded-full {{ ci.dot }} {% if ci.pulse %}pulse-dot{% endif %}"></span>
             <span>{{ ci.label }}</span>
