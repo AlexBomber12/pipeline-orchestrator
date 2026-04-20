@@ -547,6 +547,9 @@ def test_sync_runners_applies_active_flag_change_immediately() -> None:
                 codex_usage_provider,
             )
 
+        def clear_staged_config_reload(self) -> None:
+            self.staged = None
+
     config = AppConfig(
         repositories=[_repo("https://github.com/octo/alpha.git", active=True, coder="codex")],
         daemon=DaemonConfig(poll_interval_sec=1),
@@ -577,6 +580,71 @@ def test_sync_runners_applies_active_flag_change_immediately() -> None:
     assert runner.app_config is config
     assert runner.claude_usage_provider == "claude-provider"
     assert runner.codex_usage_provider == "codex-provider"
+
+
+def test_sync_runners_clears_staged_reload_after_immediate_active_update() -> None:
+    class _StagingRunner(_FakeRunner):
+        def __init__(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            redis_client: Any,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+        ) -> None:
+            super().__init__(
+                repo_config,
+                app_config,
+                redis_client,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+            self.staged: tuple[Any, ...] | None = ("stale",)
+
+        def stage_config_reload(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+        ) -> None:
+            self.staged = (
+                repo_config,
+                app_config,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+
+        def clear_staged_config_reload(self) -> None:
+            self.staged = None
+
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git", active=False, coder="codex")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    runner = _StagingRunner(
+        _repo("https://github.com/octo/alpha.git", active=True, coder="claude"),
+        AppConfig(
+            repositories=[_repo("https://github.com/octo/alpha.git", active=True, coder="claude")]
+        ),
+        _FakeRedisClient(),
+        "old-claude-provider",
+        "old-codex-provider",
+    )
+
+    main_module._sync_runners(
+        {"https://github.com/octo/alpha": runner},
+        config,
+        _FakeRedisClient(),
+        "claude-provider",
+        "codex-provider",
+        registry=None,  # type: ignore[arg-type]
+    )
+
+    assert runner.repo_config.active is False
+    assert runner.repo_config.coder is not None
+    assert runner.repo_config.coder.value == "codex"
+    assert runner.staged is None
 
 
 def test_find_repo_config_matches_normalized_url() -> None:

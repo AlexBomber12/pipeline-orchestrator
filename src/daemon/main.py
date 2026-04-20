@@ -225,6 +225,8 @@ def _sync_runners(
                     claude_usage_provider,
                     codex_usage_provider,
                 )
+                if hasattr(runner, "clear_staged_config_reload"):
+                    runner.clear_staged_config_reload()
             elif hasattr(runner, "stage_config_reload"):
                 runner.stage_config_reload(
                     repo,

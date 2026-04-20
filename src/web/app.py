@@ -61,6 +61,13 @@ _CODER_LABELS = {
     "claude": "Claude CLI",
     "codex": "Codex CLI",
 }
+_DEFERRED_CODER_SWITCH_STATES = {
+    PipelineState.CODING,
+    PipelineState.WATCH,
+    PipelineState.FIX,
+    PipelineState.MERGE,
+    PipelineState.PAUSED,
+}
 
 
 def _default_repo_state(
@@ -1041,12 +1048,7 @@ async def post_repo_detail_coder(
         raw_state = await redis_client.get(state_key)
         if raw_state:
             state = RepoState.model_validate_json(raw_state)
-            if state.state not in {
-                PipelineState.CODING,
-                PipelineState.WATCH,
-                PipelineState.FIX,
-                PipelineState.MERGE,
-            }:
+            if state.state not in _DEFERRED_CODER_SWITCH_STATES:
                 refreshed = load_config(CONFIG_PATH)
                 refreshed_repo = _find_repo_config_by_name(refreshed, name)
                 if refreshed_repo is not None:
@@ -1067,12 +1069,9 @@ async def post_repo_detail_coder(
         return HTMLResponse("Failed to update repository state", status_code=503)
 
     current_state = await get_repo_state(name, redis_client, config_path=CONFIG_PATH)
-    applies_after_current_pr = current_state.state in {
-        PipelineState.CODING,
-        PipelineState.WATCH,
-        PipelineState.FIX,
-        PipelineState.MERGE,
-    }
+    applies_after_current_pr = (
+        current_state.state in _DEFERRED_CODER_SWITCH_STATES
+    )
     message = f"Switching to {_coder_display_name(coder)}"
     if applies_after_current_pr:
         message += " - applies after current PR completes."
