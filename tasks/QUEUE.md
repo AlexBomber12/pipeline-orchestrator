@@ -396,7 +396,7 @@
 - Branch: pr-141-rate-limit-active-only
 
 ## PR-142: Clear upload feedback lifecycle
-- Status: DOING
+- Status: DONE
 - Tasks file: tasks/PR-142.md
 - Branch: pr-142-upload-feedback-lifecycle
 
