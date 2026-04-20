@@ -367,14 +367,14 @@
 </head>
 <body class="bg-surface-1 text-gray-200 min-h-screen">
     <nav class="border-b border-white/5 bg-surface-2">
-        <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
-            <div class="flex items-center gap-3">
+        <div class="max-w-7xl mx-auto flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-6 sm:py-4">
+            <div class="flex min-w-0 items-center gap-3">
                 <div class="w-9 h-9 rounded-md bg-accent/10 border border-accent/30 flex items-center justify-center">
                     <span class="font-mono text-accent text-sm font-semibold">PO</span>
                 </div>
-                <h1 class="text-lg font-semibold tracking-tight">Pipeline Orchestrator</h1>
+                <h1 class="min-w-0 truncate text-base font-semibold tracking-tight sm:text-lg">Pipeline Orchestrator</h1>
             </div>
-            <div class="flex items-center gap-6">
+            <div class="flex w-full flex-wrap items-center justify-between gap-3 sm:w-auto sm:justify-end sm:gap-6">
                 <a href="/"
                    class="text-sm font-medium secondary-interactive {% if title == 'Settings' %}text-gray-400{% else %}text-accent{% endif %}">
                     Dashboard
@@ -392,7 +392,7 @@
                     <span id="theme-icon-dark" aria-hidden="true">☾</span>
                     <span id="theme-icon-light" class="hidden" aria-hidden="true">☀</span>
                 </button>
-                <div id="clock" class="font-mono text-sm text-gray-400">--:--:--</div>
+                <div id="clock" class="font-mono text-sm text-gray-400 sm:text-right">--:--:--</div>
             </div>
         </div>
     </nav>
@@ -401,7 +401,7 @@
         {% include "components/redis_banner.html" %}
     </div>
 
-    <main class="max-w-7xl mx-auto px-6 py-8">
+    <main class="max-w-7xl mx-auto px-4 py-6 sm:px-6 sm:py-8">
         {% block content %}{% endblock %}
     </main>
 
