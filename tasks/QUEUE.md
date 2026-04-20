@@ -356,7 +356,7 @@
 - Branch: pr-133-theme-toggle
 
 ## PR-134: Consistent hover states on interactive elements
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-134.md
 - Branch: pr-134-hover-states
 
