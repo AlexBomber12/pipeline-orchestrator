@@ -308,25 +308,54 @@ class FixMixin(BreachMixin):
                 self.log_event(self.state.error_message)
                 return None
 
-        def read_remote_branch_head(branch: str) -> str | None:
+        def remote_branch_contains_head(branch: str, head_after: str) -> bool:
             try:
-                output = git_ops._git(
+                git_ops._git(
                     self.repo_path,
-                    "ls-remote",
-                    "--heads",
+                    "fetch",
                     "origin",
-                    branch,
+                    f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+                    timeout=60,
+                )
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+            ) as exc:
+                self.log_event(f"fetch {branch} failed after FIX stop: {exc}")
+                return False
+            try:
+                remote_head = git_ops._git(
+                    self.repo_path,
+                    "rev-parse",
+                    f"origin/{branch}",
                 ).stdout.strip()
             except (
                 subprocess.CalledProcessError,
                 subprocess.TimeoutExpired,
                 OSError,
             ) as exc:
-                self.log_event(f"ls-remote {branch} failed after FIX stop: {exc}")
-                return None
-            if not output:
-                return None
-            return output.split()[0]
+                self.log_event(
+                    f"rev-parse origin/{branch} failed after FIX stop: {exc}"
+                )
+                return False
+            if remote_head == head_after:
+                return True
+            try:
+                is_ancestor = git_ops._git(
+                    self.repo_path,
+                    "merge-base",
+                    "--is-ancestor",
+                    head_after,
+                    remote_head,
+                    check=False,
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                self.log_event(
+                    f"merge-base ancestry check failed after FIX stop: {exc}"
+                )
+                return False
+            return is_ancestor.returncode == 0
 
         def record_fix_push(head_after: str, failure_detail: str) -> bool:
             if head_before and head_before == head_after:
@@ -371,8 +400,7 @@ class FixMixin(BreachMixin):
             if head_after is None:
                 return
             branch = self.state.current_pr.branch if self.state.current_pr is not None else ""
-            remote_head = read_remote_branch_head(branch) if branch else None
-            if remote_head == head_after:
+            if branch and remote_branch_contains_head(branch, head_after):
                 if not record_fix_push(
                     head_after,
                     "after stop-cancel fix push; manual review trigger "
@@ -381,7 +409,7 @@ class FixMixin(BreachMixin):
                     return
             elif head_before and head_before != head_after:
                 self.log_event(
-                    "FIX stop-cancel left local HEAD ahead of remote; "
+                    "FIX stop-cancel left local HEAD outside the fetched remote branch; "
                     "skipping push bookkeeping and @codex review"
                 )
             if await pause_for_stop_after_bookkeeping():
