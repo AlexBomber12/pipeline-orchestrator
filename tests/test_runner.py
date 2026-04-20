@@ -12533,6 +12533,58 @@ def test_run_cycle_short_circuits_paused_when_user_paused(
     ) == 1
 
 
+@pytest.mark.parametrize(
+    ("state", "handler_name"),
+    [
+        (PipelineState.WATCH, "handle_watch"),
+        (PipelineState.MERGE, "handle_merge"),
+    ],
+)
+def test_run_cycle_short_circuits_active_watch_and_merge_when_user_paused(
+    monkeypatch: pytest.MonkeyPatch,
+    state: PipelineState,
+    handler_name: str,
+) -> None:
+    publishes: list[str] = []
+    handler_calls: list[str] = []
+    preflight_calls: list[str] = []
+    runner = _make_runner()
+    runner._recovered = True
+    runner._scaffolded = True
+    runner.state.state = state
+    runner.state.user_paused = True
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_handler() -> None:
+        handler_calls.append(handler_name)
+
+    async def fake_publish_state() -> None:
+        publishes.append("published")
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(
+        runner,
+        "preflight",
+        lambda: preflight_calls.append("preflight") or True,
+    )
+    monkeypatch.setattr(runner, handler_name, fake_handler)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+
+    asyncio.run(runner.run_cycle())
+    asyncio.run(runner.run_cycle())
+
+    assert handler_calls == []
+    assert preflight_calls == []
+    assert publishes == ["published", "published"]
+    assert sum(
+        1
+        for entry in runner.state.history
+        if entry["event"] == "Paused by user, not picking up new tasks"
+    ) == 1
+
+
 def test_run_cycle_skips_preflight_after_pause_refresh(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

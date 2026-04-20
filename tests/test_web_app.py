@@ -1205,11 +1205,12 @@ def test_repo_card_renders_pause_and_stop_controls_for_active_repo(
             False,
             1,
             1,
-            (),
             (
-                'hx-post="/repos/example__alpha/resume"',
                 'hx-post="/repos/example__alpha/pause"',
                 'hx-post="/repos/example__alpha/stop"',
+            ),
+            (
+                'hx-post="/repos/example__alpha/resume"',
             ),
         ),
         (
@@ -1217,11 +1218,12 @@ def test_repo_card_renders_pause_and_stop_controls_for_active_repo(
             False,
             1,
             1,
-            (),
             (
-                'hx-post="/repos/example__alpha/resume"',
                 'hx-post="/repos/example__alpha/pause"',
                 'hx-post="/repos/example__alpha/stop"',
+            ),
+            (
+                'hx-post="/repos/example__alpha/resume"',
             ),
         ),
         (

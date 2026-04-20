@@ -699,7 +699,12 @@ class PipelineRunner(
 
         if (
             self.state.user_paused
-            and self.state.state in (PipelineState.IDLE, PipelineState.PAUSED)
+            and self.state.state in (
+                PipelineState.IDLE,
+                PipelineState.PAUSED,
+                PipelineState.WATCH,
+                PipelineState.MERGE,
+            )
         ):
             if not self._user_pause_logged:
                 self.log_event("Paused by user, not picking up new tasks")
