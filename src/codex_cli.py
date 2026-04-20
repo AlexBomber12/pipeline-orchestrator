@@ -109,3 +109,15 @@ async def fix_review_async(
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
     return await run_codex_async("FIX REVIEW", repo_path, **kwargs)
+
+
+async def diagnose_error_async(
+    repo_path: str, context: str, model: str | None = None
+) -> tuple[int, str, str]:
+    prompt = (
+        "You are the pipeline orchestrator. An infrastructure error occurred. "
+        f"Error context: {context} "
+        "Respond with exactly one word on the first line: FIX, SKIP, or ESCALATE. "
+        "If FIX, include a brief action plan on subsequent lines."
+    )
+    return await run_codex_async(prompt, repo_path, timeout=120, model=model)

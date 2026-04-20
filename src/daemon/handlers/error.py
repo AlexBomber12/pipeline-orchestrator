@@ -1,7 +1,7 @@
 """ERROR state handler.
 
 Mixin methods:
-    handle_error — ask Claude CLI for diagnosis: FIX, SKIP, or ESCALATE
+    handle_error — ask the selected coder for diagnosis: FIX, SKIP, or ESCALATE
 
 Module-level:
     ErrorCategory   — enum for error classification
@@ -17,7 +17,7 @@ import subprocess
 from datetime import datetime, timezone
 from enum import Enum
 
-from src import claude_cli
+from src import claude_cli, codex_cli
 from src.daemon import git_ops
 from src.models import PipelineState
 from src.retry import retry_transient
@@ -78,15 +78,43 @@ def _classify_error(context: str) -> ErrorCategory:
 
 
 class ErrorMixin:
-    """Ask the claude CLI whether to FIX, SKIP, or ESCALATE the error."""
+    """Ask the selected coder whether to FIX, SKIP, or ESCALATE the error."""
 
     async def handle_error(self, error_context: str | None = None) -> None:
-        """Ask the claude CLI whether to FIX, SKIP, or ESCALATE the error."""
+        """Ask the selected coder whether to FIX, SKIP, or ESCALATE the error."""
         context = error_context or self.state.error_message or "Unknown error"
-        # Diagnosis still uses claude_cli, so skip it rather than pausing the
-        # repo when Claude itself is already rate-limited.
+        category = _classify_error(context)
+        if category == ErrorCategory.RATE_LIMIT:
+            self._error_skip_context = None
+            self._error_skip_count = 0
+            self._error_skip_active = False
+            self.log_event("Skipping AI diagnosis for rate-limit error")
+            return
+        if category == ErrorCategory.TIMEOUT:
+            self._error_skip_context = None
+            self._error_skip_count = 0
+            self._error_skip_active = False
+            self.log_event(
+                "Skipping AI diagnosis for timeout error; "
+                "will retry on next cycle"
+            )
+            return
+        selected = self._get_auxiliary_coder()
+        if selected is None:
+            self.log_event(
+                "No eligible coder available for error diagnosis; staying ERROR"
+            )
+            return
+        coder_name, _plugin = selected
+        provider = (
+            self._claude_usage_provider
+            if coder_name == "claude"
+            else self._codex_usage_provider
+        )
+        # Soft-skip diagnosis rather than pausing the repo when the selected
+        # diagnosis coder is already over its usage threshold.
         try:
-            snapshot = await asyncio.to_thread(self._claude_usage_provider.fetch)
+            snapshot = await asyncio.to_thread(provider.fetch)
         except Exception:
             snapshot = None
         if snapshot and (
@@ -103,12 +131,14 @@ class ErrorMixin:
             self._error_skip_active = True
             if self._error_skip_count > 3:
                 self.log_event(
-                    "Skipping AI diagnosis: Claude rate limited; "
+                    f"Skipping AI diagnosis: {coder_name.capitalize()} rate limited; "
                     "max soft-skip retries (3) reached, staying ERROR"
                 )
                 return
 
-            self.log_event("Skipping AI diagnosis: Claude rate limited")
+            self.log_event(
+                f"Skipping AI diagnosis: {coder_name.capitalize()} rate limited"
+            )
             self.state.state = PipelineState.IDLE
             self.state.error_message = None
             self._error_diagnose_count = 0
@@ -117,16 +147,6 @@ class ErrorMixin:
         self._error_skip_context = None
         self._error_skip_count = 0
         self._error_skip_active = False
-        category = _classify_error(context)
-        if category == ErrorCategory.RATE_LIMIT:
-            self.log_event("Skipping AI diagnosis for rate-limit error")
-            return
-        if category == ErrorCategory.TIMEOUT:
-            self.log_event(
-                "Skipping AI diagnosis for timeout error; "
-                "will retry on next cycle"
-            )
-            return
         self._error_diagnose_count += 1
         if self._error_diagnose_count > 3:
             self.log_event(
@@ -140,10 +160,15 @@ class ErrorMixin:
             ).stdout.strip()
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             pass
-        code, stdout, stderr = await claude_cli.diagnose_error_async(
-            self.repo_path, context, model=self.app_config.daemon.claude_model
-        )
-        self._detect_rate_limit(stderr, coder_name="claude")
+        if coder_name == "claude":
+            code, stdout, stderr = await claude_cli.diagnose_error_async(
+                self.repo_path, context, model=self.app_config.daemon.claude_model
+            )
+        else:
+            code, stdout, stderr = await codex_cli.diagnose_error_async(
+                self.repo_path, context, model=self.app_config.daemon.codex_model
+            )
+        self._detect_rate_limit(stderr, coder_name=coder_name)
         if self.state.rate_limited_until is not None:
             self.state.state = PipelineState.PAUSED
             # Preserve error_message so handle_paused resumes to ERROR

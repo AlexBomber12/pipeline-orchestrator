@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from src.codex_cli import (
+    diagnose_error_async,
     fix_review_async,
     run_codex_async,
     run_planned_pr_async,
@@ -217,6 +218,37 @@ async def test_fix_review_async_forwards_on_process_start(
     )
 
     assert started == [fake_proc]
+
+
+@pytest.mark.asyncio
+async def test_diagnose_error_async_uses_expected_prompt_and_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    fake_proc = _make_fake_proc(returncode=0)
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        captured["cmd"] = list(args)
+        captured["kwargs"] = kwargs
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    await diagnose_error_async("/data/repos/demo", "broken CI", model="gpt-5.4")
+
+    cmd = captured["cmd"]
+    assert cmd[:6] == [
+        "codex",
+        "--ask-for-approval",
+        "never",
+        "exec",
+        "--sandbox",
+        "danger-full-access",
+    ]
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "gpt-5.4"
+    assert "Error context: broken CI" in cmd[-1]
+    assert "FIX, SKIP, or ESCALATE" in cmd[-1]
 
 
 @pytest.mark.asyncio

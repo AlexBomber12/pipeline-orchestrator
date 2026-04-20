@@ -84,6 +84,36 @@ def select_coder(ctx: SelectionContext) -> tuple[str, CoderPlugin] | None:
     return name, ctx.registry.get(name)
 
 
+def rank_auxiliary_coders(
+    eligible: list[str], ctx: SelectionContext
+) -> list[str]:
+    """Return eligible coders for daemon auxiliary work.
+
+    Auxiliary work should stay close to legacy behavior when possible, so
+    Claude remains the first choice and Codex is the explicit fallback.
+    Exploration is never applied on this path.
+    """
+    preferred = [
+        name for name in ("claude", "codex") if name in eligible
+    ]
+    remainder = [
+        name for name in _sort_by_priority(eligible, ctx)
+        if name not in preferred
+    ]
+    return [*preferred, *remainder]
+
+
+def select_auxiliary_coder(
+    ctx: SelectionContext,
+) -> tuple[str, CoderPlugin] | None:
+    """Return the best eligible coder for diagnose/merge helper work."""
+    eligible = eligible_coders(ctx)
+    if not eligible:
+        return None
+    name = rank_auxiliary_coders(eligible, ctx)[0]
+    return name, ctx.registry.get(name)
+
+
 def _sort_by_priority(eligible: list[str], ctx: SelectionContext) -> list[str]:
     priorities = ctx.app_config.daemon.coder_priority
     return sorted(

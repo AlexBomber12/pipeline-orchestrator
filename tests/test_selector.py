@@ -10,7 +10,9 @@ from src.daemon.selector import (
     SelectionContext,
     _auth_failed,
     eligible_coders,
+    rank_auxiliary_coders,
     rank_coders,
+    select_auxiliary_coder,
     select_coder,
 )
 from src.models import RepoState
@@ -313,3 +315,33 @@ def test_epsilon_seed_deterministic() -> None:
     ]
 
     assert left_orders == right_orders
+
+
+def test_auxiliary_selector_prefers_claude_when_eligible() -> None:
+    ctx = _ctx(
+        daemon_coder=CoderType.CODEX,
+        priorities={"claude": 10, "codex": 90, "gemini": 80},
+        epsilon=0.0,
+    )
+
+    ranked = rank_auxiliary_coders(["codex", "gemini", "claude"], ctx)
+    selected = select_auxiliary_coder(ctx)
+
+    assert ranked[:2] == ["claude", "codex"]
+    assert selected is not None
+    assert selected[0] == "claude"
+
+
+def test_auxiliary_selector_falls_back_to_codex_when_claude_ineligible() -> None:
+    ctx = _ctx(limited={"claude"})
+
+    selected = select_auxiliary_coder(ctx)
+
+    assert selected is not None
+    assert selected[0] == "codex"
+
+
+def test_auxiliary_selector_returns_none_when_no_coder_is_eligible() -> None:
+    ctx = _ctx(limited={"claude", "codex", "gemini"})
+
+    assert select_auxiliary_coder(ctx) is None

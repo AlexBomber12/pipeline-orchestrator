@@ -15,7 +15,7 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src import claude_cli, github_client
+from src import claude_cli, codex_cli, github_client
 from src.daemon import git_ops
 from src.models import PipelineState
 from src.queue_parser import mark_task_done
@@ -66,7 +66,25 @@ class MergeMixin:
                     if "CONFLICT" in (
                         merge_result.stdout + merge_result.stderr
                     ):
-                        if not await self._check_rate_limit(proactive_coder="claude"):
+                        selected = self._get_auxiliary_coder()
+                        if selected is None:
+                            git_ops._git(
+                                self.repo_path,
+                                "merge", "--abort",
+                                check=False,
+                            )
+                            self.state.state = PipelineState.ERROR
+                            self.state.error_message = (
+                                "No eligible coder available for merge conflict "
+                                "resolution"
+                            )
+                            await self._save_current_run_record("error")
+                            self.log_event(self.state.error_message)
+                            return
+                        coder_name, _plugin = selected
+                        if not await self._check_rate_limit(
+                            proactive_coder=coder_name
+                        ):
                             git_ops._git(
                                 self.repo_path,
                                 "merge", "--abort",
@@ -78,21 +96,42 @@ class MergeMixin:
                         )
                         if self._current_run_record is not None:
                             self._current_run_record.had_merge_conflict = True
-                        code, _stdout, _stderr = await claude_cli.run_claude_async(
+                        prompt = (
                             "Resolve all merge conflicts in the working "
                             "tree. Keep both sides where possible. "
-                            "Run scripts/ci.sh to verify.",
-                            self.repo_path,
-                            timeout=300,
-                            model=self.app_config.daemon.claude_model,
-                            system_prompt_file=None,
+                            "Run scripts/ci.sh to verify."
                         )
+                        if coder_name == "claude":
+                            code, _stdout, _stderr = await claude_cli.run_claude_async(
+                                prompt,
+                                self.repo_path,
+                                timeout=300,
+                                model=self.app_config.daemon.claude_model,
+                                system_prompt_file=None,
+                            )
+                        else:
+                            code, _stdout, _stderr = await codex_cli.run_codex_async(
+                                prompt,
+                                self.repo_path,
+                                timeout=300,
+                                model=self.app_config.daemon.codex_model,
+                            )
                         if code != 0:
+                            self._detect_rate_limit(_stderr, coder_name=coder_name)
                             git_ops._git(
                                 self.repo_path,
                                 "merge", "--abort",
                                 check=False,
                             )
+                            if self.state.rate_limited_until is not None:
+                                self.state.state = PipelineState.PAUSED
+                                self.state.error_message = None
+                                await self._save_current_run_record("rate_limit")
+                                self.log_event(
+                                    f"Rate limit pause active until "
+                                    f"{self.state.rate_limited_until.isoformat()}"
+                                )
+                                return
                             self.state.state = PipelineState.ERROR
                             self.state.error_message = (
                                 "Merge conflict resolution failed"
