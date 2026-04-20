@@ -400,6 +400,23 @@ def test_upload_zip_with_pr_files_extracts_and_succeeds(
     assert {path.name for path in staging.iterdir()} == {"PR-001.md", "PR-002.md"}
 
 
+def test_upload_zip_with_sparse_pr_files_lists_explicit_ids(
+    one_repo_config: Path, repo_dir: Path, uploads_dir: Path
+) -> None:
+    resp = _post_upload(
+        [
+            _zip_file(
+                {
+                    "PR-124.md": _task_bytes("PR-124.md", pr_id="PR-124"),
+                    "PR-141.md": _task_bytes("PR-141.md", pr_id="PR-141"),
+                }
+            )
+        ]
+    )
+    assert resp.status_code == 200
+    assert "Accepted 2 task files (PR-124, PR-141)." in resp.text
+
+
 def test_upload_single_file_zip_success_message(
     one_repo_config: Path,
     repo_dir: Path,
@@ -414,6 +431,10 @@ def test_upload_single_file_zip_success_message(
 test_upload_zip_with_nested_directories_rejected = _make_zip_error_test([_zip_file({"nested/PR-001.md": _task_bytes()})], 422, "path separators")  # noqa: E501
 test_upload_zip_with_non_md_entries_rejected = _make_zip_error_test([_zip_file({"README.md": b"# nope\n"})], 422, "Invalid file name")  # noqa: E501
 test_upload_zip_corrupt_returns_400 = _make_zip_error_test([("files", ("broken.zip", b"not-a-zip", "application/zip"))], 400, "corrupt or unreadable")  # noqa: E501
+
+
+def test_task_upload_summary_lists_non_numeric_ids_explicitly() -> None:
+    assert web_app._task_upload_summary(["PR-ABC.md", "PR-XYZ.md"]) == "PR-ABC, PR-XYZ"
 
 
 def test_upload_zip_entry_read_error_returns_400(

@@ -1956,7 +1956,16 @@ def _task_upload_summary(task_filenames: list[str]) -> str:
     labels = [filename.removesuffix(".md") for filename in ordered]
     if len(labels) == 1:
         return labels[0]
-    return f"{labels[0]} through {labels[-1]}"
+    pr_numbers: list[int] = []
+    for filename in ordered:
+        match = _re.fullmatch(r"PR-(\d+)\.md", filename)
+        if not match:
+            return ", ".join(labels)
+        pr_numbers.append(int(match.group(1)))
+
+    if pr_numbers == list(range(pr_numbers[0], pr_numbers[-1] + 1)):
+        return f"{labels[0]} through {labels[-1]}"
+    return ", ".join(labels)
 
 
 def _build_upload_success_message(filenames: list[str]) -> str:
