@@ -650,6 +650,44 @@ def test_partial_repo_events_renders_deduplicated_entry(
     assert body.count('data-ts="') == 2
 
 
+def test_partial_repo_events_uses_mobile_stacked_layout_without_truncation(
+    observability_config: Path,
+) -> None:
+    now = datetime.now(timezone.utc)
+    alpha = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.CODING,
+        last_updated=now,
+        history=[
+            {
+                "time": _iso(now),
+                "last_seen_at": _iso(now + timedelta(minutes=4)),
+                "state": "CODING",
+                "event": "Long mobile event message " * 12,
+                "count": 9,
+            },
+        ],
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": alpha.model_dump_json()})
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.get("/partials/repo/example__alpha/events")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "flex flex-col gap-1" in body
+    assert "sm:flex-row sm:items-start sm:gap-2" in body
+    assert "px-1 py-2.5" in body
+    assert "sm:px-0 sm:py-2" in body
+    assert "order-2 text-gray-500 shrink-0 whitespace-nowrap sm:order-1" in body
+    assert "order-1 text-[10px]" in body
+    assert "min-w-0 text-gray-300 break-words" in body
+    assert "truncate" not in body
+    assert "(x9)" in body
+
+
 def test_repo_full_page_marks_count_span_for_oob_target(
     observability_config: Path,
 ) -> None:

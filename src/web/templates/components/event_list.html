@@ -26,22 +26,24 @@
     {% set entry_count = entry.get('count', 1) %}
     {% set first_seen = entry.get('time', '') %}
     {% set last_seen = entry.get('last_seen_at', first_seen) %}
-    <li class="flex items-center gap-3 py-2">
-        {% if entry_count > 1 %}
-        <span class="text-gray-500 shrink-0 whitespace-nowrap">
-            <span data-ts="{{ first_seen }}">{{ first_seen or '--:--:--' }}</span>
-            <span aria-hidden="true"> -&gt; </span>
-            <span data-ts="{{ last_seen }}">{{ last_seen or '--:--:--' }}</span>
-        </span>
-        {% else %}
-        <span class="text-gray-500 shrink-0" data-ts="{{ first_seen }}">
-            {{ first_seen or '--:--:--' }}
-        </span>
-        {% endif %}
-        <span class="text-[10px] font-medium px-1.5 py-0.5 rounded border {{ entry_style.badge }} shrink-0">
-            {{ entry_state }}
-        </span>
-        <span class="text-gray-300 truncate">
+    <li class="flex flex-col gap-1 px-1 py-2.5 sm:flex-row sm:items-start sm:gap-2 sm:px-0 sm:py-2">
+        <div class="flex items-center gap-2 text-xs">
+            {% if entry_count > 1 %}
+            <span class="order-2 text-gray-500 shrink-0 whitespace-nowrap sm:order-1">
+                <span data-ts="{{ first_seen }}">{{ first_seen or '--:--:--' }}</span>
+                <span aria-hidden="true"> -&gt; </span>
+                <span data-ts="{{ last_seen }}">{{ last_seen or '--:--:--' }}</span>
+            </span>
+            {% else %}
+            <span class="order-2 text-gray-500 shrink-0 whitespace-nowrap sm:order-1" data-ts="{{ first_seen }}">
+                {{ first_seen or '--:--:--' }}
+            </span>
+            {% endif %}
+            <span class="order-1 text-[10px] font-medium px-1.5 py-0.5 rounded border {{ entry_style.badge }} shrink-0 sm:order-2">
+                {{ entry_state }}
+            </span>
+        </div>
+        <span class="min-w-0 text-gray-300 break-words">
             {{ entry.get('event', '') }}{% if entry_count > 1 %} (x{{ entry_count }}){% endif %}
         </span>
     </li>
