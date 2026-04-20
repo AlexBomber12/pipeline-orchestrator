@@ -414,25 +414,34 @@ def test_reload_repo_config_if_dirty_clears_staged_reload_after_disk_refresh(
     staged_repo_config = RepoConfig.model_validate(
         {**runner.repo_config.model_dump(), "coder": "codex"}
     )
+    staged_claude = _FakeUsageProvider(snapshot="new-claude")
+    staged_codex = _FakeUsageProvider(snapshot="new-codex")
     runner.stage_config_reload(
         staged_repo_config,
         AppConfig(
             repositories=[staged_repo_config],
             daemon=runner.app_config.daemon,
         ),
-        _FakeUsageProvider(snapshot="new-claude"),
-        _FakeUsageProvider(snapshot="new-codex"),
+        staged_claude,
+        staged_codex,
     )
     disk_repo_config = RepoConfig.model_validate(
         {**runner.repo_config.model_dump(), "coder": "claude"}
     )
+    refreshed_app_config = AppConfig(
+        repositories=[disk_repo_config],
+        daemon=DaemonConfig(
+            **{
+                **runner.app_config.daemon.model_dump(),
+                "usage_api_cache_ttl_sec": 321,
+                "usage_api_beta_header": "oauth-test-header",
+            }
+        ),
+    )
     monkeypatch.setattr(
         runner_module,
         "load_config",
-        lambda path="config.yml": AppConfig(
-            repositories=[disk_repo_config],
-            daemon=runner.app_config.daemon,
-        ),
+        lambda path="config.yml": refreshed_app_config,
     )
 
     asyncio.run(runner.reload_repo_config_if_dirty())
@@ -442,8 +451,11 @@ def test_reload_repo_config_if_dirty_clears_staged_reload_after_disk_refresh(
     assert runner._pending_repo_config is None
     assert runner._pending_app_config is None
     assert runner._pending_usage_providers is None
-    assert runner._claude_usage_provider.fetch() == "new-claude"
-    assert runner._codex_usage_provider.fetch() == "new-codex"
+    assert runner._claude_usage_provider is not staged_claude
+    assert runner._codex_usage_provider is not staged_codex
+    assert getattr(runner._claude_usage_provider, "_cache_ttl") == 321
+    assert getattr(runner._claude_usage_provider, "_beta_header") == "oauth-test-header"
+    assert getattr(runner._codex_usage_provider, "_cache_ttl") == 321
 
 
 def _allow_all_coder_auth(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -13577,6 +13589,41 @@ def test_run_cycle_dispatches_error_handler_when_ai_enabled(
 
     assert calls == ["handle_error"]
     assert publishes == ["published"]
+
+
+def test_run_cycle_reloads_dirty_config_before_error_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    runner = _make_runner()
+    runner._recovered = True
+    runner._scaffolded = True
+    runner.state.state = PipelineState.ERROR
+    runner.state.rate_limited_until = None
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_reload_repo_config_if_dirty() -> None:
+        calls.append("reload")
+
+    async def fake_handle_error() -> None:
+        calls.append("handle_error")
+
+    async def fake_publish_state() -> None:
+        calls.append("publish")
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", lambda: True)
+    monkeypatch.setattr(
+        runner, "reload_repo_config_if_dirty", fake_reload_repo_config_if_dirty
+    )
+    monkeypatch.setattr(runner, "handle_error", fake_handle_error)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+
+    asyncio.run(runner.run_cycle())
+
+    assert calls == ["reload", "handle_error", "publish"]
 
 
 # ── ErrorCategory / _classify_error ──────────────────────────────────

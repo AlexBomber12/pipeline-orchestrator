@@ -257,6 +257,22 @@ class PipelineRunner(
             codex_usage_provider,
         )
 
+    def _build_usage_providers_for_app_config(
+        self,
+        app_config: AppConfig,
+    ) -> tuple[UsageProvider, UsageProvider]:
+        """Rebuild shared usage providers from the active config snapshot."""
+        claude_provider = self._registry.get("claude").create_usage_provider(
+            config=app_config
+        )
+        codex_provider = self._registry.get("codex").create_usage_provider(
+            config=app_config
+        )
+        return (
+            claude_provider or self._claude_usage_provider,
+            codex_provider or self._codex_usage_provider,
+        )
+
     def _apply_staged_config_reload(self) -> None:
         """Apply any queued config changes now that the runner is safe to swap."""
         if self._pending_repo_config is None or self._pending_app_config is None:
@@ -290,8 +306,9 @@ class PipelineRunner(
             if repo_slug_from_url(repo.url) == self.name:
                 self.repo_config = repo
                 self.app_config = config
-                if self._pending_usage_providers is not None:
-                    self.set_usage_providers(*self._pending_usage_providers)
+                self.set_usage_providers(
+                    *self._build_usage_providers_for_app_config(config)
+                )
                 self.clear_staged_config_reload()
                 await self.redis.delete(dirty_key)
                 self.log_event("Reloaded repo config from config.yml")
@@ -876,6 +893,7 @@ class PipelineRunner(
         elif current == PipelineState.PAUSED:
             await self.handle_paused()
         elif current == PipelineState.ERROR:
+            await self.reload_repo_config_if_dirty()
             if self.state.rate_limited_until is not None:
                 self.state.state = PipelineState.PAUSED
                 self.log_event("Legacy ERROR + rate_limited_until -> PAUSED")
