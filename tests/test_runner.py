@@ -2272,6 +2272,46 @@ def test_handle_fix_posts_codex_review_after_push(
     )
 
 
+def test_handle_fix_finishes_push_bookkeeping_before_post_exit_stop_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", _async_cli_result(0, "", "")
+    )
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019")
+    runner.redis.store[f"control:{runner.name}:stop"] = "1"
+
+    async def stale_stop_monitor(
+        _cli_task: asyncio.Task[tuple[int, str, str]],
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_monitor_stop_request", stale_stop_monitor)
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.user_paused is True
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.push_count == 1
+    assert posted == [(runner.owner_repo, 77, "@codex review")]
+    assert any(
+        "deferring pause until fix bookkeeping completes" in entry["event"].lower()
+        for entry in runner.state.history
+    )
+    assert any("Fix pushed, iteration #1" in e["event"] for e in runner.state.history)
+
+
 def test_handle_fix_honors_stop_requested_during_fix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2357,7 +2397,7 @@ def test_handle_fix_honors_persisted_stop_after_fast_fix_exit(
     assert runner.state.error_message is None
     assert f"control:{runner.name}:stop" not in runner.redis.store
     assert any(
-        "after fix exit" in entry["event"].lower()
+        "deferring pause until fix bookkeeping completes" in entry["event"].lower()
         for entry in runner.state.history
     )
 

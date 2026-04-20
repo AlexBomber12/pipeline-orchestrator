@@ -264,26 +264,36 @@ class FixMixin(BreachMixin):
             )
             return
 
-        async def pause_for_stop_if_requested() -> bool:
+        stop_requested_after_exit = False
+
+        async def capture_stop_requested_after_exit() -> bool:
+            nonlocal stop_requested_after_exit
+            if stop_requested_after_exit:
+                return True
             if self._stop_requested:
-                requested = True
-            else:
-                requested = await self._pop_stop_request()
-                if requested:
-                    self._stop_requested = True
-                    self.state.user_paused = True
-                    self.log_event(
-                        "User stop requested after FIX exit; honoring persisted stop"
-                    )
+                stop_requested_after_exit = True
+                return True
+            requested = await self._pop_stop_request()
             if not requested:
+                return False
+            self._stop_requested = True
+            self.state.user_paused = True
+            stop_requested_after_exit = True
+            self.log_event(
+                "User stop requested after FIX exit; deferring pause "
+                "until FIX bookkeeping completes"
+            )
+            return True
+
+        async def pause_for_stop_after_bookkeeping() -> bool:
+            if not stop_requested_after_exit:
                 return False
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
             self.log_event("FIX aborted: user stop requested")
             return True
 
-        if await pause_for_stop_if_requested():
-            return
+        await capture_stop_requested_after_exit()
         if idle_flag["timed_out"]:
             self.state.state = PipelineState.ERROR
             self.state.error_message = (
@@ -293,8 +303,7 @@ class FixMixin(BreachMixin):
             await self._save_cli_log("", "", "FIX idle timeout")
             return
         await self._save_cli_log(stdout, stderr, f"FIX REVIEW output [{coder_name}]")
-        if await pause_for_stop_if_requested():
-            return
+        await capture_stop_requested_after_exit()
         if code != 0:
             self._detect_rate_limit(stderr, coder_name=coder_name)
             if self.state.rate_limited_until is not None:
@@ -304,6 +313,8 @@ class FixMixin(BreachMixin):
                     f"Rate limit pause active until "
                     f"{self.state.rate_limited_until.isoformat()}"
                 )
+                return
+            if await pause_for_stop_after_bookkeeping():
                 return
             self.state.state = PipelineState.ERROR
             self.state.error_message = stderr.strip() or f"{coder_name} exit {code}"
@@ -323,11 +334,13 @@ class FixMixin(BreachMixin):
 
         if head_before and head_before == head_after:
             self._last_push_at = datetime.now(timezone.utc)
-            self.state.state = PipelineState.WATCH
             self.log_event(
                 "FIX REVIEW exited 0 but HEAD unchanged; "
                 "no push, skipping @codex review"
             )
+            if await pause_for_stop_after_bookkeeping():
+                return
+            self.state.state = PipelineState.WATCH
             return
 
         push_time = datetime.now(timezone.utc)
@@ -340,7 +353,6 @@ class FixMixin(BreachMixin):
         else:
             iteration = 0
 
-        self.state.state = PipelineState.WATCH
         self.log_event(f"Fix pushed, iteration #{iteration}")
         if (
             self.state.current_pr is not None
@@ -352,3 +364,7 @@ class FixMixin(BreachMixin):
                 f"#{self.state.current_pr.number} after fix push; "
                 "manual review trigger required to avoid fix/push loop"
             )
+            return
+        if await pause_for_stop_after_bookkeeping():
+            return
+        self.state.state = PipelineState.WATCH
