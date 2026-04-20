@@ -392,6 +392,8 @@ class FixMixin(BreachMixin):
             )
             self.log_event(self.state.error_message)
             await self._save_cli_log("", "", "FIX idle timeout")
+            if await pause_for_stop_after_bookkeeping():
+                return
             return
         await self._save_cli_log(stdout, stderr, f"FIX REVIEW output [{coder_name}]")
         await capture_stop_requested_after_exit()
