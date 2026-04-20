@@ -457,6 +457,65 @@ def test_log_event_caps_history_at_100(monkeypatch: pytest.MonkeyPatch) -> None:
     assert runner.state.history[-1]["event"] == "event 149"
 
 
+def test_log_event_deduplicates_consecutive_identical_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeDateTime:
+        _values = iter(
+            [
+                datetime(2026, 4, 20, 11, 55, 0, tzinfo=timezone.utc),
+                datetime(2026, 4, 20, 12, 0, 0, tzinfo=timezone.utc),
+                datetime(2026, 4, 20, 12, 5, 0, tzinfo=timezone.utc),
+            ]
+        )
+
+        @classmethod
+        def now(cls, tz: timezone) -> datetime:
+            value = next(cls._values)
+            return value.astimezone(tz)
+
+    monkeypatch.setattr(runner_module, "datetime", _FakeDateTime)
+    runner = _make_runner()
+
+    runner.log_event("No tasks available")
+    runner.log_event("No tasks available")
+
+    assert len(runner.state.history) == 1
+    assert runner.state.history[0]["count"] == 2
+    assert runner.state.history[0]["time"] == "2026-04-20T12:00:00+00:00"
+    assert runner.state.history[0]["last_seen_at"] == "2026-04-20T12:05:00+00:00"
+
+
+def test_log_event_does_not_deduplicate_when_state_changes() -> None:
+    runner = _make_runner()
+
+    runner.state.state = PipelineState.IDLE
+    runner.log_event("No tasks available")
+    runner.state.state = PipelineState.WATCH
+    runner.log_event("No tasks available")
+
+    assert len(runner.state.history) == 2
+    assert [entry["state"] for entry in runner.state.history] == ["IDLE", "WATCH"]
+    assert all(entry.get("count", 1) == 1 for entry in runner.state.history)
+
+
+def test_log_event_starts_new_counter_after_different_event() -> None:
+    runner = _make_runner()
+
+    runner.log_event("No tasks available")
+    runner.log_event("No tasks available")
+    runner.log_event("Picked task PR-130")
+    runner.log_event("No tasks available")
+
+    assert len(runner.state.history) == 3
+    assert runner.state.history[0]["event"] == "No tasks available"
+    assert runner.state.history[0]["count"] == 2
+    assert runner.state.history[1]["event"] == "Picked task PR-130"
+    assert runner.state.history[1]["count"] == 1
+    assert runner.state.history[2]["event"] == "No tasks available"
+    assert runner.state.history[2]["count"] == 1
+
+
 def test_handle_idle_no_tasks_leaves_state_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
