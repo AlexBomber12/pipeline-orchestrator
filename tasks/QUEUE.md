@@ -371,7 +371,7 @@
 - Branch: pr-136-progress-bar-sse
 
 ## PR-137: Settings page logical grouping and one-line hints
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-137.md
 - Branch: pr-137-settings-clarity
 
