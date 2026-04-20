@@ -376,7 +376,7 @@
 - Branch: pr-137-settings-clarity
 
 ## PR-138: Coder selector on repo detail page with hot-reload
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-138.md
 - Branch: pr-138-repo-coder-selector
 
