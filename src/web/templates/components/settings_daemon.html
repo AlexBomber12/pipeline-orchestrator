@@ -1,191 +1,177 @@
-<!-- Timing -->
-<div class="mb-6">
-    <h3 class="text-sm font-semibold text-gray-300 uppercase tracking-wide mb-3">Timing</h3>
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <label class="flex flex-col gap-1 text-sm cursor-pointer">
-            <span class="text-gray-400">Poll interval (seconds)</span>
-            <input type="number"
-                   name="poll_interval_sec"
-                   value="{{ daemon.poll_interval_sec }}"
-                   min="1"
-                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
-                   hx-put="/settings/daemon"
-                   hx-trigger="change"
-                   hx-target="#settings-daemon"
-                   hx-swap="innerHTML">
-            <span class="text-xs text-gray-500">How often the daemon checks each repo.</span>
-        </label>
-        <label class="flex flex-col gap-1 text-sm cursor-pointer">
-            <span class="text-gray-400">PLANNED PR timeout (seconds)</span>
-            <input type="number"
-                   name="planned_pr_timeout_sec"
-                   value="{{ daemon.planned_pr_timeout_sec }}"
-                   min="300"
-                   max="7200"
-                   step="300"
-                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
-                   hx-put="/settings/daemon"
-                   hx-trigger="change"
-                   hx-target="#settings-daemon"
-                   hx-swap="innerHTML">
-            <span class="text-xs text-gray-500">Max time the coder gets before being killed.</span>
-        </label>
-    </div>
-</div>
+<div class="space-y-6">
+    <section>
+        <div class="mb-3">
+            <h3 class="text-base font-semibold text-gray-200">Timeouts</h3>
+            <p class="text-sm text-gray-500">Core timing limits for normal polling, planning, review, and FIX work.</p>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <label class="flex flex-col gap-1 text-sm cursor-pointer">
+                <span class="text-gray-400">Poll interval (seconds)</span>
+                <input type="number"
+                       name="poll_interval_sec"
+                       value="{{ daemon.poll_interval_sec }}"
+                       min="1"
+                       class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+                       hx-put="/settings/daemon"
+                       hx-trigger="change"
+                       hx-target="#settings-daemon"
+                       hx-swap="innerHTML">
+                <span class="text-xs text-gray-500">Seconds between daemon checks across configured repositories.</span>
+            </label>
+            <label class="flex flex-col gap-1 text-sm cursor-pointer">
+                <span class="text-gray-400">PLANNED PR timeout (seconds)</span>
+                <input type="number"
+                       name="planned_pr_timeout_sec"
+                       value="{{ daemon.planned_pr_timeout_sec }}"
+                       min="300"
+                       max="7200"
+                       step="300"
+                       class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+                       hx-put="/settings/daemon"
+                       hx-trigger="change"
+                       hx-target="#settings-daemon"
+                       hx-swap="innerHTML">
+                <span class="text-xs text-gray-500">Seconds before the coder subprocess is killed if no activity.</span>
+            </label>
+            <label class="flex flex-col gap-1 text-sm cursor-pointer">
+                <span class="text-gray-400">FIX idle timeout (seconds since last push)</span>
+                <input type="number"
+                       name="fix_idle_timeout_sec"
+                       value="{{ daemon.fix_idle_timeout_sec }}"
+                       min="300"
+                       max="7200"
+                       step="300"
+                       class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+                       hx-put="/settings/daemon"
+                       hx-trigger="change"
+                       hx-target="#settings-daemon"
+                       hx-swap="innerHTML">
+                <span class="text-xs text-gray-500">FIX time budget, reset on each successful push.</span>
+            </label>
+            <label class="flex flex-col gap-1 text-sm cursor-pointer">
+                <span class="text-gray-400">Default review timeout (minutes)</span>
+                <input type="number"
+                       name="review_timeout_min"
+                       value="{{ daemon.review_timeout_min }}"
+                       min="1"
+                       class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+                       hx-put="/settings/daemon"
+                       hx-trigger="change"
+                       hx-target="#settings-daemon"
+                       hx-swap="innerHTML">
+                <span class="text-xs text-gray-500">Minutes to wait for review before the PR moves to HUNG.</span>
+            </label>
+        </div>
+    </section>
 
-<!-- Review handling -->
-<div class="mb-6 pt-4 border-t border-white/5">
-    <h3 class="text-sm font-semibold text-gray-300 uppercase tracking-wide mb-3">Review handling</h3>
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <label class="flex flex-col gap-1 text-sm cursor-pointer">
-            <span class="text-gray-400">Default review timeout (minutes)</span>
-            <input type="number"
-                   name="review_timeout_min"
-                   value="{{ daemon.review_timeout_min }}"
-                   min="1"
-                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
-                   hx-put="/settings/daemon"
-                   hx-trigger="change"
-                   hx-target="#settings-daemon"
-                   hx-swap="innerHTML">
-            <span class="text-xs text-gray-500">If Codex doesn't review in time, PR flips to HUNG.</span>
-        </label>
-        <label class="flex flex-col gap-1 text-sm cursor-pointer">
-            <span class="text-gray-400">FIX idle timeout (seconds since last push)</span>
-            <input type="number"
-                   name="fix_idle_timeout_sec"
-                   value="{{ daemon.fix_idle_timeout_sec }}"
-                   min="300"
-                   max="7200"
-                   step="300"
-                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
-                   hx-put="/settings/daemon"
-                   hx-trigger="change"
-                   hx-target="#settings-daemon"
-                   hx-swap="innerHTML">
-            <span class="text-xs text-gray-500">Kills the coder during FIX if no push. Resets on each push.</span>
-        </label>
-    </div>
-    <div class="mt-3">
-        <label class="flex items-center gap-3 text-sm cursor-pointer">
-            <input type="checkbox"
-                   name="auto_fallback"
-                   value="true"
-                   {% if daemon.auto_fallback %}checked{% endif %}
-                   class="accent-accent"
-                   hx-put="/settings/daemon"
-                   hx-trigger="change"
-                   hx-target="#settings-daemon"
-                   hx-swap="innerHTML"
-                   hx-vals='{"auto_fallback": "{{ "false" if daemon.auto_fallback else "true" }}"}'>
-            <span>
-                <span class="text-gray-200">Auto fallback across eligible coders</span>
-                <span class="block text-xs text-gray-500">
-                    When the preferred coder is unavailable, let the selector pick another eligible coder.
+    <section class="pt-4 border-t border-white/5">
+        <div class="mb-3">
+            <h3 class="text-base font-semibold text-gray-200">Rate Limits</h3>
+            <p class="text-sm text-gray-500">Pause thresholds that keep the active coder below session and weekly usage caps.</p>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <label class="flex flex-col gap-1 text-sm cursor-pointer">
+                <span class="text-gray-400">Session rate limit pause (%)</span>
+                <input type="number"
+                       name="rate_limit_session_pause_percent"
+                       value="{{ daemon.rate_limit_session_pause_percent }}"
+                       min="50"
+                       max="100"
+                       step="5"
+                       class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+                       hx-put="/settings/daemon"
+                       hx-trigger="change"
+                       hx-target="#settings-daemon"
+                       hx-swap="innerHTML">
+                <span class="text-xs text-gray-500">Pause when 5-hour session usage reaches this percentage.</span>
+            </label>
+            <label class="flex flex-col gap-1 text-sm cursor-pointer">
+                <span class="text-gray-400">Weekly rate limit pause (%)</span>
+                <input type="number"
+                       name="rate_limit_weekly_pause_percent"
+                       value="{{ daemon.rate_limit_weekly_pause_percent }}"
+                       min="50"
+                       max="100"
+                       step="5"
+                       class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+                       hx-put="/settings/daemon"
+                       hx-trigger="change"
+                       hx-target="#settings-daemon"
+                       hx-swap="innerHTML">
+                <span class="text-xs text-gray-500">Set to 100 to keep running until the provider returns a rate-limit response.</span>
+            </label>
+        </div>
+    </section>
+
+    <section class="pt-4 border-t border-white/5">
+        <div class="mb-3">
+            <h3 class="text-base font-semibold text-gray-200">Self-Heal</h3>
+            <p class="text-sm text-gray-500">Fallback and diagnosis controls for stalled reviews, unavailable coders, and failed runs.</p>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <label class="flex items-start gap-3 text-sm cursor-pointer">
+                <input type="checkbox"
+                       name="auto_fallback"
+                       value="true"
+                       {% if daemon.auto_fallback %}checked{% endif %}
+                       class="accent-accent mt-1"
+                       hx-put="/settings/daemon"
+                       hx-trigger="change"
+                       hx-target="#settings-daemon"
+                       hx-swap="innerHTML"
+                       hx-vals='{"auto_fallback": "{{ "false" if daemon.auto_fallback else "true" }}"}'>
+                <span>
+                    <span class="text-gray-200">Auto fallback across eligible coders</span>
+                    <span class="block text-xs text-gray-500">Switch to another eligible coder when the preferred one is unavailable.</span>
                 </span>
-            </span>
-        </label>
-    </div>
-    <div class="mt-3">
-        <label class="flex items-center gap-3 text-sm cursor-pointer">
-            <input type="checkbox"
-                   name="hung_fallback_codex_review"
-                   value="true"
-                   {% if daemon.hung_fallback_codex_review %}checked{% endif %}
-                   class="accent-accent"
-                   hx-put="/settings/daemon"
-                   hx-trigger="change"
-                   hx-target="#settings-daemon"
-                   hx-swap="innerHTML"
-                   hx-vals='{"hung_fallback_codex_review": "{{ "false" if daemon.hung_fallback_codex_review else "true" }}"}'>
-            <span>
-                <span class="text-gray-200">HUNG fallback: post <span class="font-mono">@codex review</span></span>
-                <span class="block text-xs text-gray-500">
-                    When a PR exceeds its review timeout, re-ping Codex on the anchor comment.
+            </label>
+            <label class="flex items-start gap-3 text-sm cursor-pointer">
+                <input type="checkbox"
+                       name="hung_fallback_codex_review"
+                       value="true"
+                       {% if daemon.hung_fallback_codex_review %}checked{% endif %}
+                       class="accent-accent mt-1"
+                       hx-put="/settings/daemon"
+                       hx-trigger="change"
+                       hx-target="#settings-daemon"
+                       hx-swap="innerHTML"
+                       hx-vals='{"hung_fallback_codex_review": "{{ "false" if daemon.hung_fallback_codex_review else "true" }}"}'>
+                <span>
+                    <span class="text-gray-200">HUNG fallback: post <span class="font-mono">@codex review</span></span>
+                    <span class="block text-xs text-gray-500">Re-post the review trigger when a PR times out waiting for Codex.</span>
                 </span>
-            </span>
-        </label>
-    </div>
-</div>
-
-<!-- Coder selection -->
-<div class="mb-6 pt-4 border-t border-white/5">
-    <h3 class="text-sm font-semibold text-gray-300 uppercase tracking-wide mb-3">Coder selection</h3>
-    <label class="flex flex-col gap-1 text-sm cursor-pointer">
-        <span class="text-gray-400">Exploration epsilon</span>
-        <input type="number"
-               name="exploration_epsilon"
-               value="{{ daemon.exploration_epsilon }}"
-               min="0"
-               max="0.5"
-               step="0.01"
-               class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
-               hx-put="/settings/daemon"
-               hx-trigger="change"
-               hx-target="#settings-daemon"
-               hx-swap="innerHTML">
-        <span class="text-xs text-gray-500">
-            Probability 0-0.5 that selector picks a non-top eligible coder to accumulate comparison data. Default 0.15 (roughly 1 in 7 selections). Set to 0 to disable exploration.
-        </span>
-    </label>
-</div>
-
-<!-- Rate limits -->
-<div class="mb-6 pt-4 border-t border-white/5">
-    <h3 class="text-sm font-semibold text-gray-300 uppercase tracking-wide mb-3">Rate limits</h3>
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <label class="flex flex-col gap-1 text-sm cursor-pointer">
-            <span class="text-gray-400">Session rate limit pause (%)</span>
-            <input type="number"
-                   name="rate_limit_session_pause_percent"
-                   value="{{ daemon.rate_limit_session_pause_percent }}"
-                   min="50"
-                   max="100"
-                   step="5"
-                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
-                   hx-put="/settings/daemon"
-                   hx-trigger="change"
-                   hx-target="#settings-daemon"
-                   hx-swap="innerHTML">
-            <span class="text-xs text-gray-500">Pause when 5-hour session usage exceeds this threshold.</span>
-        </label>
-        <label class="flex flex-col gap-1 text-sm cursor-pointer">
-            <span class="text-gray-400">Weekly rate limit pause (%)</span>
-            <input type="number"
-                   name="rate_limit_weekly_pause_percent"
-                   value="{{ daemon.rate_limit_weekly_pause_percent }}"
-                   min="50"
-                   max="100"
-                   step="5"
-                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
-                   hx-put="/settings/daemon"
-                   hx-trigger="change"
-                   hx-target="#settings-daemon"
-                   hx-swap="innerHTML">
-            <span class="text-xs text-gray-500">Set to 100 to run until API returns 429.</span>
-        </label>
-    </div>
-</div>
-
-<!-- Error recovery -->
-<div class="pt-4 border-t border-white/5">
-    <h3 class="text-sm font-semibold text-gray-300 uppercase tracking-wide mb-3">Error recovery</h3>
-    <label class="flex items-center gap-3 text-sm cursor-pointer">
-        <input type="checkbox"
-               name="error_handler_use_ai"
-               value="true"
-               {% if daemon.error_handler_use_ai %}checked{% endif %}
-               class="accent-accent"
-               hx-put="/settings/daemon"
-               hx-trigger="change"
-               hx-target="#settings-daemon"
-               hx-swap="innerHTML"
-               hx-vals='{"error_handler_use_ai": "{{ "false" if daemon.error_handler_use_ai else "true" }}"}'>
-        <span>
-            <span class="text-gray-200">Error handler: use AI diagnosis</span>
-            <span class="block text-xs text-gray-500">
-                Let the coder analyze failures before falling back to default recovery.
-            </span>
-        </span>
-    </label>
+            </label>
+            <label class="flex items-start gap-3 text-sm cursor-pointer">
+                <input type="checkbox"
+                       name="error_handler_use_ai"
+                       value="true"
+                       {% if daemon.error_handler_use_ai %}checked{% endif %}
+                       class="accent-accent mt-1"
+                       hx-put="/settings/daemon"
+                       hx-trigger="change"
+                       hx-target="#settings-daemon"
+                       hx-swap="innerHTML"
+                       hx-vals='{"error_handler_use_ai": "{{ "false" if daemon.error_handler_use_ai else "true" }}"}'>
+                <span>
+                    <span class="text-gray-200">Error handler: use AI diagnosis</span>
+                    <span class="block text-xs text-gray-500">Use the coder to diagnose ERROR before generic recovery kicks in.</span>
+                </span>
+            </label>
+            <label class="flex flex-col gap-1 text-sm cursor-pointer">
+                <span class="text-gray-400">Exploration epsilon</span>
+                <input type="number"
+                       name="exploration_epsilon"
+                       value="{{ daemon.exploration_epsilon }}"
+                       min="0"
+                       max="0.5"
+                       step="0.01"
+                       class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+                       hx-put="/settings/daemon"
+                       hx-trigger="change"
+                       hx-target="#settings-daemon"
+                       hx-swap="innerHTML">
+                <span class="text-xs text-gray-500">Chance from 0 to 0.5 to try a different eligible coder for comparison data.</span>
+            </label>
+        </div>
+    </section>
 </div>
