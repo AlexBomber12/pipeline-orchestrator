@@ -325,6 +325,45 @@ def test_index_route_returns_html(
     assert 'id="status-bar"' in body
 
 
+@pytest.mark.parametrize(
+    "path",
+    ["/", "/settings", "/repo/example__alpha"],
+)
+def test_theme_toggle_is_rendered_on_main_pages(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get(path)
+
+    assert response.status_code == 200
+    assert 'id="theme-toggle"' in response.text
+    assert 'meta name="color-scheme" content="dark light"' in response.text
+
+
+def test_base_template_includes_theme_bootstrap_assets(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    body = response.text
+    assert "html[data-theme=\"light\"]" in body
+    assert "let storedTheme = null;" in body
+    assert "localStorage.getItem(STORAGE_KEY)" in body
+    assert "if (storedTheme === 'light' || storedTheme === 'dark')" in body
+    assert "localStorage.setItem(STORAGE_KEY, theme)" in body
+    assert "prefers-color-scheme: light" in body
+    assert "document.documentElement.dataset.theme = theme;" in body
+    assert "theme-icon-dark" in body
+    assert "theme-icon-light" in body
+
+
 def test_api_states_returns_json(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

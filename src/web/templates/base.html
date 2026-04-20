@@ -1,8 +1,9 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="dark light">
     <title>{% block title %}Pipeline Orchestrator{% endblock %}</title>
 
     <script src="https://cdn.tailwindcss.com"></script>
@@ -25,6 +26,30 @@
     <link
         href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
         rel="stylesheet">
+
+    <script>
+        (function () {
+            const STORAGE_KEY = 'theme';
+            let theme = 'dark';
+            let storedTheme = null;
+
+            try {
+                storedTheme = localStorage.getItem(STORAGE_KEY);
+            } catch (_error) {}
+
+            if (storedTheme === 'light' || storedTheme === 'dark') {
+                theme = storedTheme;
+            } else if (
+                window.matchMedia &&
+                window.matchMedia('(prefers-color-scheme: light)').matches
+            ) {
+                theme = 'light';
+            }
+
+            document.documentElement.dataset.theme = theme;
+            document.documentElement.style.colorScheme = theme;
+        })();
+    </script>
 
     <script>
         tailwind.config = {
@@ -51,14 +76,253 @@
     </script>
 
     <style>
+        :root,
+        html[data-theme="dark"] {
+            --bg-0: #0a0a0f;
+            --bg-1: #12121a;
+            --bg-2: #1a1a25;
+            --bg-2-rgb: 26 26 37;
+            --text-0: #f5f7fb;
+            --text-1: #d1d5db;
+            --text-2: #9ca3af;
+            --text-3: #6b7280;
+            --text-4: #4b5563;
+            --border-soft: rgba(255, 255, 255, 0.05);
+            --border-strong: rgba(255, 255, 255, 0.1);
+            --neutral-rgb: 107 114 128;
+            --accent: #22d3ee;
+            --accent-rgb: 34 211 238;
+            --ok: #34d399;
+            --warn: #fbbf24;
+            --fail: #f87171;
+            --hung: #a78bfa;
+            --log-bg: #020617;
+            --log-fg: #4ade80;
+        }
+
+        html[data-theme="light"] {
+            --bg-0: #f5f7fb;
+            --bg-1: #ffffff;
+            --bg-2: #e7ebf3;
+            --bg-2-rgb: 231 235 243;
+            --text-0: #111827;
+            --text-1: #1f2937;
+            --text-2: #475569;
+            --text-3: #64748b;
+            --text-4: #94a3b8;
+            --border-soft: rgba(15, 23, 42, 0.08);
+            --border-strong: rgba(15, 23, 42, 0.14);
+            --neutral-rgb: 100 116 139;
+            --accent: #0891b2;
+            --accent-rgb: 8 145 178;
+            --ok: #059669;
+            --warn: #b45309;
+            --fail: #dc2626;
+            --hung: #7c3aed;
+            --log-bg: #e2e8f0;
+            --log-fg: #166534;
+        }
+
+        html {
+            background-color: var(--bg-0);
+        }
+
         body {
             font-family: 'DM Sans', system-ui, sans-serif;
+            background-color: var(--bg-0);
+            color: var(--text-1);
+            transition: background-color 0.15s ease, color 0.15s ease;
         }
 
         .font-mono,
         code,
         pre {
             font-family: 'JetBrains Mono', ui-monospace, monospace;
+        }
+
+        .bg-surface-1 {
+            background-color: var(--bg-0) !important;
+        }
+
+        .bg-surface-2 {
+            background-color: var(--bg-1) !important;
+        }
+
+        .bg-surface-3,
+        .bg-surface-3\/40,
+        .bg-surface-3\/60 {
+            background-color: rgb(var(--bg-2-rgb) / 1) !important;
+        }
+
+        .bg-surface-3\/40 {
+            background-color: rgb(var(--bg-2-rgb) / 0.4) !important;
+        }
+
+        .bg-surface-3\/60 {
+            background-color: rgb(var(--bg-2-rgb) / 0.6) !important;
+        }
+
+        .bg-accent\/10 {
+            background-color: rgb(var(--accent-rgb) / 0.1) !important;
+        }
+
+        .bg-accent\/20 {
+            background-color: rgb(var(--accent-rgb) / 0.2) !important;
+        }
+
+        .border-white\/5 {
+            border-color: var(--border-soft) !important;
+        }
+
+        .border-white\/10 {
+            border-color: var(--border-strong) !important;
+        }
+
+        .divide-white\/5 > :not([hidden]) ~ :not([hidden]) {
+            border-color: var(--border-soft) !important;
+        }
+
+        .border-accent\/30 {
+            border-color: rgb(var(--accent-rgb) / 0.3) !important;
+        }
+
+        .border-accent\/40 {
+            border-color: rgb(var(--accent-rgb) / 0.4) !important;
+        }
+
+        .text-accent {
+            color: var(--accent) !important;
+        }
+
+        .text-accent\/70 {
+            color: rgb(var(--accent-rgb) / 0.7) !important;
+        }
+
+        .text-white,
+        .text-gray-100,
+        .text-gray-200 {
+            color: var(--text-0) !important;
+        }
+
+        .text-gray-300 {
+            color: var(--text-1) !important;
+        }
+
+        .text-gray-400 {
+            color: var(--text-2) !important;
+        }
+
+        .text-gray-500 {
+            color: var(--text-3) !important;
+        }
+
+        .text-gray-600,
+        .placeholder\:text-gray-600::placeholder {
+            color: var(--text-3) !important;
+        }
+
+        .bg-gray-500 {
+            background-color: rgb(var(--neutral-rgb) / 1) !important;
+        }
+
+        .bg-gray-500\/10 {
+            background-color: rgb(var(--neutral-rgb) / 0.1) !important;
+        }
+
+        .border-gray-500\/30 {
+            border-color: rgb(var(--neutral-rgb) / 0.3) !important;
+        }
+
+        .bg-ok {
+            background-color: var(--ok) !important;
+        }
+
+        .bg-ok\/10 {
+            background-color: color-mix(in srgb, var(--ok) 10%, transparent) !important;
+        }
+
+        .text-ok {
+            color: var(--ok) !important;
+        }
+
+        .border-ok\/30 {
+            border-color: color-mix(in srgb, var(--ok) 30%, transparent) !important;
+        }
+
+        .bg-warn {
+            background-color: var(--warn) !important;
+        }
+
+        .bg-warn\/10 {
+            background-color: color-mix(in srgb, var(--warn) 10%, transparent) !important;
+        }
+
+        .text-warn {
+            color: var(--warn) !important;
+        }
+
+        .border-warn\/30 {
+            border-color: color-mix(in srgb, var(--warn) 30%, transparent) !important;
+        }
+
+        .bg-fail {
+            background-color: var(--fail) !important;
+        }
+
+        .text-fail {
+            color: var(--fail) !important;
+        }
+
+        .text-fail\/80 {
+            color: color-mix(in srgb, var(--fail) 80%, transparent) !important;
+        }
+
+        .text-hung {
+            color: var(--hung) !important;
+        }
+
+        .bg-black {
+            background-color: var(--log-bg) !important;
+        }
+
+        .text-green-400 {
+            color: var(--log-fg) !important;
+        }
+
+        .hover\:bg-surface-3:hover {
+            background-color: rgb(var(--bg-2-rgb) / 1) !important;
+        }
+
+        .hover\:bg-accent\/10:hover {
+            background-color: rgb(var(--accent-rgb) / 0.1) !important;
+        }
+
+        .hover\:bg-accent\/20:hover {
+            background-color: rgb(var(--accent-rgb) / 0.2) !important;
+        }
+
+        .hover\:border-white\/10:hover {
+            border-color: var(--border-strong) !important;
+        }
+
+        .hover\:border-accent\/30:hover {
+            border-color: rgb(var(--accent-rgb) / 0.3) !important;
+        }
+
+        .hover\:border-accent\/40:hover {
+            border-color: rgb(var(--accent-rgb) / 0.4) !important;
+        }
+
+        .hover\:text-gray-200:hover {
+            color: var(--text-0) !important;
+        }
+
+        .hover\:text-accent:hover {
+            color: var(--accent) !important;
+        }
+
+        .focus\:border-accent:focus {
+            border-color: var(--accent) !important;
         }
 
         @keyframes pulse-dot {
@@ -99,6 +363,15 @@
                    class="text-sm font-medium {% if title == 'Settings' %}text-accent{% else %}text-gray-400 hover:text-gray-200{% endif %}">
                     Settings
                 </a>
+                <button
+                    id="theme-toggle"
+                    type="button"
+                    class="inline-flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-surface-3/60 text-gray-300 transition hover:border-accent/40 hover:bg-accent/10 hover:text-accent"
+                    aria-label="Switch to light theme"
+                    title="Toggle theme">
+                    <span id="theme-icon-dark" aria-hidden="true">☾</span>
+                    <span id="theme-icon-light" class="hidden" aria-hidden="true">☀</span>
+                </button>
                 <div id="clock" class="font-mono text-sm text-gray-400">--:--:--</div>
             </div>
         </div>
@@ -111,6 +384,49 @@
     <main class="max-w-7xl mx-auto px-6 py-8">
         {% block content %}{% endblock %}
     </main>
+
+    <script>
+        (function () {
+            const STORAGE_KEY = 'theme';
+            const button = document.getElementById('theme-toggle');
+            const darkIcon = document.getElementById('theme-icon-dark');
+            const lightIcon = document.getElementById('theme-icon-light');
+
+            function applyTheme(theme, persist) {
+                document.documentElement.dataset.theme = theme;
+                document.documentElement.style.colorScheme = theme;
+
+                if (persist) {
+                    try {
+                        localStorage.setItem(STORAGE_KEY, theme);
+                    } catch (_error) {}
+                }
+
+                if (button) {
+                    const nextTheme = theme === 'dark' ? 'light' : 'dark';
+                    button.setAttribute('aria-label', `Switch to ${nextTheme} theme`);
+                    button.setAttribute('title', `Switch to ${nextTheme} theme`);
+                }
+
+                if (darkIcon && lightIcon) {
+                    darkIcon.classList.toggle('hidden', theme !== 'dark');
+                    lightIcon.classList.toggle('hidden', theme !== 'light');
+                }
+            }
+
+            applyTheme(document.documentElement.dataset.theme || 'dark', false);
+
+            if (button) {
+                button.addEventListener('click', function () {
+                    const currentTheme = document.documentElement.dataset.theme === 'light'
+                        ? 'light'
+                        : 'dark';
+                    const nextTheme = currentTheme === 'dark' ? 'light' : 'dark';
+                    applyTheme(nextTheme, true);
+                });
+            }
+        })();
+    </script>
 
     <script>
         (function () {
