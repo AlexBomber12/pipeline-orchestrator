@@ -178,6 +178,10 @@
             border-color: var(--border-strong) !important;
         }
 
+        .divide-white\/5 > :not([hidden]) ~ :not([hidden]) {
+            border-color: var(--border-soft) !important;
+        }
+
         .border-accent\/30 {
             border-color: rgb(var(--accent-rgb) / 0.3) !important;
         }
@@ -227,6 +231,38 @@
 
         .border-gray-500\/30 {
             border-color: rgb(var(--neutral-rgb) / 0.3) !important;
+        }
+
+        .bg-ok {
+            background-color: var(--ok) !important;
+        }
+
+        .bg-ok\/10 {
+            background-color: color-mix(in srgb, var(--ok) 10%, transparent) !important;
+        }
+
+        .text-ok {
+            color: var(--ok) !important;
+        }
+
+        .border-ok\/30 {
+            border-color: color-mix(in srgb, var(--ok) 30%, transparent) !important;
+        }
+
+        .bg-warn {
+            background-color: var(--warn) !important;
+        }
+
+        .bg-warn\/10 {
+            background-color: color-mix(in srgb, var(--warn) 10%, transparent) !important;
+        }
+
+        .text-warn {
+            color: var(--warn) !important;
+        }
+
+        .border-warn\/30 {
+            border-color: color-mix(in srgb, var(--warn) 30%, transparent) !important;
         }
 
         .bg-fail {
