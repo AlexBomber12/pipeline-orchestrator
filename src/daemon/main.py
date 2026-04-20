@@ -39,6 +39,7 @@ from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
 from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
 from src.daemon.runner import PipelineRunner
+from src.models import PipelineState
 from src.usage import UsageProvider
 
 logging.basicConfig(
@@ -56,6 +57,20 @@ DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 #: ``CONFIG_RELOAD_CYCLES * daemon.poll_interval_sec`` seconds, so it
 #: adapts to both fast and slow deployments.
 CONFIG_RELOAD_CYCLES = 5
+_DEFERRED_RUNNER_CONFIG_STATES = {
+    PipelineState.CODING,
+    PipelineState.WATCH,
+    PipelineState.FIX,
+    PipelineState.MERGE,
+    PipelineState.PAUSED,
+    PipelineState.HUNG,
+}
+
+
+def _runner_requires_idle_boundary(runner: Any) -> bool:
+    """Return whether this runner should defer config changes to IDLE."""
+    state = getattr(getattr(runner, "state", None), "state", None)
+    return state in _DEFERRED_RUNNER_CONFIG_STATES
 
 
 def _setup_git_auth() -> None:
@@ -218,7 +233,11 @@ def _sync_runners(
         if key in runners:
             runner = runners[key]
             active_changed = runner.repo_config.active != repo.active
-            if not runner.repo_config.active or active_changed:
+            if (
+                not runner.repo_config.active
+                or active_changed
+                or not _runner_requires_idle_boundary(runner)
+            ):
                 runner.repo_config = repo
                 runner.app_config = config
                 runner.set_usage_providers(
