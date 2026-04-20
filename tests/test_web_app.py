@@ -46,6 +46,14 @@ class _FakeRedis:
     async def get(self, key: str) -> str | None:
         return self.store.get(key)
 
+    async def set(self, key: str, value: str, **_kwargs: object) -> None:
+        self.store[key] = value
+
+    async def delete(self, key: str) -> int:
+        existed = key in self.store
+        self.store.pop(key, None)
+        return int(existed)
+
     async def lrange(self, key: str, start: int, stop: int) -> list[str]:
         values = self.lists.get(key, [])
         if stop < 0:
@@ -277,6 +285,95 @@ def test_partial_repo_list_empty_state(
 
     assert response.status_code == 200
     assert "No repositories configured" in response.text
+
+
+def test_pause_resume_stop_endpoints_update_repo_state(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+    monkeypatch.setattr(
+        web_app,
+        "aioredis",
+        type("_StubAioredisWithMutableState", (), {"from_url": staticmethod(lambda url, decode_responses=True: fake)})(),
+    )
+
+    with TestClient(app) as client:
+        pause = client.post("/repos/example__alpha/pause")
+        assert pause.status_code == 200
+        paused = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+        assert paused.user_paused is True
+
+        stop = client.post("/repos/example__alpha/stop")
+        assert stop.status_code == 200
+        stopped = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+        assert stopped.user_paused is True
+        assert fake.store["control:example__alpha:stop"] == "1"
+
+        resume = client.post("/repos/example__alpha/resume")
+        assert resume.status_code == 200
+        resumed = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+        assert resumed.user_paused is False
+        assert "control:example__alpha:stop" not in fake.store
+
+
+def test_pause_endpoint_is_idempotent(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        user_paused=True,
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+    monkeypatch.setattr(
+        web_app,
+        "aioredis",
+        type("_StubAioredisWithMutableState", (), {"from_url": staticmethod(lambda url, decode_responses=True: fake)})(),
+    )
+
+    with TestClient(app) as client:
+        first = client.post("/repos/example__alpha/pause")
+        second = client.post("/repos/example__alpha/pause")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    paused = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+    assert paused.user_paused is True
+
+
+def test_resume_endpoint_is_idempotent(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        user_paused=False,
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+    monkeypatch.setattr(
+        web_app,
+        "aioredis",
+        type("_StubAioredisWithMutableState", (), {"from_url": staticmethod(lambda url, decode_responses=True: fake)})(),
+    )
+
+    with TestClient(app) as client:
+        first = client.post("/repos/example__alpha/resume")
+        second = client.post("/repos/example__alpha/resume")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    resumed = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+    assert resumed.user_paused is False
 
 
 def test_partial_repo_list_renders_queue_progress(

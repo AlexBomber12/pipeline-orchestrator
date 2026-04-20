@@ -1884,6 +1884,72 @@ def test_handle_coding_survives_post_comment_failure(
     )
 
 
+def test_handle_coding_stop_request_terminates_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    stop_called = {"terminate": 0, "kill": 0, "wait": 0}
+
+    class _FakeProc:
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self._done = asyncio.Event()
+
+        def terminate(self) -> None:
+            stop_called["terminate"] += 1
+            self.returncode = -15
+            self._done.set()
+
+        def kill(self) -> None:
+            stop_called["kill"] += 1
+            self.returncode = -9
+            self._done.set()
+
+        async def wait(self) -> int:
+            stop_called["wait"] += 1
+            await self._done.wait()
+            return self.returncode or 0
+
+    async def fake_run_planned_pr_async(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        proc = _FakeProc()
+        on_process_start = kwargs["on_process_start"]
+        assert callable(on_process_start)
+        on_process_start(proc)
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise
+        return (0, "ok", "")
+
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        fake_run_planned_pr_async,
+    )
+
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-127",
+        title="Pause controls",
+        status=TaskStatus.DOING,
+        branch="pr-127-control-endpoints-backend",
+    )
+    runner.redis.store[f"control:{runner.name}:stop"] = "1"
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.user_paused is True
+    assert runner.state.error_message is None
+    assert stop_called["terminate"] == 1
+    assert stop_called["kill"] == 0
+    assert stop_called["wait"] >= 1
+    assert any(
+        "user stop requested" in entry["event"].lower()
+        for entry in runner.state.history
+    )
+
+
 def test_handle_fix_posts_codex_review_after_push(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -11709,6 +11775,43 @@ def test_run_cycle_returns_after_preflight_failure(
     asyncio.run(runner.run_cycle())
 
     assert publishes == ["published"]
+
+
+def test_run_cycle_short_circuits_idle_when_user_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publishes: list[str] = []
+    idle_calls: list[str] = []
+    runner = _make_runner()
+    runner._recovered = True
+    runner._scaffolded = True
+    runner.state.state = PipelineState.IDLE
+    runner.state.user_paused = True
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_handle_idle() -> None:
+        idle_calls.append("idle")
+
+    async def fake_publish_state() -> None:
+        publishes.append("published")
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", lambda: True)
+    monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+
+    asyncio.run(runner.run_cycle())
+    asyncio.run(runner.run_cycle())
+
+    assert idle_calls == []
+    assert publishes == ["published", "published"]
+    assert sum(
+        1
+        for entry in runner.state.history
+        if entry["event"] == "Paused by user, not picking up new tasks"
+    ) == 1
 
 
 @pytest.mark.parametrize(

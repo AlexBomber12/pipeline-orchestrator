@@ -24,7 +24,7 @@ from typing import Any, AsyncIterator
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from src.coders import build_coder_registry
@@ -134,6 +134,21 @@ def _find_repo_config_by_name(
         if repo_slug_from_url(repo.url) == name:
             return repo
     return None
+
+
+async def _load_mutable_repo_state(
+    request: Request,
+    name: str,
+) -> tuple[aioredis.Redis, RepoState] | tuple[None, HTMLResponse]:
+    """Return the Redis client plus the current mutable state for ``name``."""
+    cfg = load_config(CONFIG_PATH)
+    repo = _find_repo_config_by_name(cfg, name)
+    if repo is None:
+        return None, HTMLResponse("Repository not found", status_code=404)
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return None, HTMLResponse("Redis unavailable", status_code=503)
+    return redis_client, await get_repo_state(name, redis_client, config_path=CONFIG_PATH)
 
 
 def _effective_coder_name(
@@ -846,6 +861,44 @@ async def repo_detail(request: Request, name: str) -> HTMLResponse:
             "events": list(context["repo"].history),
         },
     )
+
+
+@app.post("/repos/{name}/pause")
+async def pause_repo(request: Request, name: str) -> Response:
+    loaded = await _load_mutable_repo_state(request, name)
+    if loaded[0] is None:
+        return loaded[1]
+    redis_client, state = loaded
+    state.user_paused = True
+    await redis_client.set(f"pipeline:{name}", state.model_dump_json())
+    return JSONResponse({"ok": True, "user_paused": True})
+
+
+@app.post("/repos/{name}/resume")
+async def resume_repo(request: Request, name: str) -> Response:
+    loaded = await _load_mutable_repo_state(request, name)
+    if loaded[0] is None:
+        return loaded[1]
+    redis_client, state = loaded
+    state.user_paused = False
+    await redis_client.set(f"pipeline:{name}", state.model_dump_json())
+    try:
+        await redis_client.delete(f"control:{name}:stop")
+    except Exception:
+        pass
+    return JSONResponse({"ok": True, "user_paused": False})
+
+
+@app.post("/repos/{name}/stop")
+async def stop_repo(request: Request, name: str) -> Response:
+    loaded = await _load_mutable_repo_state(request, name)
+    if loaded[0] is None:
+        return loaded[1]
+    redis_client, state = loaded
+    state.user_paused = True
+    await redis_client.set(f"pipeline:{name}", state.model_dump_json())
+    await redis_client.set(f"control:{name}:stop", "1", ex=60)
+    return JSONResponse({"ok": True, "user_paused": True})
 
 
 @app.get("/repo/{name}/metrics")

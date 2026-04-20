@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,7 @@ async def run_codex_async(
     cwd: str,
     timeout: int | None = 600,
     model: str | None = None,
+    on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
 ) -> tuple[int, str, str]:
     """Invoke ``codex exec`` with ``prompt`` inside ``cwd``.
 
@@ -46,6 +48,8 @@ async def run_codex_async(
             cwd=cwd,
             stdin=asyncio.subprocess.DEVNULL,
         )
+        if on_process_start is not None:
+            on_process_start(proc)
 
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             proc.communicate(), timeout=timeout
@@ -83,21 +87,25 @@ async def run_planned_pr_async(
     repo_path: str,
     model: str | None = None,
     timeout: int = 900,
+    on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
     **_kwargs: object,
 ) -> tuple[int, str, str]:
     """Trigger a ``PLANNED PR`` run in ``repo_path`` via Codex CLI."""
-    return await run_codex_async(
-        "PLANNED PR", repo_path, timeout=timeout, model=model
-    )
+    kwargs: dict[str, object] = {"timeout": timeout, "model": model}
+    if on_process_start is not None:
+        kwargs["on_process_start"] = on_process_start
+    return await run_codex_async("PLANNED PR", repo_path, **kwargs)
 
 
 async def fix_review_async(
     repo_path: str,
     model: str | None = None,
     timeout: int | None = None,
+    on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
     **_kwargs: object,
 ) -> tuple[int, str, str]:
     """Trigger a ``FIX REVIEW`` run in ``repo_path`` via Codex CLI."""
-    return await run_codex_async(
-        "FIX REVIEW", repo_path, timeout=timeout, model=model
-    )
+    kwargs: dict[str, object] = {"timeout": timeout, "model": model}
+    if on_process_start is not None:
+        kwargs["on_process_start"] = on_process_start
+    return await run_codex_async("FIX REVIEW", repo_path, **kwargs)
