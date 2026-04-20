@@ -64,6 +64,20 @@ def _message_timestamp(message: str) -> datetime | None:
     return parsed
 
 
+def _history_before_subscription(
+    history_messages: list[str],
+    subscribed_at: datetime,
+) -> list[str]:
+    """Keep only history entries that predate the live subscription."""
+    replayable_history: list[str] = []
+    for message in history_messages:
+        timestamp = _message_timestamp(message)
+        if timestamp is not None and timestamp >= subscribed_at:
+            continue
+        replayable_history.append(message)
+    return replayable_history
+
+
 async def _is_disconnected(request: Any) -> bool:
     checker = getattr(request, "is_disconnected", None)
     if checker is None:
@@ -88,6 +102,7 @@ async def stream_repo_events(
     try:
         pubsub = redis_client.pubsub()
         await pubsub.subscribe(_channel_name(repo_name))
+        subscribed_at = datetime.now(timezone.utc)
         history = await redis_client.lrange(_history_name(repo_name), 0, history_limit - 1)
     except RedisError as exc:
         if pubsub is not None:
@@ -113,6 +128,8 @@ async def stream_repo_events(
                     data = data.decode("utf-8")
                 if isinstance(data, str):
                     buffered_messages.append(data)
+
+            history_messages = _history_before_subscription(history_messages, subscribed_at)
 
             replay_messages: list[str] = []
             seen_messages: set[str] = set()

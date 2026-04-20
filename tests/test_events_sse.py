@@ -8,9 +8,11 @@ from typing import Any
 from fastapi.testclient import TestClient
 from redis.exceptions import ConnectionError
 from src.events import publisher
+import src.events.sse as sse_module
 from src.events.sse import (
     INITIAL_BUFFER_DRAIN_LIMIT,
     RepoEventsUnavailableError,
+    _history_before_subscription,
     _is_disconnected,
     _message_timestamp,
     format_sse_comment,
@@ -133,6 +135,31 @@ def test_message_timestamp_normalizes_naive_values_to_utc() -> None:
         0,
         tzinfo=timezone.utc,
     )
+
+
+def test_history_before_subscription_keeps_only_pre_subscribe_history() -> None:
+    subscribed_at = datetime(2026, 4, 20, 15, 0, 1, tzinfo=timezone.utc)
+    older_history = json.dumps(
+        {
+            "type": "progress_updated",
+            "repo": "example__repo",
+            "data": {"percent": 1},
+            "timestamp": "2026-04-20T15:00:00Z",
+        }
+    )
+    overlapping_history = json.dumps(
+        {
+            "type": "progress_updated",
+            "repo": "example__repo",
+            "data": {"percent": 2},
+            "timestamp": "2026-04-20T15:00:02Z",
+        }
+    )
+
+    assert _history_before_subscription(
+        [older_history, overlapping_history],
+        subscribed_at,
+    ) == [older_history]
 
 
 async def test_is_disconnected_defaults_to_false_and_supports_sync_checker() -> None:
@@ -553,6 +580,91 @@ async def test_stream_repo_events_bounds_initial_buffer_drain_under_load() -> No
     first_frame = await asyncio.wait_for(anext(stream), timeout=0.1)
 
     assert b'"percent": 0' in first_frame
+    assert redis.busy_pubsub.index == INITIAL_BUFFER_DRAIN_LIMIT
+
+    request.disconnected = True
+    try:
+        await anext(stream)
+    except StopAsyncIteration:
+        pass
+    else:
+        raise AssertionError("stream should stop after disconnect")
+
+
+async def test_stream_repo_events_does_not_reorder_when_buffer_drain_hits_cap(monkeypatch) -> None:
+    request = _Request()
+    base = datetime(2026, 4, 20, 15, 0, tzinfo=timezone.utc)
+
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            return base - timedelta(seconds=1)
+
+    monkeypatch.setattr(sse_module, "datetime", _FixedDateTime)
+
+    class _BusyPubSub(_FakePubSub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.index = 0
+
+        async def get_message(
+            self,
+            *,
+            ignore_subscribe_messages: bool = True,
+            timeout: float = 0.0,
+        ) -> dict[str, Any] | None:
+            if timeout <= 0:
+                payload = json.dumps(
+                    publisher.build_repo_event(
+                        "example__repo",
+                        "progress_updated",
+                        {"percent": self.index},
+                        now=base + timedelta(seconds=self.index),
+                    )
+                )
+                self.index += 1
+                return {"data": payload}
+            return None
+
+    class _BusyRedis(_FakeRedis):
+        def __init__(self) -> None:
+            super().__init__()
+            self.busy_pubsub = _BusyPubSub()
+            newest_history = [
+                json.dumps(
+                    publisher.build_repo_event(
+                        "example__repo",
+                        "progress_updated",
+                        {"percent": percent},
+                        now=base + timedelta(seconds=percent),
+                    )
+                )
+                for percent in range(
+                    INITIAL_BUFFER_DRAIN_LIMIT * 2 - 1,
+                    INITIAL_BUFFER_DRAIN_LIMIT - 1,
+                    -1,
+                )
+            ]
+            self.lists["repo-events-history:example__repo"] = newest_history
+
+        def pubsub(self) -> _BusyPubSub:
+            self.pubsubs.append(self.busy_pubsub)
+            return self.busy_pubsub
+
+    redis = _BusyRedis()
+    stream = await stream_repo_events(
+        redis,
+        "example__repo",
+        request,
+        keepalive_interval=0.0,
+        poll_interval=0.01,
+    )
+
+    first_frame = await asyncio.wait_for(anext(stream), timeout=0.1)
+    second_frame = await asyncio.wait_for(anext(stream), timeout=0.1)
+
+    assert b'"percent": 0' in first_frame
+    assert b'"percent": 1' in second_frame
     assert redis.busy_pubsub.index == INITIAL_BUFFER_DRAIN_LIMIT
 
     request.disconnected = True
