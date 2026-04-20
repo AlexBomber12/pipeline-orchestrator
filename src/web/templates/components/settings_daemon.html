@@ -2,20 +2,20 @@
 <div class="mb-6">
     <h3 class="text-sm font-semibold text-gray-300 uppercase tracking-wide mb-3">Timing</h3>
     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <label class="flex flex-col gap-1 text-sm">
+        <label class="flex flex-col gap-1 text-sm cursor-pointer">
             <span class="text-gray-400">Poll interval (seconds)</span>
             <input type="number"
                    name="poll_interval_sec"
                    value="{{ daemon.poll_interval_sec }}"
                    min="1"
-                   class="w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
                    hx-put="/settings/daemon"
                    hx-trigger="change"
                    hx-target="#settings-daemon"
                    hx-swap="innerHTML">
             <span class="text-xs text-gray-500">How often the daemon checks each repo.</span>
         </label>
-        <label class="flex flex-col gap-1 text-sm">
+        <label class="flex flex-col gap-1 text-sm cursor-pointer">
             <span class="text-gray-400">PLANNED PR timeout (seconds)</span>
             <input type="number"
                    name="planned_pr_timeout_sec"
@@ -23,7 +23,7 @@
                    min="300"
                    max="7200"
                    step="300"
-                   class="w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
                    hx-put="/settings/daemon"
                    hx-trigger="change"
                    hx-target="#settings-daemon"
@@ -37,20 +37,20 @@
 <div class="mb-6 pt-4 border-t border-white/5">
     <h3 class="text-sm font-semibold text-gray-300 uppercase tracking-wide mb-3">Review handling</h3>
     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <label class="flex flex-col gap-1 text-sm">
+        <label class="flex flex-col gap-1 text-sm cursor-pointer">
             <span class="text-gray-400">Default review timeout (minutes)</span>
             <input type="number"
                    name="review_timeout_min"
                    value="{{ daemon.review_timeout_min }}"
                    min="1"
-                   class="w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
                    hx-put="/settings/daemon"
                    hx-trigger="change"
                    hx-target="#settings-daemon"
                    hx-swap="innerHTML">
             <span class="text-xs text-gray-500">If Codex doesn't review in time, PR flips to HUNG.</span>
         </label>
-        <label class="flex flex-col gap-1 text-sm">
+        <label class="flex flex-col gap-1 text-sm cursor-pointer">
             <span class="text-gray-400">FIX idle timeout (seconds since last push)</span>
             <input type="number"
                    name="fix_idle_timeout_sec"
@@ -58,7 +58,7 @@
                    min="300"
                    max="7200"
                    step="300"
-                   class="w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
                    hx-put="/settings/daemon"
                    hx-trigger="change"
                    hx-target="#settings-daemon"
@@ -67,7 +67,7 @@
         </label>
     </div>
     <div class="mt-3">
-        <label class="flex items-center gap-3 text-sm">
+        <label class="flex items-center gap-3 text-sm cursor-pointer">
             <input type="checkbox"
                    name="auto_fallback"
                    value="true"
@@ -87,7 +87,7 @@
         </label>
     </div>
     <div class="mt-3">
-        <label class="flex items-center gap-3 text-sm">
+        <label class="flex items-center gap-3 text-sm cursor-pointer">
             <input type="checkbox"
                    name="hung_fallback_codex_review"
                    value="true"
@@ -111,7 +111,7 @@
 <!-- Coder selection -->
 <div class="mb-6 pt-4 border-t border-white/5">
     <h3 class="text-sm font-semibold text-gray-300 uppercase tracking-wide mb-3">Coder selection</h3>
-    <label class="flex flex-col gap-1 text-sm">
+    <label class="flex flex-col gap-1 text-sm cursor-pointer">
         <span class="text-gray-400">Exploration epsilon</span>
         <input type="number"
                name="exploration_epsilon"
@@ -119,7 +119,7 @@
                min="0"
                max="0.5"
                step="0.01"
-               class="w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+               class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
                hx-put="/settings/daemon"
                hx-trigger="change"
                hx-target="#settings-daemon"
@@ -134,7 +134,7 @@
 <div class="mb-6 pt-4 border-t border-white/5">
     <h3 class="text-sm font-semibold text-gray-300 uppercase tracking-wide mb-3">Rate limits</h3>
     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <label class="flex flex-col gap-1 text-sm">
+        <label class="flex flex-col gap-1 text-sm cursor-pointer">
             <span class="text-gray-400">Session rate limit pause (%)</span>
             <input type="number"
                    name="rate_limit_session_pause_percent"
@@ -142,14 +142,14 @@
                    min="50"
                    max="100"
                    step="5"
-                   class="w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
                    hx-put="/settings/daemon"
                    hx-trigger="change"
                    hx-target="#settings-daemon"
                    hx-swap="innerHTML">
             <span class="text-xs text-gray-500">Pause when 5-hour session usage exceeds this threshold.</span>
         </label>
-        <label class="flex flex-col gap-1 text-sm">
+        <label class="flex flex-col gap-1 text-sm cursor-pointer">
             <span class="text-gray-400">Weekly rate limit pause (%)</span>
             <input type="number"
                    name="rate_limit_weekly_pause_percent"
@@ -157,7 +157,7 @@
                    min="50"
                    max="100"
                    step="5"
-                   class="w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
                    hx-put="/settings/daemon"
                    hx-trigger="change"
                    hx-target="#settings-daemon"
@@ -170,7 +170,7 @@
 <!-- Error recovery -->
 <div class="pt-4 border-t border-white/5">
     <h3 class="text-sm font-semibold text-gray-300 uppercase tracking-wide mb-3">Error recovery</h3>
-    <label class="flex items-center gap-3 text-sm">
+    <label class="flex items-center gap-3 text-sm cursor-pointer">
         <input type="checkbox"
                name="error_handler_use_ai"
                value="true"

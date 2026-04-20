@@ -113,7 +113,7 @@
                 <dd class="font-mono text-gray-200">
                     {% if repo.current_pr.url %}
                     <a href="{{ repo.current_pr.url }}" target="_blank" rel="noopener"
-                       class="text-accent hover:underline">#{{ repo.current_pr.number }}</a>
+                       class="secondary-interactive text-accent">#{{ repo.current_pr.number }}</a>
                     {% else %}
                     #{{ repo.current_pr.number }}
                     {% endif %}

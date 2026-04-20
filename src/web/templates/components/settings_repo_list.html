@@ -39,7 +39,7 @@
                 <input type="text"
                        name="branch"
                        value="{{ repo.branch }}"
-                       class="w-28 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none"
+                       class="primary-interactive w-28 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none"
                        hx-put="{{ put_url }}"
                        hx-trigger="change"
                        hx-target="#settings-repo-list"
@@ -76,7 +76,7 @@
                        value="{{ repo.review_timeout_min if repo.review_timeout_min is not none else '' }}"
                        placeholder="{{ daemon.review_timeout_min if daemon is defined else 60 }} (default)"
                        min="1"
-                       class="w-20 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 placeholder:text-gray-600 focus:border-accent focus:outline-none"
+                       class="primary-interactive w-20 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 placeholder:text-gray-600 focus:border-accent focus:outline-none"
                        hx-put="{{ put_url }}"
                        hx-trigger="change"
                        hx-target="#settings-repo-list"
@@ -85,7 +85,7 @@
             </td>
             <td class="px-4 py-2">
                 <select name="coder"
-                        class="w-24 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 text-xs focus:border-accent focus:outline-none"
+                        class="primary-interactive w-24 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 text-xs focus:border-accent focus:outline-none"
                         hx-put="{{ put_url }}"
                         hx-trigger="change"
                         hx-target="#settings-repo-list"
@@ -97,7 +97,7 @@
             </td>
             <td class="px-4 py-2 text-right">
                 <button type="button"
-                        class="text-xs font-medium px-2 py-1 rounded border border-fail/30 text-fail hover:bg-fail/10"
+                        class="primary-interactive text-xs font-medium px-2 py-1 rounded border border-fail/30 text-fail"
                         hx-delete="{{ delete_url }}"
                         hx-target="#settings-repo-list"
                         hx-swap="innerHTML"
@@ -117,13 +117,13 @@
                            name="url"
                            required
                            placeholder="https://github.com/owner/repo"
-                           class="flex-1 min-w-[20rem] bg-surface-3 border border-white/10 rounded px-3 py-1.5 text-gray-200 focus:border-accent focus:outline-none">
+                           class="primary-interactive flex-1 min-w-[20rem] bg-surface-3 border border-white/10 rounded px-3 py-1.5 text-gray-200 focus:border-accent focus:outline-none">
                     <input type="text"
                            name="branch"
                            value="main"
-                           class="w-28 bg-surface-3 border border-white/10 rounded px-3 py-1.5 text-gray-200 focus:border-accent focus:outline-none">
+                           class="primary-interactive w-28 bg-surface-3 border border-white/10 rounded px-3 py-1.5 text-gray-200 focus:border-accent focus:outline-none">
                     <button type="submit"
-                            class="px-3 py-1.5 rounded bg-accent/10 border border-accent/30 text-accent text-sm font-medium hover:bg-accent/20">
+                            class="primary-interactive px-3 py-1.5 rounded bg-accent/10 border border-accent/30 text-accent text-sm font-medium">
                         Add Repository
                     </button>
                 </form>

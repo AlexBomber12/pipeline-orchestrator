@@ -24,7 +24,7 @@
                     </td>
                     <td class="py-3 pr-4">
                         <select name="{{ 'claude_model' if coder.name == 'claude' else 'codex_model' }}"
-                                class="min-w-40 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+                                class="primary-interactive min-w-40 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
                                 hx-put="/settings/daemon"
                                 hx-trigger="change"
                                 hx-target="#settings-daemon"
@@ -56,7 +56,7 @@
                                name="coder"
                                value="{{ coder.name }}"
                                {% if coder.is_default %}checked{% endif %}
-                               class="accent-accent mt-1"
+                               class="accent-accent mt-1 cursor-pointer"
                                hx-put="/settings/daemon"
                                hx-trigger="change"
                                hx-target="#settings-daemon"
