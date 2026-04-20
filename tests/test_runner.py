@@ -1950,6 +1950,44 @@ def test_handle_coding_stop_request_terminates_process(
     )
 
 
+def test_handle_coding_honors_persisted_stop_after_fast_cli_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        _async_cli_result(1, "", "coder failed fast"),
+    )
+
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-127",
+        title="Pause controls",
+        status=TaskStatus.DOING,
+        branch="pr-127-control-endpoints-backend",
+    )
+    runner.redis.store[f"control:{runner.name}:stop"] = "1"
+
+    async def stale_stop_monitor(
+        _cli_task: asyncio.Task[tuple[int, str, str]],
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_monitor_stop_request", stale_stop_monitor)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.user_paused is True
+    assert runner.state.error_message is None
+    assert f"control:{runner.name}:stop" not in runner.redis.store
+    assert any(
+        "after coder exit" in entry["event"].lower()
+        for entry in runner.state.history
+    )
+
+
 def test_handle_fix_posts_codex_review_after_push(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

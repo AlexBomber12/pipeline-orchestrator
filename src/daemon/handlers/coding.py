@@ -168,6 +168,10 @@ class CodingMixin:
             )
             return
         await self._save_cli_log(stdout, stderr, f"PLANNED PR output [{coder_name}]")
+        if not self._stop_requested and await self._pop_stop_request():
+            self._stop_requested = True
+            self.state.user_paused = True
+            self.log_event("User stop requested after coder exit; honoring persisted stop")
         if self._stop_requested:
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
