@@ -52,7 +52,11 @@ from src.daemon.preflight import PreflightMixin
 from src.daemon.rate_limit import RateLimitMixin
 from src.daemon.recovery import RecoveryMixin
 from src.daemon.repo_ops import RepoOpsMixin
-from src.daemon.selector import SelectionContext, select_coder
+from src.daemon.selector import (
+    SelectionContext,
+    select_auxiliary_coder,
+    select_coder,
+)
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
 from src.usage import UsageProvider
@@ -250,6 +254,18 @@ class PipelineRunner(
         )
         return select_coder(ctx)
 
+    def _select_auxiliary_coder(self) -> tuple[str, CoderPlugin] | None:
+        """Return the best eligible coder for daemon helper workflows."""
+        ctx = SelectionContext(
+            registry=self._registry,
+            repo_config=self.repo_config,
+            app_config=self.app_config,
+            state=self.state,
+            rng=self._selector_rng,
+            auth_statuses=self._auth_status_cache or None,
+        )
+        return select_auxiliary_coder(ctx)
+
     def _get_coder(
         self, *, allow_exploration: bool = True
     ) -> tuple[str, CoderPlugin]:
@@ -262,6 +278,13 @@ class PipelineRunner(
         coder_name = coder.value if isinstance(coder, CoderType) else str(coder)
         self.state.coder = coder_name
         return coder_name, self._registry.get(coder_name)
+
+    def _get_auxiliary_coder(self) -> tuple[str, CoderPlugin] | None:
+        """Return the eligible coder for diagnosis/merge helper workflows."""
+        result = self._select_auxiliary_coder()
+        if result is not None:
+            self.state.coder = result[0]
+        return result
 
     async def _refresh_auth_status_cache(self) -> None:
         """Refresh cached coder auth state off the event loop."""

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from src import codex_cli
 from src import retry as retry_module
 from src.coder_registry import CoderRegistry
 from src.coders import claude as claude_plugin_module
@@ -266,6 +267,13 @@ def _make_runner(**repo_overrides: Any) -> PipelineRunner:
         codex_provider,
     )
     runner._selector_rng.seed(0)
+    runner._auth_status_cache = {
+        "claude": {"status": "ok"},
+        "codex": {"status": "ok"},
+    }
+    runner._auth_status_cache_expires_at = (
+        datetime.now(timezone.utc) + timedelta(minutes=5)
+    )
     return runner
 
 
@@ -5434,6 +5442,154 @@ def test_handle_merge_resolves_conflict(
     ), "conflict-resolved HEAD must be pushed to origin"
 
 
+def test_handle_merge_falls_back_to_codex_for_conflict_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_calls: list[tuple[str, ...]] = []
+
+    def fake_git(
+        repo_path: str,
+        *args: str,
+        **kwargs: Any,
+    ) -> _FakeCompletedProcess:
+        git_calls.append(args)
+        if args[:2] == ("merge", "origin/main"):
+            return _FakeCompletedProcess(
+                args=["git", *args],
+                returncode=1,
+                stdout="CONFLICT (content): merge conflict in foo",
+            )
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    proactive_coders: list[str | None] = []
+
+    async def fake_check_rate_limit(
+        self,
+        proactive_coder: str | None = None,
+    ) -> bool:
+        proactive_coders.append(proactive_coder)
+        return True
+
+    codex_calls: list[tuple[str, str]] = []
+
+    async def fake_codex(
+        prompt: str,
+        cwd: str,
+        timeout: int | None = 600,
+        model: str | None = None,
+        **kwargs: Any,
+    ) -> tuple[int, str, str]:
+        codex_calls.append((prompt, cwd))
+        return (0, "", "")
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_check_rate_limit", fake_check_rate_limit)
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_select_auxiliary_coder",
+        lambda self: ("codex", self._registry.get("codex")),
+    )
+    monkeypatch.setattr(codex_cli, "run_codex_async", fake_codex)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_claude_async",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Claude should not be used when Codex is selected")
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, num, body: None,
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert proactive_coders == ["codex"]
+    assert codex_calls, "Codex must be invoked on merge conflict fallback"
+    assert any(cmd[:2] == ("push", "origin") for cmd in git_calls)
+
+
+def test_handle_merge_sets_error_when_no_auxiliary_coder_is_eligible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_calls: list[tuple[str, ...]] = []
+    claude_calls: list[object] = []
+    codex_calls: list[object] = []
+
+    def fake_git(
+        repo_path: str,
+        *args: str,
+        **kwargs: Any,
+    ) -> _FakeCompletedProcess:
+        git_calls.append(args)
+        if args[:2] == ("merge", "origin/main"):
+            return _FakeCompletedProcess(
+                args=["git", *args],
+                returncode=1,
+                stdout="CONFLICT (content): merge conflict in foo",
+            )
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_select_auxiliary_coder",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        claude_cli,
+        "run_claude_async",
+        lambda *args, **kwargs: claude_calls.append(args),
+    )
+    monkeypatch.setattr(
+        codex_cli,
+        "run_codex_async",
+        lambda *args, **kwargs: codex_calls.append(args),
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._start_current_run_record("claude", "opus")
+
+    asyncio.run(runner.handle_merge())
+
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert (
+        runner.state.error_message
+        == "No eligible coder available for merge conflict resolution"
+    )
+    assert ("merge", "--abort") in git_calls
+    assert not claude_calls
+    assert not codex_calls
+    assert len(recent) == 1
+    assert recent[0].exit_reason == "error"
+
+
 def test_handle_merge_skips_sync_for_cross_repo_pr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5705,6 +5861,82 @@ def test_handle_error_skip_clears_state(monkeypatch: pytest.MonkeyPatch) -> None
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.error_message is None
     assert runner.state.current_task is None
+
+
+def test_handle_error_falls_back_to_codex_for_diagnosis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_calls: list[tuple[str, str, str | None]] = []
+
+    async def fake_codex_diag(
+        repo_path: str,
+        context: str,
+        model: str | None = None,
+    ) -> tuple[int, str, str]:
+        codex_calls.append((repo_path, context, model))
+        return (0, "ESCALATE", "")
+
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_select_auxiliary_coder",
+        lambda self: ("codex", self._registry.get("codex")),
+    )
+    monkeypatch.setattr(codex_cli, "diagnose_error_async", fake_codex_diag)
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Claude should not be used when Codex is selected")
+        ),
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+
+    asyncio.run(runner.handle_error())
+
+    assert codex_calls == [(runner.repo_path, "boom", runner.app_config.daemon.codex_model)]
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "boom"
+
+
+def test_handle_error_logs_when_no_auxiliary_coder_is_eligible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_calls: list[object] = []
+    codex_calls: list[object] = []
+
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_select_auxiliary_coder",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        lambda *args, **kwargs: claude_calls.append(args),
+    )
+    monkeypatch.setattr(
+        codex_cli,
+        "diagnose_error_async",
+        lambda *args, **kwargs: codex_calls.append(args),
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "boom"
+    assert not claude_calls
+    assert not codex_calls
+    assert any(
+        e["event"] == "No eligible coder available for error diagnosis; staying ERROR"
+        for e in runner.state.history
+    )
 
 
 def test_handle_error_escalate_keeps_error(monkeypatch: pytest.MonkeyPatch) -> None:
