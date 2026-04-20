@@ -548,10 +548,10 @@ class IdleMixin:
             queue_tasks = tasks
         else:
             queue_tasks = dag_tasks
-        self.state.queue_done = sum(
-            1 for t in queue_tasks if t.status == TaskStatus.DONE
+        self._set_queue_progress(
+            sum(1 for t in queue_tasks if t.status == TaskStatus.DONE),
+            len(queue_tasks),
         )
-        self.state.queue_total = len(queue_tasks)
         generated_headers = getattr(self, "_idle_dag_headers", None)
         generated_statuses = getattr(self, "_idle_dag_statuses", None)
         if (

@@ -57,6 +57,7 @@ from src.daemon.selector import (
     select_auxiliary_coder,
     select_coder,
 )
+from src.events import publish_repo_event
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
 from src.usage import UsageProvider
@@ -205,6 +206,8 @@ class PipelineRunner(
         self._last_push_at_pr_number: int | None = None
         self._last_codex_review_pr: int | None = None
         self._last_codex_review_head_sha: str | None = None
+        self._queue_progress_dirty = False
+        self._last_published_queue_progress: tuple[int, int] | None = None
         self._usage_degraded_logged = False
         self._claude_usage_provider = claude_usage_provider
         self._codex_usage_provider = codex_usage_provider
@@ -364,6 +367,37 @@ class PipelineRunner(
         """Map a file extension to a stable language label for metrics."""
         suffix = Path(path).suffix.lower()
         return _EXTENSION_LANGUAGE_MAP.get(suffix)
+
+    def _set_queue_progress(self, done: int, total: int) -> None:
+        """Update queue counters and mark progress publishing as needed."""
+        changed = (
+            self.state.queue_done != done
+            or self.state.queue_total != total
+        )
+        self.state.queue_done = done
+        self.state.queue_total = total
+        if changed:
+            self._queue_progress_dirty = True
+
+    async def _publish_progress_updated_if_needed(self) -> None:
+        """Publish debounced queue progress updates after state is saved."""
+        if not self._queue_progress_dirty:
+            return
+        progress = (self.state.queue_done, self.state.queue_total)
+        if progress == self._last_published_queue_progress:
+            self._queue_progress_dirty = False
+            return
+        await publish_repo_event(
+            self.name,
+            "progress_updated",
+            {
+                "queue_done": self.state.queue_done,
+                "queue_total": self.state.queue_total,
+            },
+            redis_client=self.redis,
+        )
+        self._last_published_queue_progress = progress
+        self._queue_progress_dirty = False
 
     def _compute_diff_stats(self, base_branch: str) -> dict[str, object]:
         """Compute file/language/line stats for the current branch vs base."""
@@ -631,6 +665,7 @@ class PipelineRunner(
                         await self.redis.renamenx(old_upload, new_upload)
             except Exception:
                 pass
+        await self._publish_progress_updated_if_needed()
 
     async def _save_cli_log(self, stdout: str, stderr: str, label: str) -> None:
         _MAX_CLI_LOG_BYTES = 64 * 1024  # 64 KB cap per entry

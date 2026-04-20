@@ -159,6 +159,9 @@ class _FakeRedis:
             stop = len(values) + stop
         self.lists[key] = values[start:stop + 1]
 
+    async def publish(self, key: str, value: str) -> int:
+        return 1
+
     async def transaction(
         self,
         func,
@@ -674,6 +677,87 @@ def test_handle_idle_sets_queue_counters_with_mixed_statuses(
 
     assert runner.state.queue_done == 2
     assert runner.state.queue_total == 3
+
+
+def test_handle_idle_publishes_progress_update_only_for_new_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    tasks = [
+        QueueTask(pr_id="PR-001", title="Done", status=TaskStatus.DONE, branch="pr-001"),
+        QueueTask(pr_id="PR-002", title="Todo", status=TaskStatus.TODO, branch="pr-002"),
+    ]
+    published: list[tuple[str, str, dict[str, int], object | None]] = []
+
+    async def _fake_publish_repo_event(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, int],
+        redis_client: object | None = None,
+    ) -> None:
+        published.append((repo_name, event_type, payload, redis_client))
+
+    async def _fake_handle_coding() -> None:
+        return None
+
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: tasks)
+    monkeypatch.setattr(idle_module, "get_next_task", lambda t: tasks[1])
+    monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda tasks, repo_path, base_branch, open_pr_branches: tasks,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
+    )
+    monkeypatch.setattr(runner_module, "publish_repo_event", _fake_publish_repo_event)
+
+    runner = _make_runner()
+    runner.handle_coding = _fake_handle_coding  # type: ignore[method-assign]
+
+    asyncio.run(runner.handle_idle())
+    asyncio.run(runner.publish_state())
+    runner._set_queue_progress(1, 2)
+    asyncio.run(runner.publish_state())
+
+    assert published == [
+        (
+            runner.name,
+            "progress_updated",
+            {"queue_done": 1, "queue_total": 2},
+            runner.redis,
+        )
+    ]
+
+
+def test_publish_state_skips_progress_update_when_value_was_already_published(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    published: list[tuple[str, str, dict[str, int], object | None]] = []
+
+    async def _fake_publish_repo_event(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, int],
+        redis_client: object | None = None,
+    ) -> None:
+        published.append((repo_name, event_type, payload, redis_client))
+
+    monkeypatch.setattr(runner_module, "publish_repo_event", _fake_publish_repo_event)
+
+    runner = _make_runner()
+    runner._last_published_queue_progress = (1, 2)
+    runner._set_queue_progress(1, 2)
+
+    asyncio.run(runner.publish_state())
+
+    assert published == []
+    assert runner._queue_progress_dirty is False
 
 
 def test_handle_idle_uses_dag_when_headers_present(
