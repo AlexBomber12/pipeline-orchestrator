@@ -13626,6 +13626,87 @@ def test_run_cycle_reloads_dirty_config_before_error_handler(
     assert calls == ["reload", "handle_error", "publish"]
 
 
+def test_run_cycle_stops_idle_dispatch_when_dirty_reload_disables_repo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    runner = _make_runner()
+    runner._recovered = True
+    runner._scaffolded = True
+    runner.state.state = PipelineState.IDLE
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_refresh_user_paused_from_redis() -> None:
+        calls.append("refresh")
+
+    async def fake_reload_repo_config_if_dirty() -> None:
+        calls.append("reload")
+        runner.repo_config.active = False
+
+    async def fake_handle_idle() -> None:
+        calls.append("handle_idle")
+
+    async def fake_publish_state() -> None:
+        calls.append("publish")
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", lambda: True)
+    monkeypatch.setattr(
+        runner,
+        "_refresh_user_paused_from_redis",
+        fake_refresh_user_paused_from_redis,
+    )
+    monkeypatch.setattr(
+        runner, "reload_repo_config_if_dirty", fake_reload_repo_config_if_dirty
+    )
+    monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+
+    asyncio.run(runner.run_cycle())
+
+    assert "reload" in calls
+    assert "handle_idle" not in calls
+    assert calls[-1] == "publish"
+
+
+def test_run_cycle_stops_error_dispatch_when_dirty_reload_disables_repo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    runner = _make_runner()
+    runner._recovered = True
+    runner._scaffolded = True
+    runner.state.state = PipelineState.ERROR
+    runner.state.rate_limited_until = None
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_reload_repo_config_if_dirty() -> None:
+        calls.append("reload")
+        runner.repo_config.active = False
+
+    async def fake_handle_error() -> None:
+        calls.append("handle_error")
+
+    async def fake_publish_state() -> None:
+        calls.append("publish")
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", lambda: True)
+    monkeypatch.setattr(
+        runner, "reload_repo_config_if_dirty", fake_reload_repo_config_if_dirty
+    )
+    monkeypatch.setattr(runner, "handle_error", fake_handle_error)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+
+    asyncio.run(runner.run_cycle())
+
+    assert calls == ["reload", "publish"]
+
+
 # ── ErrorCategory / _classify_error ──────────────────────────────────
 
 
