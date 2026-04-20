@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any, AsyncIterator
+
+from redis.exceptions import RedisError
 
 KEEPALIVE_INTERVAL_SECONDS = 15.0
 HISTORY_REPLAY_LIMIT = 20
 POLL_INTERVAL_SECONDS = 0.1
+
+
+class RepoEventsUnavailableError(Exception):
+    """Raised when the Redis-backed SSE stream cannot be initialized."""
 
 
 def _channel_name(repo_name: str) -> str:
@@ -49,44 +55,47 @@ async def stream_repo_events(
     history_limit: int = HISTORY_REPLAY_LIMIT,
     keepalive_interval: float = KEEPALIVE_INTERVAL_SECONDS,
     poll_interval: float = POLL_INTERVAL_SECONDS,
-    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> AsyncIterator[bytes]:
-    """Yield SSE frames for repo history replay and live Redis Pub/Sub."""
-    history = await redis_client.lrange(_history_name(repo_name), 0, history_limit - 1)
-    for message in reversed(history):
-        if await _is_disconnected(request):
-            return
-        yield format_sse_event(message)
-
-    pubsub = redis_client.pubsub()
-    await pubsub.subscribe(_channel_name(repo_name))
-    last_keepalive = asyncio.get_running_loop().time()
-
+    """Return an SSE stream for repo history replay and live Redis Pub/Sub."""
     try:
-        while True:
-            if await _is_disconnected(request):
-                return
+        history = await redis_client.lrange(_history_name(repo_name), 0, history_limit - 1)
+        pubsub = redis_client.pubsub()
+        await pubsub.subscribe(_channel_name(repo_name))
+    except RedisError as exc:
+        raise RepoEventsUnavailableError("Redis unavailable") from exc
 
-            message = await pubsub.get_message(
-                ignore_subscribe_messages=True,
-                timeout=poll_interval,
-            )
-            if message is not None:
-                data = message.get("data")
-                if isinstance(data, bytes):
-                    data = data.decode("utf-8")
-                if isinstance(data, str):
-                    yield format_sse_event(data)
-                    last_keepalive = asyncio.get_running_loop().time()
-                    continue
+    async def _stream() -> AsyncIterator[bytes]:
+        try:
+            for message in reversed(history):
+                if await _is_disconnected(request):
+                    return
+                yield format_sse_event(message)
 
-            now = asyncio.get_running_loop().time()
-            if now - last_keepalive >= keepalive_interval:
-                yield format_sse_comment("keepalive")
-                last_keepalive = now
-                continue
+            last_keepalive = asyncio.get_running_loop().time()
 
-            await sleep(poll_interval)
-    finally:
-        await pubsub.unsubscribe(_channel_name(repo_name))
-        await pubsub.aclose()
+            while True:
+                if await _is_disconnected(request):
+                    return
+
+                message = await pubsub.get_message(
+                    ignore_subscribe_messages=True,
+                    timeout=poll_interval,
+                )
+                if message is not None:
+                    data = message.get("data")
+                    if isinstance(data, bytes):
+                        data = data.decode("utf-8")
+                    if isinstance(data, str):
+                        yield format_sse_event(data)
+                        last_keepalive = asyncio.get_running_loop().time()
+                        continue
+
+                now = asyncio.get_running_loop().time()
+                if now - last_keepalive >= keepalive_interval:
+                    yield format_sse_comment("keepalive")
+                    last_keepalive = now
+        finally:
+            await pubsub.unsubscribe(_channel_name(repo_name))
+            await pubsub.aclose()
+
+    return _stream()

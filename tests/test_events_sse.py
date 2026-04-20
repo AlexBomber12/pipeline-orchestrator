@@ -5,8 +5,10 @@ import json
 from typing import Any
 
 from fastapi.testclient import TestClient
+from redis.exceptions import ConnectionError
 from src.events import publisher
 from src.events.sse import (
+    RepoEventsUnavailableError,
     _is_disconnected,
     format_sse_comment,
     format_sse_event,
@@ -76,10 +78,6 @@ class _Request:
         return self.disconnected
 
 
-async def _no_sleep(_delay: float) -> None:
-    return None
-
-
 async def _wait_for_pubsub(redis: _FakeRedis) -> _FakePubSub:
     while not redis.pubsubs:
         await asyncio.sleep(0)
@@ -126,8 +124,8 @@ async def test_stream_repo_events_replays_history_then_forwards_live_messages() 
         request,
         keepalive_interval=60.0,
         poll_interval=0.01,
-        sleep=_no_sleep,
     )
+    stream = await stream
 
     assert await anext(stream) == format_sse_event(first)
     assert await anext(stream) == format_sse_event(second)
@@ -159,8 +157,8 @@ async def test_stream_repo_events_emits_keepalive_after_ignored_message() -> Non
         request,
         keepalive_interval=0.0,
         poll_interval=0.01,
-        sleep=_no_sleep,
     )
+    stream = await stream
 
     next_message = asyncio.create_task(anext(stream))
     pubsub = await _wait_for_pubsub(redis)
@@ -185,30 +183,31 @@ async def test_stream_repo_events_stops_before_subscribing_when_already_disconne
     redis.lists["repo-events-history:example__repo"] = [message]
     request = _Request(disconnected=True)
 
-    frames = [frame async for frame in stream_repo_events(redis, "example__repo", request)]
+    frames = [frame async for frame in await stream_repo_events(redis, "example__repo", request)]
 
     assert frames == []
-    assert redis.pubsubs == []
+    assert len(redis.pubsubs) == 1
+    pubsub = redis.pubsubs[0]
+    assert pubsub.unsubscribed == ["repo-events:example__repo"]
+    assert pubsub.closed is True
 
 
-async def test_stream_repo_events_uses_sleep_when_idle() -> None:
+async def test_stream_repo_events_returns_keepalive_without_extra_idle_sleep() -> None:
     redis = _FakeRedis()
     request = _Request()
-    sleep_calls: list[float] = []
-
-    async def _record_sleep(delay: float) -> None:
-        sleep_calls.append(delay)
-        request.disconnected = True
 
     stream = stream_repo_events(
         redis,
         "example__repo",
         request,
-        keepalive_interval=60.0,
+        keepalive_interval=0.0,
         poll_interval=0.01,
-        sleep=_record_sleep,
     )
+    stream = await stream
 
+    assert await anext(stream) == b":keepalive\n\n"
+
+    request.disconnected = True
     try:
         await anext(stream)
     except StopAsyncIteration:
@@ -216,10 +215,26 @@ async def test_stream_repo_events_uses_sleep_when_idle() -> None:
     else:
         raise AssertionError("stream should stop after disconnect")
 
-    assert sleep_calls == [0.01]
     pubsub = redis.pubsubs[0]
     assert pubsub.unsubscribed == ["repo-events:example__repo"]
     assert pubsub.closed is True
+
+
+async def test_stream_repo_events_raises_unavailable_when_history_fetch_fails() -> None:
+    redis = _FakeRedis()
+    request = _Request()
+
+    async def _failing_lrange(key: str, start: int, stop: int) -> list[str]:
+        raise ConnectionError("redis down")
+
+    redis.lrange = _failing_lrange  # type: ignore[method-assign]
+
+    try:
+        await stream_repo_events(redis, "example__repo", request)
+    except RepoEventsUnavailableError as exc:
+        assert str(exc) == "Redis unavailable"
+    else:
+        raise AssertionError("stream setup should fail when Redis history fetch fails")
 
 
 def test_api_repo_events_route_returns_sse_response(monkeypatch) -> None:
@@ -235,7 +250,10 @@ def test_api_repo_events_route_returns_sse_response(monkeypatch) -> None:
         seen["redis_client"] = redis_client
         seen["repo_name"] = repo_name
         seen["request"] = request
-        yield b":keepalive\n\n"
+        async def _stream():
+            yield b":keepalive\n\n"
+
+        return _stream()
 
     monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
     monkeypatch.setattr(web_app, "stream_repo_events", _fake_stream)
@@ -259,6 +277,31 @@ def test_api_repo_events_route_returns_503_without_redis(monkeypatch) -> None:
             return None
 
     monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/api/repos/example__repo/events")
+
+    assert response.status_code == 503
+    assert response.text == "Redis unavailable"
+
+
+def test_api_repo_events_route_returns_503_when_stream_setup_fails(monkeypatch) -> None:
+    redis = object()
+
+    class _StubAioredis:
+        @staticmethod
+        def from_url(url: str, decode_responses: bool = True) -> object:
+            return redis
+
+    async def _failing_stream(
+        redis_client: object,
+        repo_name: str,
+        request: object,
+    ) -> Any:
+        raise RepoEventsUnavailableError("Redis unavailable")
+
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    monkeypatch.setattr(web_app, "stream_repo_events", _failing_stream)
 
     with TestClient(app) as client:
         response = client.get("/api/repos/example__repo/events")

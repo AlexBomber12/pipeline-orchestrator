@@ -40,7 +40,7 @@ from src.config import (
     update_daemon_config,
     update_repository,
 )
-from src.events.sse import stream_repo_events
+from src.events.sse import RepoEventsUnavailableError, stream_repo_events
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
 from src.queue_parser import QueueValidationError, parse_queue_text, parse_task_header
@@ -844,8 +844,12 @@ async def api_repo_events(name: str, request: Request) -> Response:
     redis_client = getattr(request.app.state, "redis", None)
     if redis_client is None:
         return Response("Redis unavailable", status_code=503)
+    try:
+        stream = await stream_repo_events(redis_client, name, request)
+    except RepoEventsUnavailableError:
+        return Response("Redis unavailable", status_code=503)
     return StreamingResponse(
-        stream_repo_events(redis_client, name, request),
+        stream,
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
