@@ -31,18 +31,20 @@
         (function () {
             const STORAGE_KEY = 'theme';
             let theme = 'dark';
+            let storedTheme = null;
 
             try {
-                const storedTheme = localStorage.getItem(STORAGE_KEY);
-                if (storedTheme === 'light' || storedTheme === 'dark') {
-                    theme = storedTheme;
-                } else if (
-                    window.matchMedia &&
-                    window.matchMedia('(prefers-color-scheme: light)').matches
-                ) {
-                    theme = 'light';
-                }
+                storedTheme = localStorage.getItem(STORAGE_KEY);
             } catch (_error) {}
+
+            if (storedTheme === 'light' || storedTheme === 'dark') {
+                theme = storedTheme;
+            } else if (
+                window.matchMedia &&
+                window.matchMedia('(prefers-color-scheme: light)').matches
+            ) {
+                theme = 'light';
+            }
 
             document.documentElement.dataset.theme = theme;
             document.documentElement.style.colorScheme = theme;

@@ -354,7 +354,9 @@ def test_base_template_includes_theme_bootstrap_assets(
 
     body = response.text
     assert "html[data-theme=\"light\"]" in body
+    assert "let storedTheme = null;" in body
     assert "localStorage.getItem(STORAGE_KEY)" in body
+    assert "if (storedTheme === 'light' || storedTheme === 'dark')" in body
     assert "localStorage.setItem(STORAGE_KEY, theme)" in body
     assert "prefers-color-scheme: light" in body
     assert "document.documentElement.dataset.theme = theme;" in body
