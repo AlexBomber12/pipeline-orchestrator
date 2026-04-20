@@ -676,7 +676,10 @@ class PipelineRunner(
             await self.publish_state()
             return
 
-        if self.state.state == PipelineState.IDLE and self.state.user_paused:
+        if (
+            self.state.user_paused
+            and self.state.state in (PipelineState.IDLE, PipelineState.PAUSED)
+        ):
             if not self._user_pause_logged:
                 self.log_event("Paused by user, not picking up new tasks")
                 self._user_pause_logged = True

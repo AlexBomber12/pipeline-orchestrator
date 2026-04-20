@@ -11868,6 +11868,49 @@ def test_run_cycle_short_circuits_idle_when_user_paused(
     ) == 1
 
 
+def test_run_cycle_short_circuits_paused_when_user_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publishes: list[str] = []
+    paused_calls: list[str] = []
+    preflight_calls: list[str] = []
+    runner = _make_runner()
+    runner._recovered = True
+    runner._scaffolded = True
+    runner.state.state = PipelineState.PAUSED
+    runner.state.user_paused = True
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_handle_paused() -> None:
+        paused_calls.append("paused")
+
+    async def fake_publish_state() -> None:
+        publishes.append("published")
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(
+        runner,
+        "preflight",
+        lambda: preflight_calls.append("preflight") or True,
+    )
+    monkeypatch.setattr(runner, "handle_paused", fake_handle_paused)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+
+    asyncio.run(runner.run_cycle())
+    asyncio.run(runner.run_cycle())
+
+    assert paused_calls == []
+    assert preflight_calls == []
+    assert publishes == ["published", "published"]
+    assert sum(
+        1
+        for entry in runner.state.history
+        if entry["event"] == "Paused by user, not picking up new tasks"
+    ) == 1
+
+
 def test_run_cycle_skips_preflight_after_pause_refresh(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
