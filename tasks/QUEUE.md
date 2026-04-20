@@ -381,7 +381,7 @@
 - Branch: pr-138-repo-coder-selector
 
 ## PR-139: Mobile responsive dashboard layout
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-139.md
 - Branch: pr-139-mobile-responsive
 
