@@ -292,7 +292,7 @@ def test_upload_without_queue_md(
         )
     assert resp.status_code == 200
     assert "Accepted 1 task file (PR-001)." in resp.text
-    assert "Daemon will commit and push within 60 seconds." in resp.text
+    assert "Daemon will commit and push after the next polling cycle." in resp.text
     assert "Auto-dismissing in 30 seconds." in resp.text
 
     repo_upload_dir = uploads_dir / "example__alpha"
@@ -379,7 +379,7 @@ def test_upload_stages_files_and_sets_redis_key(
     assert "Also uploaded helper file: QUEUE.md." in resp.text
     assert resp.headers["HX-Retarget"] == "#upload-feedback-example__alpha"
     assert "Dismiss upload feedback" in resp.text
-    assert "after-settle" in resp.text
+    assert "::load" in resp.text
 
     repo_upload_dir = uploads_dir / "example__alpha"
     subdirs = list(repo_upload_dir.iterdir())

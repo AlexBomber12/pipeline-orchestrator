@@ -1980,7 +1980,7 @@ def _build_upload_success_message(filenames: list[str]) -> str:
         lines.append(
             f"Also uploaded helper {helper_noun}: {', '.join(sorted(helper_filenames))}."
         )
-    lines.append("Daemon will commit and push within 60 seconds.")
+    lines.append("Daemon will commit and push after the next polling cycle.")
     lines.append("Auto-dismissing in 30 seconds.")
     return "\n".join(lines)
 
