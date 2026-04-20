@@ -311,7 +311,7 @@
 - Branch: pr-124-coverage-gate-100
 
 ## PR-125: Auto-ready draft PRs before merge
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-125.md
 - Branch: pr-125-draft-pr-auto-ready
 
