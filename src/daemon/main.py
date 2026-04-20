@@ -254,7 +254,7 @@ async def main() -> None:
     """Initialize runners and drive the poll loop forever."""
     gh_dir = os.environ.get("GH_CONFIG_DIR")
     if gh_dir:
-        os.environ["GH_CONFIG_HOME"] = gh_dir
+        os.environ["GH_CONFIG_HOME"] = gh_dir  # pragma: no cover
 
     _setup_git_auth()
     auth = _validate_auth()
