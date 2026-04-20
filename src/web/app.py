@@ -1925,18 +1925,69 @@ def _get_upload_lock(repo_name: str) -> asyncio.Lock:
     return _upload_locks[repo_name]
 
 
+def _upload_feedback_target(repo_name: str) -> str:
+    css_name = _re.sub(r"([.#\[\]:>+~(){}|^$*!])", r"\\\1", repo_name)
+    return f"#upload-feedback-{css_name}"
+
+
+def _format_upload_message_lines(message: str) -> list[str]:
+    return [line for line in message.splitlines() if line.strip()]
+
+
+def _task_upload_summary(task_filenames: list[str]) -> str:
+    if not task_filenames:
+        return ""
+
+    def _sort_key(filename: str) -> tuple[int, int | str]:
+        match = _re.fullmatch(r"PR-(\d+)\.md", filename)
+        if match:
+            return (0, int(match.group(1)))
+        return (1, filename)
+
+    ordered = sorted(task_filenames, key=_sort_key)
+    labels = [filename.removesuffix(".md") for filename in ordered]
+    if len(labels) == 1:
+        return labels[0]
+    return f"{labels[0]} through {labels[-1]}"
+
+
+def _build_upload_success_message(filenames: list[str]) -> str:
+    task_filenames = [
+        filename for filename in filenames if _re.fullmatch(_TASK_UPLOAD_PATTERN, filename)
+    ]
+    helper_filenames = [
+        filename for filename in filenames if filename not in task_filenames
+    ]
+
+    task_count = len(task_filenames)
+    noun = "file" if task_count == 1 else "files"
+    summary = _task_upload_summary(task_filenames)
+    if summary:
+        lines = [f"Accepted {task_count} task {noun} ({summary})."]
+    else:
+        lines = [f"Accepted {task_count} task {noun}."]
+
+    if helper_filenames:
+        helper_noun = "file" if len(helper_filenames) == 1 else "files"
+        lines.append(
+            f"Also uploaded helper {helper_noun}: {', '.join(sorted(helper_filenames))}."
+        )
+    lines.append("Daemon will commit and push within 60 seconds.")
+    lines.append("Auto-dismissing in 30 seconds.")
+    return "\n".join(lines)
+
+
 def _render_upload_error(
     request: Request, message: str, status_code: int, repo_name: str = ""
 ) -> HTMLResponse:
     response = templates.TemplateResponse(
         request,
         "components/upload_error.html",
-        {"message": message},
+        {"message": message, "message_lines": _format_upload_message_lines(message)},
         status_code=status_code,
     )
     if repo_name:
-        css_name = _re.sub(r"([.#\[\]:>+~(){}|^$*!])", r"\\\1", repo_name)
-        response.headers["HX-Retarget"] = f"#upload-error-{css_name}"
+        response.headers["HX-Retarget"] = _upload_feedback_target(repo_name)
         response.headers["HX-Reswap"] = "innerHTML"
     return response
 
@@ -1947,10 +1998,9 @@ def _render_upload_success(
     response = templates.TemplateResponse(
         request,
         "components/upload_success.html",
-        {"message": message},
+        {"message": message, "message_lines": _format_upload_message_lines(message)},
     )
-    css_name = _re.sub(r"([.#\[\]:>+~(){}|^$*!])", r"\\\1", repo_name)
-    response.headers["HX-Retarget"] = f"#upload-error-{css_name}"
+    response.headers["HX-Retarget"] = _upload_feedback_target(repo_name)
     response.headers["HX-Reswap"] = "innerHTML"
     return response
 
@@ -2196,14 +2246,14 @@ async def upload_tasks(
                 if any("missing Depends on" in issue for issue in issues):
                     return _render_upload_error(
                         request,
-                        "Task file missing required field: Depends on. "
+                        f"Task file validation failed: {fname}: missing Depends on field.\n"
                         "Use 'Depends on: none' for tasks with no dependencies.",
                         400,
                         repo_name=name,
                     )
                 return _render_upload_error(
                     request,
-                    "\n".join(issues),
+                    "Task file validation failed:\n" + "\n".join(issues),
                     400,
                     repo_name=name,
                 )
@@ -2292,6 +2342,6 @@ async def upload_tasks(
 
     return _render_upload_success(
         request,
-        "Tasks queued. The daemon will commit and push on its next cycle.",
+        _build_upload_success_message(new_files),
         repo_name=name,
     )

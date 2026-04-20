@@ -65,8 +65,10 @@
                 {% endif %}
                 <form hx-post="/repos/{{ repo.name }}/upload-tasks"
                       hx-encoding="multipart/form-data"
-                      hx-target="#upload-error-{{ repo.name }}"
-                      hx-swap="innerHTML">
+                      hx-target="#upload-feedback-{{ repo.name }}"
+                      hx-swap="innerHTML"
+                      hx-indicator="#upload-indicator-{{ repo.name }}"
+                      hx-disabled-elt="#upload-{{ repo.name }}">
                     <input type="file" name="files" multiple accept=".md,.zip,application/zip,application/x-zip-compressed"
                            onchange="this.form.requestSubmit()"
                            class="hidden" id="upload-{{ repo.name }}">
@@ -74,6 +76,14 @@
                            class="primary-interactive inline-flex min-h-11 items-center rounded border border-white/10 px-3 text-xs font-medium text-gray-400 cursor-pointer sm:min-h-0 sm:px-2 sm:py-0.5">
                         Upload tasks
                     </label>
+                    <span id="upload-indicator-{{ repo.name }}"
+                          class="htmx-indicator inline-flex items-center gap-1 text-xs text-gray-500 opacity-0 transition-opacity duration-150">
+                        <svg class="h-3.5 w-3.5 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                            <circle cx="12" cy="12" r="9" class="opacity-25" stroke="currentColor" stroke-width="3"></circle>
+                            <path d="M21 12a9 9 0 0 0-9-9" class="opacity-90" stroke="currentColor" stroke-width="3" stroke-linecap="round"></path>
+                        </svg>
+                        <span>Uploading...</span>
+                    </span>
                 </form>
             </div>
         </div>
@@ -143,7 +153,7 @@
         {% elif repo.state.value == 'PAUSED' %}
         <div class="text-xs text-warn italic mt-1">Paused, resuming soon...</div>
         {% endif %}
-        <div id="upload-error-{{ repo.name }}"></div>
+        <div id="upload-feedback-{{ repo.name }}"></div>
     </div>
     {% endfor %}
 </div>

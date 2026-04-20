@@ -1,3 +1,15 @@
-<div class="rounded-lg border border-ok/30 bg-ok/10 px-3 py-2 text-ok text-xs mt-2">
-    {{ message }}
+<div class="relative mt-2 rounded-lg border border-ok/30 bg-ok/10 px-3 py-2 pr-9 text-ok text-xs"
+     data-upload-feedback-card
+     hx-on::after-settle="setTimeout(() => this.remove(), 30000)">
+    <button type="button"
+            class="absolute right-2 top-2 text-sm leading-none text-ok/80 hover:text-ok"
+            aria-label="Dismiss upload feedback"
+            onclick="this.closest('[data-upload-feedback-card]').remove()">
+        ×
+    </button>
+    <div class="space-y-1">
+        {% for line in message_lines %}
+        <p>{{ line }}</p>
+        {% endfor %}
+    </div>
 </div>

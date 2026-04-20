@@ -307,7 +307,10 @@ return 0
                 lambda: git_ops._git(self.repo_path, "push", "origin", branch, timeout=60),
                 operation_name=f"git push origin {branch}",
             )
-            self.log_event(f"Pushed uploaded task files: {filenames}")
+            task_count = sum(1 for name in filenames if name.startswith("PR-") and name.endswith(".md"))
+            self.log_event(
+                f"Uploaded {task_count} task files to tasks/ and pushed to main"
+            )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
             logger.error("%s: upload git operations failed: %s", self.name, exc)
             self.log_event(f"Upload push failed: {exc}")

@@ -470,7 +470,10 @@ def test_process_pending_uploads_success_and_nothing_to_commit(
     ]
     assert removed == [staging]
     assert key not in runner.redis.store
-    assert any("Pushed uploaded task files" in event for event in runner.events)
+    assert any(
+        "Uploaded 0 task files to tasks/ and pushed to main" in event
+        for event in runner.events
+    )
 
 
 def test_process_pending_uploads_returns_none_when_newer_manifest_exists(
