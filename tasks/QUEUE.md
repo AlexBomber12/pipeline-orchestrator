@@ -306,7 +306,7 @@
 - Branch: pr-122-coverage-handler-watch
 
 ## PR-124: Lock coverage gate at 100%
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-124.md
 - Branch: pr-124-coverage-gate-100
 
