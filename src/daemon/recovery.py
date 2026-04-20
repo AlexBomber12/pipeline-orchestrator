@@ -123,6 +123,15 @@ class RecoveryMixin:
                 )
                 return True
 
+            if self.state.user_paused:
+                self.state.current_pr = None
+                self.state.state = PipelineState.IDLE
+                self.log_event(
+                    f"Recovered: DOING task {doing.pr_id}, no PR "
+                    "but user_paused -> defer CODING until resume"
+                )
+                return True
+
             self.state.state = PipelineState.CODING
             self.log_event(
                 f"Recovered: DOING task {doing.pr_id}, no PR "
