@@ -95,7 +95,11 @@ async def stream_repo_events(
                     yield format_sse_comment("keepalive")
                     last_keepalive = now
         finally:
-            await pubsub.unsubscribe(_channel_name(repo_name))
-            await pubsub.aclose()
+            try:
+                await pubsub.unsubscribe(_channel_name(repo_name))
+            except RedisError:
+                pass
+            finally:
+                await pubsub.aclose()
 
     return _stream()

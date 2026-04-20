@@ -25,12 +25,15 @@ class _FakePubSub:
         self.subscribed = asyncio.Event()
         self.unsubscribed: list[str] = []
         self.closed = False
+        self.unsubscribe_error: Exception | None = None
 
     async def subscribe(self, channel: str) -> None:
         self.channels.add(channel)
         self.subscribed.set()
 
     async def unsubscribe(self, channel: str) -> None:
+        if self.unsubscribe_error is not None:
+            raise self.unsubscribe_error
         self.unsubscribed.append(channel)
         self.channels.discard(channel)
 
@@ -235,6 +238,30 @@ async def test_stream_repo_events_raises_unavailable_when_history_fetch_fails() 
         assert str(exc) == "Redis unavailable"
     else:
         raise AssertionError("stream setup should fail when Redis history fetch fails")
+
+
+async def test_stream_repo_events_closes_pubsub_when_unsubscribe_fails() -> None:
+    redis = _FakeRedis()
+    request = _Request()
+    stream = await stream_repo_events(
+        redis,
+        "example__repo",
+        request,
+        keepalive_interval=0.0,
+        poll_interval=0.01,
+    )
+    pubsub = await _wait_for_pubsub(redis)
+    pubsub.unsubscribe_error = ConnectionError("redis down")
+    request.disconnected = True
+
+    try:
+        await anext(stream)
+    except StopAsyncIteration:
+        pass
+    else:
+        raise AssertionError("stream should stop after disconnect")
+
+    assert pubsub.closed is True
 
 
 def test_api_repo_events_route_returns_sse_response(monkeypatch) -> None:
