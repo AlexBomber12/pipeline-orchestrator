@@ -13,6 +13,7 @@ from src import config as src_config
 from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
 from src.config import load_config
+from src.models import PipelineState, RepoState
 from src.web import app as web_app
 from src.web.app import app
 
@@ -32,6 +33,68 @@ class _StubAioredis:
     @staticmethod
     def from_url(url: str, decode_responses: bool = True) -> _StubAioredisClient:
         return _StubAioredisClient()
+
+
+class _FakeRedis:
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+
+    async def ping(self) -> bool:
+        return True
+
+    async def get(self, key: str) -> str | None:
+        return self.store.get(key)
+
+    async def set(self, key: str, value: str, **_kwargs: object) -> None:
+        self.store[key] = value
+
+    async def delete(self, key: str) -> int:
+        existed = key in self.store
+        self.store.pop(key, None)
+        return int(existed)
+
+    async def exists(self, key: str) -> int:
+        return int(key in self.store)
+
+    async def transaction(
+        self,
+        func,
+        *watches: str,
+        value_from_callable: bool = False,
+        **_kwargs: object,
+    ):
+        pipe = _FakePipeline(self)
+        func_value = func(pipe)
+        if hasattr(func_value, "__await__"):
+            func_value = await func_value
+        exec_value = await pipe.execute()
+        if value_from_callable:
+            return func_value
+        return exec_value
+
+
+class _FakePipeline:
+    def __init__(self, redis: _FakeRedis) -> None:
+        self.redis = redis
+        self.commands: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    async def get(self, key: str) -> str | None:
+        return self.redis.store.get(key)
+
+    def multi(self) -> None:
+        return None
+
+    def set(self, key: str, value: str, **kwargs: object) -> "_FakePipeline":
+        self.commands.append(("set", (key, value), kwargs))
+        return self
+
+    async def execute(self) -> list[object]:
+        results: list[object] = []
+        for command, args, kwargs in self.commands:
+            if command == "set":
+                await self.redis.set(args[0], args[1], **kwargs)
+                results.append(True)
+        return results
 
 
 @pytest.fixture(autouse=True)
@@ -1707,7 +1770,7 @@ def test_coders_table_omits_unknown_selected_model(
     assert "(default)" in body
 
 
-def test_repo_detail_coder_badge_renders(
+def test_repo_detail_coder_selector_renders(
     one_repo_config: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1718,12 +1781,14 @@ def test_repo_detail_coder_badge_renders(
 
     assert response.status_code == 200
     body = response.text
-    assert "Coder: Claude Code" in body
-    assert 'name="coder"' not in body
-    assert "Coder: Codex CLI" not in body
+    assert 'hx-post="/repos/example__alpha/coder"' in body
+    assert 'name="coder"' in body
+    assert "Any (bandit picks per-PR)" in body
+    assert "Claude CLI" in body
+    assert "Codex CLI" in body
 
 
-def test_repo_detail_badge_shows_repo_effective_coder(
+def test_repo_detail_selector_marks_repo_override_selected(
     one_repo_config: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1745,23 +1810,231 @@ def test_repo_detail_badge_shows_repo_effective_coder(
 
     assert response.status_code == 200
     body = response.text
-    assert "Coder: Codex CLI" in body
-    assert "Coder: Claude Code" not in body
+    assert '<option value="codex" selected>' in body
+    assert "inherits Claude" not in body
 
 
-def test_repo_coder_change_saves_to_config(
+def test_repo_coder_change_posts_selector_updates_config_and_sets_dirty_flag(
+    one_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(one_repo_config))
+    fake_redis = _FakeRedis()
+    published: list[tuple[str, str, dict[str, str]]] = []
+
+    async def fake_publish(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, str],
+        redis_client: object | None = None,
+    ) -> None:
+        published.append((repo_name, event_type, payload))
+
+    monkeypatch.setattr(web_app, "publish_repo_event", fake_publish)
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake_redis
+        response = client.post(
+            "/repos/example__alpha/coder",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 200
+    assert "Switching to Codex CLI." in response.text
+    cfg = load_config(str(one_repo_config))
+    assert cfg.repositories[0].coder is not None
+    assert cfg.repositories[0].coder.value == "codex"
+    assert fake_redis.store["control:example__alpha:config_dirty"] == "1"
+    assert published == [
+        (
+            "example__alpha",
+            "config_reloaded",
+            {"coder": "codex", "effective_coder": "codex"},
+        )
+    ]
+
+
+def test_repo_coder_change_updates_idle_repo_state_payload(
+    one_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(one_repo_config))
+    fake_redis = _FakeRedis()
+    fake_redis.store["pipeline:example__alpha"] = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        coder="claude",
+    ).model_dump_json()
+
+    async def fake_publish(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, str],
+        redis_client: object | None = None,
+    ) -> None:
+        return None
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake_redis
+        monkeypatch.setattr(web_app, "publish_repo_event", fake_publish)
+        response = client.post(
+            "/repos/example__alpha/coder",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 200
+    persisted = RepoState.model_validate_json(fake_redis.store["pipeline:example__alpha"])
+    assert persisted.coder == "codex"
+
+
+def test_repo_coder_change_during_active_pr_is_deferred(
+    one_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(one_repo_config))
+    fake_redis = _FakeRedis()
+    fake_redis.store["pipeline:example__alpha"] = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.WATCH,
+        coder="claude",
+    ).model_dump_json()
+
+    async def fake_publish(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, str],
+        redis_client: object | None = None,
+    ) -> None:
+        return None
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake_redis
+        monkeypatch.setattr(web_app, "publish_repo_event", fake_publish)
+        response = client.post(
+            "/repos/example__alpha/coder",
+            data={"coder": "any"},
+        )
+
+    assert response.status_code == 200
+    assert "applies after current PR completes" in response.text
+    persisted = RepoState.model_validate_json(fake_redis.store["pipeline:example__alpha"])
+    assert persisted.coder == "claude"
+
+
+def test_post_repo_detail_coder_handles_missing_invalid_and_write_error(
+    one_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(one_repo_config))
+
+    async def fake_publish(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, str],
+        redis_client: object | None = None,
+    ) -> None:
+        return None
+
+    with TestClient(app) as client:
+        client.app.state.redis = _FakeRedis()
+        monkeypatch.setattr(web_app, "publish_repo_event", fake_publish)
+
+        missing = client.post("/repos/example__ghost/coder", data={"coder": "codex"})
+        assert missing.status_code == 404
+        assert "Repository not found" in missing.text
+
+        invalid = client.post(
+            "/repos/example__alpha/coder",
+            data={"coder": "other"},
+        )
+        assert invalid.status_code == 422
+        assert "coder must be one of: any, claude, codex" in invalid.text
+
+        cleared = client.post("/repos/example__alpha/coder", data={"coder": "any"})
+        assert cleared.status_code == 200
+
+    cfg = load_config(str(one_repo_config))
+    assert cfg.repositories[0].coder is None
+
+    monkeypatch.setattr(src_config, "save_config", _raise_permission_error)
+    with TestClient(app) as client:
+        client.app.state.redis = _FakeRedis()
+        monkeypatch.setattr(web_app, "publish_repo_event", fake_publish)
+        write_error = client.post(
+            "/repos/example__alpha/coder",
+            data={"coder": "codex"},
+        )
+
+    assert write_error.status_code == 503
+    assert "Failed to write config.yml" in write_error.text
+
+
+def test_post_repo_detail_coder_requires_redis(
     one_repo_config: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(web_app, "CONFIG_PATH", str(one_repo_config))
 
     with TestClient(app) as client:
+        client.app.state.redis = None
+        response = client.post(
+            "/repos/example__alpha/coder",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 503
+    assert "Redis unavailable" in response.text
+
+
+def test_post_repo_detail_coder_returns_success_when_state_update_fails(
+    one_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(one_repo_config))
+
+    class _BoomRedis(_FakeRedis):
+        async def set(self, key: str, value: str, **_kwargs: object) -> None:
+            raise RuntimeError("boom")
+
+    async def fake_publish(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, str],
+        redis_client: object | None = None,
+    ) -> None:
+        return None
+
+    with TestClient(app) as client:
+        client.app.state.redis = _BoomRedis()
+        monkeypatch.setattr(web_app, "publish_repo_event", fake_publish)
+        response = client.post(
+            "/repos/example__alpha/coder",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 200
+    assert "Switching to Codex CLI." in response.text
+    reloaded = load_config(str(one_repo_config))
+    assert reloaded.repositories[0].coder == "codex"
+
+
+def test_put_repo_detail_coder_still_updates_summary_fragment(
+    one_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(one_repo_config))
+
+    with TestClient(app) as client:
+        client.app.state.redis = _FakeRedis()
         response = client.put(
             "/settings/repo/example__alpha",
             data={"coder": "codex"},
         )
 
     assert response.status_code == 200
+    assert 'hx-post="/repos/example__alpha/coder"' in response.text
     cfg = load_config(str(one_repo_config))
     assert cfg.repositories[0].coder is not None
     assert cfg.repositories[0].coder.value == "codex"
@@ -1774,6 +2047,8 @@ def test_put_repo_detail_coder_handles_missing_invalid_clear_and_write_error(
     monkeypatch.setattr(web_app, "CONFIG_PATH", str(one_repo_config))
 
     with TestClient(app) as client:
+        client.app.state.redis = _FakeRedis()
+
         missing = client.put("/settings/repo/example__ghost", data={"coder": "codex"})
         assert missing.status_code == 404
         assert "Repository not found" in missing.text
@@ -1793,6 +2068,7 @@ def test_put_repo_detail_coder_handles_missing_invalid_clear_and_write_error(
 
     monkeypatch.setattr(src_config, "save_config", _raise_permission_error)
     with TestClient(app) as client:
+        client.app.state.redis = _FakeRedis()
         write_error = client.put(
             "/settings/repo/example__alpha",
             data={"coder": "codex"},

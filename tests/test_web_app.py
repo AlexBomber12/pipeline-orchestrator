@@ -8,7 +8,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
+from src.config import load_config
 from src.models import (
     CIStatus,
     PipelineState,
@@ -800,10 +802,65 @@ def test_repo_detail_route_renders_full_page(
     assert 'hx-trigger="every 5s"' in body
     assert "Current Task" in body
     assert "Current PR" in body
-    assert "Coder: Claude Code" in body
-    assert 'name="coder"' not in body
+    assert 'hx-post="/repos/example__alpha/coder"' in body
+    assert 'name="coder"' in body
+    assert "Any (bandit picks per-PR)" in body
     assert "Recent PRs" not in body
     assert "Event log" in body
+
+
+def test_repo_summary_banner_keeps_fragment_wrapped(
+    two_repo_config: Path,
+) -> None:
+    now = datetime(2026, 4, 20, 17, 0, 0, tzinfo=timezone.utc)
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        last_updated=now,
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+
+    context = asyncio.run(
+        web_app._repo_template_context(
+            "example__alpha",
+            fake,
+            coder_update_message="Switching to Codex.",
+        )
+    )
+    rendered = web_app.templates.get_template(
+        "components/repo_summary.html"
+    ).render(context)
+
+    assert rendered.count("<section") == rendered.count("</section>")
+    assert rendered.count("<div") == rendered.count("</div>")
+    banner = (
+        '<div class="mb-4 rounded-lg border border-accent/30 '
+        'bg-accent/10 px-4 py-3 text-sm text-accent">'
+    )
+    assert banner in rendered
+    assert "Switching to Codex." in rendered
+
+
+def test_repo_summary_error_fragment_keeps_divs_balanced(
+    two_repo_config: Path,
+) -> None:
+    now = datetime(2026, 4, 20, 17, 0, 0, tzinfo=timezone.utc)
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.ERROR,
+        error_message="boom",
+        last_updated=now,
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+
+    context = asyncio.run(web_app._repo_template_context("example__alpha", fake))
+    rendered = web_app.templates.get_template(
+        "components/repo_summary.html"
+    ).render(context)
+
+    assert rendered.count("<div") == rendered.count("</div>")
 
 
 def _metrics_record(
@@ -1563,3 +1620,405 @@ def test_pause_endpoint_returns_503_when_redis_is_unavailable(
 
     assert response.status_code == 503
     assert response.text == "Redis unavailable"
+
+
+def test_post_repo_detail_coder_returns_503_before_config_write_when_redis_ping_fails(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _PingBoomRedis(_FakeRedis):
+        async def ping(self) -> bool:
+            raise RuntimeError("redis is down")
+
+    write_attempted = False
+
+    def _fail_if_called(*args: object, **kwargs: object) -> None:
+        nonlocal write_attempted
+        write_attempted = True
+        raise AssertionError("update_repository should not be called")
+
+    monkeypatch.setattr(web_app, "update_repository", _fail_if_called)
+
+    with TestClient(app) as client:
+        client.app.state.redis = _PingBoomRedis()
+        response = client.post(
+            "/repos/example__alpha/coder",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 503
+    assert response.text == "Redis unavailable"
+    assert write_attempted is False
+
+
+def test_post_repo_detail_coder_defers_paused_repo_switch_message(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paused = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.PAUSED,
+        coder="claude",
+        current_pr=PRInfo(number=17, branch="pr-017-sample"),
+        last_updated=datetime(2026, 4, 20, 17, 0, 0, tzinfo=timezone.utc),
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": paused.model_dump_json()})
+
+    async def _fake_publish_repo_event(*args: object, **kwargs: object) -> None:
+        return None
+
+    async def _fake_repo_template_context(
+        name: str,
+        redis_client: object | None,
+        *,
+        coder_update_message: str | None = None,
+        include_metrics: bool = False,
+    ) -> dict[str, object]:
+        return {"coder_update_message": coder_update_message or ""}
+
+    def _fake_template_response(
+        request: object,
+        template_name: str,
+        context: dict[str, object],
+    ) -> HTMLResponse:
+        return HTMLResponse(str(context["coder_update_message"]))
+
+    monkeypatch.setattr(web_app, "publish_repo_event", _fake_publish_repo_event)
+    monkeypatch.setattr(web_app, "update_repository", lambda *args, **kwargs: None)
+    monkeypatch.setattr(web_app, "_repo_template_context", _fake_repo_template_context)
+    monkeypatch.setattr(web_app.templates, "TemplateResponse", _fake_template_response)
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.post(
+            "/repos/example__alpha/coder",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 200
+    assert response.text == "Switching to Codex CLI - applies after current PR completes."
+    stored = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+    assert stored.coder == "claude"
+
+
+def test_post_repo_detail_coder_defers_hung_repo_switch_message(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hung = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.HUNG,
+        coder="claude",
+        current_pr=PRInfo(number=17, branch="pr-017-sample"),
+        last_updated=datetime(2026, 4, 20, 17, 0, 0, tzinfo=timezone.utc),
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": hung.model_dump_json()})
+
+    async def _fake_publish_repo_event(*args: object, **kwargs: object) -> None:
+        return None
+
+    async def _fake_repo_template_context(
+        name: str,
+        redis_client: object | None,
+        *,
+        coder_update_message: str | None = None,
+        include_metrics: bool = False,
+    ) -> dict[str, object]:
+        return {"coder_update_message": coder_update_message or ""}
+
+    def _fake_template_response(
+        request: object,
+        template_name: str,
+        context: dict[str, object],
+    ) -> HTMLResponse:
+        return HTMLResponse(str(context["coder_update_message"]))
+
+    monkeypatch.setattr(web_app, "publish_repo_event", _fake_publish_repo_event)
+    monkeypatch.setattr(web_app, "update_repository", lambda *args, **kwargs: None)
+    monkeypatch.setattr(web_app, "_repo_template_context", _fake_repo_template_context)
+    monkeypatch.setattr(web_app.templates, "TemplateResponse", _fake_template_response)
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.post(
+            "/repos/example__alpha/coder",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 200
+    assert response.text == "Switching to Codex CLI - applies after current PR completes."
+    stored = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+    assert stored.coder == "claude"
+
+
+def test_post_repo_detail_coder_updates_idle_repo_via_transaction(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    idle = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        coder="claude",
+        last_updated=datetime(2026, 4, 20, 17, 0, 0, tzinfo=timezone.utc),
+    )
+
+    class _TrackingRedis(_FakeRedis):
+        def __init__(self, store: dict[str, str] | None = None) -> None:
+            super().__init__(store)
+            self.transactions: list[tuple[str, ...]] = []
+
+        async def ping(self) -> bool:
+            return True
+
+        async def transaction(
+            self,
+            func,
+            *watches: str,
+            value_from_callable: bool = False,
+            **_kwargs: object,
+        ):
+            self.transactions.append(tuple(watches))
+            return await super().transaction(
+                func,
+                *watches,
+                value_from_callable=value_from_callable,
+                **_kwargs,
+            )
+
+    fake = _TrackingRedis({"pipeline:example__alpha": idle.model_dump_json()})
+
+    async def _fake_publish_repo_event(*args: object, **kwargs: object) -> None:
+        return None
+
+    async def _fake_repo_template_context(
+        name: str,
+        redis_client: object | None,
+        *,
+        coder_update_message: str | None = None,
+        include_metrics: bool = False,
+    ) -> dict[str, object]:
+        return {"coder_update_message": coder_update_message or ""}
+
+    def _fake_template_response(
+        request: object,
+        template_name: str,
+        context: dict[str, object],
+    ) -> HTMLResponse:
+        return HTMLResponse(str(context["coder_update_message"]))
+
+    monkeypatch.setattr(web_app, "publish_repo_event", _fake_publish_repo_event)
+    monkeypatch.setattr(web_app, "_repo_template_context", _fake_repo_template_context)
+    monkeypatch.setattr(web_app.templates, "TemplateResponse", _fake_template_response)
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.post(
+            "/repos/example__alpha/coder",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 200
+    assert response.text == "Switching to Codex CLI."
+    stored = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+    assert stored.coder == "codex"
+    assert ("pipeline:example__alpha",) in fake.transactions
+
+
+def test_post_repo_detail_coder_skips_missing_state_during_transaction(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    idle = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        coder="claude",
+        last_updated=datetime(2026, 4, 20, 17, 0, 0, tzinfo=timezone.utc),
+    )
+
+    class _MissingStateRedis(_FakeRedis):
+        async def ping(self) -> bool:
+            return True
+
+        async def transaction(
+            self,
+            func,
+            *watches: str,
+            value_from_callable: bool = False,
+            **_kwargs: object,
+        ):
+            self.store.pop("pipeline:example__alpha", None)
+            return await super().transaction(
+                func,
+                *watches,
+                value_from_callable=value_from_callable,
+                **_kwargs,
+            )
+
+    fake = _MissingStateRedis({"pipeline:example__alpha": idle.model_dump_json()})
+
+    async def _fake_publish_repo_event(*args: object, **kwargs: object) -> None:
+        return None
+
+    async def _fake_repo_template_context(
+        name: str,
+        redis_client: object | None,
+        *,
+        coder_update_message: str | None = None,
+        include_metrics: bool = False,
+    ) -> dict[str, object]:
+        return {"coder_update_message": coder_update_message or ""}
+
+    def _fake_template_response(
+        request: object,
+        template_name: str,
+        context: dict[str, object],
+    ) -> HTMLResponse:
+        return HTMLResponse(str(context["coder_update_message"]))
+
+    monkeypatch.setattr(web_app, "publish_repo_event", _fake_publish_repo_event)
+    monkeypatch.setattr(web_app, "_repo_template_context", _fake_repo_template_context)
+    monkeypatch.setattr(web_app.templates, "TemplateResponse", _fake_template_response)
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.post(
+            "/repos/example__alpha/coder",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 200
+    assert response.text == "Switching to Codex CLI."
+    assert "pipeline:example__alpha" not in fake.store
+
+
+def test_post_repo_detail_coder_skips_transaction_when_state_turns_hung(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    idle = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        coder="claude",
+        last_updated=datetime(2026, 4, 20, 17, 0, 0, tzinfo=timezone.utc),
+    )
+
+    class _HungDuringTransactionRedis(_FakeRedis):
+        async def ping(self) -> bool:
+            return True
+
+        async def transaction(
+            self,
+            func,
+            *watches: str,
+            value_from_callable: bool = False,
+            **_kwargs: object,
+        ):
+            self.store["pipeline:example__alpha"] = RepoState(
+                url="https://github.com/example/alpha.git",
+                name="example__alpha",
+                state=PipelineState.HUNG,
+                coder="claude",
+                current_pr=PRInfo(number=17, branch="pr-017-sample"),
+                last_updated=datetime(2026, 4, 20, 17, 0, 0, tzinfo=timezone.utc),
+            ).model_dump_json()
+            return await super().transaction(
+                func,
+                *watches,
+                value_from_callable=value_from_callable,
+                **_kwargs,
+            )
+
+    fake = _HungDuringTransactionRedis(
+        {"pipeline:example__alpha": idle.model_dump_json()}
+    )
+
+    async def _fake_publish_repo_event(*args: object, **kwargs: object) -> None:
+        return None
+
+    async def _fake_repo_template_context(
+        name: str,
+        redis_client: object | None,
+        *,
+        coder_update_message: str | None = None,
+        include_metrics: bool = False,
+    ) -> dict[str, object]:
+        return {"coder_update_message": coder_update_message or ""}
+
+    def _fake_template_response(
+        request: object,
+        template_name: str,
+        context: dict[str, object],
+    ) -> HTMLResponse:
+        return HTMLResponse(str(context["coder_update_message"]))
+
+    monkeypatch.setattr(web_app, "publish_repo_event", _fake_publish_repo_event)
+    monkeypatch.setattr(web_app, "_repo_template_context", _fake_repo_template_context)
+    monkeypatch.setattr(web_app.templates, "TemplateResponse", _fake_template_response)
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.post(
+            "/repos/example__alpha/coder",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 200
+    assert response.text == "Switching to Codex CLI - applies after current PR completes."
+    stored = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+    assert stored.coder == "claude"
+
+
+def test_post_repo_detail_coder_returns_success_when_publish_event_fails(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    idle = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        coder="claude",
+        last_updated=datetime(2026, 4, 20, 17, 0, 0, tzinfo=timezone.utc),
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": idle.model_dump_json()})
+
+    async def _failing_publish_repo_event(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("event bus unavailable")
+
+    async def _fake_repo_template_context(
+        name: str,
+        redis_client: object | None,
+        *,
+        coder_update_message: str | None = None,
+        include_metrics: bool = False,
+    ) -> dict[str, object]:
+        return {"coder_update_message": coder_update_message or ""}
+
+    def _fake_template_response(
+        request: object,
+        template_name: str,
+        context: dict[str, object],
+    ) -> HTMLResponse:
+        return HTMLResponse(str(context["coder_update_message"]))
+
+    monkeypatch.setattr(web_app, "publish_repo_event", _failing_publish_repo_event)
+    monkeypatch.setattr(web_app, "_repo_template_context", _fake_repo_template_context)
+    monkeypatch.setattr(web_app.templates, "TemplateResponse", _fake_template_response)
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.post(
+            "/repos/example__alpha/coder",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 200
+    assert response.text == "Switching to Codex CLI."
+    stored = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+    assert stored.coder == "codex"
+    reloaded = load_config(str(two_repo_config))
+    assert reloaded.repositories[0].coder == "codex"

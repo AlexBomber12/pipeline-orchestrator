@@ -35,7 +35,7 @@ import redis.asyncio as aioredis
 from src import github_client  # noqa: F401 — tests reference runner_module.github_client
 from src.coder_registry import CoderPlugin, CoderRegistry
 from src.coders import build_coder_registry
-from src.config import AppConfig, CoderType, RepoConfig
+from src.config import AppConfig, CoderType, RepoConfig, load_config
 from src.daemon import (
     git_ops,
     scaffolder,  # noqa: F401 — tests reference runner_module.scaffolder
@@ -219,6 +219,11 @@ class PipelineRunner(
         self._current_coder_process: asyncio.subprocess.Process | None = None
         self._stop_requested = False
         self._user_pause_logged = False
+        self._pending_repo_config: RepoConfig | None = None
+        self._pending_app_config: AppConfig | None = None
+        self._pending_usage_providers: (
+            tuple[UsageProvider, UsageProvider] | None
+        ) = None
 
     @property
     def app_config(self) -> AppConfig:
@@ -236,6 +241,80 @@ class PipelineRunner(
         """Swap in the shared daemon-level usage providers."""
         self._claude_usage_provider = claude_usage_provider
         self._codex_usage_provider = codex_usage_provider
+
+    def stage_config_reload(
+        self,
+        repo_config: RepoConfig,
+        app_config: AppConfig,
+        claude_usage_provider: UsageProvider,
+        codex_usage_provider: UsageProvider,
+    ) -> None:
+        """Queue config changes to apply at the next safe task-pickup boundary."""
+        self._pending_repo_config = repo_config
+        self._pending_app_config = app_config
+        self._pending_usage_providers = (
+            claude_usage_provider,
+            codex_usage_provider,
+        )
+
+    def _build_usage_providers_for_app_config(
+        self,
+        app_config: AppConfig,
+    ) -> tuple[UsageProvider, UsageProvider]:
+        """Rebuild shared usage providers from the active config snapshot."""
+        claude_provider = self._registry.get("claude").create_usage_provider(
+            config=app_config
+        )
+        codex_provider = self._registry.get("codex").create_usage_provider(
+            config=app_config
+        )
+        return (
+            claude_provider or self._claude_usage_provider,
+            codex_provider or self._codex_usage_provider,
+        )
+
+    def _apply_staged_config_reload(self) -> None:
+        """Apply any queued config changes now that the runner is safe to swap."""
+        if self._pending_repo_config is None or self._pending_app_config is None:
+            return
+        self.repo_config = self._pending_repo_config
+        self.app_config = self._pending_app_config
+        if self._pending_usage_providers is not None:
+            self.set_usage_providers(*self._pending_usage_providers)
+        self.clear_staged_config_reload()
+
+    def clear_staged_config_reload(self) -> None:
+        """Drop any queued config swap once a newer config is in effect."""
+        self._pending_repo_config = None
+        self._pending_app_config = None
+        self._pending_usage_providers = None
+
+    async def reload_repo_config_if_dirty(self) -> None:
+        """Hot-reload repo config at the idle boundary when flagged by the web UI."""
+        dirty_key = f"control:{self.name}:config_dirty"
+        dirty_exists = False
+        if hasattr(self.redis, "exists"):
+            dirty_exists = bool(await self.redis.exists(dirty_key))
+        elif hasattr(self.redis, "get"):
+            dirty_exists = (await self.redis.get(dirty_key)) is not None
+        if not dirty_exists:
+            self._apply_staged_config_reload()
+            return
+
+        config = load_config()
+        for repo in config.repositories:
+            if repo_slug_from_url(repo.url) == self.name:
+                self.repo_config = repo
+                self.app_config = config
+                self.set_usage_providers(
+                    *self._build_usage_providers_for_app_config(config)
+                )
+                self.clear_staged_config_reload()
+                await self.redis.delete(dirty_key)
+                self.log_event("Reloaded repo config from config.yml")
+                return
+        await self.redis.delete(dirty_key)
+        self._apply_staged_config_reload()
 
     def _select_coder(
         self, *, allow_exploration: bool = True
@@ -799,6 +878,10 @@ class PipelineRunner(
                 if not self._user_pause_logged:
                     self.log_event("Paused by user, not picking up new tasks")
                     self._user_pause_logged = True
+                await self.publish_state()
+                return
+            await self.reload_repo_config_if_dirty()
+            if not self.repo_config.active:
                 await self.publish_state()
                 return
             self._user_pause_logged = False

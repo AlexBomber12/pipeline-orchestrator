@@ -39,6 +39,7 @@ from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
 from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
 from src.daemon.runner import PipelineRunner
+from src.models import PipelineState
 from src.usage import UsageProvider
 
 logging.basicConfig(
@@ -56,6 +57,67 @@ DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 #: ``CONFIG_RELOAD_CYCLES * daemon.poll_interval_sec`` seconds, so it
 #: adapts to both fast and slow deployments.
 CONFIG_RELOAD_CYCLES = 5
+_DEFERRED_RUNNER_CONFIG_STATES = {
+    PipelineState.CODING,
+    PipelineState.WATCH,
+    PipelineState.FIX,
+    PipelineState.MERGE,
+    PipelineState.PAUSED,
+    PipelineState.HUNG,
+}
+
+
+def _runner_requires_idle_boundary(runner: Any) -> bool:
+    """Return whether this runner should defer config changes to IDLE."""
+    state = getattr(getattr(runner, "state", None), "state", None)
+    return state in _DEFERRED_RUNNER_CONFIG_STATES
+
+
+def _repo_config_differs_only_in_coder(current: RepoConfig, updated: RepoConfig) -> bool:
+    """Return whether the repo delta is limited to the coder selection."""
+    if current.coder == updated.coder:
+        return False
+    updated_payload = updated.model_dump()
+    updated_payload["coder"] = current.coder
+    return current.model_dump() == updated_payload
+
+
+def _app_config_differs_only_in_repo_coder(
+    current: AppConfig,
+    updated: AppConfig,
+    repo_key: str,
+) -> bool:
+    """Return whether the app-config delta is limited to one repo's coder field."""
+    current_repo = _find_repo_config(current, repo_key)
+    updated_repo = _find_repo_config(updated, repo_key)
+    if current_repo is None or updated_repo is None:
+        return False
+    if not _repo_config_differs_only_in_coder(current_repo, updated_repo):
+        return False
+
+    current_payload = current.model_dump(mode="json")
+    updated_payload = updated.model_dump(mode="json")
+
+    current_repos = current_payload.get("repositories", [])
+    updated_repos = updated_payload.get("repositories", [])
+    if len(current_repos) != len(updated_repos):
+        return False
+
+    for current_repo_payload, updated_repo_payload in zip(current_repos, updated_repos):
+        if normalize_repo_url(current_repo_payload["url"]) != normalize_repo_url(
+            updated_repo_payload["url"]
+        ):
+            return False
+        if normalize_repo_url(current_repo_payload["url"]) == repo_key:
+            current_repo_payload = {
+                **current_repo_payload,
+                "coder": updated_repo_payload.get("coder"),
+            }
+        if current_repo_payload != updated_repo_payload:
+            return False
+
+    current_payload["repositories"] = updated_repos
+    return current_payload == updated_payload
 
 
 def _setup_git_auth() -> None:
@@ -216,12 +278,44 @@ def _sync_runners(
     # Add new runners and refresh configs on existing ones.
     for key, repo in desired.items():
         if key in runners:
-            runners[key].repo_config = repo
-            runners[key].app_config = config
-            runners[key].set_usage_providers(
-                claude_usage_provider,
-                codex_usage_provider,
+            runner = runners[key]
+            active_changed = runner.repo_config.active != repo.active
+            defer_coder_only_reload = (
+                _runner_requires_idle_boundary(runner)
+                and _repo_config_differs_only_in_coder(runner.repo_config, repo)
+                and _app_config_differs_only_in_repo_coder(
+                    runner.app_config,
+                    config,
+                    key,
+                )
             )
+            if (
+                not runner.repo_config.active
+                or active_changed
+                or not defer_coder_only_reload
+            ):
+                runner.repo_config = repo
+                runner.app_config = config
+                runner.set_usage_providers(
+                    claude_usage_provider,
+                    codex_usage_provider,
+                )
+                if hasattr(runner, "clear_staged_config_reload"):
+                    runner.clear_staged_config_reload()
+            elif hasattr(runner, "stage_config_reload"):
+                runner.stage_config_reload(
+                    repo,
+                    config,
+                    claude_usage_provider,
+                    codex_usage_provider,
+                )
+            else:
+                runner.repo_config = repo
+                runner.app_config = config
+                runner.set_usage_providers(
+                    claude_usage_provider,
+                    codex_usage_provider,
+                )
             continue
         runner = _build_runner(
             repo,
@@ -313,12 +407,6 @@ async def main() -> None:
                     )
                     config = new_config
                     claude_usage_provider, codex_usage_provider = _create_usage_providers(config)
-                    for runner in runners.values():
-                        new_repo_config = _find_repo_config(
-                            config, runner.repo_config.url
-                        )
-                        if new_repo_config is not None:
-                            runner.repo_config = new_repo_config
                     _sync_runners(
                         runners,
                         config,

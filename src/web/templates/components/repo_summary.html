@@ -19,6 +19,7 @@
 } %}
 {% set style = repo_state.state_styles.get(repo.state.value, repo_state.state_styles['IDLE']) %}
 
+<section data-repo-summary>
 <header class="flex flex-wrap items-center gap-3 mb-6">
     <h2 class="font-mono text-2xl text-gray-100 truncate">{{ repo.name }}</h2>
     <span class="inline-flex items-center gap-2"
@@ -30,14 +31,41 @@
         </span>
         <span class="hidden text-[11px] font-medium uppercase tracking-wide text-gray-500" data-stalled-hint>stalled</span>
     </span>
-    <span class="text-xs font-medium px-2 py-0.5 rounded border border-white/10 bg-surface-3 text-gray-300 font-mono">
-        Coder: {% for c in coders %}{% if c.name == effective_coder %}{{ c.display_name }}{% endif %}{% endfor %}
-    </span>
+    <form hx-post="/repos/{{ repo.name }}/coder"
+          hx-target="closest [data-repo-summary]"
+          hx-swap="outerHTML"
+          class="flex items-center gap-2 rounded border border-white/10 bg-surface-3 px-2 py-1 text-xs">
+        <label for="repo-coder-{{ repo.name }}" class="font-mono text-gray-400">Coder</label>
+        <select id="repo-coder-{{ repo.name }}"
+                name="coder"
+                class="bg-transparent text-gray-300 font-mono outline-none"
+                onchange="this.form.requestSubmit()">
+            <option value="any" {% if selected_repo_coder == 'any' %}selected{% endif %}>
+                Any (bandit picks per-PR)
+            </option>
+            {% for c in coders %}
+            <option value="{{ c.name }}" {% if selected_repo_coder == c.name %}selected{% endif %}>
+                {{ 'Claude CLI' if c.name == 'claude' else c.display_name }}
+            </option>
+            {% endfor %}
+        </select>
+        {% if selected_repo_coder == 'any' %}
+        <span class="text-[11px] text-gray-500">
+            inherits {{ inherit_coder|capitalize }}
+        </span>
+        {% endif %}
+    </form>
     {{ repo_controls(repo) }}
     <span class="ml-auto font-mono text-xs text-gray-500">
         updated <span data-ts="{{ repo.last_updated.isoformat() if repo.last_updated else '' }}">{{ repo.last_updated.strftime('%Y-%m-%d %H:%M:%S') }}</span>
     </span>
 </header>
+
+{% if coder_update_message %}
+<div class="mb-4 rounded-lg border border-accent/30 bg-accent/10 px-4 py-3 text-sm text-accent">
+    {{ coder_update_message }}
+</div>
+{% endif %}
 
 {% if repo.usage_session_percent is not none or repo.usage_weekly_percent is not none %}
 <div class="flex flex-wrap items-center gap-3 mb-4 text-xs font-mono text-gray-400">
@@ -146,3 +174,4 @@
         {% endif %}
     </section>
 </div>
+</section>

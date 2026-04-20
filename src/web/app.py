@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import logging
 import os
 import subprocess
 import tempfile
@@ -40,6 +41,7 @@ from src.config import (
     update_daemon_config,
     update_repository,
 )
+from src.events import publish_repo_event
 from src.events.sse import RepoEventsUnavailableError, stream_repo_events
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
@@ -49,12 +51,26 @@ from src.utils import repo_slug_from_url
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 CONFIG_PATH = "config.yml"
 REPOS_DIR = "/data/repos"
+logger = logging.getLogger(__name__)
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 templates.env.globals["utcnow"] = lambda: datetime.now(timezone.utc)
 _METRICS_PANEL_LIMIT = 20
 _METRICS_SCAN_LIMIT = 100
+_CODER_LABELS = {
+    "any": "Any (bandit picks per-PR)",
+    "claude": "Claude CLI",
+    "codex": "Codex CLI",
+}
+_DEFERRED_CODER_SWITCH_STATES = {
+    PipelineState.CODING,
+    PipelineState.WATCH,
+    PipelineState.FIX,
+    PipelineState.MERGE,
+    PipelineState.HUNG,
+    PipelineState.PAUSED,
+}
 
 
 def _default_repo_state(
@@ -227,6 +243,18 @@ def _daemon_default_coder_name(config: AppConfig) -> str:
     return config.daemon.coder.value
 
 
+def _repo_coder_form_value(repo_config: RepoConfig | None) -> str:
+    """Return the raw repo-level coder selection for the detail form."""
+    if repo_config is None or repo_config.coder is None:
+        return "any"
+    return repo_config.coder.value
+
+
+def _coder_display_name(coder: str) -> str:
+    """Return the UI label for a coder selection."""
+    return _CODER_LABELS.get(coder, coder)
+
+
 async def get_all_repo_states(
     redis_client: aioredis.Redis | None,
     config_path: str = CONFIG_PATH,
@@ -327,6 +355,7 @@ async def _repo_template_context(
     config_path: str = CONFIG_PATH,
     *,
     include_metrics: bool = False,
+    coder_update_message: str | None = None,
 ) -> dict[str, Any]:
     """Return template context for repo detail renders."""
     config = load_config(config_path)
@@ -338,7 +367,9 @@ async def _repo_template_context(
         "daemon": config.daemon,
         "coders": build_coder_registry().list_coders(),
         "effective_coder": _effective_coder_name(repo_config, config),
+        "selected_repo_coder": _repo_coder_form_value(repo_config),
         "inherit_coder": _daemon_default_coder_name(config),
+        "coder_update_message": coder_update_message,
         "metrics_records": (
             await _recent_repo_metrics_payload(name, redis_client)
             if include_metrics
@@ -976,6 +1007,106 @@ async def stop_repo(request: Request, name: str) -> Response:
     if failure is not None:
         return failure
     return JSONResponse({"ok": True, "user_paused": True})
+
+
+@app.post("/repos/{name}/coder", response_class=HTMLResponse)
+async def post_repo_detail_coder(
+    request: Request,
+    name: str,
+    coder: str = Form(...),
+) -> HTMLResponse:
+    cfg = load_config(CONFIG_PATH)
+    repo = _find_repo_config_by_name(cfg, name)
+    if repo is None:
+        return HTMLResponse("Repository not found", status_code=404)
+
+    if coder == "any":
+        updated_coder: str | None = None
+    elif coder in ("claude", "codex"):
+        updated_coder = coder
+    else:
+        return HTMLResponse(
+            "coder must be one of: any, claude, codex",
+            status_code=422,
+        )
+
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return HTMLResponse("Redis unavailable", status_code=503)
+    if hasattr(redis_client, "ping"):
+        try:
+            await redis_client.ping()
+        except Exception:
+            return HTMLResponse("Redis unavailable", status_code=503)
+
+    try:
+        update_repository(repo.url, path=CONFIG_PATH, coder=updated_coder)
+    except OSError as exc:
+        return HTMLResponse(f"Failed to write config.yml: {exc}", status_code=503)
+
+    dirty_key = f"control:{name}:config_dirty"
+    state_key = f"pipeline:{name}"
+    try:
+        await redis_client.set(dirty_key, "1")
+        raw_state = await redis_client.get(state_key)
+        if raw_state:
+            state = RepoState.model_validate_json(raw_state)
+            if state.state not in _DEFERRED_CODER_SWITCH_STATES:
+                refreshed = load_config(CONFIG_PATH)
+                refreshed_repo = _find_repo_config_by_name(refreshed, name)
+                if refreshed_repo is not None:
+                    effective_coder = _effective_coder_name(
+                        refreshed_repo, refreshed
+                    )
+
+                    async def _transaction(pipe: Any) -> None:
+                        latest_raw = await pipe.get(state_key)
+                        if latest_raw is None:
+                            return
+                        latest_state = RepoState.model_validate_json(latest_raw)
+                        if latest_state.state in _DEFERRED_CODER_SWITCH_STATES:
+                            return
+                        latest_state.coder = effective_coder
+                        pipe.multi()
+                        pipe.set(state_key, latest_state.model_dump_json())
+
+                    await redis_client.transaction(_transaction, state_key)
+    except Exception:
+        logger.warning("Failed to refresh repo state after coder update", exc_info=True)
+
+    try:
+        await publish_repo_event(
+            name,
+            "config_reloaded",
+            {
+                "coder": coder,
+                "effective_coder": updated_coder or cfg.daemon.coder.value,
+            },
+            redis_client,
+        )
+    except Exception:
+        logger.warning("Failed to publish coder update event", exc_info=True)
+
+    current_state = await get_repo_state(name, redis_client, config_path=CONFIG_PATH)
+    applies_after_current_pr = (
+        current_state.state in _DEFERRED_CODER_SWITCH_STATES
+    )
+    message = f"Switching to {_coder_display_name(coder)}"
+    if applies_after_current_pr:
+        message += " - applies after current PR completes."
+    else:
+        message += "."
+
+    context = await _repo_template_context(
+        name,
+        redis_client,
+        coder_update_message=message,
+    )
+    return templates.TemplateResponse(
+        request,
+        "components/repo_summary.html",
+        context,
+    )
 
 
 @app.get("/repo/{name}/metrics")

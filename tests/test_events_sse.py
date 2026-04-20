@@ -5,10 +5,10 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import src.events.sse as sse_module
 from fastapi.testclient import TestClient
 from redis.exceptions import ConnectionError
 from src.events import publisher
-import src.events.sse as sse_module
 from src.events.sse import (
     INITIAL_BUFFER_DRAIN_LIMIT,
     RepoEventsUnavailableError,

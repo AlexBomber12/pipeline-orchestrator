@@ -7,12 +7,14 @@ import json
 import logging
 import os
 import subprocess
+import types
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import main as main_module
+from src.models import PipelineState
 
 
 class _FakeRedisClient:
@@ -40,6 +42,7 @@ class _FakeRunner:
         from src.utils import repo_slug_from_url
         self.name = repo_slug_from_url(repo_config.url)
         self.cycles = 0
+        self.state = types.SimpleNamespace(state=PipelineState.IDLE)
         _FakeRunner.instances.append(self)
 
     async def run_cycle(self) -> None:
@@ -449,6 +452,510 @@ def test_hot_reload_updates_repo_config_coder(
     alpha = next(r for r in _FakeRunner.instances if r.name == "octo__alpha")
     assert alpha.repo_config.coder is not None
     assert alpha.repo_config.coder.value == "codex"
+
+
+def test_sync_runners_stages_config_reload_when_runner_supports_it() -> None:
+    class _StagingRunner(_FakeRunner):
+        def __init__(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            redis_client: Any,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+        ) -> None:
+            super().__init__(
+                repo_config,
+                app_config,
+                redis_client,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+            self.staged: tuple[Any, ...] | None = None
+
+        def stage_config_reload(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+        ) -> None:
+            self.staged = (
+                repo_config,
+                app_config,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+
+    daemon_config = DaemonConfig(poll_interval_sec=1)
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git", coder="codex")],
+        daemon=daemon_config,
+    )
+    runner = _StagingRunner(
+        _repo("https://github.com/octo/alpha.git"),
+        AppConfig(
+            repositories=[_repo("https://github.com/octo/alpha.git")],
+            daemon=daemon_config,
+        ),
+        _FakeRedisClient(),
+        "claude-provider",
+        "codex-provider",
+    )
+    runner.state.state = PipelineState.WATCH
+
+    main_module._sync_runners(
+        {"https://github.com/octo/alpha": runner},
+        config,
+        _FakeRedisClient(),
+        "claude-provider",
+        "codex-provider",
+        registry=None,  # type: ignore[arg-type]
+    )
+
+    assert runner.staged is not None
+    staged_repo, staged_app, staged_claude, staged_codex = runner.staged
+    assert staged_repo.coder is not None
+    assert staged_repo.coder.value == "codex"
+    assert staged_app is config
+    assert staged_claude == "claude-provider"
+    assert staged_codex == "codex-provider"
+
+
+def test_sync_runners_applies_active_flag_change_immediately() -> None:
+    class _StagingRunner(_FakeRunner):
+        def __init__(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            redis_client: Any,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+        ) -> None:
+            super().__init__(
+                repo_config,
+                app_config,
+                redis_client,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+            self.staged: tuple[Any, ...] | None = None
+
+        def stage_config_reload(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+        ) -> None:
+            self.staged = (
+                repo_config,
+                app_config,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+
+        def clear_staged_config_reload(self) -> None:
+            self.staged = None
+
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git", active=True, coder="codex")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    runner = _StagingRunner(
+        _repo("https://github.com/octo/alpha.git", active=False),
+        AppConfig(
+            repositories=[_repo("https://github.com/octo/alpha.git", active=False)]
+        ),
+        _FakeRedisClient(),
+        "old-claude-provider",
+        "old-codex-provider",
+    )
+
+    main_module._sync_runners(
+        {"https://github.com/octo/alpha": runner},
+        config,
+        _FakeRedisClient(),
+        "claude-provider",
+        "codex-provider",
+        registry=None,  # type: ignore[arg-type]
+    )
+
+    assert runner.staged is None
+    assert runner.repo_config.active is True
+    assert runner.repo_config.coder is not None
+    assert runner.repo_config.coder.value == "codex"
+    assert runner.app_config is config
+    assert runner.claude_usage_provider == "claude-provider"
+    assert runner.codex_usage_provider == "codex-provider"
+
+
+def test_sync_runners_clears_staged_reload_after_immediate_active_update() -> None:
+    class _StagingRunner(_FakeRunner):
+        def __init__(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            redis_client: Any,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+        ) -> None:
+            super().__init__(
+                repo_config,
+                app_config,
+                redis_client,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+            self.staged: tuple[Any, ...] | None = ("stale",)
+
+        def stage_config_reload(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+        ) -> None:
+            self.staged = (
+                repo_config,
+                app_config,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+
+        def clear_staged_config_reload(self) -> None:
+            self.staged = None
+
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git", active=False, coder="codex")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    runner = _StagingRunner(
+        _repo("https://github.com/octo/alpha.git", active=True, coder="claude"),
+        AppConfig(
+            repositories=[_repo("https://github.com/octo/alpha.git", active=True, coder="claude")]
+        ),
+        _FakeRedisClient(),
+        "old-claude-provider",
+        "old-codex-provider",
+    )
+
+    main_module._sync_runners(
+        {"https://github.com/octo/alpha": runner},
+        config,
+        _FakeRedisClient(),
+        "claude-provider",
+        "codex-provider",
+        registry=None,  # type: ignore[arg-type]
+    )
+
+    assert runner.repo_config.active is False
+    assert runner.repo_config.coder is not None
+    assert runner.repo_config.coder.value == "codex"
+    assert runner.staged is None
+
+
+def test_sync_runners_applies_config_immediately_when_runner_is_in_error() -> None:
+    class _StagingRunner(_FakeRunner):
+        def __init__(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            redis_client: Any,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+        ) -> None:
+            super().__init__(
+                repo_config,
+                app_config,
+                redis_client,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+            self.staged: tuple[Any, ...] | None = None
+
+        def stage_config_reload(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+        ) -> None:
+            self.staged = (
+                repo_config,
+                app_config,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git", coder="codex")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    runner = _StagingRunner(
+        _repo("https://github.com/octo/alpha.git", coder="claude"),
+        AppConfig(
+            repositories=[_repo("https://github.com/octo/alpha.git", coder="claude")]
+        ),
+        _FakeRedisClient(),
+        "old-claude-provider",
+        "old-codex-provider",
+    )
+    runner.state.state = PipelineState.ERROR
+
+    main_module._sync_runners(
+        {"https://github.com/octo/alpha": runner},
+        config,
+        _FakeRedisClient(),
+        "claude-provider",
+        "codex-provider",
+        registry=None,  # type: ignore[arg-type]
+    )
+
+    assert runner.staged is None
+    assert runner.repo_config.coder is not None
+    assert runner.repo_config.coder.value == "codex"
+    assert runner.app_config is config
+
+
+def test_sync_runners_applies_non_coder_repo_changes_immediately() -> None:
+    class _StagingRunner(_FakeRunner):
+        def __init__(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            redis_client: Any,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+        ) -> None:
+            super().__init__(
+                repo_config,
+                app_config,
+                redis_client,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+            self.staged: tuple[Any, ...] | None = None
+
+        def stage_config_reload(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+        ) -> None:
+            self.staged = (
+                repo_config,
+                app_config,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+
+        def clear_staged_config_reload(self) -> None:
+            self.staged = None
+
+    original_repo = _repo(
+        "https://github.com/octo/alpha.git",
+        coder="claude",
+        auto_merge=True,
+    )
+    updated_repo = _repo(
+        "https://github.com/octo/alpha.git",
+        coder="codex",
+        auto_merge=False,
+    )
+    runner = _StagingRunner(
+        original_repo,
+        AppConfig(repositories=[original_repo]),
+        _FakeRedisClient(),
+        "old-claude-provider",
+        "old-codex-provider",
+    )
+    runner.state.state = PipelineState.WATCH
+    config = AppConfig(
+        repositories=[updated_repo],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+
+    main_module._sync_runners(
+        {"https://github.com/octo/alpha": runner},
+        config,
+        _FakeRedisClient(),
+        "claude-provider",
+        "codex-provider",
+        registry=None,  # type: ignore[arg-type]
+    )
+
+    assert runner.staged is None
+    assert runner.repo_config.coder is not None
+    assert runner.repo_config.coder.value == "codex"
+    assert runner.repo_config.auto_merge is False
+    assert runner.app_config is config
+    assert runner.claude_usage_provider == "claude-provider"
+    assert runner.codex_usage_provider == "codex-provider"
+
+
+def test_repo_config_differs_only_in_coder_requires_coder_change() -> None:
+    current = _repo("https://github.com/octo/alpha.git", coder="claude")
+    same = _repo("https://github.com/octo/alpha.git", coder="claude")
+    changed = _repo(
+        "https://github.com/octo/alpha.git",
+        coder="codex",
+        auto_merge=False,
+    )
+
+    assert main_module._repo_config_differs_only_in_coder(current, same) is False
+    assert (
+        main_module._repo_config_differs_only_in_coder(current, changed) is False
+    )
+
+
+def test_app_config_differs_only_in_repo_coder_handles_non_coder_changes() -> None:
+    current = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git", coder="claude")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    missing_repo = AppConfig(repositories=[], daemon=DaemonConfig(poll_interval_sec=1))
+    changed_repo = AppConfig(
+        repositories=[
+            _repo(
+                "https://github.com/octo/alpha.git",
+                coder="codex",
+                auto_merge=False,
+            )
+        ],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    reordered_repos = AppConfig(
+        repositories=[
+            _repo("https://github.com/octo/beta.git"),
+            _repo("https://github.com/octo/alpha.git", coder="codex"),
+        ],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+
+    assert (
+        main_module._app_config_differs_only_in_repo_coder(
+            current,
+            missing_repo,
+            "https://github.com/octo/alpha",
+        )
+        is False
+    )
+    assert (
+        main_module._app_config_differs_only_in_repo_coder(
+            current,
+            changed_repo,
+            "https://github.com/octo/alpha",
+        )
+        is False
+    )
+    assert (
+        main_module._app_config_differs_only_in_repo_coder(
+            current,
+            reordered_repos,
+            "https://github.com/octo/alpha",
+        )
+        is False
+    )
+
+
+def test_app_config_differs_only_in_repo_coder_rejects_other_repo_drift() -> None:
+    current = AppConfig(
+        repositories=[
+            _repo("https://github.com/octo/alpha.git", coder="claude"),
+            _repo("https://github.com/octo/beta.git", auto_merge=True),
+        ],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    updated_with_reordered_repos = AppConfig(
+        repositories=[
+            _repo("https://github.com/octo/beta.git", auto_merge=True),
+            _repo("https://github.com/octo/alpha.git", coder="codex"),
+        ],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    updated_with_other_repo_change = AppConfig(
+        repositories=[
+            _repo("https://github.com/octo/alpha.git", coder="codex"),
+            _repo("https://github.com/octo/beta.git", auto_merge=False),
+        ],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+
+    assert (
+        main_module._app_config_differs_only_in_repo_coder(
+            current,
+            updated_with_reordered_repos,
+            "https://github.com/octo/alpha",
+        )
+        is False
+    )
+    assert (
+        main_module._app_config_differs_only_in_repo_coder(
+            current,
+            updated_with_other_repo_change,
+            "https://github.com/octo/alpha",
+        )
+        is False
+    )
+
+
+def test_sync_runners_updates_watching_runner_without_staging_support() -> None:
+    daemon_config = DaemonConfig(poll_interval_sec=1)
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git", coder="codex")],
+        daemon=daemon_config,
+    )
+    runner = _FakeRunner(
+        _repo("https://github.com/octo/alpha.git", coder="claude"),
+        AppConfig(
+            repositories=[_repo("https://github.com/octo/alpha.git", coder="claude")],
+            daemon=daemon_config,
+        ),
+        _FakeRedisClient(),
+        "old-claude-provider",
+        "old-codex-provider",
+    )
+    runner.state.state = PipelineState.WATCH
+
+    main_module._sync_runners(
+        {"https://github.com/octo/alpha": runner},
+        config,
+        _FakeRedisClient(),
+        "claude-provider",
+        "codex-provider",
+        registry=None,  # type: ignore[arg-type]
+    )
+
+    assert runner.repo_config.coder is not None
+    assert runner.repo_config.coder.value == "codex"
+    assert runner.app_config is config
+    assert runner.claude_usage_provider == "claude-provider"
+    assert runner.codex_usage_provider == "codex-provider"
+
+
+def test_find_repo_config_matches_normalized_url() -> None:
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(),
+    )
+
+    found = main_module._find_repo_config(config, "https://github.com/octo/alpha/")
+
+    assert found is not None
+    assert found.url == "https://github.com/octo/alpha.git"
+
+
+def test_find_repo_config_returns_none_for_unknown_repo() -> None:
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(),
+    )
+
+    found = main_module._find_repo_config(config, "https://github.com/octo/missing")
+
+    assert found is None
 
 
 def test_main_continues_when_one_runner_raises(
