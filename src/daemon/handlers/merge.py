@@ -9,6 +9,7 @@ Mixin methods:
 
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 from datetime import datetime, timezone
@@ -24,6 +25,8 @@ from src.retry import retry_transient
 # unresolved before ``_resolve_pending_queue_sync`` escalates to
 # ERROR.
 _QUEUE_SYNC_MAX_WAIT_SEC = 3600
+
+logger = logging.getLogger(__name__)
 
 
 class MergeMixin:
@@ -146,6 +149,18 @@ class MergeMixin:
 
         merged_diff_stats = self._compute_diff_stats(base)
         self.log_event(f"Merging PR #{number}")
+        try:
+            github_client.run_gh(
+                ["pr", "ready", str(number)],
+                repo=self.owner_repo,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Best-effort gh pr ready failed for PR #%s in %s: %s",
+                number,
+                self.owner_repo,
+                exc,
+            )
         try:
             github_client.merge_pr(self.owner_repo, number)
         except Exception as exc:
