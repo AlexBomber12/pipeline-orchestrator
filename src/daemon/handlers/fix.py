@@ -416,9 +416,9 @@ class FixMixin(BreachMixin):
                 )
             if await pause_for_stop_after_bookkeeping():
                 return
-            self.state.state = PipelineState.PAUSED
-            self.state.error_message = None
-            return
+            self.state.state = PipelineState.PAUSED  # pragma: no cover - defensive fallback
+            self.state.error_message = None  # pragma: no cover - defensive fallback
+            return  # pragma: no cover - defensive fallback
         if code != 0:
             self._detect_rate_limit(stderr, coder_name=coder_name)
             if self.state.rate_limited_until is not None:

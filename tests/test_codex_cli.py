@@ -102,6 +102,28 @@ async def test_run_codex_async_not_found(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 @pytest.mark.asyncio
+async def test_run_codex_async_calls_on_process_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_proc = _make_fake_proc(returncode=0)
+    started: list[MagicMock] = []
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    result = await run_codex_async(
+        "prompt",
+        "/tmp",
+        on_process_start=lambda proc: started.append(proc),
+    )
+
+    assert result == (0, "", "")
+    assert started == [fake_proc]
+
+
+@pytest.mark.asyncio
 async def test_run_planned_pr_async_calls_exec_with_docker_sandbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -131,6 +153,26 @@ async def test_run_planned_pr_async_calls_exec_with_docker_sandbox(
 
 
 @pytest.mark.asyncio
+async def test_run_planned_pr_async_forwards_on_process_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_proc = _make_fake_proc(returncode=0)
+    started: list[MagicMock] = []
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    await run_planned_pr_async(
+        "/data/repos/demo",
+        on_process_start=lambda proc: started.append(proc),
+    )
+
+    assert started == [fake_proc]
+
+
+@pytest.mark.asyncio
 async def test_fix_review_async_passes_prompt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -155,6 +197,26 @@ async def test_fix_review_async_passes_prompt(
         "danger-full-access",
     ]
     assert cmd[-1] == "FIX REVIEW"
+
+
+@pytest.mark.asyncio
+async def test_fix_review_async_forwards_on_process_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_proc = _make_fake_proc(returncode=0)
+    started: list[MagicMock] = []
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    await fix_review_async(
+        "/data/repos/demo",
+        on_process_start=lambda proc: started.append(proc),
+    )
+
+    assert started == [fake_proc]
 
 
 @pytest.mark.asyncio

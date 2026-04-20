@@ -548,6 +548,28 @@ async def test_diagnose_error_async_skips_system_prompt(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
+async def test_run_claude_async_calls_on_process_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_proc = _make_fake_proc(returncode=0)
+    started: list[MagicMock] = []
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    result = await run_claude_async(
+        "prompt",
+        "/tmp",
+        on_process_start=lambda proc: started.append(proc),
+    )
+
+    assert result == (0, "", "")
+    assert started == [fake_proc]
+
+
+@pytest.mark.asyncio
 async def test_run_planned_pr_async_forwards_to_run_claude_async(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -583,6 +605,24 @@ async def test_run_planned_pr_async_forwards_to_run_claude_async(
 
 
 @pytest.mark.asyncio
+async def test_run_planned_pr_async_forwards_on_process_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    callback = object()
+
+    async def fake_run_claude_async(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        captured["kwargs"] = kwargs
+        return (0, "ok", "")
+
+    monkeypatch.setattr("src.claude_cli.run_claude_async", fake_run_claude_async)
+
+    await run_planned_pr_async("/data/repos/demo", on_process_start=callback)  # type: ignore[arg-type]
+
+    assert captured["kwargs"]["on_process_start"] is callback
+
+
+@pytest.mark.asyncio
 async def test_fix_review_async_forwards_to_run_claude_async(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -615,3 +655,21 @@ async def test_fix_review_async_forwards_to_run_claude_async(
         "session_threshold": 56,
         "weekly_threshold": 78,
     }
+
+
+@pytest.mark.asyncio
+async def test_fix_review_async_forwards_on_process_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    callback = object()
+
+    async def fake_run_claude_async(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        captured["kwargs"] = kwargs
+        return (0, "ok", "")
+
+    monkeypatch.setattr("src.claude_cli.run_claude_async", fake_run_claude_async)
+
+    await fix_review_async("/data/repos/demo", on_process_start=callback)  # type: ignore[arg-type]
+
+    assert captured["kwargs"]["on_process_start"] is callback
