@@ -304,3 +304,97 @@
 - Status: DONE
 - Tasks file: tasks/PR-122.md
 - Branch: pr-122-coverage-handler-watch
+
+## PR-124: Lock coverage gate at 100%
+- Status: TODO
+- Tasks file: tasks/PR-124.md
+- Branch: pr-124-coverage-gate-100
+
+## PR-125: Auto-ready draft PRs before merge
+- Status: TODO
+- Tasks file: tasks/PR-125.md
+- Branch: pr-125-draft-pr-auto-ready
+
+## PR-126: Remove hardcoded claude_cli from error and merge handlers
+- Status: TODO
+- Tasks file: tasks/PR-126.md
+- Branch: pr-126-eligible-coder-selection
+
+## PR-127: Pause/Stop control endpoints and persistent pause flag
+- Status: TODO
+- Tasks file: tasks/PR-127.md
+- Branch: pr-127-control-endpoints-backend
+
+## PR-128: Play/Pause/Stop icon controls in UI
+- Status: TODO
+- Tasks file: tasks/PR-128.md
+- Branch: pr-128-control-icons-ui
+- Depends on: PR-127
+
+## PR-129: Replace Claude-specific labels with coder-neutral wording
+- Status: TODO
+- Tasks file: tasks/PR-129.md
+- Branch: pr-129-coder-neutral-labels
+
+## PR-130: Deduplicate consecutive identical events in the event log
+- Status: TODO
+- Tasks file: tasks/PR-130.md
+- Branch: pr-130-event-log-dedup
+
+## PR-131: Active state label pulses while daemon is live
+- Status: TODO
+- Tasks file: tasks/PR-131.md
+- Branch: pr-131-active-state-pulse
+
+## PR-132: Grey state label when daemon has no updates for 30 seconds
+- Status: TODO
+- Tasks file: tasks/PR-132.md
+- Branch: pr-132-stalled-state-grey
+- Depends on: PR-131
+
+## PR-133: Light/dark theme toggle
+- Status: TODO
+- Tasks file: tasks/PR-133.md
+- Branch: pr-133-theme-toggle
+
+## PR-134: Consistent hover states on interactive elements
+- Status: TODO
+- Tasks file: tasks/PR-134.md
+- Branch: pr-134-hover-states
+
+## PR-135: Redis Pub/Sub event bus and SSE endpoint infrastructure
+- Status: TODO
+- Tasks file: tasks/PR-135.md
+- Branch: pr-135-sse-pubsub-infra
+
+## PR-136: Sprint progress bar real-time updates via SSE
+- Status: TODO
+- Tasks file: tasks/PR-136.md
+- Branch: pr-136-progress-bar-sse
+- Depends on: PR-135
+
+## PR-137: Settings page logical grouping and one-line hints
+- Status: TODO
+- Tasks file: tasks/PR-137.md
+- Branch: pr-137-settings-clarity
+
+## PR-138: Coder selector on repo detail page with hot-reload
+- Status: TODO
+- Tasks file: tasks/PR-138.md
+- Branch: pr-138-repo-coder-selector
+
+## PR-139: Mobile responsive dashboard layout
+- Status: TODO
+- Tasks file: tasks/PR-139.md
+- Branch: pr-139-mobile-responsive
+
+## PR-140: Event log readability on narrow screens
+- Status: TODO
+- Tasks file: tasks/PR-140.md
+- Branch: pr-140-event-log-mobile
+- Depends on: PR-139
+
+## PR-141: Rate limit display only for the active coder
+- Status: TODO
+- Tasks file: tasks/PR-141.md
+- Branch: pr-141-rate-limit-active-only
