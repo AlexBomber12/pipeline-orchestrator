@@ -1351,7 +1351,39 @@ def test_repo_card_has_onclick(
     body = response.text
     assert "window.location='/repo/example__alpha'" in body
     assert "window.location='/repo/example__beta'" in body
-    assert "event.target.closest('label,input,button,a')" in body
+    assert "event.target.closest('form,label,input,button,a')" in body
+    assert 'hx-target="#upload-feedback-example__alpha"' in body
+    assert 'hx-indicator="#upload-indicator-example__alpha"' in body
+    assert 'hx-disabled-elt="#upload-example__alpha"' in body
+    assert 'id="upload-feedback-example__alpha"' in body
+    assert 'class="htmx-indicator pointer-events-none inline-flex items-center gap-1 text-xs text-gray-500 opacity-0 transition-opacity duration-150"' in body
+    assert "Uploading..." in body
+
+
+def test_repo_card_escapes_dotted_repo_name_in_hx_selectors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/my.repo.git\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo-list")
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'hx-target="#upload-feedback-example__my\\.repo"' in body
+    assert 'hx-indicator="#upload-indicator-example__my\\.repo"' in body
+    assert 'hx-disabled-elt="#upload-example__my\\.repo"' in body
+    assert 'id="upload-feedback-example__my.repo"' in body
+    assert 'id="upload-indicator-example__my.repo"' in body
+    assert 'id="upload-example__my.repo"' in body
 
 
 def test_repo_card_renders_pause_and_stop_controls_for_active_repo(

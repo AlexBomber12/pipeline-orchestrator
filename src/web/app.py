@@ -1925,18 +1925,97 @@ def _get_upload_lock(repo_name: str) -> asyncio.Lock:
     return _upload_locks[repo_name]
 
 
+def _escape_css_identifier(value: str) -> str:
+    return _re.sub(r"([.#\[\]:>+~(){}|^$*!])", r"\\\1", value)
+
+
+def _upload_feedback_target(repo_name: str) -> str:
+    css_name = _escape_css_identifier(repo_name)
+    return f"#upload-feedback-{css_name}"
+
+
+templates.env.globals["css_escape"] = _escape_css_identifier
+templates.env.globals["upload_feedback_target"] = _upload_feedback_target
+
+
+def _format_upload_message_lines(message: str) -> list[str]:
+    return [line for line in message.splitlines() if line.strip()]
+
+
+def _unique_filenames(filenames: list[str]) -> list[str]:
+    return list(dict.fromkeys(filenames))
+
+
+def _task_upload_summary(task_filenames: list[str]) -> str:
+    if not task_filenames:
+        return ""
+
+    def _sort_key(filename: str) -> tuple[int, int | str]:
+        match = _re.fullmatch(r"PR-(\d+)\.md", filename)
+        if match:
+            return (0, int(match.group(1)))
+        return (1, filename)
+
+    ordered = sorted(task_filenames, key=_sort_key)
+    labels = [filename.removesuffix(".md") for filename in ordered]
+    if len(labels) == 1:
+        return labels[0]
+    pr_numbers: list[int] = []
+    for filename in ordered:
+        match = _re.fullmatch(r"PR-(\d+)\.md", filename)
+        if not match:
+            return ", ".join(labels)
+        pr_numbers.append(int(match.group(1)))
+
+    if all(
+        current == previous + 1
+        for previous, current in zip(pr_numbers, pr_numbers[1:], strict=False)
+    ):
+        return f"{labels[0]} through {labels[-1]}"
+    return ", ".join(labels)
+
+
+def _build_upload_success_message(filenames: list[str]) -> str:
+    task_filenames = _unique_filenames(
+        [
+            filename for filename in filenames if _re.fullmatch(_TASK_UPLOAD_PATTERN, filename)
+        ]
+    )
+    helper_filenames = _unique_filenames(
+        [
+            filename for filename in filenames if not _re.fullmatch(_TASK_UPLOAD_PATTERN, filename)
+        ]
+    )
+
+    task_count = len(task_filenames)
+    noun = "file" if task_count == 1 else "files"
+    summary = _task_upload_summary(task_filenames)
+    if summary:
+        lines = [f"Accepted {task_count} task {noun} ({summary})."]
+    else:
+        lines = [f"Accepted {task_count} task {noun}."]
+
+    if helper_filenames:
+        helper_noun = "file" if len(helper_filenames) == 1 else "files"
+        lines.append(
+            f"Also uploaded helper {helper_noun}: {', '.join(sorted(helper_filenames))}."
+        )
+    lines.append("Daemon will commit and push after the next polling cycle.")
+    lines.append("Auto-dismissing in 30 seconds.")
+    return "\n".join(lines)
+
+
 def _render_upload_error(
     request: Request, message: str, status_code: int, repo_name: str = ""
 ) -> HTMLResponse:
     response = templates.TemplateResponse(
         request,
         "components/upload_error.html",
-        {"message": message},
+        {"message": message, "message_lines": _format_upload_message_lines(message)},
         status_code=status_code,
     )
     if repo_name:
-        css_name = _re.sub(r"([.#\[\]:>+~(){}|^$*!])", r"\\\1", repo_name)
-        response.headers["HX-Retarget"] = f"#upload-error-{css_name}"
+        response.headers["HX-Retarget"] = _upload_feedback_target(repo_name)
         response.headers["HX-Reswap"] = "innerHTML"
     return response
 
@@ -1947,10 +2026,9 @@ def _render_upload_success(
     response = templates.TemplateResponse(
         request,
         "components/upload_success.html",
-        {"message": message},
+        {"message": message, "message_lines": _format_upload_message_lines(message)},
     )
-    css_name = _re.sub(r"([.#\[\]:>+~(){}|^$*!])", r"\\\1", repo_name)
-    response.headers["HX-Retarget"] = f"#upload-error-{css_name}"
+    response.headers["HX-Retarget"] = _upload_feedback_target(repo_name)
     response.headers["HX-Reswap"] = "innerHTML"
     return response
 
@@ -2196,14 +2274,14 @@ async def upload_tasks(
                 if any("missing Depends on" in issue for issue in issues):
                     return _render_upload_error(
                         request,
-                        "Task file missing required field: Depends on. "
+                        f"Task file validation failed: {fname}: missing Depends on field.\n"
                         "Use 'Depends on: none' for tasks with no dependencies.",
                         400,
                         repo_name=name,
                     )
                 return _render_upload_error(
                     request,
-                    "\n".join(issues),
+                    "Task file validation failed:\n" + "\n".join(issues),
                     400,
                     repo_name=name,
                 )
@@ -2244,7 +2322,8 @@ async def upload_tasks(
             for fname, content in file_contents:
                 await asyncio.to_thread((staging_dir / fname).write_bytes, content)
 
-            new_files = [fn for fn, _ in file_contents]
+            uploaded_filenames = [fn for fn, _ in file_contents]
+            manifest_filenames = list(uploaded_filenames)
             pending_key = f"upload:{name}:pending"
             try:
                 existing_raw = await redis_client.get(pending_key)
@@ -2256,19 +2335,19 @@ async def upload_tasks(
                     existing = _json.loads(existing_raw)
                     old_staging = Path(existing["staging_dir"])
                     for old_fn in existing.get("files", []):
-                        if old_fn not in new_files and (old_staging / old_fn).is_file():
+                        if old_fn not in manifest_filenames and (old_staging / old_fn).is_file():
                             await asyncio.to_thread(
                                 shutil.copy2,
                                 str(old_staging / old_fn),
                                 str(staging_dir / old_fn),
                             )
-                            new_files.append(old_fn)
+                            manifest_filenames.append(old_fn)
                 except Exception:
                     pass
 
             manifest = {
                 "repo": name,
-                "files": new_files,
+                "files": manifest_filenames,
                 "staging_dir": str(staging_dir),
             }
             try:
@@ -2292,6 +2371,6 @@ async def upload_tasks(
 
     return _render_upload_success(
         request,
-        "Tasks queued. The daemon will commit and push on its next cycle.",
+        _build_upload_success_message(uploaded_filenames),
         repo_name=name,
     )

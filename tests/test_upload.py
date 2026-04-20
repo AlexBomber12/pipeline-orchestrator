@@ -94,12 +94,13 @@ def _task_file(
     *,
     pr_id: str = "PR-001",
     depends_on: str | None = "none",
+    task_type: str = "feature",
 ) -> tuple[str, tuple[str, bytes, str]]:
     header = [
         f"# {pr_id}: Example task",
         "",
         f"Branch: {pr_id.lower()}-example-task",
-        "- Type: feature",
+        f"- Type: {task_type}",
         "- Complexity: low",
     ]
     if depends_on is not None:
@@ -116,6 +117,18 @@ def _zip_file(
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         for entry_name, content in entries.items():
+            archive.writestr(entry_name, content)
+    return ("files", (name, buffer.getvalue(), "application/zip"))
+
+
+def _zip_file_entries(
+    entries: list[tuple[str, bytes]],
+    *,
+    name: str = "tasks.zip",
+) -> tuple[str, tuple[str, bytes, str]]:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for entry_name, content in entries:
             archive.writestr(entry_name, content)
     return ("files", (name, buffer.getvalue(), "application/zip"))
 
@@ -290,7 +303,9 @@ def test_upload_without_queue_md(
             files=[_task_file()],
         )
     assert resp.status_code == 200
-    assert "queued" in resp.text.lower()
+    assert "Accepted 1 task file (PR-001)." in resp.text
+    assert "Daemon will commit and push after the next polling cycle." in resp.text
+    assert "Auto-dismissing in 30 seconds." in resp.text
 
     repo_upload_dir = uploads_dir / "example__alpha"
     subdirs = list(repo_upload_dir.iterdir())
@@ -372,7 +387,11 @@ def test_upload_stages_files_and_sets_redis_key(
         )
 
     assert resp.status_code == 200
-    assert "queued" in resp.text.lower()
+    assert "Accepted 1 task file (PR-001)." in resp.text
+    assert "Also uploaded helper file: QUEUE.md." in resp.text
+    assert resp.headers["HX-Retarget"] == "#upload-feedback-example__alpha"
+    assert "Dismiss upload feedback" in resp.text
+    assert "::load" in resp.text
 
     repo_upload_dir = uploads_dir / "example__alpha"
     subdirs = list(repo_upload_dir.iterdir())
@@ -388,13 +407,75 @@ def test_upload_zip_with_pr_files_extracts_and_succeeds(
 ) -> None:
     resp = _post_upload([_zip_file({"PR-001.md": _task_bytes(), "PR-002.md": _task_bytes("PR-002.md", pr_id="PR-002")})])  # noqa: E501
     assert resp.status_code == 200
+    assert "Accepted 2 task files (PR-001 through PR-002)." in resp.text
     staging = next((uploads_dir / "example__alpha").iterdir())
     assert {path.name for path in staging.iterdir()} == {"PR-001.md", "PR-002.md"}
+
+
+def test_upload_zip_with_sparse_pr_files_lists_explicit_ids(
+    one_repo_config: Path, repo_dir: Path, uploads_dir: Path
+) -> None:
+    resp = _post_upload(
+        [
+            _zip_file(
+                {
+                    "PR-124.md": _task_bytes("PR-124.md", pr_id="PR-124"),
+                    "PR-141.md": _task_bytes("PR-141.md", pr_id="PR-141"),
+                }
+            )
+        ]
+    )
+    assert resp.status_code == 200
+    assert "Accepted 2 task files (PR-124, PR-141)." in resp.text
+
+
+def test_upload_single_file_zip_success_message(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    resp = _post_upload([_zip_file({"PR-001.md": _task_bytes()})])
+
+    assert resp.status_code == 200
+    assert "Accepted 1 task file (PR-001)." in resp.text
+
+
+def test_upload_zip_with_duplicate_task_entries_reports_unique_task_count(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    resp = _post_upload(
+        [
+            _zip_file_entries(
+                [
+                    ("PR-001.md", _task_bytes()),
+                    ("PR-001.md", _task_bytes()),
+                ]
+            )
+        ]
+    )
+
+    assert resp.status_code == 200
+    assert "Accepted 1 task file (PR-001)." in resp.text
+    staging = next((uploads_dir / "example__alpha").iterdir())
+    assert [path.name for path in staging.iterdir()] == ["PR-001.md"]
 
 
 test_upload_zip_with_nested_directories_rejected = _make_zip_error_test([_zip_file({"nested/PR-001.md": _task_bytes()})], 422, "path separators")  # noqa: E501
 test_upload_zip_with_non_md_entries_rejected = _make_zip_error_test([_zip_file({"README.md": b"# nope\n"})], 422, "Invalid file name")  # noqa: E501
 test_upload_zip_corrupt_returns_400 = _make_zip_error_test([("files", ("broken.zip", b"not-a-zip", "application/zip"))], 400, "corrupt or unreadable")  # noqa: E501
+
+
+def test_task_upload_summary_lists_non_numeric_ids_explicitly() -> None:
+    assert web_app._task_upload_summary(["PR-ABC.md", "PR-XYZ.md"]) == "PR-ABC, PR-XYZ"
+
+
+def test_task_upload_summary_lists_sparse_numeric_ids_without_range_allocation() -> None:
+    assert (
+        web_app._task_upload_summary(["PR-1.md", "PR-1000000000.md"])
+        == "PR-1, PR-1000000000"
+    )
 
 
 def test_upload_zip_entry_read_error_returns_400(
@@ -630,8 +711,9 @@ def test_upload_rejects_task_without_depends_on(
         )
 
     assert resp.status_code == 400
-    assert "Task file missing required field: Depends on." in resp.text
+    assert "Task file validation failed: PR-001.md: missing Depends on field." in resp.text
     assert "Depends on: none" in resp.text
+    assert "after-settle" not in resp.text
 
 
 def test_upload_rejects_non_numeric_task_without_depends_on(
@@ -649,7 +731,7 @@ def test_upload_rejects_non_numeric_task_without_depends_on(
         )
 
     assert resp.status_code == 400
-    assert "Task file missing required field: Depends on." in resp.text
+    assert "Task file validation failed: PR-ABC.md: missing Depends on field." in resp.text
     assert "Depends on: none" in resp.text
 
 
@@ -686,8 +768,28 @@ def test_upload_task_validation_errors_reference_uploaded_filename(
         )
 
     assert resp.status_code == 400
+    assert "Task file validation failed:" in resp.text
     assert "PR-ABC.md: invalid Depends on" in resp.text
     assert "/tmp/" not in resp.text
+
+
+def test_upload_surfaces_invalid_type_details(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_queue_file(), _task_file(task_type="chore")],
+        )
+
+    assert resp.status_code == 400
+    assert "Task file validation failed:" in resp.text
+    assert "PR-001.md: invalid Type" in resp.text
+    assert "chore" in resp.text
+    assert "expected one of" in resp.text
+    assert "Dismiss upload error" in resp.text
 
 
 def test_upload_accepts_task_with_depends_on_none(
@@ -718,6 +820,24 @@ def test_upload_accepts_task_with_dependencies(
     assert resp.status_code == 200
 
 
+def test_upload_success_message_handles_non_numeric_pr_ids(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[
+                _queue_file(),
+                _task_file(name="PR-ABC.md", pr_id="PR-ABC", depends_on="none"),
+            ],
+        )
+
+    assert resp.status_code == 200
+    assert "Accepted 1 task file (PR-ABC)." in resp.text
+
+
 def test_upload_allows_non_task_files_without_validation(
     one_repo_config: Path,
     repo_dir: Path,
@@ -733,6 +853,8 @@ def test_upload_allows_non_task_files_without_validation(
         )
 
     assert resp.status_code == 200
+    assert "Accepted 0 task files." in resp.text
+    assert "Also uploaded helper files: AGENTS.md, QUEUE.md." in resp.text
 
 
 def test_upload_writes_redis_manifest(
@@ -911,6 +1033,9 @@ def test_upload_merge_pending_manifest_and_ignore_scan_errors(
     assert (Path(manifest["staging_dir"]) / "AGENTS.md").read_text(
         encoding="utf-8"
     ) == "# AGENTS\n"
+    assert "Accepted 0 task files." in resp.text
+    assert "Also uploaded helper file: QUEUE.md." in resp.text
+    assert "AGENTS.md" not in resp.text
 
 
 def test_upload_ignores_pending_manifest_read_errors(
