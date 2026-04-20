@@ -336,7 +336,7 @@
 - Branch: pr-129-coder-neutral-labels
 
 ## PR-130: Deduplicate consecutive identical events in the event log
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-130.md
 - Branch: pr-130-event-log-dedup
 
