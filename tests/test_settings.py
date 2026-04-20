@@ -1380,36 +1380,57 @@ def test_put_repo_rejects_invalid_coder_value(one_repo_config: Path) -> None:
 
 
 def test_settings_daemon_renders_with_group_headers(empty_config: Path) -> None:
-    """Settings page must show the four logical group headers."""
+    """Settings page must show the reorganized daemon section headers."""
     with TestClient(app) as client:
         response = client.get("/settings")
 
     assert response.status_code == 200
     body = response.text
-    for header in ("Timing", "Review handling", "Rate limits", "Error recovery"):
+    for header in ("Timeouts", "Rate Limits", "Self-Heal", "Coders"):
         assert header in body, f"Missing group header: {header}"
 
 
 def test_settings_daemon_renders_hints_for_all_fields(empty_config: Path) -> None:
-    """Every daemon field must have a non-empty hint below the input."""
+    """Every daemon field must keep a single concise hint after regrouping."""
     with TestClient(app) as client:
         response = client.get("/partials/settings/daemon")
 
     assert response.status_code == 200
     body = response.text
-    # Each field should have at least one hint (text-xs text-gray-500) nearby.
-    hints = [
-        "How often the daemon checks each repo",
-        "Max time the coder gets before being killed",
-        "Codex doesn't review in time",
-        "Kills the coder during FIX if no push",
-        "re-ping Codex on the anchor comment",
-        "session usage exceeds this threshold",
-        "run until API returns 429",
-        "analyze failures before falling back",
+    field_names = [
+        "poll_interval_sec",
+        "planned_pr_timeout_sec",
+        "fix_idle_timeout_sec",
+        "review_timeout_min",
+        "rate_limit_session_pause_percent",
+        "rate_limit_weekly_pause_percent",
+        "auto_fallback",
+        "hung_fallback_codex_review",
+        "error_handler_use_ai",
+        "exploration_epsilon",
     ]
-    for hint_fragment in hints:
-        assert hint_fragment in body, f"Missing hint: {hint_fragment}"
+    for field_name in field_names:
+        assert f'name="{field_name}"' in body, f"Missing field: {field_name}"
+
+    hints = [
+        "Seconds between daemon checks across configured repositories.",
+        "Seconds before the coder subprocess is killed if no activity.",
+        "FIX time budget, reset on each successful push.",
+        "Minutes to wait for review before the PR moves to HUNG.",
+        "Pause when 5-hour session usage reaches this percentage.",
+        "Set to 100 to keep running until the provider returns a rate-limit response.",
+        "Switch to another eligible coder when the preferred one is unavailable.",
+        "Re-post the review trigger when a PR times out waiting for Codex.",
+        "Use the coder to diagnose ERROR before generic recovery kicks in.",
+        "Chance from 0 to 0.5 to try a different eligible coder for comparison data.",
+    ]
+    for hint_text in hints:
+        assert hint_text in body, f"Missing hint: {hint_text}"
+
+    assert "Kills the coder during FIX if no push. Resets on each push." not in body
+    assert "When the preferred coder is unavailable, let the selector pick another eligible coder." not in body
+    assert "If Codex doesn't review in time, PR flips to HUNG." not in body
+    assert "Probability 0-0.5 that selector picks a non-top eligible coder" not in body
 
 
 def test_settings_repo_list_shows_default_placeholder(
