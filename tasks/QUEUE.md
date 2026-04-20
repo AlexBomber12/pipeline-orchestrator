@@ -369,7 +369,6 @@
 - Status: TODO
 - Tasks file: tasks/PR-136.md
 - Branch: pr-136-progress-bar-sse
-- Depends on: PR-135
 
 ## PR-137: Settings page logical grouping and one-line hints
 - Status: TODO
