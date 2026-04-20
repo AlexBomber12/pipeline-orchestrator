@@ -2119,11 +2119,68 @@ def test_handle_coding_honors_persisted_pause_after_fast_cli_exit(
 
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.state == PipelineState.ERROR
     assert runner.state.user_paused is True
-    assert runner.state.error_message is None
+    assert runner.state.error_message == "coder failed fast"
     assert any(
-        "honoring latest pause state" in entry["event"].lower()
+        "finishing current run before honoring pause" in entry["event"].lower()
+        for entry in runner.state.history
+    )
+
+
+def test_handle_coding_finishes_success_path_when_pause_persists_during_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        _async_cli_result(0, "ok", ""),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [
+            PRInfo(number=127, branch="pr-127-control-endpoints-backend")
+        ],
+    )
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-127",
+        title="Pause controls",
+        status=TaskStatus.DOING,
+        branch="pr-127-control-endpoints-backend",
+    )
+    runner.redis.store[f"pipeline:{runner.name}"] = RepoState(
+        url=runner.repo_config.url,
+        name=runner.name,
+        state=PipelineState.CODING,
+        user_paused=True,
+    ).model_dump_json()
+
+    async def stale_stop_monitor(
+        _cli_task: asyncio.Task[tuple[int, str, str]],
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_monitor_stop_request", stale_stop_monitor)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.user_paused is True
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 127
+    assert posted == [(runner.owner_repo, 127, "@codex review")]
+    assert any(
+        "finishing current run before honoring pause" in entry["event"].lower()
         for entry in runner.state.history
     )
 
