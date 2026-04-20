@@ -11754,7 +11754,7 @@ def test_run_cycle_marks_recovery_complete_and_returns(
     assert publishes == ["published"]
 
 
-def test_run_cycle_skips_recovery_while_user_paused(
+def test_run_cycle_runs_recovery_before_honoring_user_pause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     publishes: list[str] = []
@@ -11792,15 +11792,14 @@ def test_run_cycle_skips_recovery_while_user_paused(
 
     asyncio.run(runner.run_cycle())
 
-    assert recovery_calls == []
+    assert recovery_calls == ["recover"]
     assert preflight_calls == []
     assert publishes == ["published"]
-    assert runner._recovered is False
-    assert sum(
-        1
+    assert runner._recovered is True
+    assert not any(
+        entry["event"] == "Paused by user, not picking up new tasks"
         for entry in runner.state.history
-        if entry["event"] == "Paused by user, not picking up new tasks"
-    ) == 1
+    )
 
 
 def test_run_cycle_returns_after_preflight_failure(

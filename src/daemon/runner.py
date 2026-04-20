@@ -644,13 +644,6 @@ class PipelineRunner(
         await self._refresh_user_paused_from_redis()
         if not self.state.user_paused:
             self._user_pause_logged = False
-        if self.state.state == PipelineState.IDLE and self.state.user_paused:
-            if not self._user_pause_logged:
-                self.log_event("Paused by user, not picking up new tasks")
-                self._user_pause_logged = True
-            await self.publish_state()
-            return
-
         if not self._recovered:
             recovery_complete = await self.recover_state()
             if not recovery_complete:
@@ -680,6 +673,13 @@ class PipelineRunner(
                 await self.publish_state()
                 return
             self._recovered = True
+            await self.publish_state()
+            return
+
+        if self.state.state == PipelineState.IDLE and self.state.user_paused:
+            if not self._user_pause_logged:
+                self.log_event("Paused by user, not picking up new tasks")
+                self._user_pause_logged = True
             await self.publish_state()
             return
 
