@@ -75,6 +75,7 @@ class RepoState(BaseModel):
     url: str
     name: str
     state: PipelineState = PipelineState.IDLE
+    user_paused: bool = False
     current_task: QueueTask | None = None
     current_pr: PRInfo | None = None
     error_message: str | None = None

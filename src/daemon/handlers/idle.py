@@ -378,6 +378,8 @@ class IdleMixin:
     async def handle_idle(self) -> None:
         """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
         self._error_diagnose_count = 0
+        if self.state.user_paused:
+            return
         if self.state.pending_queue_sync_branch is not None:
             if not self._resolve_pending_queue_sync():
                 return
@@ -624,6 +626,14 @@ class IdleMixin:
                 await self.publish_state()
                 return
 
+        await self._refresh_user_paused_from_redis()
+        if self.state.user_paused:
+            self.state.current_task = None
+            self.log_event(
+                f"Pause requested while preparing {task.pr_id}; deferring CODING"
+            )
+            return
+
         self.state.state = PipelineState.CODING
         self.log_event(f"Picked task {task.pr_id}: {task.title}")
         await self.publish_state()
@@ -631,6 +641,11 @@ class IdleMixin:
 
     async def handle_paused(self) -> None:
         """Wait for rate limit window to expire, then resume previous flow."""
+        if self.state.user_paused:
+            if not getattr(self, "_user_pause_logged", False):
+                self.log_event("Paused by user, not picking up new tasks")
+                self._user_pause_logged = True
+            return
         if self.state.rate_limited_until is None:
             self.log_event("PAUSED without rate_limited_until -> IDLE")
             self.state.state = PipelineState.IDLE

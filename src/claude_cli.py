@@ -11,6 +11,7 @@ import logging
 import os
 import subprocess
 import uuid
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +138,7 @@ async def run_claude_async(
     timeout: int | None = 600,
     model: str | None = None,
     system_prompt_file: str | None = "CLAUDE.md",
+    on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
     breach_dir: str | None = None,
     breach_run_id: str | None = None,
     session_threshold: int | None = None,
@@ -176,6 +178,8 @@ async def run_claude_async(
             stdin=asyncio.subprocess.DEVNULL,
             env=env,
         )
+        if on_process_start is not None:
+            on_process_start(proc)
 
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             proc.communicate(), timeout=timeout
@@ -213,42 +217,46 @@ async def run_planned_pr_async(
     repo_path: str,
     model: str | None = None,
     timeout: int = 900,
+    on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
     breach_dir: str | None = None,
     breach_run_id: str | None = None,
     session_threshold: int | None = None,
     weekly_threshold: int | None = None,
 ) -> tuple[int, str, str]:
-    return await run_claude_async(
-        "PLANNED PR",
-        repo_path,
-        timeout=timeout,
-        model=model,
-        breach_dir=breach_dir,
-        breach_run_id=breach_run_id,
-        session_threshold=session_threshold,
-        weekly_threshold=weekly_threshold,
-    )
+    kwargs: dict[str, object] = {
+        "timeout": timeout,
+        "model": model,
+        "breach_dir": breach_dir,
+        "breach_run_id": breach_run_id,
+        "session_threshold": session_threshold,
+        "weekly_threshold": weekly_threshold,
+    }
+    if on_process_start is not None:
+        kwargs["on_process_start"] = on_process_start
+    return await run_claude_async("PLANNED PR", repo_path, **kwargs)
 
 
 async def fix_review_async(
     repo_path: str,
     model: str | None = None,
     timeout: int | None = None,
+    on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
     breach_dir: str | None = None,
     breach_run_id: str | None = None,
     session_threshold: int | None = None,
     weekly_threshold: int | None = None,
 ) -> tuple[int, str, str]:
-    return await run_claude_async(
-        "FIX REVIEW",
-        repo_path,
-        timeout=timeout,
-        model=model,
-        breach_dir=breach_dir,
-        breach_run_id=breach_run_id,
-        session_threshold=session_threshold,
-        weekly_threshold=weekly_threshold,
-    )
+    kwargs: dict[str, object] = {
+        "timeout": timeout,
+        "model": model,
+        "breach_dir": breach_dir,
+        "breach_run_id": breach_run_id,
+        "session_threshold": session_threshold,
+        "weekly_threshold": weekly_threshold,
+    }
+    if on_process_start is not None:
+        kwargs["on_process_start"] = on_process_start
+    return await run_claude_async("FIX REVIEW", repo_path, **kwargs)
 
 
 async def diagnose_error_async(

@@ -28,6 +28,7 @@ import subprocess
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import redis.asyncio as aioredis
 
@@ -66,6 +67,8 @@ _TRANSIENT_STATES = {
 }
 
 _HISTORY_LIMIT = 100
+_STOP_WAIT_TIMEOUT_SEC = 5
+_STOP_POLL_INTERVAL_SEC = 0.5
 
 # Timeout for ``scripts/ci.sh`` on the auto-commit path.
 _CI_SCRIPT_TIMEOUT_SEC = 1800
@@ -206,6 +209,9 @@ class PipelineRunner(
         self._selector_rng = random.Random()
         self._auth_status_cache: dict[str, dict[str, str]] = {}
         self._auth_status_cache_expires_at: datetime | None = None
+        self._current_coder_process: asyncio.subprocess.Process | None = None
+        self._stop_requested = False
+        self._user_pause_logged = False
 
     @property
     def app_config(self) -> AppConfig:
@@ -460,10 +466,80 @@ class PipelineRunner(
             self._apply_diff_stats(record, stats, resolved_base_branch)
         await self._metrics_store.save(record)
 
+    def _track_current_coder_process(
+        self, proc: asyncio.subprocess.Process
+    ) -> None:
+        """Remember the active coder subprocess for user-triggered stop."""
+        self._current_coder_process = proc
+
+    async def _refresh_user_paused_from_redis(self) -> None:
+        """Merge the persisted ``user_paused`` flag into in-memory state."""
+        try:
+            raw = await self.redis.get(f"pipeline:{self.name}")
+        except Exception:
+            return
+        if not raw:
+            return
+        try:
+            persisted = RepoState.model_validate_json(raw)
+        except Exception:
+            return
+        self.state.user_paused = persisted.user_paused
+
+    async def _pop_stop_request(self) -> bool:
+        """Return True when a pending stop control signal exists."""
+        key = f"control:{self.name}:stop"
+        try:
+            raw = await self.redis.get(key)
+        except Exception:
+            return False
+        if not raw:
+            return False
+        try:
+            await self.redis.delete(key)
+        except Exception:
+            pass
+        return True
+
+    async def _terminate_current_coder(self) -> None:
+        """Terminate the active coder subprocess with TERM then KILL."""
+        proc = self._current_coder_process
+        if proc is None or proc.returncode is not None:
+            self._current_coder_process = None
+            return
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            self._current_coder_process = None
+            return
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_STOP_WAIT_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+        finally:
+            self._current_coder_process = None
+
+    async def _monitor_stop_request(
+        self, cli_task: asyncio.Task[tuple[int, str, str]]
+    ) -> None:
+        """Watch Redis for user stop commands while CODING is active."""
+        while not cli_task.done():
+            if await self._pop_stop_request():
+                self._stop_requested = True
+                self.state.user_paused = True
+                self.log_event("User stop requested; terminating current coder")
+                await self._terminate_current_coder()
+                cli_task.cancel()
+                return
+            await asyncio.sleep(_STOP_POLL_INTERVAL_SEC)
+
     async def publish_state(self) -> None:
         """Serialize ``self.state`` and write it to Redis."""
         self.state.active = self.repo_config.active
-        self.state.last_updated = datetime.now(timezone.utc)
         configured_coder = self.repo_config.coder or self.app_config.daemon.coder
         active_coder = self.state.coder or configured_coder.value
         self.state.coder = active_coder
@@ -485,13 +561,35 @@ class PipelineRunner(
                 self.state.usage_weekly_percent = None
                 self.state.usage_weekly_resets_at = None
             self.state.usage_api_degraded = provider.consecutive_failures >= 10
-        if not self.repo_config.active:
-            data = self.state.model_dump()
-            data["state"] = PipelineState.IDLE.value
-            payload = RepoState(**data).model_dump_json()
+        self.state.last_updated = datetime.now(timezone.utc)
+        state_key = f"pipeline:{self.name}"
+
+        async def _serialize_latest_state() -> str:
+            await self._refresh_user_paused_from_redis()
+            if not self.repo_config.active:
+                data = self.state.model_dump()
+                data["state"] = PipelineState.IDLE.value
+                return RepoState(**data).model_dump_json()
+            return self.state.model_dump_json()
+
+        if hasattr(self.redis, "transaction"):
+            async def _transaction(pipe: Any) -> None:
+                raw = await pipe.get(state_key)
+                if raw:
+                    try:
+                        persisted = RepoState.model_validate_json(raw)
+                    except Exception:
+                        pass
+                    else:
+                        self.state.user_paused = persisted.user_paused
+                payload = await _serialize_latest_state()
+                pipe.multi()
+                pipe.set(state_key, payload)
+
+            await self.redis.transaction(_transaction, state_key)
         else:
-            payload = self.state.model_dump_json()
-        await self.redis.set(f"pipeline:{self.name}", payload)
+            payload = await _serialize_latest_state()
+            await self.redis.set(state_key, payload)
         if self._old_basename != self.name:
             try:
                 old_key = f"pipeline:{self._old_basename}"
@@ -564,6 +662,9 @@ class PipelineRunner(
             await self.publish_state()
             return
 
+        await self._refresh_user_paused_from_redis()
+        if not self.state.user_paused:
+            self._user_pause_logged = False
         if not self._recovered:
             recovery_complete = await self.recover_state()
             if not recovery_complete:
@@ -596,6 +697,16 @@ class PipelineRunner(
             await self.publish_state()
             return
 
+        if (
+            self.state.user_paused
+            and self.state.state in (PipelineState.IDLE, PipelineState.PAUSED)
+        ):
+            if not self._user_pause_logged:
+                self.log_event("Paused by user, not picking up new tasks")
+                self._user_pause_logged = True
+            await self.publish_state()
+            return
+
         if not self.preflight():
             await self.publish_state()
             return
@@ -605,6 +716,16 @@ class PipelineRunner(
                 f"resetting stale transient state {self.state.state.value} -> IDLE"
             )
             self.state.state = PipelineState.IDLE
+
+        if self.state.state == PipelineState.IDLE:
+            await self._refresh_user_paused_from_redis()
+            if self.state.user_paused:
+                if not self._user_pause_logged:
+                    self.log_event("Paused by user, not picking up new tasks")
+                    self._user_pause_logged = True
+                await self.publish_state()
+                return
+            self._user_pause_logged = False
 
         current = self.state.state
         if current == PipelineState.IDLE:

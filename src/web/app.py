@@ -20,11 +20,11 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from src.coders import build_coder_registry
@@ -133,6 +133,82 @@ def _find_repo_config_by_name(
     for repo in config.repositories:
         if repo_slug_from_url(repo.url) == name:
             return repo
+    return None
+
+
+class _RepoStateMutationError(Exception):
+    """Sentinel for control-plane mutations that should become HTTP responses."""
+
+    def __init__(self, message: str, status_code: int = 503) -> None:
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
+async def _apply_repo_control_update(
+    request: Request,
+    name: str,
+) -> tuple[aioredis.Redis, str, str]:
+    """Return the Redis client plus the pipeline state key for ``name``."""
+    cfg = load_config(CONFIG_PATH)
+    repo = _find_repo_config_by_name(cfg, name)
+    if repo is None:
+        raise _RepoStateMutationError("Repository not found", status_code=404)
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        raise _RepoStateMutationError("Redis unavailable", status_code=503)
+    return redis_client, f"pipeline:{name}", repo.url
+
+
+async def _update_repo_pause_state(
+    request: Request,
+    name: str,
+    *,
+    user_paused: bool,
+    stop_action: Literal["leave", "clear", "set"] = "leave",
+) -> Response | None:
+    """Atomically update ``user_paused`` and any stop-signal side effect."""
+
+    try:
+        redis_client, state_key, repo_url = await _apply_repo_control_update(
+            request, name
+        )
+    except _RepoStateMutationError as exc:
+        return HTMLResponse(exc.message, status_code=exc.status_code)
+
+    stop_key = f"control:{name}:stop"
+    watch_keys: tuple[str, ...] = (state_key, stop_key) if stop_action != "leave" else (state_key,)
+    failure_message = {
+        "leave": "Failed to update repository state",
+        "clear": "Failed to clear stop request",
+        "set": "Failed to queue stop request",
+    }[stop_action]
+
+    try:
+        async def _transaction(pipe: Any) -> None:
+            raw = await pipe.get(state_key)
+            if raw is None:
+                state = _default_repo_state(name, repo_url)
+            else:
+                try:
+                    state = RepoState.model_validate_json(raw)
+                except Exception as exc:
+                    raise _RepoStateMutationError("Repository state unavailable") from exc
+
+            state.user_paused = user_paused
+
+            pipe.multi()
+            pipe.set(state_key, state.model_dump_json())
+            if stop_action == "clear":
+                pipe.delete(stop_key)
+            elif stop_action == "set":
+                pipe.set(stop_key, "1", ex=60)
+
+        await redis_client.transaction(_transaction, *watch_keys)
+    except _RepoStateMutationError as exc:
+        return HTMLResponse(exc.message, status_code=exc.status_code)
+    except Exception:
+        return HTMLResponse(failure_message, status_code=503)
     return None
 
 
@@ -846,6 +922,40 @@ async def repo_detail(request: Request, name: str) -> HTMLResponse:
             "events": list(context["repo"].history),
         },
     )
+
+
+@app.post("/repos/{name}/pause")
+async def pause_repo(request: Request, name: str) -> Response:
+    failure = await _update_repo_pause_state(request, name, user_paused=True)
+    if failure is not None:
+        return failure
+    return JSONResponse({"ok": True, "user_paused": True})
+
+
+@app.post("/repos/{name}/resume")
+async def resume_repo(request: Request, name: str) -> Response:
+    failure = await _update_repo_pause_state(
+        request,
+        name,
+        user_paused=False,
+        stop_action="clear",
+    )
+    if failure is not None:
+        return failure
+    return JSONResponse({"ok": True, "user_paused": False})
+
+
+@app.post("/repos/{name}/stop")
+async def stop_repo(request: Request, name: str) -> Response:
+    failure = await _update_repo_pause_state(
+        request,
+        name,
+        user_paused=True,
+        stop_action="set",
+    )
+    if failure is not None:
+        return failure
+    return JSONResponse({"ok": True, "user_paused": True})
 
 
 @app.get("/repo/{name}/metrics")

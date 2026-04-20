@@ -123,6 +123,26 @@ class RecoveryMixin:
                 )
                 return True
 
+            if self.state.user_paused:
+                if doing.branch and not self._preserve_crashed_run_commits(
+                    doing.branch
+                ):
+                    self.state.state = PipelineState.ERROR
+                    self.state.error_message = (
+                        f"recover_state: could not preserve crashed-run "
+                        f"commits on {doing.branch!r}; refusing to defer "
+                        "CODING while paused"
+                    )
+                    self.log_event(self.state.error_message)
+                    return True
+                self.state.current_pr = None
+                self.state.state = PipelineState.IDLE
+                self.log_event(
+                    f"Recovered: DOING task {doing.pr_id}, no PR "
+                    "but user_paused -> defer CODING until resume"
+                )
+                return True
+
             self.state.state = PipelineState.CODING
             self.log_event(
                 f"Recovered: DOING task {doing.pr_id}, no PR "

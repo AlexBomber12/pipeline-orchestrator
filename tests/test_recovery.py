@@ -254,6 +254,72 @@ def test_recover_doing_task_without_pr_rerun_coding(
     )
 
 
+def test_recover_paused_doing_task_without_pr_defers_coding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Paused recovery should discover the DOING task without restarting CODING."""
+    task = _doing_task()
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
+    )
+
+    coding_calls: list[str] = []
+
+    async def fake_coding() -> None:
+        coding_calls.append("coding")
+
+    preserved: list[str] = []
+
+    def fake_preserve(branch: str) -> bool:
+        preserved.append(branch)
+        return True
+
+    runner = _make_runner()
+    runner.state.user_paused = True
+    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner.handle_coding = fake_coding  # type: ignore[method-assign]
+    runner._preserve_crashed_run_commits = fake_preserve  # type: ignore[method-assign]
+
+    result = asyncio.run(runner.recover_state())
+
+    assert result is True
+    assert coding_calls == []
+    assert preserved == ["pr-042-inflight"]
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == "PR-042"
+    assert runner.state.current_pr is None
+    assert any(
+        "Recovered: DOING task PR-042, no PR but user_paused -> defer CODING until resume"
+        == e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_recover_paused_doing_task_without_pr_errors_when_preserve_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Paused recovery must still refuse to defer if crashed-run commits are unsafe."""
+    task = _doing_task()
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
+    )
+
+    runner = _make_runner()
+    runner.state.user_paused = True
+    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner._preserve_crashed_run_commits = lambda branch: False  # type: ignore[method-assign]
+
+    result = asyncio.run(runner.recover_state())
+
+    assert result is True
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == (
+        "recover_state: could not preserve crashed-run commits on "
+        "'pr-042-inflight'; refusing to defer CODING while paused"
+    )
+
+
 def test_recover_preserves_crashed_run_commits_before_coding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

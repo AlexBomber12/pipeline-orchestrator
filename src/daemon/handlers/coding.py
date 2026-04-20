@@ -25,6 +25,7 @@ class CodingMixin:
         for the PR; because the list API is eventually consistent, we
         retry a few times before surfacing an ERROR.
         """
+        self._stop_requested = False
         await self._refresh_auth_status_cache()
         coder_name, plugin = self._get_coder()
         model = (
@@ -58,6 +59,7 @@ class CodingMixin:
         coder_kwargs: dict[str, object] = {
             "model": model,
             "timeout": self.app_config.daemon.planned_pr_timeout_sec,
+            "on_process_start": self._track_current_coder_process,
         }
         if coder_name == "claude":
             coder_kwargs.update(
@@ -79,9 +81,16 @@ class CodingMixin:
                     breach_dir, breach_run_id, cli_task, breach_flag,
                 )
             )
+        stop_monitor = asyncio.create_task(self._monitor_stop_request(cli_task))
         try:
             code, stdout, stderr = await cli_task
         except asyncio.CancelledError:
+            if self._stop_requested:
+                self.state.state = PipelineState.PAUSED
+                self.state.error_message = None
+                await self._save_current_run_record("error")
+                self.log_event("CODING aborted: user stop requested")
+                return
             if not breach_flag["breached"]:
                 raise
             # Record the PR if Claude already created one before cancellation,
@@ -117,9 +126,11 @@ class CodingMixin:
             )
             return
         finally:
+            stop_monitor.cancel()
             if breach_monitor is not None:
                 breach_monitor.cancel()
             heartbeat.cancel()
+            self._current_coder_process = None
             if coder_name == "claude":
                 self._check_late_breach(breach_dir, breach_run_id, breach_flag)
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
@@ -156,7 +167,36 @@ class CodingMixin:
                 f"paused until {self.state.rate_limited_until}"
             )
             return
+
+        async def pause_for_stop_if_requested() -> bool:
+            if self._stop_requested:
+                requested = True
+            else:
+                requested = await self._pop_stop_request()
+                if requested:
+                    self._stop_requested = True
+                    self.state.user_paused = True
+                    self.log_event(
+                        "User stop requested after coder exit; honoring persisted stop"
+                    )
+            if not requested:
+                return False
+            self.state.state = PipelineState.PAUSED
+            self.state.error_message = None
+            await self._save_current_run_record("error")
+            self.log_event("CODING aborted: user stop requested")
+            return True
+
         await self._save_cli_log(stdout, stderr, f"PLANNED PR output [{coder_name}]")
+        if not await pause_for_stop_if_requested():
+            await self._refresh_user_paused_from_redis()
+            if self.state.user_paused:
+                self.log_event(
+                    "User pause persisted during coder exit; finishing current run "
+                    "before honoring pause"
+                )
+        if await pause_for_stop_if_requested():
+            return
         if code != 0:
             self._detect_rate_limit(stderr, coder_name=coder_name)
             if self.state.rate_limited_until is not None:
@@ -176,6 +216,8 @@ class CodingMixin:
 
         candidate = None
         for attempt in range(3):
+            if await pause_for_stop_if_requested():
+                return
             try:
                 prs = github_client.get_open_prs(
                     self.owner_repo,
@@ -199,6 +241,8 @@ class CodingMixin:
                 )
                 await asyncio.sleep(5)
 
+        if await pause_for_stop_if_requested():
+            return
         if candidate is None:
             self.state.state = PipelineState.ERROR
             self.state.error_message = (
