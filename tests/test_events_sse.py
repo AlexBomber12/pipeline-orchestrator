@@ -852,6 +852,30 @@ async def test_stream_repo_events_ignores_close_errors_after_subscribe_failure()
     assert pubsub.closed is True
 
 
+async def test_stream_repo_events_closes_pubsub_when_setup_is_cancelled() -> None:
+    redis = _FakeRedis()
+    request = _Request()
+    pubsub = _FakePubSub()
+
+    def _pubsub() -> _FakePubSub:
+        return pubsub
+
+    async def _cancelled_lrange(key: str, start: int, stop: int) -> list[str]:
+        raise asyncio.CancelledError()
+
+    redis.pubsub = _pubsub  # type: ignore[method-assign]
+    redis.lrange = _cancelled_lrange  # type: ignore[method-assign]
+
+    try:
+        await stream_repo_events(redis, "example__repo", request)
+    except asyncio.CancelledError:
+        pass
+    else:
+        raise AssertionError("stream setup should preserve cancellation")
+
+    assert pubsub.closed is True
+
+
 def test_api_repo_events_route_returns_sse_response(monkeypatch) -> None:
     redis = object()
     seen: dict[str, object] = {}

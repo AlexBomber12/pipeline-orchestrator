@@ -78,6 +78,14 @@ def _history_before_subscription(
     return replayable_history
 
 
+async def _close_pubsub(pubsub: Any) -> None:
+    """Best-effort close for setup and teardown cleanup paths."""
+    try:
+        await pubsub.aclose()
+    except RedisError:
+        pass
+
+
 async def _is_disconnected(request: Any) -> bool:
     checker = getattr(request, "is_disconnected", None)
     if checker is None:
@@ -104,13 +112,12 @@ async def stream_repo_events(
         await pubsub.subscribe(_channel_name(repo_name))
         subscribed_at = datetime.now(timezone.utc)
         history = await redis_client.lrange(_history_name(repo_name), 0, history_limit - 1)
-    except RedisError as exc:
+    except BaseException as exc:
         if pubsub is not None:
-            try:
-                await pubsub.aclose()
-            except RedisError:
-                pass
-        raise RepoEventsUnavailableError("Redis unavailable") from exc
+            await _close_pubsub(pubsub)
+        if isinstance(exc, RedisError):
+            raise RepoEventsUnavailableError("Redis unavailable") from exc
+        raise
 
     async def _stream() -> AsyncIterator[bytes]:
         try:
@@ -188,9 +195,6 @@ async def stream_repo_events(
             except RedisError:
                 pass
             finally:
-                try:
-                    await pubsub.aclose()
-                except RedisError:
-                    pass
+                await _close_pubsub(pubsub)
 
     return _stream()
