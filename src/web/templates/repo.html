@@ -4,7 +4,7 @@
 
 {% block content %}
 <div class="mb-6">
-    <a href="/" class="inline-flex items-center gap-2 text-sm text-accent hover:underline">
+    <a href="/" class="secondary-interactive inline-flex items-center gap-2 text-sm text-accent">
         <span aria-hidden="true">&larr;</span>
         <span>All repositories</span>
     </a>
@@ -21,7 +21,7 @@
 {% include "components/event_log.html" %}
 
 <details class="mt-4">
-    <summary class="text-sm text-gray-400 cursor-pointer hover:text-gray-200">
+    <summary class="secondary-interactive text-sm text-gray-400 cursor-pointer">
         Coder log
     </summary>
     <div hx-get="/partials/repo/{{ repo.name }}/cli-log"

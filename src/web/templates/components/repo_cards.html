@@ -69,7 +69,7 @@
                            onchange="this.form.requestSubmit()"
                            class="hidden" id="upload-{{ repo.name }}">
                     <label for="upload-{{ repo.name }}"
-                           class="text-xs font-medium px-2 py-0.5 rounded border border-white/10 text-gray-400 hover:text-accent hover:border-accent/30 transition-colors cursor-pointer">
+                           class="primary-interactive text-xs font-medium px-2 py-0.5 rounded border border-white/10 text-gray-400 cursor-pointer">
                         Upload tasks
                     </label>
                 </form>
@@ -115,7 +115,7 @@
         {% set ci = ci_styles.get(repo.current_pr.ci_status.value, ci_styles['PENDING']) %}
         {% set review_emoji = review_emojis.get(repo.current_pr.review_status.value, '') %}
         <div class="flex items-center gap-2 text-xs text-gray-400 mt-2 pt-2 border-t border-white/5">
-            <a href="{{ repo.current_pr.url }}" class="font-mono text-gray-300 hover:text-accent">#{{ repo.current_pr.number }}</a>
+            <a href="{{ repo.current_pr.url }}" class="secondary-interactive font-mono text-gray-300">#{{ repo.current_pr.number }}</a>
             <span class="w-2 h-2 rounded-full {{ ci.dot }} {% if ci.pulse %}pulse-dot{% endif %}"></span>
             <span>{{ ci.label }}</span>
             {% if review_emoji %}

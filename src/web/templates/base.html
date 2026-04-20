@@ -325,6 +325,26 @@
             border-color: var(--accent) !important;
         }
 
+        /* Shared hover treatments for interactive elements. */
+        .primary-interactive {
+            transition-property: color, background-color, border-color;
+            transition-duration: 150ms;
+            transition-timing-function: ease;
+        }
+
+        .primary-interactive:hover {
+            border-color: rgb(var(--accent-rgb) / 0.5) !important;
+            background-color: color-mix(in srgb, var(--text-0) 5%, transparent) !important;
+        }
+
+        .secondary-interactive {
+            transition: color 150ms ease;
+        }
+
+        .secondary-interactive:hover {
+            color: var(--accent) !important;
+        }
+
         @keyframes pulse-dot {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.3; }
@@ -356,17 +376,17 @@
             </div>
             <div class="flex items-center gap-6">
                 <a href="/"
-                   class="text-sm font-medium {% if title == 'Settings' %}text-gray-400 hover:text-gray-200{% else %}text-accent{% endif %}">
+                   class="text-sm font-medium secondary-interactive {% if title == 'Settings' %}text-gray-400{% else %}text-accent{% endif %}">
                     Dashboard
                 </a>
                 <a href="/settings"
-                   class="text-sm font-medium {% if title == 'Settings' %}text-accent{% else %}text-gray-400 hover:text-gray-200{% endif %}">
+                   class="text-sm font-medium secondary-interactive {% if title == 'Settings' %}text-accent{% else %}text-gray-400{% endif %}">
                     Settings
                 </a>
                 <button
                     id="theme-toggle"
                     type="button"
-                    class="inline-flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-surface-3/60 text-gray-300 transition hover:border-accent/40 hover:bg-accent/10 hover:text-accent"
+                    class="secondary-interactive inline-flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-surface-3/60 text-gray-300"
                     aria-label="Switch to light theme"
                     title="Toggle theme">
                     <span id="theme-icon-dark" aria-hidden="true">☾</span>
