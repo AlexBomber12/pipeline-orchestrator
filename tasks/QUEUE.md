@@ -321,7 +321,7 @@
 - Branch: pr-126-eligible-coder-selection
 
 ## PR-127: Pause/Stop control endpoints and persistent pause flag
-- Status: DOING
+- Status: DONE
 - Tasks file: tasks/PR-127.md
 - Branch: pr-127-control-endpoints-backend
 
