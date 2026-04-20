@@ -309,7 +309,7 @@ return 0
             )
             task_count = sum(1 for name in filenames if name.startswith("PR-") and name.endswith(".md"))
             self.log_event(
-                f"Uploaded {task_count} task files to tasks/ and pushed to main"
+                f"Uploaded {task_count} task files to tasks/ and pushed to {branch}"
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
             logger.error("%s: upload git operations failed: %s", self.name, exc)

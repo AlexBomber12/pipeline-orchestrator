@@ -1925,9 +1925,17 @@ def _get_upload_lock(repo_name: str) -> asyncio.Lock:
     return _upload_locks[repo_name]
 
 
+def _escape_css_identifier(value: str) -> str:
+    return _re.sub(r"([.#\[\]:>+~(){}|^$*!])", r"\\\1", value)
+
+
 def _upload_feedback_target(repo_name: str) -> str:
-    css_name = _re.sub(r"([.#\[\]:>+~(){}|^$*!])", r"\\\1", repo_name)
+    css_name = _escape_css_identifier(repo_name)
     return f"#upload-feedback-{css_name}"
+
+
+templates.env.globals["css_escape"] = _escape_css_identifier
+templates.env.globals["upload_feedback_target"] = _upload_feedback_target
 
 
 def _format_upload_message_lines(message: str) -> list[str]:
