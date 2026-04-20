@@ -20,7 +20,7 @@
 {% set active_states = ['CODING', 'WATCH', 'FIX', 'MERGE'] %}
 {% set show_play = repo.user_paused or (repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done) %}
 {% set show_pause = (repo.state.value in active_states) and not repo.user_paused %}
-{% set show_stop = repo.state.value == 'CODING' %}
+{% set show_stop = repo.state.value in active_states %}
 <div class="flex items-center gap-2 {{ extra_classes }}">
     {% if show_play %}
     <button type="button"
@@ -46,11 +46,11 @@
     {% endif %}
     {% if show_stop %}
     <button type="button"
-            aria-label="Stop running coder"
+            aria-label="Stop current run"
             title="Stop"
             class="inline-flex h-11 w-11 items-center justify-center rounded-lg border border-fail/30 bg-fail/10 text-fail transition hover:border-fail/50 hover:bg-fail/20"
             hx-post="/repos/{{ repo.name }}/stop"
-            hx-confirm="Stop the running coder? The working tree may be left dirty."
+            hx-confirm="Stop the current run? The working tree may be left dirty."
             hx-swap="none"
             onclick="event.stopPropagation()">
         {{ stop_icon() }}

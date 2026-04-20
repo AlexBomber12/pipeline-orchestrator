@@ -2272,6 +2272,63 @@ def test_handle_fix_posts_codex_review_after_push(
     )
 
 
+def test_handle_fix_honors_stop_requested_during_fix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    stop_called = {"terminate": 0, "kill": 0, "wait": 0}
+
+    class _FakeProc:
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self._done = asyncio.Event()
+
+        def terminate(self) -> None:
+            stop_called["terminate"] += 1
+            self.returncode = -15
+            self._done.set()
+
+        def kill(self) -> None:
+            stop_called["kill"] += 1
+            self.returncode = -9
+            self._done.set()
+
+        async def wait(self) -> int:
+            stop_called["wait"] += 1
+            await self._done.wait()
+            return self.returncode or 0
+
+    async def fake_fix_review_async(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        proc = _FakeProc()
+        on_process_start = kwargs["on_process_start"]
+        assert callable(on_process_start)
+        on_process_start(proc)
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise
+        return (0, "ok", "")
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix_review_async)
+
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019")
+    runner.redis.store[f"control:{runner.name}:stop"] = "1"
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.user_paused is True
+    assert runner.state.error_message is None
+    assert stop_called["terminate"] == 1
+    assert stop_called["kill"] == 0
+    assert stop_called["wait"] >= 1
+    assert any(
+        "user stop requested" in entry["event"].lower()
+        for entry in runner.state.history
+    )
+
+
 def test_fix_increments_iterations(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(

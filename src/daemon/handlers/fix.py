@@ -74,6 +74,7 @@ class FixMixin(BreachMixin):
 
     async def handle_fix(self) -> None:
         """Run ``FIX REVIEW`` via the active coder CLI and return to WATCH."""
+        self._stop_requested = False
         await self._refresh_auth_status_cache()
         coder_name, plugin = self._get_coder(allow_exploration=False)
         if not await self._check_rate_limit(proactive_coder=coder_name):
@@ -157,6 +158,7 @@ class FixMixin(BreachMixin):
         heartbeat = asyncio.create_task(self._publish_while_waiting("FIX"))
         fix_kwargs: dict[str, object] = {
             "model": model,
+            "on_process_start": self._track_current_coder_process,
         }
         if coder_name == "claude":
             fix_kwargs.update(
@@ -171,6 +173,7 @@ class FixMixin(BreachMixin):
                 **fix_kwargs,
             )
         )
+        stop_monitor = asyncio.create_task(self._monitor_stop_request(claude_task))
         idle_monitor = asyncio.create_task(
             self._monitor_fix_idle(pr_number, idle_limit, claude_task, idle_flag)
         )
@@ -184,6 +187,11 @@ class FixMixin(BreachMixin):
         try:
             code, stdout, stderr = await claude_task
         except asyncio.CancelledError:
+            if self._stop_requested:
+                self.state.state = PipelineState.PAUSED
+                self.state.error_message = None
+                self.log_event("FIX aborted: user stop requested")
+                return
             if breach_flag["breached"]:
                 if self.state.current_pr is not None:
                     self._rehydrate_last_push_at(self.state.current_pr)
@@ -217,10 +225,12 @@ class FixMixin(BreachMixin):
                 raise
             code, stdout, stderr = 1, "", ""
         finally:
+            stop_monitor.cancel()
             if breach_monitor is not None:
                 breach_monitor.cancel()
             idle_monitor.cancel()
             heartbeat.cancel()
+            self._current_coder_process = None
             if coder_name == "claude":
                 self._check_late_breach(breach_dir, breach_run_id, breach_flag)
                 self._cleanup_breach_marker(breach_dir, breach_run_id)

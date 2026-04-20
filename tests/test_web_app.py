@@ -1169,8 +1169,8 @@ def test_repo_card_renders_pause_and_stop_controls_for_active_repo(
     assert 'hx-post="/repos/example__alpha/stop"' in body
     assert 'hx-post="/repos/example__alpha/resume"' not in body
     assert 'aria-label="Pause daemon"' in body
-    assert 'aria-label="Stop running coder"' in body
-    assert 'hx-confirm="Stop the running coder? The working tree may be left dirty."' in body
+    assert 'aria-label="Stop current run"' in body
+    assert 'hx-confirm="Stop the current run? The working tree may be left dirty."' in body
     assert 'onclick="event.stopPropagation()"' in body
     assert 'h-11 w-11' in body
 
@@ -1205,29 +1205,32 @@ def test_repo_card_renders_pause_and_stop_controls_for_active_repo(
             False,
             1,
             1,
-            ('hx-post="/repos/example__alpha/pause"',),
             (
+                'hx-post="/repos/example__alpha/pause"',
                 'hx-post="/repos/example__alpha/stop"',
-                'hx-post="/repos/example__alpha/resume"',
             ),
+            ('hx-post="/repos/example__alpha/resume"',),
         ),
         (
             PipelineState.WATCH,
             False,
             1,
             1,
-            ('hx-post="/repos/example__alpha/pause"',),
             (
+                'hx-post="/repos/example__alpha/pause"',
                 'hx-post="/repos/example__alpha/stop"',
-                'hx-post="/repos/example__alpha/resume"',
             ),
+            ('hx-post="/repos/example__alpha/resume"',),
         ),
         (
             PipelineState.FIX,
             False,
             1,
             1,
-            ('hx-post="/repos/example__alpha/pause"',),
+            (
+                'hx-post="/repos/example__alpha/pause"',
+                'hx-post="/repos/example__alpha/stop"',
+            ),
             ('hx-post="/repos/example__alpha/resume"',),
         ),
     ],
