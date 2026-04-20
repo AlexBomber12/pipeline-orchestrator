@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
+from typing import NotRequired, TypedDict
 
 from pydantic import BaseModel, Field
 
@@ -71,6 +72,14 @@ class PRInfo(BaseModel):
     is_cross_repository: bool = False
 
 
+class EventEntry(TypedDict, total=False):
+    time: str
+    state: str
+    event: str
+    count: NotRequired[int]
+    last_seen_at: NotRequired[str]
+
+
 class RepoState(BaseModel):
     url: str
     name: str
@@ -85,7 +94,7 @@ class RepoState(BaseModel):
     queue_done: int = 0
     queue_total: int = 0
     active: bool = True
-    history: list[dict] = Field(default_factory=list)
+    history: list[EventEntry] = Field(default_factory=list)
     pending_queue_sync_branch: str | None = None
     pending_queue_sync_started_at: datetime | None = None
     rate_limited_until: datetime | None = None

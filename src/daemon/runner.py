@@ -655,12 +655,25 @@ class PipelineRunner(
 
     def log_event(self, event: str) -> None:
         """Append an event to ``state.history`` (capped) and log it."""
-        entry = {
-            "time": datetime.now(timezone.utc).isoformat(),
-            "state": self.state.state.value,
-            "event": event,
-        }
-        self.state.history.append(entry)
+        now = datetime.now(timezone.utc).isoformat()
+        state = self.state.state.value
+        last_entry = self.state.history[-1] if self.state.history else None
+        if (
+            last_entry is not None
+            and last_entry.get("state") == state
+            and last_entry.get("event") == event
+        ):
+            last_entry["count"] = int(last_entry.get("count", 1)) + 1
+            last_entry["last_seen_at"] = now
+        else:
+            entry = {
+                "time": now,
+                "state": state,
+                "event": event,
+                "count": 1,
+                "last_seen_at": now,
+            }
+            self.state.history.append(entry)
         if len(self.state.history) > _HISTORY_LIMIT:
             self.state.history = self.state.history[-_HISTORY_LIMIT:]
         logger.info("[%s] %s", self.name, event)

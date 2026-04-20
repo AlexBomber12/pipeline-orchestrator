@@ -23,14 +23,27 @@
     {% for entry in events|reverse %}
     {% set entry_state = entry.get('state', 'IDLE') %}
     {% set entry_style = state_styles.get(entry_state, state_styles['IDLE']) %}
+    {% set entry_count = entry.get('count', 1) %}
+    {% set first_seen = entry.get('time', '') %}
+    {% set last_seen = entry.get('last_seen_at', first_seen) %}
     <li class="flex items-center gap-3 py-2">
-        <span class="text-gray-500 shrink-0" data-ts="{{ entry.get('time', '') }}">
-            {{ entry.get('time', '--:--:--') }}
+        {% if entry_count > 1 %}
+        <span class="text-gray-500 shrink-0 whitespace-nowrap">
+            <span data-ts="{{ first_seen }}">{{ first_seen or '--:--:--' }}</span>
+            <span aria-hidden="true"> -&gt; </span>
+            <span data-ts="{{ last_seen }}">{{ last_seen or '--:--:--' }}</span>
         </span>
+        {% else %}
+        <span class="text-gray-500 shrink-0" data-ts="{{ first_seen }}">
+            {{ first_seen or '--:--:--' }}
+        </span>
+        {% endif %}
         <span class="text-[10px] font-medium px-1.5 py-0.5 rounded border {{ entry_style.badge }} shrink-0">
             {{ entry_state }}
         </span>
-        <span class="text-gray-300 truncate">{{ entry.get('event', '') }}</span>
+        <span class="text-gray-300 truncate">
+            {{ entry.get('event', '') }}{% if entry_count > 1 %} (x{{ entry_count }}){% endif %}
+        </span>
     </li>
     {% endfor %}
 </ul>
