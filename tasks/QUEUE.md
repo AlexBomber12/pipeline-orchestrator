@@ -331,7 +331,7 @@
 - Branch: pr-128-control-icons-ui
 
 ## PR-129: Replace Claude-specific labels with coder-neutral wording
-- Status: DOING
+- Status: DONE
 - Tasks file: tasks/PR-129.md
 - Branch: pr-129-coder-neutral-labels
 
