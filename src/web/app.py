@@ -2302,7 +2302,8 @@ async def upload_tasks(
             for fname, content in file_contents:
                 await asyncio.to_thread((staging_dir / fname).write_bytes, content)
 
-            new_files = [fn for fn, _ in file_contents]
+            uploaded_filenames = [fn for fn, _ in file_contents]
+            manifest_filenames = list(uploaded_filenames)
             pending_key = f"upload:{name}:pending"
             try:
                 existing_raw = await redis_client.get(pending_key)
@@ -2314,19 +2315,19 @@ async def upload_tasks(
                     existing = _json.loads(existing_raw)
                     old_staging = Path(existing["staging_dir"])
                     for old_fn in existing.get("files", []):
-                        if old_fn not in new_files and (old_staging / old_fn).is_file():
+                        if old_fn not in manifest_filenames and (old_staging / old_fn).is_file():
                             await asyncio.to_thread(
                                 shutil.copy2,
                                 str(old_staging / old_fn),
                                 str(staging_dir / old_fn),
                             )
-                            new_files.append(old_fn)
+                            manifest_filenames.append(old_fn)
                 except Exception:
                     pass
 
             manifest = {
                 "repo": name,
-                "files": new_files,
+                "files": manifest_filenames,
                 "staging_dir": str(staging_dir),
             }
             try:
@@ -2350,6 +2351,6 @@ async def upload_tasks(
 
     return _render_upload_success(
         request,
-        _build_upload_success_message(new_files),
+        _build_upload_success_message(uploaded_filenames),
         repo_name=name,
     )

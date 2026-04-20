@@ -971,6 +971,9 @@ def test_upload_merge_pending_manifest_and_ignore_scan_errors(
     assert (Path(manifest["staging_dir"]) / "AGENTS.md").read_text(
         encoding="utf-8"
     ) == "# AGENTS\n"
+    assert "Accepted 0 task files." in resp.text
+    assert "Also uploaded helper file: QUEUE.md." in resp.text
+    assert "AGENTS.md" not in resp.text
 
 
 def test_upload_ignores_pending_manifest_read_errors(
