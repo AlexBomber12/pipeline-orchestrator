@@ -140,7 +140,7 @@ async def _load_mutable_repo_state(
     request: Request,
     name: str,
 ) -> tuple[aioredis.Redis, RepoState] | tuple[None, HTMLResponse]:
-    """Return the Redis client plus the current mutable state for ``name``."""
+    """Return the Redis client plus the stored mutable state for ``name``."""
     cfg = load_config(CONFIG_PATH)
     repo = _find_repo_config_by_name(cfg, name)
     if repo is None:
@@ -148,7 +148,17 @@ async def _load_mutable_repo_state(
     redis_client = getattr(request.app.state, "redis", None)
     if redis_client is None:
         return None, HTMLResponse("Redis unavailable", status_code=503)
-    return redis_client, await get_repo_state(name, redis_client, config_path=CONFIG_PATH)
+    try:
+        raw = await redis_client.get(f"pipeline:{name}")
+    except Exception:
+        return None, HTMLResponse("Redis unavailable", status_code=503)
+    if raw is None:
+        return None, HTMLResponse("Repository state unavailable", status_code=503)
+    try:
+        state = RepoState.model_validate_json(raw)
+    except Exception:
+        return None, HTMLResponse("Repository state unavailable", status_code=503)
+    return redis_client, state
 
 
 def _effective_coder_name(
@@ -880,12 +890,12 @@ async def resume_repo(request: Request, name: str) -> Response:
     if loaded[0] is None:
         return loaded[1]
     redis_client, state = loaded
-    state.user_paused = False
-    await redis_client.set(f"pipeline:{name}", state.model_dump_json())
     try:
         await redis_client.delete(f"control:{name}:stop")
     except Exception:
-        pass
+        return HTMLResponse("Failed to clear stop request", status_code=503)
+    state.user_paused = False
+    await redis_client.set(f"pipeline:{name}", state.model_dump_json())
     return JSONResponse({"ok": True, "user_paused": False})
 
 

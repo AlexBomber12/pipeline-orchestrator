@@ -73,6 +73,11 @@ class _BoomRedis:
         raise RuntimeError("redis is down")
 
 
+class _DeleteBoomRedis(_FakeRedis):
+    async def delete(self, key: str) -> int:
+        raise RuntimeError(f"failed to delete {key}")
+
+
 class _StubAioredisClient:
     async def ping(self) -> bool:
         return True
@@ -374,6 +379,55 @@ def test_resume_endpoint_is_idempotent(
     assert second.status_code == 200
     resumed = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
     assert resumed.user_paused is False
+
+
+def test_pause_endpoint_does_not_persist_fallback_state_on_decode_failure(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeRedis({"pipeline:example__alpha": "{not-json"})
+    monkeypatch.setattr(
+        web_app,
+        "aioredis",
+        type("_StubAioredisWithMutableState", (), {"from_url": staticmethod(lambda url, decode_responses=True: fake)})(),
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/pause")
+
+    assert response.status_code == 503
+    assert fake.store["pipeline:example__alpha"] == "{not-json"
+
+
+def test_resume_endpoint_reports_stop_key_delete_failure(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        user_paused=True,
+    )
+    fake = _DeleteBoomRedis(
+        {
+            "pipeline:example__alpha": stored.model_dump_json(),
+            "control:example__alpha:stop": "1",
+        }
+    )
+    monkeypatch.setattr(
+        web_app,
+        "aioredis",
+        type("_StubAioredisWithMutableState", (), {"from_url": staticmethod(lambda url, decode_responses=True: fake)})(),
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/resume")
+
+    assert response.status_code == 503
+    state = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+    assert state.user_paused is True
+    assert fake.store["control:example__alpha:stop"] == "1"
 
 
 def test_partial_repo_list_renders_queue_progress(
