@@ -22,6 +22,7 @@ from src.models import (
 )
 from src.web import app as web_app
 from src.web.app import (
+    _active_rate_limit_coder,
     _find_repo_config_by_name,
     _format_duration_ms,
     _get_repo_state_safe,
@@ -998,6 +999,20 @@ def test_parse_iso8601_and_format_duration_cover_edge_cases() -> None:
     assert _format_duration_ms(3_660_000) == "1h 1m"
 
 
+def test_active_rate_limit_coder_hides_any_without_active_pick() -> None:
+    state = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        current_task=QueueTask(
+            pr_id="PR-141",
+            title="Rate limit badge",
+            status=TaskStatus.DOING,
+        ),
+    )
+
+    assert _active_rate_limit_coder(state, "any") is None
+
+
 def test_partial_repo_detail_returns_html_fragment(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1119,6 +1134,99 @@ def test_partial_repo_detail_renders_redis_payload(
     # Event log lives on /partials/repo/{name}/events now, so history
     # entries are no longer rendered by the summary partial.
     assert "claude started" not in body
+
+
+@pytest.mark.parametrize(
+    ("state", "present", "absent"),
+    [
+        (
+            RepoState(
+                url="https://github.com/example/alpha.git",
+                name="example__alpha",
+                state=PipelineState.CODING,
+                current_task=QueueTask(
+                    pr_id="PR-141",
+                    title="Rate limit badge",
+                    status=TaskStatus.DOING,
+                    task_file="tasks/PR-141.md",
+                ),
+                coder="claude",
+                usage_session_percent=16,
+                usage_weekly_percent=42,
+                last_updated=datetime(
+                    2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc
+                ),
+            ),
+            ("Claude Session 16%", "Weekly 42%"),
+            ("Codex Session",),
+        ),
+        (
+            RepoState(
+                url="https://github.com/example/alpha.git",
+                name="example__alpha",
+                state=PipelineState.CODING,
+                current_task=QueueTask(
+                    pr_id="PR-141",
+                    title="Rate limit badge",
+                    status=TaskStatus.DOING,
+                    task_file="tasks/PR-141.md",
+                ),
+                coder="codex",
+                usage_session_percent=16,
+                usage_weekly_percent=42,
+                usage_api_degraded=True,
+                last_updated=datetime(
+                    2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc
+                ),
+            ),
+            (),
+            ("Claude Session", "Session 16%", "Weekly 42%", "Usage API degraded"),
+        ),
+        (
+            RepoState(
+                url="https://github.com/example/alpha.git",
+                name="example__alpha",
+                state=PipelineState.IDLE,
+                current_task=None,
+                coder="claude",
+                usage_session_percent=16,
+                usage_weekly_percent=42,
+                last_updated=datetime(
+                    2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc
+                ),
+            ),
+            (),
+            ("Claude Session", "Session 16%", "Weekly 42%"),
+        ),
+    ],
+)
+def test_partial_repo_detail_rate_limit_badge_follows_active_coder(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: RepoState,
+    present: tuple[str, ...],
+    absent: tuple[str, ...],
+) -> None:
+    async def _fake_get_repo_state(
+        name: str,
+        redis_client: object | None = None,
+        config_path: str = "config.yml",
+    ) -> RepoState:
+        assert name == "example__alpha"
+        assert config_path
+        return state
+
+    monkeypatch.setattr(web_app, "get_repo_state", _fake_get_repo_state)
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo/example__alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    for needle in present:
+        assert needle in body
+    for needle in absent:
+        assert needle not in body
 
 
 def test_cli_log_route_returns_log(
