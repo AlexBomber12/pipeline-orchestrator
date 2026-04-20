@@ -5090,6 +5090,75 @@ def test_handle_merge_syncs_with_main(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def test_handle_merge_marks_pr_ready_before_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+
+    call_order: list[str] = []
+
+    def fake_run_gh(cmd: list[str], **kwargs: Any) -> None:
+        assert cmd == ["pr", "ready", "5"]
+        call_order.append("ready")
+
+    def fake_merge_pr(repo: str, num: int) -> None:
+        assert (repo, num) == (runner.owner_repo, 5)
+        call_order.append("merge")
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge_pr)
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert call_order == ["ready", "merge"]
+
+
+def test_handle_merge_ignores_pr_ready_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+
+    call_order: list[str] = []
+
+    def fail_run_gh(cmd: list[str], **kwargs: Any) -> None:
+        assert cmd == ["pr", "ready", "5"]
+        call_order.append("ready")
+        raise RuntimeError("ready failed")
+
+    def fake_merge_pr(repo: str, num: int) -> None:
+        assert (repo, num) == (runner.owner_repo, 5)
+        call_order.append("merge")
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", fail_run_gh)
+    monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge_pr)
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert call_order == ["ready", "merge"]
+
+
 def test_handle_merge_captures_success_stats_before_queue_sync(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
