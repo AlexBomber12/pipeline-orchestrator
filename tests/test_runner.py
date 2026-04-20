@@ -11754,6 +11754,55 @@ def test_run_cycle_marks_recovery_complete_and_returns(
     assert publishes == ["published"]
 
 
+def test_run_cycle_skips_recovery_while_user_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publishes: list[str] = []
+    recovery_calls: list[str] = []
+    preflight_calls: list[str] = []
+    runner = _make_runner()
+    runner.state.state = PipelineState.IDLE
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_refresh_user_paused_from_redis() -> None:
+        runner.state.user_paused = True
+
+    async def fake_recover_state() -> bool:
+        recovery_calls.append("recover")
+        return True
+
+    async def fake_publish_state() -> None:
+        publishes.append("published")
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(
+        runner,
+        "_refresh_user_paused_from_redis",
+        fake_refresh_user_paused_from_redis,
+    )
+    monkeypatch.setattr(runner, "recover_state", fake_recover_state)
+    monkeypatch.setattr(
+        runner,
+        "preflight",
+        lambda: preflight_calls.append("preflight") or True,
+    )
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+
+    asyncio.run(runner.run_cycle())
+
+    assert recovery_calls == []
+    assert preflight_calls == []
+    assert publishes == ["published"]
+    assert runner._recovered is False
+    assert sum(
+        1
+        for entry in runner.state.history
+        if entry["event"] == "Paused by user, not picking up new tasks"
+    ) == 1
+
+
 def test_run_cycle_returns_after_preflight_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -11818,6 +11867,45 @@ def test_run_cycle_short_circuits_idle_when_user_paused(
         for entry in runner.state.history
         if entry["event"] == "Paused by user, not picking up new tasks"
     ) == 1
+
+
+def test_run_cycle_skips_preflight_after_pause_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publishes: list[str] = []
+    preflight_calls: list[str] = []
+    runner = _make_runner()
+    runner._recovered = True
+    runner._scaffolded = True
+    runner.state.state = PipelineState.IDLE
+    runner.state.user_paused = False
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_refresh_user_paused_from_redis() -> None:
+        runner.state.user_paused = True
+
+    async def fake_publish_state() -> None:
+        publishes.append("published")
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(
+        runner,
+        "_refresh_user_paused_from_redis",
+        fake_refresh_user_paused_from_redis,
+    )
+    monkeypatch.setattr(
+        runner,
+        "preflight",
+        lambda: preflight_calls.append("preflight") or True,
+    )
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+
+    asyncio.run(runner.run_cycle())
+
+    assert preflight_calls == []
+    assert publishes == ["published"]
 
 
 @pytest.mark.parametrize(
