@@ -1179,8 +1179,8 @@ def test_partial_repo_detail_renders_redis_payload(
                     2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc
                 ),
             ),
-            (),
-            ("Claude Session", "Session 16%", "Weekly 42%", "Usage API degraded"),
+            ("Codex Session 16%", "Weekly 42%", "Usage API degraded"),
+            ("Claude Session",),
         ),
         (
             RepoState(

@@ -270,7 +270,7 @@ def _active_rate_limit_coder(
 
 def _coder_rate_limit_supported(coder: str | None) -> bool:
     """Return whether ``coder`` has meaningful rate-limit usage data."""
-    return coder == "claude"
+    return coder in {"claude", "codex"}
 
 
 async def get_all_repo_states(
