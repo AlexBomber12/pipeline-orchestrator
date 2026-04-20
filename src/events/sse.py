@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 from typing import Any, AsyncIterator
 
 from redis.exceptions import RedisError
@@ -43,6 +44,23 @@ def format_sse_comment(comment: str) -> bytes:
     return f":{comment}\n\n".encode("utf-8")
 
 
+def _message_timestamp(message: str) -> datetime | None:
+    """Return the event timestamp for well-formed repo event payloads."""
+    try:
+        event = json.loads(message)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(event, dict):
+        return None
+    timestamp = event.get("timestamp")
+    if not isinstance(timestamp, str):
+        return None
+    try:
+        return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 async def _is_disconnected(request: Any) -> bool:
     checker = getattr(request, "is_disconnected", None)
     if checker is None:
@@ -79,7 +97,6 @@ async def stream_repo_events(
     async def _stream() -> AsyncIterator[bytes]:
         try:
             history_messages = list(reversed(history))
-            replayed_messages = set(history_messages)
             buffered_messages: list[str] = []
             while len(buffered_messages) < INITIAL_BUFFER_DRAIN_LIMIT:
                 message = await pubsub.get_message(
@@ -92,16 +109,26 @@ async def stream_repo_events(
                 if isinstance(data, bytes):
                     data = data.decode("utf-8")
                 if isinstance(data, str):
-                    if data in replayed_messages:
-                        continue
                     buffered_messages.append(data)
 
-            for message in history_messages:
-                if await _is_disconnected(request):
-                    return
-                yield format_sse_event(message)
+            replay_messages: list[str] = []
+            seen_messages: set[str] = set()
+            for message in history_messages + buffered_messages:
+                if message in seen_messages:
+                    continue
+                seen_messages.add(message)
+                replay_messages.append(message)
 
-            for message in buffered_messages:
+            replay_timestamps = [_message_timestamp(message) for message in replay_messages]
+            if all(timestamp is not None for timestamp in replay_timestamps):
+                replay_messages = [
+                    message
+                    for _, _, message in sorted(
+                        zip(replay_timestamps, range(len(replay_messages)), replay_messages),
+                    )
+                ]
+
+            for message in replay_messages:
                 if await _is_disconnected(request):
                     return
                 yield format_sse_event(message)
@@ -112,10 +139,13 @@ async def stream_repo_events(
                 if await _is_disconnected(request):
                     return
 
-                message = await pubsub.get_message(
-                    ignore_subscribe_messages=True,
-                    timeout=poll_interval,
-                )
+                try:
+                    message = await pubsub.get_message(
+                        ignore_subscribe_messages=True,
+                        timeout=poll_interval,
+                    )
+                except RedisError:
+                    return
                 if message is not None:
                     data = message.get("data")
                     if isinstance(data, bytes):

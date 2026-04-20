@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -11,6 +12,7 @@ from src.events.sse import (
     INITIAL_BUFFER_DRAIN_LIMIT,
     RepoEventsUnavailableError,
     _is_disconnected,
+    _message_timestamp,
     format_sse_comment,
     format_sse_event,
     stream_repo_events,
@@ -112,6 +114,13 @@ def test_format_sse_helpers() -> None:
     assert invalid_event == b":invalid event payload\n\n"
     assert scalar_event == b":invalid event payload\n\n"
     assert format_sse_comment("keepalive") == b":keepalive\n\n"
+
+
+def test_message_timestamp_rejects_malformed_payloads() -> None:
+    assert _message_timestamp('"not-an-object"') is None
+    assert _message_timestamp('{"type":"progress_updated"}') is None
+    assert _message_timestamp('{"timestamp":123}') is None
+    assert _message_timestamp('{"timestamp":"not-a-timestamp"}') is None
 
 
 async def test_is_disconnected_defaults_to_false_and_supports_sync_checker() -> None:
@@ -345,6 +354,64 @@ async def test_stream_repo_events_subscribes_before_history_without_replaying_du
         raise AssertionError("stream should stop after disconnect")
 
 
+async def test_stream_repo_events_orders_buffered_and_history_messages_by_timestamp() -> None:
+    redis = _FakeRedis()
+    request = _Request()
+    base = datetime(2026, 4, 20, 15, 0, tzinfo=timezone.utc)
+    buffered_older = json.dumps(
+        publisher.build_repo_event(
+            "example__repo",
+            "progress_updated",
+            {"percent": 10},
+            now=base,
+        )
+    )
+    newer_history = json.dumps(
+        publisher.build_repo_event(
+            "example__repo",
+            "progress_updated",
+            {"percent": 20},
+            now=base + timedelta(seconds=1),
+        )
+    )
+    newest_history = json.dumps(
+        publisher.build_repo_event(
+            "example__repo",
+            "progress_updated",
+            {"percent": 30},
+            now=base + timedelta(seconds=2),
+        )
+    )
+
+    async def _racing_lrange(key: str, start: int, stop: int) -> list[str]:
+        await redis.publish("repo-events:example__repo", buffered_older)
+        return [newest_history, newer_history]
+
+    redis.lrange = _racing_lrange  # type: ignore[method-assign]
+
+    stream = await stream_repo_events(
+        redis,
+        "example__repo",
+        request,
+        history_limit=2,
+        keepalive_interval=0.0,
+        poll_interval=0.01,
+    )
+
+    assert await anext(stream) == format_sse_event(buffered_older)
+    assert await anext(stream) == format_sse_event(newer_history)
+    assert await anext(stream) == format_sse_event(newest_history)
+    assert await anext(stream) == b":keepalive\n\n"
+
+    request.disconnected = True
+    try:
+        await anext(stream)
+    except StopAsyncIteration:
+        pass
+    else:
+        raise AssertionError("stream should stop after disconnect")
+
+
 async def test_stream_repo_events_stops_before_buffered_messages_when_disconnected() -> None:
     redis = _FakeRedis()
     request = _Request()
@@ -490,6 +557,40 @@ async def test_stream_repo_events_ignores_close_errors_during_disconnect_teardow
     else:
         raise AssertionError("stream should stop after disconnect")
 
+    assert pubsub.closed is True
+
+
+async def test_stream_repo_events_stops_cleanly_when_live_reads_fail() -> None:
+    redis = _FakeRedis()
+    request = _Request()
+    stream = await stream_repo_events(
+        redis,
+        "example__repo",
+        request,
+        keepalive_interval=60.0,
+        poll_interval=0.01,
+    )
+    pubsub = await _wait_for_pubsub(redis)
+
+    async def _failing_get_message(
+        *,
+        ignore_subscribe_messages: bool = True,
+        timeout: float = 0.0,
+    ) -> dict[str, Any] | None:
+        if timeout > 0:
+            raise ConnectionError("redis down")
+        return None
+
+    pubsub.get_message = _failing_get_message  # type: ignore[method-assign]
+
+    try:
+        await anext(stream)
+    except StopAsyncIteration:
+        pass
+    else:
+        raise AssertionError("stream should stop when live Redis reads fail")
+
+    assert pubsub.unsubscribed == ["repo-events:example__repo"]
     assert pubsub.closed is True
 
 
