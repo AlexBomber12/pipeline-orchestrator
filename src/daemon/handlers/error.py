@@ -85,9 +85,15 @@ class ErrorMixin:
         context = error_context or self.state.error_message or "Unknown error"
         category = _classify_error(context)
         if category == ErrorCategory.RATE_LIMIT:
+            self._error_skip_context = None
+            self._error_skip_count = 0
+            self._error_skip_active = False
             self.log_event("Skipping AI diagnosis for rate-limit error")
             return
         if category == ErrorCategory.TIMEOUT:
+            self._error_skip_context = None
+            self._error_skip_count = 0
+            self._error_skip_active = False
             self.log_event(
                 "Skipping AI diagnosis for timeout error; "
                 "will retry on next cycle"

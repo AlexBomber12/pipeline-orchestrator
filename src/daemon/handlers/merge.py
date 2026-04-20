@@ -117,11 +117,21 @@ class MergeMixin:
                                 model=self.app_config.daemon.codex_model,
                             )
                         if code != 0:
+                            self._detect_rate_limit(_stderr, coder_name=coder_name)
                             git_ops._git(
                                 self.repo_path,
                                 "merge", "--abort",
                                 check=False,
                             )
+                            if self.state.rate_limited_until is not None:
+                                self.state.state = PipelineState.PAUSED
+                                self.state.error_message = None
+                                await self._save_current_run_record("rate_limit")
+                                self.log_event(
+                                    f"Rate limit pause active until "
+                                    f"{self.state.rate_limited_until.isoformat()}"
+                                )
+                                return
                             self.state.state = PipelineState.ERROR
                             self.state.error_message = (
                                 "Merge conflict resolution failed"

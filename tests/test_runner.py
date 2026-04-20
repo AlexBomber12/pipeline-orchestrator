@@ -5797,6 +5797,68 @@ def test_handle_merge_aborts_on_unresolvable_conflict(
     assert abort_cmds, "git merge --abort must be invoked"
 
 
+def test_handle_merge_pauses_when_conflict_resolution_hits_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_calls: list[list[str]] = []
+
+    def fake_git(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append(cmd)
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return _FakeCompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout="CONFLICT (content): merge conflict in foo",
+            )
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+
+    async def fake_claude_async(
+        prompt: str,
+        cwd: str,
+        timeout: int | None = 600,
+        model: str | None = None,
+        **kwargs: Any,
+    ) -> tuple[int, str, str]:
+        return (1, "", "Error: 429 Too Many Requests")
+
+    monkeypatch.setattr(
+        claude_cli,
+        "run_claude_async",
+        fake_claude_async,
+    )
+
+    merge_pr_calls: list[tuple[str, int]] = []
+
+    def fake_merge_pr(repo: str, num: int) -> None:
+        merge_pr_calls.append((repo, num))
+
+    monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge_pr)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.error_message is None
+    assert runner.state.rate_limited_until is not None
+    assert not merge_pr_calls, "merge_pr must not be called while paused"
+    abort_cmds = [
+        cmd for cmd in git_calls
+        if cmd[:3] == ["git", "merge", "--abort"]
+    ]
+    assert abort_cmds, "git merge --abort must be invoked"
+    assert any(
+        "Rate limit pause active until" in e["event"] for e in runner.state.history
+    )
+
+
 def test_handle_merge_sets_error_when_pre_sync_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -10645,10 +10707,16 @@ def test_handle_error_skips_diagnose_for_rate_limit(
     runner = _make_runner()
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "Claude rate limit exceeded"
+    runner._error_skip_context = "stale context"
+    runner._error_skip_count = 3
+    runner._error_skip_active = True
 
     asyncio.run(runner.handle_error())
 
     assert cli_calls == []
+    assert runner._error_skip_context is None
+    assert runner._error_skip_count == 0
+    assert runner._error_skip_active is False
 
 
 def test_handle_error_skips_diagnose_for_timeout(
@@ -10665,10 +10733,16 @@ def test_handle_error_skips_diagnose_for_timeout(
     runner = _make_runner()
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "Timeout waiting for response"
+    runner._error_skip_context = "stale context"
+    runner._error_skip_count = 2
+    runner._error_skip_active = True
 
     asyncio.run(runner.handle_error())
 
     assert cli_calls == []
+    assert runner._error_skip_context is None
+    assert runner._error_skip_count == 0
+    assert runner._error_skip_active is False
 
 
 def test_handle_error_preserves_error_message_on_rate_limit(
