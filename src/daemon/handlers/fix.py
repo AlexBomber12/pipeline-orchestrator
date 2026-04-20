@@ -308,6 +308,26 @@ class FixMixin(BreachMixin):
                 self.log_event(self.state.error_message)
                 return None
 
+        def read_remote_branch_head(branch: str) -> str | None:
+            try:
+                output = git_ops._git(
+                    self.repo_path,
+                    "ls-remote",
+                    "--heads",
+                    "origin",
+                    branch,
+                ).stdout.strip()
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+            ) as exc:
+                self.log_event(f"ls-remote {branch} failed after FIX stop: {exc}")
+                return None
+            if not output:
+                return None
+            return output.split()[0]
+
         def record_fix_push(head_after: str, failure_detail: str) -> bool:
             if head_before and head_before == head_after:
                 return True
@@ -350,12 +370,20 @@ class FixMixin(BreachMixin):
             head_after = read_head_after_fix()
             if head_after is None:
                 return
-            if not record_fix_push(
-                head_after,
-                "after stop-cancel fix push; manual review trigger "
-                "required to avoid fix/push loop",
-            ):
-                return
+            branch = self.state.current_pr.branch if self.state.current_pr is not None else ""
+            remote_head = read_remote_branch_head(branch) if branch else None
+            if remote_head == head_after:
+                if not record_fix_push(
+                    head_after,
+                    "after stop-cancel fix push; manual review trigger "
+                    "required to avoid fix/push loop",
+                ):
+                    return
+            elif head_before and head_before != head_after:
+                self.log_event(
+                    "FIX stop-cancel left local HEAD ahead of remote; "
+                    "skipping push bookkeeping and @codex review"
+                )
             if await pause_for_stop_after_bookkeeping():
                 return
             self.state.state = PipelineState.PAUSED
