@@ -529,6 +529,43 @@ def test_stop_endpoint_reports_atomic_stop_key_write_failure(
     assert "control:example__alpha:stop" not in fake.store
 
 
+@pytest.mark.parametrize(
+    ("path", "expected_paused", "stop_key_present"),
+    [
+        ("/repos/example__alpha/pause", True, False),
+        ("/repos/example__alpha/resume", False, False),
+        ("/repos/example__alpha/stop", True, True),
+    ],
+)
+def test_control_endpoints_work_without_existing_pipeline_state(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    expected_paused: bool,
+    stop_key_present: bool,
+) -> None:
+    fake = _FakeRedis()
+    monkeypatch.setattr(
+        web_app,
+        "aioredis",
+        type(
+            "_StubAioredisWithMutableState",
+            (),
+            {"from_url": staticmethod(lambda url, decode_responses=True: fake)},
+        )(),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(path)
+
+    assert response.status_code == 200
+    state = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+    assert state.name == "example__alpha"
+    assert state.url == "https://github.com/example/alpha.git"
+    assert state.user_paused is expected_paused
+    assert ("control:example__alpha:stop" in fake.store) is stop_key_present
+
+
 def test_partial_repo_list_renders_queue_progress(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

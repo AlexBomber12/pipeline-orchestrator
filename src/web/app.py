@@ -148,7 +148,7 @@ class _RepoStateMutationError(Exception):
 async def _apply_repo_control_update(
     request: Request,
     name: str,
-) -> tuple[aioredis.Redis, str]:
+) -> tuple[aioredis.Redis, str, str]:
     """Return the Redis client plus the pipeline state key for ``name``."""
     cfg = load_config(CONFIG_PATH)
     repo = _find_repo_config_by_name(cfg, name)
@@ -157,7 +157,7 @@ async def _apply_repo_control_update(
     redis_client = getattr(request.app.state, "redis", None)
     if redis_client is None:
         raise _RepoStateMutationError("Redis unavailable", status_code=503)
-    return redis_client, f"pipeline:{name}"
+    return redis_client, f"pipeline:{name}", repo.url
 
 
 async def _update_repo_pause_state(
@@ -170,7 +170,9 @@ async def _update_repo_pause_state(
     """Atomically update ``user_paused`` and any stop-signal side effect."""
 
     try:
-        redis_client, state_key = await _apply_repo_control_update(request, name)
+        redis_client, state_key, repo_url = await _apply_repo_control_update(
+            request, name
+        )
     except _RepoStateMutationError as exc:
         return HTMLResponse(exc.message, status_code=exc.status_code)
 
@@ -186,11 +188,12 @@ async def _update_repo_pause_state(
         async def _transaction(pipe: Any) -> None:
             raw = await pipe.get(state_key)
             if raw is None:
-                raise _RepoStateMutationError("Repository state unavailable")
-            try:
-                state = RepoState.model_validate_json(raw)
-            except Exception as exc:
-                raise _RepoStateMutationError("Repository state unavailable") from exc
+                state = _default_repo_state(name, repo_url)
+            else:
+                try:
+                    state = RepoState.model_validate_json(raw)
+                except Exception as exc:
+                    raise _RepoStateMutationError("Repository state unavailable") from exc
 
             state.user_paused = user_paused
 

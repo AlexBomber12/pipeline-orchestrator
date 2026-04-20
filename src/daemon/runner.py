@@ -28,6 +28,7 @@ import subprocess
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import redis.asyncio as aioredis
 
@@ -538,9 +539,7 @@ class PipelineRunner(
 
     async def publish_state(self) -> None:
         """Serialize ``self.state`` and write it to Redis."""
-        await self._refresh_user_paused_from_redis()
         self.state.active = self.repo_config.active
-        self.state.last_updated = datetime.now(timezone.utc)
         configured_coder = self.repo_config.coder or self.app_config.daemon.coder
         active_coder = self.state.coder or configured_coder.value
         self.state.coder = active_coder
@@ -562,13 +561,35 @@ class PipelineRunner(
                 self.state.usage_weekly_percent = None
                 self.state.usage_weekly_resets_at = None
             self.state.usage_api_degraded = provider.consecutive_failures >= 10
-        if not self.repo_config.active:
-            data = self.state.model_dump()
-            data["state"] = PipelineState.IDLE.value
-            payload = RepoState(**data).model_dump_json()
+        self.state.last_updated = datetime.now(timezone.utc)
+        state_key = f"pipeline:{self.name}"
+
+        async def _serialize_latest_state() -> str:
+            await self._refresh_user_paused_from_redis()
+            if not self.repo_config.active:
+                data = self.state.model_dump()
+                data["state"] = PipelineState.IDLE.value
+                return RepoState(**data).model_dump_json()
+            return self.state.model_dump_json()
+
+        if hasattr(self.redis, "transaction"):
+            async def _transaction(pipe: Any) -> None:
+                raw = await pipe.get(state_key)
+                if raw:
+                    try:
+                        persisted = RepoState.model_validate_json(raw)
+                    except Exception:
+                        pass
+                    else:
+                        self.state.user_paused = persisted.user_paused
+                payload = await _serialize_latest_state()
+                pipe.multi()
+                pipe.set(state_key, payload)
+
+            await self.redis.transaction(_transaction, state_key)
         else:
-            payload = self.state.model_dump_json()
-        await self.redis.set(f"pipeline:{self.name}", payload)
+            payload = await _serialize_latest_state()
+            await self.redis.set(state_key, payload)
         if self._old_basename != self.name:
             try:
                 old_key = f"pipeline:{self._old_basename}"

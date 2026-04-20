@@ -36,6 +36,7 @@ from src.models import (
     PipelineState,
     PRInfo,
     QueueTask,
+    RepoState,
     ReviewStatus,
     TaskStatus,
 )
@@ -156,6 +157,46 @@ class _FakeRedis:
         if stop < 0:
             stop = len(values) + stop
         self.lists[key] = values[start:stop + 1]
+
+    async def transaction(
+        self,
+        func,
+        *watches: str,
+        value_from_callable: bool = False,
+        **_kwargs: object,
+    ):
+        pipe = _FakePipeline(self)
+        func_value = func(pipe)
+        if asyncio.iscoroutine(func_value):
+            func_value = await func_value
+        exec_value = await pipe.execute()
+        if value_from_callable:
+            return func_value
+        return exec_value
+
+
+class _FakePipeline:
+    def __init__(self, redis: _FakeRedis) -> None:
+        self.redis = redis
+        self.commands: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    async def get(self, key: str) -> str | None:
+        return self.redis.store.get(key)
+
+    def multi(self) -> None:
+        return None
+
+    def set(self, key: str, value: str, **kwargs: object) -> "_FakePipeline":
+        self.commands.append(("set", (key, value), kwargs))
+        return self
+
+    async def execute(self) -> list[object]:
+        results: list[object] = []
+        for command, args, kwargs in self.commands:
+            if command == "set":
+                await self.redis.set(args[0], args[1], **kwargs)
+                results.append(True)
+        return results
 
 
 class _FakeCompletedProcess:
@@ -1984,6 +2025,48 @@ def test_handle_coding_honors_persisted_stop_after_fast_cli_exit(
     assert f"control:{runner.name}:stop" not in runner.redis.store
     assert any(
         "after coder exit" in entry["event"].lower()
+        for entry in runner.state.history
+    )
+
+
+def test_handle_coding_honors_persisted_pause_after_fast_cli_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        _async_cli_result(1, "", "coder failed fast"),
+    )
+
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-127",
+        title="Pause controls",
+        status=TaskStatus.DOING,
+        branch="pr-127-control-endpoints-backend",
+    )
+    runner.redis.store[f"pipeline:{runner.name}"] = RepoState(
+        url=runner.repo_config.url,
+        name=runner.name,
+        state=PipelineState.CODING,
+        user_paused=True,
+    ).model_dump_json()
+
+    async def stale_stop_monitor(
+        _cli_task: asyncio.Task[tuple[int, str, str]],
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_monitor_stop_request", stale_stop_monitor)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.user_paused is True
+    assert runner.state.error_message is None
+    assert any(
+        "honoring latest pause state" in entry["event"].lower()
         for entry in runner.state.history
     )
 
@@ -5343,6 +5426,34 @@ def test_publish_state_writes_to_redis() -> None:
     key, payload = runner.redis.writes[0]
     assert key == f"pipeline:{runner.name}"
     assert runner.name in payload
+
+
+def test_publish_state_preserves_concurrent_pause_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    runner.redis.store[f"pipeline:{runner.name}"] = RepoState(
+        url=runner.repo_config.url,
+        name=runner.name,
+        state=PipelineState.IDLE,
+        user_paused=False,
+    ).model_dump_json()
+
+    def fake_fetch() -> None:
+        runner.redis.store[f"pipeline:{runner.name}"] = RepoState(
+            url=runner.repo_config.url,
+            name=runner.name,
+            state=PipelineState.IDLE,
+            user_paused=True,
+        ).model_dump_json()
+        return None
+
+    monkeypatch.setattr(runner._claude_usage_provider, "fetch", fake_fetch)
+
+    asyncio.run(runner.publish_state())
+
+    stored = RepoState.model_validate_json(runner.redis.store[f"pipeline:{runner.name}"])
+    assert stored.user_paused is True
 
 
 def test_publish_state_keeps_selected_fallback_coder(

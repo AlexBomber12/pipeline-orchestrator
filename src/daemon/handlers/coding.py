@@ -172,6 +172,13 @@ class CodingMixin:
             self._stop_requested = True
             self.state.user_paused = True
             self.log_event("User stop requested after coder exit; honoring persisted stop")
+        if not self._stop_requested:
+            await self._refresh_user_paused_from_redis()
+            if self.state.user_paused:
+                self._stop_requested = True
+                self.log_event(
+                    "User pause persisted during coder exit; honoring latest pause state"
+                )
         if self._stop_requested:
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
