@@ -1356,7 +1356,11 @@ def test_repo_card_has_onclick(
     assert 'hx-indicator="#upload-indicator-example__alpha"' in body
     assert 'hx-disabled-elt="#upload-example__alpha"' in body
     assert 'id="upload-feedback-example__alpha"' in body
-    assert 'class="htmx-indicator pointer-events-none inline-flex items-center gap-1 text-xs text-gray-500 opacity-0 transition-opacity duration-150"' in body
+    assert (
+        'class="htmx-indicator pointer-events-none inline-flex items-center gap-1 '
+        'text-xs text-gray-500 opacity-0 transition-opacity duration-150"'
+        in body
+    )
     assert "Uploading..." in body
 
 

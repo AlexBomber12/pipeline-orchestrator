@@ -10,6 +10,7 @@ Mixin methods:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import shutil
@@ -285,6 +286,16 @@ return 0
                 if src.is_file():
                     dest = Path(self.repo_path) / _uploaded_repo_path(fname)
                     dest.parent.mkdir(parents=True, exist_ok=True)
+                    if dest.exists():
+                        old_hash = hashlib.sha256(dest.read_bytes()).hexdigest()
+                        new_hash = hashlib.sha256(src.read_bytes()).hexdigest()
+                        warning = (
+                            "Upload overwrite warning: "
+                            f"{_uploaded_repo_path(fname)} existing_sha256={old_hash} "
+                            f"new_sha256={new_hash}"
+                        )
+                        logger.warning("%s: %s", self.name, warning)
+                        self.log_event(warning)
                     shutil.copy2(str(src), str(dest))
 
             git_ops._git(
