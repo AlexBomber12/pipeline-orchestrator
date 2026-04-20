@@ -316,7 +316,7 @@
 - Branch: pr-125-draft-pr-auto-ready
 
 ## PR-126: Remove hardcoded claude_cli from error and merge handlers
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-126.md
 - Branch: pr-126-eligible-coder-selection
 
