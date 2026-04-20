@@ -329,7 +329,6 @@
 - Status: TODO
 - Tasks file: tasks/PR-128.md
 - Branch: pr-128-control-icons-ui
-- Depends on: PR-127
 
 ## PR-129: Replace Claude-specific labels with coder-neutral wording
 - Status: TODO
