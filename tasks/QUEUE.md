@@ -405,6 +405,32 @@
 - Tasks file: tasks/PR-143.md
 - Branch: pr-143-upload-no-idle-guard
 
+## PR-144: Bounded subprocess wait after TimeoutError and CancelledError
+- Status: TODO
+- Tasks file: tasks/PR-144.md
+- Branch: pr-144-cancel-wait-timeout
+
+## PR-145: FIX iteration cap with ESCALATE at iteration boundary
+- Status: TODO
+- Tasks file: tasks/PR-145.md
+- Branch: pr-145-fix-iteration-cap
+- Depends on: PR-144
+
+## PR-146: Pause and Stop event log feedback with cancel-pause support
+- Status: TODO
+- Tasks file: tasks/PR-146.md
+- Branch: pr-146-pause-stop-events
+
+## PR-147: Re-trigger @codex review on stale CHANGES_REQUESTED
+- Status: TODO
+- Tasks file: tasks/PR-147.md
+- Branch: pr-147-stale-review-retrigger
+
+## PR-148: Separate "Commits" metric matching GitHub Commits count
+- Status: TODO
+- Tasks file: tasks/PR-148.md
+- Branch: pr-148-commits-match-gh
+
 ## PR-149: Coder-neutral log_event text in Python handlers
 - Status: TODO
 - Tasks file: tasks/PR-149.md
