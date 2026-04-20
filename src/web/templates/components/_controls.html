@@ -20,7 +20,7 @@
 {% set active_states = ['CODING', 'WATCH', 'FIX', 'MERGE'] %}
 {% set show_play = repo.user_paused or (repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done) %}
 {% set show_pause = (repo.state.value in active_states) and not repo.user_paused %}
-{% set show_stop = repo.state.value in active_states %}
+{% set show_stop = repo.state.value == 'CODING' %}
 <div class="flex items-center gap-2 {{ extra_classes }}">
     {% if show_play %}
     <button type="button"
