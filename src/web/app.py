@@ -66,6 +66,7 @@ _DEFERRED_CODER_SWITCH_STATES = {
     PipelineState.WATCH,
     PipelineState.FIX,
     PipelineState.MERGE,
+    PipelineState.HUNG,
     PipelineState.PAUSED,
 }
 
