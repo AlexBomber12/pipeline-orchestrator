@@ -1451,6 +1451,63 @@ def test_handle_idle_proceeds_to_coding_when_no_matching_pr(
     assert runner.state.current_pr.number == 17
 
 
+def test_handle_idle_rereads_pause_flag_before_coding_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    task = QueueTask(
+        pr_id="PR-042",
+        title="Sample",
+        status=TaskStatus.TODO,
+        branch="pr-042-sample",
+    )
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: task)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    runner = _make_runner()
+    refresh_calls: list[str] = []
+    coding_calls: list[str] = []
+
+    async def fake_refresh_user_paused_from_redis() -> None:
+        refresh_calls.append("refresh")
+        runner.state.user_paused = True
+
+    async def fake_publish_state() -> None:
+        return None
+
+    async def fake_handle_coding() -> None:
+        coding_calls.append("coding")
+
+    monkeypatch.setattr(
+        runner,
+        "_refresh_user_paused_from_redis",
+        fake_refresh_user_paused_from_redis,
+    )
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+    monkeypatch.setattr(runner, "handle_coding", fake_handle_coding)
+
+    asyncio.run(runner.handle_idle())
+
+    assert refresh_calls == ["refresh"]
+    assert coding_calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert any(
+        entry["event"] == "Pause requested while preparing PR-042; deferring CODING"
+        for entry in runner.state.history
+    )
+
+
 def test_handle_idle_defers_on_gh_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

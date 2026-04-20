@@ -626,6 +626,14 @@ class IdleMixin:
                 await self.publish_state()
                 return
 
+        await self._refresh_user_paused_from_redis()
+        if self.state.user_paused:
+            self.state.current_task = None
+            self.log_event(
+                f"Pause requested while preparing {task.pr_id}; deferring CODING"
+            )
+            return
+
         self.state.state = PipelineState.CODING
         self.log_event(f"Picked task {task.pr_id}: {task.title}")
         await self.publish_state()
