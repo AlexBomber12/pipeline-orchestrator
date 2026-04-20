@@ -386,7 +386,7 @@
 - Branch: pr-139-mobile-responsive
 
 ## PR-140: Event log readability on narrow screens
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-140.md
 - Branch: pr-140-event-log-mobile
 
