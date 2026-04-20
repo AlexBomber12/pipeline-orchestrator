@@ -389,7 +389,6 @@
 - Status: TODO
 - Tasks file: tasks/PR-140.md
 - Branch: pr-140-event-log-mobile
-- Depends on: PR-139
 
 ## PR-141: Rate limit display only for the active coder
 - Status: TODO
