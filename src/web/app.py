@@ -255,6 +255,24 @@ def _coder_display_name(coder: str) -> str:
     return _CODER_LABELS.get(coder, coder)
 
 
+def _active_rate_limit_coder(
+    state: RepoState, effective_coder: str
+) -> str | None:
+    """Return the active coder whose rate-limit data should be shown."""
+    if state.current_task is None:
+        return None
+    if state.coder:
+        return state.coder
+    if effective_coder == "any":
+        return None
+    return effective_coder
+
+
+def _coder_rate_limit_supported(coder: str | None) -> bool:
+    """Return whether ``coder`` has meaningful rate-limit usage data."""
+    return coder in {"claude", "codex"}
+
+
 async def get_all_repo_states(
     redis_client: aioredis.Redis | None,
     config_path: str = CONFIG_PATH,
@@ -361,12 +379,24 @@ async def _repo_template_context(
     config = load_config(config_path)
     state = await get_repo_state(name, redis_client, config_path=config_path)
     repo_config = _find_repo_config_by_name(config, name)
+    effective_coder = _effective_coder_name(repo_config, config)
+    active_rate_limit_coder = _active_rate_limit_coder(state, effective_coder)
+    show_rate_limit_badge = _coder_rate_limit_supported(active_rate_limit_coder) and (
+        state.usage_session_percent is not None
+        or state.usage_weekly_percent is not None
+        or state.usage_api_degraded
+    )
     return {
         "repo": state,
         "repo_config": repo_config,
         "daemon": config.daemon,
         "coders": build_coder_registry().list_coders(),
-        "effective_coder": _effective_coder_name(repo_config, config),
+        "effective_coder": effective_coder,
+        "active_rate_limit_coder": active_rate_limit_coder,
+        "active_rate_limit_coder_label": (
+            "Claude" if active_rate_limit_coder == "claude" else "Codex"
+        ),
+        "show_rate_limit_badge": show_rate_limit_badge,
         "selected_repo_coder": _repo_coder_form_value(repo_config),
         "inherit_coder": _daemon_default_coder_name(config),
         "coder_update_message": coder_update_message,
