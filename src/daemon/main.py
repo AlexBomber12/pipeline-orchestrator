@@ -217,7 +217,15 @@ def _sync_runners(
     for key, repo in desired.items():
         if key in runners:
             runner = runners[key]
-            if hasattr(runner, "stage_config_reload"):
+            active_changed = runner.repo_config.active != repo.active
+            if not runner.repo_config.active or active_changed:
+                runner.repo_config = repo
+                runner.app_config = config
+                runner.set_usage_providers(
+                    claude_usage_provider,
+                    codex_usage_provider,
+                )
+            elif hasattr(runner, "stage_config_reload"):
                 runner.stage_config_reload(
                     repo,
                     config,

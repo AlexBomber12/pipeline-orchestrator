@@ -807,6 +807,34 @@ def test_repo_detail_route_renders_full_page(
     assert "Event log" in body
 
 
+def test_repo_summary_banner_keeps_fragment_wrapped(
+    two_repo_config: Path,
+) -> None:
+    now = datetime(2026, 4, 20, 17, 0, 0, tzinfo=timezone.utc)
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        last_updated=now,
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+
+    context = asyncio.run(
+        web_app._repo_template_context(
+            "example__alpha",
+            fake,
+            coder_update_message="Switching to Codex.",
+        )
+    )
+    rendered = web_app.templates.get_template(
+        "components/repo_summary.html"
+    ).render(context)
+
+    assert rendered.count("<section") == rendered.count("</section>")
+    assert '<div class="mb-4 rounded-lg border border-accent/30 bg-accent/10 px-4 py-3 text-sm text-accent">' in rendered
+    assert "Switching to Codex." in rendered
+
+
 def _metrics_record(
     run_id: str,
     *,
