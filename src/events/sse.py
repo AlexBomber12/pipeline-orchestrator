@@ -59,9 +59,9 @@ async def stream_repo_events(
     """Return an SSE stream for repo history replay and live Redis Pub/Sub."""
     pubsub = None
     try:
-        history = await redis_client.lrange(_history_name(repo_name), 0, history_limit - 1)
         pubsub = redis_client.pubsub()
         await pubsub.subscribe(_channel_name(repo_name))
+        history = await redis_client.lrange(_history_name(repo_name), 0, history_limit - 1)
     except RedisError as exc:
         if pubsub is not None:
             try:
@@ -72,7 +72,28 @@ async def stream_repo_events(
 
     async def _stream() -> AsyncIterator[bytes]:
         try:
-            for message in reversed(history):
+            history_messages = list(reversed(history))
+            replayed_messages = set(history_messages)
+            buffered_messages: list[str] = []
+            while True:
+                message = await pubsub.get_message(
+                    ignore_subscribe_messages=True,
+                    timeout=0.0,
+                )
+                if message is None:
+                    break
+                data = message.get("data")
+                if isinstance(data, bytes):
+                    data = data.decode("utf-8")
+                if isinstance(data, str) and data not in replayed_messages:
+                    buffered_messages.append(data)
+
+            for message in history_messages:
+                if await _is_disconnected(request):
+                    return
+                yield format_sse_event(message)
+
+            for message in buffered_messages:
                 if await _is_disconnected(request):
                     return
                 yield format_sse_event(message)
@@ -106,6 +127,9 @@ async def stream_repo_events(
             except RedisError:
                 pass
             finally:
-                await pubsub.aclose()
+                try:
+                    await pubsub.aclose()
+                except RedisError:
+                    pass
 
     return _stream()

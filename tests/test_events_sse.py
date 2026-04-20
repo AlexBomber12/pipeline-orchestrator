@@ -47,6 +47,11 @@ class _FakePubSub:
         ignore_subscribe_messages: bool = True,
         timeout: float = 0.0,
     ) -> dict[str, Any] | None:
+        if timeout <= 0:
+            try:
+                return self.messages.get_nowait()
+            except asyncio.QueueEmpty:
+                return None
         try:
             return await asyncio.wait_for(self.messages.get(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -230,6 +235,100 @@ async def test_stream_repo_events_returns_keepalive_without_extra_idle_sleep() -
     assert pubsub.closed is True
 
 
+async def test_stream_repo_events_forwards_buffered_live_message_after_history_replay() -> None:
+    redis = _FakeRedis()
+    request = _Request()
+    buffered_message = json.dumps(
+        publisher.build_repo_event("example__repo", "progress_updated", {"percent": 10})
+    )
+
+    stream = await stream_repo_events(
+        redis,
+        "example__repo",
+        request,
+        keepalive_interval=0.0,
+        poll_interval=0.01,
+    )
+    pubsub = await _wait_for_pubsub(redis)
+    await pubsub.messages.put({"data": buffered_message.encode("utf-8")})
+
+    assert await anext(stream) == format_sse_event(buffered_message)
+    assert await anext(stream) == b":keepalive\n\n"
+
+    request.disconnected = True
+    try:
+        await anext(stream)
+    except StopAsyncIteration:
+        pass
+    else:
+        raise AssertionError("stream should stop after disconnect")
+
+
+async def test_stream_repo_events_subscribes_before_history_without_replaying_duplicates() -> None:
+    redis = _FakeRedis()
+    request = _Request()
+    old_message = json.dumps(
+        publisher.build_repo_event("example__repo", "state_changed", {"state": "IDLE"})
+    )
+    raced_message = json.dumps(
+        publisher.build_repo_event("example__repo", "progress_updated", {"percent": 10})
+    )
+    redis.lists["repo-events-history:example__repo"] = [old_message]
+
+    async def _racing_lrange(key: str, start: int, stop: int) -> list[str]:
+        redis.lists[key].insert(0, raced_message)
+        await redis.publish("repo-events:example__repo", raced_message)
+        values = redis.lists.get(key, [])
+        return values[start : stop + 1]
+
+    redis.lrange = _racing_lrange  # type: ignore[method-assign]
+
+    stream = await stream_repo_events(
+        redis,
+        "example__repo",
+        request,
+        keepalive_interval=0.0,
+        poll_interval=0.01,
+    )
+
+    assert await anext(stream) == format_sse_event(old_message)
+    assert await anext(stream) == format_sse_event(raced_message)
+    assert await anext(stream) == b":keepalive\n\n"
+
+    request.disconnected = True
+    try:
+        await anext(stream)
+    except StopAsyncIteration:
+        pass
+    else:
+        raise AssertionError("stream should stop after disconnect")
+
+
+async def test_stream_repo_events_stops_before_buffered_messages_when_disconnected() -> None:
+    redis = _FakeRedis()
+    request = _Request()
+    buffered_message = json.dumps(
+        publisher.build_repo_event("example__repo", "progress_updated", {"percent": 10})
+    )
+
+    stream = await stream_repo_events(
+        redis,
+        "example__repo",
+        request,
+        keepalive_interval=0.0,
+        poll_interval=0.01,
+    )
+    pubsub = await _wait_for_pubsub(redis)
+    await pubsub.messages.put({"data": buffered_message.encode("utf-8")})
+    request.disconnected = True
+
+    frames = [frame async for frame in stream]
+
+    assert frames == []
+    assert pubsub.unsubscribed == ["repo-events:example__repo"]
+    assert pubsub.closed is True
+
+
 async def test_stream_repo_events_raises_unavailable_when_history_fetch_fails() -> None:
     redis = _FakeRedis()
     request = _Request()
@@ -259,6 +358,30 @@ async def test_stream_repo_events_closes_pubsub_when_unsubscribe_fails() -> None
     )
     pubsub = await _wait_for_pubsub(redis)
     pubsub.unsubscribe_error = ConnectionError("redis down")
+    request.disconnected = True
+
+    try:
+        await anext(stream)
+    except StopAsyncIteration:
+        pass
+    else:
+        raise AssertionError("stream should stop after disconnect")
+
+    assert pubsub.closed is True
+
+
+async def test_stream_repo_events_ignores_close_errors_during_disconnect_teardown() -> None:
+    redis = _FakeRedis()
+    request = _Request()
+    stream = await stream_repo_events(
+        redis,
+        "example__repo",
+        request,
+        keepalive_interval=0.0,
+        poll_interval=0.01,
+    )
+    pubsub = await _wait_for_pubsub(redis)
+    pubsub.close_error = ConnectionError("close failed")
     request.disconnected = True
 
     try:
