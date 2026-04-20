@@ -73,6 +73,53 @@ def _runner_requires_idle_boundary(runner: Any) -> bool:
     return state in _DEFERRED_RUNNER_CONFIG_STATES
 
 
+def _repo_config_differs_only_in_coder(current: RepoConfig, updated: RepoConfig) -> bool:
+    """Return whether the repo delta is limited to the coder selection."""
+    if current.coder == updated.coder:
+        return False
+    updated_payload = updated.model_dump()
+    updated_payload["coder"] = current.coder
+    return current.model_dump() == updated_payload
+
+
+def _app_config_differs_only_in_repo_coder(
+    current: AppConfig,
+    updated: AppConfig,
+    repo_key: str,
+) -> bool:
+    """Return whether the app-config delta is limited to one repo's coder field."""
+    current_repo = _find_repo_config(current, repo_key)
+    updated_repo = _find_repo_config(updated, repo_key)
+    if current_repo is None or updated_repo is None:
+        return False
+    if not _repo_config_differs_only_in_coder(current_repo, updated_repo):
+        return False
+
+    current_payload = current.model_dump(mode="json")
+    updated_payload = updated.model_dump(mode="json")
+
+    current_repos = current_payload.get("repositories", [])
+    updated_repos = updated_payload.get("repositories", [])
+    if len(current_repos) != len(updated_repos):
+        return False
+
+    for current_repo_payload, updated_repo_payload in zip(current_repos, updated_repos):
+        if normalize_repo_url(current_repo_payload["url"]) != normalize_repo_url(
+            updated_repo_payload["url"]
+        ):
+            return False
+        if normalize_repo_url(current_repo_payload["url"]) == repo_key:
+            current_repo_payload = {
+                **current_repo_payload,
+                "coder": updated_repo_payload.get("coder"),
+            }
+        if current_repo_payload != updated_repo_payload:
+            return False
+
+    current_payload["repositories"] = updated_repos
+    return current_payload == updated_payload
+
+
 def _setup_git_auth() -> None:
     """Run ``gh auth setup-git`` so git clone/push works automatically."""
     try:
@@ -233,10 +280,19 @@ def _sync_runners(
         if key in runners:
             runner = runners[key]
             active_changed = runner.repo_config.active != repo.active
+            defer_coder_only_reload = (
+                _runner_requires_idle_boundary(runner)
+                and _repo_config_differs_only_in_coder(runner.repo_config, repo)
+                and _app_config_differs_only_in_repo_coder(
+                    runner.app_config,
+                    config,
+                    key,
+                )
+            )
             if (
                 not runner.repo_config.active
                 or active_changed
-                or not _runner_requires_idle_boundary(runner)
+                or not defer_coder_only_reload
             ):
                 runner.repo_config = repo
                 runner.app_config = config
