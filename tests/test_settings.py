@@ -1400,9 +1400,9 @@ def test_settings_daemon_renders_hints_for_all_fields(empty_config: Path) -> Non
     # Each field should have at least one hint (text-xs text-gray-500) nearby.
     hints = [
         "How often the daemon checks each repo",
-        "Max time Claude gets before being killed",
+        "Max time the coder gets before being killed",
         "Codex doesn't review in time",
-        "Kills Claude during FIX if no push",
+        "Kills the coder during FIX if no push",
         "re-ping Codex on the anchor comment",
         "session usage exceeds this threshold",
         "run until API returns 429",
