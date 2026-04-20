@@ -1286,6 +1286,52 @@ def test_updated_header_has_data_ts(
     assert f'data-ts="{now.isoformat()}"' in body
 
 
+@pytest.mark.parametrize(
+    ("state", "should_pulse"),
+    [
+        (PipelineState.CODING, True),
+        (PipelineState.WATCH, True),
+        (PipelineState.FIX, True),
+        (PipelineState.MERGE, True),
+        (PipelineState.IDLE, False),
+        (PipelineState.PREFLIGHT, False),
+        (PipelineState.PAUSED, False),
+        (PipelineState.HUNG, False),
+        (PipelineState.ERROR, False),
+    ],
+)
+def test_repo_detail_state_badge_pulses_only_for_active_states(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: PipelineState,
+    should_pulse: bool,
+) -> None:
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=state,
+        last_updated=datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc),
+    )
+    async def _fake_get_repo_state(
+        name: str,
+        redis_client: object | None = None,
+        config_path: str = "config.yml",
+    ) -> RepoState:
+        assert name == "example__alpha"
+        assert config_path
+        return stored
+
+    monkeypatch.setattr(web_app, "get_repo_state", _fake_get_repo_state)
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo/example__alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    assert state.value in body
+    assert body.count("pulse-dot") == (1 if should_pulse else 0)
+
+
 def test_index_shows_warning_when_redis_key_missing(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
