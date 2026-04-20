@@ -263,6 +263,27 @@ class FixMixin(BreachMixin):
                 f"paused until {self.state.rate_limited_until}"
             )
             return
+
+        async def pause_for_stop_if_requested() -> bool:
+            if self._stop_requested:
+                requested = True
+            else:
+                requested = await self._pop_stop_request()
+                if requested:
+                    self._stop_requested = True
+                    self.state.user_paused = True
+                    self.log_event(
+                        "User stop requested after FIX exit; honoring persisted stop"
+                    )
+            if not requested:
+                return False
+            self.state.state = PipelineState.PAUSED
+            self.state.error_message = None
+            self.log_event("FIX aborted: user stop requested")
+            return True
+
+        if await pause_for_stop_if_requested():
+            return
         if idle_flag["timed_out"]:
             self.state.state = PipelineState.ERROR
             self.state.error_message = (
@@ -272,6 +293,8 @@ class FixMixin(BreachMixin):
             await self._save_cli_log("", "", "FIX idle timeout")
             return
         await self._save_cli_log(stdout, stderr, f"FIX REVIEW output [{coder_name}]")
+        if await pause_for_stop_if_requested():
+            return
         if code != 0:
             self._detect_rate_limit(stderr, coder_name=coder_name)
             if self.state.rate_limited_until is not None:

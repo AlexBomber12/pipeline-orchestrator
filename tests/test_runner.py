@@ -2329,6 +2329,39 @@ def test_handle_fix_honors_stop_requested_during_fix(
     )
 
 
+def test_handle_fix_honors_persisted_stop_after_fast_fix_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "fix_review_async",
+        _async_cli_result(1, "", "fix failed fast"),
+    )
+
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019")
+    runner.redis.store[f"control:{runner.name}:stop"] = "1"
+
+    async def stale_stop_monitor(
+        _cli_task: asyncio.Task[tuple[int, str, str]],
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_monitor_stop_request", stale_stop_monitor)
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.user_paused is True
+    assert runner.state.error_message is None
+    assert f"control:{runner.name}:stop" not in runner.redis.store
+    assert any(
+        "after fix exit" in entry["event"].lower()
+        for entry in runner.state.history
+    )
+
+
 def test_fix_increments_iterations(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
