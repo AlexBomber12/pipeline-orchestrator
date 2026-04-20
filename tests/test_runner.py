@@ -442,6 +442,8 @@ def test_reload_repo_config_if_dirty_clears_staged_reload_after_disk_refresh(
     assert runner._pending_repo_config is None
     assert runner._pending_app_config is None
     assert runner._pending_usage_providers is None
+    assert runner._claude_usage_provider.fetch() == "new-claude"
+    assert runner._codex_usage_provider.fetch() == "new-codex"
 
 
 def _allow_all_coder_auth(monkeypatch: pytest.MonkeyPatch) -> None:

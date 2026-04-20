@@ -290,6 +290,8 @@ class PipelineRunner(
             if repo_slug_from_url(repo.url) == self.name:
                 self.repo_config = repo
                 self.app_config = config
+                if self._pending_usage_providers is not None:
+                    self.set_usage_providers(*self._pending_usage_providers)
                 self.clear_staged_config_reload()
                 await self.redis.delete(dirty_key)
                 self.log_event("Reloaded repo config from config.yml")
