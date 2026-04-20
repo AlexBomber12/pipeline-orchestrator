@@ -896,10 +896,6 @@ class PipelineRunner(
         elif current == PipelineState.PAUSED:
             await self.handle_paused()
         elif current == PipelineState.ERROR:
-            await self.reload_repo_config_if_dirty()
-            if not self.repo_config.active:
-                await self.publish_state()
-                return
             if self.state.rate_limited_until is not None:
                 self.state.state = PipelineState.PAUSED
                 self.log_event("Legacy ERROR + rate_limited_until -> PAUSED")

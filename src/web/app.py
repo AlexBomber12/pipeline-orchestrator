@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import logging
 import os
 import subprocess
 import tempfile
@@ -50,6 +51,7 @@ from src.utils import repo_slug_from_url
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 CONFIG_PATH = "config.yml"
 REPOS_DIR = "/data/repos"
+logger = logging.getLogger(__name__)
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
@@ -1069,6 +1071,10 @@ async def post_repo_detail_coder(
                         pipe.set(state_key, latest_state.model_dump_json())
 
                     await redis_client.transaction(_transaction, state_key)
+    except Exception:
+        logger.warning("Failed to refresh repo state after coder update", exc_info=True)
+
+    try:
         await publish_repo_event(
             name,
             "config_reloaded",
@@ -1079,7 +1085,7 @@ async def post_repo_detail_coder(
             redis_client,
         )
     except Exception:
-        return HTMLResponse("Failed to update repository state", status_code=503)
+        logger.warning("Failed to publish coder update event", exc_info=True)
 
     current_state = await get_repo_state(name, redis_client, config_path=CONFIG_PATH)
     applies_after_current_pr = (

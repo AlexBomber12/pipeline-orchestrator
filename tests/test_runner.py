@@ -13591,7 +13591,7 @@ def test_run_cycle_dispatches_error_handler_when_ai_enabled(
     assert publishes == ["published"]
 
 
-def test_run_cycle_reloads_dirty_config_before_error_handler(
+def test_run_cycle_does_not_reload_dirty_config_before_error_handler(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
@@ -13623,7 +13623,7 @@ def test_run_cycle_reloads_dirty_config_before_error_handler(
 
     asyncio.run(runner.run_cycle())
 
-    assert calls == ["reload", "handle_error", "publish"]
+    assert calls == ["handle_error", "publish"]
 
 
 def test_run_cycle_stops_idle_dispatch_when_dirty_reload_disables_repo(
@@ -13671,7 +13671,7 @@ def test_run_cycle_stops_idle_dispatch_when_dirty_reload_disables_repo(
     assert calls[-1] == "publish"
 
 
-def test_run_cycle_stops_error_dispatch_when_dirty_reload_disables_repo(
+def test_run_cycle_error_state_ignores_dirty_reload_until_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
@@ -13704,7 +13704,7 @@ def test_run_cycle_stops_error_dispatch_when_dirty_reload_disables_repo(
 
     asyncio.run(runner.run_cycle())
 
-    assert calls == ["reload", "publish"]
+    assert calls == ["handle_error", "publish"]
 
 
 # ── ErrorCategory / _classify_error ──────────────────────────────────

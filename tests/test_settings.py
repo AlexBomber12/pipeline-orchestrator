@@ -1988,7 +1988,7 @@ def test_post_repo_detail_coder_requires_redis(
     assert "Redis unavailable" in response.text
 
 
-def test_post_repo_detail_coder_returns_503_when_state_update_fails(
+def test_post_repo_detail_coder_returns_success_when_state_update_fails(
     one_repo_config: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2014,8 +2014,10 @@ def test_post_repo_detail_coder_returns_503_when_state_update_fails(
             data={"coder": "codex"},
         )
 
-    assert response.status_code == 503
-    assert "Failed to update repository state" in response.text
+    assert response.status_code == 200
+    assert "Switching to Codex CLI." in response.text
+    reloaded = load_config(str(one_repo_config))
+    assert reloaded.repositories[0].coder == "codex"
 
 
 def test_put_repo_detail_coder_still_updates_summary_fragment(
