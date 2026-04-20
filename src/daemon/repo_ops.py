@@ -307,7 +307,13 @@ return 0
                 lambda: git_ops._git(self.repo_path, "push", "origin", branch, timeout=60),
                 operation_name=f"git push origin {branch}",
             )
-            task_count = sum(1 for name in filenames if name.startswith("PR-") and name.endswith(".md"))
+            task_count = len(
+                {
+                    name
+                    for name in filenames
+                    if name.startswith("PR-") and name.endswith(".md")
+                }
+            )
             self.log_event(
                 f"Uploaded {task_count} task files to tasks/ and pushed to {branch}"
             )

@@ -121,6 +121,18 @@ def _zip_file(
     return ("files", (name, buffer.getvalue(), "application/zip"))
 
 
+def _zip_file_entries(
+    entries: list[tuple[str, bytes]],
+    *,
+    name: str = "tasks.zip",
+) -> tuple[str, tuple[str, bytes, str]]:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for entry_name, content in entries:
+            archive.writestr(entry_name, content)
+    return ("files", (name, buffer.getvalue(), "application/zip"))
+
+
 def _task_bytes(name: str = "PR-001.md", *, pr_id: str = "PR-001") -> bytes:
     return _task_file(name, pr_id=pr_id)[1][1]
 
@@ -426,6 +438,28 @@ def test_upload_single_file_zip_success_message(
 
     assert resp.status_code == 200
     assert "Accepted 1 task file (PR-001)." in resp.text
+
+
+def test_upload_zip_with_duplicate_task_entries_reports_unique_task_count(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    resp = _post_upload(
+        [
+            _zip_file_entries(
+                [
+                    ("PR-001.md", _task_bytes()),
+                    ("PR-001.md", _task_bytes()),
+                ]
+            )
+        ]
+    )
+
+    assert resp.status_code == 200
+    assert "Accepted 1 task file (PR-001)." in resp.text
+    staging = next((uploads_dir / "example__alpha").iterdir())
+    assert [path.name for path in staging.iterdir()] == ["PR-001.md"]
 
 
 test_upload_zip_with_nested_directories_rejected = _make_zip_error_test([_zip_file({"nested/PR-001.md": _task_bytes()})], 422, "path separators")  # noqa: E501

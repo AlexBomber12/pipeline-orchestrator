@@ -527,6 +527,37 @@ def test_process_pending_uploads_reports_configured_push_branch(
     )
 
 
+def test_process_pending_uploads_counts_unique_task_filenames_in_log_event(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = _Runner(tmp_path)
+    Path(runner.repo_path).mkdir(parents=True)
+    staging = tmp_path / "uploads" / "demo"
+    staging.mkdir(parents=True)
+    (staging / "QUEUE.md").write_text("# Queue\n", encoding="utf-8")
+    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
+    (staging / "PR-002.md").write_text("# PR-002\n", encoding="utf-8")
+    key = f"upload:{runner.name}:pending"
+    manifest = json.dumps(
+        {
+            "files": ["QUEUE.md", "PR-001.md", "PR-001.md", "PR-002.md"],
+            "staging_dir": str(staging),
+        }
+    )
+    runner.redis.store[key] = manifest
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
+    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
+    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
+
+    assert _run(runner.process_pending_uploads()) is True
+    assert any(
+        "Uploaded 2 task files to tasks/ and pushed to main" in event
+        for event in runner.events
+    )
+
+
 def test_process_pending_uploads_handles_failures_and_safe_mode(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

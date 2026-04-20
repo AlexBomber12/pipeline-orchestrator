@@ -1942,6 +1942,10 @@ def _format_upload_message_lines(message: str) -> list[str]:
     return [line for line in message.splitlines() if line.strip()]
 
 
+def _unique_filenames(filenames: list[str]) -> list[str]:
+    return list(dict.fromkeys(filenames))
+
+
 def _task_upload_summary(task_filenames: list[str]) -> str:
     if not task_filenames:
         return ""
@@ -1972,12 +1976,16 @@ def _task_upload_summary(task_filenames: list[str]) -> str:
 
 
 def _build_upload_success_message(filenames: list[str]) -> str:
-    task_filenames = [
-        filename for filename in filenames if _re.fullmatch(_TASK_UPLOAD_PATTERN, filename)
-    ]
-    helper_filenames = [
-        filename for filename in filenames if filename not in task_filenames
-    ]
+    task_filenames = _unique_filenames(
+        [
+            filename for filename in filenames if _re.fullmatch(_TASK_UPLOAD_PATTERN, filename)
+        ]
+    )
+    helper_filenames = _unique_filenames(
+        [
+            filename for filename in filenames if not _re.fullmatch(_TASK_UPLOAD_PATTERN, filename)
+        ]
+    )
 
     task_count = len(task_filenames)
     noun = "file" if task_count == 1 else "files"
