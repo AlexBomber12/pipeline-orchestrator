@@ -1,0 +1,60 @@
+{% macro play_icon() -%}
+<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" class="w-5 h-5">
+    <path d="M8.25 6.75a.75.75 0 0 1 1.144-.638l8.25 5.25a.75.75 0 0 1 0 1.276l-8.25 5.25A.75.75 0 0 1 8.25 17.25V6.75Z" />
+</svg>
+{%- endmacro %}
+
+{% macro pause_icon() -%}
+<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" class="w-5 h-5">
+    <path d="M6.75 5.25A.75.75 0 0 1 7.5 4.5h2.25a.75.75 0 0 1 .75.75v13.5a.75.75 0 0 1-.75.75H7.5a.75.75 0 0 1-.75-.75V5.25Zm6.75 0a.75.75 0 0 1 .75-.75h2.25a.75.75 0 0 1 .75.75v13.5a.75.75 0 0 1-.75.75h-2.25a.75.75 0 0 1-.75-.75V5.25Z" />
+</svg>
+{%- endmacro %}
+
+{% macro stop_icon() -%}
+<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" class="w-5 h-5">
+    <path d="M7.5 6A1.5 1.5 0 0 0 6 7.5v9A1.5 1.5 0 0 0 7.5 18h9a1.5 1.5 0 0 0 1.5-1.5v-9A1.5 1.5 0 0 0 16.5 6h-9Z" />
+</svg>
+{%- endmacro %}
+
+{% macro repo_controls(repo, extra_classes='') -%}
+{% set active_states = ['CODING', 'WATCH', 'FIX', 'MERGE'] %}
+{% set show_play = repo.user_paused or (repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done) %}
+{% set show_pause = (repo.state.value in active_states) and not repo.user_paused %}
+{% set show_stop = repo.state.value in active_states %}
+<div class="flex items-center gap-2 {{ extra_classes }}">
+    {% if show_play %}
+    <button type="button"
+            aria-label="Resume daemon"
+            title="Resume"
+            class="inline-flex h-11 w-11 items-center justify-center rounded-lg border border-white/10 bg-surface-3/60 text-gray-300 transition hover:border-accent/40 hover:bg-accent/10 hover:text-accent"
+            hx-post="/repos/{{ repo.name }}/resume"
+            hx-swap="none"
+            onclick="event.stopPropagation()">
+        {{ play_icon() }}
+    </button>
+    {% endif %}
+    {% if show_pause %}
+    <button type="button"
+            aria-label="Pause daemon"
+            title="Pause"
+            class="inline-flex h-11 w-11 items-center justify-center rounded-lg border border-white/10 bg-surface-3/60 text-gray-300 transition hover:border-accent/40 hover:bg-accent/10 hover:text-accent"
+            hx-post="/repos/{{ repo.name }}/pause"
+            hx-swap="none"
+            onclick="event.stopPropagation()">
+        {{ pause_icon() }}
+    </button>
+    {% endif %}
+    {% if show_stop %}
+    <button type="button"
+            aria-label="Stop running coder"
+            title="Stop"
+            class="inline-flex h-11 w-11 items-center justify-center rounded-lg border border-fail/30 bg-fail/10 text-fail transition hover:border-fail/50 hover:bg-fail/20"
+            hx-post="/repos/{{ repo.name }}/stop"
+            hx-confirm="Stop the running coder? The working tree may be left dirty."
+            hx-swap="none"
+            onclick="event.stopPropagation()">
+        {{ stop_icon() }}
+    </button>
+    {% endif %}
+</div>
+{%- endmacro %}

@@ -1143,6 +1143,111 @@ def test_repo_card_has_onclick(
     assert "event.target.closest('label,input,button,a')" in body
 
 
+def test_repo_card_renders_pause_and_stop_controls_for_active_repo(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.CODING,
+        user_paused=False,
+        queue_done=0,
+        queue_total=2,
+        last_updated=now,
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.get("/partials/repo-list")
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'hx-post="/repos/example__alpha/pause"' in body
+    assert 'hx-post="/repos/example__alpha/stop"' in body
+    assert 'hx-post="/repos/example__alpha/resume"' not in body
+    assert 'aria-label="Pause daemon"' in body
+    assert 'aria-label="Stop running coder"' in body
+    assert 'hx-confirm="Stop the running coder? The working tree may be left dirty."' in body
+    assert 'onclick="event.stopPropagation()"' in body
+    assert 'h-11 w-11' in body
+
+
+@pytest.mark.parametrize(
+    ("state", "user_paused", "queue_done", "queue_total", "present", "absent"),
+    [
+        (
+            PipelineState.PAUSED,
+            True,
+            0,
+            1,
+            ('hx-post="/repos/example__alpha/resume"', 'aria-label="Resume daemon"'),
+            (
+                'hx-post="/repos/example__alpha/pause"',
+                'hx-post="/repos/example__alpha/stop"',
+            ),
+        ),
+        (
+            PipelineState.IDLE,
+            False,
+            0,
+            2,
+            ('hx-post="/repos/example__alpha/resume"',),
+            (
+                'hx-post="/repos/example__alpha/pause"',
+                'hx-post="/repos/example__alpha/stop"',
+            ),
+        ),
+        (
+            PipelineState.MERGE,
+            False,
+            1,
+            1,
+            (
+                'hx-post="/repos/example__alpha/pause"',
+                'hx-post="/repos/example__alpha/stop"',
+            ),
+            ('hx-post="/repos/example__alpha/resume"',),
+        ),
+    ],
+)
+def test_repo_detail_renders_control_visibility_matrix(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: PipelineState,
+    user_paused: bool,
+    queue_done: int,
+    queue_total: int,
+    present: tuple[str, ...],
+    absent: tuple[str, ...],
+) -> None:
+    now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=state,
+        user_paused=user_paused,
+        queue_done=queue_done,
+        queue_total=queue_total,
+        last_updated=now,
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.get("/repo/example__alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    for needle in present:
+        assert needle in body
+    for needle in absent:
+        assert needle not in body
+
+
 def test_updated_header_has_data_ts(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
