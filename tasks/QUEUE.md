@@ -326,7 +326,7 @@
 - Branch: pr-127-control-endpoints-backend
 
 ## PR-128: Play/Pause/Stop icon controls in UI
-- Status: TODO
+- Status: DOING
 - Tasks file: tasks/PR-128.md
 - Branch: pr-128-control-icons-ui
 
