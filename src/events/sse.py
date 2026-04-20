@@ -57,11 +57,17 @@ async def stream_repo_events(
     poll_interval: float = POLL_INTERVAL_SECONDS,
 ) -> AsyncIterator[bytes]:
     """Return an SSE stream for repo history replay and live Redis Pub/Sub."""
+    pubsub = None
     try:
         history = await redis_client.lrange(_history_name(repo_name), 0, history_limit - 1)
         pubsub = redis_client.pubsub()
         await pubsub.subscribe(_channel_name(repo_name))
     except RedisError as exc:
+        if pubsub is not None:
+            try:
+                await pubsub.aclose()
+            except RedisError:
+                pass
         raise RepoEventsUnavailableError("Redis unavailable") from exc
 
     async def _stream() -> AsyncIterator[bytes]:

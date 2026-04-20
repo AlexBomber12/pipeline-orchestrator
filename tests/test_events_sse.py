@@ -25,9 +25,13 @@ class _FakePubSub:
         self.subscribed = asyncio.Event()
         self.unsubscribed: list[str] = []
         self.closed = False
+        self.subscribe_error: Exception | None = None
         self.unsubscribe_error: Exception | None = None
+        self.close_error: Exception | None = None
 
     async def subscribe(self, channel: str) -> None:
+        if self.subscribe_error is not None:
+            raise self.subscribe_error
         self.channels.add(channel)
         self.subscribed.set()
 
@@ -49,6 +53,9 @@ class _FakePubSub:
             return None
 
     async def aclose(self) -> None:
+        if self.close_error is not None:
+            self.closed = True
+            raise self.close_error
         self.closed = True
 
 
@@ -260,6 +267,49 @@ async def test_stream_repo_events_closes_pubsub_when_unsubscribe_fails() -> None
         pass
     else:
         raise AssertionError("stream should stop after disconnect")
+
+    assert pubsub.closed is True
+
+
+async def test_stream_repo_events_closes_pubsub_when_subscribe_fails() -> None:
+    redis = _FakeRedis()
+    request = _Request()
+    pubsub = _FakePubSub()
+    pubsub.subscribe_error = ConnectionError("redis down")
+
+    def _pubsub() -> _FakePubSub:
+        return pubsub
+
+    redis.pubsub = _pubsub  # type: ignore[method-assign]
+
+    try:
+        await stream_repo_events(redis, "example__repo", request)
+    except RepoEventsUnavailableError as exc:
+        assert str(exc) == "Redis unavailable"
+    else:
+        raise AssertionError("stream setup should fail when Redis subscribe fails")
+
+    assert pubsub.closed is True
+
+
+async def test_stream_repo_events_ignores_close_errors_after_subscribe_failure() -> None:
+    redis = _FakeRedis()
+    request = _Request()
+    pubsub = _FakePubSub()
+    pubsub.subscribe_error = ConnectionError("redis down")
+    pubsub.close_error = ConnectionError("close failed")
+
+    def _pubsub() -> _FakePubSub:
+        return pubsub
+
+    redis.pubsub = _pubsub  # type: ignore[method-assign]
+
+    try:
+        await stream_repo_events(redis, "example__repo", request)
+    except RepoEventsUnavailableError as exc:
+        assert str(exc) == "Redis unavailable"
+    else:
+        raise AssertionError("stream setup should fail when Redis subscribe fails")
 
     assert pubsub.closed is True
 
