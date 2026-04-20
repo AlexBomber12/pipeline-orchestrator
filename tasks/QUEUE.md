@@ -341,7 +341,7 @@
 - Branch: pr-130-event-log-dedup
 
 ## PR-131: Active state label pulses while daemon is live
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-131.md
 - Branch: pr-131-active-state-pulse
 
