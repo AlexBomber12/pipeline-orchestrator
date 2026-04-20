@@ -184,15 +184,14 @@ class FixMixin(BreachMixin):
                     breach_dir, breach_run_id, claude_task, breach_flag,
                 )
             )
+        stop_cancelled = False
         try:
             code, stdout, stderr = await claude_task
         except asyncio.CancelledError:
             if self._stop_requested:
-                self.state.state = PipelineState.PAUSED
-                self.state.error_message = None
-                self.log_event("FIX aborted: user stop requested")
-                return
-            if breach_flag["breached"]:
+                stop_cancelled = True
+                code, stdout, stderr = 1, "", ""
+            elif breach_flag["breached"]:
                 if self.state.current_pr is not None:
                     self._rehydrate_last_push_at(self.state.current_pr)
                     try:
@@ -221,9 +220,10 @@ class FixMixin(BreachMixin):
                     f"paused until {self.state.rate_limited_until}"
                 )
                 return
-            if not idle_flag["timed_out"]:
+            elif not idle_flag["timed_out"]:
                 raise
-            code, stdout, stderr = 1, "", ""
+            else:
+                code, stdout, stderr = 1, "", ""
         finally:
             stop_monitor.cancel()
             if breach_monitor is not None:
@@ -293,6 +293,48 @@ class FixMixin(BreachMixin):
             self.log_event("FIX aborted: user stop requested")
             return True
 
+        def read_head_after_fix() -> str | None:
+            try:
+                return git_ops._git(
+                    self.repo_path, "rev-parse", "HEAD"
+                ).stdout.strip()
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+            ) as exc:
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = f"rev-parse after fix failed: {exc}"
+                self.log_event(self.state.error_message)
+                return None
+
+        def record_fix_push(head_after: str, failure_detail: str) -> bool:
+            if head_before and head_before == head_after:
+                return True
+
+            push_time = datetime.now(timezone.utc)
+            self._last_push_at = push_time
+            if self.state.current_pr is not None:
+                self._last_push_at_pr_number = self.state.current_pr.number
+                self.state.current_pr.push_count += 1
+                self.state.current_pr.last_activity = push_time
+                iteration = self.state.current_pr.push_count
+            else:
+                iteration = 0
+
+            self.log_event(f"Fix pushed, iteration #{iteration}")
+            if (
+                self.state.current_pr is not None
+                and not self._post_codex_review(self.state.current_pr.number)
+            ):
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = (
+                    f"Failed to post @codex review on PR "
+                    f"#{self.state.current_pr.number} {failure_detail}"
+                )
+                return False
+            return True
+
         await capture_stop_requested_after_exit()
         if idle_flag["timed_out"]:
             self.state.state = PipelineState.ERROR
@@ -304,6 +346,21 @@ class FixMixin(BreachMixin):
             return
         await self._save_cli_log(stdout, stderr, f"FIX REVIEW output [{coder_name}]")
         await capture_stop_requested_after_exit()
+        if stop_cancelled:
+            head_after = read_head_after_fix()
+            if head_after is None:
+                return
+            if not record_fix_push(
+                head_after,
+                "after stop-cancel fix push; manual review trigger "
+                "required to avoid fix/push loop",
+            ):
+                return
+            if await pause_for_stop_after_bookkeeping():
+                return
+            self.state.state = PipelineState.PAUSED
+            self.state.error_message = None
+            return
         if code != 0:
             self._detect_rate_limit(stderr, coder_name=coder_name)
             if self.state.rate_limited_until is not None:
@@ -321,15 +378,8 @@ class FixMixin(BreachMixin):
             self.log_event(f"[{coder_name}] fix_review failed: {self.state.error_message}")
             return
 
-        head_after = ""  # PR-050: verify HEAD moved
-        try:
-            head_after = git_ops._git(
-                self.repo_path, "rev-parse", "HEAD"
-            ).stdout.strip()
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = f"rev-parse after fix failed: {exc}"
-            self.log_event(self.state.error_message)
+        head_after = read_head_after_fix()
+        if head_after is None:
             return
 
         if head_before and head_before == head_after:
@@ -343,27 +393,11 @@ class FixMixin(BreachMixin):
             self.state.state = PipelineState.WATCH
             return
 
-        push_time = datetime.now(timezone.utc)
-        self._last_push_at = push_time
-        if self.state.current_pr is not None:
-            self._last_push_at_pr_number = self.state.current_pr.number
-            self.state.current_pr.push_count += 1
-            self.state.current_pr.last_activity = push_time
-            iteration = self.state.current_pr.push_count
-        else:
-            iteration = 0
-
-        self.log_event(f"Fix pushed, iteration #{iteration}")
-        if (
-            self.state.current_pr is not None
-            and not self._post_codex_review(self.state.current_pr.number)
+        if not record_fix_push(
+            head_after,
+            "after fix push; manual review trigger required "
+            "to avoid fix/push loop",
         ):
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = (
-                f"Failed to post @codex review on PR "
-                f"#{self.state.current_pr.number} after fix push; "
-                "manual review trigger required to avoid fix/push loop"
-            )
             return
         if await pause_for_stop_after_bookkeeping():
             return

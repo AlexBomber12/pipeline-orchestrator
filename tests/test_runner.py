@@ -2369,6 +2369,85 @@ def test_handle_fix_honors_stop_requested_during_fix(
     )
 
 
+def test_handle_fix_finishes_push_bookkeeping_before_stop_cancel_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop-cancelled FIX must still record a completed push before pausing."""
+    rev_parse_calls = {"count": 0}
+    posted: list[int] = []
+    saved_logs: list[tuple[str, str, str]] = []
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_calls["count"] += 1
+            sha = "aaa111\n" if rev_parse_calls["count"] == 1 else "bbb222\n"
+            return _FakeCompletedProcess(args=["git", *args], stdout=sha, returncode=0)
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        await asyncio.Future()
+        return (0, "", "")
+
+    async def no_idle_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    async def no_breach_monitor(
+        self: object,
+        breach_dir: str,
+        run_id: str,
+        claude_task: asyncio.Task,  # type: ignore[type-arg]
+        breach_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=42, branch="pr-042-fix")
+
+    async def save_log(stdout: str, stderr: str, label: str) -> None:
+        saved_logs.append((stdout, stderr, label))
+
+    async def stop_monitor(
+        cli_task: asyncio.Task[tuple[int, str, str]],
+    ) -> None:
+        runner._stop_requested = True
+        runner.state.user_paused = True
+        await asyncio.sleep(0)
+        cli_task.cancel()
+
+    monkeypatch.setattr(runner, "_save_cli_log", save_log)
+    monkeypatch.setattr(runner, "_monitor_stop_request", stop_monitor)
+    monkeypatch.setattr(
+        runner, "_post_codex_review", lambda pr_number: posted.append(pr_number) or True
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.user_paused is True
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.push_count == 1
+    assert runner.state.current_pr.last_activity is not None
+    assert runner._last_push_at is not None
+    assert runner._last_push_at_pr_number == 42
+    assert posted == [42]
+    assert saved_logs == [("", "", "FIX REVIEW output [claude]")]
+    assert any("Fix pushed, iteration #1" in e["event"] for e in runner.state.history)
+
+
 def test_handle_fix_honors_persisted_stop_after_fast_fix_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
