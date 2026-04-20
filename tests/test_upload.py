@@ -437,6 +437,13 @@ def test_task_upload_summary_lists_non_numeric_ids_explicitly() -> None:
     assert web_app._task_upload_summary(["PR-ABC.md", "PR-XYZ.md"]) == "PR-ABC, PR-XYZ"
 
 
+def test_task_upload_summary_lists_sparse_numeric_ids_without_range_allocation() -> None:
+    assert (
+        web_app._task_upload_summary(["PR-1.md", "PR-1000000000.md"])
+        == "PR-1, PR-1000000000"
+    )
+
+
 def test_upload_zip_entry_read_error_returns_400(
     one_repo_config: Path,
     repo_dir: Path,

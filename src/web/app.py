@@ -1963,7 +1963,10 @@ def _task_upload_summary(task_filenames: list[str]) -> str:
             return ", ".join(labels)
         pr_numbers.append(int(match.group(1)))
 
-    if pr_numbers == list(range(pr_numbers[0], pr_numbers[-1] + 1)):
+    if all(
+        current == previous + 1
+        for previous, current in zip(pr_numbers, pr_numbers[1:], strict=False)
+    ):
         return f"{labels[0]} through {labels[-1]}"
     return ", ".join(labels)
 
