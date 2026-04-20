@@ -349,7 +349,6 @@
 - Status: TODO
 - Tasks file: tasks/PR-132.md
 - Branch: pr-132-stalled-state-grey
-- Depends on: PR-131
 
 ## PR-133: Light/dark theme toggle
 - Status: TODO
