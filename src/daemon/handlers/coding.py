@@ -246,7 +246,8 @@ class CodingMixin:
         if candidate is None:
             self.state.state = PipelineState.ERROR
             self.state.error_message = (
-                f"Claude CLI succeeded but no PR found for branch {target_branch!r}"
+                f"[{coder_name}] coder succeeded but no PR found for branch "
+                f"{target_branch!r}"
             )
             await self._save_current_run_record("error")
             self.log_event(self.state.error_message)

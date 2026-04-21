@@ -4349,11 +4349,6 @@ def test_handle_coding_errors_after_all_retries(
     flip to ERROR so operators see that Claude exited 0 without opening
     a PR."""
     _patch_subprocess(monkeypatch)
-    monkeypatch.setattr(
-        claude_cli,
-        "run_planned_pr_async",
-        _async_cli_result(0, "ok", ""),
-    )
     call_count = {"n": 0}
 
     def always_empty(repo: str, **kw: Any) -> list[PRInfo]:
@@ -4371,14 +4366,26 @@ def test_handle_coding_errors_after_all_retries(
 
     monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
 
+    class _CodexPlugin:
+        async def run_planned_pr(
+            self, path: str, **kwargs: object
+        ) -> tuple[int, str, str]:
+            return (0, "ok", "")
+
     runner = _make_runner()
+    runner._get_coder = lambda allow_exploration=False: (  # type: ignore[method-assign]
+        "codex",
+        _CodexPlugin(),
+    )
     runner.state.current_task = QueueTask(
         pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
     )
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.ERROR
-    assert "no PR found" in (runner.state.error_message or "")
+    assert runner.state.error_message == (
+        "[codex] coder succeeded but no PR found for branch 'pr-001'"
+    )
     assert call_count["n"] == 3
     assert slept.count(5) == 2
 
@@ -11006,6 +11013,7 @@ def test_monitor_fix_idle_resets_timer_on_detected_push(
 ) -> None:
     """A newly detected push should reset the timer without cancelling the target."""
     runner = _make_runner()
+    runner.state.coder = "codex"
     events: list[str] = []
     monkeypatch.setattr(runner, "log_event", events.append)
 
@@ -11076,7 +11084,7 @@ def test_monitor_fix_idle_resets_timer_on_detected_push(
 
     assert idle_flag["timed_out"] is False
     assert target_holder["task"].cancelled() is True
-    assert "FIX: Claude pushed, resetting idle timer" in events
+    assert "FIX: [codex] pushed, resetting idle timer" in events
 
 
 def test_monitor_fix_idle_logs_poll_failures_before_timing_out(
