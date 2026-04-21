@@ -436,7 +436,7 @@
 - Branch: pr-149-coder-neutral-logs
 
 ## PR-150: Event log state badges have consistent width
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-150.md
 - Branch: pr-150-state-badge-alignment
 
