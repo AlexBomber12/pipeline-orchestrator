@@ -2803,6 +2803,7 @@ def test_handle_fix_cap_ignores_existing_label_create_failure(
         branch="pr-088",
         fix_iteration_count=2,
     )
+    runner.state.user_paused = True
     runner._app_config = _app_cfg(fix_iteration_cap=2)
 
     asyncio.run(runner.handle_fix())
@@ -2828,6 +2829,9 @@ def test_handle_fix_cap_ignores_existing_label_create_failure(
         ["pr", "edit", "88", "--add-label", "escalated"],
     ]
     assert runner.state.state == PipelineState.IDLE
+    assert runner.state.user_paused is True
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.is_escalated is True
 
 
 def test_handle_fix_cap_skips_repeat_escalation_when_pr_already_escalated(
@@ -2864,6 +2868,7 @@ def test_handle_fix_cap_skips_repeat_escalation_when_pr_already_escalated(
         fix_iteration_count=2,
         is_escalated=True,
     )
+    runner.state.user_paused = True
     runner._app_config = _app_cfg(fix_iteration_cap=2)
 
     asyncio.run(runner.handle_fix())
@@ -2871,6 +2876,7 @@ def test_handle_fix_cap_skips_repeat_escalation_when_pr_already_escalated(
     assert posted == []
     assert gh_calls == []
     assert runner.state.state == PipelineState.IDLE
+    assert runner.state.user_paused is True
     assert any(
         entry["event"]
         == "FIX cap reached (2/2) on PR #91: already escalated, moving to IDLE."

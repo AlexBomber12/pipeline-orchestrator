@@ -100,7 +100,6 @@ class FixMixin(BreachMixin):
             count = current_pr.fix_iteration_count
             pr_number = current_pr.number
             if current_pr.is_escalated:
-                self.state.user_paused = False
                 self.state.error_message = None
                 self.state.state = PipelineState.IDLE
                 self.log_event(
@@ -146,7 +145,6 @@ class FixMixin(BreachMixin):
                 self.log_event(self.state.error_message)
                 return
             current_pr.is_escalated = True
-            self.state.user_paused = False
             self.state.error_message = None
             self.state.state = PipelineState.IDLE
             self.log_event(
