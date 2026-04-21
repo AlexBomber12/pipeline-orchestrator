@@ -35,6 +35,28 @@ def test_load_config_missing_file_returns_defaults(tmp_path: Path) -> None:
     assert cfg.auth.gh_config_dir == "/data/auth/gh"
 
 
+def test_load_config_missing_file_applies_env_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PO_FIX_ITERATION_CAP", "4")
+
+    cfg = load_config(str(tmp_path / "does-not-exist.yml"))
+
+    assert cfg.daemon.fix_iteration_cap == 4
+
+
+def test_load_config_raw_omits_runtime_env_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PO_FIX_ITERATION_CAP", "4")
+
+    raw = config_module._load_config_raw(str(tmp_path / "does-not-exist.yml"))
+
+    assert raw == {}
+
+
 def test_daemon_config_claude_model_default() -> None:
     from src.config import DaemonConfig
 
@@ -380,6 +402,25 @@ def test_update_daemon_config_selector_fields(tmp_path: Path) -> None:
     assert cfg.daemon.coder_priority == {"claude": 10, "codex": 20}
 
 
+def test_update_daemon_config_does_not_persist_env_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "config.yml"
+    path.write_text("daemon:\n  review_timeout_min: 60\n", encoding="utf-8")
+    monkeypatch.setenv("PO_FIX_ITERATION_CAP", "4")
+
+    updated = update_daemon_config(str(path), poll_interval_sec=45)
+
+    assert updated.daemon.poll_interval_sec == 45
+    assert "fix_iteration_cap: 4" not in path.read_text(encoding="utf-8")
+    assert load_config(str(path)).daemon.fix_iteration_cap == 4
+
+    monkeypatch.delenv("PO_FIX_ITERATION_CAP")
+    reloaded = load_config(str(path))
+    assert reloaded.daemon.fix_iteration_cap == 15
+
+
 def test_daemon_config_rejects_exploration_epsilon_out_of_range() -> None:
     from pydantic import ValidationError
     from src.config import DaemonConfig
@@ -417,6 +458,12 @@ def test_fix_idle_timeout_default() -> None:
     from src.config import DaemonConfig
 
     assert DaemonConfig().fix_idle_timeout_sec == 1800
+
+
+def test_fix_iteration_cap_default() -> None:
+    from src.config import DaemonConfig
+
+    assert DaemonConfig().fix_iteration_cap == 15
 
 
 def test_fix_review_timeout_removed() -> None:
@@ -461,9 +508,11 @@ def test_update_daemon_config_accepts_timeouts(tmp_path: Path) -> None:
     updated = update_daemon_config(
         path=str(cfg_path),
         fix_idle_timeout_sec=2000,
+        fix_iteration_cap=12,
         planned_pr_timeout_sec=1200,
     )
     assert updated.daemon.fix_idle_timeout_sec == 2000
+    assert updated.daemon.fix_iteration_cap == 12
     assert updated.daemon.planned_pr_timeout_sec == 1200
 
 
@@ -475,6 +524,16 @@ def test_fix_idle_timeout_rejects_zero_or_negative() -> None:
         DaemonConfig(fix_idle_timeout_sec=0)
     with pytest.raises(ValidationError):
         DaemonConfig(fix_idle_timeout_sec=-5)
+
+
+def test_fix_iteration_cap_rejects_zero_or_negative() -> None:
+    from pydantic import ValidationError
+    from src.config import DaemonConfig
+
+    with pytest.raises(ValidationError):
+        DaemonConfig(fix_iteration_cap=0)
+    with pytest.raises(ValidationError):
+        DaemonConfig(fix_iteration_cap=-1)
 
 
 def test_daemon_config_rate_limit_defaults() -> None:
@@ -556,6 +615,45 @@ def test_load_config_does_not_override_existing_fix_idle_timeout_sec(
     cfg = load_config(str(cfg_path))
 
     assert cfg.daemon.fix_idle_timeout_sec == 240
+
+
+def test_load_config_applies_fix_iteration_cap_env_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  fix_iteration_cap: 15\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PO_FIX_ITERATION_CAP", "5")
+
+    cfg = load_config(str(cfg_path))
+
+    assert cfg.daemon.fix_iteration_cap == 5
+
+
+def test_apply_daemon_env_overrides_creates_daemon_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw: dict[str, object] = {}
+    monkeypatch.setenv("PO_FIX_ITERATION_CAP", "4")
+
+    config_module._apply_daemon_env_overrides(raw)
+
+    assert raw == {"daemon": {"fix_iteration_cap": "4"}}
+
+
+def test_apply_daemon_env_overrides_ignores_non_mapping_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw: dict[str, object] = {"daemon": "invalid"}
+    monkeypatch.setenv("PO_FIX_ITERATION_CAP", "6")
+
+    config_module._apply_daemon_env_overrides(raw)
+
+    assert raw == {"daemon": "invalid"}
 
 
 def test_repo_poll_interval_default() -> None:

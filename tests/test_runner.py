@@ -2594,6 +2594,7 @@ def test_handle_fix_posts_codex_review_after_push(
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.push_count == 1
+    assert runner.state.current_pr.fix_iteration_count == 1
     assert posted == [(runner.owner_repo, 77, "@codex review")]
     assert any(
         "Posted @codex review on PR #77" in e["event"]
@@ -2633,6 +2634,7 @@ def test_handle_fix_finishes_push_bookkeeping_before_post_exit_stop_pause(
     assert runner.state.user_paused is True
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.push_count == 1
+    assert runner.state.current_pr.fix_iteration_count == 1
     assert posted == [(runner.owner_repo, 77, "@codex review")]
     assert any(
         "deferring pause until fix bookkeeping completes" in entry["event"].lower()
@@ -2696,6 +2698,372 @@ def test_handle_fix_honors_stop_requested_during_fix(
         "user stop requested" in entry["event"].lower()
         for entry in runner.state.history
     )
+
+
+def test_handle_fix_escalates_at_iteration_cap_before_next_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted: list[tuple[str, int, str]] = []
+    gh_calls: list[list[str]] = []
+    fix_called: list[bool] = []
+
+    class _UnexpectedPlugin:
+        async def fix_review(
+            self, path: str, **kwargs: object
+        ) -> tuple[int, str, str]:
+            fix_called.append(True)
+            return (0, "", "")
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    def fake_run_gh(cmd: list[str], **kwargs: Any) -> str:
+        gh_calls.append(cmd)
+        return ""
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_run_gh)
+
+    runner = _make_runner()
+    runner._get_coder = lambda allow_exploration=False: (  # type: ignore[method-assign]
+        "claude",
+        _UnexpectedPlugin(),
+    )
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=77,
+        branch="pr-077",
+        fix_iteration_count=15,
+    )
+    runner._app_config = _app_cfg(fix_iteration_cap=15)
+
+    asyncio.run(runner.handle_fix())
+
+    assert fix_called == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.user_paused is False
+    assert posted == [
+        (
+            runner.owner_repo,
+            77,
+            "@AlexBomber12 FIX iteration cap reached (15/15). "
+            "Escalating for manual review.",
+        )
+    ]
+    assert gh_calls == [
+        [
+            "label",
+            "create",
+            "escalated",
+            "--color",
+            "B60205",
+            "--description",
+            "Daemon escalated, manual review required",
+        ],
+        ["pr", "edit", "77", "--add-label", "escalated"],
+    ]
+    assert any(
+        entry["event"]
+        == "FIX cap reached (15/15) on PR #77: escalated, moving to IDLE."
+        for entry in runner.state.history
+    )
+
+
+def test_handle_fix_cap_ignores_existing_label_create_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted: list[tuple[str, int, str]] = []
+    gh_calls: list[list[str]] = []
+
+    class _UnexpectedPlugin:
+        async def fix_review(
+            self, path: str, **kwargs: object
+        ) -> tuple[int, str, str]:
+            raise AssertionError("fix_review should not run at cap boundary")
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    def fake_run_gh(cmd: list[str], **kwargs: Any) -> str:
+        gh_calls.append(cmd)
+        if cmd[:3] == ["label", "create", "escalated"]:
+            raise RuntimeError("label already exists")
+        return ""
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_run_gh)
+
+    runner = _make_runner()
+    runner._get_coder = lambda allow_exploration=False: (  # type: ignore[method-assign]
+        "claude",
+        _UnexpectedPlugin(),
+    )
+    runner.state.current_pr = PRInfo(
+        number=88,
+        branch="pr-088",
+        fix_iteration_count=2,
+    )
+    runner.state.user_paused = True
+    runner._app_config = _app_cfg(fix_iteration_cap=2)
+
+    asyncio.run(runner.handle_fix())
+
+    assert posted == [
+        (
+            runner.owner_repo,
+            88,
+            "@AlexBomber12 FIX iteration cap reached (2/2). "
+            "Escalating for manual review.",
+        )
+    ]
+    assert gh_calls == [
+        [
+            "label",
+            "create",
+            "escalated",
+            "--color",
+            "B60205",
+            "--description",
+            "Daemon escalated, manual review required",
+        ],
+        ["pr", "edit", "88", "--add-label", "escalated"],
+    ]
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.user_paused is True
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.is_escalated is True
+
+
+def test_handle_fix_cap_skips_repeat_escalation_when_pr_already_escalated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted: list[tuple[str, int, str]] = []
+    gh_calls: list[list[str]] = []
+
+    class _UnexpectedPlugin:
+        async def fix_review(
+            self, path: str, **kwargs: object
+        ) -> tuple[int, str, str]:
+            raise AssertionError("fix_review should not run at cap boundary")
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda cmd, **kwargs: gh_calls.append(cmd) or "",
+    )
+
+    runner = _make_runner()
+    runner._get_coder = lambda allow_exploration=False: (  # type: ignore[method-assign]
+        "claude",
+        _UnexpectedPlugin(),
+    )
+    runner.state.current_pr = PRInfo(
+        number=91,
+        branch="pr-091",
+        fix_iteration_count=2,
+        is_escalated=True,
+    )
+    runner.state.user_paused = True
+    runner._app_config = _app_cfg(fix_iteration_cap=2)
+
+    asyncio.run(runner.handle_fix())
+
+    assert posted == []
+    assert gh_calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.user_paused is True
+    assert any(
+        entry["event"]
+        == "FIX blocked for escalated PR #91, moving to IDLE."
+        for entry in runner.state.history
+    )
+
+
+def test_handle_fix_blocks_escalated_pr_even_when_counter_resets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted: list[tuple[str, int, str]] = []
+    gh_calls: list[list[str]] = []
+
+    class _UnexpectedPlugin:
+        async def fix_review(
+            self, path: str, **kwargs: object
+        ) -> tuple[int, str, str]:
+            raise AssertionError("fix_review should not run for escalated PRs")
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda cmd, **kwargs: gh_calls.append(cmd) or "",
+    )
+
+    runner = _make_runner()
+    runner._get_coder = lambda allow_exploration=False: (  # type: ignore[method-assign]
+        "claude",
+        _UnexpectedPlugin(),
+    )
+    runner.state.current_pr = PRInfo(
+        number=92,
+        branch="pr-092",
+        fix_iteration_count=0,
+        is_escalated=True,
+    )
+    runner._app_config = _app_cfg(fix_iteration_cap=2)
+
+    asyncio.run(runner.handle_fix())
+
+    assert posted == []
+    assert gh_calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert any(
+        entry["event"] == "FIX blocked for escalated PR #92, moving to IDLE."
+        for entry in runner.state.history
+    )
+
+
+def test_handle_idle_preserves_fix_iteration_count_when_reattaching_same_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    task = QueueTask(
+        pr_id="PR-145",
+        title="Fix iteration cap",
+        status=TaskStatus.TODO,
+        branch="pr-145-fix-iteration-cap",
+    )
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: task)
+
+    reattached_pr = PRInfo(
+        number=145,
+        branch="pr-145-fix-iteration-cap",
+        title="PR-145: Fix iteration cap",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [reattached_pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: {"head_commit_date": "2026-04-21T00:48:54Z"},
+    )
+
+    runner = _make_runner()
+    runner.state.current_task = task
+    runner.state.current_pr = PRInfo(
+        number=145,
+        branch="pr-145-fix-iteration-cap",
+        fix_iteration_count=15,
+    )
+
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 145
+    assert runner.state.current_pr.fix_iteration_count == 15
+
+
+def test_handle_fix_cap_sets_error_when_comment_post_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _UnexpectedPlugin:
+        async def fix_review(
+            self, path: str, **kwargs: object
+        ) -> tuple[int, str, str]:
+            raise AssertionError("fix_review should not run at cap boundary")
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: (_ for _ in ()).throw(
+            RuntimeError("gh unavailable")
+        ),
+    )
+
+    runner = _make_runner()
+    runner._get_coder = lambda allow_exploration=False: (  # type: ignore[method-assign]
+        "claude",
+        _UnexpectedPlugin(),
+    )
+    runner.state.current_pr = PRInfo(
+        number=89,
+        branch="pr-089",
+        fix_iteration_count=2,
+    )
+    runner._app_config = _app_cfg(fix_iteration_cap=2)
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "post_comment failed: gh unavailable"
+
+
+def test_handle_fix_cap_sets_error_when_add_label_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted: list[tuple[str, int, str]] = []
+
+    class _UnexpectedPlugin:
+        async def fix_review(
+            self, path: str, **kwargs: object
+        ) -> tuple[int, str, str]:
+            raise AssertionError("fix_review should not run at cap boundary")
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    def fake_run_gh(cmd: list[str], **kwargs: Any) -> str:
+        if cmd[:2] == ["pr", "edit"]:
+            raise RuntimeError("add label failed")
+        return ""
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_run_gh)
+
+    runner = _make_runner()
+    runner._get_coder = lambda allow_exploration=False: (  # type: ignore[method-assign]
+        "claude",
+        _UnexpectedPlugin(),
+    )
+    runner.state.current_pr = PRInfo(
+        number=90,
+        branch="pr-090",
+        fix_iteration_count=2,
+    )
+    runner._app_config = _app_cfg(fix_iteration_cap=2)
+
+    asyncio.run(runner.handle_fix())
+
+    assert posted == [
+        (
+            runner.owner_repo,
+            90,
+            "@AlexBomber12 FIX iteration cap reached (2/2). "
+            "Escalating for manual review.",
+        )
+    ]
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "pr edit failed: add label failed"
 
 
 def test_handle_fix_finishes_push_bookkeeping_before_stop_cancel_pause(
@@ -2777,6 +3145,7 @@ def test_handle_fix_finishes_push_bookkeeping_before_stop_cancel_pause(
     assert runner.state.user_paused is True
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.push_count == 1
+    assert runner.state.current_pr.fix_iteration_count == 1
     assert runner.state.current_pr.last_activity is not None
     assert runner._last_push_at is not None
     assert runner._last_push_at_pr_number == 42
@@ -2864,6 +3233,7 @@ def test_handle_fix_stop_cancel_skips_push_bookkeeping_when_remote_head_is_stale
     assert runner.state.user_paused is True
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.push_count == 0
+    assert runner.state.current_pr.fix_iteration_count == 0
     assert runner.state.current_pr.last_activity is None
     assert runner._last_push_at is None
     assert runner._last_push_at_pr_number is None
@@ -4152,6 +4522,34 @@ def test_handle_watch_changes_requested_triggers_fix(
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.push_count == 1
     assert any("Fix pushed" in e["event"] for e in runner.state.history)
+
+
+def test_handle_watch_preserves_fix_iteration_count_for_same_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = PRInfo(
+        number=5,
+        branch="pr-001",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=datetime.now(timezone.utc),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=5,
+        branch="pr-001",
+        fix_iteration_count=7,
+    )
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.fix_iteration_count == 7
 
 
 def test_handle_watch_no_fix_when_ci_pending_and_changes_requested(
@@ -7431,6 +7829,37 @@ def test_handle_idle_no_tasks_no_open_prs_clears_current_pr(
 
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is None
+
+
+def test_handle_idle_new_open_pr_resets_fix_iteration_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [PRInfo(number=42, branch="fresh-branch")],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(
+        number=99,
+        branch="old-branch",
+        fix_iteration_count=7,
+    )
+
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 42
+    assert runner.state.current_pr.fix_iteration_count == 0
 
 
 def test_handle_idle_no_tasks_does_not_change_state_from_idle(

@@ -64,6 +64,7 @@ daemon:
   error_handler_use_ai: true
   claude_model: opus
   fix_idle_timeout_sec: 1800
+  fix_iteration_cap: 15
   planned_pr_timeout_sec: 900
 
 web:
@@ -74,3 +75,5 @@ auth:
   claude_config_dir: /data/auth/claude
   gh_config_dir: /data/auth/gh
 ```
+
+`PO_FIX_ITERATION_CAP` overrides `daemon.fix_iteration_cap` for daemon runs.

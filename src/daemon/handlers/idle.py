@@ -37,6 +37,15 @@ from src.task_status import (
 class IdleMixin:
     """Handle IDLE state: sync, pick next task, dispatch to CODING."""
 
+    def _preserve_fix_iteration_count(self, pr):
+        """Carry the iteration counter forward when reattaching the same PR."""
+        current_pr = self.state.current_pr
+        if current_pr is None or current_pr.number != pr.number:
+            return pr
+        return pr.model_copy(
+            update={"fix_iteration_count": current_pr.fix_iteration_count}
+        )
+
     @staticmethod
     def _generate_queue_md(
         headers: list[TaskHeader],
@@ -597,7 +606,8 @@ class IdleMixin:
                 match = next(
                     (pr for pr in prs if pr.branch in done_branches), None
                 )
-                self.state.current_pr = match or prs[0]
+                selected = match or prs[0]
+                self.state.current_pr = self._preserve_fix_iteration_count(selected)
                 self.log_event(
                     f"IDLE: {len(prs)} open PR(s) detected (manual work)"
                 )
@@ -616,9 +626,9 @@ class IdleMixin:
             )
 
             if existing is not None:
-                self.state.current_pr = existing
+                self.state.current_pr = self._preserve_fix_iteration_count(existing)
                 self.state.state = PipelineState.WATCH
-                self._rehydrate_last_push_at(existing)
+                self._rehydrate_last_push_at(self.state.current_pr)
                 self.log_event(
                     f"Task {task.pr_id} has existing open PR #{existing.number} "
                     f"on {task_branch!r} -> WATCH (no duplicate CODING)"
