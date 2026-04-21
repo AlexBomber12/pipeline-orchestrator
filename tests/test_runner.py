@@ -10105,6 +10105,40 @@ def test_codex_review_reposted_after_new_push(
     assert runner._last_codex_review_head_sha == "head-2"
 
 
+def test_codex_review_reposted_same_head_when_bypass_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forced stale-review retrigger must bypass same-head cache dedup."""
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr(
+        git_ops_module,
+        "_git",
+        lambda *args, **kwargs: _FakeCompletedProcess(
+            args=list(args), stdout="head-1\n", returncode=0
+        ),
+    )
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
+
+    assert runner._post_codex_review(42) is True
+    assert runner._post_codex_review(
+        42,
+        bypass_same_head_dedup=True,
+    ) is True
+
+    assert posted == [
+        (runner.owner_repo, 42, "@codex review"),
+        (runner.owner_repo, 42, "@codex review"),
+    ]
+    assert runner._last_codex_review_pr == 42
+    assert runner._last_codex_review_head_sha == "head-1"
+
+
 def test_codex_review_not_reposted_when_author_already_requested_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -11210,17 +11244,29 @@ def test_handle_watch_retriggers_stale_changes_requested_review(
         },
     )
     retriggers: list[int] = []
+    bypass_flags: list[bool] = []
 
     runner = _make_runner()
     runner.state.current_pr = pr
     runner.state.state = PipelineState.WATCH
     runner._last_push_at = now - timedelta(minutes=11)
     runner._last_push_at_pr_number = pr.number
-    runner._post_codex_review = retriggers.append  # type: ignore[assignment]
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> bool:
+        retriggers.append(number)
+        bypass_flags.append(bypass_same_head_dedup)
+        return True
+
+    runner._post_codex_review = fake_post  # type: ignore[assignment]
 
     asyncio.run(runner.handle_watch())
 
     assert retriggers == [42]
+    assert bypass_flags == [True]
     assert runner.state.last_stale_retrigger_at is not None
     assert any(
         entry["event"]

@@ -232,5 +232,8 @@ class WatchMixin:
             f"Stale CHANGES_REQUESTED on PR #{pr_number}; re-triggering "
             "@codex review."
         )
-        self._post_codex_review(pr_number)
-        self.state.last_stale_retrigger_at = now
+        if self._post_codex_review(
+            pr_number,
+            bypass_same_head_dedup=True,
+        ):
+            self.state.last_stale_retrigger_at = now

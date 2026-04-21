@@ -35,7 +35,12 @@ def _author_already_requested_review(
 class HungMixin:
     """Nudge the reviewer with ``@codex review`` or give up, per config."""
 
-    def _post_codex_review(self, pr_number: int) -> bool:
+    def _post_codex_review(
+        self,
+        pr_number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> bool:
         """Post ``@codex review`` on ``pr_number``.
 
         Called after PR creation (``handle_coding``) and after every
@@ -107,6 +112,8 @@ class HungMixin:
             )
             return True
         elif (
+            not bypass_same_head_dedup
+            and
             self._last_codex_review_pr == pr_number
             and self._last_codex_review_head_sha == head_sha
         ):
