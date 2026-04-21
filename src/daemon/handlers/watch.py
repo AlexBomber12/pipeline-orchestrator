@@ -8,12 +8,13 @@ Mixin methods:
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from src import github_client
 from src.models import CIStatus, FeedbackCheckResult, PipelineState, ReviewStatus
 
 logger = logging.getLogger(__name__)
+_STALE_RETRIGGER_DEBOUNCE = timedelta(hours=1)
 
 
 class WatchMixin:
@@ -112,6 +113,7 @@ class WatchMixin:
                 f"PR #{found.number} CHANGES_REQUESTED but no new "
                 "Codex feedback since last push; waiting for fresh review"
             )
+            self._maybe_retrigger_stale_review(found.number)
 
         last_activity = found.last_activity or self.state.last_updated
         if last_activity.tzinfo is None:
@@ -180,3 +182,44 @@ class WatchMixin:
             if created > last_activity:
                 return FeedbackCheckResult.NEW
         return FeedbackCheckResult.NONE
+
+    def _maybe_retrigger_stale_review(self, pr_number: int) -> None:
+        """Re-trigger ``@codex review`` when a stale review blocks progress."""
+        current_pr = self.state.current_pr
+        if current_pr is None:
+            return
+        if current_pr.review_status != ReviewStatus.CHANGES_REQUESTED:
+            return
+
+        last_push_age_seconds = github_client.get_last_push_age_seconds(
+            self.owner_repo,
+            pr_number,
+        )
+        if last_push_age_seconds is None:
+            return
+
+        now = datetime.now(timezone.utc)
+        stale_after = timedelta(
+            minutes=self.app_config.daemon.stale_review_threshold_min
+        )
+        if last_push_age_seconds < stale_after.total_seconds():
+            return
+
+        last_retrigger_at = self.state.last_stale_retrigger_at
+        if last_retrigger_at is not None:
+            if last_retrigger_at.tzinfo is None:
+                last_retrigger_at = last_retrigger_at.replace(
+                    tzinfo=timezone.utc
+                )
+            if now - last_retrigger_at < _STALE_RETRIGGER_DEBOUNCE:
+                return
+
+        self.log_event(
+            f"Stale CHANGES_REQUESTED on PR #{pr_number}; re-triggering "
+            "@codex review."
+        )
+        success, posted, retry_at = self._post_codex_review_result(
+            pr_number,
+            bypass_same_head_dedup=True,
+        )
+        self.state.last_stale_retrigger_at = now

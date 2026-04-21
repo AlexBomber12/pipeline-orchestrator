@@ -71,6 +71,7 @@ def test_repo_state_json_round_trip() -> None:
         last_updated=now,
         history=[{"event": "started", "at": now.isoformat()}],
         rate_limited_coders={"claude", "codex"},
+        last_stale_retrigger_at=now,
     )
 
     payload = state.model_dump_json()
@@ -83,3 +84,34 @@ def test_pr_info_fix_iteration_count_defaults_to_zero() -> None:
     pr = PRInfo(number=7, branch="pr-007")
 
     assert pr.fix_iteration_count == 0
+
+
+def test_repo_state_resets_stale_retrigger_on_new_pr_transition() -> None:
+    state = RepoState(
+        url="https://github.com/example/repo.git",
+        name="repo",
+        current_pr=PRInfo(number=1, branch="pr-001"),
+    )
+    state.last_stale_retrigger_at = datetime.now(timezone.utc)
+
+    state.current_pr = PRInfo(number=2, branch="pr-002")
+
+    assert state.last_stale_retrigger_at is None
+
+
+def test_repo_state_keeps_stale_retrigger_when_refreshing_same_pr() -> None:
+    now = datetime.now(timezone.utc)
+    state = RepoState(
+        url="https://github.com/example/repo.git",
+        name="repo",
+        current_pr=PRInfo(number=1, branch="pr-001"),
+        last_stale_retrigger_at=now,
+    )
+
+    state.current_pr = PRInfo(number=1, branch="pr-001", title="refreshed")
+
+    assert state.last_stale_retrigger_at == now
+
+
+def test_repo_state_transition_helper_handles_non_prinfo_values() -> None:
+    assert RepoState._is_new_pr_transition("old", "new") is True

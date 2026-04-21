@@ -34,6 +34,7 @@ _REPO_FIELDS = {
 _DAEMON_FIELDS = {
     "poll_interval_sec",
     "review_timeout_min",
+    "stale_review_threshold_min",
     "hung_fallback_codex_review",
     "error_handler_use_ai",
     "claude_model",
@@ -57,6 +58,7 @@ _DAEMON_FIELDS = {
 
 _DAEMON_ENV_OVERRIDES = {
     "PO_FIX_ITERATION_CAP": "fix_iteration_cap",
+    "PO_STALE_REVIEW_THRESHOLD_MIN": "stale_review_threshold_min",
 }
 
 
@@ -92,6 +94,7 @@ class RepoConfig(BaseModel):
 class DaemonConfig(BaseModel):
     poll_interval_sec: int = 60
     review_timeout_min: int = Field(default=60, ge=1)
+    stale_review_threshold_min: int = Field(default=10, ge=1)
     hung_fallback_codex_review: bool = True
     error_handler_use_ai: bool = True
     claude_model: str = "opus"

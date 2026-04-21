@@ -30,6 +30,7 @@ from src.daemon.handlers import fix as fix_module
 from src.daemon.handlers import hung as hung_module
 from src.daemon.handlers import idle as idle_module
 from src.daemon.handlers import merge as merge_module
+from src.daemon.handlers import watch as watch_module
 from src.daemon.runner import ErrorCategory, PipelineRunner, _classify_error
 from src.models import (
     CIStatus,
@@ -10104,6 +10105,40 @@ def test_codex_review_reposted_after_new_push(
     assert runner._last_codex_review_head_sha == "head-2"
 
 
+def test_codex_review_reposted_same_head_when_bypass_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forced stale-review retrigger must bypass same-head cache dedup."""
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr(
+        git_ops_module,
+        "_git",
+        lambda *args, **kwargs: _FakeCompletedProcess(
+            args=list(args), stdout="head-1\n", returncode=0
+        ),
+    )
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
+
+    assert runner._post_codex_review(42) is True
+    assert runner._post_codex_review(
+        42,
+        bypass_same_head_dedup=True,
+    ) is True
+
+    assert posted == [
+        (runner.owner_repo, 42, "@codex review"),
+        (runner.owner_repo, 42, "@codex review"),
+    ]
+    assert runner._last_codex_review_pr == 42
+    assert runner._last_codex_review_head_sha == "head-1"
+
+
 def test_codex_review_not_reposted_when_author_already_requested_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -10153,6 +10188,47 @@ def test_codex_review_not_reposted_when_author_already_requested_review(
         "PR author already requested review for this head" in e["event"]
         for e in runner.state.history
     )
+
+
+def test_codex_review_result_returns_retry_at_for_author_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_at = datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc)
+    runner = _make_runner()
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: {
+            "author": "alice",
+            "head_sha": "head-1",
+            "head_commit_date": "2026-04-17T23:14:11Z",
+        },
+    )
+    monkeypatch.setattr(
+        hung_module,
+        "_author_already_requested_review",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        hung_module,
+        "_author_recent_review_requested_at",
+        lambda *args, **kwargs: requested_at,
+    )
+    monkeypatch.setattr(
+        git_ops_module,
+        "_git",
+        lambda *args, **kwargs: _FakeCompletedProcess(
+            args=list(args), stdout="head-1\n", returncode=0
+        ),
+    )
+    runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
+
+    success, posted, retry_at = runner._post_codex_review_result(42)
+
+    assert success is True
+    assert posted is False
+    assert retry_at == requested_at + timedelta(minutes=5)
 
 
 def test_codex_review_git_head_lookup_failure_does_not_dedup(
@@ -10238,6 +10314,26 @@ def test_author_already_requested_review_fails_open_on_lookup_error(
             "2026-04-17T23:14:11Z",
         )
         is False
+    )
+
+
+def test_author_recent_review_requested_at_fails_open_on_lookup_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        hung_module.github_client,
+        "get_recent_codex_review_request_time",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    assert (
+        hung_module._author_recent_review_requested_at(
+            "octo/demo",
+            42,
+            "alice",
+            "2026-04-17T23:14:11Z",
+        )
+        is None
     )
 
 
@@ -11083,6 +11179,392 @@ def test_handle_watch_stale_feedback_still_times_out(
 
     assert fix_called == []
     assert runner.state.state == PipelineState.HUNG
+
+
+def test_maybe_retrigger_stale_review_returns_without_current_pr() -> None:
+    runner = _make_runner()
+
+    runner._maybe_retrigger_stale_review(42)
+
+    assert runner.state.last_stale_retrigger_at is None
+
+
+def test_maybe_retrigger_stale_review_returns_for_non_changes_requested() -> None:
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        review_status=ReviewStatus.APPROVED,
+    )
+
+    runner._maybe_retrigger_stale_review(42)
+
+    assert runner.state.last_stale_retrigger_at is None
+
+
+def test_maybe_retrigger_stale_review_returns_for_missing_push_age(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, number: None,
+    )
+
+    runner._maybe_retrigger_stale_review(42)
+
+    assert runner.state.last_stale_retrigger_at is None
+
+
+def test_handle_watch_retriggers_stale_changes_requested_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=now,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, number: 11 * 60,
+    )
+    retriggers: list[int] = []
+    bypass_flags: list[bool] = []
+
+    runner = _make_runner()
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = now - timedelta(minutes=11)
+    runner._last_push_at_pr_number = pr.number
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        retriggers.append(number)
+        bypass_flags.append(bypass_same_head_dedup)
+        return True, True, None
+
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert retriggers == [42]
+    assert bypass_flags == [True]
+    assert runner.state.last_stale_retrigger_at is not None
+    assert any(
+        entry["event"]
+        == "Stale CHANGES_REQUESTED on PR #42; re-triggering @codex review."
+        for entry in runner.state.history
+    )
+
+
+def test_handle_watch_retries_after_author_dedup_window_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=now,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, number: 11 * 60,
+    )
+    bypass_flags: list[bool] = []
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return now if tz is None else now.astimezone(tz)
+
+    runner = _make_runner(stale_review_threshold_min=1)
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = now - timedelta(minutes=11)
+    runner._last_push_at_pr_number = pr.number
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
+
+    requested_at = now - timedelta(minutes=1)
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        bypass_flags.append(bypass_same_head_dedup)
+        return True, False, requested_at + timedelta(minutes=5)
+
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert bypass_flags == [True]
+    assert runner.state.last_stale_retrigger_at == now
+
+
+def test_handle_watch_debounces_failed_stale_review_retrigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=now,
+    )
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, number: 11 * 60,
+    )
+    bypass_flags: list[bool] = []
+
+    runner = _make_runner()
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = now - timedelta(minutes=11)
+    runner._last_push_at_pr_number = pr.number
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        bypass_flags.append(bypass_same_head_dedup)
+        return False, False, None
+
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert bypass_flags == [True]
+    assert runner.state.last_stale_retrigger_at == now
+
+
+def test_handle_watch_does_not_retrigger_recent_changes_requested_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=now,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, number: 5 * 60,
+    )
+    retriggers: list[int] = []
+
+    runner = _make_runner()
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = now - timedelta(minutes=5)
+    runner._last_push_at_pr_number = pr.number
+    runner._post_codex_review = retriggers.append  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert retriggers == []
+    assert runner.state.last_stale_retrigger_at is None
+
+
+def test_handle_watch_does_not_retrigger_within_debounce_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=now,
+    )
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, number: 60 * 60,
+    )
+    retriggers: list[int] = []
+
+    runner = _make_runner()
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.state.last_stale_retrigger_at = now - timedelta(minutes=30)
+    runner._last_push_at = now - timedelta(hours=1)
+    runner._last_push_at_pr_number = pr.number
+    runner._post_codex_review = retriggers.append  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert retriggers == []
+    assert runner.state.last_stale_retrigger_at == now - timedelta(minutes=30)
+
+
+def test_handle_watch_normalizes_naive_stale_retrigger_timestamps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=now,
+    )
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, number: 60 * 60,
+    )
+    retriggers: list[int] = []
+
+    runner = _make_runner()
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.state.last_stale_retrigger_at = datetime(2026, 4, 21, 11, 30)
+    runner._last_push_at = now - timedelta(hours=1)
+    runner._last_push_at_pr_number = pr.number
+    runner._post_codex_review = retriggers.append  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert retriggers == []
+
+
+@pytest.mark.parametrize(
+    "review_status",
+    [ReviewStatus.APPROVED, ReviewStatus.PENDING],
+)
+def test_handle_watch_does_not_retrigger_for_non_changes_requested_status(
+    monkeypatch: pytest.MonkeyPatch,
+    review_status: ReviewStatus,
+) -> None:
+    now = datetime.now(timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.SUCCESS,
+        review_status=review_status,
+        last_activity=now,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    retriggers: list[int] = []
+
+    runner = _make_runner()
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._post_codex_review = retriggers.append  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert retriggers == []
 
 
 def test_handle_fix_records_last_push_at(
