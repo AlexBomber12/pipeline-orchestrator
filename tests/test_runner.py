@@ -2879,7 +2879,54 @@ def test_handle_fix_cap_skips_repeat_escalation_when_pr_already_escalated(
     assert runner.state.user_paused is True
     assert any(
         entry["event"]
-        == "FIX cap reached (2/2) on PR #91: already escalated, moving to IDLE."
+        == "FIX blocked for escalated PR #91, moving to IDLE."
+        for entry in runner.state.history
+    )
+
+
+def test_handle_fix_blocks_escalated_pr_even_when_counter_resets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted: list[tuple[str, int, str]] = []
+    gh_calls: list[list[str]] = []
+
+    class _UnexpectedPlugin:
+        async def fix_review(
+            self, path: str, **kwargs: object
+        ) -> tuple[int, str, str]:
+            raise AssertionError("fix_review should not run for escalated PRs")
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda cmd, **kwargs: gh_calls.append(cmd) or "",
+    )
+
+    runner = _make_runner()
+    runner._get_coder = lambda allow_exploration=False: (  # type: ignore[method-assign]
+        "claude",
+        _UnexpectedPlugin(),
+    )
+    runner.state.current_pr = PRInfo(
+        number=92,
+        branch="pr-092",
+        fix_iteration_count=0,
+        is_escalated=True,
+    )
+    runner._app_config = _app_cfg(fix_iteration_cap=2)
+
+    asyncio.run(runner.handle_fix())
+
+    assert posted == []
+    assert gh_calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert any(
+        entry["event"] == "FIX blocked for escalated PR #92, moving to IDLE."
         for entry in runner.state.history
     )
 

@@ -136,16 +136,11 @@ class AppConfig(BaseModel):
     auth: AuthConfig = Field(default_factory=AuthConfig)
 
 
-def load_config(path: str = "config.yml") -> AppConfig:
-    """Read a YAML config file and return an AppConfig.
-
-    If the file is missing, return an AppConfig populated with defaults.
-    """
+def _load_config_raw(path: str = "config.yml") -> dict[str, Any]:
+    """Return the parsed config mapping from ``path`` or an empty mapping."""
     config_path = Path(path)
     if not config_path.is_file():
-        raw: dict[str, Any] = {}
-        _apply_daemon_env_overrides(raw)
-        return AppConfig.model_validate(raw)
+        return {}
 
     with config_path.open("r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh) or {}
@@ -166,6 +161,16 @@ def load_config(path: str = "config.yml") -> AppConfig:
             if "rate_limit_session_pause_percent" not in daemon:
                 daemon["rate_limit_session_pause_percent"] = legacy_rate
 
+    return raw
+
+
+def load_config(path: str = "config.yml") -> AppConfig:
+    """Read a YAML config file and return an AppConfig.
+
+    If the file is missing, return an AppConfig populated with defaults.
+    Env overrides apply to this runtime view only.
+    """
+    raw = _load_config_raw(path)
     _apply_daemon_env_overrides(raw)
 
     return AppConfig.model_validate(raw)
@@ -257,7 +262,7 @@ def add_repository(
     if unknown:
         raise ValueError(f"Unknown repository fields: {sorted(unknown)}")
 
-    config = load_config(path)
+    config = AppConfig.model_validate(_load_config_raw(path))
     if _find_repo_index(config, url) >= 0:
         raise ValueError(f"Repository already configured: {url}")
 
@@ -272,7 +277,7 @@ def remove_repository(url: str, path: str = "config.yml") -> AppConfig:
 
     Raises ``ValueError`` if ``url`` (normalized) is not configured.
     """
-    config = load_config(path)
+    config = AppConfig.model_validate(_load_config_raw(path))
     idx = _find_repo_index(config, url)
     if idx < 0:
         raise ValueError(f"Repository not found: {url}")
@@ -295,7 +300,7 @@ def update_repository(
     if unknown:
         raise ValueError(f"Unknown repository fields: {sorted(unknown)}")
 
-    config = load_config(path)
+    config = AppConfig.model_validate(_load_config_raw(path))
     idx = _find_repo_index(config, url)
     if idx < 0:
         raise ValueError(f"Repository not found: {url}")
@@ -321,7 +326,7 @@ def update_daemon_config(
     if unknown:
         raise ValueError(f"Unknown daemon fields: {sorted(unknown)}")
 
-    config = load_config(path)
+    config = AppConfig.model_validate(_load_config_raw(path))
     # Same reasoning as update_repository: go through model_validate so a
     # malformed patch raises instead of corrupting the on-disk config.
     config.daemon = DaemonConfig.model_validate(

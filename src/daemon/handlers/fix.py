@@ -93,21 +93,20 @@ class FixMixin(BreachMixin):
         self.state.state = PipelineState.FIX
         current_pr = self.state.current_pr
         fix_iteration_cap = self.app_config.daemon.fix_iteration_cap
+        if current_pr is not None and current_pr.is_escalated:
+            self.state.error_message = None
+            self.state.state = PipelineState.IDLE
+            self.log_event(
+                f"FIX blocked for escalated PR #{current_pr.number}, moving to IDLE."
+            )
+            await self.publish_state()
+            return
         if (
             current_pr is not None
             and current_pr.fix_iteration_count >= fix_iteration_cap
         ):
             count = current_pr.fix_iteration_count
             pr_number = current_pr.number
-            if current_pr.is_escalated:
-                self.state.error_message = None
-                self.state.state = PipelineState.IDLE
-                self.log_event(
-                    f"FIX cap reached ({count}/{fix_iteration_cap}) on PR "
-                    f"#{pr_number}: already escalated, moving to IDLE."
-                )
-                await self.publish_state()
-                return
             comment = (
                 "@AlexBomber12 FIX iteration cap reached "
                 f"({count}/{fix_iteration_cap}). Escalating for manual review."
