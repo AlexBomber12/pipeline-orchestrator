@@ -62,6 +62,7 @@ class PRInfo(BaseModel):
     pr_id: str | None = None
     ci_status: CIStatus = CIStatus.PENDING
     review_status: ReviewStatus = ReviewStatus.PENDING
+    commits_count: int = 0
     push_count: int = 0
     fix_iteration_count: int = 0
     url: str = ""

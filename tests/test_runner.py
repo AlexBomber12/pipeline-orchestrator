@@ -13057,6 +13057,7 @@ def test_handle_fix_counts_push_when_head_changes(
 
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
+    assert runner.state.current_pr.commits_count == 0
     assert runner.state.current_pr.push_count == 1
     assert runner._last_push_at is not None
     assert before <= runner._last_push_at <= after
