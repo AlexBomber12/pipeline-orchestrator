@@ -2,7 +2,7 @@ services:
   web:
     build: .
     entrypoint: ["bash", "scripts/entrypoint.sh"]
-    command: uvicorn src.web.app:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn src.web.app:app --host 0.0.0.0 --port 8000 --reload --reload-dir src/web --reload-include "*.py" --reload-include "*.html" --reload-include "*.css"
     user: "1000:1000"
     mem_limit: 2g
     ports:
