@@ -62,7 +62,10 @@ async def run_codex_async(
             proc.kill()
         except ProcessLookupError:
             pass
-        await proc.wait()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            logger.warning("[codex] subprocess did not exit within 5s after kill")
         logger.error("[codex] codex exec timed out after %ss", timeout)
         return (-1, "", f"Timeout after {timeout}s")
     except asyncio.CancelledError:
@@ -71,7 +74,10 @@ async def run_codex_async(
                 proc.kill()
             except ProcessLookupError:
                 pass
-            await proc.wait()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                logger.warning("[codex] subprocess did not exit within 5s after kill")
         logger.error("[codex] codex exec task cancelled, subprocess killed")
         raise
     except FileNotFoundError as exc:
