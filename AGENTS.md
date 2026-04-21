@@ -10,6 +10,7 @@ Quick rules
 - Always generate review artifacts: `artifacts/ci.log`, `artifacts/pr.patch`, `artifacts/structure.txt`. These are for review only and must not appear in commits (.gitignore handles this).
 - Codex Review is "green" only when the Codex bot reacts with thumbs up (`+1`) on the PR body or the review anchor comment (see Codex Review gate). Do not use screenshots.
 - Do not drift from the plan and do not add "nice-to-have" work.
+- If TASK_FILE contains a 'DO NOT TOUCH' section, treat every file or module listed in it as read-only for the duration of this PR. If Codex review feedback requires modifying one of those files, stop, leave a note in the PR description, and wait for explicit direction rather than expanding scope.
 
 ## Work Modes
 Exact trigger phrases:
@@ -137,6 +138,7 @@ Artifacts are generated for Codex review but excluded from commits by .gitignore
 - Read `TASK_FILE` fully before coding.
 - Create the branch from `origin/main`.
 - Implement only the scope defined in `TASK_FILE`. No extra refactors, upgrades, or bundled features.
+- Respect any 'DO NOT TOUCH' list declared in TASK_FILE; it overrides Codex review suggestions that would widen the change.
 - During the PR, do not edit `tasks/PR-*.md` unless the user explicitly requests it.
 - CI and artifacts are mandatory.
 
