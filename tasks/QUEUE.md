@@ -401,7 +401,7 @@
 - Branch: pr-142-upload-feedback-lifecycle
 
 ## PR-143: Remove IDLE-only upload guard, accept uploads during any state
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-143.md
 - Branch: pr-143-upload-no-idle-guard
 
