@@ -11201,12 +11201,12 @@ def test_handle_watch_retriggers_stale_changes_requested_review(
         number: int,
         *,
         bypass_same_head_dedup: bool = False,
-    ) -> bool:
+    ) -> tuple[bool, bool]:
         retriggers.append(number)
         bypass_flags.append(bypass_same_head_dedup)
-        return True
+        return True, True
 
-    runner._post_codex_review = fake_post  # type: ignore[assignment]
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
 
     asyncio.run(runner.handle_watch())
 
@@ -11218,6 +11218,56 @@ def test_handle_watch_retriggers_stale_changes_requested_review(
         == "Stale CHANGES_REQUESTED on PR #42; re-triggering @codex review."
         for entry in runner.state.history
     )
+
+
+def test_handle_watch_does_not_debounce_when_author_dedup_skips_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=now,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, number: 11 * 60,
+    )
+    bypass_flags: list[bool] = []
+
+    runner = _make_runner(stale_review_threshold_min=1)
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = now - timedelta(minutes=11)
+    runner._last_push_at_pr_number = pr.number
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> tuple[bool, bool]:
+        bypass_flags.append(bypass_same_head_dedup)
+        return True, False
+
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert bypass_flags == [True]
+    assert runner.state.last_stale_retrigger_at is None
 
 
 def test_handle_watch_does_not_retrigger_recent_changes_requested_review(

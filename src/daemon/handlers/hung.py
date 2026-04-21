@@ -35,34 +35,13 @@ def _author_already_requested_review(
 class HungMixin:
     """Nudge the reviewer with ``@codex review`` or give up, per config."""
 
-    def _post_codex_review(
+    def _post_codex_review_result(
         self,
         pr_number: int,
         *,
         bypass_same_head_dedup: bool = False,
-    ) -> bool:
-        """Post ``@codex review`` on ``pr_number``.
-
-        Called after PR creation (``handle_coding``) and after every
-        fix push (``handle_fix``) so Codex kicks off a review for each
-        iteration instead of relying on the GitHub-side Automatic
-        Reviews trigger (which we want configured for PR creation only
-        to avoid duplicate reviews).
-
-        Skips posting when the PR author already has a recent
-        ``@codex review`` comment — Claude's PLANNED PR runbook posts
-        that trigger itself and an immediate daemon-side repost would
-        queue a duplicate Codex review.
-
-        Returns ``True`` on success and ``False`` on a logged failure.
-        The caller decides whether a failure is fatal: after a fix
-        push it must be, otherwise the next ``handle_watch`` cycle
-        still sees the prior ``CHANGES_REQUESTED`` signal and loops
-        back into ``handle_fix`` immediately, pushing a new fix every
-        poll interval without ever re-requesting a review. After PR
-        creation it can stay a warning because Codex Automatic Reviews
-        still fires on the creation event itself.
-        """
+    ) -> tuple[bool, bool]:
+        """Post ``@codex review`` and report ``(success, posted)``."""
         current_pr = self.state.current_pr
         cache_dedup_key = False
         head_sha: str | None = None
@@ -110,17 +89,16 @@ class HungMixin:
                 f"Skipping duplicate @codex review for PR #{pr_number}; "
                 "PR author already requested review for this head"
             )
-            return True
+            return True, False
         elif (
             not bypass_same_head_dedup
-            and
-            self._last_codex_review_pr == pr_number
+            and self._last_codex_review_pr == pr_number
             and self._last_codex_review_head_sha == head_sha
         ):
             self.log_event(
                 f"Skipping duplicate @codex review for PR #{pr_number}"
             )
-            return True
+            return True, False
 
         if head_sha is not None:
             self._last_codex_review_pr = pr_number
@@ -134,7 +112,7 @@ class HungMixin:
                 self.owner_repo, pr_number, "@codex review"
             )
             self.log_event(f"Posted @codex review on PR #{pr_number}")
-            return True
+            return True, True
         except Exception as exc:
             if cache_dedup_key:
                 self._last_codex_review_pr = None
@@ -143,7 +121,41 @@ class HungMixin:
                 f"Warning: failed to post @codex review on PR "
                 f"#{pr_number}: {exc}"
             )
-            return False
+            return False, False
+
+    def _post_codex_review(
+        self,
+        pr_number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> bool:
+        """Post ``@codex review`` on ``pr_number``.
+
+        Called after PR creation (``handle_coding``) and after every
+        fix push (``handle_fix``) so Codex kicks off a review for each
+        iteration instead of relying on the GitHub-side Automatic
+        Reviews trigger (which we want configured for PR creation only
+        to avoid duplicate reviews).
+
+        Skips posting when the PR author already has a recent
+        ``@codex review`` comment — Claude's PLANNED PR runbook posts
+        that trigger itself and an immediate daemon-side repost would
+        queue a duplicate Codex review.
+
+        Returns ``True`` on success and ``False`` on a logged failure.
+        The caller decides whether a failure is fatal: after a fix
+        push it must be, otherwise the next ``handle_watch`` cycle
+        still sees the prior ``CHANGES_REQUESTED`` signal and loops
+        back into ``handle_fix`` immediately, pushing a new fix every
+        poll interval without ever re-requesting a review. After PR
+        creation it can stay a warning because Codex Automatic Reviews
+        still fires on the creation event itself.
+        """
+        success, _posted = self._post_codex_review_result(
+            pr_number,
+            bypass_same_head_dedup=bypass_same_head_dedup,
+        )
+        return success
 
     async def handle_hung(self) -> None:
         """Nudge the reviewer with ``@codex review`` or give up, per config."""
