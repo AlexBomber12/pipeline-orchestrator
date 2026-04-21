@@ -414,7 +414,6 @@
 - Status: TODO
 - Tasks file: tasks/PR-145.md
 - Branch: pr-145-fix-iteration-cap
-- Depends on: PR-144
 
 ## PR-146: Pause and Stop event log feedback with cancel-pause support
 - Status: TODO
