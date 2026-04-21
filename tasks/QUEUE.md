@@ -411,7 +411,7 @@
 - Branch: pr-144-cancel-wait-timeout
 
 ## PR-145: FIX iteration cap with ESCALATE at iteration boundary
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-145.md
 - Branch: pr-145-fix-iteration-cap
 
