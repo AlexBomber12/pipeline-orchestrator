@@ -222,9 +222,4 @@ class WatchMixin:
             pr_number,
             bypass_same_head_dedup=True,
         )
-        if success and posted:
-            self.state.last_stale_retrigger_at = now
-        elif success and retry_at is not None:
-            self.state.last_stale_retrigger_at = (
-                retry_at - _STALE_RETRIGGER_DEBOUNCE
-            )
+        self.state.last_stale_retrigger_at = now

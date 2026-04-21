@@ -11309,11 +11309,17 @@ def test_handle_watch_retries_after_author_dedup_window_expires(
     )
     bypass_flags: list[bool] = []
 
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return now if tz is None else now.astimezone(tz)
+
     runner = _make_runner(stale_review_threshold_min=1)
     runner.state.current_pr = pr
     runner.state.state = PipelineState.WATCH
     runner._last_push_at = now - timedelta(minutes=11)
     runner._last_push_at_pr_number = pr.number
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
 
     requested_at = now - timedelta(minutes=1)
 
@@ -11330,9 +11336,64 @@ def test_handle_watch_retries_after_author_dedup_window_expires(
     asyncio.run(runner.handle_watch())
 
     assert bypass_flags == [True]
-    assert runner.state.last_stale_retrigger_at == requested_at + timedelta(
-        minutes=5
-    ) - watch_module._STALE_RETRIGGER_DEBOUNCE
+    assert runner.state.last_stale_retrigger_at == now
+
+
+def test_handle_watch_debounces_failed_stale_review_retrigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=now,
+    )
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, number: 11 * 60,
+    )
+    bypass_flags: list[bool] = []
+
+    runner = _make_runner()
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = now - timedelta(minutes=11)
+    runner._last_push_at_pr_number = pr.number
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        bypass_flags.append(bypass_same_head_dedup)
+        return False, False, None
+
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert bypass_flags == [True]
+    assert runner.state.last_stale_retrigger_at == now
 
 
 def test_handle_watch_does_not_retrigger_recent_changes_requested_review(
