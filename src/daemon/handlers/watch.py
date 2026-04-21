@@ -8,12 +8,13 @@ Mixin methods:
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from src import github_client
 from src.models import CIStatus, FeedbackCheckResult, PipelineState, ReviewStatus
 
 logger = logging.getLogger(__name__)
+_STALE_RETRIGGER_DEBOUNCE = timedelta(hours=1)
 
 
 class WatchMixin:
@@ -112,6 +113,7 @@ class WatchMixin:
                 f"PR #{found.number} CHANGES_REQUESTED but no new "
                 "Codex feedback since last push; waiting for fresh review"
             )
+            self._maybe_retrigger_stale_review(found.number)
 
         last_activity = found.last_activity or self.state.last_updated
         if last_activity.tzinfo is None:
@@ -180,3 +182,55 @@ class WatchMixin:
             if created > last_activity:
                 return FeedbackCheckResult.NEW
         return FeedbackCheckResult.NONE
+
+    def _maybe_retrigger_stale_review(self, pr_number: int) -> None:
+        """Re-trigger ``@codex review`` when a stale review blocks progress."""
+        current_pr = self.state.current_pr
+        if current_pr is None:
+            return
+        if current_pr.review_status != ReviewStatus.CHANGES_REQUESTED:
+            return
+
+        try:
+            pr_meta = github_client.get_pr_metadata(self.owner_repo, pr_number)
+        except Exception:
+            logger.warning(
+                "Failed to load PR metadata for stale review check on PR #%s",
+                pr_number,
+                exc_info=True,
+            )
+            return
+
+        head_sha = str(pr_meta.get("head_sha") or "")
+        head_commit_date = str(pr_meta.get("head_commit_date") or "")
+        if not head_sha or not head_commit_date:
+            return
+
+        last_push_at = github_client._parse_iso(head_commit_date)
+        if last_push_at is None:
+            return
+        if last_push_at.tzinfo is None:
+            last_push_at = last_push_at.replace(tzinfo=timezone.utc)
+
+        now = datetime.now(timezone.utc)
+        stale_after = timedelta(
+            minutes=self.app_config.daemon.stale_review_threshold_min
+        )
+        if now - last_push_at < stale_after:
+            return
+
+        last_retrigger_at = self.state.last_stale_retrigger_at
+        if last_retrigger_at is not None:
+            if last_retrigger_at.tzinfo is None:
+                last_retrigger_at = last_retrigger_at.replace(
+                    tzinfo=timezone.utc
+                )
+            if now - last_retrigger_at < _STALE_RETRIGGER_DEBOUNCE:
+                return
+
+        self.log_event(
+            f"Stale CHANGES_REQUESTED on PR #{pr_number}; re-triggering "
+            "@codex review."
+        )
+        self._post_codex_review(pr_number)
+        self.state.last_stale_retrigger_at = now

@@ -110,3 +110,24 @@ class RepoState(BaseModel):
     usage_weekly_resets_at: int | None = None
     usage_api_degraded: bool = False
     coder: str | None = None
+    last_stale_retrigger_at: datetime | None = None
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "current_pr":
+            current_pr = getattr(self, "current_pr", None)
+            if self._is_new_pr_transition(current_pr, value):
+                super().__setattr__("last_stale_retrigger_at", None)
+        super().__setattr__(name, value)
+
+    @staticmethod
+    def _is_new_pr_transition(old_pr: object, new_pr: object) -> bool:
+        if old_pr is None and new_pr is None:
+            return False
+        if old_pr is None or new_pr is None:
+            return True
+        if not isinstance(old_pr, PRInfo) or not isinstance(new_pr, PRInfo):
+            return old_pr != new_pr
+        return (
+            old_pr.number != new_pr.number
+            or old_pr.branch != new_pr.branch
+        )

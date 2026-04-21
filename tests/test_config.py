@@ -40,10 +40,12 @@ def test_load_config_missing_file_applies_env_overrides(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("PO_FIX_ITERATION_CAP", "4")
+    monkeypatch.setenv("PO_STALE_REVIEW_THRESHOLD_MIN", "12")
 
     cfg = load_config(str(tmp_path / "does-not-exist.yml"))
 
     assert cfg.daemon.fix_iteration_cap == 4
+    assert cfg.daemon.stale_review_threshold_min == 12
 
 
 def test_load_config_raw_omits_runtime_env_overrides(
