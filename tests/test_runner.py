@@ -10190,6 +10190,47 @@ def test_codex_review_not_reposted_when_author_already_requested_review(
     )
 
 
+def test_codex_review_result_returns_retry_at_for_author_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_at = datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc)
+    runner = _make_runner()
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: {
+            "author": "alice",
+            "head_sha": "head-1",
+            "head_commit_date": "2026-04-17T23:14:11Z",
+        },
+    )
+    monkeypatch.setattr(
+        hung_module,
+        "_author_already_requested_review",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        hung_module,
+        "_author_recent_review_requested_at",
+        lambda *args, **kwargs: requested_at,
+    )
+    monkeypatch.setattr(
+        git_ops_module,
+        "_git",
+        lambda *args, **kwargs: _FakeCompletedProcess(
+            args=list(args), stdout="head-1\n", returncode=0
+        ),
+    )
+    runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
+
+    success, posted, retry_at = runner._post_codex_review_result(42)
+
+    assert success is True
+    assert posted is False
+    assert retry_at == requested_at + timedelta(minutes=5)
+
+
 def test_codex_review_git_head_lookup_failure_does_not_dedup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -10273,6 +10314,26 @@ def test_author_already_requested_review_fails_open_on_lookup_error(
             "2026-04-17T23:14:11Z",
         )
         is False
+    )
+
+
+def test_author_recent_review_requested_at_fails_open_on_lookup_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        hung_module.github_client,
+        "get_recent_codex_review_request_time",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    assert (
+        hung_module._author_recent_review_requested_at(
+            "octo/demo",
+            42,
+            "alice",
+            "2026-04-17T23:14:11Z",
+        )
+        is None
     )
 
 
@@ -11201,10 +11262,10 @@ def test_handle_watch_retriggers_stale_changes_requested_review(
         number: int,
         *,
         bypass_same_head_dedup: bool = False,
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, datetime | None]:
         retriggers.append(number)
         bypass_flags.append(bypass_same_head_dedup)
-        return True, True
+        return True, True, None
 
     runner._post_codex_review_result = fake_post  # type: ignore[assignment]
 
@@ -11220,10 +11281,10 @@ def test_handle_watch_retriggers_stale_changes_requested_review(
     )
 
 
-def test_handle_watch_does_not_debounce_when_author_dedup_skips_post(
+def test_handle_watch_retries_after_author_dedup_window_expires(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc)
     pr = PRInfo(
         number=42,
         branch="pr-042-fix",
@@ -11254,20 +11315,24 @@ def test_handle_watch_does_not_debounce_when_author_dedup_skips_post(
     runner._last_push_at = now - timedelta(minutes=11)
     runner._last_push_at_pr_number = pr.number
 
+    requested_at = now - timedelta(minutes=1)
+
     def fake_post(
         number: int,
         *,
         bypass_same_head_dedup: bool = False,
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, datetime | None]:
         bypass_flags.append(bypass_same_head_dedup)
-        return True, False
+        return True, False, requested_at + timedelta(minutes=5)
 
     runner._post_codex_review_result = fake_post  # type: ignore[assignment]
 
     asyncio.run(runner.handle_watch())
 
     assert bypass_flags == [True]
-    assert runner.state.last_stale_retrigger_at is None
+    assert runner.state.last_stale_retrigger_at == requested_at + timedelta(
+        minutes=5
+    ) - watch_module._STALE_RETRIGGER_DEBOUNCE
 
 
 def test_handle_watch_does_not_retrigger_recent_changes_requested_review(

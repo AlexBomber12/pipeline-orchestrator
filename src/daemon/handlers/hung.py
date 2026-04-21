@@ -7,7 +7,7 @@ Mixin methods:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from src import github_client
 from src.daemon import git_ops
@@ -32,6 +32,24 @@ def _author_already_requested_review(
         return False
 
 
+def _author_recent_review_requested_at(
+    owner_repo: str,
+    pr_number: int,
+    pr_author: str,
+    head_commit_date: str,
+) -> datetime | None:
+    """Best-effort timestamp for a recent PR-author trigger on this head."""
+    try:
+        return github_client.get_recent_codex_review_request_time(
+            owner_repo,
+            pr_number,
+            pr_author=pr_author,
+            after_iso=head_commit_date,
+        )
+    except Exception:
+        return None
+
+
 class HungMixin:
     """Nudge the reviewer with ``@codex review`` or give up, per config."""
 
@@ -40,8 +58,8 @@ class HungMixin:
         pr_number: int,
         *,
         bypass_same_head_dedup: bool = False,
-    ) -> tuple[bool, bool]:
-        """Post ``@codex review`` and report ``(success, posted)``."""
+    ) -> tuple[bool, bool, datetime | None]:
+        """Post ``@codex review`` and report success/post/retry timing."""
         current_pr = self.state.current_pr
         cache_dedup_key = False
         head_sha: str | None = None
@@ -89,7 +107,16 @@ class HungMixin:
                 f"Skipping duplicate @codex review for PR #{pr_number}; "
                 "PR author already requested review for this head"
             )
-            return True, False
+            requested_at = _author_recent_review_requested_at(
+                self.owner_repo,
+                pr_number,
+                pr_author,
+                head_commit_date,
+            )
+            retry_at = None
+            if requested_at is not None:
+                retry_at = requested_at + timedelta(minutes=5)
+            return True, False, retry_at
         elif (
             not bypass_same_head_dedup
             and self._last_codex_review_pr == pr_number
@@ -98,7 +125,7 @@ class HungMixin:
             self.log_event(
                 f"Skipping duplicate @codex review for PR #{pr_number}"
             )
-            return True, False
+            return True, False, None
 
         if head_sha is not None:
             self._last_codex_review_pr = pr_number
@@ -112,7 +139,7 @@ class HungMixin:
                 self.owner_repo, pr_number, "@codex review"
             )
             self.log_event(f"Posted @codex review on PR #{pr_number}")
-            return True, True
+            return True, True, None
         except Exception as exc:
             if cache_dedup_key:
                 self._last_codex_review_pr = None
@@ -121,7 +148,7 @@ class HungMixin:
                 f"Warning: failed to post @codex review on PR "
                 f"#{pr_number}: {exc}"
             )
-            return False, False
+            return False, False, None
 
     def _post_codex_review(
         self,
@@ -151,7 +178,7 @@ class HungMixin:
         creation it can stay a warning because Codex Automatic Reviews
         still fires on the creation event itself.
         """
-        success, _posted = self._post_codex_review_result(
+        success, _posted, _retry_at = self._post_codex_review_result(
             pr_number,
             bypass_same_head_dedup=bypass_same_head_dedup,
         )

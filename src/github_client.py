@@ -715,13 +715,33 @@ def has_recent_codex_review_request(
     this is what keeps the dedup safe when the daemon and PR author
     share a gh identity.
     """
+    return (
+        get_recent_codex_review_request_time(
+            repo,
+            pr_number,
+            pr_author,
+            within_minutes=within_minutes,
+            after_iso=after_iso,
+        )
+        is not None
+    )
+
+
+def get_recent_codex_review_request_time(
+    repo: str,
+    pr_number: int,
+    pr_author: str,
+    within_minutes: int = 5,
+    after_iso: str | None = None,
+) -> datetime | None:
+    """Return the latest qualifying PR-author ``@codex review`` timestamp."""
     try:
         comments = _gh_api_paginated(
             f"repos/{repo}/issues/{pr_number}/comments"
         ) or []
     except RuntimeError as exc:
         if _is_http_404_error(exc):
-            return False
+            return None
         raise
     now = datetime.now(timezone.utc)
     cutoff = within_minutes * 60
@@ -740,8 +760,8 @@ def has_recent_codex_review_request(
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
         if (now - created).total_seconds() < cutoff:
-            return True
-    return False
+            return created
+    return None
 
 
 def _gh_api_paginated(path: str) -> list[dict] | None:

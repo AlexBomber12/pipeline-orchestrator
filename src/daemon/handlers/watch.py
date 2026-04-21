@@ -218,9 +218,13 @@ class WatchMixin:
             f"Stale CHANGES_REQUESTED on PR #{pr_number}; re-triggering "
             "@codex review."
         )
-        success, posted = self._post_codex_review_result(
+        success, posted, retry_at = self._post_codex_review_result(
             pr_number,
             bypass_same_head_dedup=True,
         )
         if success and posted:
             self.state.last_stale_retrigger_at = now
+        elif success and retry_at is not None:
+            self.state.last_stale_retrigger_at = (
+                retry_at - _STALE_RETRIGGER_DEBOUNCE
+            )
