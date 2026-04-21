@@ -1,17 +1,17 @@
 {% macro play_icon() -%}
-<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" class="w-5 h-5">
+<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" class="w-5 h-5 md:w-4 md:h-4">
     <path d="M8.25 6.75a.75.75 0 0 1 1.144-.638l8.25 5.25a.75.75 0 0 1 0 1.276l-8.25 5.25A.75.75 0 0 1 8.25 17.25V6.75Z" />
 </svg>
 {%- endmacro %}
 
 {% macro pause_icon() -%}
-<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" class="w-5 h-5">
+<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" class="w-5 h-5 md:w-4 md:h-4">
     <path d="M6.75 5.25A.75.75 0 0 1 7.5 4.5h2.25a.75.75 0 0 1 .75.75v13.5a.75.75 0 0 1-.75.75H7.5a.75.75 0 0 1-.75-.75V5.25Zm6.75 0a.75.75 0 0 1 .75-.75h2.25a.75.75 0 0 1 .75.75v13.5a.75.75 0 0 1-.75.75h-2.25a.75.75 0 0 1-.75-.75V5.25Z" />
 </svg>
 {%- endmacro %}
 
 {% macro stop_icon() -%}
-<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" class="w-5 h-5">
+<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" class="w-5 h-5 md:w-4 md:h-4">
     <path d="M7.5 6A1.5 1.5 0 0 0 6 7.5v9A1.5 1.5 0 0 0 7.5 18h9a1.5 1.5 0 0 0 1.5-1.5v-9A1.5 1.5 0 0 0 16.5 6h-9Z" />
 </svg>
 {%- endmacro %}
@@ -26,7 +26,7 @@
     <button type="button"
             aria-label="Resume daemon"
             title="Resume"
-            class="secondary-interactive inline-flex h-11 w-11 items-center justify-center rounded-lg border border-white/10 bg-surface-3/60 text-gray-300"
+            class="inline-flex items-center justify-center h-8 w-8 md:h-7 md:w-7 p-1.5 -m-1.5 md:p-0 md:m-0 rounded-md text-gray-400 hover:text-white hover:bg-white/5 transition-colors"
             hx-post="/repos/{{ repo.name }}/resume"
             hx-swap="none"
             onclick="event.stopPropagation()">
@@ -37,7 +37,7 @@
     <button type="button"
             aria-label="Pause daemon"
             title="Pause"
-            class="secondary-interactive inline-flex h-11 w-11 items-center justify-center rounded-lg border border-white/10 bg-surface-3/60 text-gray-300"
+            class="inline-flex items-center justify-center h-8 w-8 md:h-7 md:w-7 p-1.5 -m-1.5 md:p-0 md:m-0 rounded-md text-gray-400 hover:text-white hover:bg-white/5 transition-colors"
             hx-post="/repos/{{ repo.name }}/pause"
             hx-swap="none"
             onclick="event.stopPropagation()">
@@ -48,7 +48,7 @@
     <button type="button"
             aria-label="Stop current run"
             title="Stop"
-            class="secondary-interactive inline-flex h-11 w-11 items-center justify-center rounded-lg border border-fail/30 bg-fail/10 text-fail"
+            class="inline-flex items-center justify-center h-8 w-8 md:h-7 md:w-7 p-1.5 -m-1.5 md:p-0 md:m-0 rounded-md text-gray-400 hover:text-fail hover:bg-fail/10 transition-colors"
             hx-post="/repos/{{ repo.name }}/stop"
             hx-confirm="Stop the current run? The working tree may be left dirty."
             hx-swap="none"
