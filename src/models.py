@@ -66,6 +66,7 @@ class PRInfo(BaseModel):
     fix_iteration_count: int = 0
     url: str = ""
     last_activity: datetime | None = None
+    is_escalated: bool = False
     # True when the PR head is on a forked repository instead of
     # ``origin``. The daemon's auto-commit safety net cannot push to a
     # fork (no credentials, different remote), so it must refuse

@@ -99,6 +99,16 @@ class FixMixin(BreachMixin):
         ):
             count = current_pr.fix_iteration_count
             pr_number = current_pr.number
+            if current_pr.is_escalated:
+                self.state.user_paused = False
+                self.state.error_message = None
+                self.state.state = PipelineState.IDLE
+                self.log_event(
+                    f"FIX cap reached ({count}/{fix_iteration_cap}) on PR "
+                    f"#{pr_number}: already escalated, moving to IDLE."
+                )
+                await self.publish_state()
+                return
             comment = (
                 "@AlexBomber12 FIX iteration cap reached "
                 f"({count}/{fix_iteration_cap}). Escalating for manual review."
@@ -135,6 +145,7 @@ class FixMixin(BreachMixin):
                 self.state.error_message = f"pr edit failed: {exc}"
                 self.log_event(self.state.error_message)
                 return
+            current_pr.is_escalated = True
             self.state.user_paused = False
             self.state.error_message = None
             self.state.state = PipelineState.IDLE

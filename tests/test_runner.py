@@ -2830,6 +2830,54 @@ def test_handle_fix_cap_ignores_existing_label_create_failure(
     assert runner.state.state == PipelineState.IDLE
 
 
+def test_handle_fix_cap_skips_repeat_escalation_when_pr_already_escalated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted: list[tuple[str, int, str]] = []
+    gh_calls: list[list[str]] = []
+
+    class _UnexpectedPlugin:
+        async def fix_review(
+            self, path: str, **kwargs: object
+        ) -> tuple[int, str, str]:
+            raise AssertionError("fix_review should not run at cap boundary")
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda cmd, **kwargs: gh_calls.append(cmd) or "",
+    )
+
+    runner = _make_runner()
+    runner._get_coder = lambda allow_exploration=False: (  # type: ignore[method-assign]
+        "claude",
+        _UnexpectedPlugin(),
+    )
+    runner.state.current_pr = PRInfo(
+        number=91,
+        branch="pr-091",
+        fix_iteration_count=2,
+        is_escalated=True,
+    )
+    runner._app_config = _app_cfg(fix_iteration_cap=2)
+
+    asyncio.run(runner.handle_fix())
+
+    assert posted == []
+    assert gh_calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert any(
+        entry["event"]
+        == "FIX cap reached (2/2) on PR #91: already escalated, moving to IDLE."
+        for entry in runner.state.history
+    )
+
+
 def test_handle_idle_preserves_fix_iteration_count_when_reattaching_same_pr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -156,7 +156,7 @@ def get_open_prs(
             "--state",
             "open",
             "--json",
-            "number,title,headRefName,headRefOid,statusCheckRollup,url,updatedAt,commits,author,isCrossRepository",
+            "number,title,headRefName,headRefOid,statusCheckRollup,url,updatedAt,commits,author,isCrossRepository,labels",
         ],
         repo=repo,
     )
@@ -190,6 +190,11 @@ def get_open_prs(
                 push_count=len(commits),
                 url=entry.get("url", ""),
                 last_activity=_parse_iso(entry.get("updatedAt")),
+                is_escalated=any(
+                    isinstance(label, dict)
+                    and (label.get("name") or "").lower() == "escalated"
+                    for label in (entry.get("labels") or [])
+                ),
                 is_cross_repository=bool(entry.get("isCrossRepository", False)),
             )
         )
