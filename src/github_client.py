@@ -187,6 +187,7 @@ def get_open_prs(
                     pr_author=(entry.get("author") or {}).get("login", ""),
                     head_sha=head_sha,
                 ),
+                commits_count=len(commits),
                 push_count=len(commits),
                 url=entry.get("url", ""),
                 last_activity=_parse_iso(entry.get("updatedAt")),

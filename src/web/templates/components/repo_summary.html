@@ -163,6 +163,10 @@
                 </dd>
             </div>
             <div class="flex flex-col items-start gap-1 sm:flex-row sm:items-baseline sm:justify-between sm:gap-3">
+                <dt class="text-gray-500">Commits</dt>
+                <dd class="font-mono text-gray-200">{{ repo.current_pr.commits_count }}</dd>
+            </div>
+            <div class="flex flex-col items-start gap-1 sm:flex-row sm:items-baseline sm:justify-between sm:gap-3">
                 <dt class="text-gray-500">Pushes</dt>
                 <dd class="font-mono text-gray-200">{{ repo.current_pr.push_count }}</dd>
             </div>

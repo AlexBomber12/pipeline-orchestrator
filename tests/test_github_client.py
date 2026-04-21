@@ -2383,6 +2383,7 @@ def test_get_open_prs_returns_prinfo_objects(
     assert prs[0].pr_id == "PR-110"
     assert prs[0].ci_status == CIStatus.SUCCESS
     assert prs[0].review_status == ReviewStatus.APPROVED
+    assert prs[0].commits_count == 2
     assert prs[0].push_count == 2
     assert prs[0].url == "https://example.test/pr/42"
     assert prs[0].last_activity == datetime(2026, 4, 18, 11, 22, 33, tzinfo=_tz.utc)

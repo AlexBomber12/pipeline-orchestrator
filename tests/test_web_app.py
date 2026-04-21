@@ -1220,6 +1220,7 @@ def test_partial_repo_detail_renders_redis_payload(
             branch="pr-042-wire-it-up",
             ci_status=CIStatus.SUCCESS,
             review_status=ReviewStatus.APPROVED,
+            commits_count=4,
             push_count=3,
             url="https://github.com/example/alpha/pull/99",
         ),
@@ -1261,6 +1262,10 @@ def test_partial_repo_detail_renders_redis_payload(
     assert "#99" in body
     assert "https://github.com/example/alpha/pull/99" in body
     assert "pr-042-wire-it-up" in body
+    assert "Commits" in body
+    assert "Pushes" in body
+    assert ">4</dd>" in body
+    assert ">3</dd>" in body
     assert "CODING" in body
     # Event log lives on /partials/repo/{name}/events now, so history
     # entries are no longer rendered by the summary partial.
