@@ -91,6 +91,35 @@ async def test_run_codex_async_timeout_ignores_missing_process_on_kill(
 
 
 @pytest.mark.asyncio
+async def test_run_codex_async_timeout_returns_when_wait_cleanup_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_proc = _make_fake_proc()
+    fake_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError)
+    call_count = 0
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        return fake_proc
+
+    async def fake_wait_for(coro: Any, timeout: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return await coro
+        coro.close()
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setattr("src.codex_cli.asyncio.wait_for", fake_wait_for)
+
+    result = await run_codex_async("prompt", "/tmp", timeout=5)
+
+    assert result == (-1, "", "Timeout after 5s")
+    fake_proc.kill.assert_called_once()
+    fake_proc.wait.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_run_codex_async_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
         raise FileNotFoundError(2, "No such file or directory", "codex")
@@ -320,3 +349,32 @@ async def test_run_codex_async_cancellation_kills_process(
 
     fake_proc.kill.assert_called_once()
     fake_proc.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_codex_async_cancelled_raises_when_wait_cleanup_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_proc = _make_fake_proc()
+    fake_proc.communicate = AsyncMock(side_effect=asyncio.CancelledError)
+    call_count = 0
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        return fake_proc
+
+    async def fake_wait_for(coro: Any, timeout: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return await coro
+        coro.close()
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setattr("src.codex_cli.asyncio.wait_for", fake_wait_for)
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_codex_async("prompt", "/tmp")
+
+    fake_proc.kill.assert_called_once()
+    fake_proc.wait.assert_called_once()
