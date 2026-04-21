@@ -35,6 +35,17 @@ def test_load_config_missing_file_returns_defaults(tmp_path: Path) -> None:
     assert cfg.auth.gh_config_dir == "/data/auth/gh"
 
 
+def test_load_config_missing_file_applies_env_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PO_FIX_ITERATION_CAP", "4")
+
+    cfg = load_config(str(tmp_path / "does-not-exist.yml"))
+
+    assert cfg.daemon.fix_iteration_cap == 4
+
+
 def test_daemon_config_claude_model_default() -> None:
     from src.config import DaemonConfig
 

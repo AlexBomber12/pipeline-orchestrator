@@ -143,7 +143,9 @@ def load_config(path: str = "config.yml") -> AppConfig:
     """
     config_path = Path(path)
     if not config_path.is_file():
-        return AppConfig()
+        raw: dict[str, Any] = {}
+        _apply_daemon_env_overrides(raw)
+        return AppConfig.model_validate(raw)
 
     with config_path.open("r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh) or {}

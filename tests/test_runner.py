@@ -2830,6 +2830,58 @@ def test_handle_fix_cap_ignores_existing_label_create_failure(
     assert runner.state.state == PipelineState.IDLE
 
 
+def test_handle_idle_preserves_fix_iteration_count_when_reattaching_same_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    task = QueueTask(
+        pr_id="PR-145",
+        title="Fix iteration cap",
+        status=TaskStatus.TODO,
+        branch="pr-145-fix-iteration-cap",
+    )
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: task)
+
+    reattached_pr = PRInfo(
+        number=145,
+        branch="pr-145-fix-iteration-cap",
+        title="PR-145: Fix iteration cap",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [reattached_pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: {"head_commit_date": "2026-04-21T00:48:54Z"},
+    )
+
+    runner = _make_runner()
+    runner.state.current_task = task
+    runner.state.current_pr = PRInfo(
+        number=145,
+        branch="pr-145-fix-iteration-cap",
+        fix_iteration_count=15,
+    )
+
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 145
+    assert runner.state.current_pr.fix_iteration_count == 15
+
+
 def test_handle_fix_cap_sets_error_when_comment_post_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
