@@ -857,7 +857,7 @@ class PipelineRunner(
             )
         ):
             if not self._user_pause_logged:
-                self.log_event("Paused by user, not picking up new tasks")
+                self.log_event("Paused. Press Play to resume.")
                 self._user_pause_logged = True
             await self.publish_state()
             return
@@ -876,7 +876,7 @@ class PipelineRunner(
             await self._refresh_user_paused_from_redis()
             if self.state.user_paused:
                 if not self._user_pause_logged:
-                    self.log_event("Paused by user, not picking up new tasks")
+                    self.log_event("Paused. Press Play to resume.")
                     self._user_pause_logged = True
                 await self.publish_state()
                 return

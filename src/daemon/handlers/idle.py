@@ -653,7 +653,7 @@ class IdleMixin:
         """Wait for rate limit window to expire, then resume previous flow."""
         if self.state.user_paused:
             if not getattr(self, "_user_pause_logged", False):
-                self.log_event("Paused by user, not picking up new tasks")
+                self.log_event("Paused. Press Play to resume.")
                 self._user_pause_logged = True
             return
         if self.state.rate_limited_until is None:

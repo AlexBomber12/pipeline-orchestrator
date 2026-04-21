@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Literal
+from typing import Any, AsyncIterator, Callable, Literal
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI, Form, Request, UploadFile
@@ -56,6 +56,7 @@ logger = logging.getLogger(__name__)
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 templates.env.globals["utcnow"] = lambda: datetime.now(timezone.utc)
+_HISTORY_LIMIT = 100
 _METRICS_PANEL_LIMIT = 20
 _METRICS_SCAN_LIMIT = 100
 _CODER_LABELS = {
@@ -70,6 +71,12 @@ _DEFERRED_CODER_SWITCH_STATES = {
     PipelineState.MERGE,
     PipelineState.HUNG,
     PipelineState.PAUSED,
+}
+_ACTIVE_RUN_STATES = {
+    PipelineState.CODING,
+    PipelineState.WATCH,
+    PipelineState.FIX,
+    PipelineState.MERGE,
 }
 
 
@@ -183,7 +190,8 @@ async def _update_repo_pause_state(
     *,
     user_paused: bool,
     stop_action: Literal["leave", "clear", "set"] = "leave",
-) -> Response | None:
+    event_message: str | Callable[[RepoState], str] | None = None,
+) -> RepoState | Response:
     """Atomically update ``user_paused`` and any stop-signal side effect."""
 
     try:
@@ -202,7 +210,7 @@ async def _update_repo_pause_state(
     }[stop_action]
 
     try:
-        async def _transaction(pipe: Any) -> None:
+        async def _transaction(pipe: Any) -> RepoState:
             raw = await pipe.get(state_key)
             if raw is None:
                 state = _default_repo_state(name, repo_url)
@@ -213,6 +221,9 @@ async def _update_repo_pause_state(
                     raise _RepoStateMutationError("Repository state unavailable") from exc
 
             state.user_paused = user_paused
+            if event_message is not None:
+                message = event_message(state) if callable(event_message) else event_message
+                _append_history_entry(state, message)
 
             pipe.multi()
             pipe.set(state_key, state.model_dump_json())
@@ -220,13 +231,83 @@ async def _update_repo_pause_state(
                 pipe.delete(stop_key)
             elif stop_action == "set":
                 pipe.set(stop_key, "1", ex=60)
+            return state
 
-        await redis_client.transaction(_transaction, *watch_keys)
+        state = await redis_client.transaction(
+            _transaction,
+            *watch_keys,
+            value_from_callable=True,
+        )
     except _RepoStateMutationError as exc:
         return HTMLResponse(exc.message, status_code=exc.status_code)
     except Exception:
         return HTMLResponse(failure_message, status_code=503)
-    return None
+
+    if event_message is not None:
+        message = event_message(state) if callable(event_message) else event_message
+        await _publish_history_entry_event(
+            name,
+            state,
+            message,
+            redis_client,
+        )
+
+    return state
+
+
+def _append_history_entry(state: RepoState, event: str) -> None:
+    """Mirror ``Runner.log_event`` for web control-plane history entries."""
+    now = datetime.now(timezone.utc).isoformat()
+    current_state = state.state.value
+    last_entry = state.history[-1] if state.history else None
+    if (
+        last_entry is not None
+        and last_entry.get("state") == current_state
+        and last_entry.get("event") == event
+    ):
+        last_entry["count"] = int(last_entry.get("count", 1)) + 1
+        last_entry["last_seen_at"] = now
+        return
+
+    state.history.append(
+        {
+            "time": now,
+            "state": current_state,
+            "event": event,
+            "count": 1,
+            "last_seen_at": now,
+        }
+    )
+    if len(state.history) > _HISTORY_LIMIT:
+        state.history = state.history[-_HISTORY_LIMIT:]
+
+
+async def _publish_history_entry_event(
+    name: str,
+    state: RepoState,
+    event_message: str,
+    redis_client: aioredis.Redis,
+) -> None:
+    """Publish a live history update for repo-detail subscribers."""
+    try:
+        await publish_repo_event(
+            name,
+            "history_updated",
+            {
+                "state": state.state.value,
+                "event": event_message,
+            },
+            redis_client,
+        )
+    except Exception:
+        logger.warning("Failed to publish repo history update", exc_info=True)
+
+
+def _resume_event_message(state: RepoState) -> str:
+    """Return the user-facing event emitted by the Play control."""
+    if state.state in _ACTIVE_RUN_STATES:
+        return "Pause canceled. Continue current run."
+    return "Resumed. Taking next task from queue."
 
 
 def _effective_coder_name(
@@ -1007,35 +1088,45 @@ async def repo_detail(request: Request, name: str) -> HTMLResponse:
 
 @app.post("/repos/{name}/pause")
 async def pause_repo(request: Request, name: str) -> Response:
-    failure = await _update_repo_pause_state(request, name, user_paused=True)
-    if failure is not None:
-        return failure
+    result = await _update_repo_pause_state(
+        request,
+        name,
+        user_paused=True,
+        event_message=(
+            "Pause requested. Finishing current PR cycle "
+            "(may take several iterations)."
+        ),
+    )
+    if isinstance(result, Response):
+        return result
     return JSONResponse({"ok": True, "user_paused": True})
 
 
 @app.post("/repos/{name}/resume")
 async def resume_repo(request: Request, name: str) -> Response:
-    failure = await _update_repo_pause_state(
+    result = await _update_repo_pause_state(
         request,
         name,
         user_paused=False,
         stop_action="clear",
+        event_message=_resume_event_message,
     )
-    if failure is not None:
-        return failure
+    if isinstance(result, Response):
+        return result
     return JSONResponse({"ok": True, "user_paused": False})
 
 
 @app.post("/repos/{name}/stop")
 async def stop_repo(request: Request, name: str) -> Response:
-    failure = await _update_repo_pause_state(
+    result = await _update_repo_pause_state(
         request,
         name,
         user_paused=True,
         stop_action="set",
+        event_message="Stop requested. Aborting run; working tree may be left dirty.",
     )
-    if failure is not None:
-        return failure
+    if isinstance(result, Response):
+        return result
     return JSONResponse({"ok": True, "user_paused": True})
 
 
