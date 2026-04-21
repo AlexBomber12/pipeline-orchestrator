@@ -11141,7 +11141,7 @@ def test_maybe_retrigger_stale_review_returns_for_non_changes_requested() -> Non
     assert runner.state.last_stale_retrigger_at is None
 
 
-def test_maybe_retrigger_stale_review_returns_for_missing_metadata(
+def test_maybe_retrigger_stale_review_returns_for_missing_push_age(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = _make_runner()
@@ -11153,57 +11153,8 @@ def test_maybe_retrigger_stale_review_returns_for_missing_metadata(
 
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_metadata",
-        lambda repo, number: {"author": "octocat", "head_sha": "", "head_commit_date": ""},
-    )
-
-    runner._maybe_retrigger_stale_review(42)
-
-    assert runner.state.last_stale_retrigger_at is None
-
-
-def test_maybe_retrigger_stale_review_returns_on_metadata_exception(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner = _make_runner()
-    runner.state.current_pr = PRInfo(
-        number=42,
-        branch="pr-042-fix",
-        review_status=ReviewStatus.CHANGES_REQUESTED,
-    )
-
-    def _raise(repo: str, number: int) -> dict[str, str]:
-        raise RuntimeError("metadata unavailable")
-
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
-        _raise,
-    )
-
-    runner._maybe_retrigger_stale_review(42)
-
-    assert runner.state.last_stale_retrigger_at is None
-
-
-def test_maybe_retrigger_stale_review_returns_for_unparseable_push_time(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner = _make_runner()
-    runner.state.current_pr = PRInfo(
-        number=42,
-        branch="pr-042-fix",
-        review_status=ReviewStatus.CHANGES_REQUESTED,
-    )
-
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
-        lambda repo, number: {
-            "author": "octocat",
-            "head_sha": "abc123",
-            "head_commit_date": "not-a-timestamp",
-        },
+        "get_last_push_age_seconds",
+        lambda repo, number: None,
     )
 
     runner._maybe_retrigger_stale_review(42)
@@ -11234,14 +11185,8 @@ def test_handle_watch_retriggers_stale_changes_requested_review(
     )
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_metadata",
-        lambda repo, number: {
-            "author": "octocat",
-            "head_sha": "abc123",
-            "head_commit_date": (
-                now - timedelta(minutes=11)
-            ).isoformat().replace("+00:00", "Z"),
-        },
+        "get_last_push_age_seconds",
+        lambda repo, number: 11 * 60,
     )
     retriggers: list[int] = []
     bypass_flags: list[bool] = []
@@ -11298,14 +11243,8 @@ def test_handle_watch_does_not_retrigger_recent_changes_requested_review(
     )
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_metadata",
-        lambda repo, number: {
-            "author": "octocat",
-            "head_sha": "abc123",
-            "head_commit_date": (
-                now - timedelta(minutes=5)
-            ).isoformat().replace("+00:00", "Z"),
-        },
+        "get_last_push_age_seconds",
+        lambda repo, number: 5 * 60,
     )
     retriggers: list[int] = []
 
@@ -11352,12 +11291,8 @@ def test_handle_watch_does_not_retrigger_within_debounce_window(
     )
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_metadata",
-        lambda repo, number: {
-            "author": "octocat",
-            "head_sha": "abc123",
-            "head_commit_date": "2026-04-21T11:00:00Z",
-        },
+        "get_last_push_age_seconds",
+        lambda repo, number: 60 * 60,
     )
     retriggers: list[int] = []
 
@@ -11405,12 +11340,8 @@ def test_handle_watch_normalizes_naive_stale_retrigger_timestamps(
     )
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_metadata",
-        lambda repo, number: {
-            "author": "octocat",
-            "head_sha": "abc123",
-            "head_commit_date": "2026-04-21T11:00:00",
-        },
+        "get_last_push_age_seconds",
+        lambda repo, number: 60 * 60,
     )
     retriggers: list[int] = []
 

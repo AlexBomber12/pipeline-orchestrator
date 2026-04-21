@@ -191,32 +191,18 @@ class WatchMixin:
         if current_pr.review_status != ReviewStatus.CHANGES_REQUESTED:
             return
 
-        try:
-            pr_meta = github_client.get_pr_metadata(self.owner_repo, pr_number)
-        except Exception:
-            logger.warning(
-                "Failed to load PR metadata for stale review check on PR #%s",
-                pr_number,
-                exc_info=True,
-            )
+        last_push_age_seconds = github_client.get_last_push_age_seconds(
+            self.owner_repo,
+            pr_number,
+        )
+        if last_push_age_seconds is None:
             return
-
-        head_sha = str(pr_meta.get("head_sha") or "")
-        head_commit_date = str(pr_meta.get("head_commit_date") or "")
-        if not head_sha or not head_commit_date:
-            return
-
-        last_push_at = github_client._parse_iso(head_commit_date)
-        if last_push_at is None:
-            return
-        if last_push_at.tzinfo is None:
-            last_push_at = last_push_at.replace(tzinfo=timezone.utc)
 
         now = datetime.now(timezone.utc)
         stale_after = timedelta(
             minutes=self.app_config.daemon.stale_review_threshold_min
         )
-        if now - last_push_at < stale_after:
+        if last_push_age_seconds < stale_after.total_seconds():
             return
 
         last_retrigger_at = self.state.last_stale_retrigger_at
