@@ -421,7 +421,7 @@
 - Branch: pr-146-pause-stop-events
 
 ## PR-147: Re-trigger @codex review on stale CHANGES_REQUESTED
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-147.md
 - Branch: pr-147-stale-review-retrigger
 
