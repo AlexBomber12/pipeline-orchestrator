@@ -406,7 +406,7 @@
 - Branch: pr-143-upload-no-idle-guard
 
 ## PR-144: Bounded subprocess wait after TimeoutError and CancelledError
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-144.md
 - Branch: pr-144-cancel-wait-timeout
 
