@@ -426,7 +426,7 @@
 - Branch: pr-147-stale-review-retrigger
 
 ## PR-148: Separate "Commits" metric matching GitHub Commits count
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-148.md
 - Branch: pr-148-commits-match-gh
 
