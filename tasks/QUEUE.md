@@ -431,7 +431,7 @@
 - Branch: pr-148-commits-match-gh
 
 ## PR-149: Coder-neutral log_event text in Python handlers
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-149.md
 - Branch: pr-149-coder-neutral-logs
 
