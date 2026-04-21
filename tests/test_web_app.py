@@ -421,25 +421,156 @@ def test_pause_resume_stop_endpoints_update_repo_state(
         state=PipelineState.IDLE,
     )
     fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+    published: list[tuple[str, str, dict[str, object], object | None]] = []
+
+    async def _fake_publish_repo_event(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, object],
+        redis_client: object | None = None,
+    ) -> None:
+        published.append((repo_name, event_type, payload, redis_client))
+
     monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
+    monkeypatch.setattr(web_app, "publish_repo_event", _fake_publish_repo_event)
 
     with TestClient(app) as client:
         pause = client.post("/repos/example__alpha/pause")
         assert pause.status_code == 200
         paused = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
         assert paused.user_paused is True
+        assert paused.history[-1]["event"] == (
+            "Pause requested. Finishing current PR cycle "
+            "(may take several iterations)."
+        )
 
         stop = client.post("/repos/example__alpha/stop")
         assert stop.status_code == 200
         stopped = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
         assert stopped.user_paused is True
         assert fake.store["control:example__alpha:stop"] == "1"
+        assert stopped.history[-1]["event"] == (
+            "Stop requested. Aborting run; working tree may be left dirty."
+        )
 
         resume = client.post("/repos/example__alpha/resume")
         assert resume.status_code == 200
         resumed = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
         assert resumed.user_paused is False
         assert "control:example__alpha:stop" not in fake.store
+        assert resumed.history[-1]["event"] == (
+            "Resumed. Taking next task from queue."
+        )
+
+    assert [entry["event"] for entry in resumed.history] == [
+        "Pause requested. Finishing current PR cycle (may take several iterations).",
+        "Stop requested. Aborting run; working tree may be left dirty.",
+        "Resumed. Taking next task from queue.",
+    ]
+    assert published == [
+        (
+            "example__alpha",
+            "history_updated",
+            {
+                "state": "IDLE",
+                "event": (
+                    "Pause requested. Finishing current PR cycle "
+                    "(may take several iterations)."
+                ),
+            },
+            fake,
+        ),
+        (
+            "example__alpha",
+            "history_updated",
+            {
+                "state": "IDLE",
+                "event": "Stop requested. Aborting run; working tree may be left dirty.",
+            },
+            fake,
+        ),
+        (
+            "example__alpha",
+            "history_updated",
+            {
+                "state": "IDLE",
+                "event": "Resumed. Taking next task from queue.",
+            },
+            fake,
+        ),
+    ]
+
+
+def test_resume_endpoint_cancels_pending_pause_for_active_run(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.CODING,
+        user_paused=True,
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/resume")
+
+    assert response.status_code == 200
+    resumed = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+    assert resumed.user_paused is False
+    assert resumed.history[-1]["event"] == "Pause canceled. Continue current run."
+
+
+def test_pause_then_resume_while_active_does_not_log_effective_paused_event(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.FIX,
+        user_paused=False,
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
+
+    with TestClient(app) as client:
+        pause = client.post("/repos/example__alpha/pause")
+        resume = client.post("/repos/example__alpha/resume")
+
+    assert pause.status_code == 200
+    assert resume.status_code == 200
+    state = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+    assert [entry["event"] for entry in state.history] == [
+        "Pause requested. Finishing current PR cycle (may take several iterations).",
+        "Pause canceled. Continue current run.",
+    ]
+    assert "Paused. Press Play to resume." not in [
+        entry["event"] for entry in state.history
+    ]
+
+
+def test_append_history_entry_caps_control_history_at_100() -> None:
+    state = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        history=[
+            {
+                "time": f"2026-04-10T12:{minute:02d}:00+00:00",
+                "state": "IDLE",
+                "event": f"event {minute}",
+            }
+            for minute in range(100)
+        ],
+    )
+
+    web_app._append_history_entry(state, "new event")
+
+    assert len(state.history) == 100
+    assert state.history[0]["event"] == "event 1"
+    assert state.history[-1]["event"] == "new event"
 
 
 def test_pause_endpoint_is_idempotent(

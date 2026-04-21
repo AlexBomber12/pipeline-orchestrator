@@ -13694,7 +13694,7 @@ def test_run_cycle_runs_recovery_before_honoring_user_pause(
     assert publishes == ["published"]
     assert runner._recovered is True
     assert not any(
-        entry["event"] == "Paused by user, not picking up new tasks"
+        entry["event"] == "Paused. Press Play to resume."
         for entry in runner.state.history
     )
 
@@ -13761,7 +13761,7 @@ def test_run_cycle_short_circuits_idle_when_user_paused(
     assert sum(
         1
         for entry in runner.state.history
-        if entry["event"] == "Paused by user, not picking up new tasks"
+        if entry["event"] == "Paused. Press Play to resume."
     ) == 1
 
 
@@ -13804,7 +13804,7 @@ def test_run_cycle_short_circuits_paused_when_user_paused(
     assert sum(
         1
         for entry in runner.state.history
-        if entry["event"] == "Paused by user, not picking up new tasks"
+        if entry["event"] == "Paused. Press Play to resume."
     ) == 1
 
 
@@ -13856,7 +13856,7 @@ def test_run_cycle_short_circuits_active_watch_and_merge_when_user_paused(
     assert sum(
         1
         for entry in runner.state.history
-        if entry["event"] == "Paused by user, not picking up new tasks"
+        if entry["event"] == "Paused. Press Play to resume."
     ) == 1
 
 
@@ -13946,7 +13946,7 @@ def test_run_cycle_rereads_pause_flag_before_idle_dispatch(
     assert sum(
         1
         for entry in runner.state.history
-        if entry["event"] == "Paused by user, not picking up new tasks"
+        if entry["event"] == "Paused. Press Play to resume."
     ) == 1
 
 
@@ -15762,7 +15762,7 @@ def test_handle_paused_logs_user_pause_only_once() -> None:
     assert sum(
         1
         for entry in runner.state.history
-        if entry["event"] == "Paused by user, not picking up new tasks"
+        if entry["event"] == "Paused. Press Play to resume."
     ) == 1
 
 
