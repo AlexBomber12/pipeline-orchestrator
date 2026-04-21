@@ -63,6 +63,7 @@ def test_repo_state_json_round_trip() -> None:
             ci_status=CIStatus.SUCCESS,
             review_status=ReviewStatus.EYES,
             push_count=1,
+            fix_iteration_count=2,
             url="https://github.com/example/repo/pull/2",
             last_activity=now,
         ),
@@ -76,3 +77,9 @@ def test_repo_state_json_round_trip() -> None:
     restored = RepoState.model_validate_json(payload)
 
     assert restored == state
+
+
+def test_pr_info_fix_iteration_count_defaults_to_zero() -> None:
+    pr = PRInfo(number=7, branch="pr-007")
+
+    assert pr.fix_iteration_count == 0

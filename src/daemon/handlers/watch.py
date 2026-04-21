@@ -37,7 +37,8 @@ class WatchMixin:
             self.log_event(str(exc))
             return
 
-        current_number = self.state.current_pr.number
+        current_pr = self.state.current_pr
+        current_number = current_pr.number
         found = next((p for p in prs if p.number == current_number), None)
         if found is None:
             merged = github_client.is_pr_merged(self.owner_repo, current_number)
@@ -59,6 +60,9 @@ class WatchMixin:
             self.state.state = PipelineState.IDLE
             return
 
+        found = found.model_copy(
+            update={"fix_iteration_count": current_pr.fix_iteration_count}
+        )
         self.state.current_pr = found
         # Retry rehydrate every cycle so a transient commit-time fetch
         # failure during ``recover_state`` doesn't permanently leave

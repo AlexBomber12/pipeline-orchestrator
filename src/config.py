@@ -38,6 +38,7 @@ _DAEMON_FIELDS = {
     "error_handler_use_ai",
     "claude_model",
     "fix_idle_timeout_sec",
+    "fix_iteration_cap",
     "planned_pr_timeout_sec",
     "rate_limit_session_pause_percent",
     "rate_limit_weekly_pause_percent",
@@ -52,6 +53,10 @@ _DAEMON_FIELDS = {
     "exploration_epsilon",
     "coder",
     "codex_model",
+}
+
+_DAEMON_ENV_OVERRIDES = {
+    "PO_FIX_ITERATION_CAP": "fix_iteration_cap",
 }
 
 
@@ -91,6 +96,7 @@ class DaemonConfig(BaseModel):
     error_handler_use_ai: bool = True
     claude_model: str = "opus"
     fix_idle_timeout_sec: int = Field(default=1800, ge=1)
+    fix_iteration_cap: int = Field(default=15, ge=1)
     planned_pr_timeout_sec: int = Field(default=900, ge=60)
     rate_limit_session_pause_percent: int = Field(default=95, ge=0, le=100)
     rate_limit_weekly_pause_percent: int = Field(default=100, ge=0, le=100)
@@ -158,7 +164,27 @@ def load_config(path: str = "config.yml") -> AppConfig:
             if "rate_limit_session_pause_percent" not in daemon:
                 daemon["rate_limit_session_pause_percent"] = legacy_rate
 
+    _apply_daemon_env_overrides(raw)
+
     return AppConfig.model_validate(raw)
+
+
+def _apply_daemon_env_overrides(raw: dict[str, Any]) -> None:
+    """Apply supported daemon env-var overrides onto ``raw`` config."""
+    daemon = raw.get("daemon")
+    overrides = {
+        field: os.environ.get(env_name)
+        for env_name, field in _DAEMON_ENV_OVERRIDES.items()
+        if os.environ.get(env_name) not in (None, "")
+    }
+    if not overrides:
+        return
+    if daemon is None:
+        daemon = {}
+        raw["daemon"] = daemon
+    if not isinstance(daemon, dict):
+        return
+    daemon.update(overrides)
 
 
 def normalize_repo_url(url: str) -> str:

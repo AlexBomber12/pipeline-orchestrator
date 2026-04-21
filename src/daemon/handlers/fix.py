@@ -91,6 +91,59 @@ class FixMixin(BreachMixin):
             return
 
         self.state.state = PipelineState.FIX
+        current_pr = self.state.current_pr
+        fix_iteration_cap = self.app_config.daemon.fix_iteration_cap
+        if (
+            current_pr is not None
+            and current_pr.fix_iteration_count >= fix_iteration_cap
+        ):
+            count = current_pr.fix_iteration_count
+            pr_number = current_pr.number
+            comment = (
+                "@AlexBomber12 FIX iteration cap reached "
+                f"({count}/{fix_iteration_cap}). Escalating for manual review."
+            )
+            try:
+                github_client.post_comment(self.owner_repo, pr_number, comment)
+            except Exception as exc:
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = f"post_comment failed: {exc}"
+                self.log_event(self.state.error_message)
+                return
+            try:
+                github_client.run_gh(
+                    [
+                        "label",
+                        "create",
+                        "escalated",
+                        "--color",
+                        "B60205",
+                        "--description",
+                        "Daemon escalated, manual review required",
+                    ],
+                    repo=self.owner_repo,
+                )
+            except Exception as exc:
+                self.log_event(f"FIX cap label create skipped: {exc}")
+            try:
+                github_client.run_gh(
+                    ["pr", "edit", str(pr_number), "--add-label", "escalated"],
+                    repo=self.owner_repo,
+                )
+            except Exception as exc:
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = f"pr edit failed: {exc}"
+                self.log_event(self.state.error_message)
+                return
+            self.state.user_paused = False
+            self.state.error_message = None
+            self.state.state = PipelineState.IDLE
+            self.log_event(
+                f"FIX cap reached ({count}/{fix_iteration_cap}) on PR "
+                f"#{pr_number}: escalated, moving to IDLE."
+            )
+            await self.publish_state()
+            return
         self.log_event(f"[{coder_name}] entering FIX")
         await self.publish_state()
         if self._current_run_record is not None:
@@ -366,8 +419,9 @@ class FixMixin(BreachMixin):
             if self.state.current_pr is not None:
                 self._last_push_at_pr_number = self.state.current_pr.number
                 self.state.current_pr.push_count += 1
+                self.state.current_pr.fix_iteration_count += 1
                 self.state.current_pr.last_activity = push_time
-                iteration = self.state.current_pr.push_count
+                iteration = self.state.current_pr.fix_iteration_count
             else:
                 iteration = 0
 
