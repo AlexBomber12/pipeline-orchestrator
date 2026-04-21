@@ -62,7 +62,9 @@ class FixMixin(BreachMixin):
                 latest_push_at = None
             if latest_push_at is not None and latest_push_at > last_known_push:
                 last_known_push = latest_push_at
-                self.log_event("FIX: Claude pushed, resetting idle timer")
+                self.log_event(
+                    f"FIX: [{self.state.coder or 'coder'}] pushed, resetting idle timer"
+                )
             elapsed = time.monotonic() - last_known_push
             if elapsed >= idle_limit:
                 self.log_event(
