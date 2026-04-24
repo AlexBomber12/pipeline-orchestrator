@@ -11,22 +11,6 @@ import asyncio
 from src import github_client
 from src.models import PipelineState
 
-"""In-memory counter of consecutive coder-exit-without-PR failures per task.
-Resets on daemon restart; upgrade to Redis persistence in later PR."""
-_NO_PR_RETRY_COUNTS: dict[str, int] = {}
-
-
-def _clear_stale_no_pr_retry_count(runner: object, current_pr_id: str | None) -> None:
-    """Drop stale no-PR retry state when CODING starts for another task."""
-    if current_pr_id is None:
-        return
-    last_failed_pr_id = getattr(runner, "_last_no_pr_failed_pr_id", None)
-    if last_failed_pr_id == current_pr_id:
-        return
-    _NO_PR_RETRY_COUNTS.pop(last_failed_pr_id or current_pr_id, None)
-    if last_failed_pr_id is not None:
-        runner._last_no_pr_failed_pr_id = None
-
 
 class CodingMixin:
     """Run ``PLANNED PR`` via the active coder CLI and hand off to WATCH."""
@@ -42,8 +26,6 @@ class CodingMixin:
         retry a few times before surfacing an ERROR.
         """
         self._stop_requested = False
-        current_pr_id = self.state.current_task.pr_id if self.state.current_task is not None else None
-        _clear_stale_no_pr_retry_count(self, current_pr_id)
         await self._refresh_auth_status_cache()
         coder_name, plugin = self._get_coder()
         model = (
@@ -262,29 +244,13 @@ class CodingMixin:
         if await pause_for_stop_if_requested():
             return
         if candidate is None:
-            no_pr_message = (
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = (
                 f"[{coder_name}] coder succeeded but no PR found for branch "
                 f"{target_branch!r}"
             )
-            retry_count = 0
-            if current_pr_id is not None:
-                retry_count = _NO_PR_RETRY_COUNTS.get(current_pr_id, 0) + 1
-                _NO_PR_RETRY_COUNTS[current_pr_id] = retry_count
-                self._last_no_pr_failed_pr_id = current_pr_id
-            self.log_event(no_pr_message)
-            if retry_count >= 2 and current_pr_id is not None:
-                blocked_message = (
-                    f"Task {current_pr_id} blocked: coder failed to create PR "
-                    "2 times in a row. Manual intervention required."
-                )
-                self.state.state = PipelineState.HUNG
-                self.state.error_message = blocked_message
-                await self._save_current_run_record("error")
-                self.log_event(blocked_message)
-                return
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = no_pr_message
             await self._save_current_run_record("error")
+            self.log_event(self.state.error_message)
             return
 
         self.state.current_pr = candidate
