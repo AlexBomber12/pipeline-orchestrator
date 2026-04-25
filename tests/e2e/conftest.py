@@ -22,6 +22,7 @@ import requests
 TEST_DASHBOARD_URL = "http://localhost:18800"
 TESTBED_SLUG = "AlexBomber12__pipeline-orchestrator-testbed"
 TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
+TESTBED_DEFAULT_BRANCH = "main"
 REPO_DIR = Path(__file__).resolve().parents[2]
 EVIDENCE_DIR = REPO_DIR / "tests" / "e2e" / "evidence"
 
@@ -239,12 +240,15 @@ def _branch_prefix_for(pr_id: str) -> str:
     return f"pr-{pr_id.lower().replace('.', '-')}-"
 
 
-def _list_owned_testbed_pr_numbers(pr_ids: Iterable[str]) -> set[str]:
-    """Return open PR numbers whose head branch belongs to one of ``pr_ids``.
+def _list_owned_testbed_pr_numbers(
+    pr_ids: Iterable[str], *, state: str = "open"
+) -> set[str]:
+    """Return PR numbers in ``state`` whose head branch belongs to one of ``pr_ids``.
 
     Filtering by head-branch prefix keeps teardown scoped to PRs created by
     this test session, so a parallel CI run or an unrelated PR opened on
-    the testbed during the test is never closed.
+    the testbed during the test is never closed. ``state`` accepts any value
+    ``gh pr list --state`` does (``open``, ``merged``, ``closed``, ``all``).
     """
     prefixes = tuple(_branch_prefix_for(pid) for pid in pr_ids)
     if not prefixes:
@@ -257,7 +261,7 @@ def _list_owned_testbed_pr_numbers(pr_ids: Iterable[str]) -> set[str]:
             "-R",
             TESTBED_REPO,
             "--state",
-            "open",
+            state,
             "--json",
             "number,headRefName",
         ],
@@ -267,7 +271,7 @@ def _list_owned_testbed_pr_numbers(pr_ids: Iterable[str]) -> set[str]:
     )
     if result.returncode != 0:
         raise RuntimeError(
-            f"Failed to list open PRs on {TESTBED_REPO} during testbed cleanup "
+            f"Failed to list {state} PRs on {TESTBED_REPO} during testbed cleanup "
             f"(exit {result.returncode}): {result.stderr.strip() or result.stdout.strip()}"
         )
     try:
@@ -282,6 +286,63 @@ def _list_owned_testbed_pr_numbers(pr_ids: Iterable[str]) -> set[str]:
         if any(head.startswith(prefix) for prefix in prefixes):
             owned.add(str(pr.get("number")))
     return owned
+
+
+def _get_testbed_branch_sha(branch: str = TESTBED_DEFAULT_BRANCH) -> str:
+    result = subprocess.run(
+        [
+            "gh",
+            "api",
+            f"repos/{TESTBED_REPO}/git/ref/heads/{branch}",
+            "-q",
+            ".object.sha",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to read {branch!r} HEAD on {TESTBED_REPO} "
+            f"(exit {result.returncode}): "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    sha = result.stdout.strip()
+    if not sha:
+        raise RuntimeError(
+            f"`gh api` returned empty SHA for {branch!r} on {TESTBED_REPO}"
+        )
+    return sha
+
+
+def _reset_testbed_branch(sha: str, branch: str = TESTBED_DEFAULT_BRANCH) -> None:
+    """Force-reset the testbed default branch to ``sha``.
+
+    Used after a test-owned PR auto-merges so the next run starts from the
+    same baseline the fixture captured at entry.
+    """
+    result = subprocess.run(
+        [
+            "gh",
+            "api",
+            "-X",
+            "PATCH",
+            f"repos/{TESTBED_REPO}/git/refs/heads/{branch}",
+            "-f",
+            f"sha={sha}",
+            "-F",
+            "force=true",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to reset {branch!r} to {sha} on {TESTBED_REPO} during testbed "
+            f"cleanup (exit {result.returncode}): "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
 
 
 def _close_testbed_prs(numbers: Iterable[str]) -> None:
@@ -327,16 +388,22 @@ def reset_testbed_clean() -> Iterable[Callable[[str], None]]:
     """Yield a registration callback; teardown closes only test-owned PRs.
 
     Tests must call the yielded ``register(pr_id)`` for each task they upload.
-    Teardown lists open PRs on the testbed and closes only those whose head
-    branch matches a registered PR_ID, so concurrent runs and unrelated
-    activity on the testbed are unaffected.
+    Teardown closes any open PR whose head branch matches a registered
+    PR_ID and, because ``config.test.yml`` enables auto-merge, also force-
+    resets the testbed default branch to the SHA captured at fixture entry
+    when any registered PR has merged. That keeps the testbed at a known
+    baseline regardless of whether the test exited before or after merge.
     """
     registered: set[str] = set()
+    baseline_sha = _get_testbed_branch_sha()
 
     def register(pr_id: str) -> None:
         registered.add(_normalize_pr_id(pr_id))
 
     yield register
-    test_owned = _list_owned_testbed_pr_numbers(registered)
-    _close_testbed_prs(test_owned)
+    open_owned = _list_owned_testbed_pr_numbers(registered, state="open")
+    _close_testbed_prs(open_owned)
+    merged_owned = _list_owned_testbed_pr_numbers(registered, state="merged")
+    if merged_owned and _get_testbed_branch_sha() != baseline_sha:
+        _reset_testbed_branch(baseline_sha)
     _wait_daemon_idle()
