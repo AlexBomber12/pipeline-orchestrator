@@ -449,3 +449,68 @@
 - Status: DONE
 - Tasks file: tasks/PR-152.md
 - Branch: pr-152-remove-start-badge
+
+## PR-153a: Python e2e test infrastructure (conftest skeleton + smoke test)
+- Status: TODO
+- Tasks file: tasks/PR-153a.md
+- Branch: pr-153a-e2e-python-skeleton
+
+## PR-153b: Docker compose test stack on port 18800
+- Status: TODO
+- Tasks file: tasks/PR-153b.md
+- Branch: pr-153b-e2e-docker-stack
+- Depends on: PR-153a
+
+## PR-153c: Test config, test dependencies, PO_CONFIG_PATH override
+- Status: TODO
+- Tasks file: tasks/PR-153c.md
+- Branch: pr-153c-e2e-config-and-deps
+- Depends on: PR-153b
+
+## PR-154a: Mock coder shim wrapper and Python context manager
+- Status: TODO
+- Tasks file: tasks/PR-154a.md
+- Branch: pr-154a-coder-shim
+- Depends on: PR-153c
+
+## PR-154b: e2e test 1 — upload and merge happy path
+- Status: TODO
+- Tasks file: tasks/PR-154b.md
+- Branch: pr-154b-e2e-test-upload-merge
+- Depends on: PR-154a
+
+## PR-154c: e2e test 2 — stop and resume during CODING
+- Status: TODO
+- Tasks file: tasks/PR-154c.md
+- Branch: pr-154c-e2e-stop-resume
+- Depends on: PR-154b
+
+## PR-154d: e2e test 3 — Redis kill and recover
+- Status: TODO
+- Tasks file: tasks/PR-154d.md
+- Branch: pr-154d-e2e-redis-down
+- Depends on: PR-154c
+
+## PR-154e: e2e test 4 — SIGKILL daemon recovery
+- Status: TODO
+- Tasks file: tasks/PR-154e.md
+- Branch: pr-154e-e2e-sigkill-recovery
+- Depends on: PR-154d
+
+## PR-155a: GitHub Actions CI workflow with two-tier gate
+- Status: TODO
+- Tasks file: tasks/PR-155a.md
+- Branch: pr-155a-gha-workflow
+- Depends on: PR-154e
+
+## PR-155b: GitHub App setup documentation and AGENTS.md update
+- Status: TODO
+- Tasks file: tasks/PR-155b.md
+- Branch: pr-155b-ci-setup-docs
+- Depends on: PR-155a
+
+## PR-155c: Local e2e debug script and documentation
+- Status: TODO
+- Tasks file: tasks/PR-155c.md
+- Branch: pr-155c-local-e2e-debug
+- Depends on: PR-155b
