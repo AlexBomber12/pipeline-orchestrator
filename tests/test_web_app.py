@@ -1555,7 +1555,7 @@ def test_repo_card_renders_pause_and_stop_controls_for_active_repo(
     assert 'aria-label="Stop current run"' in body
     assert 'hx-confirm="Stop the current run? The working tree may be left dirty."' in body
     assert 'onclick="event.stopPropagation()"' in body
-    assert 'h-11 w-11' in body
+    assert 'h-8 w-8 md:h-7 md:w-7' in body
 
 
 @pytest.mark.parametrize(
