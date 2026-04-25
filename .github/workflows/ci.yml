@@ -81,7 +81,7 @@ jobs:
               git_protocol: https
           EOF
           chmod 600 tests/e2e/data/auth/gh/hosts.yml
-          sudo chown -R 1000:1000 tests/e2e/data
+          sudo chown -R 1000:1000 tests/e2e/data/auth tests/e2e/data/repos
 
       - name: Bring up test stack
         run: docker compose -f docker-compose.test.yml up -d --wait
