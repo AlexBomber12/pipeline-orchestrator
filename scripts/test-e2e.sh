@@ -68,16 +68,16 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$NO_UP" -eq 0 ]]; then
-  bash scripts/init-test-volume.sh
-  docker compose -f docker-compose.test.yml up -d --wait
-fi
-
 SHIM_SCENARIO_PATH="tests/e2e/data/shim-scenario"
 SHIM_BACKUP=""
 RESTORE_SHIM=0
+exit_code=0
 
-restore_shim() {
+cleanup() {
+  trap_rc=$?
+  trap - EXIT
+  set +e
+
   if [[ "$RESTORE_SHIM" -eq 1 ]]; then
     if [[ -n "$SHIM_BACKUP" && -f "$SHIM_BACKUP" ]]; then
       mv -f "$SHIM_BACKUP" "$SHIM_SCENARIO_PATH"
@@ -88,8 +88,33 @@ restore_shim() {
   if [[ -n "$SHIM_BACKUP" && -f "$SHIM_BACKUP" ]]; then
     rm -f "$SHIM_BACKUP"
   fi
+
+  if [[ "$NO_UP" -eq 0 && "$KEEP_UP" -eq 0 ]]; then
+    teardown_rc=0
+    docker compose -f docker-compose.test.yml down -v || teardown_rc=$?
+    if [[ "$teardown_rc" -ne 0 ]]; then
+      echo "warning: teardown failed (rc=$teardown_rc); preserving exit code $exit_code" >&2
+    fi
+  fi
+
+  final_rc="$exit_code"
+  if [[ "$final_rc" -eq 0 && "$trap_rc" -ne 0 ]]; then
+    final_rc="$trap_rc"
+  fi
+
+  if [[ "$final_rc" -eq 0 ]]; then
+    echo "PASS in ${SECONDS}s"
+  else
+    echo "FAIL in ${SECONDS}s"
+  fi
+  exit "$final_rc"
 }
-trap restore_shim EXIT
+trap cleanup EXIT
+
+if [[ "$NO_UP" -eq 0 ]]; then
+  bash scripts/init-test-volume.sh
+  docker compose -f docker-compose.test.yml up -d --wait
+fi
 
 if [[ -n "$SCENARIO" ]]; then
   mkdir -p tests/e2e/data
@@ -106,20 +131,4 @@ if [[ -n "$FILTER" ]]; then
   FILTER_ARGS=(-k "$FILTER")
 fi
 
-exit_code=0
 python -m pytest tests/e2e/ -v "${FILTER_ARGS[@]}" || exit_code=$?
-
-if [[ "$KEEP_UP" -eq 0 ]]; then
-  teardown_rc=0
-  docker compose -f docker-compose.test.yml down -v || teardown_rc=$?
-  if [[ "$teardown_rc" -ne 0 ]]; then
-    echo "warning: teardown failed (rc=$teardown_rc); preserving pytest exit code $exit_code" >&2
-  fi
-fi
-
-if [[ "$exit_code" -eq 0 ]]; then
-  echo "PASS in ${SECONDS}s"
-else
-  echo "FAIL in ${SECONDS}s"
-fi
-exit "$exit_code"
