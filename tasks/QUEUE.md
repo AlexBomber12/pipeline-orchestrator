@@ -486,7 +486,7 @@
 - Branch: pr-154d-e2e-redis-down
 
 ## PR-154e: e2e test 4 — SIGKILL daemon recovery
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-154e.md
 - Branch: pr-154e-e2e-sigkill-recovery
 
