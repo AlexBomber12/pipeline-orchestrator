@@ -464,7 +464,6 @@
 - Status: TODO
 - Tasks file: tasks/PR-153c.md
 - Branch: pr-153c-e2e-config-and-deps
-- Depends on: PR-153b
 
 ## PR-154a: Mock coder shim wrapper and Python context manager
 - Status: TODO
