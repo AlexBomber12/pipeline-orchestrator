@@ -13,3 +13,6 @@ artifacts/
 .coverage
 .coverage.*
 htmlcov/
+tests/e2e/data/
+tests/e2e/evidence/
+tests/e2e/.pytest_cache/
