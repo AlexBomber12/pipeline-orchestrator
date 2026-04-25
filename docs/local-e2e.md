@@ -21,7 +21,7 @@ On AI-Server (192.168.50.4) and DESKTOP-5NT9DG3 WSL these prerequisites are alre
 - `scripts/test-e2e.sh --filter test_upload_and_merge` runs only that test.
 - `scripts/test-e2e.sh --keep-up` leaves the stack up after tests finish so containers can be inspected.
 - `scripts/test-e2e.sh --no-up --keep-up --filter test_smoke` is the fastest iteration loop while actively developing: stack stays up across runs, only the named test executes.
-- `scripts/test-e2e.sh --scenario success --filter test_upload_and_merge` pre-writes the named scenario to `tests/e2e/data/shim-scenario` before pytest starts, useful when a test reads the scenario rather than setting it via fixture.
+- `scripts/test-e2e.sh --scenario success --filter test_upload_and_merge` pre-writes the named scenario to `tests/e2e/data/shim-scenario` before pytest starts, useful when a test reads the scenario rather than setting it via fixture. The previous file contents (or `success\n` if the file did not exist) are restored on exit, so the override does not leak into later runs.
 - `scripts/test-e2e.sh --help` prints usage and exits 0.
 
 The script always echoes a one-line `PASS in Ns` or `FAIL in Ns` summary on the last line and exits with the pytest exit code; the wall-clock duration uses bash's `SECONDS` builtin and covers stack bring-up plus pytest plus teardown.

@@ -21,7 +21,9 @@ Flags:
   --keep-up         Skip teardown after tests so you can inspect the stack.
   --no-up           Skip startup; assume the test stack is already running.
   --filter PATTERN  Forward as -k PATTERN to pytest.
-  --scenario NAME   Pre-write NAME to tests/e2e/data/shim-scenario before running tests.
+  --scenario NAME   Pre-write NAME to tests/e2e/data/shim-scenario before running
+                    tests; the prior file contents (or success if absent) are
+                    restored on exit so the override does not leak across runs.
   -h, --help        Print this usage and exit 0.
 
 See docs/local-e2e.md for details and troubleshooting.
@@ -71,9 +73,32 @@ if [[ "$NO_UP" -eq 0 ]]; then
   docker compose -f docker-compose.test.yml up -d --wait
 fi
 
+SHIM_SCENARIO_PATH="tests/e2e/data/shim-scenario"
+SHIM_BACKUP=""
+RESTORE_SHIM=0
+
+restore_shim() {
+  if [[ "$RESTORE_SHIM" -eq 1 ]]; then
+    if [[ -n "$SHIM_BACKUP" && -f "$SHIM_BACKUP" ]]; then
+      mv -f "$SHIM_BACKUP" "$SHIM_SCENARIO_PATH"
+    else
+      printf 'success\n' > "$SHIM_SCENARIO_PATH"
+    fi
+  fi
+  if [[ -n "$SHIM_BACKUP" && -f "$SHIM_BACKUP" ]]; then
+    rm -f "$SHIM_BACKUP"
+  fi
+}
+trap restore_shim EXIT
+
 if [[ -n "$SCENARIO" ]]; then
   mkdir -p tests/e2e/data
-  printf '%s' "$SCENARIO" > tests/e2e/data/shim-scenario
+  if [[ -f "$SHIM_SCENARIO_PATH" ]]; then
+    SHIM_BACKUP="$(mktemp)"
+    cp "$SHIM_SCENARIO_PATH" "$SHIM_BACKUP"
+  fi
+  RESTORE_SHIM=1
+  printf '%s' "$SCENARIO" > "$SHIM_SCENARIO_PATH"
 fi
 
 FILTER_ARGS=()
@@ -81,14 +106,20 @@ if [[ -n "$FILTER" ]]; then
   FILTER_ARGS=(-k "$FILTER")
 fi
 
-set +e
-python -m pytest tests/e2e/ -v "${FILTER_ARGS[@]}"
-exit_code=$?
-set -e
+exit_code=0
+python -m pytest tests/e2e/ -v "${FILTER_ARGS[@]}" || exit_code=$?
 
 if [[ "$KEEP_UP" -eq 0 ]]; then
-  docker compose -f docker-compose.test.yml down -v
+  teardown_rc=0
+  docker compose -f docker-compose.test.yml down -v || teardown_rc=$?
+  if [[ "$teardown_rc" -ne 0 ]]; then
+    echo "warning: teardown failed (rc=$teardown_rc); preserving pytest exit code $exit_code" >&2
+  fi
 fi
 
-echo "$([ $exit_code -eq 0 ] && echo PASS || echo FAIL) in ${SECONDS}s"
+if [[ "$exit_code" -eq 0 ]]; then
+  echo "PASS in ${SECONDS}s"
+else
+  echo "FAIL in ${SECONDS}s"
+fi
 exit "$exit_code"
