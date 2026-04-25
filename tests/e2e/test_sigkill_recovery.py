@@ -1,3 +1,4 @@
+import datetime as dt
 import subprocess
 import time
 
@@ -67,7 +68,12 @@ def test_sigkill_during_coding_recovers_correctly(
         status = upload_zip(zip_path)
         assert status in (200, 201), f"upload failed with status {status}"
 
-        wait_for_state(["CODING"], timeout_sec=30)
+        pre_kill_entry = wait_for_state(["CODING"], timeout_sec=30)
+        pre_kill_last_updated = pre_kill_entry.get("last_updated")
+        assert pre_kill_last_updated, (
+            f"pre-kill CODING state has no last_updated: {pre_kill_entry!r}"
+        )
+        pre_kill_ts = dt.datetime.fromisoformat(pre_kill_last_updated)
 
         subprocess.run(
             ["docker", "kill", "--signal=KILL", DAEMON_CONTAINER],
@@ -104,8 +110,37 @@ def test_sigkill_during_coding_recovers_correctly(
             f"after restart; last value was {running_again!r}"
         )
 
-        recovered = wait_for_state(
-            ["IDLE", "CODING", "WATCH"], timeout_sec=90
+        recovered = None
+        recovered_states = ("IDLE", "CODING", "WATCH")
+        last_seen_state = None
+        last_seen_ts: dt.datetime | None = None
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            entry = get_state()
+            if entry is not None:
+                last_seen_state = entry.get("state")
+                last_updated = entry.get("last_updated")
+                ts: dt.datetime | None = None
+                if last_updated:
+                    try:
+                        ts = dt.datetime.fromisoformat(last_updated)
+                    except ValueError:
+                        ts = None
+                last_seen_ts = ts
+                if (
+                    ts is not None
+                    and ts > pre_kill_ts
+                    and last_seen_state in recovered_states
+                ):
+                    recovered = entry
+                    break
+            time.sleep(1)
+        assert recovered is not None, (
+            f"daemon did not produce a fresh post-restart state in "
+            f"{list(recovered_states)!r} within 90s; "
+            f"last_seen_state={last_seen_state!r}, "
+            f"last_seen_last_updated={last_seen_ts.isoformat() if last_seen_ts else None!r}, "
+            f"pre_kill_last_updated={pre_kill_ts.isoformat()!r}"
         )
 
         recovered_state = recovered.get("state")
