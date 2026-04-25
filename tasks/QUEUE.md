@@ -441,7 +441,7 @@
 - Branch: pr-150-state-badge-alignment
 
 ## PR-151: Play/Pause/Stop buttons size responsive and subtle
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-151.md
 - Branch: pr-151-button-sizing
 
