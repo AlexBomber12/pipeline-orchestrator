@@ -12,7 +12,7 @@ from src import codex_cli
 from src.config import AppConfig, load_config
 from src.usage import OpenAIUsageProvider, UsageProvider
 
-CONFIG_PATH = "config.yml"
+CONFIG_PATH = os.environ.get("PO_CONFIG_PATH", "config.yml")
 _AUTH_CHECK_TIMEOUT_SEC = 5
 _CODEX_RETRY_PATTERN = re.compile(
     r"try again in\s+"

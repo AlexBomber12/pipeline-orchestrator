@@ -49,7 +49,7 @@ from src.queue_parser import QueueValidationError, parse_queue_text, parse_task_
 from src.utils import repo_slug_from_url
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
-CONFIG_PATH = "config.yml"
+CONFIG_PATH = os.environ.get("PO_CONFIG_PATH", "config.yml")
 REPOS_DIR = "/data/repos"
 logger = logging.getLogger(__name__)
 
