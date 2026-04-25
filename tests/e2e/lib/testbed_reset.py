@@ -7,6 +7,7 @@ lighter per-test cleanup.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -14,6 +15,15 @@ from pathlib import Path
 
 TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
 TESTBED_URL = f"https://github.com/{TESTBED_REPO}.git"
+
+
+def _clone_url() -> str:
+    # Embed GH_TOKEN (set on the integration job) so `git push` is
+    # authenticated without needing a host-side `gh auth setup-git`.
+    token = os.environ.get("GH_TOKEN", "").strip()
+    if not token:
+        return TESTBED_URL
+    return f"https://x-access-token:{token}@github.com/{TESTBED_REPO}.git"
 
 
 def close_all_open_prs() -> int:
@@ -104,7 +114,7 @@ def wipe_tasks_dir_on_main() -> bool:
     workdir = Path(tempfile.mkdtemp(prefix="testbed-reset-"))
     try:
         clone = subprocess.run(
-            ["git", "clone", "--depth", "1", TESTBED_URL, str(workdir / "repo")],
+            ["git", "clone", "--depth", "1", _clone_url(), str(workdir / "repo")],
             capture_output=True,
             text=True,
             check=False,

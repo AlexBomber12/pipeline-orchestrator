@@ -20,6 +20,8 @@ import pytest
 from tests.e2e.lib import testbed_reset
 from tests.e2e.lib.testbed_reset import (
     TESTBED_REPO,
+    TESTBED_URL,
+    _clone_url,
     close_all_open_prs,
     delete_non_main_branches,
     reset_testbed_full,
@@ -220,6 +222,56 @@ def test_wipe_tasks_dir_cleans_workdir_even_on_exception(tmp_path) -> None:
     rmtree_mock.assert_called_once()
     assert Path(rmtree_mock.call_args.args[0]) == tmp_path
     assert rmtree_mock.call_args.kwargs.get("ignore_errors") is True
+
+
+def test_clone_url_returns_plain_url_without_token(monkeypatch) -> None:
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    assert _clone_url() == TESTBED_URL
+
+
+def test_clone_url_embeds_gh_token_when_set(monkeypatch) -> None:
+    monkeypatch.setenv("GH_TOKEN", "  ghs_secret  ")
+    assert _clone_url() == (
+        f"https://x-access-token:ghs_secret@github.com/{TESTBED_REPO}.git"
+    )
+
+
+def test_wipe_tasks_dir_uses_authenticated_clone_url_when_token_set(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("GH_TOKEN", "ghs_xyz")
+    clone_ok = _completed(returncode=0)
+    config_ok = _completed(returncode=0)
+    rm_ok = _completed(returncode=0)
+    commit_ok = _completed(returncode=0)
+    push_ok = _completed(returncode=0)
+
+    captured: dict = {}
+
+    with (
+        patch.object(testbed_reset.tempfile, "mkdtemp", return_value=str(tmp_path)),
+        patch.object(testbed_reset.subprocess, "run") as run,
+    ):
+        seq = iter([clone_ok, config_ok, config_ok, rm_ok, commit_ok, push_ok])
+
+        def fake_run(cmd, *a, **kw):
+            from pathlib import Path as _P
+
+            if cmd[:2] == ["git", "clone"]:
+                captured["clone_cmd"] = list(cmd)
+                target = cmd[-1]
+                _P(target).mkdir(parents=True, exist_ok=True)
+                (_P(target) / "tasks").mkdir(parents=True, exist_ok=True)
+            return next(seq)
+
+        run.side_effect = fake_run
+        assert wipe_tasks_dir_on_main() is True
+
+    clone_cmd = captured["clone_cmd"]
+    assert clone_cmd[:4] == ["git", "clone", "--depth", "1"]
+    assert clone_cmd[4] == (
+        f"https://x-access-token:ghs_xyz@github.com/{TESTBED_REPO}.git"
+    )
 
 
 def test_reset_testbed_full_aggregates_all_helpers() -> None:
