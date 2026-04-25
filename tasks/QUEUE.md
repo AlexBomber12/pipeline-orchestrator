@@ -511,6 +511,6 @@
 - Branch: pr-156-gha-dns-and-path-fix
 
 ## PR-157: testbed reset fixture for pytest session start
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-157.md
 - Branch: pr-157-testbed-reset-fixture
