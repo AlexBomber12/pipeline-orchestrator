@@ -319,7 +319,9 @@ def _reset_testbed_branch(sha: str, branch: str = TESTBED_DEFAULT_BRANCH) -> Non
     """Force-reset the testbed default branch to ``sha``.
 
     Used after a test-owned PR auto-merges so the next run starts from the
-    same baseline the fixture captured at entry.
+    same baseline the fixture captured at entry. Callers MUST verify with
+    :func:`_assert_only_owned_commits_on_branch` first so unrelated commits
+    that landed concurrently are not silently discarded.
     """
     result = subprocess.run(
         [
@@ -342,6 +344,94 @@ def _reset_testbed_branch(sha: str, branch: str = TESTBED_DEFAULT_BRANCH) -> Non
             f"Failed to reset {branch!r} to {sha} on {TESTBED_REPO} during testbed "
             f"cleanup (exit {result.returncode}): "
             f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+
+
+def _get_pr_merge_sha(number: str) -> str | None:
+    """Return the merge commit SHA for ``number`` on the testbed, or None."""
+    result = subprocess.run(
+        [
+            "gh",
+            "pr",
+            "view",
+            number,
+            "-R",
+            TESTBED_REPO,
+            "--json",
+            "mergeCommit",
+            "-q",
+            ".mergeCommit.oid",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to read merge commit for PR #{number} on {TESTBED_REPO} "
+            f"(exit {result.returncode}): "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    return result.stdout.strip() or None
+
+
+def _get_commit_first_parent(sha: str) -> str | None:
+    """Return the first-parent SHA of ``sha`` on the testbed, or None at root."""
+    result = subprocess.run(
+        [
+            "gh",
+            "api",
+            f"repos/{TESTBED_REPO}/commits/{sha}",
+            "-q",
+            ".parents[0].sha",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to read commit {sha} on {TESTBED_REPO} during testbed cleanup "
+            f"(exit {result.returncode}): "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    return result.stdout.strip() or None
+
+
+def _assert_only_owned_commits_on_branch(
+    baseline_sha: str,
+    current_sha: str,
+    owned_merge_shas: set[str],
+    *,
+    max_walk: int = 100,
+) -> None:
+    """Walk first-parent from ``current_sha`` to ``baseline_sha``.
+
+    Raises if any commit on the chain is not in ``owned_merge_shas``, so the
+    caller can refuse to rewrite the default branch when an unrelated push
+    landed alongside the test-owned merges.
+    """
+    sha: str | None = current_sha
+    walked = 0
+    while sha and sha != baseline_sha:
+        if sha not in owned_merge_shas:
+            raise RuntimeError(
+                f"Refusing to reset {TESTBED_DEFAULT_BRANCH} on {TESTBED_REPO}: "
+                f"commit {sha} on the first-parent chain is not attributable "
+                f"to any test-owned merged PR "
+                f"(owned merges={sorted(owned_merge_shas)}). Clean up manually."
+            )
+        sha = _get_commit_first_parent(sha)
+        walked += 1
+        if walked > max_walk:
+            raise RuntimeError(
+                f"Walked {max_walk} commits from {current_sha} without reaching "
+                f"baseline {baseline_sha} on {TESTBED_REPO}; aborting reset."
+            )
+    if sha != baseline_sha:
+        raise RuntimeError(
+            f"First-parent walk from {current_sha} ended at {sha} instead of "
+            f"baseline {baseline_sha} on {TESTBED_REPO}; aborting reset."
         )
 
 
@@ -389,10 +479,13 @@ def reset_testbed_clean() -> Iterable[Callable[[str], None]]:
 
     Tests must call the yielded ``register(pr_id)`` for each task they upload.
     Teardown closes any open PR whose head branch matches a registered
-    PR_ID and, because ``config.test.yml`` enables auto-merge, also force-
-    resets the testbed default branch to the SHA captured at fixture entry
-    when any registered PR has merged. That keeps the testbed at a known
-    baseline regardless of whether the test exited before or after merge.
+    PR_ID. Because ``config.test.yml`` enables auto-merge, teardown also
+    handles registered PRs that merged: it walks first-parent from the
+    current default-branch HEAD back to the SHA captured at fixture entry,
+    confirms every commit on that chain is the merge commit of a registered
+    test-owned PR, and only then force-resets the branch back to baseline.
+    If anything unrelated pushed to the default branch in the meantime, the
+    walk raises ``RuntimeError`` instead of silently rewriting history.
     """
     registered: set[str] = set()
     baseline_sha = _get_testbed_branch_sha()
@@ -404,6 +497,16 @@ def reset_testbed_clean() -> Iterable[Callable[[str], None]]:
     open_owned = _list_owned_testbed_pr_numbers(registered, state="open")
     _close_testbed_prs(open_owned)
     merged_owned = _list_owned_testbed_pr_numbers(registered, state="merged")
-    if merged_owned and _get_testbed_branch_sha() != baseline_sha:
-        _reset_testbed_branch(baseline_sha)
+    if merged_owned:
+        current_sha = _get_testbed_branch_sha()
+        if current_sha != baseline_sha:
+            owned_merge_shas = {
+                sha
+                for number in merged_owned
+                if (sha := _get_pr_merge_sha(number)) is not None
+            }
+            _assert_only_owned_commits_on_branch(
+                baseline_sha, current_sha, owned_merge_shas
+            )
+            _reset_testbed_branch(baseline_sha)
     _wait_daemon_idle()
