@@ -120,6 +120,54 @@ run_slow() {
 }
 
 main() {
+    local invoked
+    invoked="$(basename "$0")"
+
+    # The web container mounts the same shim and probes `claude --version`,
+    # `codex --version`, and `codex login status` to populate the auth panel.
+    # Without a short-circuit those read-only probes would race the daemon
+    # by mutating branches and creating PRs in the testbed (Codex P1).
+    local arg
+    for arg in "$@"; do
+        case "${arg}" in
+            --version|-V)
+                printf '%s 0.0.0-shim\n' "${invoked}"
+                exit 0
+                ;;
+        esac
+    done
+    if [[ "${invoked}" == "codex" && "${1:-}" == "login" ]]; then
+        printf 'Logged in (shim)\n'
+        exit 0
+    fi
+
+    # Only proceed when invoked with the daemon's coding flags. The daemon runs
+    # `claude --print ...` and `codex ... exec ...`; any other invocation is a
+    # no-op so non-coder probes cannot trigger git/gh side effects.
+    local is_coding=0
+    case "${invoked}" in
+        claude)
+            for arg in "$@"; do
+                if [[ "${arg}" == "--print" ]]; then
+                    is_coding=1
+                    break
+                fi
+            done
+            ;;
+        codex)
+            for arg in "$@"; do
+                if [[ "${arg}" == "exec" ]]; then
+                    is_coding=1
+                    break
+                fi
+            done
+            ;;
+    esac
+    if [[ "${is_coding}" -ne 1 ]]; then
+        printf 'shim: %s invoked without coding flags, exiting 0\n' "${invoked}" >&2
+        exit 0
+    fi
+
     local scenario
     scenario="$(read_scenario)"
 
