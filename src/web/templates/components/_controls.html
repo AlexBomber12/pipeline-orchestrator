@@ -21,12 +21,12 @@
 {% set show_play = repo.user_paused or (repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done) %}
 {% set show_pause = (repo.state.value in active_states) and not repo.user_paused %}
 {% set show_stop = repo.state.value in active_states %}
-<div class="flex items-center gap-2 {{ extra_classes }}">
+<div class="flex items-center gap-3 md:gap-2 {{ extra_classes }}">
     {% if show_play %}
     <button type="button"
             aria-label="Resume daemon"
             title="Resume"
-            class="secondary-interactive inline-flex h-11 w-11 items-center justify-center rounded-lg border border-white/10 bg-surface-3/60 text-gray-300"
+            class="relative inline-flex items-center justify-center h-8 w-8 md:h-7 md:w-7 rounded-md text-gray-400 hover:text-white hover:bg-white/5 transition-colors before:absolute before:-inset-1.5 before:content-[''] md:before:content-none"
             hx-post="/repos/{{ repo.name }}/resume"
             hx-swap="none"
             onclick="event.stopPropagation()">
@@ -37,7 +37,7 @@
     <button type="button"
             aria-label="Pause daemon"
             title="Pause"
-            class="secondary-interactive inline-flex h-11 w-11 items-center justify-center rounded-lg border border-white/10 bg-surface-3/60 text-gray-300"
+            class="relative inline-flex items-center justify-center h-8 w-8 md:h-7 md:w-7 rounded-md text-gray-400 hover:text-white hover:bg-white/5 transition-colors before:absolute before:-inset-1.5 before:content-[''] md:before:content-none"
             hx-post="/repos/{{ repo.name }}/pause"
             hx-swap="none"
             onclick="event.stopPropagation()">
@@ -48,7 +48,7 @@
     <button type="button"
             aria-label="Stop current run"
             title="Stop"
-            class="secondary-interactive inline-flex h-11 w-11 items-center justify-center rounded-lg border border-fail/30 bg-fail/10 text-fail"
+            class="relative inline-flex items-center justify-center h-8 w-8 md:h-7 md:w-7 rounded-md text-gray-400 hover:text-fail hover:bg-fail/10 transition-colors before:absolute before:-inset-1.5 before:content-[''] md:before:content-none"
             hx-post="/repos/{{ repo.name }}/stop"
             hx-confirm="Stop the current run? The working tree may be left dirty."
             hx-swap="none"
