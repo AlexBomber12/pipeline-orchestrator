@@ -50,6 +50,21 @@ def test_stop_during_coding_then_resume_picks_next_task(
             f"unexpected state after stop: {post_stop_entry['state']!r}"
         )
 
+    second_pr_id_int = first_pr_id_int + 1
+    while second_pr_id_int <= int(time.time()):
+        second_pr_id_int = int(time.time()) + 1
+    second_expected_pr_id = f"PR-{second_pr_id_int}"
+
+    with coder_shim("success"):
+        # Queue the follow-up task BEFORE calling /resume so the daemon
+        # cannot run PAUSED -> IDLE and re-select the stopped task in the
+        # 2s poll window before the second upload arrives.
+        zip_path = make_task_zip(
+            second_pr_id_int, "e2e-stop-resume-success", coder="any", priority=2
+        )
+        status = upload_zip(zip_path)
+        assert status in (200, 201), f"second upload failed with status {status}"
+
         resume_resp = requests.post(
             f"{dashboard_url}/repos/{testbed_slug}/resume", timeout=10
         )
@@ -57,18 +72,6 @@ def test_stop_during_coding_then_resume_picks_next_task(
             f"resume returned status {resume_resp.status_code}: "
             f"{resume_resp.text!r}"
         )
-
-    second_pr_id_int = first_pr_id_int + 1
-    while second_pr_id_int <= int(time.time()):
-        second_pr_id_int = int(time.time()) + 1
-    second_expected_pr_id = f"PR-{second_pr_id_int}"
-
-    with coder_shim("success"):
-        zip_path = make_task_zip(
-            second_pr_id_int, "e2e-stop-resume-success", coder="any", priority=2
-        )
-        status = upload_zip(zip_path)
-        assert status in (200, 201), f"second upload failed with status {status}"
 
         coding_entry = wait_for_state(["CODING"], timeout_sec=60)
         coding_task = coding_entry.get("current_task") or {}
