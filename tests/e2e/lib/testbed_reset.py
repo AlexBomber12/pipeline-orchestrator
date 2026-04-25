@@ -18,6 +18,8 @@ TESTBED_URL = f"https://github.com/{TESTBED_REPO}.git"
 
 def close_all_open_prs() -> int:
     """Close every open PR on testbed with --delete-branch. Returns count closed."""
+    # `gh pr list` defaults to --limit 30; pass an explicit large cap so the
+    # session-start reset cannot leave older open PRs behind on a busy testbed.
     listing = subprocess.run(
         [
             "gh",
@@ -27,6 +29,8 @@ def close_all_open_prs() -> int:
             TESTBED_REPO,
             "--state",
             "open",
+            "--limit",
+            "1000",
             "--json",
             "number",
             "--jq",
@@ -56,8 +60,17 @@ def close_all_open_prs() -> int:
 
 def delete_non_main_branches() -> int:
     """Delete every branch on testbed that is NOT main. Returns count deleted."""
+    # `gh api` returns one page (30) by default; --paginate walks every page so
+    # the cleanup sees all branches when the testbed accumulates more than 30.
     listing = subprocess.run(
-        ["gh", "api", f"repos/{TESTBED_REPO}/branches", "--jq", ".[].name"],
+        [
+            "gh",
+            "api",
+            "--paginate",
+            f"repos/{TESTBED_REPO}/branches",
+            "--jq",
+            ".[].name",
+        ],
         capture_output=True,
         text=True,
         check=False,

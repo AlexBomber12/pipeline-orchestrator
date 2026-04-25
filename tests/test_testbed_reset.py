@@ -40,6 +40,12 @@ def test_close_all_open_prs_closes_each_listed_number() -> None:
     calls = run.call_args_list
     assert calls[0].args[0][:3] == ["gh", "pr", "list"]
     assert "-R" in calls[0].args[0] and TESTBED_REPO in calls[0].args[0]
+    # An explicit --limit prevents gh's default of 30 from silently truncating
+    # the listing on a busy testbed.
+    list_cmd = calls[0].args[0]
+    assert "--limit" in list_cmd
+    limit_value = list_cmd[list_cmd.index("--limit") + 1]
+    assert int(limit_value) >= 1000
     for i, n in enumerate(("101", "102", "103"), start=1):
         cmd = calls[i].args[0]
         assert cmd[:3] == ["gh", "pr", "close"]
@@ -71,6 +77,10 @@ def test_delete_non_main_branches_filters_main_and_blank() -> None:
         run.side_effect = [listing, ok, ok]
         assert delete_non_main_branches() == 2
     calls = run.call_args_list
+    # The branch listing must use --paginate so gh fetches every page rather
+    # than the default 30 results.
+    assert calls[0].args[0][:2] == ["gh", "api"]
+    assert "--paginate" in calls[0].args[0]
     delete_targets = [c.args[0][-1] for c in calls[1:]]
     assert delete_targets == [
         f"repos/{TESTBED_REPO}/git/refs/heads/feature-a",
