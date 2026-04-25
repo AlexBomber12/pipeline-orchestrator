@@ -28,9 +28,9 @@ services:
       CLAUDE_CONFIG_DIR: /data/auth/claude
       GH_CONFIG_DIR: /data/auth/gh
       HOME: /data/auth
+      PATH: /usr/local/bin:/home/runner/.npm-global/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
       PO_CONFIG_PATH: /app/config.test.yml
       PO_SHIM_SCENARIO_FILE: /data/shim-scenario
-      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/runner/.npm-global/bin
 
   daemon-test:
     build: .
@@ -49,9 +49,9 @@ services:
       CLAUDE_CONFIG_DIR: /data/auth/claude
       GH_CONFIG_DIR: /data/auth/gh
       HOME: /data/auth
+      PATH: /usr/local/bin:/home/runner/.npm-global/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
       PO_CONFIG_PATH: /app/config.test.yml
       PO_SHIM_SCENARIO_FILE: /data/shim-scenario
-      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/runner/.npm-global/bin
 
 volumes:
   codex-auth-test:

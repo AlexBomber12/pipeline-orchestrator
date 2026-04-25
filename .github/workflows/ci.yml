@@ -86,6 +86,19 @@ jobs:
       - name: Bring up test stack
         run: docker compose -f docker-compose.test.yml up -d --wait
 
+      - name: Wait for Docker DNS propagation
+        run: sleep 20
+
+      - name: Verify shim is mounted in daemon-test
+        run: |
+          actual=$(docker compose -f docker-compose.test.yml exec -T daemon-test which claude)
+          if [ "$actual" != "/usr/local/bin/claude" ]; then
+            echo "ERROR: shim not mounted; daemon-test which claude returned: $actual" >&2
+            echo "Expected /usr/local/bin/claude. Check docker-compose.test.yml volume mounts and PATH env." >&2
+            exit 1
+          fi
+          echo "OK: shim mounted at $actual"
+
       - name: Run e2e tests
         env:
           GH_TOKEN: ${{ steps.testbed-token.outputs.token }}
