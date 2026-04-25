@@ -456,7 +456,7 @@
 - Branch: pr-153a-e2e-python-skeleton
 
 ## PR-153b: Docker compose test stack on port 18800
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-153b.md
 - Branch: pr-153b-e2e-docker-stack
 
