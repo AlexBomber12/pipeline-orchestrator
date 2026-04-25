@@ -479,7 +479,6 @@
 - Status: TODO
 - Tasks file: tasks/PR-154c.md
 - Branch: pr-154c-e2e-stop-resume
-- Depends on: PR-154b
 
 ## PR-154d: e2e test 3 — Redis kill and recover
 - Status: TODO
