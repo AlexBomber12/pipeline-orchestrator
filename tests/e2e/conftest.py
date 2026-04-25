@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 import requests
 
+from tests.e2e.lib.testbed_reset import reset_testbed_full
+
 TEST_DASHBOARD_URL = "http://localhost:18800"
 TESTBED_SLUG = "AlexBomber12__pipeline-orchestrator-testbed"
 TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
@@ -17,6 +19,24 @@ TEST_DATA_DIR = REPO_DIR / "tests/e2e/data"
 EVIDENCE_DIR = REPO_DIR / "tests/e2e/evidence"
 
 collect_ignore = ["data"]
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _reset_testbed_session():
+    """Reset testbed to a known-clean state at session start.
+
+    Closes open PRs, deletes non-main branches, wipes tasks/ on main. Runs
+    ONCE per pytest session before any test. The per-test reset_testbed
+    fixture handles lighter cleanup between individual tests.
+
+    ``reset_testbed_full()`` raises on hard failures (listing call failed,
+    clone/commit/push failed). We deliberately do NOT swallow that error:
+    pytest will mark the session as errored, which is the signal we want —
+    running e2e tests against a polluted testbed produces nondeterministic
+    failures that are far worse than a loud setup abort.
+    """
+    counts = reset_testbed_full()
+    yield counts
 
 
 @pytest.fixture(scope="session")

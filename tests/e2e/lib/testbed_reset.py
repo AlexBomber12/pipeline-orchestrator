@@ -1,0 +1,221 @@
+"""Helpers to reset the testbed repository to a known-clean state.
+
+Used by the session-scoped fixture at pytest session start. NOT used between
+individual tests; the per-test reset_testbed fixture in conftest handles the
+lighter per-test cleanup.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
+TESTBED_URL = f"https://github.com/{TESTBED_REPO}.git"
+
+
+def _clone_url() -> str:
+    # Embed GH_TOKEN (set on the integration job) so `git push` is
+    # authenticated without needing a host-side `gh auth setup-git`.
+    token = os.environ.get("GH_TOKEN", "").strip()
+    if not token:
+        return TESTBED_URL
+    return f"https://x-access-token:{token}@github.com/{TESTBED_REPO}.git"
+
+
+def close_all_open_prs() -> int:
+    """Close every open PR on testbed with --delete-branch. Returns count closed.
+
+    Raises RuntimeError if the underlying ``gh pr list`` call fails. Per-PR
+    close failures are tolerated (count reflects only successes) so a single
+    bad PR cannot block the rest of the cleanup.
+    """
+    # `gh pr list` defaults to --limit 30; pass an explicit large cap so the
+    # session-start reset cannot leave older open PRs behind on a busy testbed.
+    listing = subprocess.run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "-R",
+            TESTBED_REPO,
+            "--state",
+            "open",
+            "--limit",
+            "1000",
+            "--json",
+            "number",
+            "--jq",
+            ".[].number",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    if listing.returncode != 0:
+        # Surface listing failures (typically gh auth/API errors) instead of
+        # silently treating them as "no PRs to close" — otherwise stale PRs
+        # would survive the session-start reset.
+        raise RuntimeError(
+            f"close_all_open_prs: gh pr list failed (rc={listing.returncode}): "
+            f"{(listing.stderr or listing.stdout).strip()}"
+        )
+    closed = 0
+    for line in listing.stdout.splitlines():
+        n = line.strip()
+        if not n:
+            continue
+        result = subprocess.run(
+            ["gh", "pr", "close", n, "-R", TESTBED_REPO, "--delete-branch"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            closed += 1
+    return closed
+
+
+def delete_non_main_branches() -> int:
+    """Delete every branch on testbed that is NOT main. Returns count deleted.
+
+    Raises RuntimeError if the underlying ``gh api`` listing call fails.
+    Per-branch delete failures are tolerated (count reflects only
+    successes) so a single bad branch cannot block the rest of the cleanup.
+    """
+    # `gh api` returns one page (30) by default; --paginate walks every page so
+    # the cleanup sees all branches when the testbed accumulates more than 30.
+    listing = subprocess.run(
+        [
+            "gh",
+            "api",
+            "--paginate",
+            f"repos/{TESTBED_REPO}/branches",
+            "--jq",
+            ".[].name",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    if listing.returncode != 0:
+        # Surface listing failures so we never silently treat an auth/API
+        # error as "no non-main branches present" and leave stale refs.
+        raise RuntimeError(
+            f"delete_non_main_branches: gh api listing failed "
+            f"(rc={listing.returncode}): "
+            f"{(listing.stderr or listing.stdout).strip()}"
+        )
+    deleted = 0
+    for line in listing.stdout.splitlines():
+        name = line.strip()
+        if not name or name == "main":
+            continue
+        result = subprocess.run(
+            [
+                "gh",
+                "api",
+                "-X",
+                "DELETE",
+                f"repos/{TESTBED_REPO}/git/refs/heads/{name}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            deleted += 1
+    return deleted
+
+
+def wipe_tasks_dir_on_main() -> bool:
+    """Clone testbed, remove tasks/ if present, push back. Returns True iff a push happened.
+
+    Returns False ONLY when there is nothing to wipe (the cloned main branch
+    has no ``tasks/`` directory). Real failures — clone, commit, or push —
+    raise RuntimeError so the session-start fixture can surface auth/API
+    regressions instead of silently leaving a polluted testbed.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="testbed-reset-"))
+    try:
+        clone = subprocess.run(
+            ["git", "clone", "--depth", "1", _clone_url(), str(workdir / "repo")],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        if clone.returncode != 0:
+            raise RuntimeError(
+                f"wipe_tasks_dir_on_main: git clone failed "
+                f"(rc={clone.returncode}): {clone.stderr.strip()}"
+            )
+        repo = workdir / "repo"
+        tasks = repo / "tasks"
+        if not tasks.exists():
+            return False
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.email", "testbed-reset@test.invalid"],
+            check=False,
+            timeout=10,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.name", "Testbed Reset Fixture"],
+            check=False,
+            timeout=10,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "rm", "-rf", "tasks/"],
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        commit = subprocess.run(
+            ["git", "-C", str(repo), "commit", "-m", "test: reset tasks/ at session start"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        if commit.returncode != 0:
+            raise RuntimeError(
+                f"wipe_tasks_dir_on_main: git commit failed "
+                f"(rc={commit.returncode}): {commit.stderr.strip()}"
+            )
+        push = subprocess.run(
+            ["git", "-C", str(repo), "push", "origin", "main"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        if push.returncode != 0:
+            raise RuntimeError(
+                f"wipe_tasks_dir_on_main: git push failed "
+                f"(rc={push.returncode}): {push.stderr.strip()}"
+            )
+        return True
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def reset_testbed_full() -> dict:
+    """Full reset: close PRs, delete branches, wipe tasks/. Returns counts dict.
+
+    Propagates RuntimeError from any helper that detects a hard failure
+    (listing call failed, clone/commit/push failed). The session-scoped
+    fixture relies on this to abort before tests run against a polluted
+    testbed.
+    """
+    return {
+        "prs_closed": close_all_open_prs(),
+        "branches_deleted": delete_non_main_branches(),
+        "tasks_wiped": wipe_tasks_dir_on_main(),
+    }
