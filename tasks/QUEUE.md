@@ -476,7 +476,7 @@
 - Branch: pr-154b-e2e-test-upload-merge
 
 ## PR-154c: e2e test 2 — stop and resume during CODING
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-154c.md
 - Branch: pr-154c-e2e-stop-resume
 
