@@ -8,6 +8,7 @@ in-process code path.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import time
 import zipfile
@@ -229,7 +230,25 @@ def take_screenshot(request: pytest.FixtureRequest) -> Callable[[str], Path]:
     return _shot
 
 
-def _list_open_testbed_pr_numbers() -> set[str]:
+def _branch_prefix_for(pr_id: str) -> str:
+    """Return the canonical branch prefix the daemon emits for ``pr_id``.
+
+    Mirrors the formula in :func:`_task_markdown` so cleanup can match only
+    branches authored by the current test session.
+    """
+    return f"pr-{pr_id.lower().replace('.', '-')}-"
+
+
+def _list_owned_testbed_pr_numbers(pr_ids: Iterable[str]) -> set[str]:
+    """Return open PR numbers whose head branch belongs to one of ``pr_ids``.
+
+    Filtering by head-branch prefix keeps teardown scoped to PRs created by
+    this test session, so a parallel CI run or an unrelated PR opened on
+    the testbed during the test is never closed.
+    """
+    prefixes = tuple(_branch_prefix_for(pid) for pid in pr_ids)
+    if not prefixes:
+        return set()
     result = subprocess.run(
         [
             "gh",
@@ -240,9 +259,7 @@ def _list_open_testbed_pr_numbers() -> set[str]:
             "--state",
             "open",
             "--json",
-            "number",
-            "--jq",
-            ".[].number",
+            "number,headRefName",
         ],
         capture_output=True,
         text=True,
@@ -253,7 +270,18 @@ def _list_open_testbed_pr_numbers() -> set[str]:
             f"Failed to list open PRs on {TESTBED_REPO} during testbed cleanup "
             f"(exit {result.returncode}): {result.stderr.strip() or result.stdout.strip()}"
         )
-    return {raw.strip() for raw in result.stdout.splitlines() if raw.strip()}
+    try:
+        prs = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Failed to parse `gh pr list` output during testbed cleanup: {exc}"
+        ) from exc
+    owned: set[str] = set()
+    for pr in prs:
+        head = pr.get("headRefName") or ""
+        if any(head.startswith(prefix) for prefix in prefixes):
+            owned.add(str(pr.get("number")))
+    return owned
 
 
 def _close_testbed_prs(numbers: Iterable[str]) -> None:
@@ -276,13 +304,17 @@ def _wait_daemon_idle(timeout_sec: float = 60.0) -> None:
     deadline = time.monotonic() + timeout_sec
     last: dict[str, Any] | None = None
     while time.monotonic() < deadline:
-        last = _fetch_state(TESTBED_SLUG)
-        if (
-            last is not None
-            and last.get("state") == "IDLE"
-            and last.get("current_pr") in (None, "", 0)
-        ):
-            return
+        try:
+            last = _fetch_state(TESTBED_SLUG)
+        except requests.RequestException:
+            last = None
+        else:
+            if (
+                last is not None
+                and last.get("state") == "IDLE"
+                and last.get("current_pr") in (None, "", 0)
+            ):
+                return
         time.sleep(1.0)
     raise TimeoutError(
         f"Daemon did not reach IDLE for slug {TESTBED_SLUG!r} within "
@@ -291,9 +323,20 @@ def _wait_daemon_idle(timeout_sec: float = 60.0) -> None:
 
 
 @pytest.fixture
-def reset_testbed_clean() -> Iterable[None]:
-    pre_existing = _list_open_testbed_pr_numbers()
-    yield
-    test_owned = _list_open_testbed_pr_numbers() - pre_existing
+def reset_testbed_clean() -> Iterable[Callable[[str], None]]:
+    """Yield a registration callback; teardown closes only test-owned PRs.
+
+    Tests must call the yielded ``register(pr_id)`` for each task they upload.
+    Teardown lists open PRs on the testbed and closes only those whose head
+    branch matches a registered PR_ID, so concurrent runs and unrelated
+    activity on the testbed are unaffected.
+    """
+    registered: set[str] = set()
+
+    def register(pr_id: str) -> None:
+        registered.add(_normalize_pr_id(pr_id))
+
+    yield register
+    test_owned = _list_owned_testbed_pr_numbers(registered)
     _close_testbed_prs(test_owned)
     _wait_daemon_idle()
