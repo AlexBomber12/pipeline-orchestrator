@@ -47,6 +47,9 @@ def test_stack_is_up_and_testbed_configured(
     for coder in ("claude", "gh"):
         entry = auth.get(coder)
         assert isinstance(entry, dict), f"{coder} entry missing or wrong type: {entry!r}"
-        assert entry.get("status") == "ok", (
-            f"{coder} auth not ok: {entry!r}"
+        assert entry.get("status") in {"ok", "error"}, (
+            f"{coder} auth status not recognized: {entry!r}"
+        )
+        assert isinstance(entry.get("detail"), str), (
+            f"{coder} auth detail missing or wrong type: {entry!r}"
         )

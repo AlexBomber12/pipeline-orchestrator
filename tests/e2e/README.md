@@ -25,6 +25,7 @@ pytest against this directory explicitly:
 
 ```bash
 docker compose -f docker-compose.test.yml up -d --build
+pip install -r requirements-test.txt
 pytest tests/e2e/
 docker compose -f docker-compose.test.yml down -v
 ```
