@@ -59,6 +59,72 @@ def test_load_config_raw_omits_runtime_env_overrides(
     assert raw == {}
 
 
+def test_load_config_honors_po_config_path_env_var(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.test.yml"
+    cfg_path.write_text(
+        """
+repositories:
+  - url: https://github.com/example/test-repo.git
+    branch: main
+daemon:
+  poll_interval_sec: 2
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PO_CONFIG_PATH", str(cfg_path))
+
+    cfg = load_config()
+
+    assert len(cfg.repositories) == 1
+    assert cfg.repositories[0].url == "https://github.com/example/test-repo.git"
+    assert cfg.daemon.poll_interval_sec == 2
+
+
+def test_load_config_explicit_path_ignores_po_config_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    explicit_cfg = tmp_path / "explicit.yml"
+    explicit_cfg.write_text(
+        """
+repositories:
+  - url: https://github.com/example/explicit-repo.git
+""",
+        encoding="utf-8",
+    )
+    env_cfg = tmp_path / "env.yml"
+    env_cfg.write_text(
+        """
+repositories:
+  - url: https://github.com/example/env-repo.git
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PO_CONFIG_PATH", str(env_cfg))
+
+    cfg = load_config(str(explicit_cfg))
+
+    assert [r.url for r in cfg.repositories] == [
+        "https://github.com/example/explicit-repo.git"
+    ]
+
+
+def test_load_config_unset_po_config_path_defaults_to_config_yml(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("PO_CONFIG_PATH", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    cfg = load_config()
+
+    assert isinstance(cfg, AppConfig)
+    assert cfg.repositories == []
+
+
 def test_daemon_config_claude_model_default() -> None:
     from src.config import DaemonConfig
 

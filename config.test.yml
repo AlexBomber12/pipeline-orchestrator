@@ -1,0 +1,29 @@
+repositories:
+  - url: https://github.com/AlexBomber12/pipeline-orchestrator-testbed.git
+    branch: main
+    auto_merge: true
+    poll_interval_sec: 2
+
+daemon:
+  poll_interval_sec: 2
+  review_timeout_min: 2
+  auto_fallback: true
+  hung_fallback_codex_review: true
+  error_handler_use_ai: false
+  claude_model: opus
+  fix_idle_timeout_sec: 60
+  planned_pr_timeout_sec: 60
+  coder_priority:
+    codex: 81
+    claude: 76
+  exploration_epsilon: 0.15
+  rate_limit_session_pause_percent: 90
+  rate_limit_weekly_pause_percent: 95
+
+web:
+  host: 0.0.0.0
+  port: 8000
+
+auth:
+  claude_config_dir: /data/auth/claude
+  gh_config_dir: /data/auth/gh

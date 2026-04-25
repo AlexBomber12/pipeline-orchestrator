@@ -167,13 +167,20 @@ def _load_config_raw(path: str = "config.yml") -> dict[str, Any]:
     return raw
 
 
-def load_config(path: str = "config.yml") -> AppConfig:
+def load_config(path: str | None = None) -> AppConfig:
     """Read a YAML config file and return an AppConfig.
 
     If the file is missing, return an AppConfig populated with defaults.
     Env overrides apply to this runtime view only.
+
+    When ``path`` is omitted, the path is resolved from the
+    ``PO_CONFIG_PATH`` environment variable, falling back to
+    ``"config.yml"`` when the variable is unset. Explicit paths are
+    honored as-is so callers that pin a config file (e.g. unit tests,
+    settings writers) keep their existing semantics.
     """
-    raw = _load_config_raw(path)
+    resolved_path = path if path is not None else os.environ.get("PO_CONFIG_PATH", "config.yml")
+    raw = _load_config_raw(resolved_path)
     _apply_daemon_env_overrides(raw)
 
     return AppConfig.model_validate(raw)
