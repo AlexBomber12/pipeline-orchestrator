@@ -461,7 +461,7 @@
 - Branch: pr-153b-e2e-docker-stack
 
 ## PR-153c: Test config, test dependencies, PO_CONFIG_PATH override
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-153c.md
 - Branch: pr-153c-e2e-config-and-deps
 
