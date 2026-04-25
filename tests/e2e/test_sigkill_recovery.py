@@ -110,11 +110,20 @@ def test_sigkill_during_coding_recovers_correctly(
             f"after restart; last value was {running_again!r}"
         )
 
+        # Wait for the restarted run to quiesce — i.e. for the re-picked
+        # task to reach WATCH (slow shim finishes its 30s sleep, pushes the
+        # branch, and opens the PR). Treating CODING as terminal would let
+        # the test exit mid-run, after which reset_testbed teardown could
+        # race the shim's pending PR creation and leak an open PR into
+        # later e2e tests. Allowing IDLE here would defeat the recovery
+        # contract: handle_idle is expected to re-pick the queued task
+        # within seconds. The freshness gate (ts > pre_kill_ts) still
+        # guards against accepting the pre-kill state.
         recovered = None
-        recovered_states = ("IDLE", "CODING", "WATCH")
+        recovered_states = ("WATCH",)
         last_seen_state = None
         last_seen_ts: dt.datetime | None = None
-        deadline = time.monotonic() + 90
+        deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             entry = get_state()
             if entry is not None:
@@ -136,8 +145,8 @@ def test_sigkill_during_coding_recovers_correctly(
                     break
             time.sleep(1)
         assert recovered is not None, (
-            f"daemon did not produce a fresh post-restart state in "
-            f"{list(recovered_states)!r} within 90s; "
+            f"daemon did not quiesce in {list(recovered_states)!r} within "
+            f"120s after restart; "
             f"last_seen_state={last_seen_state!r}, "
             f"last_seen_last_updated={last_seen_ts.isoformat() if last_seen_ts else None!r}, "
             f"pre_kill_last_updated={pre_kill_ts.isoformat()!r}"
@@ -145,24 +154,14 @@ def test_sigkill_during_coding_recovers_correctly(
 
         recovered_state = recovered.get("state")
         current_task = recovered.get("current_task")
-        if recovered_state == "IDLE":
-            # SIGKILL during the slow shim's pre-PR sleep leaves the testbed
-            # queue with no DOING task and no matching open PR, so
-            # recover_state legitimately settles in IDLE with current_task
-            # cleared. handle_idle re-picks the task on the next cycle.
-            assert current_task is None or current_task.get("pr_id") == expected_pr_id, (
-                f"recovered IDLE current_task={current_task!r}, "
-                f"expected None or pr_id={expected_pr_id!r}"
-            )
-        else:
-            assert current_task is not None, (
-                f"recovered into {recovered_state!r} with no current_task — "
-                f"daemon dropped in-flight task on restart"
-            )
-            assert current_task.get("pr_id") == expected_pr_id, (
-                f"recovered {recovered_state!r} current_task={current_task!r}, "
-                f"expected pr_id={expected_pr_id!r}"
-            )
+        assert current_task is not None, (
+            f"recovered into {recovered_state!r} with no current_task — "
+            f"daemon dropped in-flight task on restart"
+        )
+        assert current_task.get("pr_id") == expected_pr_id, (
+            f"recovered {recovered_state!r} current_task={current_task!r}, "
+            f"expected pr_id={expected_pr_id!r}"
+        )
 
     final = get_state()
     assert final is not None, "no state entry returned for testbed after recovery"
