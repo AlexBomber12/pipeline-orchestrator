@@ -12,7 +12,7 @@ services:
     volumes:
       - .:/app
       - ./config.test.yml:/app/config.yml:ro
-      - ./tests/e2e/data:/data
+      - test-data:/data
       - codex-auth-test:/data/auth/.codex
     environment:
       REDIS_URL: redis://redis-test:6379/0
@@ -32,7 +32,7 @@ services:
     volumes:
       - .:/app:ro
       - ./config.test.yml:/app/config.yml:ro
-      - ./tests/e2e/data:/data
+      - test-data:/data
       - codex-auth-test:/data/auth/.codex
     environment:
       REDIS_URL: redis://redis-test:6379/0
@@ -51,3 +51,4 @@ services:
 
 volumes:
   codex-auth-test:
+  test-data:

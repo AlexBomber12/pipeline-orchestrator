@@ -22,7 +22,6 @@ TEST_DASHBOARD_URL = "http://localhost:18800"
 TESTBED_SLUG = "AlexBomber12__pipeline-orchestrator-testbed"
 TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
 REPO_DIR = Path(__file__).resolve().parents[2]
-TEST_DATA_DIR = REPO_DIR / "tests" / "e2e" / "data"
 EVIDENCE_DIR = REPO_DIR / "tests" / "e2e" / "evidence"
 
 _REQUIRED_SERVICES = {"daemon-test", "web-test", "redis-test"}
@@ -169,6 +168,17 @@ def _task_markdown(pr_id: str, title_slug: str, coder: str, priority: int) -> st
     )
 
 
+def _normalize_pr_id(pr_id: str) -> str:
+    """Return ``pr_id`` in canonical ``PR-<suffix>`` form.
+
+    The dashboard's upload endpoint enforces ``^PR-[A-Za-z0-9._-]+\\.md$``,
+    so callers that pass a bare numeric (e.g. ``"800"``) would otherwise
+    produce ``800.md`` and get rejected with HTTP 422.
+    """
+    suffix = pr_id[3:] if pr_id[:3].upper() == "PR-" else pr_id
+    return f"PR-{suffix}"
+
+
 @pytest.fixture
 def make_task_zip(tmp_path: Path) -> Callable[..., Path]:
     def _make(
@@ -178,9 +188,10 @@ def make_task_zip(tmp_path: Path) -> Callable[..., Path]:
         priority: int = 2,
     ) -> Path:
         content = _task_markdown(pr_id, title_slug, coder, priority)
-        zip_path = tmp_path / f"{pr_id}-{title_slug}.zip"
+        normalized = _normalize_pr_id(pr_id)
+        zip_path = tmp_path / f"{normalized}-{title_slug}.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr(f"{pr_id}.md", content)
+            zf.writestr(f"{normalized}.md", content)
         return zip_path
 
     return _make

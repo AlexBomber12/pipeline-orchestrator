@@ -11,9 +11,12 @@ stack rather than in-process Python objects. Tests here communicate with
 - `lib/` — helpers shared across multiple tests.
 - `test_*.py` — the tests themselves. `test_smoke.py` is the one added
   in PR-153; PR-154 introduces the behavioural suite.
-- `data/` — runtime bind mount for `/data` inside the test containers
-  (gitignored).
 - `evidence/` — screenshots captured by failing tests (gitignored).
+
+Runtime state (`/data` inside the test containers) lives in a named
+docker volume (`test-data`) so ownership stays with UID 1000 instead of
+inheriting from a host bind-mount path. `docker compose -f
+docker-compose.test.yml down -v` clears it.
 
 ## Running
 
