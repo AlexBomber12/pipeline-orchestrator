@@ -28,6 +28,12 @@ def _reset_testbed_session():
     Closes open PRs, deletes non-main branches, wipes tasks/ on main. Runs
     ONCE per pytest session before any test. The per-test reset_testbed
     fixture handles lighter cleanup between individual tests.
+
+    ``reset_testbed_full()`` raises on hard failures (listing call failed,
+    clone/commit/push failed). We deliberately do NOT swallow that error:
+    pytest will mark the session as errored, which is the signal we want —
+    running e2e tests against a polluted testbed produces nondeterministic
+    failures that are far worse than a loud setup abort.
     """
     counts = reset_testbed_full()
     yield counts
