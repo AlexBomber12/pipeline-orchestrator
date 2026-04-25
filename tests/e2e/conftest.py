@@ -16,6 +16,8 @@ REPO_DIR = Path(__file__).resolve().parents[2]
 TEST_DATA_DIR = REPO_DIR / "tests/e2e/data"
 EVIDENCE_DIR = REPO_DIR / "tests/e2e/evidence"
 
+collect_ignore = ["data"]
+
 
 @pytest.fixture(scope="session")
 def dashboard_url():
@@ -43,7 +45,7 @@ def get_state():
             return None
         entries = payload if isinstance(payload, list) else payload.get("states", [])
         for entry in entries:
-            if entry.get("slug") == slug:
+            if entry.get("name") == slug or entry.get("slug") == slug:
                 return entry
         return None
 

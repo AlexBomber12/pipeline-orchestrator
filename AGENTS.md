@@ -32,6 +32,28 @@ When triggered by the pipeline orchestrator daemon (non-interactive):
 - Artifacts (ci.log, pr.patch, structure.txt) are generated for Codex review but must not appear in commits. The .gitignore already excludes them.
 - NEVER commit .patch files to the repository under any circumstances.
 
+## CI gates and merge criteria
+
+The pipeline-orchestrator repo runs CI on GitHub Actions for every pull request. The workflow has two jobs that both must pass for merge eligibility, in addition to the existing Codex review +1 requirement.
+
+The unit job runs `scripts/ci.sh` in a clean environment: ruff check, pytest with 100 percent coverage requirement, no integration tests. This is intentional duplication of what the coder ran locally before opening the PR. Three reasons make the duplication valuable:
+
+1. Authoritative result in a clean environment. The coder ran `ci.sh` inside the daemon container with whatever pip cache happened to be present and whatever local file changes might exist; GHA runs in a fresh `ubuntu-latest` VM with a freshly-resolved pip install from `requirements.txt`. Drift between the two environments is detected here.
+2. Coder discipline check. The local run is a pre-flight that should already be green when the PR is opened; if GHA's unit job is red, something went wrong in the coder's process.
+3. `requirements.txt` drift detection. If the coder updated the local environment but forgot to update `requirements.txt`, local tests pass but GHA's fresh install will surface the missing dependency. The opposite case is also caught: `requirements.txt` updated to a version that does not satisfy a transitive constraint.
+
+Coder responsibility for the unit job: `scripts/ci.sh` exits 0 locally before opening the PR. GHA validates the same in a clean environment.
+
+The integration job runs the e2e suite under `tests/e2e/` against an isolated docker compose stack with the mock coder shim. It depends on the unit job and runs only if unit passed. It serializes globally across all PRs because all integration jobs share one testbed repository (https://github.com/AlexBomber12/pipeline-orchestrator-testbed).
+
+Coder responsibility for the integration job: NONE. The coder cannot invoke docker compose from inside the daemon container that runs it; integration tests are GHA's responsibility, never the coder's.
+
+Merge contract: a PR is merge-eligible when all three are true. (1) Unit job green. (2) Integration job green. (3) Codex review +1 valid (non-stale per the review anchor rules). The daemon's auto-merge logic reads `statusCheckRollup` from the GitHub API, which aggregates all required checks; the daemon already handles multi-check workflows correctly via the existing `CIStatus` enum logic in `src/task_status.py`.
+
+Failure handling: if the unit job fails, the coder fixes it the same as `scripts/ci.sh` local failures (FIX REVIEW driven by Codex feedback or by the human reviewer pointing at the GHA log). If the integration job fails, the failure is treated identically to a Codex review failure: the coder enters FIX REVIEW mode, examines the GHA run logs and uploaded `e2e-evidence` artifact, fixes the issue, pushes, and waits for the re-run. Integration test failures must be fixed by code change, never by disabling or skipping the test. If a test is genuinely flaky and the failure is not reproducible, the human reviewer may rerun the failed job manually via the GHA UI.
+
+Setup prerequisite: `docs/ci-setup.md` describes the one-time setup of the GitHub App that powers integration tests. New deployments of pipeline-orchestrator must complete that setup before the integration job will function on their fork.
+
 ## Codex Review gate (GitHub PR)
 
 This repo treats Codex Review as a single pass/fail signal.

@@ -30,6 +30,7 @@ services:
       HOME: /data/auth
       PO_CONFIG_PATH: /app/config.test.yml
       PO_SHIM_SCENARIO_FILE: /data/shim-scenario
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/runner/.npm-global/bin
 
   daemon-test:
     build: .
@@ -50,6 +51,7 @@ services:
       HOME: /data/auth
       PO_CONFIG_PATH: /app/config.test.yml
       PO_SHIM_SCENARIO_FILE: /data/shim-scenario
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/runner/.npm-global/bin
 
 volumes:
   codex-auth-test:
