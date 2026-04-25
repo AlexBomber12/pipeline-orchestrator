@@ -257,12 +257,18 @@ def _close_all_testbed_prs() -> None:
         number = raw.strip()
         if not number:
             continue
-        subprocess.run(
+        close = subprocess.run(
             ["gh", "pr", "close", number, "-R", TESTBED_REPO, "--delete-branch"],
             capture_output=True,
             text=True,
             check=False,
         )
+        if close.returncode != 0:
+            raise RuntimeError(
+                f"Failed to close PR #{number} on {TESTBED_REPO} during testbed "
+                f"cleanup (exit {close.returncode}): "
+                f"{close.stderr.strip() or close.stdout.strip()}"
+            )
 
 
 def _wait_daemon_idle(timeout_sec: float = 60.0) -> None:
