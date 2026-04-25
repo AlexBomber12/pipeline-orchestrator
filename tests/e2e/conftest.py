@@ -229,7 +229,7 @@ def take_screenshot(request: pytest.FixtureRequest) -> Callable[[str], Path]:
     return _shot
 
 
-def _close_all_testbed_prs() -> None:
+def _list_open_testbed_pr_numbers() -> set[str]:
     result = subprocess.run(
         [
             "gh",
@@ -253,10 +253,11 @@ def _close_all_testbed_prs() -> None:
             f"Failed to list open PRs on {TESTBED_REPO} during testbed cleanup "
             f"(exit {result.returncode}): {result.stderr.strip() or result.stdout.strip()}"
         )
-    for raw in result.stdout.splitlines():
-        number = raw.strip()
-        if not number:
-            continue
+    return {raw.strip() for raw in result.stdout.splitlines() if raw.strip()}
+
+
+def _close_testbed_prs(numbers: Iterable[str]) -> None:
+    for number in numbers:
         close = subprocess.run(
             ["gh", "pr", "close", number, "-R", TESTBED_REPO, "--delete-branch"],
             capture_output=True,
@@ -291,6 +292,8 @@ def _wait_daemon_idle(timeout_sec: float = 60.0) -> None:
 
 @pytest.fixture
 def reset_testbed_clean() -> Iterable[None]:
+    pre_existing = _list_open_testbed_pr_numbers()
     yield
-    _close_all_testbed_prs()
+    test_owned = _list_open_testbed_pr_numbers() - pre_existing
+    _close_testbed_prs(test_owned)
     _wait_daemon_idle()
