@@ -16,6 +16,8 @@ REPO_DIR = Path(__file__).resolve().parents[2]
 TEST_DATA_DIR = REPO_DIR / "tests/e2e/data"
 EVIDENCE_DIR = REPO_DIR / "tests/e2e/evidence"
 
+collect_ignore = ["data"]
+
 
 @pytest.fixture(scope="session")
 def dashboard_url():
