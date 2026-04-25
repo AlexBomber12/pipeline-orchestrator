@@ -9,6 +9,7 @@ from __future__ import annotations
 import requests
 
 VALID_STATES = {
+    "PREFLIGHT",
     "IDLE",
     "CODING",
     "WATCH",
