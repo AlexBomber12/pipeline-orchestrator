@@ -83,12 +83,6 @@ jobs:
           chmod 600 tests/e2e/data/auth/gh/hosts.yml
           sudo chown -R 1000:1000 tests/e2e/data/auth tests/e2e/data/repos tests/e2e/data/uploads
 
-      - name: Start redis-test
-        run: docker compose -f docker-compose.test.yml up -d --wait redis-test
-
-      - name: Wait for Docker DNS propagation
-        run: sleep 20
-
       - name: Bring up test stack
         run: docker compose -f docker-compose.test.yml up -d --wait
 
