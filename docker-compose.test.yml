@@ -1,0 +1,53 @@
+name: pipeline-orchestrator-test
+
+services:
+  web-test:
+    build: .
+    container_name: pipeline-orchestrator-web-test
+    entrypoint: ["bash", "scripts/entrypoint.sh"]
+    command: uvicorn src.web.app:app --app-dir /app --host 0.0.0.0 --port 8000
+    user: "1000:1000"
+    ports:
+      - "18800:8000"
+    volumes:
+      - .:/app
+      - ./config.test.yml:/app/config.yml:ro
+      - ./tests/e2e/data:/data
+      - codex-auth-test:/data/auth/.codex
+    environment:
+      REDIS_URL: redis://redis-test:6379/0
+      CLAUDE_CONFIG_DIR: /data/auth/claude
+      GH_CONFIG_DIR: /data/auth/gh
+      HOME: /data/auth
+      PO_CONFIG_PATH: /app/config.yml
+    restart: unless-stopped
+    depends_on:
+      - redis-test
+
+  daemon-test:
+    build: .
+    container_name: pipeline-orchestrator-daemon-test
+    command: python -m src.daemon.main
+    user: "1000:1000"
+    volumes:
+      - .:/app:ro
+      - ./config.test.yml:/app/config.yml:ro
+      - ./tests/e2e/data:/data
+      - codex-auth-test:/data/auth/.codex
+    environment:
+      REDIS_URL: redis://redis-test:6379/0
+      CLAUDE_CONFIG_DIR: /data/auth/claude
+      GH_CONFIG_DIR: /data/auth/gh
+      HOME: /data/auth
+      PO_CONFIG_PATH: /app/config.yml
+    restart: unless-stopped
+    depends_on:
+      - redis-test
+
+  redis-test:
+    image: redis:7-alpine
+    container_name: pipeline-orchestrator-redis-test
+    restart: unless-stopped
+
+volumes:
+  codex-auth-test:
