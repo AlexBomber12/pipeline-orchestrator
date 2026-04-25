@@ -8,4 +8,5 @@ select = ["E", "F", "W", "I"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+norecursedirs = ["tests/e2e", "tests-manual"]
 asyncio_mode = "auto"
