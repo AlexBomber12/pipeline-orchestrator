@@ -77,3 +77,9 @@ auth:
 ```
 
 `PO_FIX_ITERATION_CAP` overrides `daemon.fix_iteration_cap` for daemon runs.
+
+## Local development
+
+For one-time setup of GitHub Actions integration tests (GitHub App provisioning), see [docs/ci-setup.md](docs/ci-setup.md).
+
+For local debugging of e2e tests (running tests against a local test stack outside of CI), see [docs/local-e2e.md](docs/local-e2e.md).
