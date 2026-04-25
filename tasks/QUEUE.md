@@ -469,7 +469,6 @@
 - Status: TODO
 - Tasks file: tasks/PR-154a.md
 - Branch: pr-154a-coder-shim
-- Depends on: PR-153c
 
 ## PR-154b: e2e test 1 — upload and merge happy path
 - Status: TODO
