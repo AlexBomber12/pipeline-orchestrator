@@ -26,7 +26,7 @@ def test_full_happy_path_via_shim_succeeds(
 
         wait_for_state(["CODING"], timeout_sec=30)
         wait_for_state(["WATCH"], timeout_sec=90)
-        wait_for_state(["MERGE", "IDLE"], timeout_sec=180)
+        wait_for_state(["IDLE"], timeout_sec=180)
 
     state = get_state()
     assert state is not None, "no state entry returned for testbed"
