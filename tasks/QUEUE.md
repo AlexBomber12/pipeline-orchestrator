@@ -506,7 +506,7 @@
 - Branch: pr-155c-local-e2e-debug
 
 ## PR-156: GHA workflow DNS race fix and PATH override hardening
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-156.md
 - Branch: pr-156-gha-dns-and-path-fix
 
@@ -514,4 +514,3 @@
 - Status: TODO
 - Tasks file: tasks/PR-157.md
 - Branch: pr-157-testbed-reset-fixture
-- Depends on: PR-156
