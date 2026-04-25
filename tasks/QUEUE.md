@@ -449,3 +449,26 @@
 - Status: DONE
 - Tasks file: tasks/PR-152.md
 - Branch: pr-152-remove-start-badge
+
+## PR-153: Integration test infrastructure setup
+- Status: TODO
+- Tasks file: tasks/PR-153.md
+- Branch: pr-153-e2e-infrastructure
+
+## PR-154: Core e2e tests with mock coder shim
+- Status: TODO
+- Tasks file: tasks/PR-154.md
+- Branch: pr-154-e2e-core-tests
+- Depends on: PR-153
+
+## PR-155: GitHub Actions CI workflow with two-tier gate
+- Status: TODO
+- Tasks file: tasks/PR-155.md
+- Branch: pr-155-gha-ci-workflow
+- Depends on: PR-154
+
+## PR-155b: Local e2e debug script and documentation
+- Status: TODO
+- Tasks file: tasks/PR-155b.md
+- Branch: pr-155b-local-e2e-debug
+- Depends on: PR-155
