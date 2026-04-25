@@ -22,7 +22,6 @@ def test_stop_during_coding_then_resume_picks_next_task(
         ) from exc
 
     first_pr_id_int = int(time.time())
-    first_expected_pr_id = f"PR-{first_pr_id_int}"
 
     with coder_shim("slow"):
         zip_path = make_task_zip(
@@ -40,19 +39,15 @@ def test_stop_during_coding_then_resume_picks_next_task(
             f"stop returned status {stop_resp.status_code}: {stop_resp.text!r}"
         )
 
-        wait_for_state(["IDLE", "PAUSED"], timeout_sec=60)
-
-        state = get_state()
-        assert state is not None, "no state entry returned for testbed after stop"
-        assert state["state"] in ("IDLE", "PAUSED"), (
-            f"unexpected state after stop: {state['state']!r}"
-        )
-        current_task = state.get("current_task")
-        assert (
-            current_task is None
-            or current_task.get("pr_id") != first_expected_pr_id
-        ), (
-            f"current_task still references stopped PR after stop: {current_task!r}"
+        # The slow shim sleeps 30s before any side effect, so its natural
+        # completion path is CODING -> WATCH -> ... -> IDLE and never visits
+        # PAUSED. Requiring PAUSED within a window shorter than the shim's
+        # sleep proves the in-flight run was actually interrupted; if /stop
+        # regressed to a no-op the run would still be CODING here and this
+        # wait would time out.
+        post_stop_entry = wait_for_state(["PAUSED"], timeout_sec=20)
+        assert post_stop_entry["state"] == "PAUSED", (
+            f"unexpected state after stop: {post_stop_entry['state']!r}"
         )
 
         resume_resp = requests.post(
@@ -66,6 +61,7 @@ def test_stop_during_coding_then_resume_picks_next_task(
     second_pr_id_int = first_pr_id_int + 1
     while second_pr_id_int <= int(time.time()):
         second_pr_id_int = int(time.time()) + 1
+    second_expected_pr_id = f"PR-{second_pr_id_int}"
 
     with coder_shim("success"):
         zip_path = make_task_zip(
@@ -74,7 +70,12 @@ def test_stop_during_coding_then_resume_picks_next_task(
         status = upload_zip(zip_path)
         assert status in (200, 201), f"second upload failed with status {status}"
 
-        wait_for_state(["CODING"], timeout_sec=60)
+        coding_entry = wait_for_state(["CODING"], timeout_sec=60)
+        coding_task = coding_entry.get("current_task") or {}
+        assert coding_task.get("pr_id") == second_expected_pr_id, (
+            f"resumed CODING was for current_task={coding_task!r}, "
+            f"expected pr_id={second_expected_pr_id!r}"
+        )
 
         wait_for_state(["IDLE"], timeout_sec=180)
 
