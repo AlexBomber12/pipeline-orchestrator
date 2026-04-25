@@ -451,7 +451,7 @@
 - Branch: pr-152-remove-start-badge
 
 ## PR-153a: Python e2e test infrastructure (conftest skeleton + smoke test)
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-153a.md
 - Branch: pr-153a-e2e-python-skeleton
 
