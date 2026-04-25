@@ -262,6 +262,8 @@ def _list_owned_testbed_pr_numbers(
             TESTBED_REPO,
             "--state",
             state,
+            "--limit",
+            "1000",
             "--json",
             "number,headRefName",
         ],
