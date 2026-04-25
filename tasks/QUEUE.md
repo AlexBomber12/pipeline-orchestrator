@@ -491,7 +491,7 @@
 - Branch: pr-154e-e2e-sigkill-recovery
 
 ## PR-155a: GitHub Actions CI workflow with two-tier gate
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-155a.md
 - Branch: pr-155a-gha-workflow
 
@@ -499,7 +499,6 @@
 - Status: TODO
 - Tasks file: tasks/PR-155b.md
 - Branch: pr-155b-ci-setup-docs
-- Depends on: PR-155a
 
 ## PR-155c: Local e2e debug script and documentation
 - Status: TODO
