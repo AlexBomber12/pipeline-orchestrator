@@ -25,6 +25,10 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - name: Prepare /data runtime root
+        run: |
+          sudo mkdir -p /data/repos /data/uploads
+          sudo chown -R "$(id -u):$(id -g)" /data
       - run: pip install -r requirements.txt
       - run: bash scripts/ci.sh
 
