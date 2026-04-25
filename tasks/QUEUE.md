@@ -459,7 +459,6 @@
 - Status: TODO
 - Tasks file: tasks/PR-153b.md
 - Branch: pr-153b-e2e-docker-stack
-- Depends on: PR-153a
 
 ## PR-153c: Test config, test dependencies, PO_CONFIG_PATH override
 - Status: TODO
