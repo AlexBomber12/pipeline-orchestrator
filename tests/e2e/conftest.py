@@ -132,9 +132,7 @@ def upload_zip():
     return _upload_zip
 
 
-@pytest.fixture
-def reset_testbed():
-    yield
+def _close_open_testbed_prs() -> None:
     listing = subprocess.run(
         [
             "gh",
@@ -171,6 +169,13 @@ def reset_testbed():
             text=True,
             check=False,
         )
+
+
+@pytest.fixture
+def reset_testbed():
+    _close_open_testbed_prs()
+    yield
+    _close_open_testbed_prs()
 
 
 @pytest.fixture
