@@ -165,6 +165,6 @@ def test_sigkill_during_coding_recovers_correctly(
 
     final = get_state()
     assert final is not None, "no state entry returned for testbed after recovery"
-    assert final["slug"] == testbed_slug, (
-        f"final slug was {final['slug']!r}, expected {testbed_slug!r}"
+    assert final["name"] == testbed_slug, (
+        f"final name was {final['name']!r}, expected {testbed_slug!r}"
     )

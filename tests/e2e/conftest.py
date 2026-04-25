@@ -43,7 +43,7 @@ def get_state():
             return None
         entries = payload if isinstance(payload, list) else payload.get("states", [])
         for entry in entries:
-            if entry.get("slug") == slug:
+            if entry.get("name") == slug or entry.get("slug") == slug:
                 return entry
         return None
 

@@ -125,8 +125,8 @@ def test_redis_kill_during_idle_does_not_crash_daemon(
     assert state["state"] == "IDLE", (
         f"final state was {state['state']!r}, expected IDLE"
     )
-    assert state["slug"] == testbed_slug, (
-        f"final slug was {state['slug']!r}, expected {testbed_slug!r}"
+    assert state["name"] == testbed_slug, (
+        f"final name was {state['name']!r}, expected {testbed_slug!r}"
     )
 
     assert _is_daemon_running() == "true", (
