@@ -1,12 +1,13 @@
 import json
-import os  # noqa: F401  # imported for upcoming PR-154 fixtures
-import subprocess  # noqa: F401  # imported for upcoming PR-154 fixtures
+import subprocess
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 
 import pytest
+import requests
 
 TEST_DASHBOARD_URL = "http://localhost:18800"
 TESTBED_SLUG = "AlexBomber12__pipeline-orchestrator-testbed"
@@ -67,6 +68,109 @@ def wait_for_state(get_state):
         )
 
     return _wait_for_state
+
+
+@pytest.fixture
+def make_task_zip(tmp_path):
+    def _make_task_zip(
+        pr_id: int,
+        title_slug: str,
+        coder: str = "any",
+        priority: int = 2,
+    ) -> Path:
+        body = (
+            f"# PR-{pr_id}: {title_slug}\n"
+            "\n"
+            f"Branch: pr-{pr_id}-{title_slug}\n"
+            "- Type: feature\n"
+            "- Complexity: low\n"
+            "- Depends on: none\n"
+            f"- Priority: {priority}\n"
+            f"- Coder: {coder}\n"
+            "\n"
+            "## Problem\n"
+            f"e2e test placeholder for PR-{pr_id}.\n"
+            "\n"
+            "## Scope\n"
+            "Trivial scope. Touch a marker file.\n"
+            "\n"
+            "## Files to create\n"
+            "None.\n"
+            "\n"
+            "## Files to touch\n"
+            "tests/e2e-shim-marker.txt: append a marker line.\n"
+            "\n"
+            "## Files NOT to touch\n"
+            "Anything else.\n"
+            "\n"
+            "## Success criteria\n"
+            "1. The marker file gains one line.\n"
+        )
+        md_name = f"PR-{pr_id}.md"
+        md_path = tmp_path / md_name
+        md_path.write_text(body)
+        zip_path = tmp_path / f"PR-{pr_id}.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(md_path, arcname=md_name)
+        return zip_path
+
+    return _make_task_zip
+
+
+@pytest.fixture
+def upload_zip():
+    def _upload_zip(zip_path: Path, slug: str = TESTBED_SLUG) -> int:
+        url = f"{TEST_DASHBOARD_URL}/repos/{slug}/upload-tasks"
+        with open(zip_path, "rb") as fh:
+            response = requests.post(
+                url,
+                files={"files": (zip_path.name, fh, "application/zip")},
+                timeout=30,
+            )
+        return response.status_code
+
+    return _upload_zip
+
+
+@pytest.fixture
+def reset_testbed():
+    yield
+    listing = subprocess.run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "-R",
+            TESTBED_REPO,
+            "--state",
+            "open",
+            "--json",
+            "number",
+            "--jq",
+            ".[].number",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    for line in listing.stdout.splitlines():
+        number = line.strip()
+        if not number:
+            continue
+        subprocess.run(
+            [
+                "gh",
+                "pr",
+                "close",
+                number,
+                "-R",
+                TESTBED_REPO,
+                "--delete-branch",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
 
 @pytest.fixture
