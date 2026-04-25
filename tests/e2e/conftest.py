@@ -171,9 +171,12 @@ def _task_markdown(pr_id: str, title_slug: str, coder: str, priority: int) -> st
 def _normalize_pr_id(pr_id: str) -> str:
     """Return ``pr_id`` in canonical ``PR-<suffix>`` form.
 
-    The dashboard's upload endpoint enforces ``^PR-[A-Za-z0-9._-]+\\.md$``,
-    so callers that pass a bare numeric (e.g. ``"800"``) would otherwise
-    produce ``800.md`` and get rejected with HTTP 422.
+    Both the dashboard's upload endpoint
+    (``^PR-[A-Za-z0-9._-]+\\.md$`` in ``src/web/app.py``) and the daemon's
+    task-header parser (``^#\\s+PR-...`` in ``src/queue_parser.py``) require
+    the ``PR-`` prefix, so callers that pass a bare numeric (e.g. ``"800"``)
+    would otherwise be rejected by either the upload (HTTP 422) or the
+    daemon when it tries to read the task file.
     """
     suffix = pr_id[3:] if pr_id[:3].upper() == "PR-" else pr_id
     return f"PR-{suffix}"
@@ -187,8 +190,8 @@ def make_task_zip(tmp_path: Path) -> Callable[..., Path]:
         coder: str = "any",
         priority: int = 2,
     ) -> Path:
-        content = _task_markdown(pr_id, title_slug, coder, priority)
         normalized = _normalize_pr_id(pr_id)
+        content = _task_markdown(normalized, title_slug, coder, priority)
         zip_path = tmp_path / f"{normalized}-{title_slug}.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr(f"{normalized}.md", content)

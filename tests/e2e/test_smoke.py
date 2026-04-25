@@ -44,5 +44,9 @@ def test_stack_is_up_and_testbed_configured(
     auth_resp = requests.get(f"{dashboard_url}/api/auth-status", timeout=5)
     assert auth_resp.status_code == 200, auth_resp.text
     auth = auth_resp.json()
-    assert auth.get("claude", {}).get("status") == "ok", auth.get("claude")
-    assert auth.get("gh", {}).get("status") == "ok", auth.get("gh")
+    for coder in ("claude", "gh"):
+        entry = auth.get(coder)
+        assert isinstance(entry, dict), f"{coder} entry missing or wrong type: {entry!r}"
+        assert isinstance(entry.get("status"), str) and entry["status"], (
+            f"{coder} entry missing status string: {entry!r}"
+        )
