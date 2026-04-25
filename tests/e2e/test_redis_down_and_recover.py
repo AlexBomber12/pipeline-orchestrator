@@ -129,6 +129,10 @@ def test_redis_kill_during_idle_does_not_crash_daemon(
         f"final slug was {state['slug']!r}, expected {testbed_slug!r}"
     )
 
+    assert _is_daemon_running() == "true", (
+        "daemon-test container is not running after Redis recovery"
+    )
+
     final_restart_count = _get_restart_count()
     assert final_restart_count == initial_restart_count, (
         f"daemon restart count changed from {initial_restart_count} to "
