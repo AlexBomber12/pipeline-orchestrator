@@ -494,7 +494,6 @@
 - Status: TODO
 - Tasks file: tasks/PR-155a.md
 - Branch: pr-155a-gha-workflow
-- Depends on: PR-154e
 
 ## PR-155b: GitHub App setup documentation and AGENTS.md update
 - Status: TODO
