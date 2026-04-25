@@ -21,12 +21,15 @@ services:
     volumes:
       - ./tests/e2e/data:/data
       - codex-auth-test:/data/auth/.codex
+      - ./tests/e2e/lib/coder_shim.sh:/usr/local/bin/claude:ro
+      - ./tests/e2e/lib/coder_shim.sh:/usr/local/bin/codex:ro
     environment:
       REDIS_URL: redis://redis-test:6379/0
       CLAUDE_CONFIG_DIR: /data/auth/claude
       GH_CONFIG_DIR: /data/auth/gh
       HOME: /data/auth
       PO_CONFIG_PATH: /app/config.test.yml
+      PO_SHIM_SCENARIO_FILE: /data/shim-scenario
 
   daemon-test:
     build: .
@@ -38,12 +41,15 @@ services:
     volumes:
       - ./tests/e2e/data:/data
       - codex-auth-test:/data/auth/.codex
+      - ./tests/e2e/lib/coder_shim.sh:/usr/local/bin/claude:ro
+      - ./tests/e2e/lib/coder_shim.sh:/usr/local/bin/codex:ro
     environment:
       REDIS_URL: redis://redis-test:6379/0
       CLAUDE_CONFIG_DIR: /data/auth/claude
       GH_CONFIG_DIR: /data/auth/gh
       HOME: /data/auth
       PO_CONFIG_PATH: /app/config.test.yml
+      PO_SHIM_SCENARIO_FILE: /data/shim-scenario
 
 volumes:
   codex-auth-test:
