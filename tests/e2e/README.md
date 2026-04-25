@@ -8,13 +8,12 @@ isolated from the production stack on 8800. These tests drive HTTP requests to
 the dashboard, observe Redis-backed state transitions, and capture browser
 evidence via Playwright.
 
-## Status of this PR (PR-153a)
+## Status
 
-Python skeleton only. The directory, conftest fixtures, and a single import
-smoke test exist, but the layer is **not yet runnable end-to-end**: there is
-no docker compose test stack, no `requirements-test.txt`, and Playwright is
-not installed. PR-153b adds the docker stack; PR-153c adds the test
-dependencies and `config.test.yml`.
+Sprint F1.0 part 1 (infrastructure) is complete: skeleton, docker compose
+test stack, `requirements-test.txt`, `config.test.yml`, and a runnable smoke
+test against `/api/states`. Behavioral tests with the mock coder shim land
+in the PR-154 series.
 
 ## Directory layout
 

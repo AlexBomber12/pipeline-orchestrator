@@ -12,7 +12,7 @@ from src import claude_cli
 from src.config import AppConfig, load_config
 from src.usage import OAuthUsageProvider, UsageProvider
 
-CONFIG_PATH = "config.yml"
+CONFIG_PATH = os.environ.get("PO_CONFIG_PATH", "config.yml")
 _AUTH_CHECK_TIMEOUT_SEC = 5
 _ANTHROPIC_RATE_LIMIT_PATTERN = re.compile(
     r"(\d{1,3})%\s*(?:of\s+)?(?:your\s+)?(?:(weekly|week|session|5-hour)\s+)?rate\s*limit"
