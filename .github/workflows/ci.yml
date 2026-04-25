@@ -73,7 +73,7 @@ jobs:
         env:
           TESTBED_TOKEN: ${{ steps.testbed-token.outputs.token }}
         run: |
-          mkdir -p tests/e2e/data/auth/gh tests/e2e/data/repos
+          mkdir -p tests/e2e/data/auth/gh tests/e2e/data/repos tests/e2e/data/uploads
           cat > tests/e2e/data/auth/gh/hosts.yml <<EOF
           github.com:
               user: x-access-token
@@ -81,7 +81,7 @@ jobs:
               git_protocol: https
           EOF
           chmod 600 tests/e2e/data/auth/gh/hosts.yml
-          sudo chown -R 1000:1000 tests/e2e/data/auth tests/e2e/data/repos
+          sudo chown -R 1000:1000 tests/e2e/data/auth tests/e2e/data/repos tests/e2e/data/uploads
 
       - name: Bring up test stack
         run: docker compose -f docker-compose.test.yml up -d --wait
