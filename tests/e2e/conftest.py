@@ -235,7 +235,10 @@ def _close_all_testbed_prs() -> None:
         check=False,
     )
     if result.returncode != 0:
-        return
+        raise RuntimeError(
+            f"Failed to list open PRs on {TESTBED_REPO} during testbed cleanup "
+            f"(exit {result.returncode}): {result.stderr.strip() or result.stdout.strip()}"
+        )
     for raw in result.stdout.splitlines():
         number = raw.strip()
         if not number:
@@ -250,15 +253,20 @@ def _close_all_testbed_prs() -> None:
 
 def _wait_daemon_idle(timeout_sec: float = 60.0) -> None:
     deadline = time.monotonic() + timeout_sec
+    last: dict[str, Any] | None = None
     while time.monotonic() < deadline:
-        state = _fetch_state(TESTBED_SLUG)
+        last = _fetch_state(TESTBED_SLUG)
         if (
-            state is not None
-            and state.get("state") == "IDLE"
-            and state.get("current_pr") in (None, "", 0)
+            last is not None
+            and last.get("state") == "IDLE"
+            and last.get("current_pr") in (None, "", 0)
         ):
             return
         time.sleep(1.0)
+    raise TimeoutError(
+        f"Daemon did not reach IDLE for slug {TESTBED_SLUG!r} within "
+        f"{timeout_sec}s. Last state: {last}"
+    )
 
 
 @pytest.fixture
