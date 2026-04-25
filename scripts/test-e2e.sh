@@ -89,7 +89,7 @@ cleanup() {
     rm -f "$SHIM_BACKUP"
   fi
 
-  if [[ "$NO_UP" -eq 0 && "$KEEP_UP" -eq 0 ]]; then
+  if [[ "$KEEP_UP" -eq 0 ]]; then
     teardown_rc=0
     docker compose -f docker-compose.test.yml down -v || teardown_rc=$?
     if [[ "$teardown_rc" -ne 0 ]]; then
