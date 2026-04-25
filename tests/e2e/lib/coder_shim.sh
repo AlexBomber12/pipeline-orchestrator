@@ -76,13 +76,28 @@ write_marker_and_commit() {
     git commit -m "${pr}: shim implementation"
 }
 
+ensure_pr_url() {
+    # Reuse an existing open PR for the head branch when present, otherwise
+    # create one. FIX REVIEW invocations land on a branch that already has a
+    # PR from the prior CODING pass; `gh pr create` would fail in that case
+    # and the daemon would record a coder failure (Codex P1).
+    local branch="$1" pr="$2"
+    local existing
+    existing="$(gh pr list --head "${branch}" --state open --json url --jq '.[0].url' 2>/dev/null || true)"
+    if [[ -n "${existing}" && "${existing}" != "null" ]]; then
+        printf '%s' "${existing}"
+        return
+    fi
+    gh pr create --base main --head "${branch}" --title "${pr}: shim" --body "Shim PR for testing"
+}
+
 run_success() {
     local pr="$1" branch="$2"
     git_setup_branch "${branch}"
     write_marker_and_commit "${pr}"
     git push -u origin "${branch}" --force-with-lease
     local pr_url
-    pr_url="$(gh pr create --base main --head "${branch}" --title "${pr}: shim" --body "Shim PR for testing")"
+    pr_url="$(ensure_pr_url "${branch}" "${pr}")"
     gh pr comment "${pr_url}" --body "@codex review"
 }
 
@@ -104,7 +119,7 @@ run_malformed_pr() {
     write_marker_and_commit "${pr}"
     git push -u origin "${bad_branch}" --force-with-lease
     local pr_url
-    pr_url="$(gh pr create --base main --head "${bad_branch}" --title "${pr}: shim" --body "Shim PR for testing")"
+    pr_url="$(ensure_pr_url "${bad_branch}" "${pr}")"
     gh pr comment "${pr_url}" --body "@codex review"
 }
 
@@ -115,7 +130,7 @@ run_slow() {
     write_marker_and_commit "${pr}"
     git push -u origin "${branch}" --force-with-lease
     local pr_url
-    pr_url="$(gh pr create --base main --head "${branch}" --title "${pr}: shim" --body "Shim PR for testing")"
+    pr_url="$(ensure_pr_url "${branch}" "${pr}")"
     gh pr comment "${pr_url}" --body "@codex review"
 }
 
