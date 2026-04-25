@@ -489,7 +489,6 @@
 - Status: TODO
 - Tasks file: tasks/PR-154e.md
 - Branch: pr-154e-e2e-sigkill-recovery
-- Depends on: PR-154d
 
 ## PR-155a: GitHub Actions CI workflow with two-tier gate
 - Status: TODO
