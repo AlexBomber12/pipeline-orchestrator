@@ -501,6 +501,6 @@
 - Branch: pr-155b-ci-setup-docs
 
 ## PR-155c: Local e2e debug script and documentation
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-155c.md
 - Branch: pr-155c-local-e2e-debug
