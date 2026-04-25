@@ -111,7 +111,7 @@ def test_sigkill_during_coding_recovers_correctly(
         )
 
         recovered = None
-        recovered_states = ("IDLE", "CODING", "WATCH")
+        recovered_states = ("CODING", "WATCH")
         last_seen_state = None
         last_seen_ts: dt.datetime | None = None
         deadline = time.monotonic() + 90
@@ -144,23 +144,15 @@ def test_sigkill_during_coding_recovers_correctly(
         )
 
         recovered_state = recovered.get("state")
-        assert recovered_state not in ("ERROR", "HUNG"), (
-            f"daemon recovered into stuck state {recovered_state!r}"
-        )
-
         current_task = recovered.get("current_task")
-        if recovered_state in ("CODING", "WATCH"):
-            assert current_task is not None, (
-                f"recovered into {recovered_state!r} with no current_task"
-            )
-            assert current_task.get("pr_id") == expected_pr_id, (
-                f"recovered {recovered_state!r} current_task={current_task!r}, "
-                f"expected pr_id={expected_pr_id!r}"
-            )
-        else:
-            assert current_task is None, (
-                f"recovered into IDLE but current_task={current_task!r} is not None"
-            )
+        assert current_task is not None, (
+            f"recovered into {recovered_state!r} with no current_task — "
+            f"daemon dropped in-flight task on restart"
+        )
+        assert current_task.get("pr_id") == expected_pr_id, (
+            f"recovered {recovered_state!r} current_task={current_task!r}, "
+            f"expected pr_id={expected_pr_id!r}"
+        )
 
     final = get_state()
     assert final is not None, "no state entry returned for testbed after recovery"
