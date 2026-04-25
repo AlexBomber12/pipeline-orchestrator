@@ -57,7 +57,7 @@ def test_sigkill_during_coding_recovers_correctly(
             f"test stack did not reach IDLE before test start: {exc}"
         ) from exc
 
-    pr_id_int = 804
+    pr_id_int = int(time.time())
     expected_pr_id = f"PR-{pr_id_int}"
 
     with coder_shim("slow"):
@@ -75,20 +75,22 @@ def test_sigkill_during_coding_recovers_correctly(
             timeout=10,
         )
 
-        running = _is_daemon_running()
-        assert running == "false", (
-            f"daemon container still reports Running={running!r} after SIGKILL"
-        )
-        exit_code = _daemon_exit_code()
-        assert exit_code == 137, (
-            f"daemon container exit code was {exit_code}, expected 137 (128 + SIGKILL)"
-        )
-
-        subprocess.run(
-            ["docker", "compose", "-f", COMPOSE_FILE, "up", "-d", "daemon-test"],
-            check=True,
-            timeout=60,
-        )
+        try:
+            running = _is_daemon_running()
+            assert running == "false", (
+                f"daemon container still reports Running={running!r} after SIGKILL"
+            )
+            exit_code = _daemon_exit_code()
+            assert exit_code == 137, (
+                f"daemon container exit code was {exit_code}, "
+                f"expected 137 (128 + SIGKILL)"
+            )
+        finally:
+            subprocess.run(
+                ["docker", "compose", "-f", COMPOSE_FILE, "up", "-d", "daemon-test"],
+                check=True,
+                timeout=60,
+            )
 
         deadline = time.monotonic() + 30
         running_again = "false"
