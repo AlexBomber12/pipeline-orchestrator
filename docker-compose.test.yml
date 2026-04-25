@@ -28,14 +28,22 @@ services:
       CLAUDE_CONFIG_DIR: /data/auth/claude
       GH_CONFIG_DIR: /data/auth/gh
       HOME: /data/auth
+      PATH: /usr/local/bin:/home/runner/.npm-global/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
       PO_CONFIG_PATH: /app/config.test.yml
       PO_SHIM_SCENARIO_FILE: /data/shim-scenario
-      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/runner/.npm-global/bin
 
   daemon-test:
     build: .
     container_name: pipeline-orchestrator-daemon-test
-    command: bash scripts/entrypoint.sh python -m src.daemon.main
+    command:
+      - bash
+      - -c
+      - |
+        until getent hosts redis-test >/dev/null 2>&1; do
+          echo "daemon-test: waiting for redis-test DNS to resolve..."
+          sleep 1
+        done
+        exec bash scripts/entrypoint.sh python -m src.daemon.main
     depends_on:
       redis-test:
         condition: service_healthy
@@ -49,9 +57,9 @@ services:
       CLAUDE_CONFIG_DIR: /data/auth/claude
       GH_CONFIG_DIR: /data/auth/gh
       HOME: /data/auth
+      PATH: /usr/local/bin:/home/runner/.npm-global/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
       PO_CONFIG_PATH: /app/config.test.yml
       PO_SHIM_SCENARIO_FILE: /data/shim-scenario
-      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/runner/.npm-global/bin
 
 volumes:
   codex-auth-test:
