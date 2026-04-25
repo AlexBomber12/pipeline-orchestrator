@@ -446,6 +446,6 @@
 - Branch: pr-151-button-sizing
 
 ## PR-152: Remove nonfunctional Start badge from repo cards
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-152.md
 - Branch: pr-152-remove-start-badge
