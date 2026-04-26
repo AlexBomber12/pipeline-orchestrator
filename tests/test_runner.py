@@ -1699,6 +1699,66 @@ def test_select_next_task_from_dag_marks_current_task_doing_without_open_pr(
     assert "- Status: DOING" in queue_md
 
 
+def test_select_next_task_from_dag_skips_user_stopped_current_task(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Stopped task\n\n"
+        "Branch: pr-001-stopped\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+    (tasks_dir / "PR-002.md").write_text(
+        "# PR-002: Follow-up task\n\n"
+        "Branch: pr-002-follow-up\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+    runner._user_stopped_task_pr_ids.add("PR-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="Stopped task",
+        status=TaskStatus.DOING,
+        task_file="tasks/PR-001.md",
+        branch="pr-001-stopped",
+    )
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-002"
+    assert task.status == TaskStatus.TODO
+    assert runner._idle_dag_statuses == {
+        "PR-001": TaskStatus.TODO,
+        "PR-002": TaskStatus.TODO,
+    }
+
+
 def test_select_next_task_from_dag_rejects_header_filename_mismatch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

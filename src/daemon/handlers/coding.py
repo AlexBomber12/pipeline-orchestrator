@@ -104,6 +104,8 @@ class CodingMixin:
             code, stdout, stderr = await cli_task
         except asyncio.CancelledError:
             if self._stop_requested:
+                if current_pr_id is not None:
+                    self._user_stopped_task_pr_ids.add(current_pr_id)
                 self.state.state = PipelineState.PAUSED
                 self.state.error_message = None
                 await self._save_current_run_record("error")
@@ -199,6 +201,8 @@ class CodingMixin:
                     )
             if not requested:
                 return False
+            if current_pr_id is not None:
+                self._user_stopped_task_pr_ids.add(current_pr_id)
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
             await self._save_current_run_record("error")

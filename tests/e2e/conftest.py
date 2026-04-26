@@ -140,12 +140,8 @@ def make_task_zip(tmp_path):
 
 
 @pytest.fixture
-def upload_zip(get_state):
+def upload_zip():
     def _upload_zip(zip_path: Path, slug: str = TESTBED_SLUG) -> int:
-        state = get_state(slug)
-        if state is not None and state.get("state") == "PAUSED":
-            wipe_tasks_dir_on_main()
-
         url = f"{TEST_DASHBOARD_URL}/repos/{slug}/upload-tasks"
         with open(zip_path, "rb") as fh:
             response = requests.post(

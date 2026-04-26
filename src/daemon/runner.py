@@ -219,6 +219,7 @@ class PipelineRunner(
         self._auth_status_cache_expires_at: datetime | None = None
         self._current_coder_process: asyncio.subprocess.Process | None = None
         self._stop_requested = False
+        self._user_stopped_task_pr_ids: set[str] = set()
         self._user_pause_logged = False
         self._pending_repo_config: RepoConfig | None = None
         self._pending_app_config: AppConfig | None = None

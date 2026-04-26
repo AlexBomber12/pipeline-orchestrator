@@ -344,6 +344,9 @@ class IdleMixin:
                 if self.state.current_task is not None
                 else None
             )
+            stopped_task_pr_ids = getattr(self, "_user_stopped_task_pr_ids", set())
+            if current_task_pr_id in stopped_task_pr_ids:
+                current_task_pr_id = None
             statuses = {
                 header.pr_id: derive_task_status(
                     header,
@@ -355,6 +358,11 @@ class IdleMixin:
                 for header in headers
             }
             eligible = get_eligible_tasks(dag_headers, statuses)
+            eligible = [
+                header
+                for header in eligible
+                if header.pr_id not in stopped_task_pr_ids
+            ]
         except ValueError as exc:
             raise QueueValidationError([str(exc)]) from exc
 
@@ -365,7 +373,10 @@ class IdleMixin:
             for header in dag_headers
         ]
         doing_tasks = [
-            task for task in self._idle_dag_tasks if task.status == TaskStatus.DOING
+            task
+            for task in self._idle_dag_tasks
+            if task.status == TaskStatus.DOING
+            and task.pr_id not in stopped_task_pr_ids
         ]
         if doing_tasks:
             return doing_tasks[0]
