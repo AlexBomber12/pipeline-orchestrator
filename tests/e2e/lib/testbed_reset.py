@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from urllib.parse import quote
 
 TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
 TESTBED_URL = f"https://github.com/{TESTBED_REPO}.git"
@@ -29,27 +30,18 @@ def _clone_url() -> str:
 def close_all_open_prs() -> int:
     """Close every open PR on testbed with --delete-branch. Returns count closed.
 
-    Raises RuntimeError if the underlying ``gh pr list`` call fails. Per-PR
+    Raises RuntimeError if the underlying ``gh api`` call fails. Per-PR
     close failures are tolerated (count reflects only successes) so a single
     bad PR cannot block the rest of the cleanup.
     """
-    # `gh pr list` defaults to --limit 30; pass an explicit large cap so the
-    # session-start reset cannot leave older open PRs behind on a busy testbed.
     listing = subprocess.run(
         [
             "gh",
-            "pr",
-            "list",
-            "-R",
-            TESTBED_REPO,
-            "--state",
-            "open",
-            "--limit",
-            "1000",
-            "--json",
-            "number",
+            "api",
+            "--paginate",
+            f"repos/{TESTBED_REPO}/pulls?state=open&per_page=100",
             "--jq",
-            ".[].number",
+            '.[] | [.number, .head.ref] | @tsv',
         ],
         capture_output=True,
         text=True,
@@ -61,16 +53,26 @@ def close_all_open_prs() -> int:
         # silently treating them as "no PRs to close" — otherwise stale PRs
         # would survive the session-start reset.
         raise RuntimeError(
-            f"close_all_open_prs: gh pr list failed (rc={listing.returncode}): "
+            f"close_all_open_prs: gh api listing failed (rc={listing.returncode}): "
             f"{(listing.stderr or listing.stdout).strip()}"
         )
     closed = 0
     for line in listing.stdout.splitlines():
-        n = line.strip()
+        parts = line.strip().split("\t")
+        n = parts[0] if parts else ""
+        branch = parts[1] if len(parts) > 1 else ""
         if not n:
             continue
         result = subprocess.run(
-            ["gh", "pr", "close", n, "-R", TESTBED_REPO, "--delete-branch"],
+            [
+                "gh",
+                "api",
+                "-X",
+                "PATCH",
+                f"repos/{TESTBED_REPO}/pulls/{n}",
+                "-f",
+                "state=closed",
+            ],
             capture_output=True,
             text=True,
             check=False,
@@ -78,6 +80,20 @@ def close_all_open_prs() -> int:
         )
         if result.returncode == 0:
             closed += 1
+        if branch and branch != "main":
+            subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    "-X",
+                    "DELETE",
+                    f"repos/{TESTBED_REPO}/git/refs/heads/{quote(branch, safe='')}",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
     return closed
 
 

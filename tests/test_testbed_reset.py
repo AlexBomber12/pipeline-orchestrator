@@ -37,34 +37,47 @@ def _completed(returncode: int = 0, stdout: str = "", stderr: str = "") -> subpr
 
 
 def test_close_all_open_prs_closes_each_listed_number() -> None:
-    listing = _completed(stdout="101\n102\n103\n")
+    listing = _completed(stdout="101\tbranch-a\n102\tbranch-b\n103\tmain\n")
     close_ok = _completed(returncode=0)
+    delete_ok = _completed(returncode=0)
     with patch.object(testbed_reset.subprocess, "run") as run:
-        run.side_effect = [listing, close_ok, close_ok, close_ok]
+        run.side_effect = [listing, close_ok, delete_ok, close_ok, delete_ok, close_ok]
         assert close_all_open_prs() == 3
     calls = run.call_args_list
-    assert calls[0].args[0][:3] == ["gh", "pr", "list"]
-    assert "-R" in calls[0].args[0] and TESTBED_REPO in calls[0].args[0]
-    # An explicit --limit prevents gh's default of 30 from silently truncating
-    # the listing on a busy testbed.
+    assert calls[0].args[0][:3] == ["gh", "api", "--paginate"]
     list_cmd = calls[0].args[0]
-    assert "--limit" in list_cmd
-    limit_value = list_cmd[list_cmd.index("--limit") + 1]
-    assert int(limit_value) >= 1000
-    for i, n in enumerate(("101", "102", "103"), start=1):
-        cmd = calls[i].args[0]
-        assert cmd[:3] == ["gh", "pr", "close"]
-        assert cmd[3] == n
-        assert "--delete-branch" in cmd
-        assert calls[i].kwargs.get("timeout") == 30
+    assert f"repos/{TESTBED_REPO}/pulls?state=open&per_page=100" in list_cmd
+    close_calls = [c for c in calls[1:] if "PATCH" in c.args[0]]
+    delete_calls = [c for c in calls[1:] if "DELETE" in c.args[0]]
+    for call, n in zip(close_calls, ("101", "102", "103"), strict=True):
+        cmd = call.args[0]
+        assert cmd[:4] == ["gh", "api", "-X", "PATCH"]
+        assert cmd[4] == f"repos/{TESTBED_REPO}/pulls/{n}"
+        assert call.kwargs.get("timeout") == 30
+    assert [c.args[0][-1] for c in delete_calls] == [
+        f"repos/{TESTBED_REPO}/git/refs/heads/branch-a",
+        f"repos/{TESTBED_REPO}/git/refs/heads/branch-b",
+    ]
+    for call in delete_calls:
+        assert call.kwargs.get("timeout") == 30
+
+
+def test_close_all_open_prs_url_encodes_deleted_branch_name() -> None:
+    listing = _completed(stdout="101\tfeature/x\n")
+    ok = _completed(returncode=0)
+    with patch.object(testbed_reset.subprocess, "run") as run:
+        run.side_effect = [listing, ok, ok]
+        assert close_all_open_prs() == 1
+    delete_cmd = run.call_args_list[2].args[0]
+    assert delete_cmd[-1] == f"repos/{TESTBED_REPO}/git/refs/heads/feature%2Fx"
 
 
 def test_close_all_open_prs_skips_blank_lines_and_failures() -> None:
-    listing = _completed(stdout="\n101\n\n102\n")
+    listing = _completed(stdout="\n101\tbranch-a\n\n102\tbranch-b\n")
     fail = _completed(returncode=1, stderr="boom")
     ok = _completed(returncode=0)
     with patch.object(testbed_reset.subprocess, "run") as run:
-        run.side_effect = [listing, fail, ok]
+        run.side_effect = [listing, fail, ok, ok, ok]
         assert close_all_open_prs() == 1
 
 
@@ -81,7 +94,7 @@ def test_close_all_open_prs_raises_when_listing_fails() -> None:
     listing_fail = _completed(returncode=1, stderr="auth required")
     with patch.object(testbed_reset.subprocess, "run") as run:
         run.side_effect = [listing_fail]
-        with pytest.raises(RuntimeError, match="gh pr list failed"):
+        with pytest.raises(RuntimeError, match="gh api listing failed"):
             close_all_open_prs()
 
 
