@@ -381,7 +381,6 @@ class IdleMixin:
             task
             for task in self._idle_dag_tasks
             if task.status == TaskStatus.DOING
-            and task.pr_id not in stopped_task_pr_ids
         ]
         if doing_tasks:
             stopped_task_pr_ids.clear()
