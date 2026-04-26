@@ -287,6 +287,35 @@ def test_ensure_repo_cloned_wraps_claude_backfill_failure(
         _run(runner.ensure_repo_cloned())
 
 
+def test_ensure_repo_cloned_fetch_uses_prune(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = _Runner(tmp_path)
+    runner._scaffolded = True
+    Path(runner.repo_path).mkdir(parents=True)
+    calls: list[tuple[Any, ...]] = []
+    _patch_retry_passthrough(monkeypatch)
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        del kwargs
+        calls.append((repo_path, *args))
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", fake_git)
+    monkeypatch.setattr(repo_ops, "_base_branch_ahead_of_origin", lambda path, branch: False)
+    monkeypatch.setattr(repo_ops, "_working_tree_dirty", lambda path: False)
+    monkeypatch.setattr(repo_ops.scaffolder, "ensure_claude_md", lambda path, branch: False)
+
+    _run(runner.ensure_repo_cloned())
+
+    fetch_calls = [c for c in calls if c[1] == "fetch"]
+    assert fetch_calls, "ensure_repo_cloned must invoke git fetch"
+    assert all("--prune" in c for c in fetch_calls), (
+        f"ensure_repo_cloned fetch must include --prune; got {fetch_calls}"
+    )
+
+
 def test_sync_to_main_runs_git_sequence_and_wraps_oserror(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -304,7 +333,7 @@ def test_sync_to_main_runs_git_sequence_and_wraps_oserror(
     runner.sync_to_main()
 
     assert calls == [
-        (runner.repo_path, "fetch", "origin", "main"),
+        (runner.repo_path, "fetch", "--prune", "origin", "main"),
         (runner.repo_path, "checkout", "main"),
         (runner.repo_path, "reset", "--hard", "origin/main"),
         (runner.repo_path, "clean", "-fd"),

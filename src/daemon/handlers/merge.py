@@ -46,7 +46,7 @@ class MergeMixin:
                 retry_transient(
                     lambda: git_ops._git(
                         self.repo_path,
-                        "fetch", "origin", base, pr_branch,
+                        "fetch", "--prune", "origin", base, pr_branch,
                         timeout=60,
                     ),
                     operation_name=f"git fetch origin {base} {pr_branch}",
@@ -247,7 +247,9 @@ class MergeMixin:
 
         try:
             retry_transient(
-                lambda: git_ops._git(self.repo_path, "fetch", "origin", base),
+                lambda: git_ops._git(
+                    self.repo_path, "fetch", "--prune", "origin", base
+                ),
                 operation_name=f"git fetch origin {base}",
             )
             git_ops._git(self.repo_path, "checkout", base)
