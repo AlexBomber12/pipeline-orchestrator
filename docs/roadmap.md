@@ -758,6 +758,131 @@ Given trunk-based reality + AI context limits, the following adjustments apply:
 - **LOWER priority:** features intended for theoretical multi-user / multi-team setups. AGENTS.md bounded reading scope (PR-168/177), per-repo `review_timeout_min` UI, multi-tenancy considerations.
 - **Neutral:** features that improve baseline reliability regardless of team size. State model refactor (Wave 5), bounded-retry unification (PR-184), Thompson Sampling (Sprint 11).
 
+---
+
+## Multi-tier agent hierarchy (architectural direction, added 2026-04-26)
+
+Direction crystallized in conversation 2026-04-26 evening. Aleksei's framing: "звать human раньше — а он должен звать другого агента, который имеет [memory access, full architecture nav, time/tokens for cross-file reasoning, escape capability]."
+
+This is a refinement of the **Tester role** Vision item (line 698) — broader and more specific. Not just review-time second opinion, but **always-available diagnostic agent** that coder can escalate to mid-cycle.
+
+### Three-tier model
+
+```
+Tier 1: Coder agent (claude / codex CLI in PR working dir)
+   ↓ ESCALATE protocol (PR-166)
+Tier 2: Architect / Diagnostic agent (NEW)
+   ↓ ESCALATE when needs strategic decision
+Tier 3: Human (Aleksei)
+```
+
+### Tier 1 (current, mostly built)
+- Cwd: single PR working dir
+- Context: task file + AGENTS.md + (after PR-167) CI logs + review feedback
+- Mandate: implement task per spec
+- Time budget: 5-30 min per FIX cycle
+- Cost: low (CLI quota)
+- ESCALATE trigger: PR-166 protocol, no-push counter (PR-164), explicit ESCALATE marker in stdout
+
+### Tier 2 (new direction, future PR series)
+- Read access: full repo + memory entries + roadmap.md + past PR history + past chats
+- Mandate: diagnose cross-component issues, classify infra-vs-product, decide split-vs-fix-in-place, propose architectural direction
+- Time budget: 5-15 min per investigation
+- Cost: medium (Sonnet/Opus with large context window + Graphify navigation)
+- ESCALATE trigger: ambiguous architectural decision, novel pattern requiring strategic taste, business/priority decision required
+
+### Tier 3 (untouchable)
+- Mandate: architectural taste, approval, strategic priority
+- Receives notifications from Tier 2 with diagnosis + recommendation
+- Decides split-vs-merge, prioritization, halt-vs-continue
+
+### What's needed to build Tier 2
+
+**Code:**
+- ESCALATED state in daemon state machine (foundation in PR-166)
+- Tier 2 invocation logic in daemon — spawn architect agent with rich prompt
+- Architect agent prompt template — what slice of memory + roadmap + diff is included
+- Architect agent output protocol — recommendation format (diagnosis + action + escalation flag)
+
+**Infrastructure:**
+- Graphify (or equivalent) for navigating large codebase under context budget
+- Search-past-chats access for Tier 2 (similar to `conversation_search` tool available in human-AI sessions)
+- Cost budget enforcement for Tier 2 invocations — only when Tier 1 stuck, not for every issue
+- Notification system to human when Tier 2 escalates above
+
+**Mental model discipline:**
+- Tier 2 can be wrong → it RECOMMENDS, does not DECIDE
+- Tier 2 has cost → use only when Tier 1 stuck, not as routine helper
+- Coder stays in PR scope; Architect crosses scope; Human spans projects
+- Each tier's mandate and limits are explicit and respected
+
+### Realistic walkthrough (the case from 2026-04-26 session)
+
+```
+14:30 Daemon picks PR-160 (test pollution fix). Tier 1 coder works.
+14:45 Initial implementation, push, CI runs.
+14:50 CI fails on test_stop_during_coding_then_resume.
+14:51 Tier 1 enters FIX cycle, reads CI log via PR-167 enrichment.
+14:55 Tier 1 attempts fix. Push. CI fails again (same test, same error).
+15:00 Tier 1 attempts again. CI fails (same).
+15:05 Tier 1 attempts again. CI fails (same). PR-164 no-push counter reaches 3.
+15:08 PR-166 ESCALATE protocol triggers. Tier 1 posts ESCALATE marker:
+      "ESCALATE: CI fails consistently on test X; my fixes don't address root cause."
+15:09 Daemon transitions PR to ESCALATED state, spawns Tier 2 architect.
+
+Tier 2 receives:
+- PR url + diff + commit messages
+- All CI logs from failed runs
+- Read access to full repo (via Graphify nav)
+- Access to memory entries + roadmap
+- Search-past-chats capability
+
+Tier 2 reasoning (5-10 min):
+- "test_stop_during_coding fails with timed out for IDLE state"
+- "Examining conftest.py: reset_testbed only closes PRs, doesn't wipe tasks/"
+- "Memory: similar pattern discussed yesterday in PR-159 self-FIX"
+- "Roadmap: Variant D direction long-term, but this is shorter horizon"
+- "Diagnosis: test pollution between test runs, C-1 pattern"
+- "Recommendation: separate PR fixing reset_testbed fixture; OUT OF SCOPE for current PR-160"
+- "Don't force coder to fix it; ESCALATE to human for follow-up PR approval"
+
+15:15 Tier 2 posts comment on ESCALATED PR with diagnosis + recommendation. Notifies human.
+15:20 Human accepts recommendation. New PR-160a opened with fixture fix. Original PR-160 on hold.
+15:30 Tier 1 coder works on PR-160a (smaller, focused). Merges OK.
+15:40 Daemon resumes PR-160 (original), now has fixture fix in main, retries successfully.
+```
+
+### Priority and timing
+
+**Sprint group:** beyond current Sprint F-foundation series. Realistic order:
+1. F1 series (PR-163, 164, 165, 166) — foundation reliability + ESCALATE protocol (Tier 1 escalation capability)
+2. Stage 2 quick wins (PR-167, 168, 169) — production-ready basics
+3. Stage 3 UX (Tools 4, 5, 6) — single-architect empowerment
+4. Variant D series — kill QUEUE.md, direct injection
+5. Sprint 11 — Thompson Sampling, cost-aware reward
+6. **Tier 2 architect agent series (3-5 PRs)** — diagnostic agent foundation
+7. Round 5+ — Graphify integration (likely co-developed with Tier 2)
+
+Estimate: Tier 2 minimal viable becomes possible after Sprint 11 + Graphify spike, roughly 2-3 months from foundation closure. Could come earlier if found higher priority than Sprint 11.
+
+### Boundary conditions
+
+**Tier 2 must NOT:**
+- Auto-merge PRs (architect recommends, doesn't decide)
+- Modify production code directly (architect proposes diffs, coder applies)
+- Spawn additional agents (no recursive Tier 3 self-replication)
+- Operate without rate limit / cost budget
+
+**Tier 2 SHOULD:**
+- Always escalate to human when budget exhausted
+- Post recommendations as markdown comments (human-readable)
+- Reference specific lines / files / past PR numbers (auditable reasoning)
+- Time-out gracefully if reasoning exceeds budget
+
+This direction explicitly informed by **AI context limit observation** (line 745) and **trunk-based reality** (line 727). Tier 2 is the natural next step in single-architect productivity multiplication: not replacement, **leverage**.
+
+---
+
 ### Layer 2 substrate: Graphify investigation
 
 **Item to investigate:** [Graphify](https://graphify.net/) — open-source AI coding assistant skill that builds a navigable knowledge graph of a repo (AST via Tree-sitter + semantic via LLM + Leiden clustering). MIT-licensed, runs locally, no telemetry. Target compression: ~70× token reduction (1.7K vs 123K on a 52-file mixed corpus per their published benchmarks).
