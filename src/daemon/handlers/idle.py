@@ -648,6 +648,7 @@ class IdleMixin:
         if pin in ("claude", "codex"):
             await self._refresh_auth_status_cache()
             if self._select_coder(allow_exploration=False) is None:
+                self.state.current_pr = None
                 self.state.state = PipelineState.HUNG
                 self.state.error_message = (
                     f"Task {task.pr_id} pinned to {pin} but coder unavailable"

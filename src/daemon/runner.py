@@ -365,11 +365,20 @@ class PipelineRunner(
     def _get_coder(
         self, *, allow_exploration: bool = True
     ) -> tuple[str, CoderPlugin]:
-        """Return ``(coder_name, coder_plugin)`` for the active coder."""
+        """Return ``(coder_name, coder_plugin)`` for the active coder.
+
+        When the active task pins a specific coder via ``Coder:`` and no
+        eligible coder is available, fall back to the pinned coder rather
+        than the repo/global default to preserve the hard-pin guarantee.
+        """
         result = self._select_coder(allow_exploration=allow_exploration)
         if result is not None:
             self.state.coder = result[0]
             return result
+        pin = self._active_task_coder_pin()
+        if pin in ("claude", "codex"):
+            self.state.coder = pin
+            return pin, self._registry.get(pin)
         coder = self.repo_config.coder or self.app_config.daemon.coder
         coder_name = coder.value if isinstance(coder, CoderType) else str(coder)
         self.state.coder = coder_name
