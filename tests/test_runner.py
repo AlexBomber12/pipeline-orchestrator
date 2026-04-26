@@ -11938,6 +11938,74 @@ def test_handle_watch_does_not_retrigger_for_non_changes_requested_status(
     assert retriggers == []
 
 
+def test_handle_watch_allows_pending_review_only_when_repo_bypasses_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-test",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.PENDING,
+        last_activity=datetime.now(timezone.utc),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    merged: list[int] = []
+
+    async def fake_handle_merge() -> None:
+        merged.append(42)
+
+    runner = _make_runner(allow_merge_without_review=True)
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.handle_merge = fake_handle_merge  # type: ignore[method-assign]
+
+    asyncio.run(runner.handle_watch())
+
+    assert merged == [42]
+
+
+def test_handle_watch_does_not_bypass_changes_requested_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-test",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=datetime.now(timezone.utc),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [],
+    )
+    merged: list[int] = []
+
+    async def fake_handle_merge() -> None:
+        merged.append(42)
+
+    runner = _make_runner(allow_merge_without_review=True)
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    runner._last_push_at_pr_number = pr.number
+    runner.handle_merge = fake_handle_merge  # type: ignore[method-assign]
+
+    asyncio.run(runner.handle_watch())
+
+    assert merged == []
+    assert runner.state.state == PipelineState.WATCH
+
+
 def test_handle_fix_records_last_push_at(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

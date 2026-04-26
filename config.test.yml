@@ -2,6 +2,8 @@ repositories:
   - url: https://github.com/AlexBomber12/pipeline-orchestrator-testbed.git
     branch: main
     auto_merge: true
+    allow_merge_without_checks: true
+    allow_merge_without_review: true
     poll_interval_sec: 2
 
 daemon:

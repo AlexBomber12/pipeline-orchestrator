@@ -76,7 +76,11 @@ class WatchMixin:
 
         ci = found.ci_status
         review = found.review_status
-        if ci == CIStatus.SUCCESS and review == ReviewStatus.APPROVED:
+        review_allows_merge = review == ReviewStatus.APPROVED or (
+            self.repo_config.allow_merge_without_review
+            and review == ReviewStatus.PENDING
+        )
+        if ci == CIStatus.SUCCESS and review_allows_merge:
             if self.repo_config.auto_merge:
                 await self.handle_merge()
             else:

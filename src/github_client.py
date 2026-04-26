@@ -21,6 +21,7 @@ _REPO_URL_RE = re.compile(
 CODEX_BOT_LOGIN_PATTERN = re.compile(
     r"codex", re.IGNORECASE
 )
+_CODEX_ONBOARDING_TEXT = "create a Codex account and connect to github"
 
 _review_status_cache: dict[str, "ReviewStatus"] = {}
 _review_status_cache_cycle: int | None = None
@@ -69,6 +70,12 @@ def _is_codex_user(user_dict: dict | None) -> bool:
         return False
     login = user_dict.get("login", "") or ""
     return bool(CODEX_BOT_LOGIN_PATTERN.search(login))
+
+
+def _is_codex_onboarding_comment(comment: dict) -> bool:
+    """Return True for Codex connector setup guidance, not review feedback."""
+    body = comment.get("body") or ""
+    return _CODEX_ONBOARDING_TEXT.lower() in body.lower()
 
 
 def _is_reaction_content(reaction: dict, content: str) -> bool:
@@ -478,6 +485,8 @@ def _compute_review_status(
     anchor_ts = (anchor.get("created_at") or "") if anchor else ""
     for comment in issue_comments + review_comments:
         if not _is_codex_user(comment.get("user")):
+            continue
+        if _is_codex_onboarding_comment(comment):
             continue
         if anchor_ts and (comment.get("created_at") or "") <= anchor_ts:
             continue
