@@ -514,3 +514,13 @@
 - Status: DONE
 - Tasks file: tasks/PR-157.md
 - Branch: pr-157-testbed-reset-fixture
+
+## PR-158: Coder pin from task header respected (FINDING-2)
+- Status: TODO
+- Tasks file: tasks/PR-158.md
+- Branch: pr-158-coder-pin-respected
+
+## PR-159: derive_task_status reflects current_task in QUEUE.md (B-1 fix)
+- Status: TODO
+- Tasks file: tasks/PR-159.md
+- Branch: pr-159-queue-doing-current-task
