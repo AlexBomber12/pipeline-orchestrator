@@ -27,6 +27,7 @@ _REPO_FIELDS = {
     "active",
     "poll_interval_sec",
     "allow_merge_without_checks",
+    "allow_merge_without_review",
     "coder",
     "disabled_coders",
 }
@@ -76,6 +77,7 @@ class RepoConfig(BaseModel):
     active: bool = True
     poll_interval_sec: int = 60
     allow_merge_without_checks: bool = False
+    allow_merge_without_review: bool = False
     coder: CoderType | None = None
     disabled_coders: list[str] | None = None
 

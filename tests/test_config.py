@@ -754,6 +754,7 @@ def test_repo_poll_interval_rejects_float() -> None:
 def test_repo_allow_merge_without_checks_default() -> None:
     repo = RepoConfig(url="https://github.com/example/repo")
     assert repo.allow_merge_without_checks is False
+    assert repo.allow_merge_without_review is False
 
 
 def test_repo_allow_merge_without_checks_loads_from_yaml(tmp_path: Path) -> None:
@@ -766,6 +767,18 @@ def test_repo_allow_merge_without_checks_loads_from_yaml(tmp_path: Path) -> None
     )
     cfg = load_config(str(cfg_path))
     assert cfg.repositories[0].allow_merge_without_checks is True
+
+
+def test_repo_allow_merge_without_review_loads_from_yaml(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/repo\n"
+        "    allow_merge_without_review: true\n",
+        encoding="utf-8",
+    )
+    cfg = load_config(str(cfg_path))
+    assert cfg.repositories[0].allow_merge_without_review is True
 
 
 def test_config_rejects_invalid_port(tmp_path: Path) -> None:

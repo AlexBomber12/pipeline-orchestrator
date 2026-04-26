@@ -21,6 +21,7 @@ _REPO_URL_RE = re.compile(
 CODEX_BOT_LOGIN_PATTERN = re.compile(
     r"codex", re.IGNORECASE
 )
+_CODEX_ONBOARDING_TEXT = "create a Codex account and connect to github"
 
 _review_status_cache: dict[str, "ReviewStatus"] = {}
 _review_status_cache_cycle: int | None = None
@@ -69,6 +70,12 @@ def _is_codex_user(user_dict: dict | None) -> bool:
         return False
     login = user_dict.get("login", "") or ""
     return bool(CODEX_BOT_LOGIN_PATTERN.search(login))
+
+
+def _is_codex_onboarding_comment(comment: dict) -> bool:
+    """Return True for Codex connector setup guidance, not review feedback."""
+    body = comment.get("body") or ""
+    return _CODEX_ONBOARDING_TEXT.lower() in body.lower()
 
 
 def _is_reaction_content(reaction: dict, content: str) -> bool:
@@ -149,17 +156,28 @@ def get_open_prs(
 ) -> list[PRInfo]:
     """Return open PRs for ``repo`` (``owner/repo``) with CI and review status."""
     _begin_review_cache_cycle()
-    raw = run_gh(
-        [
-            "pr",
-            "list",
-            "--state",
-            "open",
-            "--json",
-            "number,title,headRefName,headRefOid,statusCheckRollup,url,updatedAt,commits,author,isCrossRepository,labels",
-        ],
-        repo=repo,
-    )
+    try:
+        raw = run_gh(
+            [
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--json",
+                "number,title,headRefName,headRefOid,statusCheckRollup,url,updatedAt,commits,author,isCrossRepository,labels",
+            ],
+            repo=repo,
+        )
+    except RuntimeError as exc:
+        if "GraphQL: API rate limit" not in str(exc):
+            raise
+        logger.warning(
+            "gh pr list GraphQL rate-limited for %s; falling back to REST", repo
+        )
+        return _get_open_prs_rest(
+            repo,
+            allow_merge_without_checks=allow_merge_without_checks,
+        )
     if not isinstance(raw, list):
         return []
 
@@ -197,6 +215,58 @@ def get_open_prs(
                     for label in (entry.get("labels") or [])
                 ),
                 is_cross_repository=bool(entry.get("isCrossRepository", False)),
+            )
+        )
+    return prs
+
+
+def _get_open_prs_rest(
+    repo: str,
+    *,
+    allow_merge_without_checks: bool,
+) -> list[PRInfo]:
+    """Return open PRs via REST when GraphQL status rollup is unavailable."""
+    raw = _gh_api_paginated(f"repos/{repo}/pulls?state=open&per_page=100")
+    if raw is None:
+        return []
+
+    prs: list[PRInfo] = []
+    for entry in raw:
+        number = int(entry.get("number", 0))
+        if not number:
+            continue
+        head = entry.get("head") or {}
+        user = entry.get("user") or {}
+        title = entry.get("title", "")
+        head_sha = head.get("sha", "")
+        labels = entry.get("labels") or []
+        prs.append(
+            PRInfo(
+                number=number,
+                branch=head.get("ref", ""),
+                title=title,
+                pr_id=extract_queue_pr_id(title),
+                ci_status=(
+                    CIStatus.SUCCESS
+                    if allow_merge_without_checks
+                    else CIStatus.PENDING
+                ),
+                review_status=get_pr_review_status(
+                    repo,
+                    number,
+                    pr_author=user.get("login", ""),
+                    head_sha=head_sha,
+                ),
+                commits_count=1 if head_sha else 0,
+                push_count=1 if head_sha else 0,
+                url=entry.get("html_url", ""),
+                last_activity=_parse_iso(entry.get("updated_at")),
+                is_escalated=any(
+                    isinstance(label, dict)
+                    and (label.get("name") or "").lower() == "escalated"
+                    for label in labels
+                ),
+                is_cross_repository=bool(head.get("repo", {}).get("fork", False)),
             )
         )
     return prs
@@ -478,6 +548,8 @@ def _compute_review_status(
     anchor_ts = (anchor.get("created_at") or "") if anchor else ""
     for comment in issue_comments + review_comments:
         if not _is_codex_user(comment.get("user")):
+            continue
+        if _is_codex_onboarding_comment(comment):
             continue
         if anchor_ts and (comment.get("created_at") or "") <= anchor_ts:
             continue

@@ -1130,6 +1130,51 @@ def test_review_status_changes_requested_without_p1_p2_tags(
     )
 
 
+def test_review_status_ignores_codex_onboarding_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json as _json
+
+    clear_review_status_cache()
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = _find_api_path(cmd)
+        if "issues" in path and path.endswith("/comments"):
+            data = [
+                [
+                    {
+                        "id": 10,
+                        "user": {"login": "author"},
+                        "body": "@codex review",
+                        "created_at": "2026-01-01T00:00:00Z",
+                    },
+                    {
+                        "id": 20,
+                        "user": {"login": "chatgpt-codex-connector"},
+                        "body": (
+                            "To use Codex here, create a Codex account "
+                            "and connect to github."
+                        ),
+                        "created_at": "2026-01-01T00:01:00Z",
+                    },
+                ],
+            ]
+        elif "pulls" in path and path.endswith("/comments"):
+            data = []
+        elif path.endswith("/reactions"):
+            data = []
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status("owner/name", 42, pr_author="author")
+        == ReviewStatus.PENDING
+    )
+
+
 def test_review_status_pending_when_no_codex_activity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2389,6 +2434,72 @@ def test_get_open_prs_returns_prinfo_objects(
     assert prs[0].last_activity == datetime(2026, 4, 18, 11, 22, 33, tzinfo=_tz.utc)
     assert prs[0].is_escalated is True
     assert prs[0].is_cross_repository is True
+
+
+def test_get_open_prs_falls_back_to_rest_on_graphql_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_graphql(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("GraphQL: API rate limit exceeded")
+
+    monkeypatch.setattr("src.github_client.run_gh", fail_graphql)
+    monkeypatch.setattr(
+        "src.github_client._gh_api_paginated",
+        lambda path: [
+            {"number": 0},
+            {
+                "number": 42,
+                "title": "PR-110: Add coverage",
+                "head": {
+                    "ref": "feature-branch",
+                    "sha": "abc123",
+                    "repo": {"fork": True},
+                },
+                "html_url": "https://example.test/pr/42",
+                "updated_at": "2026-04-18T11:22:33Z",
+                "user": {"login": "alice"},
+                "labels": [{"name": "escalated"}],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "src.github_client.get_pr_review_status",
+        lambda repo, number, pr_author, head_sha: ReviewStatus.PENDING,
+    )
+
+    prs = get_open_prs("owner/name", allow_merge_without_checks=True)
+
+    assert [pr.number for pr in prs] == [42]
+    assert prs[0].branch == "feature-branch"
+    assert prs[0].ci_status == CIStatus.SUCCESS
+    assert prs[0].review_status == ReviewStatus.PENDING
+    assert prs[0].last_activity == datetime(2026, 4, 18, 11, 22, 33, tzinfo=_tz.utc)
+    assert prs[0].is_escalated is True
+    assert prs[0].is_cross_repository is True
+
+
+def test_get_open_prs_propagates_non_rate_limit_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_graphql(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("gh failed")
+
+    monkeypatch.setattr("src.github_client.run_gh", fail_graphql)
+
+    with pytest.raises(RuntimeError, match="gh failed"):
+        get_open_prs("owner/name")
+
+
+def test_get_open_prs_rest_fallback_returns_empty_for_unexpected_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_graphql(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("GraphQL: API rate limit exceeded")
+
+    monkeypatch.setattr("src.github_client.run_gh", fail_graphql)
+    monkeypatch.setattr("src.github_client._gh_api_paginated", lambda path: None)
+
+    assert get_open_prs("owner/name") == []
 
 
 def test_get_open_prs_returns_empty_for_non_list_payload(

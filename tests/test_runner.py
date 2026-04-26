@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from redis.exceptions import ConnectionError as RedisConnectionError
 from src import codex_cli
 from src import retry as retry_module
 from src.coder_registry import CoderRegistry
@@ -405,6 +406,29 @@ def test_reload_repo_config_if_dirty_supports_redis_without_exists(
     asyncio.run(runner.reload_repo_config_if_dirty())
 
     assert runner.repo_config.coder == CoderType.CODEX
+
+
+def test_reload_repo_config_if_dirty_applies_staged_reload_when_redis_unavailable() -> None:
+    runner = _make_runner()
+    next_repo_config = RepoConfig.model_validate(
+        {**runner.repo_config.model_dump(), "coder": "codex"}
+    )
+    runner.stage_config_reload(
+        next_repo_config,
+        AppConfig(repositories=[next_repo_config], daemon=runner.app_config.daemon),
+        None,
+        None,
+    )
+
+    async def broken_exists(key: str) -> int:
+        raise RedisConnectionError("redis down")
+
+    runner.redis.exists = broken_exists  # type: ignore[method-assign]
+
+    asyncio.run(runner.reload_repo_config_if_dirty())
+
+    assert runner.repo_config.coder == CoderType.CODEX
+    assert runner._pending_repo_config is None
 
 
 def test_reload_repo_config_if_dirty_clears_staged_reload_after_disk_refresh(
@@ -1697,6 +1721,161 @@ def test_select_next_task_from_dag_marks_current_task_doing_without_open_pr(
     )
     assert "## PR-001" in queue_md
     assert "- Status: DOING" in queue_md
+
+
+def test_select_next_task_from_dag_skips_user_stopped_current_task(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Stopped task\n\n"
+        "Branch: pr-001-stopped\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+    (tasks_dir / "PR-002.md").write_text(
+        "# PR-002: Follow-up task\n\n"
+        "Branch: pr-002-follow-up\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+    runner._user_stopped_task_pr_ids.add("PR-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="Stopped task",
+        status=TaskStatus.DOING,
+        task_file="tasks/PR-001.md",
+        branch="pr-001-stopped",
+    )
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-002"
+    assert task.status == TaskStatus.TODO
+    assert runner._idle_dag_statuses == {
+        "PR-001": TaskStatus.TODO,
+        "PR-002": TaskStatus.TODO,
+    }
+    assert runner._user_stopped_task_pr_ids == set()
+
+
+def test_select_next_task_from_dag_retries_user_stopped_task_when_only_choice(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Stopped task\n\n"
+        "Branch: pr-001-stopped\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+    runner._user_stopped_task_pr_ids.add("PR-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="Stopped task",
+        status=TaskStatus.DOING,
+        task_file="tasks/PR-001.md",
+        branch="pr-001-stopped",
+    )
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-001"
+    assert task.status == TaskStatus.TODO
+    assert runner._user_stopped_task_pr_ids == set()
+
+
+def test_select_next_task_from_dag_watches_user_stopped_task_with_open_pr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Open PR task\n\n"
+        "Branch: pr-001-open\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = [PRInfo(number=11, branch="pr-001-open", pr_id="PR-001")]
+    runner._idle_merged_prs = []
+    runner._user_stopped_task_pr_ids.add("PR-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="Open PR task",
+        status=TaskStatus.DOING,
+        task_file="tasks/PR-001.md",
+        branch="pr-001-open",
+    )
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-001"
+    assert task.status == TaskStatus.DOING
+    assert runner._user_stopped_task_pr_ids == set()
 
 
 def test_select_next_task_from_dag_rejects_header_filename_mismatch(
@@ -11781,6 +11960,74 @@ def test_handle_watch_does_not_retrigger_for_non_changes_requested_status(
     asyncio.run(runner.handle_watch())
 
     assert retriggers == []
+
+
+def test_handle_watch_allows_pending_review_only_when_repo_bypasses_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-test",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.PENDING,
+        last_activity=datetime.now(timezone.utc),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    merged: list[int] = []
+
+    async def fake_handle_merge() -> None:
+        merged.append(42)
+
+    runner = _make_runner(allow_merge_without_review=True)
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.handle_merge = fake_handle_merge  # type: ignore[method-assign]
+
+    asyncio.run(runner.handle_watch())
+
+    assert merged == [42]
+
+
+def test_handle_watch_does_not_bypass_changes_requested_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-test",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=datetime.now(timezone.utc),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [],
+    )
+    merged: list[int] = []
+
+    async def fake_handle_merge() -> None:
+        merged.append(42)
+
+    runner = _make_runner(allow_merge_without_review=True)
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    runner._last_push_at_pr_number = pr.number
+    runner.handle_merge = fake_handle_merge  # type: ignore[method-assign]
+
+    asyncio.run(runner.handle_watch())
+
+    assert merged == []
+    assert runner.state.state == PipelineState.WATCH
 
 
 def test_handle_fix_records_last_push_at(
