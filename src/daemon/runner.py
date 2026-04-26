@@ -874,12 +874,19 @@ class PipelineRunner(
     async def _refresh_github_api_budget(self) -> RateLimitBudget | None:
         """Refresh the installation budget, sharing one probe across runners.
 
-        The local TTL guards repeated refreshes from the same runner. The
-        cross-runner Redis lock (``try_claim_refresh_lock``) guarantees that
-        among all ``PipelineRunner`` instances, only one actually invokes
-        ``gh api rate_limit`` per TTL window; the rest read the persisted
-        observation. Without this, probe traffic scales linearly with repo
-        count and can itself exhaust the rate limit.
+        The local TTL guards repeated ``gh api rate_limit`` probes from the
+        same runner. The cross-runner Redis lock (``try_claim_refresh_lock``)
+        guarantees that among all ``PipelineRunner`` instances, only one
+        actually invokes ``gh api rate_limit`` per TTL window; the rest read
+        the persisted observation. Without this, probe traffic scales linearly
+        with repo count and can itself exhaust the rate limit.
+
+        The shared Redis snapshot is consulted on every refresh, even within
+        the local TTL window. Otherwise a runner can keep returning a stale
+        "healthy" cached value for up to a minute after a sibling has already
+        published a "critical" update — exactly the window where multi-repo
+        deployments would keep spending GitHub quota during the most sensitive
+        moment.
 
         The TTL is only advanced once a snapshot is actually in hand. On
         concurrent startup a non-lock holder may see ``read_budget()`` return
@@ -895,6 +902,9 @@ class PipelineRunner(
         during exactly the conditions the protection exists to cover.
         """
         now = datetime.now(timezone.utc)
+        shared = await read_budget(self.redis)
+        if shared is not None:
+            self._github_api_budget_cache = shared
         if (
             self._github_api_budget_last_fetched is not None
             and (now - self._github_api_budget_last_fetched).total_seconds() < 60
@@ -908,11 +918,6 @@ class PipelineRunner(
                 await write_budget(self.redis, budget)
                 return budget
             await release_refresh_lock(self.redis)
-        shared = await read_budget(self.redis)
-        if shared is not None:
-            self._github_api_budget_cache = shared
-            self._github_api_budget_last_fetched = now
-            return shared
         if self._github_api_budget_cache is not None:
             self._github_api_budget_last_fetched = now
         return self._github_api_budget_cache

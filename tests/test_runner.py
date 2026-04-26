@@ -17730,6 +17730,45 @@ def test_run_cycle_short_circuits_when_budget_critical(
     )
 
 
+def test_refresh_github_api_budget_picks_up_sibling_update_within_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Within the local TTL, a sibling's freshly published snapshot must win.
+
+    The local TTL only guards repeated ``gh api rate_limit`` probes from the
+    same runner; otherwise a multi-repo deployment can keep using a stale
+    "healthy" local cache for up to 60s after a sibling has already published
+    a "critical" update, exactly when the protection should engage.
+    """
+    from src.daemon.github_rate_limit import BUDGET_REDIS_KEY
+
+    runner = _make_runner()
+    stale_local = _budget(remaining=4500, limit=5000)
+    runner._github_api_budget_cache = stale_local
+    runner._github_api_budget_last_fetched = datetime.now(timezone.utc)
+
+    fresh_shared = _budget(remaining=120, limit=5000)
+    runner.redis.store[BUDGET_REDIS_KEY] = fresh_shared.to_redis_payload()
+
+    fetch_calls = {"count": 0}
+
+    def _fetch() -> object:
+        fetch_calls["count"] += 1  # pragma: no cover - probe must not be invoked
+        return _budget(remaining=1)
+
+    monkeypatch.setattr(
+        runner_module.github_client, "fetch_rate_limit_budget", _fetch
+    )
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    assert fetch_calls["count"] == 0
+    assert result is not None
+    assert result.remaining == fresh_shared.remaining
+    assert runner._github_api_budget_cache is not None
+    assert runner._github_api_budget_cache.remaining == fresh_shared.remaining
+
+
 def test_refresh_github_api_budget_keeps_cache_when_fetch_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
