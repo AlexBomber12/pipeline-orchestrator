@@ -531,6 +531,6 @@
 - Branch: pr-160-per-test-tasks-wipe
 
 ## PR-161: Daemon git fetch uses --prune to drop stale remote-tracking refs
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-161.md
 - Branch: pr-161-git-fetch-prune
