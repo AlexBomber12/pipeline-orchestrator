@@ -21,6 +21,9 @@ daemon:
   exploration_epsilon: 0.15
   rate_limit_session_pause_percent: 90
   rate_limit_weekly_pause_percent: 95
+  github_api_pause_threshold_percent: 5
+  github_api_slowdown_threshold_percent: 20
+  github_api_slowdown_multiplier: 5
 
 web:
   host: 0.0.0.0

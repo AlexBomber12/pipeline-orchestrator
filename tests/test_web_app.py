@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -23,6 +23,7 @@ from src.models import (
 from src.web import app as web_app
 from src.web.app import (
     _active_rate_limit_coder,
+    _build_github_api_budget_view,
     _find_repo_config_by_name,
     _format_duration_ms,
     _get_repo_state_safe,
@@ -2302,3 +2303,85 @@ def test_post_repo_detail_coder_returns_success_when_publish_event_fails(
     assert stored.coder == "codex"
     reloaded = load_config(str(two_repo_config))
     assert reloaded.repositories[0].coder == "codex"
+
+
+def _make_budget_redis(
+    remaining: int,
+    limit: int = 5000,
+    reset_at: datetime | None = None,
+) -> _FakeRedis:
+    from src.daemon.github_rate_limit import (
+        BUDGET_REDIS_KEY,
+        RateLimitBudget,
+    )
+
+    budget = RateLimitBudget(
+        installation_id=None,
+        remaining=remaining,
+        limit=limit,
+        reset_at=reset_at
+        or (datetime.now(timezone.utc) + timedelta(seconds=1800)),
+    )
+    return _FakeRedis({BUDGET_REDIS_KEY: budget.to_redis_payload()})
+
+
+def test_build_github_api_budget_view_returns_none_without_observation() -> None:
+    config = load_config()
+    assert asyncio.run(_build_github_api_budget_view(_FakeRedis(), config)) is None
+
+
+def test_build_github_api_budget_view_buckets_ok() -> None:
+    config = load_config()
+    config.daemon.github_api_pause_threshold_percent = 5
+    config.daemon.github_api_slowdown_threshold_percent = 20
+    redis = _make_budget_redis(remaining=4500, limit=5000)  # 90%
+
+    view = asyncio.run(_build_github_api_budget_view(redis, config))
+
+    assert view is not None
+    assert view["bucket"] == "ok"
+    assert view["remaining"] == 4500
+    assert view["limit"] == 5000
+
+
+def test_build_github_api_budget_view_buckets_low() -> None:
+    config = load_config()
+    config.daemon.github_api_pause_threshold_percent = 5
+    config.daemon.github_api_slowdown_threshold_percent = 20
+    redis = _make_budget_redis(remaining=500)  # 10%
+
+    view = asyncio.run(_build_github_api_budget_view(redis, config))
+
+    assert view is not None
+    assert view["bucket"] == "low"
+
+
+def test_build_github_api_budget_view_buckets_critical() -> None:
+    config = load_config()
+    config.daemon.github_api_pause_threshold_percent = 5
+    config.daemon.github_api_slowdown_threshold_percent = 20
+    redis = _make_budget_redis(remaining=10)  # 0.2%
+
+    view = asyncio.run(_build_github_api_budget_view(redis, config))
+
+    assert view is not None
+    assert view["bucket"] == "critical"
+
+
+def test_build_github_api_budget_view_bucket_ok_when_reset_window_elapsed() -> None:
+    """Stale snapshots past their reset_at must not flag the dashboard.
+
+    The daemon stops throttling once ``now >= reset_at``; the dashboard
+    coloring should track the same trigger so operators don't see warning
+    or critical state while the runner is operating normally.
+    """
+    config = load_config()
+    config.daemon.github_api_pause_threshold_percent = 5
+    config.daemon.github_api_slowdown_threshold_percent = 20
+    expired = datetime.now(timezone.utc) - timedelta(seconds=60)
+    redis = _make_budget_redis(remaining=10, reset_at=expired)  # 0.2%, but expired
+
+    view = asyncio.run(_build_github_api_budget_view(redis, config))
+
+    assert view is not None
+    assert view["bucket"] == "ok"
