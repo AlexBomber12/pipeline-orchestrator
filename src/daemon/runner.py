@@ -60,6 +60,7 @@ from src.daemon.selector import (
 from src.events import publish_repo_event
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
+from src.queue_parser import QueueValidationError, parse_task_header
 from src.usage import UsageProvider
 from src.utils import repo_slug_from_url
 
@@ -316,6 +317,18 @@ class PipelineRunner(
         await self.redis.delete(dirty_key)
         self._apply_staged_config_reload()
 
+    def _active_task_coder_pin(self) -> str | None:
+        """Return the active task's ``Coder:`` header value if parseable."""
+        task = self.state.current_task
+        if task is None or not task.task_file:
+            return None
+        task_path = Path(self.repo_path) / task.task_file
+        try:
+            header = parse_task_header(task_path)
+        except (QueueValidationError, OSError):
+            return None
+        return header.coder
+
     def _select_coder(
         self, *, allow_exploration: bool = True
     ) -> tuple[str, CoderPlugin] | None:
@@ -333,6 +346,7 @@ class PipelineRunner(
             state=self.state,
             rng=self._selector_rng,
             auth_statuses=self._auth_status_cache or None,
+            task_coder_pin=self._active_task_coder_pin(),
         )
         return select_coder(ctx)
 

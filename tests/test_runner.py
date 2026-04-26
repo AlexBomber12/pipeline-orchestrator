@@ -1838,6 +1838,70 @@ def test_handle_idle_rereads_pause_flag_before_coding_transition(
     )
 
 
+def test_handle_idle_transitions_to_hung_when_pinned_coder_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A task pinned to ``codex`` whose coder is unavailable must transition
+    to HUNG with a clear message instead of silently falling back."""
+    _patch_subprocess(monkeypatch)
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-200.md").write_text(
+        "# PR-200: Pinned to codex\n\n"
+        "Branch: pr-200-pinned\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: codex\n",
+        encoding="utf-8",
+    )
+    task = QueueTask(
+        pr_id="PR-200",
+        title="Pinned to codex",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-200.md",
+        branch="pr-200-pinned",
+    )
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: task)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    coding_called = {"v": False}
+
+    async def spy_handle_coding(self):
+        coding_called["v"] = True
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "handle_coding", spy_handle_coding)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._auth_status_cache = {
+        "claude": {"status": "ok"},
+        "codex": {"status": "failed"},
+    }
+    runner._auth_status_cache_expires_at = (
+        datetime.now(timezone.utc) + timedelta(minutes=5)
+    )
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.error_message == (
+        "Task PR-200 pinned to codex but coder unavailable"
+    )
+    assert not coding_called["v"]
+
+
 def test_handle_idle_defers_on_gh_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

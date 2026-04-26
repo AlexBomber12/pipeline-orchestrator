@@ -26,30 +26,45 @@ class SelectionContext:
     state: RepoState
     rng: random.Random
     auth_statuses: dict[str, dict[str, str]] | None = None
+    # Hard pin from the active task header (`Coder:` field).
+    # ``"claude"`` / ``"codex"`` short-circuit selection; ``"any"`` and
+    # ``None`` defer to repo / global defaults so unpinned tasks keep
+    # the legacy auto_fallback behavior.
+    task_coder_pin: str | None = None
 
 
 def eligible_coders(ctx: SelectionContext) -> list[str]:
     """Return the currently runnable coder names in preference order."""
+    task_pin = ctx.task_coder_pin
+    if task_pin in ("claude", "codex"):
+        if _coder_runtime_ok(task_pin, ctx):
+            return [task_pin]
+        return []
+
     pinned = ctx.repo_config.coder
     preferred = pinned or ctx.app_config.daemon.coder
     if not ctx.app_config.daemon.auto_fallback:
         return [preferred.value]
 
-    result: list[str] = []
-    for name in ctx.registry.coder_names():
-        if not _supports_runtime(name):
-            continue
-        if _is_rate_limited(name, ctx.state):
-            continue
-        if _auth_failed(name, ctx.registry, ctx.auth_statuses):
-            continue
-        if _is_disabled_for_repo(name, ctx.repo_config):
-            continue
-        result.append(name)
+    result = [
+        name
+        for name in ctx.registry.coder_names()
+        if _coder_runtime_ok(name, ctx)
+    ]
 
     if pinned is not None and pinned.value in result:
         return [pinned.value] + [name for name in result if name != pinned.value]
     return result
+
+
+def _coder_runtime_ok(name: str, ctx: SelectionContext) -> bool:
+    """Return True when *name* passes every per-coder runtime gate."""
+    return (
+        _supports_runtime(name)
+        and not _is_rate_limited(name, ctx.state)
+        and not _auth_failed(name, ctx.registry, ctx.auth_statuses)
+        and not _is_disabled_for_repo(name, ctx.repo_config)
+    )
 
 
 def rank_coders(eligible: list[str], ctx: SelectionContext) -> list[str]:
