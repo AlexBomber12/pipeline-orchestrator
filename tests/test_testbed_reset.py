@@ -341,3 +341,77 @@ def test_reset_testbed_fixture_closes_prs_then_wipes_tasks_before_and_after() ->
         sys.modules.pop(module_name, None)
 
     assert calls == ["close", "wipe", "close", "wipe"]
+
+
+def test_upload_zip_wipes_tasks_before_upload_when_testbed_paused(
+    tmp_path: Path,
+) -> None:
+    module_name = "tests.e2e.conftest"
+    zip_path = tmp_path / "PR-123.zip"
+    zip_path.write_bytes(b"zip bytes")
+    post_calls: list[tuple[str, object]] = []
+    wipe_calls: list[str] = []
+
+    class Response:
+        status_code = 201
+
+    def post(url: str, *, files: dict[str, object], timeout: int) -> Response:
+        post_calls.append((url, files["files"][0]))
+        assert timeout == 30
+        return Response()
+
+    def get_state(slug: str) -> dict[str, str]:
+        assert slug == "custom__repo"
+        return {"state": "PAUSED"}
+
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace(post=post)}):
+            e2e_conftest = importlib.import_module(module_name)
+
+        with patch.object(
+            e2e_conftest,
+            "wipe_tasks_dir_on_main",
+            side_effect=lambda: wipe_calls.append("wipe") or True,
+        ):
+            upload = e2e_conftest.upload_zip.__wrapped__(get_state)
+            assert upload(zip_path, slug="custom__repo") == 201
+    finally:
+        sys.modules.pop(module_name, None)
+
+    assert wipe_calls == ["wipe"]
+    assert post_calls == [
+        (
+            "http://localhost:18800/repos/custom__repo/upload-tasks",
+            "PR-123.zip",
+        )
+    ]
+
+
+def test_upload_zip_does_not_wipe_tasks_when_testbed_not_paused(
+    tmp_path: Path,
+) -> None:
+    module_name = "tests.e2e.conftest"
+    zip_path = tmp_path / "PR-123.zip"
+    zip_path.write_bytes(b"zip bytes")
+
+    class Response:
+        status_code = 200
+
+    def post(_url: str, *, files: dict[str, object], timeout: int) -> Response:
+        assert files["files"][0] == "PR-123.zip"
+        assert timeout == 30
+        return Response()
+
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace(post=post)}):
+            e2e_conftest = importlib.import_module(module_name)
+
+        with patch.object(e2e_conftest, "wipe_tasks_dir_on_main") as wipe:
+            upload = e2e_conftest.upload_zip.__wrapped__(lambda _slug: {"state": "IDLE"})
+            assert upload(zip_path) == 200
+    finally:
+        sys.modules.pop(module_name, None)
+
+    wipe.assert_not_called()
