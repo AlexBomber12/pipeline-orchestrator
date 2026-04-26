@@ -314,8 +314,7 @@ def test_reset_testbed_full_aggregates_all_helpers() -> None:
 
 
 def test_reset_testbed_fixture_closes_prs_then_wipes_tasks_before_and_after() -> None:
-    sys.modules.setdefault("requests", types.SimpleNamespace())
-    e2e_conftest = importlib.import_module("tests.e2e.conftest")
+    module_name = "tests.e2e.conftest"
     calls: list[str] = []
 
     def close_prs() -> None:
@@ -325,13 +324,20 @@ def test_reset_testbed_fixture_closes_prs_then_wipes_tasks_before_and_after() ->
         calls.append("wipe")
         return True
 
-    with (
-        patch.object(e2e_conftest, "_close_open_testbed_prs", side_effect=close_prs),
-        patch.object(e2e_conftest, "wipe_tasks_dir_on_main", side_effect=wipe_tasks),
-    ):
-        fixture = e2e_conftest.reset_testbed.__wrapped__()
-        next(fixture)
-        with pytest.raises(StopIteration):
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
+            e2e_conftest = importlib.import_module(module_name)
+
+        with (
+            patch.object(e2e_conftest, "_close_open_testbed_prs", side_effect=close_prs),
+            patch.object(e2e_conftest, "wipe_tasks_dir_on_main", side_effect=wipe_tasks),
+        ):
+            fixture = e2e_conftest.reset_testbed.__wrapped__()
             next(fixture)
+            with pytest.raises(StopIteration):
+                next(fixture)
+    finally:
+        sys.modules.pop(module_name, None)
 
     assert calls == ["close", "wipe", "close", "wipe"]
