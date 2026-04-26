@@ -554,4 +554,3 @@
 - Status: TODO
 - Tasks file: tasks/PR-165.md
 - Branch: pr-165-poll-github-during-fix
-- Depends on: PR-163
