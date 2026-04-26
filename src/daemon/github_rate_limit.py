@@ -143,3 +143,23 @@ async def try_claim_refresh_lock(redis_client: Any, ttl_seconds: int) -> bool:
     except Exception:
         return True
     return bool(result)
+
+
+async def release_refresh_lock(redis_client: Any) -> None:
+    """Release the refresh lock so another runner can probe immediately.
+
+    Called when the lock holder failed to obtain a snapshot (for example a
+    transient ``gh api rate_limit`` failure). Holding the lock for the full
+    TTL after a failed probe would silently disable rate-limit protection
+    during exactly the conditions the protection is meant to cover, since
+    every runner would see ``read_budget`` return ``None`` and proceed
+    normally for up to ``ttl_seconds``.
+    """
+    if redis_client is None:
+        return
+    try:
+        await redis_client.delete(REFRESH_LOCK_REDIS_KEY)
+    except Exception:
+        logger.warning(
+            "Failed to release GitHub API rate-limit refresh lock", exc_info=True
+        )

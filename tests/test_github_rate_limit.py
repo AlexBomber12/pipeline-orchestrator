@@ -11,6 +11,7 @@ from src.daemon.github_rate_limit import (
     REFRESH_LOCK_REDIS_KEY,
     RateLimitBudget,
     read_budget,
+    release_refresh_lock,
     try_claim_refresh_lock,
     write_budget,
 )
@@ -113,6 +114,7 @@ class _FakeRedis:
         self.store: dict[str, str] = {}
         self.set_failure = False
         self.get_failure = False
+        self.delete_failure = False
 
     async def set(
         self,
@@ -132,6 +134,14 @@ class _FakeRedis:
         if self.get_failure:
             raise RuntimeError("redis offline")
         return self.store.get(key)
+
+    async def delete(self, key: str) -> int:
+        if self.delete_failure:
+            raise RuntimeError("redis offline")
+        if key in self.store:
+            del self.store[key]
+            return 1
+        return 0
 
 
 def test_write_and_read_budget_roundtrip() -> None:
@@ -193,3 +203,28 @@ def test_try_claim_refresh_lock_returns_true_on_redis_failure() -> None:
     redis = _FakeRedis()
     redis.set_failure = True
     assert asyncio.run(try_claim_refresh_lock(redis, ttl_seconds=60)) is True
+
+
+def test_release_refresh_lock_clears_held_lock() -> None:
+    """A failed probe must release the lock so a sibling can retry."""
+    redis = _FakeRedis()
+    asyncio.run(try_claim_refresh_lock(redis, ttl_seconds=60))
+    assert REFRESH_LOCK_REDIS_KEY in redis.store
+    asyncio.run(release_refresh_lock(redis))
+    assert REFRESH_LOCK_REDIS_KEY not in redis.store
+    # The next caller may now claim the lock immediately.
+    assert asyncio.run(try_claim_refresh_lock(redis, ttl_seconds=60)) is True
+
+
+def test_release_refresh_lock_no_op_when_redis_is_none() -> None:
+    asyncio.run(release_refresh_lock(None))
+
+
+def test_release_refresh_lock_swallows_redis_failure() -> None:
+    """A delete error must not propagate; the TTL provides eventual recovery."""
+    redis = _FakeRedis()
+    redis.store[REFRESH_LOCK_REDIS_KEY] = "1"
+    redis.delete_failure = True
+    asyncio.run(release_refresh_lock(redis))
+    # The lock was not removed, but TTL on the underlying key still applies.
+    assert REFRESH_LOCK_REDIS_KEY in redis.store

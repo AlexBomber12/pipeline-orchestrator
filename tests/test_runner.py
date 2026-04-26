@@ -17750,6 +17750,31 @@ def test_refresh_github_api_budget_keeps_cache_when_fetch_fails(
     assert result is cached
 
 
+def test_refresh_github_api_budget_releases_lock_when_probe_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lock holder whose ``gh api`` call fails must free the lock for a sibling.
+
+    Otherwise every runner is blocked from probing for the full TTL window
+    while ``read_budget`` returns ``None``, silently disabling rate-limit
+    protection during exactly the conditions it was added to cover.
+    """
+    from src.daemon.github_rate_limit import REFRESH_LOCK_REDIS_KEY
+
+    runner = _make_runner()
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "fetch_rate_limit_budget",
+        lambda: None,
+    )
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    assert result is None
+    assert REFRESH_LOCK_REDIS_KEY not in runner.redis.store
+    assert REFRESH_LOCK_REDIS_KEY in runner.redis.deleted
+
+
 def test_refresh_github_api_budget_skips_fetch_when_lock_held(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

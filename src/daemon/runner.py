@@ -45,6 +45,7 @@ from src.daemon.git_ops import _repo_looks_scaffolded, repo_owner_from_url
 from src.daemon.github_rate_limit import (
     RateLimitBudget,
     read_budget,
+    release_refresh_lock,
     try_claim_refresh_lock,
     write_budget,
 )
@@ -886,6 +887,12 @@ class PipelineRunner(
         the next cycle must retry rather than treating "no data" as a fresh
         observation, otherwise budget protection silently disengages for
         the full TTL window.
+
+        When this runner wins the lock but the probe itself returns ``None``
+        (transient ``gh api rate_limit`` failure), the lock is released so a
+        sibling can retry on its next cycle. Holding it for the full TTL on
+        a failed probe would suppress every other runner's probe attempt
+        during exactly the conditions the protection exists to cover.
         """
         now = datetime.now(timezone.utc)
         if (
@@ -900,6 +907,7 @@ class PipelineRunner(
                 self._github_api_budget_last_fetched = now
                 await write_budget(self.redis, budget)
                 return budget
+            await release_refresh_lock(self.redis)
         shared = await read_budget(self.redis)
         if shared is not None:
             self._github_api_budget_cache = shared
