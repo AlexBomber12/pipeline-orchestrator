@@ -55,6 +55,9 @@ _DAEMON_FIELDS = {
     "exploration_epsilon",
     "coder",
     "codex_model",
+    "github_api_pause_threshold_percent",
+    "github_api_slowdown_threshold_percent",
+    "github_api_slowdown_multiplier",
 }
 
 _DAEMON_ENV_OVERRIDES = {
@@ -121,6 +124,9 @@ class DaemonConfig(BaseModel):
     exploration_epsilon: float = Field(default=0.15, ge=0.0, le=0.5)
     coder: CoderType = CoderType.CLAUDE
     codex_model: str = ""
+    github_api_pause_threshold_percent: int = Field(default=5, ge=0, le=100)
+    github_api_slowdown_threshold_percent: int = Field(default=20, ge=0, le=100)
+    github_api_slowdown_multiplier: int = Field(default=5, ge=1, le=60)
 
 
 class WebConfig(BaseModel):

@@ -42,6 +42,7 @@ from src.daemon import (
     scaffolder,  # noqa: F401 — tests reference runner_module.scaffolder
 )
 from src.daemon.git_ops import _repo_looks_scaffolded, repo_owner_from_url
+from src.daemon.github_rate_limit import RateLimitBudget, write_budget
 from src.daemon.handlers.coding import CodingMixin
 from src.daemon.handlers.error import ErrorCategory, ErrorMixin, _classify_error  # noqa: F401 — re-exported for tests
 from src.daemon.handlers.fix import FixMixin
@@ -52,6 +53,7 @@ from src.daemon.handlers.watch import WatchMixin
 from src.daemon.preflight import PreflightMixin
 from src.daemon.rate_limit import RateLimitMixin
 from src.daemon.recovery import RecoveryMixin
+from src.daemon.recovery_policy import BoundedRecoveryPolicy
 from src.daemon.repo_ops import RepoOpsMixin
 from src.daemon.selector import (
     SelectionContext,
@@ -227,6 +229,34 @@ class PipelineRunner(
         self._pending_usage_providers: (
             tuple[UsageProvider, UsageProvider] | None
         ) = None
+        # GitHub API rate-limit budget tracking. The budget is refreshed
+        # at most once per minute; counters drive the BoundedRecoveryPolicy
+        # transitions for the slowdown/pause threshold actions.
+        self._github_api_budget_cache: RateLimitBudget | None = None
+        self._github_api_budget_last_fetched: datetime | None = None
+        self._github_api_pause_attempts = 0
+        self._github_api_slowdown_attempts = 0
+        self._github_api_slowdown_cycle = 0
+        self._github_api_pause_policy: BoundedRecoveryPolicy[
+            "PipelineRunner"
+        ] = BoundedRecoveryPolicy(
+            name="github_api_pause",
+            max_attempts=1,
+            counter_getter=lambda r: r._github_api_pause_attempts,
+            counter_setter=lambda r, n: setattr(r, "_github_api_pause_attempts", n),
+            on_threshold=lambda r: r._enter_github_api_pause(),
+        )
+        self._github_api_slowdown_policy: BoundedRecoveryPolicy[
+            "PipelineRunner"
+        ] = BoundedRecoveryPolicy(
+            name="github_api_slowdown",
+            max_attempts=1,
+            counter_getter=lambda r: r._github_api_slowdown_attempts,
+            counter_setter=lambda r, n: setattr(
+                r, "_github_api_slowdown_attempts", n
+            ),
+            on_threshold=lambda r: r._enter_github_api_slowdown(),
+        )
 
     @property
     def app_config(self) -> AppConfig:
@@ -835,6 +865,97 @@ class PipelineRunner(
             except Exception:
                 logger.warning("[%s] heartbeat publish failed, will retry", self.name)
 
+    async def _refresh_github_api_budget(self) -> RateLimitBudget | None:
+        """Fetch and persist the latest installation budget at most once/min."""
+        now = datetime.now(timezone.utc)
+        if (
+            self._github_api_budget_last_fetched is not None
+            and (now - self._github_api_budget_last_fetched).total_seconds() < 60
+        ):
+            return self._github_api_budget_cache
+        budget = await asyncio.to_thread(github_client.fetch_rate_limit_budget)
+        self._github_api_budget_last_fetched = now
+        if budget is None:
+            return self._github_api_budget_cache
+        self._github_api_budget_cache = budget
+        await write_budget(self.redis, budget)
+        return budget
+
+    def _enter_github_api_pause(self) -> None:
+        """Threshold action for ``_github_api_pause_policy``.
+
+        Only the transition cycle invokes ``maybe_escalate``, so this
+        runs at most once per low-budget window.
+        """
+        budget = self._github_api_budget_cache
+        if budget is None:  # pragma: no cover - guarded by caller
+            return
+        reset_iso = budget.reset_at.isoformat()
+        remaining_min = max(
+            0,
+            int((budget.reset_at - datetime.now(timezone.utc)).total_seconds() // 60),
+        )
+        self.log_event(
+            f"GitHub API budget critical ({budget.remaining}/{budget.limit}), "
+            f"pausing until {reset_iso} ({remaining_min} min)"
+        )
+
+    def _enter_github_api_slowdown(self) -> None:
+        """Threshold action for ``_github_api_slowdown_policy``."""
+        budget = self._github_api_budget_cache
+        if budget is None:  # pragma: no cover - guarded by caller
+            return
+        multiplier = self.app_config.daemon.github_api_slowdown_multiplier
+        effective_interval = self.repo_config.poll_interval_sec * multiplier
+        self.log_event(
+            f"GitHub API budget low ({budget.remaining}/{budget.limit}), "
+            f"slowing polling to {effective_interval}s"
+        )
+
+    async def _check_github_api_budget(self) -> bool:
+        """Return ``True`` if the cycle may proceed; ``False`` to skip it.
+
+        Implements three threshold paths driven by ``app_config.daemon``:
+        critical → pause until ``reset_at``; warning → run only one in
+        ``github_api_slowdown_multiplier`` cycles; otherwise normal.
+        Both threshold transitions are mediated by ``BoundedRecoveryPolicy``
+        instances so the bookkeeping matches the dirty-tree and FIX
+        iteration-cap recovery sites.
+        """
+        budget = await self._refresh_github_api_budget()
+        if budget is None:
+            return True
+
+        pct = budget.remaining_percent
+        pause_pct = self.app_config.daemon.github_api_pause_threshold_percent
+        slowdown_pct = self.app_config.daemon.github_api_slowdown_threshold_percent
+        multiplier = max(1, self.app_config.daemon.github_api_slowdown_multiplier)
+        now = datetime.now(timezone.utc)
+
+        if pct < pause_pct and now < budget.reset_at:
+            was_zero = self._github_api_pause_attempts == 0
+            self._github_api_pause_policy.increment(self)
+            if was_zero:
+                await self._github_api_pause_policy.maybe_escalate(self)
+            return False
+
+        if self._github_api_pause_attempts > 0:
+            self._github_api_pause_policy.reset(self)
+
+        if pct < slowdown_pct:
+            was_zero = self._github_api_slowdown_attempts == 0
+            self._github_api_slowdown_policy.increment(self)
+            if was_zero:
+                await self._github_api_slowdown_policy.maybe_escalate(self)
+            proceed = self._github_api_slowdown_cycle % multiplier == 0
+            self._github_api_slowdown_cycle += 1
+            return proceed
+
+        if self._github_api_slowdown_attempts > 0:
+            self._github_api_slowdown_policy.reset(self)
+            self._github_api_slowdown_cycle = 0
+        return True
+
     async def run_cycle(self) -> None:
         """Advance the state machine by one step."""
         try:
@@ -843,6 +964,10 @@ class PipelineRunner(
             self.state.state = PipelineState.ERROR
             self.state.error_message = str(exc)
             self.log_event(f"ensure_repo_cloned failed: {exc}")
+            await self.publish_state()
+            return
+
+        if not await self._check_github_api_budget():
             await self.publish_state()
             return
 

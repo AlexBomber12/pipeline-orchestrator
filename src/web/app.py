@@ -41,6 +41,7 @@ from src.config import (
     update_daemon_config,
     update_repository,
 )
+from src.daemon.github_rate_limit import read_budget
 from src.events import publish_repo_event
 from src.events.sse import RepoEventsUnavailableError, stream_repo_events
 from src.metrics import MetricsStore, RunRecord
@@ -352,6 +353,38 @@ def _active_rate_limit_coder(
 def _coder_rate_limit_supported(coder: str | None) -> bool:
     """Return whether ``coder`` has meaningful rate-limit usage data."""
     return coder in {"claude", "codex"}
+
+
+async def _build_github_api_budget_view(
+    redis_client: aioredis.Redis | None,
+    config: AppConfig,
+) -> dict[str, Any] | None:
+    """Return a render-ready budget snapshot for the dashboard.
+
+    Returns ``None`` when no observation has been persisted yet so the
+    template can hide the bar entirely. Color bucket maps to the same
+    daemon thresholds the poll loop uses, so the dashboard's red/amber
+    indicator matches the daemon's actual pause/slowdown trigger points.
+    """
+    budget = await read_budget(redis_client)
+    if budget is None:
+        return None
+    pct = budget.remaining_percent
+    pause_pct = config.daemon.github_api_pause_threshold_percent
+    slowdown_pct = config.daemon.github_api_slowdown_threshold_percent
+    if pct < pause_pct:
+        bucket = "critical"
+    elif pct < slowdown_pct:
+        bucket = "low"
+    else:
+        bucket = "ok"
+    return {
+        "remaining": budget.remaining,
+        "limit": budget.limit,
+        "percent": round(pct, 1),
+        "reset_at": budget.reset_at,
+        "bucket": bucket,
+    }
 
 
 async def get_all_repo_states(
@@ -954,6 +987,9 @@ async def index(request: Request) -> HTMLResponse:
     stats = _compute_stats(states)
     alerts = _build_alerts(states)
     latest_alert = min(alerts, key=lambda a: a["duration_seconds"]) if alerts else None
+    github_api_budget = await _build_github_api_budget_view(
+        redis_client, load_config(CONFIG_PATH)
+    )
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -963,6 +999,7 @@ async def index(request: Request) -> HTMLResponse:
             "stats": stats,
             "latest_alert": latest_alert,
             "redis_warning": redis_warning,
+            "github_api_budget": github_api_budget,
         },
     )
 
@@ -1022,10 +1059,17 @@ async def partial_redis_banner(request: Request) -> HTMLResponse:
 async def partial_repo_list(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
     states, redis_warning = await get_all_repo_states(redis_client)
+    github_api_budget = await _build_github_api_budget_view(
+        redis_client, load_config(CONFIG_PATH)
+    )
     return templates.TemplateResponse(
         request,
         "components/repo_cards.html",
-        {"repos": states, "redis_warning": redis_warning},
+        {
+            "repos": states,
+            "redis_warning": redis_warning,
+            "github_api_budget": github_api_budget,
+        },
     )
 
 

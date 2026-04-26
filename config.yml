@@ -17,6 +17,9 @@ daemon:
     claude: 76
   exploration_epsilon: 0.15
   rate_limit_pause_percent: 90
+  github_api_pause_threshold_percent: 5
+  github_api_slowdown_threshold_percent: 20
+  github_api_slowdown_multiplier: 5
 web:
   host: 0.0.0.0
   port: 8000

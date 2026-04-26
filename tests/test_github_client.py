@@ -2959,3 +2959,126 @@ def test_ci_status_pending_when_states_missing_or_mixed() -> None:
 
 def test_parse_iso_returns_none_for_invalid_string() -> None:
     assert _parse_iso("not-a-date") is None
+
+
+def test_get_current_rate_limit_budget_returns_persisted_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from src.daemon.github_rate_limit import (
+        BUDGET_REDIS_KEY,
+        RateLimitBudget,
+    )
+
+    class _FakeRedis:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+
+        async def get(self, key: str) -> str | None:
+            return self.store.get(key)
+
+    redis = _FakeRedis()
+    redis.store[BUDGET_REDIS_KEY] = RateLimitBudget(
+        installation_id=None,
+        remaining=42,
+        limit=5000,
+        reset_at=datetime.fromtimestamp(1745683200, tz=_tz.utc),
+    ).to_redis_payload()
+
+    result = asyncio.run(github_client.get_current_rate_limit_budget(redis))
+    assert result is not None
+    assert result.remaining == 42
+
+
+def test_get_current_rate_limit_budget_none_when_no_observation() -> None:
+    import asyncio
+
+    class _FakeRedis:
+        async def get(self, key: str) -> str | None:
+            return None
+
+    assert asyncio.run(
+        github_client.get_current_rate_limit_budget(_FakeRedis())
+    ) is None
+
+
+def test_fetch_rate_limit_budget_parses_dict_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        github_client,
+        "run_gh",
+        lambda args, **kw: {"remaining": 4321, "limit": 5000, "reset": 1745683200},
+    )
+    budget = github_client.fetch_rate_limit_budget()
+    assert budget is not None
+    assert budget.remaining == 4321
+    assert budget.limit == 5000
+
+
+def test_fetch_rate_limit_budget_parses_string_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        github_client,
+        "run_gh",
+        lambda args, **kw: '{"remaining": 100, "limit": 5000, "reset": 0}',
+    )
+    budget = github_client.fetch_rate_limit_budget()
+    assert budget is not None
+    assert budget.remaining == 100
+
+
+def test_fetch_rate_limit_budget_returns_none_for_invalid_json_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        github_client, "run_gh", lambda args, **kw: "not-json"
+    )
+    assert github_client.fetch_rate_limit_budget() is None
+
+
+def test_fetch_rate_limit_budget_returns_none_for_unexpected_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(github_client, "run_gh", lambda args, **kw: [1, 2])
+    assert github_client.fetch_rate_limit_budget() is None
+
+
+def test_fetch_rate_limit_budget_returns_none_for_missing_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(github_client, "run_gh", lambda args, **kw: {"remaining": 10})
+    assert github_client.fetch_rate_limit_budget() is None
+
+
+def test_fetch_rate_limit_budget_returns_none_when_gh_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise(args: list[str], **kw: Any) -> None:
+        raise RuntimeError("API rate limit exceeded")
+
+    monkeypatch.setattr(github_client, "run_gh", _raise)
+    assert github_client.fetch_rate_limit_budget() is None
+
+
+def test_fetch_rate_limit_budget_returns_none_when_gh_oserror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise(args: list[str], **kw: Any) -> None:
+        raise OSError("gh missing")
+
+    monkeypatch.setattr(github_client, "run_gh", _raise)
+    assert github_client.fetch_rate_limit_budget() is None
+
+
+def test_fetch_rate_limit_budget_returns_none_on_malformed_int(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        github_client,
+        "run_gh",
+        lambda args, **kw: {"remaining": "abc", "limit": 5000, "reset": 0},
+    )
+    assert github_client.fetch_rate_limit_budget() is None

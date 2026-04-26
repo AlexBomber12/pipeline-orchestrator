@@ -95,6 +95,18 @@ def _disable_dag_selection_by_default(
     )
 
 
+@pytest.fixture(autouse=True)
+def _disable_github_rate_limit_fetch_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tests that don't pin a budget shouldn't actually call the gh CLI."""
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "fetch_rate_limit_budget",
+        lambda: None,
+    )
+
+
 class _FakeRedis:
     """Minimal async Redis double capturing ``set`` calls."""
 
@@ -17454,3 +17466,251 @@ def test_handle_coding_honors_stop_requested_after_pr_poll_exhaustion(
         entry["event"] == "CODING aborted: user stop requested"
         for entry in runner.state.history
     )
+
+
+# ---- GitHub API rate-limit-aware polling (PR-163) -----------------------
+
+
+def _far_future_reset(seconds: int = 1800) -> datetime:
+    return datetime.now(timezone.utc) + timedelta(seconds=seconds)
+
+
+def _budget(remaining: int, limit: int = 5000, reset_at: datetime | None = None):
+    from src.daemon.github_rate_limit import RateLimitBudget
+
+    return RateLimitBudget(
+        installation_id=None,
+        remaining=remaining,
+        limit=limit,
+        reset_at=reset_at or _far_future_reset(),
+    )
+
+
+def _set_budget(runner: PipelineRunner, budget: object) -> None:
+    """Pre-populate the runner's budget cache so refresh becomes a no-op."""
+    runner._github_api_budget_cache = budget  # type: ignore[assignment]
+    runner._github_api_budget_last_fetched = datetime.now(timezone.utc)
+
+
+def test_check_budget_returns_true_when_no_observation() -> None:
+    runner = _make_runner()
+    assert asyncio.run(runner._check_github_api_budget()) is True
+
+
+def test_check_budget_returns_false_below_pause_threshold() -> None:
+    runner = _make_runner()
+    runner.app_config.daemon.github_api_pause_threshold_percent = 5
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+    _set_budget(runner, _budget(remaining=10, limit=5000))  # 0.2%
+
+    proceed = asyncio.run(runner._check_github_api_budget())
+
+    assert proceed is False
+    assert runner._github_api_pause_attempts == 1
+    assert any(
+        "GitHub API budget critical" in e["event"] for e in runner.state.history
+    )
+
+
+def test_check_budget_pause_log_only_fires_once_per_window() -> None:
+    runner = _make_runner()
+    runner.app_config.daemon.github_api_pause_threshold_percent = 5
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+    _set_budget(runner, _budget(remaining=10, limit=5000))
+
+    asyncio.run(runner._check_github_api_budget())
+    asyncio.run(runner._check_github_api_budget())
+
+    pause_logs = [
+        e for e in runner.state.history if "GitHub API budget critical" in e["event"]
+    ]
+    assert len(pause_logs) == 1
+
+
+def test_check_budget_resets_pause_counter_on_recovery() -> None:
+    runner = _make_runner()
+    runner.app_config.daemon.github_api_pause_threshold_percent = 5
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+
+    _set_budget(runner, _budget(remaining=10, limit=5000))
+    asyncio.run(runner._check_github_api_budget())
+    assert runner._github_api_pause_attempts == 1
+
+    _set_budget(runner, _budget(remaining=4500, limit=5000))
+    proceed = asyncio.run(runner._check_github_api_budget())
+
+    assert proceed is True
+    assert runner._github_api_pause_attempts == 0
+
+
+def test_check_budget_pause_window_passed_means_proceed() -> None:
+    runner = _make_runner()
+    runner.app_config.daemon.github_api_pause_threshold_percent = 5
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+    # reset_at already in the past — the pause window has elapsed.
+    _set_budget(
+        runner,
+        _budget(
+            remaining=10,
+            limit=5000,
+            reset_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        ),
+    )
+
+    proceed = asyncio.run(runner._check_github_api_budget())
+
+    assert proceed is True
+
+
+def test_check_budget_slowdown_runs_one_in_n_cycles() -> None:
+    runner = _make_runner()
+    runner.app_config.daemon.github_api_pause_threshold_percent = 5
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+    runner.app_config.daemon.github_api_slowdown_multiplier = 5
+    _set_budget(runner, _budget(remaining=500, limit=5000))  # 10%
+
+    decisions = [
+        asyncio.run(runner._check_github_api_budget()) for _ in range(11)
+    ]
+
+    # cycles 0, 5, 10 proceed; everything else skipped
+    assert decisions[0] is True
+    assert decisions[5] is True
+    assert decisions[10] is True
+    assert decisions[1:5] == [False, False, False, False]
+    slowdown_logs = [
+        e for e in runner.state.history if "GitHub API budget low" in e["event"]
+    ]
+    assert len(slowdown_logs) == 1
+
+
+def test_check_budget_slowdown_resets_on_recovery() -> None:
+    runner = _make_runner()
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+
+    _set_budget(runner, _budget(remaining=500, limit=5000))
+    asyncio.run(runner._check_github_api_budget())
+    asyncio.run(runner._check_github_api_budget())
+    assert runner._github_api_slowdown_attempts == 2
+
+    _set_budget(runner, _budget(remaining=4500, limit=5000))
+    proceed = asyncio.run(runner._check_github_api_budget())
+
+    assert proceed is True
+    assert runner._github_api_slowdown_attempts == 0
+    assert runner._github_api_slowdown_cycle == 0
+
+
+def test_check_budget_normal_proceeds_without_changes() -> None:
+    runner = _make_runner()
+    _set_budget(runner, _budget(remaining=4500, limit=5000))
+
+    proceed = asyncio.run(runner._check_github_api_budget())
+
+    assert proceed is True
+    assert runner._github_api_pause_attempts == 0
+    assert runner._github_api_slowdown_attempts == 0
+
+
+def test_check_budget_zero_multiplier_falls_back_to_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+    # bypass pydantic validator to exercise the max(1, ...) guard
+    object.__setattr__(
+        runner.app_config.daemon, "github_api_slowdown_multiplier", 0
+    )
+    _set_budget(runner, _budget(remaining=500, limit=5000))
+
+    proceed = asyncio.run(runner._check_github_api_budget())
+
+    # multiplier coerced to 1 means every cycle in slowdown still proceeds.
+    assert proceed is True
+
+
+def test_refresh_github_api_budget_fetches_and_persists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    fetched = _budget(remaining=4321, limit=5000)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "fetch_rate_limit_budget",
+        lambda: fetched,
+    )
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    assert result is fetched
+    assert runner._github_api_budget_cache is fetched
+    from src.daemon.github_rate_limit import BUDGET_REDIS_KEY
+
+    assert BUDGET_REDIS_KEY in runner.redis.store
+
+
+def test_refresh_github_api_budget_uses_cache_within_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    cached = _budget(remaining=999)
+    runner._github_api_budget_cache = cached
+    runner._github_api_budget_last_fetched = datetime.now(timezone.utc)
+
+    calls = {"count": 0}
+
+    def _fetch() -> object:
+        calls["count"] += 1
+        return _budget(remaining=1)
+
+    monkeypatch.setattr(
+        runner_module.github_client, "fetch_rate_limit_budget", _fetch
+    )
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    assert result is cached
+    assert calls["count"] == 0
+
+
+def test_run_cycle_short_circuits_when_budget_critical(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch, stdout="")
+    runner = _make_runner()
+    runner._scaffolded = True
+    runner._recovered = True
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "fetch_rate_limit_budget",
+        lambda: _budget(remaining=1, limit=5000),
+    )
+
+    asyncio.run(runner.run_cycle())
+
+    # Critical-budget path skips preflight/state machine and just publishes.
+    assert runner.redis.writes, "publish_state should still run on early-return"
+    assert any(
+        "GitHub API budget critical" in e["event"] for e in runner.state.history
+    )
+
+
+def test_refresh_github_api_budget_keeps_cache_when_fetch_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    cached = _budget(remaining=999)
+    runner._github_api_budget_cache = cached
+    runner._github_api_budget_last_fetched = (
+        datetime.now(timezone.utc) - timedelta(seconds=120)
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "fetch_rate_limit_budget",
+        lambda: None,
+    )
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    assert result is cached
