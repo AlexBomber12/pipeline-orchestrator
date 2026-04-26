@@ -541,7 +541,7 @@
 - Branch: pr-162-bounded-recovery-policy
 
 ## PR-163: GitHub API rate-limit-aware polling
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-163.md
 - Branch: pr-163-github-api-rate-limit
 
