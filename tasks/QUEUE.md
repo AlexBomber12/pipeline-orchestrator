@@ -526,7 +526,7 @@
 - Branch: pr-159-queue-doing-current-task
 
 ## PR-160: Per-test reset_testbed wipes tasks/ on testbed
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-160.md
 - Branch: pr-160-per-test-tasks-wipe
 
