@@ -524,3 +524,13 @@
 - Status: DONE
 - Tasks file: tasks/PR-159.md
 - Branch: pr-159-queue-doing-current-task
+
+## PR-160: Per-test reset_testbed wipes tasks/ on testbed
+- Status: TODO
+- Tasks file: tasks/PR-160.md
+- Branch: pr-160-per-test-tasks-wipe
+
+## PR-161: Daemon git fetch uses --prune to drop stale remote-tracking refs
+- Status: TODO
+- Tasks file: tasks/PR-161.md
+- Branch: pr-161-git-fetch-prune
