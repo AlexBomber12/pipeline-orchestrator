@@ -995,9 +995,13 @@ async def get_current_rate_limit_budget(
 def fetch_rate_limit_budget() -> RateLimitBudget | None:
     """Fetch ``gh api rate_limit`` and return a parsed :class:`RateLimitBudget`.
 
-    Used by the daemon's poll loop to refresh the persisted budget.
-    Returns ``None`` if the gh CLI call fails or returns an unparseable
-    payload — callers treat that as "no data".
+    Returns the more constrained of the REST/core and GraphQL buckets so the
+    daemon throttles before either is exhausted. Hot-path polling here uses
+    GraphQL-heavy ``gh`` commands (``gh pr list --json …``), which consume
+    GraphQL points independently of the REST/core bucket; tracking only
+    ``rate.*`` (== ``resources.core``) would let GraphQL exhaustion slip
+    through. Returns ``None`` if the gh CLI call fails or returns an
+    unparseable payload — callers treat that as "no data".
     """
     try:
         raw = run_gh(
@@ -1005,7 +1009,7 @@ def fetch_rate_limit_budget() -> RateLimitBudget | None:
                 "api",
                 "rate_limit",
                 "--jq",
-                "{remaining: .rate.remaining, limit: .rate.limit, reset: .rate.reset}",
+                "{core: .resources.core, graphql: .resources.graphql}",
             ]
         )
     except (RuntimeError, subprocess.TimeoutExpired, OSError):
@@ -1015,6 +1019,18 @@ def fetch_rate_limit_budget() -> RateLimitBudget | None:
             raw = json.loads(raw)
         except json.JSONDecodeError:
             return None
+    if not isinstance(raw, dict):
+        return None
+    core = _parse_rate_limit_bucket(raw.get("core"))
+    graphql = _parse_rate_limit_bucket(raw.get("graphql"))
+    candidates = [b for b in (core, graphql) if b is not None]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda b: b.remaining_percent)
+
+
+def _parse_rate_limit_bucket(raw: object) -> RateLimitBudget | None:
+    """Parse one ``resources.<bucket>`` entry from ``gh api rate_limit``."""
     if not isinstance(raw, dict):
         return None
     try:

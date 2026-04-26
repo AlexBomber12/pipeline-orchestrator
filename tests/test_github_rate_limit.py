@@ -8,8 +8,10 @@ from typing import Any
 
 from src.daemon.github_rate_limit import (
     BUDGET_REDIS_KEY,
+    REFRESH_LOCK_REDIS_KEY,
     RateLimitBudget,
     read_budget,
+    try_claim_refresh_lock,
     write_budget,
 )
 
@@ -112,10 +114,19 @@ class _FakeRedis:
         self.set_failure = False
         self.get_failure = False
 
-    async def set(self, key: str, value: str) -> None:
+    async def set(
+        self,
+        key: str,
+        value: str,
+        ex: int | None = None,
+        nx: bool = False,
+    ) -> bool | None:
         if self.set_failure:
             raise RuntimeError("redis offline")
+        if nx and key in self.store:
+            return None
         self.store[key] = value
+        return True
 
     async def get(self, key: str) -> str | None:
         if self.get_failure:
@@ -162,3 +173,23 @@ def test_write_budget_swallows_redis_failure() -> None:
     redis.set_failure = True
     asyncio.run(write_budget(redis, _budget()))
     assert BUDGET_REDIS_KEY not in redis.store
+
+
+def test_try_claim_refresh_lock_first_caller_wins() -> None:
+    redis = _FakeRedis()
+    assert asyncio.run(try_claim_refresh_lock(redis, ttl_seconds=60)) is True
+    assert REFRESH_LOCK_REDIS_KEY in redis.store
+    # Second caller within the TTL window must be denied.
+    assert asyncio.run(try_claim_refresh_lock(redis, ttl_seconds=60)) is False
+
+
+def test_try_claim_refresh_lock_returns_true_when_redis_is_none() -> None:
+    """No-redis deployments fall back to per-runner refreshes (single-runner)."""
+    assert asyncio.run(try_claim_refresh_lock(None, ttl_seconds=60)) is True
+
+
+def test_try_claim_refresh_lock_returns_true_on_redis_failure() -> None:
+    """Redis hiccup must not block the rate-limit observation entirely."""
+    redis = _FakeRedis()
+    redis.set_failure = True
+    assert asyncio.run(try_claim_refresh_lock(redis, ttl_seconds=60)) is True

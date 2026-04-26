@@ -42,7 +42,12 @@ from src.daemon import (
     scaffolder,  # noqa: F401 — tests reference runner_module.scaffolder
 )
 from src.daemon.git_ops import _repo_looks_scaffolded, repo_owner_from_url
-from src.daemon.github_rate_limit import RateLimitBudget, write_budget
+from src.daemon.github_rate_limit import (
+    RateLimitBudget,
+    read_budget,
+    try_claim_refresh_lock,
+    write_budget,
+)
 from src.daemon.handlers.coding import CodingMixin
 from src.daemon.handlers.error import ErrorCategory, ErrorMixin, _classify_error  # noqa: F401 — re-exported for tests
 from src.daemon.handlers.fix import FixMixin
@@ -866,20 +871,33 @@ class PipelineRunner(
                 logger.warning("[%s] heartbeat publish failed, will retry", self.name)
 
     async def _refresh_github_api_budget(self) -> RateLimitBudget | None:
-        """Fetch and persist the latest installation budget at most once/min."""
+        """Refresh the installation budget, sharing one probe across runners.
+
+        The local TTL guards repeated refreshes from the same runner. The
+        cross-runner Redis lock (``try_claim_refresh_lock``) guarantees that
+        among all ``PipelineRunner`` instances, only one actually invokes
+        ``gh api rate_limit`` per TTL window; the rest read the persisted
+        observation. Without this, probe traffic scales linearly with repo
+        count and can itself exhaust the rate limit.
+        """
         now = datetime.now(timezone.utc)
         if (
             self._github_api_budget_last_fetched is not None
             and (now - self._github_api_budget_last_fetched).total_seconds() < 60
         ):
             return self._github_api_budget_cache
-        budget = await asyncio.to_thread(github_client.fetch_rate_limit_budget)
         self._github_api_budget_last_fetched = now
-        if budget is None:
-            return self._github_api_budget_cache
-        self._github_api_budget_cache = budget
-        await write_budget(self.redis, budget)
-        return budget
+        if await try_claim_refresh_lock(self.redis, ttl_seconds=60):
+            budget = await asyncio.to_thread(github_client.fetch_rate_limit_budget)
+            if budget is not None:
+                self._github_api_budget_cache = budget
+                await write_budget(self.redis, budget)
+                return budget
+        shared = await read_budget(self.redis)
+        if shared is not None:
+            self._github_api_budget_cache = shared
+            return shared
+        return self._github_api_budget_cache
 
     def _enter_github_api_pause(self) -> None:
         """Threshold action for ``_github_api_pause_policy``.

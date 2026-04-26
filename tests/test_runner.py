@@ -116,9 +116,18 @@ class _FakeRedis:
         self.deleted: list[str] = []
         self.lists: dict[str, list[str]] = {}
 
-    async def set(self, key: str, value: str, ex: int | None = None) -> None:
+    async def set(
+        self,
+        key: str,
+        value: str,
+        ex: int | None = None,
+        nx: bool = False,
+    ) -> bool | None:
+        if nx and key in self.store:
+            return None
         self.writes.append((key, value))
         self.store[key] = value
+        return True
 
     async def get(self, key: str) -> str | None:
         return self.store.get(key)
@@ -17709,6 +17718,93 @@ def test_refresh_github_api_budget_keeps_cache_when_fetch_fails(
         runner_module.github_client,
         "fetch_rate_limit_budget",
         lambda: None,
+    )
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    assert result is cached
+
+
+def test_refresh_github_api_budget_skips_fetch_when_lock_held(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Other runners reuse the persisted observation instead of re-probing."""
+    from src.daemon.github_rate_limit import (
+        BUDGET_REDIS_KEY,
+        REFRESH_LOCK_REDIS_KEY,
+    )
+
+    runner = _make_runner()
+    # Simulate another runner holding the lock and having published a budget.
+    persisted = _budget(remaining=2500, limit=5000)
+    runner.redis.store[REFRESH_LOCK_REDIS_KEY] = "1"
+    runner.redis.store[BUDGET_REDIS_KEY] = persisted.to_redis_payload()
+
+    fetch_calls = {"count": 0}
+
+    def _fetch() -> object:
+        fetch_calls["count"] += 1
+        return _budget(remaining=1)
+
+    monkeypatch.setattr(
+        runner_module.github_client, "fetch_rate_limit_budget", _fetch
+    )
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    assert fetch_calls["count"] == 0
+    assert result is not None
+    assert result.remaining == persisted.remaining
+    # Cache mirrors the shared observation so subsequent local-TTL hits work.
+    assert runner._github_api_budget_cache is not None
+    assert runner._github_api_budget_cache.remaining == persisted.remaining
+
+
+def test_refresh_github_api_budget_lock_serializes_concurrent_runners(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two runners sharing one Redis trigger exactly one ``gh api`` probe."""
+    shared_redis = _FakeRedis()
+    runner_a = _make_runner()
+    runner_b = _make_runner()
+    runner_a.redis = shared_redis  # type: ignore[assignment]
+    runner_b.redis = shared_redis  # type: ignore[assignment]
+
+    fetched = _budget(remaining=4000, limit=5000)
+    fetch_calls = {"count": 0}
+
+    def _fetch() -> object:
+        fetch_calls["count"] += 1
+        return fetched
+
+    monkeypatch.setattr(
+        runner_module.github_client, "fetch_rate_limit_budget", _fetch
+    )
+
+    result_a = asyncio.run(runner_a._refresh_github_api_budget())
+    result_b = asyncio.run(runner_b._refresh_github_api_budget())
+
+    assert fetch_calls["count"] == 1
+    assert result_a is fetched
+    assert result_b is not None
+    assert result_b.remaining == fetched.remaining
+
+
+def test_refresh_github_api_budget_falls_back_to_local_cache_when_shared_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lock held but no shared observation yet — keep the previous local value."""
+    from src.daemon.github_rate_limit import REFRESH_LOCK_REDIS_KEY
+
+    runner = _make_runner()
+    cached = _budget(remaining=777)
+    runner._github_api_budget_cache = cached
+    runner.redis.store[REFRESH_LOCK_REDIS_KEY] = "1"
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "fetch_rate_limit_budget",
+        lambda: _budget(remaining=1),
     )
 
     result = asyncio.run(runner._refresh_github_api_budget())

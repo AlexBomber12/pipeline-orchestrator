@@ -3003,13 +3003,20 @@ def test_get_current_rate_limit_budget_none_when_no_observation() -> None:
     ) is None
 
 
+def _bucket(remaining: int, limit: int = 5000, reset: int = 1745683200) -> dict:
+    return {"remaining": remaining, "limit": limit, "reset": reset}
+
+
 def test_fetch_rate_limit_budget_parses_dict_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         github_client,
         "run_gh",
-        lambda args, **kw: {"remaining": 4321, "limit": 5000, "reset": 1745683200},
+        lambda args, **kw: {
+            "core": _bucket(remaining=4321),
+            "graphql": _bucket(remaining=4900),
+        },
     )
     budget = github_client.fetch_rate_limit_budget()
     assert budget is not None
@@ -3023,11 +3030,44 @@ def test_fetch_rate_limit_budget_parses_string_response(
     monkeypatch.setattr(
         github_client,
         "run_gh",
-        lambda args, **kw: '{"remaining": 100, "limit": 5000, "reset": 0}',
+        lambda args, **kw: (
+            '{"core": {"remaining": 100, "limit": 5000, "reset": 0},'
+            ' "graphql": {"remaining": 4500, "limit": 5000, "reset": 0}}'
+        ),
     )
     budget = github_client.fetch_rate_limit_budget()
     assert budget is not None
     assert budget.remaining == 100
+
+
+def test_fetch_rate_limit_budget_returns_graphql_when_more_constrained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GraphQL exhaustion must surface even when REST/core is healthy."""
+    monkeypatch.setattr(
+        github_client,
+        "run_gh",
+        lambda args, **kw: {
+            "core": _bucket(remaining=4900),
+            "graphql": _bucket(remaining=10),
+        },
+    )
+    budget = github_client.fetch_rate_limit_budget()
+    assert budget is not None
+    assert budget.remaining == 10
+
+
+def test_fetch_rate_limit_budget_falls_back_when_one_bucket_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        github_client,
+        "run_gh",
+        lambda args, **kw: {"core": _bucket(remaining=4321)},
+    )
+    budget = github_client.fetch_rate_limit_budget()
+    assert budget is not None
+    assert budget.remaining == 4321
 
 
 def test_fetch_rate_limit_budget_returns_none_for_invalid_json_string(
@@ -3049,7 +3089,18 @@ def test_fetch_rate_limit_budget_returns_none_for_unexpected_type(
 def test_fetch_rate_limit_budget_returns_none_for_missing_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(github_client, "run_gh", lambda args, **kw: {"remaining": 10})
+    monkeypatch.setattr(
+        github_client,
+        "run_gh",
+        lambda args, **kw: {"core": {"remaining": 10}},
+    )
+    assert github_client.fetch_rate_limit_budget() is None
+
+
+def test_fetch_rate_limit_budget_returns_none_when_both_buckets_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(github_client, "run_gh", lambda args, **kw: {})
     assert github_client.fetch_rate_limit_budget() is None
 
 
@@ -3079,6 +3130,9 @@ def test_fetch_rate_limit_budget_returns_none_on_malformed_int(
     monkeypatch.setattr(
         github_client,
         "run_gh",
-        lambda args, **kw: {"remaining": "abc", "limit": 5000, "reset": 0},
+        lambda args, **kw: {
+            "core": {"remaining": "abc", "limit": 5000, "reset": 0},
+            "graphql": {"remaining": "xyz", "limit": 5000, "reset": 0},
+        },
     )
     assert github_client.fetch_rate_limit_budget() is None

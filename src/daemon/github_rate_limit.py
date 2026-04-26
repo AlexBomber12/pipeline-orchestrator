@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 #: a single budget per gh-CLI auth is the operational unit anyway.
 BUDGET_REDIS_KEY = "github_rate_limit_budget"
 
+#: Cross-runner refresh-lock key. Set with ``NX`` + ``EX`` so only one runner
+#: per TTL window probes ``gh api rate_limit``; the rest read the result via
+#: ``read_budget``. Without this, probe traffic scales linearly with repo
+#: count and can itself exhaust the rate limit it is meant to protect.
+REFRESH_LOCK_REDIS_KEY = "github_rate_limit_refresh_lock"
+
 
 @dataclass(frozen=True)
 class RateLimitBudget:
@@ -117,3 +123,23 @@ async def write_budget(redis_client: Any, budget: RateLimitBudget) -> None:
         await redis_client.set(BUDGET_REDIS_KEY, budget.to_redis_payload())
     except Exception:
         logger.warning("Failed to persist GitHub API budget", exc_info=True)
+
+
+async def try_claim_refresh_lock(redis_client: Any, ttl_seconds: int) -> bool:
+    """Atomically claim the right to refresh the budget for ``ttl_seconds``.
+
+    Returns ``True`` when the caller should perform ``fetch_rate_limit_budget``
+    and persist the result via :func:`write_budget`; ``False`` when another
+    runner already holds the lock and the caller should fall back to reading
+    the most recent observation via :func:`read_budget`. Returns ``True`` when
+    Redis is unavailable so a single-runner setup keeps refreshing normally.
+    """
+    if redis_client is None:
+        return True
+    try:
+        result = await redis_client.set(
+            REFRESH_LOCK_REDIS_KEY, "1", nx=True, ex=ttl_seconds
+        )
+    except Exception:
+        return True
+    return bool(result)
