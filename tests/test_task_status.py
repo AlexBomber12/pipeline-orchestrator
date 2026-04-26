@@ -82,6 +82,66 @@ def test_derive_todo_when_neither() -> None:
     assert status == TaskStatus.TODO
 
 
+def test_derive_doing_when_current_task_matches_without_open_pr() -> None:
+    status = derive_task_status(
+        _header("pr-085-status-from-git"),
+        set(),
+        [],
+        current_task_pr_id="PR-085",
+    )
+
+    assert status == TaskStatus.DOING
+
+
+def test_derive_done_when_current_task_matches_but_pr_already_merged() -> None:
+    status = derive_task_status(
+        _header("pr-085-status-from-git"),
+        {"PR-085"},
+        [],
+        current_task_pr_id="PR-085",
+    )
+
+    assert status == TaskStatus.DONE
+
+
+def test_derive_doing_when_current_task_matches_and_open_pr_exists() -> None:
+    status = derive_task_status(
+        _header("pr-085-status-from-git"),
+        set(),
+        [
+            PRInfo(
+                number=109,
+                branch="pr-085-status-from-git",
+                title="PR-085: Status derivation from git",
+            )
+        ],
+        current_task_pr_id="PR-085",
+    )
+
+    assert status == TaskStatus.DOING
+
+
+def test_derive_todo_when_current_task_pr_id_is_unrelated() -> None:
+    status = derive_task_status(
+        _header("pr-085-status-from-git", pr_id="PR-085"),
+        set(),
+        [],
+        current_task_pr_id="PR-999",
+    )
+
+    assert status == TaskStatus.TODO
+
+
+def test_derive_default_current_task_pr_id_preserves_legacy_todo() -> None:
+    status = derive_task_status(
+        _header("pr-085-status-from-git"),
+        set(),
+        [],
+    )
+
+    assert status == TaskStatus.TODO
+
+
 def test_get_merged_pr_ids(monkeypatch) -> None:
     calls: list[list[str]] = []
 
