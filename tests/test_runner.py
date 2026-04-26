@@ -3536,6 +3536,9 @@ def test_handle_fix_three_no_push_cycles_transition_to_hung(
     )
     assert runner.state.state == PipelineState.HUNG
     assert runner.state.current_pr.no_push_fix_count == 0
+    # is_escalated must be set so handle_hung's hung_fallback_codex_review
+    # path stays parked instead of bouncing back to WATCH.
+    assert runner.state.current_pr.is_escalated is True
     assert posted[-1] == (runner.owner_repo, 217, expected_msg)
     assert any(entry["event"] == expected_msg for entry in runner.state.history)
 
@@ -3639,6 +3642,7 @@ def test_handle_fix_no_push_counter_independent_of_fix_iteration_count(
     # fix_iteration_count untouched: only productive pushes increment it.
     assert runner.state.current_pr.fix_iteration_count == 2
     assert runner.state.current_pr.no_push_fix_count == 0
+    assert runner.state.current_pr.is_escalated is True
     expected_msg = (
         "FIX deadlock: 3 consecutive no-push FIX cycles on PR #220. "
         "Coder unable to identify actionable fix. Manual review required."
@@ -3712,6 +3716,7 @@ def test_handle_fix_no_push_deadlock_post_failure_still_transitions_to_hung(
     assert runner.state.state == PipelineState.HUNG
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.no_push_fix_count == 0
+    assert runner.state.current_pr.is_escalated is True
     assert any(
         "failed to post FIX deadlock comment" in entry["event"]
         for entry in runner.state.history
@@ -5700,6 +5705,39 @@ def test_handle_hung_posts_codex_review_and_returns_to_watch(
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.last_activity is not None
+
+
+def test_handle_hung_stays_hung_when_pr_is_escalated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Escalated PRs (e.g. parked here by the FIX no-push deadlock circuit
+    breaker) must stay HUNG even when ``hung_fallback_codex_review`` is on;
+    otherwise the fallback bounces back to WATCH and re-enters the loop
+    that triggered escalation in the first place."""
+    posted: list[tuple[str, int, str]] = []
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+
+    runner = _make_runner()
+    assert runner.app_config.daemon.hung_fallback_codex_review is True
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(
+        number=217, branch="pr-217", is_escalated=True
+    )
+    asyncio.run(runner.handle_hung())
+
+    assert posted == []
+    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.is_escalated is True
+    assert any(
+        "PR #217 escalated; staying HUNG" in entry["event"]
+        for entry in runner.state.history
+    )
 
 
 def test_handle_hung_sets_error_when_fallback_post_fails(

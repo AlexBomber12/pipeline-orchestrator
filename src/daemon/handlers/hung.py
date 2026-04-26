@@ -186,6 +186,18 @@ class HungMixin:
 
     async def handle_hung(self) -> None:
         """Nudge the reviewer with ``@codex review`` or give up, per config."""
+        current_pr = self.state.current_pr
+        if current_pr is not None and current_pr.is_escalated:
+            # Escalated PRs (e.g. parked here by the FIX no-push deadlock
+            # circuit breaker) require manual intervention. Skip the
+            # @codex review fallback so the runner stays HUNG instead of
+            # bouncing through WATCH and re-entering the loop that
+            # triggered escalation in the first place.
+            self.log_event(
+                f"PR #{current_pr.number} escalated; staying HUNG, "
+                "skipping @codex review fallback. Manual review required."
+            )
+            return
         if (
             self.app_config.daemon.hung_fallback_codex_review
             and self.state.current_pr is not None

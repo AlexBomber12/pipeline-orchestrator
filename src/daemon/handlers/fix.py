@@ -83,6 +83,12 @@ class FixMixin(BreachMixin):
         the no-push counter so a future cycle out of HUNG starts fresh.
         Comment-post failures are logged but never block the HUNG
         transition: HUNG is the safe parking state regardless.
+
+        Marks ``current_pr.is_escalated`` so ``handle_hung`` keeps the
+        runner parked even when ``hung_fallback_codex_review`` is on.
+        Without this, the default fallback would post ``@codex review``
+        and bounce back to WATCH on the very next tick, immediately
+        re-entering the FIX loop the deadlock counter was meant to stop.
         """
         count = current_pr.no_push_fix_count
         pr_number = current_pr.number
@@ -98,6 +104,7 @@ class FixMixin(BreachMixin):
                 f"Warning: failed to post FIX deadlock comment on PR "
                 f"#{pr_number}: {exc}"
             )
+        current_pr.is_escalated = True
         current_pr.no_push_fix_count = 0
         self.state.state = PipelineState.HUNG
         self.state.error_message = None
