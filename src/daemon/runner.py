@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 import redis.asyncio as aioredis
+from redis.exceptions import RedisError
 
 from src import github_client  # noqa: F401 — tests reference runner_module.github_client
 from src.coder_registry import CoderPlugin, CoderRegistry
@@ -295,10 +296,19 @@ class PipelineRunner(
         """Hot-reload repo config at the idle boundary when flagged by the web UI."""
         dirty_key = f"control:{self.name}:config_dirty"
         dirty_exists = False
-        if hasattr(self.redis, "exists"):
-            dirty_exists = bool(await self.redis.exists(dirty_key))
-        elif hasattr(self.redis, "get"):
-            dirty_exists = (await self.redis.get(dirty_key)) is not None
+        try:
+            if hasattr(self.redis, "exists"):
+                dirty_exists = bool(await self.redis.exists(dirty_key))
+            elif hasattr(self.redis, "get"):
+                dirty_exists = (await self.redis.get(dirty_key)) is not None
+        except RedisError as exc:
+            logger.warning(
+                "Skipping config dirty check for %s while Redis is unavailable: %s",
+                self.name,
+                exc,
+            )
+            self._apply_staged_config_reload()
+            return
         if not dirty_exists:
             self._apply_staged_config_reload()
             return

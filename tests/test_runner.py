@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from redis.exceptions import ConnectionError as RedisConnectionError
 from src import codex_cli
 from src import retry as retry_module
 from src.coder_registry import CoderRegistry
@@ -405,6 +406,29 @@ def test_reload_repo_config_if_dirty_supports_redis_without_exists(
     asyncio.run(runner.reload_repo_config_if_dirty())
 
     assert runner.repo_config.coder == CoderType.CODEX
+
+
+def test_reload_repo_config_if_dirty_applies_staged_reload_when_redis_unavailable() -> None:
+    runner = _make_runner()
+    next_repo_config = RepoConfig.model_validate(
+        {**runner.repo_config.model_dump(), "coder": "codex"}
+    )
+    runner.stage_config_reload(
+        next_repo_config,
+        AppConfig(repositories=[next_repo_config], daemon=runner.app_config.daemon),
+        None,
+        None,
+    )
+
+    async def broken_exists(key: str) -> int:
+        raise RedisConnectionError("redis down")
+
+    runner.redis.exists = broken_exists  # type: ignore[method-assign]
+
+    asyncio.run(runner.reload_repo_config_if_dirty())
+
+    assert runner.repo_config.coder == CoderType.CODEX
+    assert runner._pending_repo_config is None
 
 
 def test_reload_repo_config_if_dirty_clears_staged_reload_after_disk_refresh(
