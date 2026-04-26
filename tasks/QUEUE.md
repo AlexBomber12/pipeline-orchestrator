@@ -521,6 +521,6 @@
 - Branch: pr-158-coder-pin-respected
 
 ## PR-159: derive_task_status reflects current_task in QUEUE.md (B-1 fix)
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-159.md
 - Branch: pr-159-queue-doing-current-task
