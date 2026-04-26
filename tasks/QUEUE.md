@@ -544,13 +544,11 @@
 - Status: TODO
 - Tasks file: tasks/PR-163.md
 - Branch: pr-163-github-api-rate-limit
-- Depends on: PR-162
 
 ## PR-164: FIX no-push deadlock circuit breaker
 - Status: TODO
 - Tasks file: tasks/PR-164.md
 - Branch: pr-164-fix-no-push-circuit-breaker
-- Depends on: PR-162
 
 ## PR-165: GitHub state polling during long FIX cycle
 - Status: TODO
