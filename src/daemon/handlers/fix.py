@@ -75,6 +75,35 @@ class FixMixin(BreachMixin):
                 target.cancel()
                 return
 
+    async def _escalate_fix_no_push_deadlock(self, current_pr: PRInfo) -> None:
+        """Park the PR in HUNG after consecutive no-push FIX cycles.
+
+        Logs the deadlock event with the counter value, posts an
+        explanatory comment on the PR, transitions to HUNG, and resets
+        the no-push counter so a future cycle out of HUNG starts fresh.
+        Comment-post failures are logged but never block the HUNG
+        transition: HUNG is the safe parking state regardless.
+        """
+        count = current_pr.no_push_fix_count
+        pr_number = current_pr.number
+        message = (
+            f"FIX deadlock: {count} consecutive no-push FIX cycles on PR "
+            f"#{pr_number}. Coder unable to identify actionable fix. "
+            "Manual review required."
+        )
+        try:
+            github_client.post_comment(self.owner_repo, pr_number, message)
+        except Exception as exc:
+            self.log_event(
+                f"Warning: failed to post FIX deadlock comment on PR "
+                f"#{pr_number}: {exc}"
+            )
+        current_pr.no_push_fix_count = 0
+        self.state.state = PipelineState.HUNG
+        self.state.error_message = None
+        self.log_event(message)
+        await self.publish_state()
+
     async def _escalate_fix_iteration_cap(self, current_pr: PRInfo) -> None:
         """Escalate the PR after the FIX iteration cap is reached.
 
@@ -167,6 +196,13 @@ class FixMixin(BreachMixin):
             counter_getter=lambda pr: pr.fix_iteration_count,
             counter_setter=lambda pr, n: setattr(pr, "fix_iteration_count", n),
             on_threshold=lambda pr: self._escalate_fix_iteration_cap(pr),
+        )
+        no_push_policy: BoundedRecoveryPolicy[PRInfo] = BoundedRecoveryPolicy(
+            name="fix_no_push_cap",
+            max_attempts=self.app_config.daemon.fix_no_push_cap,
+            counter_getter=lambda pr: pr.no_push_fix_count,
+            counter_setter=lambda pr, n: setattr(pr, "no_push_fix_count", n),
+            on_threshold=lambda pr: self._escalate_fix_no_push_deadlock(pr),
         )
         if current_pr is not None and await fix_iteration_policy.maybe_escalate(
             current_pr
@@ -448,6 +484,7 @@ class FixMixin(BreachMixin):
                 self._last_push_at_pr_number = self.state.current_pr.number
                 self.state.current_pr.push_count += 1
                 iteration = fix_iteration_policy.increment(self.state.current_pr)
+                no_push_policy.reset(self.state.current_pr)
                 self.state.current_pr.last_activity = push_time
             else:
                 iteration = 0
@@ -527,7 +564,14 @@ class FixMixin(BreachMixin):
                 "FIX REVIEW exited 0 but HEAD unchanged; "
                 "no push, skipping @codex review"
             )
+            if self.state.current_pr is not None:
+                no_push_policy.increment(self.state.current_pr)
             if await pause_for_stop_after_bookkeeping():
+                return
+            if (
+                self.state.current_pr is not None
+                and await no_push_policy.maybe_escalate(self.state.current_pr)
+            ):
                 return
             self.state.state = PipelineState.WATCH
             return

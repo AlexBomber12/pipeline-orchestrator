@@ -134,6 +134,35 @@ run_slow() {
     gh pr comment "${pr_url}" --body "@codex review"
 }
 
+run_no_push_fail_ci() {
+    # Two-mode scenario for the no-push FIX deadlock circuit breaker.
+    # CODING (PLANNED PR prompt): push a marker commit, create a PR, then
+    #   stamp the head SHA with a failing commit-status so WATCH transitions
+    #   straight into FIX. ``allow_merge_without_checks`` only treats *empty*
+    #   checks as success; an explicit failing status remains FAILURE.
+    # FIX (FIX REVIEW prompt): exit 0 without writing anything. The daemon
+    #   sees HEAD unchanged and increments its no-push counter; after three
+    #   consecutive cycles it parks the PR in HUNG.
+    local pr="$1" branch="$2" prompt="$3"
+    if [[ "${prompt}" == "FIX REVIEW" ]]; then
+        printf 'shim: no_push_fail_ci FIX cycle, exiting 0 without push\n' >&2
+        exit 0
+    fi
+    git_setup_branch "${branch}"
+    write_marker_and_commit "${pr}"
+    git push -u origin "${branch}" --force-with-lease
+    local head_sha
+    head_sha="$(git rev-parse HEAD)"
+    local pr_url
+    pr_url="$(ensure_pr_url "${branch}" "${pr}")"
+    gh api "repos/{owner}/{repo}/statuses/${head_sha}" \
+        -X POST \
+        -f state=failure \
+        -f context="e2e/forced-failure" \
+        -f description="forced failure for no-push deadlock e2e" >/dev/null
+    gh pr comment "${pr_url}" --body "@codex review"
+}
+
 main() {
     local invoked
     invoked="$(basename "$0")"
@@ -215,6 +244,15 @@ main() {
         exit 0
     fi
 
+    # Extract the daemon's prompt (last positional arg). Both
+    # `claude --print ... PROMPT` and `codex ... exec ... PROMPT` end with the
+    # prompt string, so scenarios that need to distinguish PLANNED PR from
+    # FIX REVIEW (e.g. no_push_fail_ci) can branch on it.
+    local prompt=""
+    if [[ $# -gt 0 ]]; then
+        prompt="${!#}"
+    fi
+
     case "${scenario}" in
         success)
             run_success "${pr}" "${branch}"
@@ -227,6 +265,9 @@ main() {
             ;;
         slow)
             run_slow "${pr}" "${branch}"
+            ;;
+        no_push_fail_ci)
+            run_no_push_fail_ci "${pr}" "${branch}" "${prompt}"
             ;;
         *)
             printf 'shim: unknown scenario %s, defaulting to success\n' "${scenario}" >&2

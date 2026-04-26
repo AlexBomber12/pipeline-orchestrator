@@ -38,12 +38,15 @@ class IdleMixin:
     """Handle IDLE state: sync, pick next task, dispatch to CODING."""
 
     def _preserve_fix_iteration_count(self, pr):
-        """Carry the iteration counter forward when reattaching the same PR."""
+        """Carry the iteration counters forward when reattaching the same PR."""
         current_pr = self.state.current_pr
         if current_pr is None or current_pr.number != pr.number:
             return pr
         return pr.model_copy(
-            update={"fix_iteration_count": current_pr.fix_iteration_count}
+            update={
+                "fix_iteration_count": current_pr.fix_iteration_count,
+                "no_push_fix_count": current_pr.no_push_fix_count,
+            }
         )
 
     @staticmethod
