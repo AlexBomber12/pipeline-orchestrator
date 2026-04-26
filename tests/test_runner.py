@@ -1627,7 +1627,7 @@ def test_select_next_task_from_dag_prefers_doing_task(
     monkeypatch.setattr(
         idle_module,
         "derive_task_status",
-        lambda header, merged_pr_ids, open_prs, merged_prs: (
+        lambda header, merged_pr_ids, open_prs, merged_prs, **kwargs: (
             TaskStatus.DOING
             if header.pr_id == "PR-001"
             else TaskStatus.TODO
@@ -1644,6 +1644,59 @@ def test_select_next_task_from_dag_prefers_doing_task(
     assert task is not None
     assert task.pr_id == "PR-001"
     assert task.status == TaskStatus.DOING
+
+
+def test_select_next_task_from_dag_marks_current_task_doing_without_open_pr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Active task\n\n"
+        "Branch: pr-001-active\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="Active task",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-001.md",
+        branch="pr-001-active",
+    )
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-001"
+    assert task.status == TaskStatus.DOING
+    assert runner._idle_dag_statuses == {"PR-001": TaskStatus.DOING}
+    assert all(t.status == TaskStatus.DOING for t in runner._idle_dag_tasks)
+    queue_md = runner._generate_queue_md(
+        runner._idle_dag_headers,
+        runner._idle_dag_statuses,
+    )
+    assert "## PR-001" in queue_md
+    assert "- Status: DOING" in queue_md
 
 
 def test_select_next_task_from_dag_rejects_header_filename_mismatch(
@@ -9775,7 +9828,7 @@ def test_select_next_task_from_dag_returns_none_when_nothing_is_eligible(
     monkeypatch.setattr(
         idle_module,
         "derive_task_status",
-        lambda header, merged_pr_ids, open_prs, merged_prs: TaskStatus.DONE,
+        lambda header, merged_pr_ids, open_prs, merged_prs, **kwargs: TaskStatus.DONE,
     )
     monkeypatch.setattr(idle_module, "get_eligible_tasks", lambda headers, statuses: [])
 

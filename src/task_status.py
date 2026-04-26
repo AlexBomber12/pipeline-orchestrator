@@ -31,6 +31,8 @@ def derive_task_status(
     merged_pr_ids: set[str],
     open_prs: Iterable[PRInfo],
     merged_prs: Iterable[PRInfo] = (),
+    *,
+    current_task_pr_id: str | None = None,
 ) -> TaskStatus:
     """Derive task status from git state."""
     if task_header.pr_id in merged_pr_ids:
@@ -49,6 +51,8 @@ def derive_task_status(
         task_header.branch,
         open_prs,
     ) is not None:
+        return TaskStatus.DOING
+    if current_task_pr_id == task_header.pr_id:
         return TaskStatus.DOING
     return TaskStatus.TODO
 
@@ -215,6 +219,8 @@ def derive_queue_task_statuses(
     base_branch: str,
     open_prs: Iterable[PRInfo],
     merged_prs: Iterable[PRInfo] = (),
+    *,
+    current_task_pr_id: str | None = None,
 ) -> list[QueueTask]:
     """Return queue tasks with status refreshed from git/GitHub state."""
     if not tasks:
@@ -239,7 +245,13 @@ def derive_queue_task_statuses(
                     f"does not match queue entry {task.pr_id!r}"
                 ]
             )
-        status = derive_task_status(header, merged_pr_ids, open_prs, merged_prs)
+        status = derive_task_status(
+            header,
+            merged_pr_ids,
+            open_prs,
+            merged_prs,
+            current_task_pr_id=current_task_pr_id,
+        )
         derived.append(
             task.model_copy(update={"status": status, "branch": header.branch})
         )

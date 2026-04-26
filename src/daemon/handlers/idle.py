@@ -339,12 +339,18 @@ class IdleMixin:
             }
             open_prs = list(getattr(self, "_idle_open_prs", ()))
             merged_prs = list(getattr(self, "_idle_merged_prs", ()))
+            current_task_pr_id = (
+                self.state.current_task.pr_id
+                if self.state.current_task is not None
+                else None
+            )
             statuses = {
                 header.pr_id: derive_task_status(
                     header,
                     merged_pr_ids,
                     open_prs,
                     merged_prs,
+                    current_task_pr_id=current_task_pr_id,
                 )
                 for header in headers
             }
@@ -501,10 +507,21 @@ class IdleMixin:
                     self.repo_config.branch,
                     prs,
                 )
-                if len(inspect.signature(derive_queue_task_statuses).parameters) >= 5:
+                derive_sig_params = inspect.signature(
+                    derive_queue_task_statuses
+                ).parameters
+                derive_kwargs: dict[str, object] = {}
+                if "current_task_pr_id" in derive_sig_params:
+                    derive_kwargs["current_task_pr_id"] = (
+                        self.state.current_task.pr_id
+                        if self.state.current_task is not None
+                        else None
+                    )
+                if len(derive_sig_params) >= 5:
                     tasks = derive_queue_task_statuses(
                         *derive_args,
                         merged_prs,
+                        **derive_kwargs,
                     )
                 else:
                     tasks = derive_queue_task_statuses(*derive_args)
