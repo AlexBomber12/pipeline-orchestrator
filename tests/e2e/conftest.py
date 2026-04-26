@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 import requests
 
-from tests.e2e.lib.testbed_reset import reset_testbed_full
+from tests.e2e.lib.testbed_reset import reset_testbed_full, wipe_tasks_dir_on_main
 
 TEST_DASHBOARD_URL = "http://localhost:18800"
 TESTBED_SLUG = "AlexBomber12__pipeline-orchestrator-testbed"
@@ -196,8 +196,10 @@ def _close_open_testbed_prs() -> None:
 @pytest.fixture
 def reset_testbed():
     _close_open_testbed_prs()
+    wipe_tasks_dir_on_main()
     yield
     _close_open_testbed_prs()
+    wipe_tasks_dir_on_main()
 
 
 @pytest.fixture

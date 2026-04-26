@@ -11,7 +11,10 @@ All subprocess.run calls are mocked; no real GitHub API or git calls happen.
 
 from __future__ import annotations
 
+import importlib
 import subprocess
+import sys
+import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -308,3 +311,27 @@ def test_reset_testbed_full_aggregates_all_helpers() -> None:
     close.assert_called_once_with()
     delete.assert_called_once_with()
     wipe.assert_called_once_with()
+
+
+def test_reset_testbed_fixture_closes_prs_then_wipes_tasks_before_and_after() -> None:
+    sys.modules.setdefault("requests", types.SimpleNamespace())
+    e2e_conftest = importlib.import_module("tests.e2e.conftest")
+    calls: list[str] = []
+
+    def close_prs() -> None:
+        calls.append("close")
+
+    def wipe_tasks() -> bool:
+        calls.append("wipe")
+        return True
+
+    with (
+        patch.object(e2e_conftest, "_close_open_testbed_prs", side_effect=close_prs),
+        patch.object(e2e_conftest, "wipe_tasks_dir_on_main", side_effect=wipe_tasks),
+    ):
+        fixture = e2e_conftest.reset_testbed.__wrapped__()
+        next(fixture)
+        with pytest.raises(StopIteration):
+            next(fixture)
+
+    assert calls == ["close", "wipe", "close", "wipe"]
