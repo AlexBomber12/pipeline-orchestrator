@@ -372,7 +372,10 @@ async def _build_github_api_budget_view(
     pct = budget.remaining_percent
     pause_pct = config.daemon.github_api_pause_threshold_percent
     slowdown_pct = config.daemon.github_api_slowdown_threshold_percent
-    if pct < pause_pct:
+    now = datetime.now(timezone.utc)
+    if now >= budget.reset_at:
+        bucket = "ok"
+    elif pct < pause_pct:
         bucket = "critical"
     elif pct < slowdown_pct:
         bucket = "low"

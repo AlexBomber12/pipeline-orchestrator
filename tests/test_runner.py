@@ -17835,3 +17835,51 @@ def test_refresh_github_api_budget_falls_back_to_local_cache_when_shared_empty(
     result = asyncio.run(runner._refresh_github_api_budget())
 
     assert result is cached
+
+
+def test_refresh_github_api_budget_keeps_ttl_unset_when_no_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent-startup race: another runner holds the lock but has not yet
+    written a snapshot, and this runner has no local cache. The TTL must not
+    advance — otherwise budget protection silently disengages for 60s while
+    ``_check_github_api_budget()`` keeps short-circuiting to ``True``.
+    """
+    from src.daemon.github_rate_limit import REFRESH_LOCK_REDIS_KEY
+
+    runner = _make_runner()
+    runner.redis.store[REFRESH_LOCK_REDIS_KEY] = "1"
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "fetch_rate_limit_budget",
+        lambda: None,  # pragma: no cover - lock held, fetch never invoked
+    )
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    assert result is None
+    assert runner._github_api_budget_last_fetched is None
+
+
+def test_refresh_github_api_budget_advances_ttl_on_shared_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once another runner publishes a snapshot, the next refresh picks it up
+    and advances the TTL so the local guard kicks in normally.
+    """
+    from src.daemon.github_rate_limit import (
+        BUDGET_REDIS_KEY,
+        REFRESH_LOCK_REDIS_KEY,
+    )
+
+    runner = _make_runner()
+    persisted = _budget(remaining=2500, limit=5000)
+    runner.redis.store[REFRESH_LOCK_REDIS_KEY] = "1"
+    runner.redis.store[BUDGET_REDIS_KEY] = persisted.to_redis_payload()
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    assert result is not None
+    assert result.remaining == persisted.remaining
+    assert runner._github_api_budget_last_fetched is not None

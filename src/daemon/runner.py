@@ -879,6 +879,13 @@ class PipelineRunner(
         ``gh api rate_limit`` per TTL window; the rest read the persisted
         observation. Without this, probe traffic scales linearly with repo
         count and can itself exhaust the rate limit.
+
+        The TTL is only advanced once a snapshot is actually in hand. On
+        concurrent startup a non-lock holder may see ``read_budget()`` return
+        ``None`` before the lock holder has finished probing; in that case
+        the next cycle must retry rather than treating "no data" as a fresh
+        observation, otherwise budget protection silently disengages for
+        the full TTL window.
         """
         now = datetime.now(timezone.utc)
         if (
@@ -886,17 +893,20 @@ class PipelineRunner(
             and (now - self._github_api_budget_last_fetched).total_seconds() < 60
         ):
             return self._github_api_budget_cache
-        self._github_api_budget_last_fetched = now
         if await try_claim_refresh_lock(self.redis, ttl_seconds=60):
             budget = await asyncio.to_thread(github_client.fetch_rate_limit_budget)
             if budget is not None:
                 self._github_api_budget_cache = budget
+                self._github_api_budget_last_fetched = now
                 await write_budget(self.redis, budget)
                 return budget
         shared = await read_budget(self.redis)
         if shared is not None:
             self._github_api_budget_cache = shared
+            self._github_api_budget_last_fetched = now
             return shared
+        if self._github_api_budget_cache is not None:
+            self._github_api_budget_last_fetched = now
         return self._github_api_budget_cache
 
     def _enter_github_api_pause(self) -> None:
