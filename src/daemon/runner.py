@@ -936,6 +936,8 @@ class PipelineRunner(
         Implements three threshold paths driven by ``app_config.daemon``:
         critical → pause until ``reset_at``; warning → run only one in
         ``github_api_slowdown_multiplier`` cycles; otherwise normal.
+        Both threshold branches are gated on ``now < budget.reset_at`` so a
+        stale snapshot whose reset has elapsed never throttles polling.
         Both threshold transitions are mediated by ``BoundedRecoveryPolicy``
         instances so the bookkeeping matches the dirty-tree and FIX
         iteration-cap recovery sites.
@@ -960,7 +962,7 @@ class PipelineRunner(
         if self._github_api_pause_attempts > 0:
             self._github_api_pause_policy.reset(self)
 
-        if pct < slowdown_pct:
+        if pct < slowdown_pct and now < budget.reset_at:
             was_zero = self._github_api_slowdown_attempts == 0
             self._github_api_slowdown_policy.increment(self)
             if was_zero:

@@ -17571,6 +17571,31 @@ def test_check_budget_pause_window_passed_means_proceed() -> None:
     assert proceed is True
 
 
+def test_check_budget_slowdown_window_passed_means_proceed() -> None:
+    runner = _make_runner()
+    runner.app_config.daemon.github_api_pause_threshold_percent = 5
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+    runner.app_config.daemon.github_api_slowdown_multiplier = 5
+    # Above the pause threshold but below slowdown, with reset already elapsed:
+    # the snapshot is stale so neither throttle branch should fire.
+    _set_budget(
+        runner,
+        _budget(
+            remaining=500,
+            limit=5000,
+            reset_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        ),
+    )
+    runner._github_api_slowdown_attempts = 3
+    runner._github_api_slowdown_cycle = 2
+
+    proceed = asyncio.run(runner._check_github_api_budget())
+
+    assert proceed is True
+    assert runner._github_api_slowdown_attempts == 0
+    assert runner._github_api_slowdown_cycle == 0
+
+
 def test_check_budget_slowdown_runs_one_in_n_cycles() -> None:
     runner = _make_runner()
     runner.app_config.daemon.github_api_pause_threshold_percent = 5
