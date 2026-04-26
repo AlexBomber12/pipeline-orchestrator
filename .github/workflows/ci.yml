@@ -52,7 +52,7 @@ jobs:
       - name: Verify gh auth
         env:
           GH_TOKEN: ${{ steps.testbed-token.outputs.token }}
-        run: gh auth status
+        run: gh api repos/AlexBomber12/pipeline-orchestrator-testbed --jq .full_name
 
       - uses: actions/setup-python@v5
         with:
