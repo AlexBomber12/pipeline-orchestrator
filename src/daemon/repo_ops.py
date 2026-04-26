@@ -77,6 +77,7 @@ class RepoOpsMixin:
                     lambda: git_ops._git(
                         self.repo_path,
                         "fetch",
+                        "--prune",
                         "origin",
                         self.repo_config.branch,
                         timeout=60,
@@ -164,7 +165,9 @@ class RepoOpsMixin:
         branch = self.repo_config.branch
         try:
             retry_transient(
-                lambda: git_ops._git(self.repo_path, "fetch", "origin", branch, timeout=60),
+                lambda: git_ops._git(
+                    self.repo_path, "fetch", "--prune", "origin", branch, timeout=60
+                ),
                 operation_name=f"git fetch origin {branch}",
             )
             git_ops._git(self.repo_path, "checkout", branch)

@@ -169,7 +169,7 @@ class FixMixin(BreachMixin):
                 retry_transient(
                     lambda: git_ops._git(
                         self.repo_path,
-                        "fetch", "origin",
+                        "fetch", "--prune", "origin",
                         f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
                         timeout=60,
                     ),

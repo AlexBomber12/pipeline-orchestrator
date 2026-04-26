@@ -743,8 +743,8 @@ def test_handle_idle_no_tasks_leaves_state_idle(
     # sync_to_main must run fetch -> checkout -> reset --hard in order so
     # that parse_queue reads QUEUE.md from the tip of origin/{branch}, not
     # whatever branch/commit the repo was left on by a prior cycle.
-    commands = [cmd[:3] for cmd in calls]
-    fetch_idx = commands.index(["git", "fetch", "origin"])
+    commands = [cmd[:4] for cmd in calls]
+    fetch_idx = commands.index(["git", "fetch", "--prune", "origin"])
     checkout_idx = next(
         i for i, cmd in enumerate(commands) if cmd[:2] == ["git", "checkout"]
     )
@@ -4449,6 +4449,10 @@ def test_handle_fix_fetches_and_resets_branch_before_fix_review(
         and "origin/pr-042-fix" in cmd
     ]
     assert fetch_calls, "expected git fetch origin pr-042-fix"
+    assert all("--prune" in calls[i] for i in fetch_calls), (
+        "git fetch in handle_fix must pass --prune to drop stale "
+        "remote-tracking refs (PR-161)"
+    )
     assert checkout_calls, "expected git checkout pr-042-fix"
     assert reset_calls, "expected git reset --hard origin/pr-042-fix"
     assert fix_called_at, "fix_review must have been invoked"
@@ -6698,10 +6702,12 @@ def test_handle_merge_refreshes_pr_head_before_merge(
     )
     asyncio.run(runner.handle_merge())
 
-    fetch_cmds = [cmd for cmd in git_calls if cmd[:3] == ["git", "fetch",
-                                                          "origin"]]
+    fetch_cmds = [
+        cmd for cmd in git_calls
+        if cmd[:4] == ["git", "fetch", "--prune", "origin"]
+    ]
     assert fetch_cmds and any("pr-001" in cmd for cmd in fetch_cmds), (
-        "must fetch origin/<pr_branch> before local merge"
+        "must fetch origin/<pr_branch> with --prune before local merge"
     )
     reset_cmds = [
         cmd for cmd in git_calls
@@ -6899,7 +6905,7 @@ def test_handle_merge_sets_error_when_pre_sync_raises(
         *args: str,
         **kwargs: Any,
     ) -> _FakeCompletedProcess:
-        if args[:3] == ("fetch", "origin", "main"):
+        if args[:4] == ("fetch", "--prune", "origin", "main"):
             raise OSError("network down")
         return _FakeCompletedProcess(args=["git", *args], returncode=0)
 
@@ -16849,7 +16855,7 @@ def test_handle_fix_stop_cancel_logs_fetch_failure_after_stop(
     fetch_calls = {"count": 0}
 
     def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
-        if args[:2] == ("fetch", "origin"):
+        if args and args[0] == "fetch":
             fetch_calls["count"] += 1
             if fetch_calls["count"] == 2:
                 raise subprocess.CalledProcessError(1, ["git", *args], stderr="fetch fail")

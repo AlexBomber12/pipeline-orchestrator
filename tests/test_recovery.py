@@ -1230,7 +1230,7 @@ def test_sync_to_main_runs_fetch_checkout_reset_in_order(
     runner.sync_to_main()
 
     assert calls == [
-        ["git", "fetch", "origin", "main"],
+        ["git", "fetch", "--prune", "origin", "main"],
         ["git", "checkout", "main"],
         ["git", "reset", "--hard", "origin/main"],
         ["git", "clean", "-fd"],
