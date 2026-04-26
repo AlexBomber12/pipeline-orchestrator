@@ -536,7 +536,7 @@
 - Branch: pr-161-git-fetch-prune
 
 ## PR-162: BoundedRecoveryPolicy framework
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-162.md
 - Branch: pr-162-bounded-recovery-policy
 
