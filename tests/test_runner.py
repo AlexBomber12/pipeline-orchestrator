@@ -8460,6 +8460,91 @@ def test_handle_idle_keeps_doing_dag_task_over_legacy_queue_fallback(
     assert runner.state.queue_total == 1
 
 
+def test_handle_idle_marks_freshly_picked_dag_task_as_doing_in_regenerated_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A freshly picked structured TODO task must be regenerated as DOING in
+    QUEUE.md before handle_coding runs, so the shim sees a DOING entry."""
+    _patch_subprocess(monkeypatch)
+    dag_task = QueueTask(
+        pr_id="PR-123",
+        title="Fresh structured task",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-123.md",
+        branch="pr-123-fresh",
+    )
+    header = TaskHeader(
+        pr_id=dag_task.pr_id,
+        title=dag_task.title,
+        branch=dag_task.branch or "",
+        task_type="feature",
+        complexity="low",
+        depends_on=[],
+        priority=1,
+        coder="any",
+    )
+
+    async def fake_select(self):
+        self._idle_dag_tasks = [dag_task]
+        self._idle_dag_headers = [header]
+        self._idle_dag_statuses = {dag_task.pr_id: TaskStatus.TODO}
+        return dag_task
+
+    monkeypatch.setattr(idle_module.IdleMixin, "_select_next_task_from_dag", fake_select)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [dag_task])
+    monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda tasks, repo_path, base_branch, prs, merged_prs=(), **kwargs: tasks,
+    )
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: dag_task)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    write_calls: list[tuple[list[TaskHeader], dict[str, TaskStatus]]] = []
+
+    def fake_write_generated_queue_md(
+        self,
+        headers: list[TaskHeader],
+        statuses: dict[str, TaskStatus],
+    ) -> bool:
+        write_calls.append((list(headers), dict(statuses)))
+        return True
+
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_write_generated_queue_md",
+        fake_write_generated_queue_md,
+    )
+
+    coding_called = {"v": False}
+
+    async def fake_handle_coding() -> None:
+        coding_called["v"] = True
+
+    runner = _make_runner()
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    asyncio.run(runner.handle_idle())
+
+    assert coding_called["v"] is True
+    assert runner.state.state == PipelineState.CODING
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == dag_task.pr_id
+    assert runner.state.current_task.status == TaskStatus.DOING
+    assert len(write_calls) == 1
+    written_headers, written_statuses = write_calls[0]
+    assert written_headers == [header]
+    assert written_statuses == {dag_task.pr_id: TaskStatus.DOING}
+
+
 def test_handle_idle_skips_queue_regeneration_when_legacy_tasks_exist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

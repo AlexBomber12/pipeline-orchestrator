@@ -570,6 +570,24 @@ class IdleMixin:
             ):
                 task = queue_task
 
+        # The shim parses QUEUE.md to find its DOING task and exits 0 if it
+        # sees only TODO. Mark the dispatched structured task DOING in the
+        # statuses dict before _write_generated_queue_md runs.
+        statuses_for_dispatch = getattr(self, "_idle_dag_statuses", None)
+        if (
+            task is not None
+            and statuses_for_dispatch is not None
+            and statuses_for_dispatch.get(task.pr_id) == TaskStatus.TODO
+        ):
+            statuses_for_dispatch[task.pr_id] = TaskStatus.DOING
+            for i, queued in enumerate(dag_tasks or ()):
+                if queued.pr_id == task.pr_id:
+                    dag_tasks[i] = queued.model_copy(
+                        update={"status": TaskStatus.DOING}
+                    )
+                    break
+            task = task.model_copy(update={"status": TaskStatus.DOING})
+
         if has_legacy_queue_tasks or dag_tasks is None:
             queue_tasks = tasks
         else:
