@@ -60,6 +60,7 @@ from src.daemon.selector import (
 from src.events import publish_repo_event
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
+from src.queue_parser import QueueValidationError, parse_task_header
 from src.usage import UsageProvider
 from src.utils import repo_slug_from_url
 
@@ -316,6 +317,18 @@ class PipelineRunner(
         await self.redis.delete(dirty_key)
         self._apply_staged_config_reload()
 
+    def _active_task_coder_pin(self) -> str | None:
+        """Return the active task's ``Coder:`` header value if parseable."""
+        task = self.state.current_task
+        if task is None or not task.task_file:
+            return None
+        task_path = Path(self.repo_path) / task.task_file
+        try:
+            header = parse_task_header(task_path)
+        except (QueueValidationError, OSError):
+            return None
+        return header.coder
+
     def _select_coder(
         self, *, allow_exploration: bool = True
     ) -> tuple[str, CoderPlugin] | None:
@@ -333,6 +346,7 @@ class PipelineRunner(
             state=self.state,
             rng=self._selector_rng,
             auth_statuses=self._auth_status_cache or None,
+            task_coder_pin=self._active_task_coder_pin(),
         )
         return select_coder(ctx)
 
@@ -351,11 +365,20 @@ class PipelineRunner(
     def _get_coder(
         self, *, allow_exploration: bool = True
     ) -> tuple[str, CoderPlugin]:
-        """Return ``(coder_name, coder_plugin)`` for the active coder."""
+        """Return ``(coder_name, coder_plugin)`` for the active coder.
+
+        When the active task pins a specific coder via ``Coder:`` and no
+        eligible coder is available, fall back to the pinned coder rather
+        than the repo/global default to preserve the hard-pin guarantee.
+        """
         result = self._select_coder(allow_exploration=allow_exploration)
         if result is not None:
             self.state.coder = result[0]
             return result
+        pin = self._active_task_coder_pin()
+        if pin in ("claude", "codex"):
+            self.state.coder = pin
+            return pin, self._registry.get(pin)
         coder = self.repo_config.coder or self.app_config.daemon.coder
         coder_name = coder.value if isinstance(coder, CoderType) else str(coder)
         self.state.coder = coder_name

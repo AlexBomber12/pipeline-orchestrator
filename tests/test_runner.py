@@ -1838,6 +1838,76 @@ def test_handle_idle_rereads_pause_flag_before_coding_transition(
     )
 
 
+def test_handle_idle_transitions_to_hung_when_pinned_coder_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A task pinned to ``codex`` whose coder is unavailable must transition
+    to HUNG with a clear message instead of silently falling back."""
+    _patch_subprocess(monkeypatch)
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-200.md").write_text(
+        "# PR-200: Pinned to codex\n\n"
+        "Branch: pr-200-pinned\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: codex\n",
+        encoding="utf-8",
+    )
+    task = QueueTask(
+        pr_id="PR-200",
+        title="Pinned to codex",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-200.md",
+        branch="pr-200-pinned",
+    )
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: task)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    coding_called = {"v": False}
+
+    async def spy_handle_coding(self):
+        coding_called["v"] = True
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "handle_coding", spy_handle_coding)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._auth_status_cache = {
+        "claude": {"status": "ok"},
+        "codex": {"status": "failed"},
+    }
+    runner._auth_status_cache_expires_at = (
+        datetime.now(timezone.utc) + timedelta(minutes=5)
+    )
+    runner.state.current_pr = PRInfo(
+        number=1234,
+        branch="some-other-branch",
+        title="Unrelated manual PR from prior cycle",
+    )
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.error_message == (
+        "Task PR-200 pinned to codex but coder unavailable"
+    )
+    assert runner.state.current_pr is None
+    assert not coding_called["v"]
+
+
 def test_handle_idle_defers_on_gh_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -15436,6 +15506,45 @@ def test_get_coder_falls_through_to_default_when_selector_returns_none(
 
     assert name == "claude"
     assert plugin.name == "claude"
+
+
+def test_get_coder_hard_pin_overrides_default_when_selector_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """When the active task pins a specific coder, ``_get_coder`` must not
+    silently fall back to the repo/global default if the selector rejects
+    the pin. Otherwise FIX iterations can run on the wrong coder."""
+    from src.config import CoderType
+
+    _allow_all_coder_auth(monkeypatch)
+    runner = _make_runner(coder=CoderType.CLAUDE)
+    runner.repo_path = str(tmp_path)
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-201.md").write_text(
+        "# PR-201: Pinned to codex\n\n"
+        "Branch: pr-201-pinned\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: codex\n",
+        encoding="utf-8",
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-201",
+        title="Pinned to codex",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-201.md",
+        branch="pr-201-pinned",
+    )
+    monkeypatch.setattr(runner_module, "select_coder", lambda ctx: None)
+
+    name, plugin = runner._get_coder()
+
+    assert name == "codex"
+    assert plugin.name == "codex"
 
 
 def test_get_coder_auto_fallback_switches_on_rate_limit_via_selector(

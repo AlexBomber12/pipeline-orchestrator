@@ -58,6 +58,7 @@ def _ctx(
     limited: set[str] | None = None,
     auth: dict[str, str] | None = None,
     seed: int = 1,
+    task_coder_pin: str | None = None,
 ) -> SelectionContext:
     registry = CoderRegistry()
     auth = auth or {}
@@ -88,6 +89,7 @@ def _ctx(
         app_config=app,
         state=state,
         rng=random.Random(seed),
+        task_coder_pin=task_coder_pin,
     )
 
 
@@ -345,3 +347,59 @@ def test_auxiliary_selector_returns_none_when_no_coder_is_eligible() -> None:
     ctx = _ctx(limited={"claude", "codex", "gemini"})
 
     assert select_auxiliary_coder(ctx) is None
+
+
+def test_task_pin_claude_returns_only_claude_when_eligible() -> None:
+    ctx = _ctx(task_coder_pin="claude", repo_coder=CoderType.CODEX)
+
+    assert eligible_coders(ctx) == ["claude"]
+
+
+def test_task_pin_claude_returns_empty_when_rate_limited() -> None:
+    ctx = _ctx(task_coder_pin="claude", limited={"claude"})
+
+    assert eligible_coders(ctx) == []
+    assert select_coder(ctx) is None
+
+
+def test_task_pin_codex_returns_empty_when_auth_failed() -> None:
+    ctx = _ctx(task_coder_pin="codex", auth={"codex": "failed"})
+
+    assert eligible_coders(ctx) == []
+    assert select_coder(ctx) is None
+
+
+def test_task_pin_any_falls_through_to_repo_pin() -> None:
+    ctx = _ctx(
+        task_coder_pin="any",
+        repo_coder=CoderType.CLAUDE,
+    )
+
+    eligible = eligible_coders(ctx)
+
+    assert eligible[0] == "claude"
+    assert "codex" in eligible
+
+
+def test_task_pin_none_preserves_repo_pin_default() -> None:
+    ctx = _ctx(repo_coder=CoderType.CODEX)
+
+    eligible = eligible_coders(ctx)
+
+    assert eligible[0] == "codex"
+    assert "claude" in eligible
+
+
+def test_task_pin_codex_overrides_repo_pin_claude() -> None:
+    ctx = _ctx(task_coder_pin="codex", repo_coder=CoderType.CLAUDE)
+
+    selected = select_coder(ctx)
+
+    assert selected is not None
+    assert selected[0] == "codex"
+
+
+def test_task_pin_codex_ignores_disabled_repo_list() -> None:
+    ctx = _ctx(task_coder_pin="codex", disabled_coders=["codex"])
+
+    assert eligible_coders(ctx) == []
