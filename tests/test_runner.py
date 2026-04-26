@@ -12,7 +12,7 @@ import time
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -22,6 +22,7 @@ from src.coder_registry import CoderRegistry
 from src.coders import claude as claude_plugin_module
 from src.config import AppConfig, CoderType, DaemonConfig, RepoConfig
 from src.daemon import git_ops as git_ops_module
+from src.daemon import recovery_policy as recovery_policy_module
 from src.daemon import runner as runner_module
 from src.daemon import selector as selector_module
 from src.daemon.handlers import breach as breach_module
@@ -527,6 +528,23 @@ def _patch_subprocess(
     return calls
 
 
+async def _preflight_true_stub() -> bool:
+    return True
+
+
+async def _preflight_false_stub() -> bool:
+    return False
+
+
+def _preflight_recording_stub(
+    sink: list[str], result: bool = True
+) -> Callable[[], Awaitable[bool]]:
+    async def _stub() -> bool:
+        sink.append("preflight")
+        return result
+    return _stub
+
+
 def _run_dirty_diagnose(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -591,7 +609,7 @@ def test_preflight_returns_true_on_clean_repo(
     _patch_subprocess(monkeypatch, stdout="")
     runner = _make_runner()
 
-    assert runner.preflight() is True
+    assert asyncio.run(runner.preflight()) is True
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.error_message is None
 
@@ -602,7 +620,7 @@ def test_preflight_returns_false_on_dirty_repo(
     _patch_subprocess(monkeypatch, stdout=" M src/foo.py\n?? artifacts/")
     runner = _make_runner()
 
-    assert runner.preflight() is False
+    assert asyncio.run(runner.preflight()) is False
     assert runner.state.state == PipelineState.ERROR
     assert "foo.py" in (runner.state.error_message or "")
     assert runner.state.history, "log_event should append an entry"
@@ -617,7 +635,7 @@ def test_preflight_sets_error_when_git_fails(
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     runner = _make_runner()
 
-    assert runner.preflight() is False
+    assert asyncio.run(runner.preflight()) is False
     assert runner.state.state == PipelineState.ERROR
 
 
@@ -633,7 +651,7 @@ def test_preflight_handles_oserror(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     runner = _make_runner()
 
-    assert runner.preflight() is False
+    assert asyncio.run(runner.preflight()) is False
     assert runner.state.state == PipelineState.ERROR
     assert "preflight failed" in (runner.state.error_message or "")
 
@@ -3367,6 +3385,66 @@ def test_handle_fix_cap_sets_error_when_add_label_fails(
     ]
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message == "pr edit failed: add label failed"
+
+
+def test_handle_fix_routes_iteration_cap_through_bounded_recovery_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guard: the FIX iteration-cap site must call
+    ``BoundedRecoveryPolicy.maybe_escalate`` rather than rebuilding
+    the threshold check inline. Future maintainers must not silently
+    bypass the framework."""
+    posted: list[tuple[str, int, str]] = []
+    gh_calls: list[list[str]] = []
+
+    class _UnexpectedPlugin:
+        async def fix_review(
+            self, path: str, **kwargs: object
+        ) -> tuple[int, str, str]:
+            raise AssertionError("fix_review must not run at cap boundary")
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda cmd, **kwargs: gh_calls.append(cmd) or "",
+    )
+
+    maybe_escalate_calls: list[str] = []
+    orig_maybe_escalate = recovery_policy_module.BoundedRecoveryPolicy.maybe_escalate
+
+    async def spy_maybe_escalate(self: Any, ctx: Any) -> bool:
+        maybe_escalate_calls.append(self.name)
+        return await orig_maybe_escalate(self, ctx)
+
+    monkeypatch.setattr(
+        recovery_policy_module.BoundedRecoveryPolicy,
+        "maybe_escalate",
+        spy_maybe_escalate,
+    )
+
+    runner = _make_runner()
+    runner._get_coder = lambda allow_exploration=False: (  # type: ignore[method-assign]
+        "claude",
+        _UnexpectedPlugin(),
+    )
+    runner.state.current_pr = PRInfo(
+        number=93,
+        branch="pr-093",
+        fix_iteration_count=2,
+    )
+    runner._app_config = _app_cfg(fix_iteration_cap=2)
+
+    asyncio.run(runner.handle_fix())
+
+    assert maybe_escalate_calls == ["fix_iteration_cap"]
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.is_escalated is True
 
 
 def test_handle_fix_finishes_push_bookkeeping_before_stop_cancel_pause(
@@ -10336,15 +10414,15 @@ def test_dirty_tree_auto_recovery_after_3_cycles(
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     runner = _make_runner()
 
-    assert runner.preflight() is False
+    assert asyncio.run(runner.preflight()) is False
     assert runner._consecutive_dirty_cycles == 1
     assert runner.state.state == PipelineState.ERROR
 
-    assert runner.preflight() is False
+    assert asyncio.run(runner.preflight()) is False
     assert runner._consecutive_dirty_cycles == 2
     assert runner.state.state == PipelineState.ERROR
 
-    assert runner.preflight() is True
+    assert asyncio.run(runner.preflight()) is True
     assert runner._consecutive_dirty_cycles == 0
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.error_message is None
@@ -10381,9 +10459,9 @@ def test_dirty_tree_auto_recovery_preserves_watch_with_open_pr(
         pr_id="PR-099", title="wip", status=TaskStatus.DOING, branch="pr-099-wip"
     )
 
-    runner.preflight()
-    runner.preflight()
-    assert runner.preflight() is True
+    asyncio.run(runner.preflight())
+    asyncio.run(runner.preflight())
+    assert asyncio.run(runner.preflight()) is True
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.number == 99
@@ -10402,11 +10480,11 @@ def test_dirty_tree_counter_resets_on_clean(
     the auto-reset threshold."""
     _patch_subprocess(monkeypatch, stdout=" M foo.py")
     runner = _make_runner()
-    assert runner.preflight() is False
+    assert asyncio.run(runner.preflight()) is False
     assert runner._consecutive_dirty_cycles == 1
 
     _patch_subprocess(monkeypatch, stdout="")
-    assert runner.preflight() is True
+    assert asyncio.run(runner.preflight()) is True
     assert runner._consecutive_dirty_cycles == 0
 
 
@@ -10430,14 +10508,49 @@ def test_dirty_tree_auto_recovery_failure_stays_error(
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     runner = _make_runner()
 
-    runner.preflight()
-    runner.preflight()
-    assert runner.preflight() is False
+    asyncio.run(runner.preflight())
+    asyncio.run(runner.preflight())
+    assert asyncio.run(runner.preflight()) is False
     assert runner.state.state == PipelineState.ERROR
     assert any(
         "Auto-recovery failed" in e["event"]
         for e in runner.state.history
     )
+
+
+def test_preflight_routes_through_bounded_recovery_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guard: the dirty-tree site must call BoundedRecoveryPolicy
+    rather than rebuilding the increment/threshold dance inline."""
+    _patch_subprocess(monkeypatch, stdout=" M src/foo.py\n")
+    runner = _make_runner()
+
+    increment_calls: list[str] = []
+    maybe_escalate_calls: list[str] = []
+    orig_increment = recovery_policy_module.BoundedRecoveryPolicy.increment
+    orig_maybe_escalate = recovery_policy_module.BoundedRecoveryPolicy.maybe_escalate
+
+    def spy_increment(self: Any, ctx: Any) -> int:
+        increment_calls.append(self.name)
+        return orig_increment(self, ctx)
+
+    async def spy_maybe_escalate(self: Any, ctx: Any) -> bool:
+        maybe_escalate_calls.append(self.name)
+        return await orig_maybe_escalate(self, ctx)
+
+    monkeypatch.setattr(
+        recovery_policy_module.BoundedRecoveryPolicy, "increment", spy_increment
+    )
+    monkeypatch.setattr(
+        recovery_policy_module.BoundedRecoveryPolicy,
+        "maybe_escalate",
+        spy_maybe_escalate,
+    )
+
+    asyncio.run(runner.preflight())
+    assert increment_calls == ["dirty_tree_auto_reset"]
+    assert maybe_escalate_calls == ["dirty_tree_auto_reset"]
 
 
 def test_codex_review_not_reposted_same_pr_same_push(
@@ -12731,7 +12844,7 @@ def test_run_cycle_clears_soft_skip_budget_after_successful_non_error_cycle(
 
     monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
     monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
-    monkeypatch.setattr(runner, "preflight", lambda: True)
+    monkeypatch.setattr(runner, "preflight", _preflight_true_stub)
 
     asyncio.run(runner.run_cycle())
 
@@ -14635,7 +14748,7 @@ def test_run_cycle_runs_recovery_before_honoring_user_pause(
     monkeypatch.setattr(
         runner,
         "preflight",
-        lambda: preflight_calls.append("preflight") or True,
+        _preflight_recording_stub(preflight_calls),
     )
     monkeypatch.setattr(runner, "publish_state", fake_publish_state)
 
@@ -14666,7 +14779,7 @@ def test_run_cycle_returns_after_preflight_failure(
         publishes.append("published")
 
     monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
-    monkeypatch.setattr(runner, "preflight", lambda: False)
+    monkeypatch.setattr(runner, "preflight", _preflight_false_stub)
     monkeypatch.setattr(runner, "publish_state", fake_publish_state)
 
     asyncio.run(runner.run_cycle())
@@ -14699,7 +14812,7 @@ def test_run_cycle_short_circuits_idle_when_user_paused(
     monkeypatch.setattr(
         runner,
         "preflight",
-        lambda: preflight_calls.append("preflight") or True,
+        _preflight_recording_stub(preflight_calls),
     )
     monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
     monkeypatch.setattr(runner, "publish_state", fake_publish_state)
@@ -14742,7 +14855,7 @@ def test_run_cycle_short_circuits_paused_when_user_paused(
     monkeypatch.setattr(
         runner,
         "preflight",
-        lambda: preflight_calls.append("preflight") or True,
+        _preflight_recording_stub(preflight_calls),
     )
     monkeypatch.setattr(runner, "handle_paused", fake_handle_paused)
     monkeypatch.setattr(runner, "publish_state", fake_publish_state)
@@ -14794,7 +14907,7 @@ def test_run_cycle_short_circuits_active_watch_and_merge_when_user_paused(
     monkeypatch.setattr(
         runner,
         "preflight",
-        lambda: preflight_calls.append("preflight") or True,
+        _preflight_recording_stub(preflight_calls),
     )
     monkeypatch.setattr(runner, handler_name, fake_handler)
     monkeypatch.setattr(runner, "publish_state", fake_publish_state)
@@ -14841,7 +14954,7 @@ def test_run_cycle_skips_preflight_after_pause_refresh(
     monkeypatch.setattr(
         runner,
         "preflight",
-        lambda: preflight_calls.append("preflight") or True,
+        _preflight_recording_stub(preflight_calls),
     )
     monkeypatch.setattr(runner, "publish_state", fake_publish_state)
 
@@ -14885,7 +14998,7 @@ def test_run_cycle_rereads_pause_flag_before_idle_dispatch(
     monkeypatch.setattr(
         runner,
         "preflight",
-        lambda: preflight_calls.append("preflight") or True,
+        _preflight_recording_stub(preflight_calls),
     )
     monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
     monkeypatch.setattr(runner, "publish_state", fake_publish_state)
@@ -14931,7 +15044,7 @@ def test_run_cycle_dispatches_watch_and_hung_handlers(
         publishes.append("published")
 
     monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
-    monkeypatch.setattr(runner, "preflight", lambda: True)
+    monkeypatch.setattr(runner, "preflight", _preflight_true_stub)
     monkeypatch.setattr(runner, handler_name, fake_handler)
     monkeypatch.setattr(runner, "publish_state", fake_publish_state)
 
@@ -14962,7 +15075,7 @@ def test_run_cycle_dispatches_error_handler_when_ai_enabled(
         publishes.append("published")
 
     monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
-    monkeypatch.setattr(runner, "preflight", lambda: True)
+    monkeypatch.setattr(runner, "preflight", _preflight_true_stub)
     monkeypatch.setattr(runner, "handle_error", fake_handle_error)
     monkeypatch.setattr(runner, "publish_state", fake_publish_state)
 
@@ -14995,7 +15108,7 @@ def test_run_cycle_does_not_reload_dirty_config_before_error_handler(
         calls.append("publish")
 
     monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
-    monkeypatch.setattr(runner, "preflight", lambda: True)
+    monkeypatch.setattr(runner, "preflight", _preflight_true_stub)
     monkeypatch.setattr(
         runner, "reload_repo_config_if_dirty", fake_reload_repo_config_if_dirty
     )
@@ -15033,7 +15146,7 @@ def test_run_cycle_stops_idle_dispatch_when_dirty_reload_disables_repo(
         calls.append("publish")
 
     monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
-    monkeypatch.setattr(runner, "preflight", lambda: True)
+    monkeypatch.setattr(runner, "preflight", _preflight_true_stub)
     monkeypatch.setattr(
         runner,
         "_refresh_user_paused_from_redis",
@@ -15076,7 +15189,7 @@ def test_run_cycle_error_state_ignores_dirty_reload_until_idle(
         calls.append("publish")
 
     monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
-    monkeypatch.setattr(runner, "preflight", lambda: True)
+    monkeypatch.setattr(runner, "preflight", _preflight_true_stub)
     monkeypatch.setattr(
         runner, "reload_repo_config_if_dirty", fake_reload_repo_config_if_dirty
     )

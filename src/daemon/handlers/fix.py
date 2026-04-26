@@ -10,7 +10,8 @@ from datetime import datetime, timezone
 from src import github_client
 from src.daemon import git_ops
 from src.daemon.handlers.breach import BreachMixin
-from src.models import PipelineState
+from src.daemon.recovery_policy import BoundedRecoveryPolicy
+from src.models import PipelineState, PRInfo
 from src.retry import retry_transient
 
 
@@ -74,6 +75,63 @@ class FixMixin(BreachMixin):
                 target.cancel()
                 return
 
+    async def _escalate_fix_iteration_cap(self, current_pr: PRInfo) -> None:
+        """Escalate the PR after the FIX iteration cap is reached.
+
+        Posts a @-mention comment, ensures the ``escalated`` label
+        exists, applies it to the PR, marks ``current_pr.is_escalated``
+        and transitions the runner to IDLE so subsequent cycles do
+        not redrive FIX. Sets ``state.ERROR`` if the GitHub mutation
+        fails — see callers for the surrounding control flow.
+        """
+        count = current_pr.fix_iteration_count
+        fix_iteration_cap = self.app_config.daemon.fix_iteration_cap
+        pr_number = current_pr.number
+        comment = (
+            "@AlexBomber12 FIX iteration cap reached "
+            f"({count}/{fix_iteration_cap}). Escalating for manual review."
+        )
+        try:
+            github_client.post_comment(self.owner_repo, pr_number, comment)
+        except Exception as exc:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = f"post_comment failed: {exc}"
+            self.log_event(self.state.error_message)
+            return
+        try:
+            github_client.run_gh(
+                [
+                    "label",
+                    "create",
+                    "escalated",
+                    "--color",
+                    "B60205",
+                    "--description",
+                    "Daemon escalated, manual review required",
+                ],
+                repo=self.owner_repo,
+            )
+        except Exception as exc:
+            self.log_event(f"FIX cap label create skipped: {exc}")
+        try:
+            github_client.run_gh(
+                ["pr", "edit", str(pr_number), "--add-label", "escalated"],
+                repo=self.owner_repo,
+            )
+        except Exception as exc:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = f"pr edit failed: {exc}"
+            self.log_event(self.state.error_message)
+            return
+        current_pr.is_escalated = True
+        self.state.error_message = None
+        self.state.state = PipelineState.IDLE
+        self.log_event(
+            f"FIX cap reached ({count}/{fix_iteration_cap}) on PR "
+            f"#{pr_number}: escalated, moving to IDLE."
+        )
+        await self.publish_state()
+
     async def handle_fix(self) -> None:
         """Run ``FIX REVIEW`` via the active coder CLI and return to WATCH."""
         self._stop_requested = False
@@ -103,56 +161,16 @@ class FixMixin(BreachMixin):
             )
             await self.publish_state()
             return
-        if (
-            current_pr is not None
-            and current_pr.fix_iteration_count >= fix_iteration_cap
+        fix_iteration_policy: BoundedRecoveryPolicy[PRInfo] = BoundedRecoveryPolicy(
+            name="fix_iteration_cap",
+            max_attempts=fix_iteration_cap,
+            counter_getter=lambda pr: pr.fix_iteration_count,
+            counter_setter=lambda pr, n: setattr(pr, "fix_iteration_count", n),
+            on_threshold=lambda pr: self._escalate_fix_iteration_cap(pr),
+        )
+        if current_pr is not None and await fix_iteration_policy.maybe_escalate(
+            current_pr
         ):
-            count = current_pr.fix_iteration_count
-            pr_number = current_pr.number
-            comment = (
-                "@AlexBomber12 FIX iteration cap reached "
-                f"({count}/{fix_iteration_cap}). Escalating for manual review."
-            )
-            try:
-                github_client.post_comment(self.owner_repo, pr_number, comment)
-            except Exception as exc:
-                self.state.state = PipelineState.ERROR
-                self.state.error_message = f"post_comment failed: {exc}"
-                self.log_event(self.state.error_message)
-                return
-            try:
-                github_client.run_gh(
-                    [
-                        "label",
-                        "create",
-                        "escalated",
-                        "--color",
-                        "B60205",
-                        "--description",
-                        "Daemon escalated, manual review required",
-                    ],
-                    repo=self.owner_repo,
-                )
-            except Exception as exc:
-                self.log_event(f"FIX cap label create skipped: {exc}")
-            try:
-                github_client.run_gh(
-                    ["pr", "edit", str(pr_number), "--add-label", "escalated"],
-                    repo=self.owner_repo,
-                )
-            except Exception as exc:
-                self.state.state = PipelineState.ERROR
-                self.state.error_message = f"pr edit failed: {exc}"
-                self.log_event(self.state.error_message)
-                return
-            current_pr.is_escalated = True
-            self.state.error_message = None
-            self.state.state = PipelineState.IDLE
-            self.log_event(
-                f"FIX cap reached ({count}/{fix_iteration_cap}) on PR "
-                f"#{pr_number}: escalated, moving to IDLE."
-            )
-            await self.publish_state()
             return
         self.log_event(f"[{coder_name}] entering FIX")
         await self.publish_state()
@@ -429,9 +447,8 @@ class FixMixin(BreachMixin):
             if self.state.current_pr is not None:
                 self._last_push_at_pr_number = self.state.current_pr.number
                 self.state.current_pr.push_count += 1
-                self.state.current_pr.fix_iteration_count += 1
+                iteration = fix_iteration_policy.increment(self.state.current_pr)
                 self.state.current_pr.last_activity = push_time
-                iteration = self.state.current_pr.fix_iteration_count
             else:
                 iteration = 0
 
