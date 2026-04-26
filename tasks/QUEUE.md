@@ -516,7 +516,7 @@
 - Branch: pr-157-testbed-reset-fixture
 
 ## PR-158: Coder pin from task header respected (FINDING-2)
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-158.md
 - Branch: pr-158-coder-pin-respected
 
