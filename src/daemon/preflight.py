@@ -10,6 +10,7 @@ from __future__ import annotations
 import subprocess
 
 from src.daemon import git_ops
+from src.daemon.recovery_policy import BoundedRecoveryPolicy
 from src.models import PipelineState
 
 # After this many consecutive cycles of a dirty working tree,
@@ -22,7 +23,16 @@ _DIRTY_CYCLES_BEFORE_AUTO_RESET = 3
 class PreflightMixin:
     """Preflight checks and dirty-tree auto-recovery."""
 
-    def preflight(self) -> bool:
+    def _build_dirty_tree_policy(self) -> BoundedRecoveryPolicy["PreflightMixin"]:
+        return BoundedRecoveryPolicy(
+            name="dirty_tree_auto_reset",
+            max_attempts=_DIRTY_CYCLES_BEFORE_AUTO_RESET,
+            counter_getter=lambda r: r._consecutive_dirty_cycles,
+            counter_setter=lambda r, n: setattr(r, "_consecutive_dirty_cycles", n),
+            on_threshold=lambda r: r._auto_reset_dirty_tree(),
+        )
+
+    async def preflight(self) -> bool:
         """Return ``True`` iff the working tree is clean."""
         try:
             result = git_ops._git(self.repo_path, "status", "--porcelain")
@@ -40,34 +50,37 @@ class PreflightMixin:
             return False
 
         dirty = result.stdout.strip()
+        policy = self._build_dirty_tree_policy()
         if dirty:
-            self._consecutive_dirty_cycles += 1
-            if self._consecutive_dirty_cycles >= _DIRTY_CYCLES_BEFORE_AUTO_RESET:
+            count = policy.increment(self)
+            if count >= _DIRTY_CYCLES_BEFORE_AUTO_RESET:
                 self.log_event(
-                    f"Dirty tree persisted {self._consecutive_dirty_cycles} "
-                    "cycles, auto-resetting to recover"
+                    f"Dirty tree persisted {count} cycles, auto-resetting to recover"
                 )
-                if self._auto_reset_dirty_tree():
+            if await policy.maybe_escalate(self):
+                if self.state.state in (PipelineState.IDLE, PipelineState.WATCH):
+                    policy.reset(self)
                     return True
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"working tree dirty: {dirty}"
             self.log_event("preflight: dirty working tree")
             return False
-        self._consecutive_dirty_cycles = 0
+        policy.reset(self)
         return True
 
-    def _auto_reset_dirty_tree(self) -> bool:
+    def _auto_reset_dirty_tree(self) -> None:
         """Hard-reset the working tree to ``origin/{branch}``.
 
-        Called by ``preflight`` once the consecutive-dirty counter
-        crosses ``_DIRTY_CYCLES_BEFORE_AUTO_RESET``. On success the
-        runner resumes the state it was in before the dirty-tree
-        stall: WATCH when an open PR was being tracked, IDLE
-        otherwise. Dropping back to IDLE unconditionally would make
-        the next cycle re-pick the still-TODO task from
-        ``origin/{base}:tasks/QUEUE.md`` and open a duplicate PR.
-        On failure the counter is left untouched and the caller
-        falls through to the usual ERROR path.
+        Called by the ``BoundedRecoveryPolicy`` once the
+        consecutive-dirty counter crosses
+        ``_DIRTY_CYCLES_BEFORE_AUTO_RESET``. On success the runner
+        resumes the state it was in before the dirty-tree stall:
+        WATCH when an open PR was being tracked, IDLE otherwise.
+        Dropping back to IDLE unconditionally would make the next
+        cycle re-pick the still-TODO task from
+        ``origin/{base}:tasks/QUEUE.md`` and open a duplicate PR. On
+        failure the state is left untouched so ``preflight`` falls
+        through to the usual ERROR path.
         """
         branch = self.repo_config.branch
         try:
@@ -88,8 +101,7 @@ class PreflightMixin:
             OSError,
         ) as exc:
             self.log_event(f"Auto-recovery failed: {exc}")
-            return False
-        self._consecutive_dirty_cycles = 0
+            return
         if self.state.current_pr is not None:
             resumed = PipelineState.WATCH
         else:
@@ -97,4 +109,3 @@ class PreflightMixin:
         self.state.state = resumed
         self.state.error_message = None
         self.log_event(f"Auto-recovered from dirty tree -> {resumed.value}")
-        return True

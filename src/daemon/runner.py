@@ -896,7 +896,7 @@ class PipelineRunner(
             await self.publish_state()
             return
 
-        if not self.preflight():
+        if not await self.preflight():
             await self.publish_state()
             return
 

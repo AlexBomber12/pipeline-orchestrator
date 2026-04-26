@@ -901,7 +901,7 @@ def test_recover_state_runs_only_once_per_process(
     async def noop_ensure() -> None:
         return None
 
-    def clean_preflight() -> bool:
+    async def clean_preflight() -> bool:
         return True
 
     async def noop_idle() -> None:
@@ -966,7 +966,7 @@ def test_run_cycle_recovered_watch_does_not_dispatch_handle_watch(
 
     preflight_calls: list[int] = []
 
-    def spy_preflight() -> bool:
+    async def spy_preflight() -> bool:
         preflight_calls.append(1)
         return True
 
@@ -1014,7 +1014,7 @@ def test_run_cycle_recovered_idle_does_not_dispatch_handle_idle(
 
     preflight_calls: list[int] = []
 
-    def spy_preflight() -> bool:
+    async def spy_preflight() -> bool:
         preflight_calls.append(1)
         return True
 
@@ -1059,7 +1059,7 @@ def test_run_cycle_dirty_tree_does_not_clobber_recovered_watch(
 
     preflight_calls: list[bool] = []
 
-    def fail_preflight() -> bool:
+    async def fail_preflight() -> bool:
         # If preflight ever runs on the recovery cycle it will report a
         # dirty tree and flip state to ERROR — exactly the P1 regression.
         preflight_calls.append(True)
@@ -1112,7 +1112,7 @@ def test_run_cycle_transient_discovery_failure_stays_retryable(
     async def noop_ensure() -> None:
         return None
 
-    def clean_preflight() -> bool:
+    async def clean_preflight() -> bool:
         return True
 
     runner = _make_runner()
@@ -1189,7 +1189,7 @@ def test_run_cycle_subsequent_cycle_still_runs_preflight(
 
     preflight_calls: list[int] = []
 
-    def ok_preflight() -> bool:
+    async def ok_preflight() -> bool:
         preflight_calls.append(1)
         return True
 
