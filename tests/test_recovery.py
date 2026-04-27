@@ -23,6 +23,18 @@ from src.models import (
 from src.queue_parser import QueueValidationError
 
 
+@pytest.fixture(autouse=True)
+def _disable_github_rate_limit_fetch_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tests that don't pin a budget shouldn't actually call the gh CLI."""
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "fetch_rate_limit_budget",
+        lambda: None,
+    )
+
+
 class _FakeRedis:
     """Minimal async Redis double capturing ``set`` calls."""
 
