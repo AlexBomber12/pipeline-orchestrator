@@ -2,9 +2,9 @@
 
 Живой документ. Обновляется после каждой merge'нутой волны и после каждой chat-session.
 
-Последнее обновление: 2026-04-27 (after Stage 1 foundation merging in progress; Multi-tier agent direction added; OBS-Y premature merge investigation logged).
+Последнее обновление: 2026-04-27 (OBS-AA test pollution v1 misdiagnosis + v2 docker-exec fix in flight; root cause and full diagnostic walkthrough preserved).
 
-Предыдущие: 2026-04-26 (after Sprint F1.0 + PR-156/157 + PR-158/159 merged; Variant D direction confirmed; Development model & Layer 2 substrate observations added), 2026-04-24 (after code audit zip __27__, corrections applied), Day 5 closure, Day 4 auto, 2026-04-21 after PR-145..PR-150.
+Предыдущие: 2026-04-27 (OBS-AA test pollution root cause located via CI evidence; PR-230 task-fixture-redis-cleanup added; earlier OBS-Y/OBS-Z investigations preserved), 2026-04-27 (OBS-Y premature merge investigation; Multi-tier agent direction; Onboarding existing project gap; OBS-Z Codex EYES race), 2026-04-26 (after Sprint F1.0 + PR-156/157 + PR-158/159 merged; Variant D direction confirmed; Development model & Layer 2 substrate observations added), 2026-04-24 (after code audit zip __27__, corrections applied), Day 5 closure, Day 4 auto, 2026-04-21 after PR-145..PR-150.
 
 ---
 
@@ -1085,6 +1085,36 @@ Combination of two approaches:
 **Backlog item:**
 
 - **PR-181:** Codex EYES race resolution (pre-push state check + differentiated stale threshold + analytics counter).
+
+### OBS-AA: Test pollution via daemon Redis state survival (root cause located 2026-04-27, fix in flight)
+
+**Observed:** `tests/e2e/test_stop_and_resume.py::test_stop_during_coding_then_resume_picks_next_task` failing consistently in CI integration job after recent merges. Initial hypothesis (architectural defect in `_select_next_task` DOING path) was incorrect. Investigation via captured `stack-logs.txt` from a real failed CI run revealed the actual sequence:
+
+```
+08:48:39  POST /stop                                         ← test sends stop
+08:48:39  Picked task PR-1777279712: e2e-sigkill-recovery   ← previous test's task!
+08:48:42  Recovered: DOING task PR-1777279712, no PR -> 
+            re-running CODING                                ← daemon recovery
+08:49:28  Picked task PR-1777279712 (again)
+08:49:29  User stop requested; terminating current coder
+08:49:34  CODING aborted: user stop requested                ← stops the WRONG task
+08:49:35  PAUSED -> IDLE
+08:49:42  Picked task PR-1777279767: e2e-stop-resume-slow   ← test's task A picked AFTER stop
+```
+
+**Root cause:** the per-test `reset_testbed` fixture in `tests/e2e/conftest.py` only closes GitHub PRs, deletes branches, wipes `tasks/` directory. It does NOT clear the daemon's persistent Redis state (`pipeline:{slug}` containing `current_task`, `current_pr`; `control:{slug}:*` containing stop/pause/dirty flags). Previous test's `current_task = PR-X, status=DOING` survives into next test, daemon's recovery path picks it up at first poll cycle of next test, the stop/resume logic operates on the leftover task instead of the test's intended task.
+
+**This is INFRASTRUCTURE pollution, not an ARCHITECTURE defect.** Daemon's `_select_next_task`, `_user_stopped_task_pr_ids`, DOING/TODO derivation are all correct given the input state. The input state is wrong because the fixture didn't reset it.
+
+**Earlier misdiagnosis (recorded for posterity):** an initial investigation attempted to locate the bug in `_select_next_task` (DOING tasks bypass stopped set). Log evidence disproved this — the stopped task in the failing run was `PR-1777279712` (previous test's leftover), not the test's task A. The DOING path is technically correct in this scenario; daemon stopped what the state machine said was current. The real defect is upstream — the state machine was carrying a task from the previous test.
+
+**MICRO PR v1 attempt (failed 2026-04-27):** First fix attempt used `redis.Redis.from_url()` to clear keys directly from host pytest process. Codex implemented `_default_test_redis_url()` that ran `docker inspect` to get container IP and connect from host. This **failed** because `redis-test` container in `docker-compose.test.yml` has NO host port mapping (only internal network exposure on 6379/tcp). Host pytest tried to connect to `172.22.0.2:6379` (internal docker IP), hit `TimeoutError`. CI runs showed `Redis is unavailable: Error -3 connecting to redis-test:6379` even from inside daemon container during test execution — the failed connection attempts plus CI workflow's `docker compose down -v` cleanup explained the SIGTERM events seen in stack-logs.txt. Branch `micro-20260427-redis-testbed-reset` deleted before merge.
+
+**MICRO PR v2 (in flight 2026-04-27, expected to land):** Rewrites `clear_testbed_redis_state(slug: str) -> int` to use `subprocess.run` with `docker compose -f docker-compose.test.yml exec -T redis-test redis-cli ...` for both KEYS enumeration of `control:{slug}:*` pattern and DEL of all collected keys (plus `pipeline:{slug}` and `upload:{slug}:pending`). No host port mapping added. No python `redis` package dependency. Subprocess approach uses container network namespace that already works correctly (the same approach is already used by CI workflow line 91 to verify `which claude` inside daemon container). Validated locally: `docker compose exec -T redis-test redis-cli ping` returns PONG, SET/GET/DEL/KEYS all work via this path. Branch `micro-20260427-redis-testbed-reset-v2`.
+
+**Lesson recorded:** when a test failure pattern looks like a state-machine bug but the symptom is reproducible only after specific test ordering, suspect test fixture state pollution before suspecting architectural defects in the daemon. The capture-and-read-actual-logs approach was decisive here; without `stack-logs.txt` the architectural-fix hypothesis would have shipped and not solved the actual problem.
+
+**Second lesson:** when designing test infrastructure helpers that need to reach docker-internal services, prefer `docker compose exec -T <container> <cmd>` over python clients connecting to discovered container IPs. The subprocess approach uses the container's own network namespace and works identically from CI runner host and developer DESKTOP. The python-from-host approach requires host port mappings or `docker inspect` IP discovery, both of which add infrastructure complexity and fail in subtle ways.
 
 ---
 
