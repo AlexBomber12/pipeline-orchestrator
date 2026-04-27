@@ -12,12 +12,89 @@ from src import github_client
 from src.daemon import git_ops
 from src.daemon.handlers.breach import BreachMixin
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
-from src.models import PipelineState, PRInfo
+from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus
 from src.retry import retry_transient
+
+_FIX_CI_LOG_TRUNCATE_CHARS = 5000
+
+
+def _fetch_failed_ci_logs(repo: str, branch: str) -> str | None:
+    """Return the last 5000 chars of failed CI logs for ``branch``, or ``None``.
+
+    Resolves the most recent failed run via ``gh run list`` filtered by
+    branch, then pulls the failure-only output via ``gh run view
+    --log-failed``. Returns ``None`` on any lookup error so the FIX
+    prompt simply omits the section instead of blocking on observability.
+    """
+    try:
+        runs = github_client.run_gh(
+            [
+                "run",
+                "list",
+                "--branch",
+                branch,
+                "--status",
+                "failure",
+                "--limit",
+                "1",
+                "--json",
+                "databaseId",
+            ],
+            repo=repo,
+        )
+    except (RuntimeError, subprocess.TimeoutExpired, OSError):
+        return None
+    if not isinstance(runs, list) or not runs:
+        return None
+    first = runs[0]
+    if not isinstance(first, dict):
+        return None
+    run_id = first.get("databaseId")
+    if not run_id:
+        return None
+    try:
+        logs = github_client.run_gh(
+            ["run", "view", str(run_id), "--log-failed"],
+            repo=repo,
+            timeout=60,
+        )
+    except (RuntimeError, subprocess.TimeoutExpired, OSError):
+        return None
+    if not isinstance(logs, str) or not logs:
+        return None
+    if len(logs) > _FIX_CI_LOG_TRUNCATE_CHARS:
+        return f"[truncated]\n{logs[-_FIX_CI_LOG_TRUNCATE_CHARS:]}"
+    return logs
+
+
+def _fetch_latest_review_feedback(repo: str, pr_number: int) -> str | None:
+    """Return the most recent CHANGES_REQUESTED review body, or ``None``."""
+    try:
+        raw = github_client.run_gh(
+            ["pr", "view", str(pr_number), "--json", "reviews"],
+            repo=repo,
+        )
+    except (RuntimeError, subprocess.TimeoutExpired, OSError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    reviews = raw.get("reviews")
+    if not isinstance(reviews, list):
+        return None
+    candidates = [
+        r for r in reviews
+        if isinstance(r, dict)
+        and (r.get("state") or "").upper() == "CHANGES_REQUESTED"
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda r: r.get("submittedAt") or "", reverse=True)
+    body = candidates[0].get("body") or ""
+    return body or None
 
 
 class FixMixin(BreachMixin):
-    """FIX REVIEW handler with idle timeout and breach monitoring."""
+    """FIX FEEDBACK handler with idle timeout and breach monitoring."""
 
     async def _monitor_fix_idle(
         self,
@@ -348,8 +425,38 @@ class FixMixin(BreachMixin):
         self.state.state = PipelineState.HUNG
         await self.publish_state()
 
+    async def _build_fix_feedback_context(
+        self, current_pr: PRInfo
+    ) -> str | None:
+        """Compose CI failure logs + latest review feedback for the FIX prompt.
+
+        Each section is added independently so the coder receives whatever
+        signals the daemon can resolve. Returns ``None`` when neither
+        source is reachable; the prompt then falls back to bare
+        ``FIX FEEDBACK``.
+        """
+        sections: list[str] = []
+        if current_pr.ci_status == CIStatus.FAILURE:
+            ci_logs = await asyncio.to_thread(
+                _fetch_failed_ci_logs, self.owner_repo, current_pr.branch
+            )
+            if ci_logs:
+                sections.append(
+                    "CI failure logs (last 5000 chars):\n" + ci_logs
+                )
+        if current_pr.review_status == ReviewStatus.CHANGES_REQUESTED:
+            feedback = await asyncio.to_thread(
+                _fetch_latest_review_feedback,
+                self.owner_repo, current_pr.number,
+            )
+            if feedback:
+                sections.append("Latest review feedback:\n" + feedback)
+        if not sections:
+            return None
+        return "\n\n".join(sections)
+
     async def handle_fix(self) -> None:
-        """Run ``FIX REVIEW`` via the active coder CLI and return to WATCH."""
+        """Run ``FIX FEEDBACK`` via the active coder CLI and return to WATCH."""
         self._stop_requested = False
         await self._refresh_auth_status_cache()
         coder_name, plugin = self._get_coder(allow_exploration=False)
@@ -465,6 +572,12 @@ class FixMixin(BreachMixin):
             "model": model,
             "on_process_start": self._track_current_coder_process,
         }
+        if self.state.current_pr is not None:
+            extra_context = await self._build_fix_feedback_context(
+                self.state.current_pr
+            )
+            if extra_context is not None:
+                fix_kwargs["extra_context"] = extra_context
         if coder_name == "claude":
             fix_kwargs.update(
                 breach_dir=breach_dir,
@@ -737,7 +850,7 @@ class FixMixin(BreachMixin):
             if await pause_for_stop_after_bookkeeping():
                 return
             return
-        await self._save_cli_log(stdout, stderr, f"FIX REVIEW output [{coder_name}]")
+        await self._save_cli_log(stdout, stderr, f"FIX FEEDBACK output [{coder_name}]")
         await capture_stop_requested_after_exit()
         if stop_cancelled:
             head_after = read_head_after_fix()
@@ -796,7 +909,7 @@ class FixMixin(BreachMixin):
         if head_before and head_before == head_after:
             self._last_push_at = datetime.now(timezone.utc)
             self.log_event(
-                "FIX REVIEW exited 0 but HEAD unchanged; "
+                "FIX FEEDBACK exited 0 but HEAD unchanged; "
                 "no push, skipping @codex review"
             )
             if self.state.current_pr is not None:

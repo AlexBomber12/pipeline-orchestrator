@@ -245,9 +245,29 @@ def test_fix_review_uses_fix_review_prompt(monkeypatch: pytest.MonkeyPatch) -> N
 
     fix_review("/data/repos/demo")
 
-    assert captured["cmd"][-1] == "FIX REVIEW"
+    assert captured["cmd"][-1] == "FIX FEEDBACK"
     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
     assert captured["kwargs"]["timeout"] == 3600
+
+
+def test_fix_review_appends_extra_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured["cmd"] = cmd
+        return _FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    fix_review(
+        "/data/repos/demo",
+        extra_context="CI failure logs (last 5000 chars):\nboom",
+    )
+
+    prompt = captured["cmd"][-1]
+    assert prompt.startswith("FIX FEEDBACK\n\n")
+    assert "CI failure logs (last 5000 chars):" in prompt
+    assert "boom" in prompt
 
 
 def test_diagnose_error_builds_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -704,7 +724,7 @@ async def test_fix_review_async_forwards_to_run_claude_async(
     )
 
     assert result == (0, "ok", "")
-    assert captured["args"] == ("FIX REVIEW", "/data/repos/demo")
+    assert captured["args"] == ("FIX FEEDBACK", "/data/repos/demo")
     assert captured["kwargs"] == {
         "timeout": None,
         "model": "opus",
@@ -731,3 +751,27 @@ async def test_fix_review_async_forwards_on_process_start(
     await fix_review_async("/data/repos/demo", on_process_start=callback)  # type: ignore[arg-type]
 
     assert captured["kwargs"]["on_process_start"] is callback
+
+
+@pytest.mark.asyncio
+async def test_fix_review_async_appends_extra_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_run_claude_async(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        captured["args"] = args
+        return (0, "ok", "")
+
+    monkeypatch.setattr("src.claude_cli.run_claude_async", fake_run_claude_async)
+
+    await fix_review_async(
+        "/data/repos/demo",
+        extra_context="Latest review feedback:\nP1: fix this",
+    )
+
+    prompt, repo = captured["args"]
+    assert repo == "/data/repos/demo"
+    assert prompt.startswith("FIX FEEDBACK\n\n")
+    assert "Latest review feedback:" in prompt
+    assert "P1: fix this" in prompt

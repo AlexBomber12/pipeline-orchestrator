@@ -226,7 +226,7 @@ async def test_fix_review_async_passes_prompt(
         "--sandbox",
         "danger-full-access",
     ]
-    assert cmd[-1] == "FIX REVIEW"
+    assert cmd[-1] == "FIX FEEDBACK"
 
 
 @pytest.mark.asyncio
@@ -247,6 +247,30 @@ async def test_fix_review_async_forwards_on_process_start(
     )
 
     assert started == [fake_proc]
+
+
+@pytest.mark.asyncio
+async def test_fix_review_async_appends_extra_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    fake_proc = _make_fake_proc(returncode=0)
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        captured["cmd"] = list(args)
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    await fix_review_async(
+        "/data/repos/demo",
+        extra_context="CI failure logs (last 5000 chars):\nboom",
+    )
+
+    prompt = captured["cmd"][-1]
+    assert prompt.startswith("FIX FEEDBACK\n\n")
+    assert "CI failure logs (last 5000 chars):" in prompt
+    assert "boom" in prompt
 
 
 @pytest.mark.asyncio
