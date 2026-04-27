@@ -242,10 +242,14 @@ def clear_testbed_redis_state(slug: str) -> int:
             check=False,
             timeout=10,
         )
-    except (OSError, subprocess.SubprocessError):
-        return 0
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"clear_testbed_redis_state: redis KEYS failed: {exc}") from exc
     if keys_result.returncode != 0:
-        return 0
+        raise RuntimeError(
+            "clear_testbed_redis_state: redis KEYS failed "
+            f"(rc={keys_result.returncode}): "
+            f"{(keys_result.stderr or keys_result.stdout).strip()}"
+        )
 
     control_keys = [line.strip() for line in keys_result.stdout.splitlines() if line.strip()]
     try:
@@ -262,14 +266,21 @@ def clear_testbed_redis_state(slug: str) -> int:
             check=False,
             timeout=10,
         )
-    except (OSError, subprocess.SubprocessError):
-        return 0
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"clear_testbed_redis_state: redis DEL failed: {exc}") from exc
     if del_result.returncode != 0:
-        return 0
+        raise RuntimeError(
+            "clear_testbed_redis_state: redis DEL failed "
+            f"(rc={del_result.returncode}): "
+            f"{(del_result.stderr or del_result.stdout).strip()}"
+        )
     try:
         return int(del_result.stdout.strip())
-    except ValueError:
-        return 0
+    except ValueError as exc:
+        raise RuntimeError(
+            "clear_testbed_redis_state: redis DEL returned non-integer output: "
+            f"{del_result.stdout.strip()}"
+        ) from exc
 
 
 def reset_testbed_full(slug: str) -> dict:

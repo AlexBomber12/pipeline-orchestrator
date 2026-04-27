@@ -79,7 +79,7 @@ def test_clear_testbed_redis_state_runs_keys_then_del(monkeypatch) -> None:
     ]
 
 
-def test_clear_testbed_redis_state_returns_zero_when_keys_fails(monkeypatch) -> None:
+def test_clear_testbed_redis_state_raises_when_keys_fails(monkeypatch) -> None:
     calls: list[tuple[str, ...]] = []
 
     def fake_run(cmd, **kwargs):
@@ -88,8 +88,43 @@ def test_clear_testbed_redis_state_returns_zero_when_keys_fails(monkeypatch) -> 
 
     monkeypatch.setattr(testbed_reset.subprocess, "run", fake_run)
 
-    assert clear_testbed_redis_state("slug") == 0
+    with pytest.raises(RuntimeError, match="redis KEYS failed"):
+        clear_testbed_redis_state("slug")
     assert len(calls) == 1
+
+
+def test_clear_testbed_redis_state_raises_when_del_fails(monkeypatch) -> None:
+    def fake_run(cmd, **kwargs):
+        if "KEYS" in cmd:
+            return _completed(stdout="control:slug:a\n")
+        return _completed(returncode=1, stderr="del failed")
+
+    monkeypatch.setattr(testbed_reset.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="redis DEL failed"):
+        clear_testbed_redis_state("slug")
+
+
+def test_clear_testbed_redis_state_raises_on_subprocess_exception(monkeypatch) -> None:
+    def fake_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=10)
+
+    monkeypatch.setattr(testbed_reset.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="redis KEYS failed"):
+        clear_testbed_redis_state("slug")
+
+
+def test_clear_testbed_redis_state_raises_on_unparseable_del_stdout(monkeypatch) -> None:
+    def fake_run(cmd, **kwargs):
+        if "KEYS" in cmd:
+            return _completed(stdout="")
+        return _completed(stdout="not-an-int\n")
+
+    monkeypatch.setattr(testbed_reset.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="non-integer output"):
+        clear_testbed_redis_state("slug")
 
 
 def test_close_all_open_prs_closes_each_listed_number() -> None:
