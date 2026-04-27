@@ -284,7 +284,9 @@ def clear_testbed_redis_state(slug: str) -> int:
 
 
 def reset_testbed_full(slug: str) -> dict:
-    """Full reset: close PRs, delete branches, wipe tasks/. Returns counts dict.
+    """Full reset: wipe tasks/, delete branches, close PRs. Returns counts dict.
+
+    Operation order is causally aligned with daemon awareness: 1) wipe tasks/ on main removes the source of work; 2) delete non-main branches removes feature artifacts; 3) close PRs is the daemon-visible signal that work has ended. Future contributors adding cleanup operations must keep this monotonic ordering so the daemon sampled at any point during cleanup never observes work-in-progress after the PR-close signal.
 
     The GitHub cleanup is repository-wide; callers pass the same slug they use
     for paired Redis cleanup so fixture call sites reset one testbed identity.
@@ -294,8 +296,11 @@ def reset_testbed_full(slug: str) -> dict:
     fixture relies on this to abort before tests run against a polluted
     testbed.
     """
+    tasks_wiped = wipe_tasks_dir_on_main()
+    branches_deleted = delete_non_main_branches()
+    prs_closed = close_all_open_prs()
     return {
-        "prs_closed": close_all_open_prs(),
-        "branches_deleted": delete_non_main_branches(),
-        "tasks_wiped": wipe_tasks_dir_on_main(),
+        "prs_closed": prs_closed,
+        "branches_deleted": branches_deleted,
+        "tasks_wiped": tasks_wiped,
     }

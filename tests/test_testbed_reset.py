@@ -405,13 +405,44 @@ def test_wipe_tasks_dir_uses_authenticated_clone_url_when_token_set(
 
 
 def test_reset_testbed_full_aggregates_all_helpers() -> None:
+    call_order: list[str] = []
+
+    def close_all_open_prs_side_effect() -> int:
+        call_order.append("close_all_open_prs")
+        return 2
+
+    def delete_non_main_branches_side_effect() -> int:
+        call_order.append("delete_non_main_branches")
+        return 3
+
+    def wipe_tasks_dir_on_main_side_effect() -> bool:
+        call_order.append("wipe_tasks_dir_on_main")
+        return True
+
     with (
-        patch.object(testbed_reset, "close_all_open_prs", return_value=2) as close,
-        patch.object(testbed_reset, "delete_non_main_branches", return_value=3) as delete,
-        patch.object(testbed_reset, "wipe_tasks_dir_on_main", return_value=True) as wipe,
+        patch.object(
+            testbed_reset,
+            "close_all_open_prs",
+            side_effect=close_all_open_prs_side_effect,
+        ) as close,
+        patch.object(
+            testbed_reset,
+            "delete_non_main_branches",
+            side_effect=delete_non_main_branches_side_effect,
+        ) as delete,
+        patch.object(
+            testbed_reset,
+            "wipe_tasks_dir_on_main",
+            side_effect=wipe_tasks_dir_on_main_side_effect,
+        ) as wipe,
     ):
         result = reset_testbed_full("slug")
     assert result == {"prs_closed": 2, "branches_deleted": 3, "tasks_wiped": True}
+    assert call_order == [
+        "wipe_tasks_dir_on_main",
+        "delete_non_main_branches",
+        "close_all_open_prs",
+    ]
     close.assert_called_once_with()
     delete.assert_called_once_with()
     wipe.assert_called_once_with()
