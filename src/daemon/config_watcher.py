@@ -97,18 +97,27 @@ async def watch_config_file_changes(
 ) -> None:
     """Poll ``config.yml`` for changes and flag runners on every edit.
 
-    Returns silently if the configured path does not exist on startup
-    (e.g. test environments without a config file). Otherwise loops
-    until cancelled, sleeping ``interval_sec`` between checks.
+    Loops until cancelled, sleeping ``interval_sec`` between checks. The
+    watcher tolerates a missing or unreadable file at startup: it keeps
+    polling and silently establishes the baseline as soon as the file
+    becomes readable, so a daemon that boots before ``config.yml`` is
+    present (or during a transient unreadable state) still picks up
+    later edits at the polling cadence.
     """
     path = config_path if config_path is not None else _resolve_config_path()
     last_signature = _safe_signature(path)
-    if last_signature is None:
-        return
     while True:
         await asyncio.sleep(interval_sec)
         current = _safe_signature(path)
-        if current is None or current == last_signature:
+        if current is None:
+            continue
+        if last_signature is None:
+            # First successful read after a missing/unreadable startup —
+            # silently baseline. Treating it as a "change" would spuriously
+            # flag every runner on the first poll.
+            last_signature = current
+            continue
+        if current == last_signature:
             continue
         names = list(get_repo_names())
         if not names:

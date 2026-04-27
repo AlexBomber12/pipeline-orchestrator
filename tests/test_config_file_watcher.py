@@ -126,41 +126,97 @@ def test_set_config_dirty_flags_logs_and_continues_on_redis_error(
     )
 
 
-def test_watch_returns_immediately_when_config_missing(tmp_path: Path) -> None:
+def test_watch_keeps_polling_when_config_missing_at_startup(
+    tmp_path: Path,
+) -> None:
+    """Codex P2: a missing file at boot must not disable the watcher."""
     redis = _FakeRedis()
     missing = tmp_path / "no-config.yml"
-    asyncio.run(
-        config_watcher.watch_config_file_changes(
-            redis,
-            get_repo_names=lambda: ["alpha"],
-            config_path=missing,
-            interval_sec=0.001,
+
+    async def driver() -> None:
+        task = asyncio.create_task(
+            config_watcher.watch_config_file_changes(
+                redis,
+                get_repo_names=lambda: ["alpha"],
+                config_path=missing,
+                interval_sec=0.01,
+            )
         )
-    )
-    assert redis.store == {}
+        await asyncio.sleep(0.05)
+        # The watcher must still be running, awaiting the file to appear.
+        assert not task.done()
+        # Create the file with a body, then mutate it: the first appearance
+        # only baselines the signature, the mutation triggers a flag.
+        _write(missing, "x: 1\n")
+        for _ in range(50):
+            await asyncio.sleep(0.02)
+            if config_watcher._safe_signature(missing) is not None:
+                break
+        future_ts = time.time() + 1
+        os.utime(missing, (future_ts, future_ts))
+        _write(missing, "x: 2\n")
+        os.utime(missing, (future_ts + 1, future_ts + 1))
+        for _ in range(50):
+            await asyncio.sleep(0.02)
+            if redis.store:
+                break
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(driver())
+    assert redis.store == {"control:alpha:config_dirty": "1"}
 
 
-def test_watch_returns_immediately_when_initial_signature_unreadable(
+def test_watch_recovers_when_initial_signature_unreadable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Codex P2: a transient OSError at boot must not disable the watcher."""
     target = tmp_path / "config.yml"
     _write(target, "x: 1\n")
     redis = _FakeRedis()
+    real_signature = config_watcher._config_signature
+    calls = {"n": 0}
 
-    def always_oserror(path: Path) -> str:
-        raise OSError("boom")
+    def flaky_signature(path: Path) -> str:
+        calls["n"] += 1
+        # First call — the startup baseline read — fails. Every later
+        # call succeeds, so the watcher must establish the baseline on
+        # its next tick instead of giving up at startup.
+        if calls["n"] == 1:
+            raise OSError("startup permission glitch")
+        return real_signature(path)
 
-    monkeypatch.setattr(config_watcher, "_config_signature", always_oserror)
+    monkeypatch.setattr(config_watcher, "_config_signature", flaky_signature)
 
-    asyncio.run(
-        config_watcher.watch_config_file_changes(
-            redis,
-            get_repo_names=lambda: ["alpha"],
-            config_path=target,
-            interval_sec=0.001,
+    async def driver() -> None:
+        task = asyncio.create_task(
+            config_watcher.watch_config_file_changes(
+                redis,
+                get_repo_names=lambda: ["alpha"],
+                config_path=target,
+                interval_sec=0.01,
+            )
         )
-    )
-    assert redis.store == {}
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        future_ts = time.time() + 1
+        _write(target, "x: 2\n")
+        os.utime(target, (future_ts, future_ts))
+        for _ in range(50):
+            await asyncio.sleep(0.02)
+            if redis.store:
+                break
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(driver())
+    assert redis.store == {"control:alpha:config_dirty": "1"}
 
 
 def test_watch_detects_content_change_and_flags_runners(tmp_path: Path) -> None:
