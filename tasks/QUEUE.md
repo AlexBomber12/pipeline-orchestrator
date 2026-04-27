@@ -555,6 +555,11 @@
 - Tasks file: tasks/PR-165.md
 - Branch: pr-165-poll-github-during-fix
 
+## PR-166: Coder ESCALATE protocol in FIX cycle
+- Status: TODO
+- Tasks file: tasks/PR-166.md
+- Branch: pr-166-coder-escalate-protocol
+
 ## PR-167: CI logs in FIX prompt and rename FIX REVIEW → FIX FEEDBACK
 - Status: DONE
 - Tasks file: tasks/PR-167.md
