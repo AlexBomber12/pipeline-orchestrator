@@ -151,7 +151,7 @@ class FixMixin(BreachMixin):
 
     def _ensure_escalated_label(
         self, pr_number: int, label_create_log_prefix: str
-    ) -> None:
+    ) -> bool:
         """Create (idempotent) and apply the ``escalated`` label.
 
         Both ``gh`` calls soft-fail with ``log_event``: the in-memory
@@ -160,6 +160,15 @@ class FixMixin(BreachMixin):
         after a daemon restart. ``label_create_log_prefix`` keeps the
         existing log strings stable so callers (no-push deadlock vs.
         coder-initiated ESCALATE) remain distinguishable in history.
+
+        Returns ``True`` when ``pr edit --add-label`` succeeded and the
+        ``escalated`` label is therefore visible to ``get_open_prs``,
+        ``False`` when the apply step failed. Callers that park the
+        runner in a state which depends on label-state for durability
+        (e.g. coder-initiated ESCALATE → IDLE, where
+        ``_preserve_fix_iteration_count`` rehydrates ``is_escalated``
+        from labels on the next IDLE refresh) check this return to
+        downgrade to a parking state that does not.
         """
         try:
             github_client.run_gh(
@@ -181,11 +190,13 @@ class FixMixin(BreachMixin):
                 ["pr", "edit", str(pr_number), "--add-label", "escalated"],
                 repo=self.owner_repo,
             )
+            return True
         except Exception as exc:
             self.log_event(
                 f"Warning: failed to apply escalated label to PR "
                 f"#{pr_number}: {exc}"
             )
+            return False
 
     async def _escalate_fix_no_push_deadlock(self, current_pr: PRInfo) -> None:
         """Park the PR in HUNG after consecutive no-push FIX cycles.
@@ -231,18 +242,21 @@ class FixMixin(BreachMixin):
     async def _escalate_fix_coder_initiated(
         self, current_pr: PRInfo, reason: str
     ) -> None:
-        """Park the PR in IDLE after the coder emits an ESCALATE marker.
+        """Park the PR after the coder emits an ESCALATE marker.
 
-        Mirrors ``_escalate_fix_no_push_deadlock`` semantically (post
-        comment, ensure+apply ``escalated`` label, mark
-        ``is_escalated``) but parks the runner in ``IDLE`` rather than
-        ``HUNG`` — the coder explicitly self-reported, so HUNG-style
-        fallback machinery is not appropriate. Comment- and label-post
-        failures are logged but never block the IDLE transition: the
-        in-memory ``is_escalated`` flag preserves the parking signal
-        for the current run, and the existing ``handle_hung``
-        ``is_escalated`` guard keeps the PR parked through any
-        downstream HUNG transition.
+        Posts an explanatory PR comment (soft-fail), then ensures and
+        applies the ``escalated`` label. The label apply is the
+        durable parking signal: on the success path the runner moves
+        to ``IDLE`` — the coder explicitly self-reported, so the
+        ``handle_hung`` ``@codex review`` fallback is not appropriate,
+        and the next IDLE refresh rehydrates ``is_escalated=True``
+        from the label. On the failure path the runner moves to
+        ``HUNG`` instead: ``handle_hung``'s ``is_escalated`` guard
+        keeps the PR parked using the in-memory flag, while moving to
+        IDLE would silently drop the parking signal during a GitHub
+        outage because ``_preserve_fix_iteration_count`` rehydrates
+        ``is_escalated`` from the (missing) label on the next refresh
+        (Codex P1 on PR #228).
         """
         pr_number = current_pr.number
         clean_reason = reason.strip() or _ESCALATE_EMPTY_REASON
@@ -257,8 +271,20 @@ class FixMixin(BreachMixin):
                 f"Warning: failed to post FIX coder ESCALATE comment on PR "
                 f"#{pr_number}: {exc}"
             )
-        self._ensure_escalated_label(pr_number, "FIX coder ESCALATE")
+        label_applied = self._ensure_escalated_label(
+            pr_number, "FIX coder ESCALATE"
+        )
         current_pr.is_escalated = True
+        if not label_applied:
+            self.state.state = PipelineState.HUNG
+            self.state.error_message = (
+                f"FIX coder ESCALATE on PR #{pr_number}: failed to apply "
+                f"`escalated` label. Reason: {clean_reason}. Manual "
+                "review required."
+            )
+            self.log_event(self.state.error_message)
+            await self.publish_state()
+            return
         self.state.state = PipelineState.IDLE
         self.state.error_message = None
         self.log_event(
@@ -912,6 +938,13 @@ class FixMixin(BreachMixin):
             await self._escalate_fix_coder_initiated(
                 self.state.current_pr, escalate_reason
             )
+            # If a stop arrived while the coder was running, honor the
+            # deferred pause: PAUSED takes precedence over the IDLE/HUNG
+            # parking state set by ``_escalate_fix_coder_initiated`` so
+            # the operator's pause request is not silently dropped on
+            # the ESCALATE branch (Codex P1 on PR #228).
+            if await pause_for_stop_after_bookkeeping():
+                return
             return
         if stop_cancelled:
             head_after = read_head_after_fix()

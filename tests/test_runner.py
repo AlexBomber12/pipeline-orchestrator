@@ -4388,10 +4388,19 @@ def test_handle_fix_coder_escalate_post_failure_still_parks_pr(
     )
 
 
-def test_handle_fix_coder_escalate_label_failures_do_not_block_idle(
+def test_handle_fix_coder_escalate_label_apply_failure_parks_in_hung(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Label create/apply failures must log + continue, not block IDLE."""
+    """Label apply failure must park in HUNG, not IDLE.
+
+    IDLE refreshes rehydrate ``is_escalated`` from GitHub labels via
+    ``_preserve_fix_iteration_count``; if the label apply soft-failed,
+    transitioning to IDLE would silently drop the parking signal on
+    the next refresh (Codex P1 on PR #228). HUNG honors the in-memory
+    flag, so the runner stays parked until the operator resolves the
+    PR. The comment is still posted (descriptive record) and the
+    ``label create`` soft-fail is unchanged.
+    """
     posted, _ = _patch_fix_with_stdout(
         monkeypatch, stdout="ESCALATE: infra error\n"
     )
@@ -4411,9 +4420,12 @@ def test_handle_fix_coder_escalate_label_failures_do_not_block_idle(
 
     asyncio.run(runner.handle_fix())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.HUNG
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.is_escalated is True
+    assert runner.state.error_message is not None
+    assert "failed to apply `escalated` label" in runner.state.error_message
+    assert "infra error" in runner.state.error_message
     assert posted and posted[0][1] == 306
     assert any(
         "FIX coder ESCALATE label create skipped: label already exists"
@@ -4423,6 +4435,42 @@ def test_handle_fix_coder_escalate_label_failures_do_not_block_idle(
     assert any(
         "failed to apply escalated label to PR #306: gh down"
         in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_fix_coder_escalate_honors_deferred_stop_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user stop arriving alongside an ESCALATE marker must win.
+
+    The ESCALATE branch parks in IDLE (or HUNG on label-apply failure);
+    if a stop request was deferred until after FIX bookkeeping, PAUSED
+    must override so the operator's pause is not silently dropped
+    (Codex P1 on PR #228).
+    """
+    posted, _ = _patch_fix_with_stdout(
+        monkeypatch, stdout="ESCALATE: handing off\n"
+    )
+
+    async def fake_pop_stop_request() -> bool:
+        return True
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=308, branch="pr-308")
+    monkeypatch.setattr(runner, "_pop_stop_request", fake_pop_stop_request)
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.error_message is None
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.is_escalated is True
+    # ESCALATE bookkeeping (comment + label) still ran before PAUSED.
+    assert posted and posted[0][1] == 308
+    assert any(
+        entry["event"] == "FIX aborted: user stop requested"
         for entry in runner.state.history
     )
 
