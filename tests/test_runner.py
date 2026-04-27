@@ -4155,6 +4155,9 @@ def test_handle_fix_no_push_deadlock_label_failures_do_not_block_hung(
         ("escalate: typo\n", None),
         # Past-tense variant rejected
         ("ESCALATED: misnamed\n", None),
+        # Strict start-of-line: indented marker must NOT trigger
+        ("  ESCALATE: indented\n", None),
+        ("\tESCALATE: tabbed\n", None),
     ],
 )
 def test_parse_escalate_marker(stdout: str, expected: str | None) -> None:

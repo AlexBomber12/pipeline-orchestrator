@@ -24,19 +24,18 @@ def _parse_escalate_marker(stdout: str) -> str | None:
     """Return the coder-supplied ESCALATE reason, or ``None``.
 
     The marker is recognized only when the LAST non-empty line of
-    ``stdout`` starts with the literal prefix ``"ESCALATE:"`` (strict
-    case-sensitive match — variants like ``escalate:`` or
-    ``ESCALATED:`` do not trigger). An empty reason (``"ESCALATE:"``
-    alone, or only trailing whitespace) is returned as the empty
-    string so the caller can substitute a placeholder rather than
-    crash.
+    ``stdout`` starts with the literal prefix ``"ESCALATE:"`` at
+    column 0 (strict case-sensitive match — variants like
+    ``escalate:``, ``ESCALATED:``, or an indented ``"  ESCALATE:"``
+    do not trigger). An empty reason (``"ESCALATE:"`` alone, or only
+    trailing whitespace) is returned as the empty string so the caller
+    can substitute a placeholder rather than crash.
     """
     for line in reversed(stdout.splitlines()):
-        stripped = line.strip()
-        if not stripped:
+        if not line.strip():
             continue
-        if stripped.startswith(_ESCALATE_MARKER_PREFIX):
-            return stripped[len(_ESCALATE_MARKER_PREFIX):].strip()
+        if line.startswith(_ESCALATE_MARKER_PREFIX):
+            return line[len(_ESCALATE_MARKER_PREFIX):].strip()
         return None
     return None
 
