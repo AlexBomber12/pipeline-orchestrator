@@ -346,6 +346,11 @@ class FixMixin(BreachMixin):
                 code, stdout, stderr = 1, "", ""
             elif breach_flag["breached"]:
                 if self.state.current_pr is not None:
+                    # Breach pause is not a no-push success; reset the
+                    # streak so a no-push success → breach → no-push
+                    # success sequence is not treated as consecutive
+                    # (Codex P2 on PR #222).
+                    no_push_policy.reset(self.state.current_pr)
                     self._rehydrate_last_push_at(self.state.current_pr)
                     try:
                         head_now = git_ops._git(
@@ -389,6 +394,10 @@ class FixMixin(BreachMixin):
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
         if breach_flag["breached"]:
             if self.state.current_pr is not None:
+                # Late-breach pause is not a no-push success; reset the
+                # streak (Codex P2 on PR #222) — same rationale as the
+                # CancelledError breach path above.
+                no_push_policy.reset(self.state.current_pr)
                 self._rehydrate_last_push_at(self.state.current_pr)
                 try:
                     head_now = git_ops._git(
@@ -562,6 +571,11 @@ class FixMixin(BreachMixin):
             head_after = read_head_after_fix()
             if head_after is None:
                 return
+            # Stop-cancel breaks the consecutive no-push streak (Codex P2
+            # on PR #222). ``record_fix_push`` already resets on a
+            # productive push; this covers the no-push case.
+            if self.state.current_pr is not None:
+                no_push_policy.reset(self.state.current_pr)
             branch = self.state.current_pr.branch if self.state.current_pr is not None else ""
             if branch and remote_branch_contains_head(branch, head_after):
                 if not record_fix_push(

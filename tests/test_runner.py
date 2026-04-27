@@ -3879,6 +3879,208 @@ def test_handle_fix_failure_resets_no_push_counter(
     assert all("FIX deadlock" not in body for _r, _n, body in posted)
 
 
+def test_handle_fix_breach_cancel_resets_no_push_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A breach pause via CancelledError breaks the no-push streak: a
+    rate-limit interruption is not a no-push success, so the counter
+    must reset (Codex P2 round 3 on PR #222)."""
+    rev_parse_calls = {"count": 0}
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_calls["count"] += 1
+            sha = "aaa111\n" if rev_parse_calls["count"] == 1 else "bbb222\n"
+            return _FakeCompletedProcess(args=["git", *args], stdout=sha, returncode=0)
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        await asyncio.Future()
+        return (0, "", "")
+
+    async def no_idle_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    async def breach_cancel_monitor(
+        self: PipelineRunner,
+        breach_dir: str,
+        run_id: str,
+        claude_task: asyncio.Task,  # type: ignore[type-arg]
+        breach_flag: dict[str, bool],
+    ) -> None:
+        self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        breach_flag["breached"] = True
+        await asyncio.sleep(0)
+        claude_task.cancel()
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_inflight_breach", breach_cancel_monitor
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=227, branch="pr-227", no_push_fix_count=2
+    )
+    monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda pr: None)
+    monkeypatch.setattr(runner, "_post_codex_review", lambda pr_number: True)
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.no_push_fix_count == 0
+
+
+def test_handle_fix_late_breach_resets_no_push_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late breach (detected after FIX completed) also breaks the
+    no-push streak — same rationale as the CancelledError breach path
+    (Codex P2 round 3 on PR #222)."""
+    rev_parse_calls = {"count": 0}
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_calls["count"] += 1
+            sha = "aaa111\n" if rev_parse_calls["count"] == 1 else "bbb222\n"
+            return _FakeCompletedProcess(args=["git", *args], stdout=sha, returncode=0)
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def no_idle_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    async def no_breach_monitor(
+        self: object,
+        breach_dir: str,
+        run_id: str,
+        claude_task: asyncio.Task,  # type: ignore[type-arg]
+        breach_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    def fake_late_breach(
+        self: PipelineRunner,
+        breach_dir: str,
+        run_id: str,
+        breach_flag: dict[str, bool],
+    ) -> None:
+        self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        breach_flag["breached"] = True
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", _async_cli_result(0, "ok", "")
+    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
+    )
+    monkeypatch.setattr(PipelineRunner, "_check_late_breach", fake_late_breach)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=228, branch="pr-228", no_push_fix_count=2
+    )
+    monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda pr: None)
+    monkeypatch.setattr(runner, "_post_codex_review", lambda pr_number: True)
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.no_push_fix_count == 0
+
+
+def test_handle_fix_stop_cancel_resets_no_push_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """User stop-cancel during FIX also breaks the no-push streak
+    (Codex P2 round 3 on PR #222). When the operator pauses mid-FIX the
+    cycle isn't a coder no-push outcome, so the counter resets."""
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        if args[:2] == ("rev-parse", "HEAD"):
+            return _FakeCompletedProcess(
+                args=["git", *args], stdout="aaa111\n", returncode=0
+            )
+        if args[:2] == ("rev-parse", "origin/pr-229"):
+            return _FakeCompletedProcess(
+                args=["git", *args], stdout="aaa111\n", returncode=0
+            )
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        await asyncio.Future()
+        return (0, "", "")
+
+    async def no_idle_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    async def no_breach_monitor(
+        self: object,
+        breach_dir: str,
+        run_id: str,
+        claude_task: asyncio.Task,  # type: ignore[type-arg]
+        breach_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=229, branch="pr-229", no_push_fix_count=2
+    )
+
+    async def stop_monitor(
+        cli_task: asyncio.Task[tuple[int, str, str]],
+    ) -> None:
+        runner._stop_requested = True
+        runner.state.user_paused = True
+        await asyncio.sleep(0)
+        cli_task.cancel()
+
+    async def save_log(stdout: str, stderr: str, label: str) -> None:
+        pass
+
+    monkeypatch.setattr(runner, "_save_cli_log", save_log)
+    monkeypatch.setattr(runner, "_monitor_stop_request", stop_monitor)
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.no_push_fix_count == 0
+
+
 def test_handle_fix_idle_timeout_resets_no_push_counter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
