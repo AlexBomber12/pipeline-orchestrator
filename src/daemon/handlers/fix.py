@@ -540,6 +540,13 @@ class FixMixin(BreachMixin):
 
         await capture_stop_requested_after_exit()
         if idle_flag["timed_out"]:
+            # Idle timeout breaks the no-push streak: the coder didn't
+            # produce a push and the daemon killed it. Reset the counter
+            # so a later "no-push success" cycle starts fresh rather
+            # than tripping the cap on a non-consecutive sequence
+            # (Codex P2 on PR #222).
+            if self.state.current_pr is not None:
+                no_push_policy.reset(self.state.current_pr)
             self.state.state = PipelineState.ERROR
             self.state.error_message = (
                 f"FIX idle timeout: no push for {idle_limit}s"
@@ -574,6 +581,12 @@ class FixMixin(BreachMixin):
             self.state.error_message = None  # pragma: no cover - defensive fallback
             return  # pragma: no cover - defensive fallback
         if code != 0:
+            # FIX failure breaks the consecutive no-push streak (Codex P2
+            # on PR #222): a sequence like no-push success → failed FIX
+            # → no-push success would otherwise still trip the deadlock
+            # cap even though the no-push cycles were not consecutive.
+            if self.state.current_pr is not None:
+                no_push_policy.reset(self.state.current_pr)
             self._detect_rate_limit(stderr, coder_name=coder_name)
             if self.state.rate_limited_until is not None:
                 self.state.state = PipelineState.PAUSED
