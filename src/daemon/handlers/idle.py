@@ -463,11 +463,17 @@ class IdleMixin:
             self.state.current_pr = None
             self.state.current_task = None
             return
+        open_pr_snapshot = tuple(sorted((pr.number, pr.branch) for pr in prs))
+        previous_open_pr_snapshot = getattr(self, "_idle_open_pr_snapshot", None)
+        refresh_merged_prs = (
+            previous_open_pr_snapshot is not None
+            and previous_open_pr_snapshot != open_pr_snapshot
+        )
         try:
             merged_prs = github_client.get_merged_prs(
                 self.owner_repo,
                 self.repo_config.branch,
-                refresh=True,
+                refresh=refresh_merged_prs,
             )
         except Exception as exc:
             self.log_event(
@@ -475,6 +481,8 @@ class IdleMixin:
                 "continuing with local merged-status heuristics"
             )
             merged_prs = []
+        else:
+            self._idle_open_pr_snapshot = open_pr_snapshot
 
         queue_path = str(Path(self.repo_path) / "tasks" / "QUEUE.md")
         strict = self.app_config.daemon.strict_queue_validation
