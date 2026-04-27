@@ -152,6 +152,13 @@ run_slow() {
     gh pr comment "${pr_url}" --body "@codex review"
 }
 
+run_escalate() {
+    # PR-166: emit the ESCALATE marker so the daemon's FIX-cycle parser
+    # transitions the runner to IDLE without further coder work.
+    printf 'shim: cannot fix this in a FIX cycle\n'
+    printf 'ESCALATE: e2e shim self-report\n'
+}
+
 main() {
     local invoked
     invoked="$(basename "$0")"
@@ -214,6 +221,14 @@ main() {
         exit 0
     fi
 
+    if [[ "${scenario}" == "escalate" ]]; then
+        # ESCALATE bypasses the testbed-repo / DOING-task plumbing: the
+        # daemon only needs the marker on stdout to enter the
+        # coder-initiated parking path (PR-166).
+        run_escalate
+        exit 0
+    fi
+
     if [[ ! -d "${REPO_DIR}" ]]; then
         printf 'shim: testbed repo not found at %s, exiting 0\n' "${REPO_DIR}" >&2
         exit 0
@@ -245,6 +260,9 @@ main() {
             ;;
         slow)
             run_slow "${pr}" "${branch}"
+            ;;
+        escalate)
+            run_escalate
             ;;
         *)
             printf 'shim: unknown scenario %s, defaulting to success\n' "${scenario}" >&2

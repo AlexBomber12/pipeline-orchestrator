@@ -22,6 +22,7 @@ VALID_SCENARIOS = {
     "hang",
     "malformed_pr",
     "slow",
+    "escalate",
 }
 
 

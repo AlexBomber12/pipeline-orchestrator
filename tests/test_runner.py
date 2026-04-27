@@ -4130,6 +4130,321 @@ def test_handle_fix_no_push_deadlock_label_failures_do_not_block_hung(
     )
 
 
+# ---------------------------------------------------------------------------
+# PR-166: Coder ESCALATE protocol in FIX cycle
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "stdout, expected",
+    [
+        # Last non-empty line is ESCALATE: <reason>
+        ("doing things\nESCALATE: rate limit exceeded\n", "rate limit exceeded"),
+        # Trailing blank lines are ignored
+        ("ESCALATE: foo\n\n\n", "foo"),
+        # ESCALATE in the middle, last line is something else → no trigger
+        ("ESCALATE: stale\nfollow-up unrelated\n", None),
+        # Empty stdout
+        ("", None),
+        # No marker at all
+        ("ran tests\nall good\n", None),
+        # Empty reason → empty string (caller substitutes placeholder)
+        ("ESCALATE:\n", ""),
+        ("ESCALATE: \n", ""),
+        # Strict case-sensitive: lowercase variant rejected
+        ("escalate: typo\n", None),
+        # Past-tense variant rejected
+        ("ESCALATED: misnamed\n", None),
+    ],
+)
+def test_parse_escalate_marker(stdout: str, expected: str | None) -> None:
+    assert fix_module._parse_escalate_marker(stdout) == expected
+
+
+def _patch_fix_with_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    stdout: str,
+    code: int = 0,
+    head_seq: Callable[[], str] | None = None,
+) -> tuple[list[tuple[str, int, str]], list[list[str]]]:
+    """Wire git/CLI/comment fakes for an ESCALATE-marker FIX cycle test.
+
+    ``head_seq`` defaults to a constant ``"abc123"`` (no-push) so tests
+    that only care about the ESCALATE behavior do not have to spell
+    out the head sequence. Returns ``(posted, gh_calls)``.
+    """
+    seq = head_seq or (lambda: "abc123")
+    posted: list[tuple[str, int, str]] = []
+    gh_calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "rev-parse"] and "HEAD" in cmd:
+            return _FakeCompletedProcess(
+                args=cmd, stdout=f"{seq()}\n", returncode=0
+            )
+        if cmd[:2] == ["git", "rev-list"]:
+            return _FakeCompletedProcess(args=cmd, stdout="0\n", returncode=0)
+        return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
+
+    async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        return (code, stdout, "")
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda cmd, **kwargs: gh_calls.append(cmd) or "",
+    )
+    return posted, gh_calls
+
+
+def test_handle_fix_coder_escalate_transitions_to_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted, gh_calls = _patch_fix_with_stdout(
+        monkeypatch, stdout="working...\nESCALATE: rate limit exceeded\n"
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=300, branch="pr-300")
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.is_escalated is True
+    expected_message = (
+        "Coder explicitly escalated this PR. Reason: rate limit exceeded. "
+        "Manual review required."
+    )
+    assert posted == [(runner.owner_repo, 300, expected_message)]
+    assert [
+        cmd for cmd in gh_calls
+        if cmd[:1] == ["label"] or cmd[:2] == ["pr", "edit"]
+    ] == [
+        [
+            "label", "create", "escalated", "--color", "B60205",
+            "--description", "Daemon escalated, manual review required",
+        ],
+        ["pr", "edit", "300", "--add-label", "escalated"],
+    ]
+    assert any(
+        entry["event"]
+        == "FIX coder ESCALATE on PR #300: rate limit exceeded. Moving to IDLE."
+        for entry in runner.state.history
+    )
+
+
+def test_handle_fix_coder_escalate_only_last_non_empty_line_triggers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ESCALATE in the middle of stdout must not trigger the protocol."""
+    posted, _ = _patch_fix_with_stdout(
+        monkeypatch,
+        stdout="ESCALATE: ignored\nfinal line is something else\n",
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=301, branch="pr-301")
+
+    asyncio.run(runner.handle_fix())
+
+    # No-push exit path: WATCH (counter incremented but cap not hit).
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.is_escalated is False
+    assert runner.state.current_pr.no_push_fix_count == 1
+    assert posted == []
+
+
+def test_handle_fix_coder_escalate_no_marker_keeps_normal_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted, gh_calls = _patch_fix_with_stdout(
+        monkeypatch, stdout="ran tests\nall good\n"
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=302, branch="pr-302")
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.is_escalated is False
+    assert posted == []
+    assert all(
+        cmd[:1] != ["label"] and cmd[:2] != ["pr", "edit"]
+        for cmd in gh_calls
+    )
+
+
+def test_handle_fix_coder_escalate_empty_reason_uses_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted, _ = _patch_fix_with_stdout(monkeypatch, stdout="ESCALATE:\n")
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=303, branch="pr-303")
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.is_escalated is True
+    expected_message = (
+        "Coder explicitly escalated this PR. Reason: (no reason provided). "
+        "Manual review required."
+    )
+    assert posted == [(runner.owner_repo, 303, expected_message)]
+    assert any(
+        "(no reason provided)" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_fix_coder_escalate_wins_over_productive_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ESCALATE marker preempts the regular push → @codex review path."""
+    head_calls = iter(["aaa000", "bbb111"])
+    review_posts: list[int] = []
+    posted, _ = _patch_fix_with_stdout(
+        monkeypatch,
+        stdout="pushed a fix\nESCALATE: cannot resolve\n",
+        head_seq=lambda: next(head_calls),
+    )
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=304, branch="pr-304")
+    monkeypatch.setattr(
+        runner,
+        "_post_codex_review",
+        lambda pr_number: review_posts.append(pr_number) or True,
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.is_escalated is True
+    # ESCALATE preempts record_fix_push → no iteration increment, no
+    # @codex review post, no_push counter reset.
+    assert runner.state.current_pr.fix_iteration_count == 0
+    assert runner.state.current_pr.push_count == 0
+    assert runner.state.current_pr.no_push_fix_count == 0
+    assert review_posts == []
+    assert posted == [
+        (
+            runner.owner_repo,
+            304,
+            "Coder explicitly escalated this PR. Reason: cannot resolve. "
+            "Manual review required.",
+        )
+    ]
+
+
+def test_handle_fix_coder_escalate_post_failure_still_parks_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Comment-post failure must not block the IDLE transition."""
+    _patch_fix_with_stdout(
+        monkeypatch, stdout="ESCALATE: cannot recover\n"
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: (_ for _ in ()).throw(
+            RuntimeError("gh down")
+        ),
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=305, branch="pr-305")
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.is_escalated is True
+    assert any(
+        "failed to post FIX coder ESCALATE comment on PR #305" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_fix_coder_escalate_label_failures_do_not_block_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Label create/apply failures must log + continue, not block IDLE."""
+    posted, _ = _patch_fix_with_stdout(
+        monkeypatch, stdout="ESCALATE: infra error\n"
+    )
+
+    def fake_run_gh(cmd: list[str], **kwargs: Any) -> str:
+        if cmd[:3] == ["label", "create", "escalated"]:
+            raise RuntimeError("label already exists")
+        if cmd[:2] == ["pr", "edit"]:
+            raise RuntimeError("gh down")
+        return ""
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_run_gh)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=306, branch="pr-306")
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.is_escalated is True
+    assert posted and posted[0][1] == 306
+    assert any(
+        "FIX coder ESCALATE label create skipped: label already exists"
+        in entry["event"]
+        for entry in runner.state.history
+    )
+    assert any(
+        "failed to apply escalated label to PR #306: gh down"
+        in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_fix_coder_escalate_resets_no_push_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Coder ESCALATE breaks the no-push streak: a deliberate bail-out
+    must not feed the deadlock counter."""
+    _patch_fix_with_stdout(monkeypatch, stdout="ESCALATE: bail out\n")
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=307, branch="pr-307", no_push_fix_count=2
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.no_push_fix_count == 0
+    assert runner.state.current_pr.is_escalated is True
+
+
 def test_handle_fix_failure_resets_no_push_counter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
