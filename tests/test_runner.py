@@ -3506,6 +3506,11 @@ def _patch_no_push_fix(
         "post_comment",
         lambda repo, number, body: posted.append((repo, number, body)),
     )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: "",
+    )
     return posted
 
 
@@ -3704,6 +3709,11 @@ def test_handle_fix_no_push_deadlock_post_failure_still_transitions_to_hung(
         "post_comment",
         lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("gh down")),
     )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: "",
+    )
 
     runner = _make_runner()
     runner._app_config = _app_cfg(fix_no_push_cap=2)
@@ -3723,6 +3733,91 @@ def test_handle_fix_no_push_deadlock_post_failure_still_transitions_to_hung(
     )
     assert any(
         "FIX deadlock: 2 consecutive no-push FIX cycles on PR #222"
+        in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_fix_no_push_deadlock_applies_escalated_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The no-push escalation must add the ``escalated`` label so
+    ``get_open_prs`` rehydrates ``is_escalated`` after a daemon restart
+    (Codex P2 on PR #222)."""
+    posted = _patch_no_push_fix(monkeypatch, head_seq=lambda: "abc123")
+    gh_calls: list[list[str]] = []
+
+    def fake_run_gh(cmd: list[str], **kwargs: Any) -> str:
+        gh_calls.append(cmd)
+        return ""
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_run_gh)
+
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_no_push_cap=2)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=223, branch="pr-223")
+
+    asyncio.run(runner.handle_fix())
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.is_escalated is True
+    escalation_calls = [
+        cmd
+        for cmd in gh_calls
+        if cmd[:1] == ["label"] or cmd[:2] == ["pr", "edit"]
+    ]
+    assert escalation_calls == [
+        [
+            "label",
+            "create",
+            "escalated",
+            "--color",
+            "B60205",
+            "--description",
+            "Daemon escalated, manual review required",
+        ],
+        ["pr", "edit", "223", "--add-label", "escalated"],
+    ]
+    assert posted[-1][1] == 223
+
+
+def test_handle_fix_no_push_deadlock_label_failures_do_not_block_hung(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Label create/add failures must not block the HUNG transition; the
+    in-memory ``is_escalated`` flag is sufficient for the current run."""
+    _patch_no_push_fix(monkeypatch, head_seq=lambda: "abc123")
+
+    def fake_run_gh(cmd: list[str], **kwargs: Any) -> str:
+        if cmd[:3] == ["label", "create", "escalated"]:
+            raise RuntimeError("label already exists")
+        if cmd[:2] == ["pr", "edit"]:
+            raise RuntimeError("gh down")
+        return ""
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_run_gh)
+
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_no_push_cap=2)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=224, branch="pr-224")
+
+    asyncio.run(runner.handle_fix())
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.is_escalated is True
+    assert any(
+        "FIX no-push label create skipped: label already exists"
+        in entry["event"]
+        for entry in runner.state.history
+    )
+    assert any(
+        "failed to apply escalated label to PR #224: gh down"
         in entry["event"]
         for entry in runner.state.history
     )
@@ -5695,6 +5790,11 @@ def test_handle_hung_posts_codex_review_and_returns_to_watch(
         posted.append((repo, number, body))
 
     monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
 
     runner = _make_runner()
     runner.state.state = PipelineState.HUNG
@@ -5721,6 +5821,11 @@ def test_handle_hung_stays_hung_when_pr_is_escalated(
         "post_comment",
         lambda repo, number, body: posted.append((repo, number, body)),
     )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
 
     runner = _make_runner()
     assert runner.app_config.daemon.hung_fallback_codex_review is True
@@ -5740,6 +5845,43 @@ def test_handle_hung_stays_hung_when_pr_is_escalated(
     )
 
 
+def test_handle_hung_escalated_pr_resolved_externally_transitions_to_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An escalated PR that the operator manually merges/closes must
+    transition out of HUNG. The early-return on ``is_escalated`` used to
+    short-circuit the PR state check and trap the runner forever (Codex
+    P1 on PR #222)."""
+    posted: list[tuple[str, int, str]] = []
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: {"state": "MERGED"},
+    )
+
+    runner = _make_runner()
+    assert runner.app_config.daemon.hung_fallback_codex_review is True
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(
+        number=217, branch="pr-217", is_escalated=True
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-217", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_hung())
+
+    assert posted == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+    assert runner.state.current_task is None
+
+
 def test_handle_hung_sets_error_when_fallback_post_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5747,6 +5889,11 @@ def test_handle_hung_sets_error_when_fallback_post_fails(
         raise RuntimeError("gh unavailable")
 
     monkeypatch.setattr(runner_module.github_client, "post_comment", boom)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
 
     runner = _make_runner()
     runner.state.state = PipelineState.HUNG

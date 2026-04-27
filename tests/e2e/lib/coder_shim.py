@@ -22,7 +22,6 @@ VALID_SCENARIOS = {
     "hang",
     "malformed_pr",
     "slow",
-    "no_push_fail_ci",
 }
 
 

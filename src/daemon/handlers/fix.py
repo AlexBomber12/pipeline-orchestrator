@@ -79,10 +79,14 @@ class FixMixin(BreachMixin):
         """Park the PR in HUNG after consecutive no-push FIX cycles.
 
         Logs the deadlock event with the counter value, posts an
-        explanatory comment on the PR, transitions to HUNG, and resets
+        explanatory comment on the PR, applies the ``escalated`` label so
+        ``get_open_prs`` rehydrates ``is_escalated`` after a daemon
+        restart (Codex P2 on PR #222), transitions to HUNG, and resets
         the no-push counter so a future cycle out of HUNG starts fresh.
-        Comment-post failures are logged but never block the HUNG
-        transition: HUNG is the safe parking state regardless.
+        Comment- and label-post failures are logged but never block the
+        HUNG transition: HUNG is the safe parking state regardless, and
+        the in-memory ``is_escalated`` flag still holds for the current
+        run.
 
         Marks ``current_pr.is_escalated`` so ``handle_hung`` keeps the
         runner parked even when ``hung_fallback_codex_review`` is on.
@@ -102,6 +106,31 @@ class FixMixin(BreachMixin):
         except Exception as exc:
             self.log_event(
                 f"Warning: failed to post FIX deadlock comment on PR "
+                f"#{pr_number}: {exc}"
+            )
+        try:
+            github_client.run_gh(
+                [
+                    "label",
+                    "create",
+                    "escalated",
+                    "--color",
+                    "B60205",
+                    "--description",
+                    "Daemon escalated, manual review required",
+                ],
+                repo=self.owner_repo,
+            )
+        except Exception as exc:
+            self.log_event(f"FIX no-push label create skipped: {exc}")
+        try:
+            github_client.run_gh(
+                ["pr", "edit", str(pr_number), "--add-label", "escalated"],
+                repo=self.owner_repo,
+            )
+        except Exception as exc:
+            self.log_event(
+                f"Warning: failed to apply escalated label to PR "
                 f"#{pr_number}: {exc}"
             )
         current_pr.is_escalated = True
