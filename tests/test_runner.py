@@ -12766,11 +12766,19 @@ def test_handle_external_terminal_pr_state_merged_resets_counters_and_marks_done
 def test_handle_external_terminal_pr_state_swallows_mark_queue_done_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A queue-sync failure on external merge must not block the IDLE transition."""
+    """A queue-sync failure on external merge must not block the IDLE
+    transition, must log a warning, and must clear ``pending_queue_sync_*``
+    so a stale marker does not stall ``handle_idle`` (Codex P2 follow-up
+    on PR #223)."""
     runner = _make_runner()
     runner.state.current_pr = PRInfo(number=44, branch="pr-044")
 
     def fake_mark_done(self: object) -> None:
+        # Simulate _mark_queue_done's eager marker-then-fragile-op shape:
+        # set the marker, then raise to model a fetch/checkout failure
+        # mid-way through the sync.
+        self.state.pending_queue_sync_branch = "queue-done-pr-044"
+        self.state.pending_queue_sync_started_at = datetime.now(timezone.utc)
         raise RuntimeError("queue mutation failed")
 
     monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", fake_mark_done)
@@ -12779,6 +12787,12 @@ def test_handle_external_terminal_pr_state_swallows_mark_queue_done_failure(
 
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is None
+    assert runner.state.pending_queue_sync_branch is None
+    assert runner.state.pending_queue_sync_started_at is None
+    assert any(
+        "_mark_queue_done failed during external-merge cleanup" in entry["event"]
+        for entry in runner.state.history
+    )
 
 
 def test_handle_external_terminal_pr_state_logs_without_pr_number(
