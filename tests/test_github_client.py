@@ -2422,9 +2422,9 @@ def test_begin_review_cache_cycle_initializes_and_increments() -> None:
     assert github_client._review_status_cache_cycle == 2
 
 
-def test_review_cache_persists_across_cycles(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_review_cache_refreshes_across_cycles(monkeypatch: pytest.MonkeyPatch) -> None:
     clear_review_status_cache()
-    calls: list[tuple[str, int, str, str]] = []
+    statuses = [ReviewStatus.PENDING, ReviewStatus.APPROVED]
 
     def fake_compute_review_status(
         repo: str,
@@ -2432,8 +2432,13 @@ def test_review_cache_persists_across_cycles(monkeypatch: pytest.MonkeyPatch) ->
         pr_author: str,
         head_sha: str,
     ) -> ReviewStatus:
-        calls.append((repo, pr_number, pr_author, head_sha))
-        return ReviewStatus.APPROVED
+        assert (repo, pr_number, pr_author, head_sha) == (
+            "owner/name",
+            42,
+            "author",
+            "sha123",
+        )
+        return statuses.pop(0)
 
     monkeypatch.setattr(
         "src.github_client._compute_review_status",
@@ -2448,9 +2453,9 @@ def test_review_cache_persists_across_cycles(monkeypatch: pytest.MonkeyPatch) ->
         "owner/name", 42, pr_author="author", head_sha="sha123"
     )
 
-    assert result1 == ReviewStatus.APPROVED
+    assert result1 == ReviewStatus.PENDING
     assert result2 == ReviewStatus.APPROVED
-    assert calls == [("owner/name", 42, "author", "sha123")]
+    assert statuses == []
 
 
 def test_is_reaction_content_rejects_non_dict() -> None:
