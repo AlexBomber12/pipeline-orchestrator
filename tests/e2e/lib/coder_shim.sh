@@ -63,7 +63,6 @@ git_setup_branch() {
     git config user.email "shim@test.invalid"
     git config user.name "Shim Coder"
     git fetch origin
-    git fetch origin "${branch}:refs/remotes/origin/${branch}" || true
     git checkout -B "${branch}" origin/main
 }
 
@@ -75,6 +74,17 @@ write_marker_and_commit() {
     printf 'shim marker for %s at %s\n' "${pr}" "${timestamp}" >> tests/e2e-shim-marker.txt
     git add tests/e2e-shim-marker.txt
     git commit -m "${pr}: shim implementation"
+}
+
+push_branch() {
+    local branch="$1"
+    local expected
+    expected="$(git ls-remote --heads origin "${branch}" | awk '{print $1}')"
+    if [[ -n "${expected}" ]]; then
+        git push -u origin "${branch}" --force-with-lease="refs/heads/${branch}:${expected}"
+        return
+    fi
+    git push -u origin "${branch}"
 }
 
 ensure_pr_url() {
@@ -96,7 +106,7 @@ run_success() {
     local pr="$1" branch="$2"
     git_setup_branch "${branch}"
     write_marker_and_commit "${pr}"
-    git push -u origin "${branch}" --force-with-lease
+    push_branch "${branch}"
     local pr_url
     pr_url="$(ensure_pr_url "${branch}" "${pr}")"
     gh pr comment "${pr_url}" --body "@codex review"
@@ -106,7 +116,7 @@ run_no_pr() {
     local pr="$1" branch="$2"
     git_setup_branch "${branch}"
     write_marker_and_commit "${pr}"
-    git push -u origin "${branch}" --force-with-lease
+    push_branch "${branch}"
 }
 
 run_malformed_pr() {
@@ -118,7 +128,7 @@ run_malformed_pr() {
     fi
     git_setup_branch "${bad_branch}"
     write_marker_and_commit "${pr}"
-    git push -u origin "${bad_branch}" --force-with-lease
+    push_branch "${bad_branch}"
     local pr_url
     pr_url="$(ensure_pr_url "${bad_branch}" "${pr}")"
     gh pr comment "${pr_url}" --body "@codex review"
@@ -129,7 +139,7 @@ run_slow() {
     git_setup_branch "${branch}"
     sleep 30
     write_marker_and_commit "${pr}"
-    git push -u origin "${branch}" --force-with-lease
+    push_branch "${branch}"
     local pr_url
     pr_url="$(ensure_pr_url "${branch}" "${pr}")"
     gh pr comment "${pr_url}" --body "@codex review"
