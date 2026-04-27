@@ -32,12 +32,12 @@ Quick rules
 Exact trigger phrases:
 - `PLANNED PR`
 - `MICRO PR: <one sentence description>`
-- `FIX REVIEW`
+- `FIX FEEDBACK`
 
 Meaning:
 - `PLANNED PR`: the default mode. Use the active entry in `tasks/QUEUE.md` to locate the corresponding `tasks/PR-*.md` file, then work strictly from that task file.
 - `MICRO PR: ...`: a tiny change. Do not touch `tasks/QUEUE.md` and do not create `tasks/PR-*.md`.
-- `FIX REVIEW`: fix feedback on an existing PR branch.
+- `FIX FEEDBACK`: apply fixes based on CI failures and/or review feedback on an existing PR branch. The daemon now injects the latest CI failure logs (last 5000 chars) and the most recent CHANGES_REQUESTED review body directly into the prompt, so the coder receives that context inline; the coder may still fetch additional context via `gh` CLI when needed.
 
 ### Daemon Mode
 
@@ -74,7 +74,7 @@ Definitions
 
 In `PLANNED PR` and `MICRO PR` flows, the coder posts `@codex review` as a PR comment immediately after PR creation AND after every push in the Fix loop. The comment body MUST be exactly the string `@codex review` with no prefix, no escape characters, no artifact list, no summary, and no trailing text. Artifact filenames belong in the PR description only, never in the trigger comment. The daemon deduplicates: if a valid `@codex review` trigger from the PR author already exists for the current HEAD SHA, the daemon skips its own post; if not, the daemon posts one as a safety net.
 
-Fix loop (used in `FIX REVIEW` mode)
+Fix loop (used in `FIX FEEDBACK` mode)
 1. Fetch PR comments, reviews, and reactions via GitHub CLI (`gh`). No screenshots.
 2. Check for Codex thumbs up on both the PR body and the review anchor comment.
 3. If a non-stale thumbs up exists (reaction created after the latest push), stop. The PR is green.
