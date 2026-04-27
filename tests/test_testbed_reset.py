@@ -493,10 +493,11 @@ def test_reset_testbed_fixture_resets_before_and_clears_after() -> None:
     ]
 
 
-def test_stop_daemon_waits_for_user_paused_without_paused_state() -> None:
+def test_stop_daemon_waits_through_active_user_paused_state() -> None:
     module_name = "tests.e2e.conftest"
     posts: list[tuple[str, int]] = []
     opens: list[tuple[str, int]] = []
+    sleeps: list[float] = []
 
     def post(url: str, timeout: int):
         posts.append((url, timeout))
@@ -521,16 +522,25 @@ def test_stop_daemon_waits_for_user_paused_without_paused_state() -> None:
             e2e_conftest = importlib.import_module(module_name)
 
         slug = e2e_conftest.TESTBED_SLUG
-        body = f'[{{"name": "{slug}", "state": "IDLE", "user_paused": true}}]'.encode()
+        responses = iter(
+            [
+                f'[{{"name": "{slug}", "state": "CODING", "user_paused": true}}]'.encode(),
+                f'[{{"name": "{slug}", "state": "IDLE", "user_paused": true}}]'.encode(),
+            ]
+        )
 
         def urlopen(url: str, timeout: int):
             opens.append((url, timeout))
-            return _Response(body)
+            return _Response(next(responses))
 
-        with patch.object(e2e_conftest.urllib.request, "urlopen", side_effect=urlopen):
+        with (
+            patch.object(e2e_conftest.urllib.request, "urlopen", side_effect=urlopen),
+            patch.object(e2e_conftest.time, "sleep", side_effect=sleeps.append),
+        ):
             e2e_conftest._stop_daemon_and_wait_paused(slug, timeout_sec=1)
     finally:
         sys.modules.pop(module_name, None)
 
     assert posts == [(f"{e2e_conftest.TEST_DASHBOARD_URL}/repos/{slug}/stop", 10)]
-    assert opens == [(f"{e2e_conftest.TEST_DASHBOARD_URL}/api/states", 5)]
+    assert opens == [(f"{e2e_conftest.TEST_DASHBOARD_URL}/api/states", 5)] * 2
+    assert sleeps == [0.5]
