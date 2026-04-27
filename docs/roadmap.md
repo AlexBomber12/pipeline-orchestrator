@@ -1042,6 +1042,50 @@ On scaffold: append marked section to existing file (or replace between existing
 
 **Renumber:** PR-186 in this spec is **distinct** from the older "PR-186 Task content viewer" (which was originally a different number; the current number for that is PR-198 → PR-186 in the renumber table at line 358). To avoid confusion, this onboarding reconciliation PR is **PR-220** in the new sequence. Updated backlog item list above.
 
+### OBS-Z: Codex EYES race window (observed 2026-04-27)
+
+**Observed:** PR #227 (PR-170 Remove STALLED indicator) sat in WATCH state for 21 minutes with `review=EYES, ci=SUCCESS`. Codex had emoji-react'd with eyes on PR body indicating "I'm reviewing" but never delivered actual review. HUNG handler triggered at 21-min timeout, posted `@codex review` fallback, Codex responded with +1 within 1 minute, PR merged normally.
+
+**Root cause:** dual-trigger race on the Codex Connector side.
+
+- Codex auto-triggers on PR creation and push (default Connector behavior, cannot be disabled)
+- Daemon ALSO posts `@codex review` after push (defensive — covers cases where Codex auto-trigger silently fails)
+- When both triggers fire within a small window, Codex sometimes posts EYES (acknowledgment) but the actual review work hangs internally — never produces +1 or CHANGES_REQUESTED
+- Only HUNG timeout (20 min default) recovers via re-trigger
+
+**Trade-off observed in dual-trigger design:**
+
+- DEFENSIVE side: Codex auto-trigger sometimes silently fails (their rate limit, transient error). Daemon's `@codex review` post is the only recovery path. Without it — silent permanent stuck.
+- COST side: when both triggers race, ~5-15% of PRs hit EYES-stuck state. 21+ minute recovery via HUNG.
+
+**Solution direction (PR-181 candidate, post-Stage-3 batch):**
+
+Combination of two approaches:
+
+1. **Pre-push state check (avoid creating race):** before daemon posts `@codex review`, check current PR state via `gh pr view --json reactions,reviews`. If Codex already reacted with EYES on PR body (auto-trigger fired first) → SKIP posting duplicate. Log: "Codex auto-trigger detected, skipping duplicate @codex review post."
+
+2. **Differentiated stale threshold (faster recovery from existing race):** new config field `stale_review_threshold_eyes_min: 5` (separate from general `stale_review_threshold_min: 10`). When review state is EYES and last activity older than 5 minutes — re-trigger as stale. EYES is recognized stuck pattern; treat with shorter timeout than CHANGES_REQUESTED (which represents legitimate active review work).
+
+3. **Analytics counter:** count "EYES race events recovered via pre-push check" vs "EYES race events recovered via 5-min stale retrigger" vs "EYES race events escalated to HUNG". Informs whether fix is effective; visible in dashboard or API endpoint.
+
+**Files to touch (PR-181 spec sketch):**
+
+- `src/daemon/handlers/coding.py` and `fix.py`: before `_post_codex_review` calls, add pre-push state check (~10 lines).
+- `src/daemon/handlers/watch.py`: add EYES branch to `_maybe_retrigger_stale_review` with shorter threshold (~15 lines).
+- `config.yml`, `config.test.yml`: add `stale_review_threshold_eyes_min` field (default 5).
+- `src/web/`: optional UI counter for EYES race telemetry (~30 lines).
+- Tests: 5-7 new unit tests covering pre-push skip, EYES retrigger, threshold comparison.
+
+**Total size:** small-medium, ~50-80 LoC product + tests.
+
+**Priority:** medium. Quality-of-life improvement, not blocker. Loses ~21 minutes per stuck PR; current cycle is ~5-10 PRs/day so estimated cost is ~1-2 hours/day of waste. Worth fixing in post-Stage-3 batch alongside PR-180 (debug logging) and PR-181 (this).
+
+**Relationship to PR-166 (coder ESCALATE protocol):** PR-166 handles coder-side stuck. This (PR-181) handles Codex-side stuck. Two different agents, both can stall; both deserve targeted recovery mechanisms.
+
+**Backlog item:**
+
+- **PR-181:** Codex EYES race resolution (pre-push state check + differentiated stale threshold + analytics counter).
+
 ---
 
 ## Deferred / Round 4
