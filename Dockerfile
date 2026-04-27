@@ -22,13 +22,20 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
+# CLI versions are pinned to known-working releases. See
+# docs/runbooks/upgrade-cli-versions.md for the upgrade procedure.
+# Override at build time, e.g.:
+#   docker build --build-arg CLAUDE_CODE_VERSION=2.2.0 .
+ARG CLAUDE_CODE_VERSION=2.1.119
+ARG CODEX_VERSION=0.125.0
+
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install -g @anthropic-ai/claude-code
+    && npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 RUN mkdir -p /home/runner/.npm-global \
-    && npm i -g --prefix /home/runner/.npm-global @openai/codex
+    && npm i -g --prefix /home/runner/.npm-global @openai/codex@${CODEX_VERSION}
 ENV PATH="/home/runner/.npm-global/bin:${PATH}"
 
 RUN useradd -m -u 1000 runner \

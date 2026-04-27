@@ -83,3 +83,5 @@ auth:
 For one-time setup of GitHub Actions integration tests (GitHub App provisioning), see [docs/ci-setup.md](docs/ci-setup.md).
 
 For local debugging of e2e tests (running tests against a local test stack outside of CI), see [docs/local-e2e.md](docs/local-e2e.md).
+
+The `@anthropic-ai/claude-code` and `@openai/codex` CLI versions are pinned in `Dockerfile` via build args. See [docs/runbooks/upgrade-cli-versions.md](docs/runbooks/upgrade-cli-versions.md) to upgrade.
