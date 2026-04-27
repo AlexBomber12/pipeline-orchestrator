@@ -12973,6 +12973,133 @@ def test_handle_fix_normal_completion_cancels_polling_task(
     assert cancellations == [True]
 
 
+def test_handle_fix_external_merge_when_coder_exits_during_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the polling task sets the terminal flag but the coder finishes
+    naturally before the cancellation lands (so ``target.cancel()`` is a
+    no-op and ``await claude_task`` returns normally), the post-finally
+    branch must still drive IDLE on MERGED (Codex P1 on PR #223)."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "post_comment", lambda *a, **kw: None
+    )
+
+    async def fake_poll(
+        self: object,
+        pr_number: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        terminal_flag: dict[str, str | None],
+    ) -> None:
+        # Set the flag but do not cancel ``target``: simulate the race
+        # where the coder finishes during the SIGTERM grace.
+        terminal_flag["state"] = "MERGED"
+
+    monkeypatch.setattr(
+        fix_module.FixMixin, "_poll_github_during_fix", fake_poll
+    )
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", _async_cli_result(0, "", "")
+    )
+
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_poll_interval_sec=1)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=81, branch="pr-081", no_push_fix_count=1, fix_iteration_count=2,
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+    assert runner.state.error_message is None
+    assert any(
+        "merged externally during FIX" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_external_terminal_pr_state_merged_saves_success_merged_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """External MERGED in FIX must finalize the run record as ``success_merged``
+    so dashboard / metrics views don't see it stuck on ``coding_complete``
+    (Codex P2 on PR #223)."""
+    runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-091",
+        title="external merge",
+        status=TaskStatus.DOING,
+        branch="pr-091",
+        task_file="tasks/PR-091.md",
+    )
+    runner.state.current_pr = PRInfo(number=91, branch="pr-091")
+    runner._start_current_run_record("claude", "opus")
+
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+    monkeypatch.setattr(
+        runner, "_compute_diff_stats", lambda base_branch: {}
+    )
+
+    saved: list[str] = []
+    original_save = runner._save_current_run_record
+
+    async def spy_save(exit_reason: str, **kwargs: object) -> None:
+        saved.append(exit_reason)
+        await original_save(exit_reason, **kwargs)
+
+    runner._save_current_run_record = spy_save  # type: ignore[assignment]
+
+    asyncio.run(runner._handle_external_terminal_pr_state("MERGED"))
+
+    assert saved == ["success_merged"]
+    assert runner._current_run_record is None
+    assert runner.state.state == PipelineState.IDLE
+
+
+def test_terminate_current_coder_uses_configured_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``daemon.coder_terminate_grace_sec`` must drive the SIGTERM-to-SIGKILL
+    grace (Codex P3 on PR #223). Operators must be able to tune the grace
+    via config rather than the value being hard-coded."""
+    runner = _make_runner()
+    runner._app_config = _app_cfg(coder_terminate_grace_sec=42)
+
+    captured_timeouts: list[float] = []
+
+    class _Proc:
+        returncode = None
+
+        def terminate(self) -> None:
+            return None
+
+        async def wait(self) -> None:
+            return None
+
+    runner._current_coder_process = _Proc()
+
+    original_wait_for = asyncio.wait_for
+
+    async def fake_wait_for(coro: object, timeout: float) -> object:
+        captured_timeouts.append(timeout)
+        return await original_wait_for(coro, timeout)
+
+    monkeypatch.setattr(
+        runner_module.asyncio, "wait_for", fake_wait_for
+    )
+
+    asyncio.run(runner._terminate_current_coder())
+
+    assert captured_timeouts == [42]
+
+
 def test_handle_watch_stale_feedback_still_times_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

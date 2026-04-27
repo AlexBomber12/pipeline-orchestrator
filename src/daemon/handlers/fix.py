@@ -307,6 +307,8 @@ class FixMixin(BreachMixin):
                 f"PR {pr_number_str} merged externally during FIX, "
                 "returning to IDLE."
             )
+            await self._save_current_run_record("success_merged")
+            self._current_run_record = None
             with contextlib.suppress(Exception):
                 self._mark_queue_done()
             self.state.current_pr = None
@@ -476,10 +478,13 @@ class FixMixin(BreachMixin):
                 stop_cancelled = True
                 code, stdout, stderr = 1, "", ""
             elif external_state_flag["state"] is not None:
-                await self._handle_external_terminal_pr_state(
-                    external_state_flag["state"]  # type: ignore[arg-type]
-                )
-                return
+                # External terminal state observed by the polling task;
+                # the post-finally external-state branch drives the
+                # transition so the same code path also covers the race
+                # where the coder finished during the SIGTERM grace
+                # window and ``target.cancel()`` became a no-op (Codex
+                # P1 on PR #223).
+                code, stdout, stderr = 1, "", ""
             elif breach_flag["breached"]:
                 if self.state.current_pr is not None:
                     # Breach pause is not a no-push success; reset the
@@ -532,6 +537,11 @@ class FixMixin(BreachMixin):
             if coder_name == "claude":
                 self._check_late_breach(breach_dir, breach_run_id, breach_flag)
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
+        if external_state_flag["state"] is not None and not stop_cancelled:
+            await self._handle_external_terminal_pr_state(
+                external_state_flag["state"]  # type: ignore[arg-type]
+            )
+            return
         if breach_flag["breached"]:
             if self.state.current_pr is not None:
                 # Late-breach pause is not a no-push success; reset the
