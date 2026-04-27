@@ -12813,15 +12813,41 @@ def test_handle_external_terminal_pr_state_logs_without_pr_number(
     )
 
 
-def test_handle_external_terminal_pr_state_closed_transitions_to_hung() -> None:
-    """Detected external close must transition runner to HUNG for manual review."""
+def test_handle_external_terminal_pr_state_closed_transitions_to_hung(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Detected external close must transition runner to HUNG for manual
+    review AND finalize the active run record as ``closed_unmerged`` so
+    the next ``handle_hung`` -> IDLE tick does not strand the run with
+    a missing ``ended_at`` / ``exit_reason`` (Codex P2 follow-up on PR
+    #223)."""
     runner = _make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-055",
+        title="external close",
+        status=TaskStatus.DOING,
+        branch="pr-055",
+        task_file="tasks/PR-055.md",
+    )
     runner.state.current_pr = PRInfo(number=55, branch="pr-055")
+    runner._start_current_run_record("claude", "opus")
+    monkeypatch.setattr(runner, "_compute_diff_stats", lambda base_branch: {})
+
+    saved: list[str] = []
+    original_save = runner._save_current_run_record
+
+    async def spy_save(exit_reason: str, **kwargs: object) -> None:
+        saved.append(exit_reason)
+        await original_save(exit_reason, **kwargs)
+
+    runner._save_current_run_record = spy_save  # type: ignore[assignment]
 
     asyncio.run(runner._handle_external_terminal_pr_state("CLOSED"))
 
     assert runner.state.state == PipelineState.HUNG
     assert runner.state.error_message is None
+    assert saved == ["closed_unmerged"]
+    assert runner._current_run_record is None
     assert any(
         "PR #55 closed externally during FIX, transitioning to HUNG."
         in entry["event"]

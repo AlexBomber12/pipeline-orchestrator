@@ -337,6 +337,13 @@ class FixMixin(BreachMixin):
             f"PR {pr_number_str} closed externally during FIX, "
             "transitioning to HUNG."
         )
+        # Finalize the run record before parking in HUNG. Otherwise the
+        # next ``handle_hung`` tick will move the runner to IDLE and
+        # clear ``current_task`` while ``ended_at`` / ``exit_reason``
+        # are still unset, leaving incomplete metrics for the closed
+        # PR (Codex P2 follow-up on PR #223).
+        await self._save_current_run_record("closed_unmerged")
+        self._current_run_record = None
         self.state.error_message = None
         self.state.state = PipelineState.HUNG
         await self.publish_state()
