@@ -22,14 +22,11 @@
 <section data-repo-summary>
 <header class="mb-6 flex flex-col items-start gap-3 sm:flex-row sm:flex-wrap sm:items-center">
     <h2 class="max-w-full truncate font-mono text-xl text-gray-100 sm:text-2xl">{{ repo.name }}</h2>
-    <span class="inline-flex items-center gap-2"
-          data-state-indicator
-          data-updated-at="{{ repo.last_updated.isoformat() if repo.last_updated else '' }}">
+    <span class="inline-flex items-center gap-2">
         <span class="inline-flex items-center gap-2 text-xs font-medium px-2 py-0.5 rounded border {{ style.badge }}" data-state-label>
             <span class="w-2.5 h-2.5 rounded-full {{ style.dot }} {% if style.detail_pulse %}pulse-dot{% endif %} shrink-0" data-state-dot></span>
             {{ repo.state.value }}
         </span>
-        <span class="hidden text-[11px] font-medium uppercase tracking-wide text-gray-500" data-stalled-hint>stalled</span>
     </span>
     <form hx-post="/repos/{{ repo.name }}/coder"
           hx-target="closest [data-repo-summary]"

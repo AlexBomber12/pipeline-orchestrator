@@ -61,9 +61,7 @@
         <div class="mb-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div class="flex min-w-0 items-center gap-2">
                 <a href="/repo/{{ repo.name }}" class="font-mono text-sm text-white truncate hover:text-accent transition-colors">{{ repo.name }}</a>
-                <span class="inline-flex items-center gap-2"
-                      data-state-indicator
-                      data-updated-at="{{ repo.last_updated.isoformat() if repo.last_updated else '' }}">
+                <span class="inline-flex items-center gap-2">
                     {% if is_synthetic %}
                     <span class="w-2.5 h-2.5 rounded-full bg-warn pulse-dot shrink-0" data-state-dot></span>
                     {% else %}
@@ -78,7 +76,6 @@
                         {{ repo.state.value }}
                     </span>
                     {% endif %}
-                    <span class="hidden text-[11px] font-medium uppercase tracking-wide text-gray-500" data-stalled-hint>stalled</span>
                 </span>
             </div>
             <div class="flex w-full flex-wrap items-center justify-between gap-2 sm:w-auto sm:justify-end">
