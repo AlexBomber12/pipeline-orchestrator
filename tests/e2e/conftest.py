@@ -198,12 +198,21 @@ def upload_zip():
 
 @pytest.fixture
 def reset_testbed():
+    setup_error = None
     try:
         _stop_daemon_and_wait_paused(TESTBED_SLUG)
         reset_testbed_full(TESTBED_SLUG)
         clear_testbed_redis_state(TESTBED_SLUG)
+    except Exception as exc:
+        setup_error = exc
+        raise
     finally:
-        _resume_daemon(TESTBED_SLUG)
+        try:
+            _resume_daemon(TESTBED_SLUG)
+        except Exception as exc:
+            if setup_error is None:
+                raise
+            setup_error.add_note(f"resume failed after reset setup error: {exc}")
     yield
     clear_testbed_redis_state(TESTBED_SLUG)
 

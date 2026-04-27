@@ -503,6 +503,7 @@ def test_reset_testbed_fixture_resumes_when_stop_wait_fails() -> None:
 
     def resume_daemon(slug: str) -> None:
         calls.append(f"resume:{slug}")
+        raise RuntimeError("resume failed")
 
     def unexpected_call(slug: str):
         calls.append(f"unexpected:{slug}")
@@ -519,7 +520,7 @@ def test_reset_testbed_fixture_resumes_when_stop_wait_fails() -> None:
             patch.object(e2e_conftest, "clear_testbed_redis_state", side_effect=unexpected_call),
         ):
             fixture = e2e_conftest.reset_testbed.__wrapped__()
-            with pytest.raises(RuntimeError, match="stop timed out"):
+            with pytest.raises(RuntimeError, match="stop timed out") as excinfo:
                 next(fixture)
     finally:
         sys.modules.pop(module_name, None)
@@ -528,6 +529,7 @@ def test_reset_testbed_fixture_resumes_when_stop_wait_fails() -> None:
         f"stop:{e2e_conftest.TESTBED_SLUG}",
         f"resume:{e2e_conftest.TESTBED_SLUG}",
     ]
+    assert excinfo.value.__notes__ == ["resume failed after reset setup error: resume failed"]
 
 
 def test_stop_daemon_waits_for_runner_pause_ack() -> None:
