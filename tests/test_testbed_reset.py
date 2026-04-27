@@ -460,12 +460,20 @@ def test_reset_testbed_fixture_resets_before_and_clears_after() -> None:
         calls.append(f"clear:{slug}")
         return 0
 
+    def stop_daemon(slug: str) -> None:
+        calls.append(f"stop:{slug}")
+
+    def resume_daemon(slug: str) -> None:
+        calls.append(f"resume:{slug}")
+
     sys.modules.pop(module_name, None)
     try:
         with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
             e2e_conftest = importlib.import_module(module_name)
 
         with (
+            patch.object(e2e_conftest, "_stop_daemon_and_wait_paused", side_effect=stop_daemon),
+            patch.object(e2e_conftest, "_resume_daemon", side_effect=resume_daemon),
             patch.object(e2e_conftest, "reset_testbed_full", side_effect=reset_full),
             patch.object(e2e_conftest, "clear_testbed_redis_state", side_effect=clear_redis),
         ):
@@ -477,7 +485,9 @@ def test_reset_testbed_fixture_resets_before_and_clears_after() -> None:
         sys.modules.pop(module_name, None)
 
     assert calls == [
+        f"stop:{e2e_conftest.TESTBED_SLUG}",
         f"reset:{e2e_conftest.TESTBED_SLUG}",
         f"clear:{e2e_conftest.TESTBED_SLUG}",
+        f"resume:{e2e_conftest.TESTBED_SLUG}",
         f"clear:{e2e_conftest.TESTBED_SLUG}",
     ]
