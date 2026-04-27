@@ -561,7 +561,7 @@
 - Branch: pr-167-fix-feedback-with-ci-logs
 
 ## PR-168: Pin npm versions for claude-code and codex CLIs
-- Status: TODO
+- Status: DOING
 - Tasks file: tasks/PR-168.md
 - Branch: pr-168-npm-version-pinning
 
