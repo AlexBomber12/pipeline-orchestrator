@@ -1,5 +1,4 @@
 import json
-import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -9,11 +8,10 @@ from pathlib import Path
 import pytest
 import requests
 
-from tests.e2e.lib.testbed_reset import reset_testbed_full, wipe_tasks_dir_on_main
+from tests.e2e.lib.testbed_reset import clear_testbed_redis_state, reset_testbed_full
 
 TEST_DASHBOARD_URL = "http://localhost:18800"
 TESTBED_SLUG = "AlexBomber12__pipeline-orchestrator-testbed"
-TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
 REPO_DIR = Path(__file__).resolve().parents[2]
 TEST_DATA_DIR = REPO_DIR / "tests/e2e/data"
 EVIDENCE_DIR = REPO_DIR / "tests/e2e/evidence"
@@ -25,9 +23,10 @@ collect_ignore = ["data"]
 def _reset_testbed_session():
     """Reset testbed to a known-clean state at session start.
 
-    Closes open PRs, deletes non-main branches, wipes tasks/ on main. Runs
-    ONCE per pytest session before any test. The per-test reset_testbed
-    fixture handles lighter cleanup between individual tests.
+    Closes open PRs, deletes non-main branches, wipes tasks/ on main, and
+    clears Redis state for the testbed slug. Runs ONCE per pytest session
+    before any test. The per-test reset_testbed fixture resets before each
+    test and clears Redis state again at teardown.
 
     ``reset_testbed_full()`` raises on hard failures (listing call failed,
     clone/commit/push failed). We deliberately do NOT swallow that error:
@@ -35,7 +34,8 @@ def _reset_testbed_session():
     running e2e tests against a polluted testbed produces nondeterministic
     failures that are far worse than a loud setup abort.
     """
-    counts = reset_testbed_full()
+    counts = reset_testbed_full(TESTBED_SLUG)
+    counts["redis_keys_deleted"] = clear_testbed_redis_state(TESTBED_SLUG)
     yield counts
 
 
@@ -154,52 +154,12 @@ def upload_zip():
     return _upload_zip
 
 
-def _close_open_testbed_prs() -> None:
-    listing = subprocess.run(
-        [
-            "gh",
-            "pr",
-            "list",
-            "-R",
-            TESTBED_REPO,
-            "--state",
-            "open",
-            "--json",
-            "number",
-            "--jq",
-            ".[].number",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    for line in listing.stdout.splitlines():
-        number = line.strip()
-        if not number:
-            continue
-        subprocess.run(
-            [
-                "gh",
-                "pr",
-                "close",
-                number,
-                "-R",
-                TESTBED_REPO,
-                "--delete-branch",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-
 @pytest.fixture
 def reset_testbed():
-    _close_open_testbed_prs()
-    wipe_tasks_dir_on_main()
+    reset_testbed_full(TESTBED_SLUG)
+    clear_testbed_redis_state(TESTBED_SLUG)
     yield
-    _close_open_testbed_prs()
-    wipe_tasks_dir_on_main()
+    clear_testbed_redis_state(TESTBED_SLUG)
 
 
 @pytest.fixture
