@@ -554,3 +554,71 @@
 - Status: DONE
 - Tasks file: tasks/PR-165.md
 - Branch: pr-165-poll-github-during-fix
+
+## PR-167: CI logs in FIX prompt and rename FIX REVIEW → FIX FEEDBACK
+- Status: TODO
+- Tasks file: tasks/PR-167.md
+- Branch: pr-167-fix-feedback-with-ci-logs
+
+## PR-168: Pin npm versions for claude-code and codex CLIs
+- Status: TODO
+- Tasks file: tasks/PR-168.md
+- Branch: pr-168-npm-version-pinning
+
+## PR-169: Hot reload config.yml on file change
+- Status: TODO
+- Tasks file: tasks/PR-169.md
+- Branch: pr-169-config-hot-reload-file-watch
+
+## PR-170: Remove STALLED indicator
+- Status: TODO
+- Tasks file: tasks/PR-170.md
+- Branch: pr-170-remove-stalled
+
+## PR-171: Spinners on upload and settings forms
+- Status: TODO
+- Tasks file: tasks/PR-171.md
+- Branch: pr-171-spinners-upload-settings
+
+## PR-172: Spinners on _controls.html and coder selector
+- Status: TODO
+- Tasks file: tasks/PR-172.md
+- Branch: pr-172-spinners-controls-selector
+- Depends on: PR-171
+
+## PR-173: Fuzzy dedup in log_event (regex numeric counter parts)
+- Status: TODO
+- Tasks file: tasks/PR-173.md
+- Branch: pr-173-log-event-fuzzy-dedup
+
+## PR-174: Event log dedup display (Lucide rotate-ccw + count badge)
+- Status: TODO
+- Tasks file: tasks/PR-174.md
+- Branch: pr-174-event-log-dedup-display
+- Depends on: PR-173
+
+## PR-175: Light-theme dropdown fix (color-scheme dark)
+- Status: TODO
+- Tasks file: tasks/PR-175.md
+- Branch: pr-175-light-theme-dropdown-fix
+
+## PR-176: Tasks viewer in repo detail page
+- Status: TODO
+- Tasks file: tasks/PR-176.md
+- Branch: pr-176-tasks-viewer
+
+## PR-177: HTMX whitelist 400 status for validation error display
+- Status: TODO
+- Tasks file: tasks/PR-177.md
+- Branch: pr-177-htmx-400-whitelist
+
+## PR-178: Pulse animation jump fix (smooth opacity transition)
+- Status: TODO
+- Tasks file: tasks/PR-178.md
+- Branch: pr-178-pulse-animation-jump-fix
+
+## PR-179: Pulse badge replaces pulse dot for active states
+- Status: TODO
+- Tasks file: tasks/PR-179.md
+- Branch: pr-179-pulse-badge-not-dot
+- Depends on: PR-178
