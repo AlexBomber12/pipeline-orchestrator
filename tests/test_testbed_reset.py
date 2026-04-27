@@ -491,3 +491,46 @@ def test_reset_testbed_fixture_resets_before_and_clears_after() -> None:
         f"resume:{e2e_conftest.TESTBED_SLUG}",
         f"clear:{e2e_conftest.TESTBED_SLUG}",
     ]
+
+
+def test_stop_daemon_waits_for_user_paused_without_paused_state() -> None:
+    module_name = "tests.e2e.conftest"
+    posts: list[tuple[str, int]] = []
+    opens: list[tuple[str, int]] = []
+
+    def post(url: str, timeout: int):
+        posts.append((url, timeout))
+        return types.SimpleNamespace(status_code=204)
+
+    class _Response:
+        def __init__(self, body: bytes) -> None:
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self) -> bytes:
+            return self.body
+
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace(post=post)}):
+            e2e_conftest = importlib.import_module(module_name)
+
+        slug = e2e_conftest.TESTBED_SLUG
+        body = f'[{{"name": "{slug}", "state": "IDLE", "user_paused": true}}]'.encode()
+
+        def urlopen(url: str, timeout: int):
+            opens.append((url, timeout))
+            return _Response(body)
+
+        with patch.object(e2e_conftest.urllib.request, "urlopen", side_effect=urlopen):
+            e2e_conftest._stop_daemon_and_wait_paused(slug, timeout_sec=1)
+    finally:
+        sys.modules.pop(module_name, None)
+
+    assert posts == [(f"{e2e_conftest.TEST_DASHBOARD_URL}/repos/{slug}/stop", 10)]
+    assert opens == [(f"{e2e_conftest.TEST_DASHBOARD_URL}/api/states", 5)]

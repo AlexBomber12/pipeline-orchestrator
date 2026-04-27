@@ -26,6 +26,7 @@ def _stop_daemon_and_wait_paused(slug: str, timeout_sec: int = 30) -> None:
 
     deadline = time.monotonic() + timeout_sec
     last_state = None
+    last_user_paused = None
     while time.monotonic() < deadline:
         try:
             with urllib.request.urlopen(f"{TEST_DASHBOARD_URL}/api/states", timeout=5) as resp:
@@ -37,13 +38,14 @@ def _stop_daemon_and_wait_paused(slug: str, timeout_sec: int = 30) -> None:
             for entry in entries:
                 if entry.get("name") == slug or entry.get("slug") == slug:
                     last_state = entry.get("state")
-                    if last_state == "PAUSED":
+                    last_user_paused = entry.get("user_paused")
+                    if last_state == "PAUSED" or last_user_paused is True:
                         return
         time.sleep(0.5)
 
     raise RuntimeError(
         f"timed out after {timeout_sec}s waiting for daemon to pause for {slug}; "
-        f"last seen state={last_state!r}"
+        f"last seen state={last_state!r}, user_paused={last_user_paused!r}"
     )
 
 
