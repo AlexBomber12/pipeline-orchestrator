@@ -198,8 +198,8 @@ def upload_zip():
 
 @pytest.fixture
 def reset_testbed():
-    _stop_daemon_and_wait_paused(TESTBED_SLUG)
     try:
+        _stop_daemon_and_wait_paused(TESTBED_SLUG)
         reset_testbed_full(TESTBED_SLUG)
         clear_testbed_redis_state(TESTBED_SLUG)
     finally:

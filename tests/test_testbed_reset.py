@@ -493,6 +493,43 @@ def test_reset_testbed_fixture_resets_before_and_clears_after() -> None:
     ]
 
 
+def test_reset_testbed_fixture_resumes_when_stop_wait_fails() -> None:
+    module_name = "tests.e2e.conftest"
+    calls: list[str] = []
+
+    def stop_daemon(slug: str) -> None:
+        calls.append(f"stop:{slug}")
+        raise RuntimeError("stop timed out")
+
+    def resume_daemon(slug: str) -> None:
+        calls.append(f"resume:{slug}")
+
+    def unexpected_call(slug: str):
+        calls.append(f"unexpected:{slug}")
+
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
+            e2e_conftest = importlib.import_module(module_name)
+
+        with (
+            patch.object(e2e_conftest, "_stop_daemon_and_wait_paused", side_effect=stop_daemon),
+            patch.object(e2e_conftest, "_resume_daemon", side_effect=resume_daemon),
+            patch.object(e2e_conftest, "reset_testbed_full", side_effect=unexpected_call),
+            patch.object(e2e_conftest, "clear_testbed_redis_state", side_effect=unexpected_call),
+        ):
+            fixture = e2e_conftest.reset_testbed.__wrapped__()
+            with pytest.raises(RuntimeError, match="stop timed out"):
+                next(fixture)
+    finally:
+        sys.modules.pop(module_name, None)
+
+    assert calls == [
+        f"stop:{e2e_conftest.TESTBED_SLUG}",
+        f"resume:{e2e_conftest.TESTBED_SLUG}",
+    ]
+
+
 def test_stop_daemon_waits_for_runner_pause_ack() -> None:
     module_name = "tests.e2e.conftest"
     posts: list[tuple[str, int]] = []
