@@ -12464,6 +12464,515 @@ def test_monitor_fix_idle_logs_poll_failures_before_timing_out(
     ]
 
 
+def test_run_coder_with_polling_returns_none_when_pr_number_is_zero() -> None:
+    """No PR is in flight yet, so the polling task must not be spawned."""
+    runner = _make_runner()
+    target = asyncio.new_event_loop().create_future()
+    try:
+        result = runner._run_coder_with_polling(0, target, {"state": None})
+    finally:
+        target.cancel()
+    assert result is None
+
+
+def test_github_api_budget_paused_handles_no_cache() -> None:
+    """A missing budget snapshot must not throttle the polling loop."""
+    runner = _make_runner()
+    runner._github_api_budget_cache = None
+    assert runner._github_api_budget_paused() is False
+
+
+def test_github_api_budget_paused_when_remaining_below_threshold() -> None:
+    """A critical cached budget must pause the polling iteration."""
+    runner = _make_runner()
+    runner._github_api_budget_cache = runner_module.RateLimitBudget(
+        installation_id=None,
+        remaining=10,
+        limit=5000,
+        reset_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+    )
+    runner._app_config = _app_cfg(github_api_pause_threshold_percent=5)
+    assert runner._github_api_budget_paused() is True
+
+
+def test_github_api_budget_paused_returns_false_when_reset_elapsed() -> None:
+    """A stale snapshot whose reset has passed must not block polling."""
+    runner = _make_runner()
+    runner._github_api_budget_cache = runner_module.RateLimitBudget(
+        installation_id=None,
+        remaining=10,
+        limit=5000,
+        reset_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    runner._app_config = _app_cfg(github_api_pause_threshold_percent=5)
+    assert runner._github_api_budget_paused() is False
+
+
+def test_github_api_budget_paused_returns_false_when_above_threshold() -> None:
+    """A healthy budget must not throttle observability polling."""
+    runner = _make_runner()
+    runner._github_api_budget_cache = runner_module.RateLimitBudget(
+        installation_id=None,
+        remaining=4_500,
+        limit=5_000,
+        reset_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+    )
+    runner._app_config = _app_cfg(github_api_pause_threshold_percent=5)
+    assert runner._github_api_budget_paused() is False
+
+
+def test_poll_github_during_fix_skips_iteration_when_budget_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the cached GH API budget is critical the loop must not call gh."""
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_poll_interval_sec=1)
+    runner._github_api_budget_cache = runner_module.RateLimitBudget(
+        installation_id=None,
+        remaining=1,
+        limit=5_000,
+        reset_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+    )
+
+    pr_state_calls: list[tuple[str, int]] = []
+
+    def fake_pr_state(repo: str, number: int) -> dict[str, str | None] | None:
+        pr_state_calls.append((repo, number))
+        return {"state": "MERGED", "mergedAt": "now", "closedAt": None}
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        if len(sleeps) >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(fix_module.github_client, "pr_state", fake_pr_state)
+
+    async def run_loop() -> None:
+        loop = asyncio.get_running_loop()
+        target_fut: asyncio.Future[None] = loop.create_future()
+
+        async def hold() -> None:
+            await target_fut
+
+        target = asyncio.create_task(hold())
+        with contextlib.suppress(asyncio.CancelledError):
+            await runner._poll_github_during_fix(7, target, {"state": None})
+        target.cancel()
+        with contextlib.suppress(BaseException):
+            await target
+
+    asyncio.run(run_loop())
+
+    assert pr_state_calls == []
+    assert sleeps == [1, 1]
+
+
+def test_poll_github_during_fix_logs_and_continues_on_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``gh pr view`` failures must be logged and not crash the loop."""
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_poll_interval_sec=1)
+    events: list[str] = []
+    monkeypatch.setattr(runner, "log_event", events.append)
+
+    sequence: list[Any] = [RuntimeError("rate-limit"), None]
+
+    def fake_pr_state(repo: str, number: int) -> dict[str, str | None] | None:
+        result = sequence.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        if len(sleeps) >= len(sequence) + 2:
+            raise asyncio.CancelledError
+
+    async def fake_to_thread(func: Any, *args: object, **kwargs: object) -> Any:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_module.github_client, "pr_state", fake_pr_state)
+
+    async def run_loop() -> None:
+        loop = asyncio.get_running_loop()
+        target_fut: asyncio.Future[None] = loop.create_future()
+
+        async def hold() -> None:
+            await target_fut
+
+        target = asyncio.create_task(hold())
+        with contextlib.suppress(asyncio.CancelledError):
+            await runner._poll_github_during_fix(11, target, {"state": None})
+        target.cancel()
+        with contextlib.suppress(BaseException):
+            await target
+
+    asyncio.run(run_loop())
+
+    assert any("GitHub poll for PR #11 failed: rate-limit" in e for e in events)
+    assert any("returned no data" in e for e in events)
+
+
+def test_poll_github_during_fix_continues_when_pr_remains_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``OPEN`` payload must not trigger termination; the loop continues."""
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_poll_interval_sec=1)
+
+    sequence: list[dict[str, str | None]] = [
+        {"state": "OPEN", "mergedAt": None, "closedAt": None},
+        {"state": "MERGED", "mergedAt": "now", "closedAt": None},
+    ]
+
+    def fake_pr_state(repo: str, number: int) -> dict[str, str | None]:
+        return sequence.pop(0)
+
+    terminated: list[bool] = []
+
+    async def fake_terminate() -> None:
+        terminated.append(True)
+
+    monkeypatch.setattr(runner, "_terminate_current_coder", fake_terminate)
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    async def fake_to_thread(func: Any, *args: object, **kwargs: object) -> Any:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_module.github_client, "pr_state", fake_pr_state)
+
+    async def run_loop() -> dict[str, str | None]:
+        loop = asyncio.get_running_loop()
+        target_fut: asyncio.Future[None] = loop.create_future()
+
+        async def hold() -> None:
+            await target_fut
+
+        target = asyncio.create_task(hold())
+        flag: dict[str, str | None] = {"state": None}
+        await runner._poll_github_during_fix(7, target, flag)
+        with contextlib.suppress(BaseException):
+            await target
+        return flag
+
+    flag = asyncio.run(run_loop())
+    assert flag == {"state": "MERGED"}
+    assert terminated == [True]
+
+
+def test_poll_github_during_fix_terminates_coder_on_external_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On detected MERGED, the loop must terminate the coder and cancel target."""
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_poll_interval_sec=1)
+    events: list[str] = []
+    monkeypatch.setattr(runner, "log_event", events.append)
+    terminated = []
+
+    async def fake_terminate() -> None:
+        terminated.append(True)
+
+    monkeypatch.setattr(runner, "_terminate_current_coder", fake_terminate)
+
+    def fake_pr_state(repo: str, number: int) -> dict[str, str | None]:
+        return {"state": "merged", "mergedAt": "now", "closedAt": None}
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    async def fake_to_thread(func: Any, *args: object, **kwargs: object) -> Any:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_module.github_client, "pr_state", fake_pr_state)
+
+    async def run_loop() -> tuple[dict[str, str | None], asyncio.Task[None]]:
+        loop = asyncio.get_running_loop()
+        target_fut: asyncio.Future[None] = loop.create_future()
+
+        async def hold() -> None:
+            await target_fut
+
+        target = asyncio.create_task(hold())
+        flag: dict[str, str | None] = {"state": None}
+        await runner._poll_github_during_fix(99, target, flag)
+        with contextlib.suppress(BaseException):
+            await target
+        return flag, target
+
+    flag, target = asyncio.run(run_loop())
+
+    assert flag == {"state": "MERGED"}
+    assert terminated == [True]
+    assert target.cancelled() is True
+    assert any(
+        "PR #99 reached terminal state MERGED during FIX" in e
+        for e in events
+    )
+
+
+def test_handle_external_terminal_pr_state_merged_resets_counters_and_marks_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Detected external merge must reset counters and clean up bookkeeping."""
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(
+        number=42,
+        branch="pr-042",
+        no_push_fix_count=2,
+        fix_iteration_count=4,
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-042",
+        title="external merge",
+        status=TaskStatus.DOING,
+        branch="pr-042",
+    )
+
+    queue_done_calls = {"count": 0}
+
+    def fake_mark_done(self: object) -> None:
+        queue_done_calls["count"] += 1
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", fake_mark_done)
+
+    asyncio.run(runner._handle_external_terminal_pr_state("MERGED"))
+
+    assert queue_done_calls["count"] == 1
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+    assert runner.state.current_task is None
+    assert runner.state.error_message is None
+    assert any(
+        "PR #42 merged externally during FIX, returning to IDLE." in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_external_terminal_pr_state_swallows_mark_queue_done_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A queue-sync failure on external merge must not block the IDLE transition."""
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=44, branch="pr-044")
+
+    def fake_mark_done(self: object) -> None:
+        raise RuntimeError("queue mutation failed")
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", fake_mark_done)
+
+    asyncio.run(runner._handle_external_terminal_pr_state("MERGED"))
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+
+
+def test_handle_external_terminal_pr_state_logs_without_pr_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even with no current_pr (race with cleanup), MERGED still moves to IDLE."""
+    runner = _make_runner()
+    runner.state.current_pr = None
+
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+    asyncio.run(runner._handle_external_terminal_pr_state("MERGED"))
+    assert runner.state.state == PipelineState.IDLE
+    assert any(
+        "merged externally during FIX" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_external_terminal_pr_state_closed_transitions_to_hung() -> None:
+    """Detected external close must transition runner to HUNG for manual review."""
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(number=55, branch="pr-055")
+
+    asyncio.run(runner._handle_external_terminal_pr_state("CLOSED"))
+
+    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.error_message is None
+    assert any(
+        "PR #55 closed externally during FIX, transitioning to HUNG."
+        in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_external_terminal_pr_state_closed_logs_without_pr_number() -> None:
+    """No-pr CLOSED race must still transition to HUNG with a generic log."""
+    runner = _make_runner()
+    runner.state.current_pr = None
+    asyncio.run(runner._handle_external_terminal_pr_state("CLOSED"))
+    assert runner.state.state == PipelineState.HUNG
+    assert any(
+        "closed externally during FIX" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_fix_external_merge_during_coder_transitions_to_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A polling task that detects MERGED while the coder runs must drive IDLE."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_poll_interval_sec=1)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=77, branch="pr-077", no_push_fix_count=1, fix_iteration_count=3,
+    )
+
+    poll_started: asyncio.Event | None = None
+
+    async def fake_poll(
+        self: object,
+        pr_number: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        terminal_flag: dict[str, str | None],
+    ) -> None:
+        nonlocal poll_started
+        poll_started = asyncio.Event()
+        terminal_flag["state"] = "MERGED"
+        target.cancel()
+
+    monkeypatch.setattr(
+        fix_module.FixMixin, "_poll_github_during_fix", fake_poll
+    )
+
+    async def fake_fix_review_async(
+        *args: object, **kwargs: object
+    ) -> tuple[int, str, str]:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise
+        return (0, "", "")
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix_review_async)
+    monkeypatch.setattr(
+        runner_module.github_client, "post_comment", lambda *a, **kw: None
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+    assert runner.state.error_message is None
+    assert any(
+        "merged externally during FIX" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_fix_external_close_during_coder_transitions_to_hung(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A polling task that detects CLOSED while the coder runs must park HUNG."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_poll_interval_sec=1)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=78, branch="pr-078")
+
+    async def fake_poll(
+        self: object,
+        pr_number: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        terminal_flag: dict[str, str | None],
+    ) -> None:
+        terminal_flag["state"] = "CLOSED"
+        target.cancel()
+
+    monkeypatch.setattr(
+        fix_module.FixMixin, "_poll_github_during_fix", fake_poll
+    )
+
+    async def fake_fix_review_async(
+        *args: object, **kwargs: object
+    ) -> tuple[int, str, str]:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise
+        return (0, "", "")
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix_review_async)
+    monkeypatch.setattr(
+        runner_module.github_client, "post_comment", lambda *a, **kw: None
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.HUNG
+    assert any(
+        "closed externally during FIX" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_fix_normal_completion_cancels_polling_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the coder exits normally, the polling task must be cancelled cleanly."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", _async_cli_result(0, "", "")
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "post_comment", lambda *a, **kw: None
+    )
+
+    cancellations: list[bool] = []
+
+    async def fake_poll(
+        self: object,
+        pr_number: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        terminal_flag: dict[str, str | None],
+    ) -> None:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            cancellations.append(True)
+            raise
+
+    monkeypatch.setattr(
+        fix_module.FixMixin, "_poll_github_during_fix", fake_poll
+    )
+
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_poll_interval_sec=1)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=79, branch="pr-079")
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert cancellations == [True]
+
+
 def test_handle_watch_stale_feedback_still_times_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

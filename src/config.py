@@ -42,6 +42,8 @@ _DAEMON_FIELDS = {
     "fix_idle_timeout_sec",
     "fix_iteration_cap",
     "fix_no_push_cap",
+    "fix_poll_interval_sec",
+    "coder_terminate_grace_sec",
     "planned_pr_timeout_sec",
     "rate_limit_session_pause_percent",
     "rate_limit_weekly_pause_percent",
@@ -107,6 +109,8 @@ class DaemonConfig(BaseModel):
     fix_idle_timeout_sec: int = Field(default=1800, ge=1)
     fix_iteration_cap: int = Field(default=15, ge=1)
     fix_no_push_cap: int = Field(default=3, ge=1)
+    fix_poll_interval_sec: int = Field(default=30, ge=1)
+    coder_terminate_grace_sec: int = Field(default=5, ge=1)
     planned_pr_timeout_sec: int = Field(default=900, ge=60)
     rate_limit_session_pause_percent: int = Field(default=95, ge=0, le=100)
     rate_limit_weekly_pause_percent: int = Field(default=100, ge=0, le=100)

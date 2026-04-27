@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -197,6 +198,132 @@ class FixMixin(BreachMixin):
         )
         await self.publish_state()
 
+    async def _poll_github_during_fix(
+        self,
+        pr_number: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        terminal_flag: dict[str, str | None],
+    ) -> None:
+        """Watch the PR for an external MERGED/CLOSED while FIX is in flight.
+
+        Polls ``github_client.pr_state`` every
+        ``app_config.daemon.fix_poll_interval_sec`` seconds. When a
+        terminal state is observed, records it in ``terminal_flag``,
+        terminates the active coder subprocess (SIGTERM with grace
+        before SIGKILL via ``_terminate_current_coder``) and cancels
+        ``target`` so the awaiting handler observes the cancellation.
+
+        Inherits PR-163 GitHub API budget awareness: when the cached
+        budget is below the pause threshold, this iteration is skipped
+        rather than spending quota on observability polling.
+
+        Transient ``gh pr view`` failures are logged once per failure
+        and the loop continues — observability must never crash the
+        daemon. Cancellation (the FIX cycle finished normally) exits
+        cleanly via the standard ``CancelledError`` propagation.
+        """
+        poll_interval = self.app_config.daemon.fix_poll_interval_sec
+        while True:
+            await asyncio.sleep(poll_interval)
+            if self._github_api_budget_paused():
+                continue
+            try:
+                state_info = await asyncio.to_thread(
+                    github_client.pr_state, self.owner_repo, pr_number
+                )
+            except Exception as exc:
+                self.log_event(
+                    f"FIX: GitHub poll for PR #{pr_number} failed: {exc}"
+                )
+                continue
+            if state_info is None:
+                self.log_event(
+                    f"FIX: GitHub poll for PR #{pr_number} returned no data"
+                )
+                continue
+            state = (state_info.get("state") or "").upper()
+            if state not in {"MERGED", "CLOSED"}:
+                continue
+            terminal_flag["state"] = state
+            self.log_event(
+                f"PR #{pr_number} reached terminal state {state} during "
+                "FIX, requesting coder termination."
+            )
+            await self._terminate_current_coder()
+            target.cancel()
+            return
+
+    def _github_api_budget_paused(self) -> bool:
+        """Return ``True`` when the cached GH API budget is below pause threshold."""
+        budget = self._github_api_budget_cache
+        if budget is None:
+            return False
+        pause_pct = self.app_config.daemon.github_api_pause_threshold_percent
+        if budget.remaining_percent >= pause_pct:
+            return False
+        if datetime.now(timezone.utc) >= budget.reset_at:
+            return False
+        return True
+
+    def _run_coder_with_polling(
+        self,
+        pr_number: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        terminal_flag: dict[str, str | None],
+    ) -> asyncio.Task[None] | None:
+        """Spawn the polling task that runs concurrently with the coder.
+
+        Returns the polling task so the caller can cancel it when the
+        coder exits normally (try/finally). Returns ``None`` when no
+        live PR number is available so the polling logic only engages
+        for real PRs (not the initial coding cycle that has not yet
+        produced one).
+        """
+        if pr_number <= 0:
+            return None
+        return asyncio.create_task(
+            self._poll_github_during_fix(pr_number, target, terminal_flag)
+        )
+
+    async def _handle_external_terminal_pr_state(
+        self, terminal_state: str
+    ) -> None:
+        """Transition the runner when an external MERGED/CLOSED is observed.
+
+        On ``MERGED``: reset the FIX recovery counters on the active PR
+        (so the next PR does not inherit a stale streak), mark the
+        queue task DONE if applicable, drop ``current_pr`` /
+        ``current_task``, and return to ``IDLE``.
+
+        On ``CLOSED``: park in ``HUNG`` so a human can resolve.
+        """
+        pr = self.state.current_pr
+        pr_number_str = f"#{pr.number}" if pr is not None else ""
+        if terminal_state == "MERGED":
+            if pr is not None:
+                pr.no_push_fix_count = 0
+                pr.fix_iteration_count = 0
+            self.log_event(
+                f"PR {pr_number_str} merged externally during FIX, "
+                "returning to IDLE."
+            )
+            with contextlib.suppress(Exception):
+                self._mark_queue_done()
+            self.state.current_pr = None
+            self.state.current_task = None
+            self.state.error_message = None
+            self.state.state = PipelineState.IDLE
+            await self.publish_state()
+            return
+        # CLOSED
+        self.log_event(
+            f"PR {pr_number_str} closed externally during FIX, "
+            "transitioning to HUNG."
+        )
+        self.state.error_message = None
+        self.state.state = PipelineState.HUNG
+        await self.publish_state()
+
     async def handle_fix(self) -> None:
         """Run ``FIX REVIEW`` via the active coder CLI and return to WATCH."""
         self._stop_requested = False
@@ -301,6 +428,7 @@ class FixMixin(BreachMixin):
         breach_dir, breach_run_id = self._breach_env()
         breach_flag: dict[str, bool] = {"breached": False}
         idle_flag: dict[str, bool] = {"timed_out": False}
+        external_state_flag: dict[str, str | None] = {"state": None}
 
         model = (
             self.app_config.daemon.codex_model
@@ -337,6 +465,9 @@ class FixMixin(BreachMixin):
                     breach_dir, breach_run_id, claude_task, breach_flag,
                 )
             )
+        external_state_monitor = self._run_coder_with_polling(
+            pr_number, claude_task, external_state_flag,
+        )
         stop_cancelled = False
         try:
             code, stdout, stderr = await claude_task
@@ -344,6 +475,11 @@ class FixMixin(BreachMixin):
             if self._stop_requested:
                 stop_cancelled = True
                 code, stdout, stderr = 1, "", ""
+            elif external_state_flag["state"] is not None:
+                await self._handle_external_terminal_pr_state(
+                    external_state_flag["state"]  # type: ignore[arg-type]
+                )
+                return
             elif breach_flag["breached"]:
                 if self.state.current_pr is not None:
                     # Breach pause is not a no-push success; reset the
@@ -387,6 +523,10 @@ class FixMixin(BreachMixin):
             if breach_monitor is not None:
                 breach_monitor.cancel()
             idle_monitor.cancel()
+            if external_state_monitor is not None:
+                external_state_monitor.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await external_state_monitor
             heartbeat.cancel()
             self._current_coder_process = None
             if coder_name == "claude":
