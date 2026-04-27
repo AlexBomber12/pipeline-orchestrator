@@ -2021,6 +2021,35 @@ def test_get_pr_author_returns_empty_on_error(
     assert get_pr_author("owner/name", 42) == ""
 
 
+def test_get_pr_author_returns_empty_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``subprocess.TimeoutExpired`` from ``run_gh`` must degrade to "".
+
+    Otherwise the timeout would bubble out of ``get_latest_codex_feedback``
+    and abort ``handle_fix`` before the coder runs, contradicting the
+    intended best-effort behavior of omitting unavailable context.
+    """
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=30)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert get_pr_author("owner/name", 42) == ""
+
+
+def test_get_pr_author_returns_empty_on_oserror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing ``gh`` binary (OSError) must degrade to "" rather than crash."""
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        raise FileNotFoundError("gh: command not found")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert get_pr_author("owner/name", 42) == ""
+
+
 def test_has_recent_codex_review_request_respects_after_iso(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3459,6 +3488,76 @@ def test_get_latest_codex_feedback_returns_none_when_endpoints_fail(
     monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
 
     assert github_client.get_latest_codex_feedback("owner/name", 42) is None
+
+
+def test_get_latest_codex_feedback_returns_none_when_endpoints_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Endpoint ``TimeoutExpired`` / ``OSError`` must degrade to ``None``,
+    not bubble out and abort the FIX cycle before the coder runs.
+    """
+    monkeypatch.setattr(
+        github_client, "get_pr_author", lambda repo, n: "author"
+    )
+
+    raised: list[type[BaseException]] = []
+    exceptions: list[BaseException] = [
+        subprocess.TimeoutExpired(cmd=["gh"], timeout=30),
+        FileNotFoundError("gh: command not found"),
+    ]
+
+    def fake_paginated(path: str) -> list[dict]:
+        if not exceptions:
+            raise AssertionError("unexpected extra call")
+        exc = exceptions.pop(0)
+        raised.append(type(exc))
+        raise exc
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    assert github_client.get_latest_codex_feedback("owner/name", 42) is None
+    assert raised == [subprocess.TimeoutExpired, FileNotFoundError]
+
+
+def test_get_latest_codex_feedback_truncates_oversized_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Joined feedback must be capped to avoid ``Argument list too long``
+    when the FIX prompt embeds it as a single CLI argument.
+    """
+    monkeypatch.setattr(
+        github_client, "get_pr_author", lambda repo, n: "author"
+    )
+
+    big_body = "x" * 6000
+
+    def fake_paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            return [
+                {
+                    "id": 1,
+                    "user": {"login": "author"},
+                    "body": "@codex review",
+                    "created_at": "2026-04-27T00:00:00Z",
+                },
+                {
+                    "id": 2,
+                    "user": {"login": "codex-bot"},
+                    "body": big_body,
+                    "created_at": "2026-04-27T01:00:00Z",
+                },
+            ]
+        if path.endswith("/pulls/42/comments"):
+            return []
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    out = github_client.get_latest_codex_feedback("owner/name", 42)
+    assert out is not None
+    assert out.startswith("[truncated]\n")
+    assert len(out) == len("[truncated]\n") + github_client._REVIEW_FEEDBACK_TRUNCATE_CHARS
+    assert out.endswith("x" * 100)
 
 
 def test_get_latest_codex_feedback_skips_empty_codex_body(

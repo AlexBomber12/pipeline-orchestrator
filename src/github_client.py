@@ -27,6 +27,8 @@ _CODEX_ONBOARDING_TEXT = "create a Codex account and connect to github"
 _review_status_cache: dict[str, "ReviewStatus"] = {}
 _review_status_cache_cycle: int | None = None
 
+_REVIEW_FEEDBACK_TRUNCATE_CHARS = 5000
+
 _last_known_sha: dict[str, str] = {}
 _merged_prs_cache: dict[tuple[str, str], tuple[float, list["PRInfo"]]] = {}
 _MERGED_PRS_CACHE_TTL_SECONDS = 60.0
@@ -615,13 +617,13 @@ def get_latest_codex_feedback(repo: str, pr_number: int) -> str | None:
         issue_comments = (
             _gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
         )
-    except RuntimeError:
+    except (RuntimeError, subprocess.TimeoutExpired, OSError):
         issue_comments = []
     try:
         review_comments = (
             _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments") or []
         )
-    except RuntimeError:
+    except (RuntimeError, subprocess.TimeoutExpired, OSError):
         review_comments = []
 
     anchor_ts = ""
@@ -647,7 +649,10 @@ def get_latest_codex_feedback(repo: str, pr_number: int) -> str | None:
 
     if not sections:
         return None
-    return "\n\n".join(sections)
+    joined = "\n\n".join(sections)
+    if len(joined) > _REVIEW_FEEDBACK_TRUNCATE_CHARS:
+        return f"[truncated]\n{joined[-_REVIEW_FEEDBACK_TRUNCATE_CHARS:]}"
+    return joined
 
 
 def merge_pr(repo: str, pr_number: int) -> None:
@@ -679,7 +684,7 @@ def get_pr_author(repo: str, pr_number: int) -> str:
                 ".user.login",
             ]
         )
-    except RuntimeError:
+    except (RuntimeError, subprocess.TimeoutExpired, OSError):
         return ""
     if isinstance(raw, str):
         return raw.strip()
