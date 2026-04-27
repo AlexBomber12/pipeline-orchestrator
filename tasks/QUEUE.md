@@ -551,6 +551,6 @@
 - Branch: pr-164-fix-no-push-circuit-breaker
 
 ## PR-165: GitHub state polling during long FIX cycle
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-165.md
 - Branch: pr-165-poll-github-during-fix
