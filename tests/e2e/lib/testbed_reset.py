@@ -1,9 +1,4 @@
-"""Helpers to reset the testbed repository to a known-clean state.
-
-Used by the session-scoped fixture at pytest session start. NOT used between
-individual tests; the per-test reset_testbed fixture in conftest handles the
-lighter per-test cleanup.
-"""
+"""Helpers to reset the testbed repository to a known-clean state."""
 
 from __future__ import annotations
 
@@ -13,6 +8,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 from urllib.parse import quote
+
+import redis
 
 TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
 TESTBED_URL = f"https://github.com/{TESTBED_REPO}.git"
@@ -222,7 +219,23 @@ def wipe_tasks_dir_on_main() -> bool:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def reset_testbed_full() -> dict:
+def clear_testbed_redis_state(redis_url: str, slug: str) -> int:
+    """Delete Redis state for one testbed repo slug and return deleted key count."""
+    client = redis.Redis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=5,
+    )
+    try:
+        keys = [f"pipeline:{slug}", f"upload:{slug}:pending"]
+        keys.extend(client.scan_iter(match=f"control:{slug}:*"))
+        return int(client.delete(*keys)) if keys else 0
+    finally:
+        client.close()
+
+
+def reset_testbed_full(redis_url: str | None = None, slug: str | None = None) -> dict:
     """Full reset: close PRs, delete branches, wipe tasks/. Returns counts dict.
 
     Propagates RuntimeError from any helper that detects a hard failure
@@ -230,8 +243,11 @@ def reset_testbed_full() -> dict:
     fixture relies on this to abort before tests run against a polluted
     testbed.
     """
-    return {
+    result = {
         "prs_closed": close_all_open_prs(),
         "branches_deleted": delete_non_main_branches(),
         "tasks_wiped": wipe_tasks_dir_on_main(),
     }
+    if redis_url is not None and slug is not None:
+        result["redis_keys_deleted"] = clear_testbed_redis_state(redis_url, slug)
+    return result

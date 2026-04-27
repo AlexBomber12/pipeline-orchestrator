@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import time
 import urllib.error
@@ -9,9 +10,14 @@ from pathlib import Path
 import pytest
 import requests
 
-from tests.e2e.lib.testbed_reset import reset_testbed_full, wipe_tasks_dir_on_main
+from tests.e2e.lib.testbed_reset import (
+    clear_testbed_redis_state,
+    reset_testbed_full,
+    wipe_tasks_dir_on_main,
+)
 
 TEST_DASHBOARD_URL = "http://localhost:18800"
+TEST_REDIS_CONTAINER = "pipeline-orchestrator-redis-test"
 TESTBED_SLUG = "AlexBomber12__pipeline-orchestrator-testbed"
 TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
 REPO_DIR = Path(__file__).resolve().parents[2]
@@ -21,13 +27,35 @@ EVIDENCE_DIR = REPO_DIR / "tests/e2e/evidence"
 collect_ignore = ["data"]
 
 
+def _default_test_redis_url() -> str:
+    try:
+        ip = subprocess.check_output(
+            [
+                "docker",
+                "inspect",
+                "-f",
+                "{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}",
+                TEST_REDIS_CONTAINER,
+            ],
+            text=True,
+            timeout=2,
+        ).split()[0]
+    except (IndexError, OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return "redis://redis-test:6379/0"
+    return f"redis://{ip}:6379/0"
+
+
+TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL") or _default_test_redis_url()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _reset_testbed_session():
     """Reset testbed to a known-clean state at session start.
 
-    Closes open PRs, deletes non-main branches, wipes tasks/ on main. Runs
-    ONCE per pytest session before any test. The per-test reset_testbed
-    fixture handles lighter cleanup between individual tests.
+    Closes open PRs, deletes non-main branches, wipes tasks/ on main, and
+    clears daemon Redis state. Runs ONCE per pytest session before any test.
+    The per-test reset_testbed fixture handles lighter cleanup between
+    individual tests.
 
     ``reset_testbed_full()`` raises on hard failures (listing call failed,
     clone/commit/push failed). We deliberately do NOT swallow that error:
@@ -35,7 +63,7 @@ def _reset_testbed_session():
     running e2e tests against a polluted testbed produces nondeterministic
     failures that are far worse than a loud setup abort.
     """
-    counts = reset_testbed_full()
+    counts = reset_testbed_full(TEST_REDIS_URL, TESTBED_SLUG)
     yield counts
 
 
@@ -193,13 +221,17 @@ def _close_open_testbed_prs() -> None:
         )
 
 
+def _reset_testbed_state() -> None:
+    _close_open_testbed_prs()
+    wipe_tasks_dir_on_main()
+    clear_testbed_redis_state(TEST_REDIS_URL, TESTBED_SLUG)
+
+
 @pytest.fixture
 def reset_testbed():
-    _close_open_testbed_prs()
-    wipe_tasks_dir_on_main()
+    _reset_testbed_state()
     yield
-    _close_open_testbed_prs()
-    wipe_tasks_dir_on_main()
+    _reset_testbed_state()
 
 
 @pytest.fixture

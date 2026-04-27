@@ -326,7 +326,7 @@ def test_reset_testbed_full_aggregates_all_helpers() -> None:
     wipe.assert_called_once_with()
 
 
-def test_reset_testbed_fixture_closes_prs_then_wipes_tasks_before_and_after() -> None:
+def test_reset_testbed_fixture_clears_state_before_and_after() -> None:
     module_name = "tests.e2e.conftest"
     calls: list[str] = []
 
@@ -337,14 +337,22 @@ def test_reset_testbed_fixture_closes_prs_then_wipes_tasks_before_and_after() ->
         calls.append("wipe")
         return True
 
+    def clear_redis(redis_url: str, slug: str) -> int:
+        calls.append(f"clear:{redis_url}:{slug}")
+        return 0
+
     sys.modules.pop(module_name, None)
     try:
-        with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
+        with (
+            patch.dict(sys.modules, {"requests": types.SimpleNamespace()}),
+            patch.dict("os.environ", {"TEST_REDIS_URL": "redis://example-redis:6379/0"}),
+        ):
             e2e_conftest = importlib.import_module(module_name)
 
         with (
             patch.object(e2e_conftest, "_close_open_testbed_prs", side_effect=close_prs),
             patch.object(e2e_conftest, "wipe_tasks_dir_on_main", side_effect=wipe_tasks),
+            patch.object(e2e_conftest, "clear_testbed_redis_state", side_effect=clear_redis),
         ):
             fixture = e2e_conftest.reset_testbed.__wrapped__()
             next(fixture)
@@ -353,4 +361,5 @@ def test_reset_testbed_fixture_closes_prs_then_wipes_tasks_before_and_after() ->
     finally:
         sys.modules.pop(module_name, None)
 
-    assert calls == ["close", "wipe", "close", "wipe"]
+    clear_call = "clear:redis://example-redis:6379/0:AlexBomber12__pipeline-orchestrator-testbed"
+    assert calls == ["close", "wipe", clear_call, "close", "wipe", clear_call]
