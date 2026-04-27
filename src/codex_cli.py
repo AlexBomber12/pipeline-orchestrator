@@ -2,7 +2,7 @@
 
 Mirrors ``claude_cli.py`` but targets OpenAI's Codex CLI (Rust binary).
 Exposes ``run_planned_pr_async`` and ``fix_review_async`` for the runner
-to dispatch PLANNED PR and FIX REVIEW workflows through Codex.
+to dispatch PLANNED PR and FIX FEEDBACK workflows through Codex.
 """
 
 from __future__ import annotations
@@ -103,18 +103,28 @@ async def run_planned_pr_async(
     return await run_codex_async("PLANNED PR", repo_path, **kwargs)
 
 
+def _build_fix_feedback_prompt(extra_context: str | None) -> str:
+    """Compose the ``FIX FEEDBACK`` prompt with optional daemon-supplied context."""
+    if extra_context:
+        return f"FIX FEEDBACK\n\n{extra_context}"
+    return "FIX FEEDBACK"
+
+
 async def fix_review_async(
     repo_path: str,
     model: str | None = None,
     timeout: int | None = None,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    extra_context: str | None = None,
     **_kwargs: object,
 ) -> tuple[int, str, str]:
-    """Trigger a ``FIX REVIEW`` run in ``repo_path`` via Codex CLI."""
+    """Trigger a ``FIX FEEDBACK`` run in ``repo_path`` via Codex CLI."""
     kwargs: dict[str, object] = {"timeout": timeout, "model": model}
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
-    return await run_codex_async("FIX REVIEW", repo_path, **kwargs)
+    return await run_codex_async(
+        _build_fix_feedback_prompt(extra_context), repo_path, **kwargs
+    )
 
 
 async def diagnose_error_async(

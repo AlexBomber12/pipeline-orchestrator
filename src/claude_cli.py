@@ -1,7 +1,7 @@
 """Wrapper around the `claude` CLI for the pipeline orchestrator daemon.
 
 Exposes the trigger-phrase entry points defined in AGENTS.md (``PLANNED PR``
-and ``FIX REVIEW``) plus an infrastructure-error diagnosis helper.
+and ``FIX FEEDBACK``) plus an infrastructure-error diagnosis helper.
 """
 
 from __future__ import annotations
@@ -85,11 +85,26 @@ def run_planned_pr(
     return run_claude("PLANNED PR", repo_path, timeout=timeout, model=model)
 
 
+def _build_fix_feedback_prompt(extra_context: str | None) -> str:
+    """Compose the ``FIX FEEDBACK`` prompt with optional daemon-supplied context."""
+    if extra_context:
+        return f"FIX FEEDBACK\n\n{extra_context}"
+    return "FIX FEEDBACK"
+
+
 def fix_review(
-    repo_path: str, model: str | None = None, timeout: int = 3600
+    repo_path: str,
+    model: str | None = None,
+    timeout: int = 3600,
+    extra_context: str | None = None,
 ) -> tuple[int, str, str]:
-    """Trigger a ``FIX REVIEW`` run in ``repo_path``."""
-    return run_claude("FIX REVIEW", repo_path, timeout=timeout, model=model)
+    """Trigger a ``FIX FEEDBACK`` run in ``repo_path``."""
+    return run_claude(
+        _build_fix_feedback_prompt(extra_context),
+        repo_path,
+        timeout=timeout,
+        model=model,
+    )
 
 
 def diagnose_error(
@@ -251,6 +266,7 @@ async def fix_review_async(
     breach_run_id: str | None = None,
     session_threshold: int | None = None,
     weekly_threshold: int | None = None,
+    extra_context: str | None = None,
 ) -> tuple[int, str, str]:
     kwargs: dict[str, object] = {
         "timeout": timeout,
@@ -262,7 +278,9 @@ async def fix_review_async(
     }
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
-    return await run_claude_async("FIX REVIEW", repo_path, **kwargs)
+    return await run_claude_async(
+        _build_fix_feedback_prompt(extra_context), repo_path, **kwargs
+    )
 
 
 async def diagnose_error_async(

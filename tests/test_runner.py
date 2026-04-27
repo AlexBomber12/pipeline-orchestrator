@@ -2944,6 +2944,240 @@ def test_handle_fix_posts_codex_review_after_push(
     )
 
 
+def _capture_fix_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Any]:
+    """Patch ``claude_cli.fix_review_async`` to record kwargs and exit 0."""
+    captured: dict[str, Any] = {}
+
+    async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        captured["kwargs"] = dict(kwargs)
+        return (0, "", "")
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+    return captured
+
+
+def test_handle_fix_injects_ci_logs_when_ci_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ci_status=FAILURE: handle_fix passes CI logs into the FIX prompt."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        fix_module, "_fetch_failed_ci_logs",
+        lambda repo, branch: "pytest assertion error: boom",
+    )
+    monkeypatch.setattr(
+        fix_module.github_client, "get_latest_codex_feedback",
+        lambda repo, pr_number: None,
+    )
+    captured = _capture_fix_kwargs(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=77, branch="pr-019", ci_status=CIStatus.FAILURE
+    )
+    asyncio.run(runner.handle_fix())
+
+    extra_context = captured["kwargs"]["extra_context"]
+    assert "CI failure logs (last 5000 chars):" in extra_context
+    assert "pytest assertion error: boom" in extra_context
+    assert "Latest review feedback:" not in extra_context
+
+
+def test_handle_fix_injects_review_feedback_when_changes_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """review_status=CHANGES_REQUESTED: handle_fix passes review body into prompt."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        fix_module, "_fetch_failed_ci_logs",
+        lambda repo, branch: None,
+    )
+    monkeypatch.setattr(
+        fix_module.github_client, "get_latest_codex_feedback",
+        lambda repo, pr_number: "P1: please rename foo to bar",
+    )
+    captured = _capture_fix_kwargs(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=77,
+        branch="pr-019",
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+    asyncio.run(runner.handle_fix())
+
+    extra_context = captured["kwargs"]["extra_context"]
+    assert "Latest review feedback:" in extra_context
+    assert "P1: please rename foo to bar" in extra_context
+    assert "CI failure logs" not in extra_context
+
+
+def test_handle_fix_injects_both_ci_logs_and_review_feedback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        fix_module, "_fetch_failed_ci_logs",
+        lambda repo, branch: "ci-boom",
+    )
+    monkeypatch.setattr(
+        fix_module.github_client, "get_latest_codex_feedback",
+        lambda repo, pr_number: "review-feedback-text",
+    )
+    captured = _capture_fix_kwargs(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=77,
+        branch="pr-019",
+        ci_status=CIStatus.FAILURE,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+    asyncio.run(runner.handle_fix())
+
+    extra_context = captured["kwargs"]["extra_context"]
+    assert "CI failure logs (last 5000 chars):" in extra_context
+    assert "ci-boom" in extra_context
+    assert "Latest review feedback:" in extra_context
+    assert "review-feedback-text" in extra_context
+
+
+def test_handle_fix_omits_extra_context_when_no_signals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ci_status=PENDING + review_status=PENDING: no extra_context kwarg."""
+    _patch_subprocess(monkeypatch)
+    captured = _capture_fix_kwargs(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019")
+    asyncio.run(runner.handle_fix())
+
+    assert "extra_context" not in captured["kwargs"]
+
+
+def test_fetch_failed_ci_logs_truncates_to_last_5000_chars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_fetch_failed_ci_logs returns last 5000 chars prefixed with [truncated]."""
+    long_log = "X" * 6000
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
+        if args[:2] == ["run", "list"]:
+            return [{"databaseId": 12345}]
+        if args[:2] == ["run", "view"]:
+            return long_log
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
+
+    out = fix_module._fetch_failed_ci_logs("octo/demo", "pr-019")
+
+    assert out is not None
+    assert out.startswith("[truncated]\n")
+    assert out.endswith("X" * 5000)
+    assert len(out) == len("[truncated]\n") + 5000
+
+
+def test_fetch_failed_ci_logs_short_log_returned_as_is(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    short_log = "tiny failure trace"
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
+        if args[:2] == ["run", "list"]:
+            return [{"databaseId": 12345}]
+        if args[:2] == ["run", "view"]:
+            return short_log
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
+
+    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") == short_log
+
+
+def test_fetch_failed_ci_logs_returns_none_when_no_failed_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        fix_module.github_client, "run_gh", lambda args, **kwargs: []
+    )
+    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
+
+
+def test_fetch_failed_ci_logs_returns_none_on_non_list_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "run_gh",
+        lambda args, **kwargs: "not a list",
+    )
+    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
+
+
+def test_fetch_failed_ci_logs_returns_none_when_first_entry_not_dict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "run_gh",
+        lambda args, **kwargs: ["unexpected-string"],
+    )
+    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
+
+
+def test_fetch_failed_ci_logs_returns_none_when_database_id_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "run_gh",
+        lambda args, **kwargs: [{"databaseId": None}],
+    )
+    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
+
+
+def test_fetch_failed_ci_logs_returns_none_when_run_view_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
+        if args[:2] == ["run", "list"]:
+            return [{"databaseId": 9}]
+        return ""
+
+    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
+    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
+
+
+def test_fetch_failed_ci_logs_returns_none_on_run_list_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
+        raise RuntimeError("api blew up")
+
+    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
+    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
+
+
+def test_fetch_failed_ci_logs_returns_none_on_run_view_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
+        if args[:2] == ["run", "list"]:
+            return [{"databaseId": 9}]
+        raise RuntimeError("log fetch blew up")
+
+    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
+    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
+
+
 def test_handle_fix_finishes_push_bookkeeping_before_post_exit_stop_pause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4225,7 +4459,7 @@ def test_handle_fix_finishes_push_bookkeeping_before_stop_cancel_pause(
     assert runner._last_push_at is not None
     assert runner._last_push_at_pr_number == 42
     assert posted == [42]
-    assert saved_logs == [("", "", "FIX REVIEW output [claude]")]
+    assert saved_logs == [("", "", "FIX FEEDBACK output [claude]")]
     assert any("Fix pushed, iteration #1" in e["event"] for e in runner.state.history)
 
 
@@ -4313,7 +4547,7 @@ def test_handle_fix_stop_cancel_skips_push_bookkeeping_when_remote_head_is_stale
     assert runner._last_push_at is None
     assert runner._last_push_at_pr_number is None
     assert posted == []
-    assert saved_logs == [("", "", "FIX REVIEW output [claude]")]
+    assert saved_logs == [("", "", "FIX FEEDBACK output [claude]")]
     assert any(
         "outside the fetched remote branch" in e["event"].lower()
         for e in runner.state.history
@@ -11983,7 +12217,7 @@ def test_handle_coding_uses_configured_timeout(
 def test_handle_fix_does_not_forward_idle_timeout_as_cli_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """FIX REVIEW should stay uncapped while the idle monitor enforces no-push timeouts."""
+    """FIX FEEDBACK should stay uncapped while the idle monitor enforces no-push timeouts."""
     _patch_subprocess(monkeypatch)
     captured: dict[str, Any] = {}
 
@@ -14737,7 +14971,7 @@ def test_handle_coding_publishes_heartbeat(
 def test_handle_fix_publishes_heartbeat(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """publish_state is called during FIX REVIEW via heartbeat task."""
+    """publish_state is called during FIX FEEDBACK via heartbeat task."""
     _patch_subprocess(monkeypatch)
     heartbeat_publishes: list[str] = []
     two_heartbeats = asyncio.Event()

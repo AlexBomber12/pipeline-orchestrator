@@ -78,7 +78,7 @@ write_marker_and_commit() {
 
 ensure_pr_url() {
     # Reuse an existing open PR for the head branch when present, otherwise
-    # create one. FIX REVIEW invocations land on a branch that already has a
+    # create one. FIX FEEDBACK invocations land on a branch that already has a
     # PR from the prior CODING pass; `gh pr create` would fail in that case
     # and the daemon would record a coder failure (Codex P1).
     local branch="$1" pr="$2"

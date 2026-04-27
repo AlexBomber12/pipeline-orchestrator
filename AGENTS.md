@@ -15,12 +15,12 @@ Quick rules
 Exact trigger phrases:
 - `PLANNED PR`
 - `MICRO PR: <one sentence description>`
-- `FIX REVIEW`
+- `FIX FEEDBACK`
 
 Meaning:
 - `PLANNED PR`: the default mode. Use the active entry in `tasks/QUEUE.md` to locate the corresponding `tasks/PR-*.md` file, then work strictly from that task file.
 - `MICRO PR: ...`: a tiny change. Do not touch `tasks/QUEUE.md` and do not create `tasks/PR-*.md`.
-- `FIX REVIEW`: fix feedback on an existing PR branch.
+- `FIX FEEDBACK`: apply fixes based on CI failures and/or review feedback on an existing PR branch. The daemon now injects the latest CI failure logs (last 5000 chars) and the Codex feedback comments posted after the most recent `@codex review` anchor (the same source that drives `ReviewStatus.CHANGES_REQUESTED`) directly into the prompt, so the coder receives that context inline; the coder may still fetch additional context via `gh` CLI when needed.
 
 ## Daemon Mode
 
@@ -50,7 +50,7 @@ Coder responsibility for the integration job: NONE. The coder cannot invoke dock
 
 Merge contract: a PR is merge-eligible when all three are true. (1) Unit job green. (2) Integration job green. (3) Codex review +1 valid (non-stale per the review anchor rules). The daemon's auto-merge logic reads `statusCheckRollup` from the GitHub API, which aggregates all required checks; the daemon already handles multi-check workflows correctly via the existing `CIStatus` enum logic in `src/task_status.py`.
 
-Failure handling: if the unit job fails, the coder fixes it the same as `scripts/ci.sh` local failures (FIX REVIEW driven by Codex feedback or by the human reviewer pointing at the GHA log). If the integration job fails, the failure is treated identically to a Codex review failure: the coder enters FIX REVIEW mode, examines the GHA run logs and uploaded `e2e-evidence` artifact, fixes the issue, pushes, and waits for the re-run. Integration test failures must be fixed by code change, never by disabling or skipping the test. If a test is genuinely flaky and the failure is not reproducible, the human reviewer may rerun the failed job manually via the GHA UI.
+Failure handling: if the unit job fails, the coder fixes it the same as `scripts/ci.sh` local failures (FIX FEEDBACK driven by Codex feedback or by the human reviewer pointing at the GHA log). If the integration job fails, the failure is treated identically to a Codex review failure: the coder enters FIX FEEDBACK mode, examines the GHA run logs and uploaded `e2e-evidence` artifact, fixes the issue, pushes, and waits for the re-run. Integration test failures must be fixed by code change, never by disabling or skipping the test. If a test is genuinely flaky and the failure is not reproducible, the human reviewer may rerun the failed job manually via the GHA UI.
 
 Setup prerequisite: `docs/ci-setup.md` describes the one-time setup of the GitHub App that powers integration tests. New deployments of pipeline-orchestrator must complete that setup before the integration job will function on their fork.
 
@@ -79,7 +79,7 @@ Definitions
 
 In `PLANNED PR` and `MICRO PR` flows, the coder posts `@codex review` as a PR comment immediately after PR creation AND after every push in the Fix loop. The comment body MUST be exactly the string `@codex review` with no prefix, no escape characters, no artifact list, no summary, and no trailing text. Artifact filenames belong in the PR description only, never in the trigger comment. The daemon deduplicates: if a valid `@codex review` trigger from the PR author already exists for the current HEAD SHA, the daemon skips its own post; if not, the daemon posts one as a safety net.
 
-Fix loop (used in `FIX REVIEW` mode)
+Fix loop (used in `FIX FEEDBACK` mode)
 1. Fetch PR comments, reviews, and reactions via GitHub CLI (`gh`). No screenshots.
 2. Check for Codex thumbs up on both the PR body and the review anchor comment.
 3. If a non-stale thumbs up exists (reaction created after the latest push), stop. The PR is green.
