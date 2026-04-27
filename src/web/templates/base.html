@@ -353,16 +353,6 @@
         .pulse-dot {
             animation: pulse-dot 2s ease-in-out infinite;
         }
-
-        .stalled {
-            filter: grayscale(100%);
-            opacity: 0.5;
-        }
-
-        .stalled .pulse-dot,
-        .pulse-dot.stalled {
-            animation: none;
-        }
     </style>
 </head>
 <body class="bg-surface-1 text-gray-200 min-h-screen">
@@ -491,34 +481,6 @@
         }
         document.addEventListener('DOMContentLoaded', formatTimestamps);
         document.body.addEventListener('htmx:afterSwap', formatTimestamps);
-    </script>
-
-    <script>
-        (function () {
-            const STALLED_THRESHOLD_MS = 30 * 1000;
-
-            function syncStalledBadges() {
-                const now = Date.now();
-                document.querySelectorAll('[data-state-indicator][data-updated-at]').forEach((indicator) => {
-                    const updatedAt = Date.parse(indicator.dataset.updatedAt);
-                    const isStalled = !Number.isNaN(updatedAt) && now - updatedAt > STALLED_THRESHOLD_MS;
-
-                    indicator.classList.toggle('stalled', isStalled);
-                    indicator.querySelectorAll('[data-state-dot], [data-state-label]').forEach((element) => {
-                        element.classList.toggle('stalled', isStalled);
-                    });
-
-                    const hint = indicator.querySelector('[data-stalled-hint]');
-                    if (hint) {
-                        hint.classList.toggle('hidden', !isStalled);
-                    }
-                });
-            }
-
-            document.addEventListener('DOMContentLoaded', syncStalledBadges);
-            document.body.addEventListener('htmx:afterSwap', syncStalledBadges);
-            setInterval(syncStalledBadges, 1000);
-        })();
     </script>
 
     <script>

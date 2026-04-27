@@ -2385,3 +2385,67 @@ def test_build_github_api_budget_view_bucket_ok_when_reset_window_elapsed() -> N
 
     assert view is not None
     assert view["bucket"] == "ok"
+
+
+def test_repo_summary_omits_stalled_artifacts_when_last_updated_is_old(
+    two_repo_config: Path,
+) -> None:
+    old = datetime.now(timezone.utc) - timedelta(seconds=60)
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        last_updated=old,
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+
+    context = asyncio.run(web_app._repo_template_context("example__alpha", fake))
+    rendered = web_app.templates.get_template(
+        "components/repo_summary.html"
+    ).render(context)
+
+    assert 'class="stalled"' not in rendered
+    assert "data-stalled-hint" not in rendered
+    assert "data-state-indicator" not in rendered
+    assert "data-updated-at" not in rendered
+
+
+def test_repo_cards_omit_stalled_artifacts_when_last_updated_is_old(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = datetime.now(timezone.utc) - timedelta(seconds=60)
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        last_updated=old,
+    )
+
+    class _StubClient:
+        async def ping(self) -> bool:
+            return True
+
+        async def get(self, key: str) -> str | None:
+            if key == "pipeline:example__alpha":
+                return stored.model_dump_json()
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
+    class _StubAioredisOne:
+        @staticmethod
+        def from_url(url: str, decode_responses: bool = True) -> _StubClient:
+            return _StubClient()
+
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredisOne())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo-list")
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'class="stalled"' not in body
+    assert "data-stalled-hint" not in body
+    assert "data-state-indicator" not in body
+    assert "data-updated-at" not in body
