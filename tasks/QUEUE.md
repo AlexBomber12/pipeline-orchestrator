@@ -566,7 +566,7 @@
 - Branch: pr-168-npm-version-pinning
 
 ## PR-169: Hot reload config.yml on file change
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-169.md
 - Branch: pr-169-config-hot-reload-file-watch
 
