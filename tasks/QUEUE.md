@@ -571,7 +571,7 @@
 - Branch: pr-169-config-hot-reload-file-watch
 
 ## PR-170: Remove STALLED indicator
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-170.md
 - Branch: pr-170-remove-stalled
 
