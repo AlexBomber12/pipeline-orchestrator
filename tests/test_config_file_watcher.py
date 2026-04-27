@@ -97,9 +97,10 @@ def test_set_config_dirty_flags_writes_each_repo(
     tmp_path: Path,
 ) -> None:
     redis = _FakeRedis()
-    asyncio.run(
+    ok = asyncio.run(
         config_watcher._set_config_dirty_flags(redis, ["alpha", "beta"])
     )
+    assert ok is True
     assert redis.store == {
         "control:alpha:config_dirty": "1",
         "control:beta:config_dirty": "1",
@@ -111,9 +112,10 @@ def test_set_config_dirty_flags_logs_and_continues_on_redis_error(
 ) -> None:
     redis = _BrokenSetRedis()
     with caplog.at_level("WARNING", logger=config_watcher.logger.name):
-        asyncio.run(
+        ok = asyncio.run(
             config_watcher._set_config_dirty_flags(redis, ["alpha", "beta"])
         )
+    assert ok is False
     assert [name for name, _ in redis.calls] == [
         "control:alpha:config_dirty",
         "control:beta:config_dirty",
@@ -337,6 +339,62 @@ def test_watch_handles_transient_unreadable_state(
 
     asyncio.run(driver())
     assert redis.store == {"control:alpha:config_dirty": "1"}
+
+
+def test_watch_retries_after_transient_redis_failure(tmp_path: Path) -> None:
+    """Codex P2: signature must not advance when Redis writes fail."""
+    target = tmp_path / "config.yml"
+    _write(target, "x: 1\n")
+
+    class _FlakyRedis(_FakeRedis):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_next = True
+
+        async def set(self, key: str, value: str) -> None:
+            self.calls.append((key, value))
+            if self.fail_next:
+                raise RuntimeError("redis offline")
+            self.store[key] = value
+
+    redis = _FlakyRedis()
+
+    async def driver() -> None:
+        task = asyncio.create_task(
+            config_watcher.watch_config_file_changes(
+                redis,
+                get_repo_names=lambda: ["alpha"],
+                config_path=target,
+                interval_sec=0.01,
+            )
+        )
+        await asyncio.sleep(0.02)
+        future_ts = time.time() + 1
+        _write(target, "x: 2\n")
+        os.utime(target, (future_ts, future_ts))
+        # Wait until the failing write has been attempted at least once.
+        for _ in range(50):
+            await asyncio.sleep(0.02)
+            if redis.calls:
+                break
+        assert redis.store == {}, "no flag written while Redis was offline"
+        # Restore Redis and let the watcher's retained signature trigger a retry.
+        redis.fail_next = False
+        for _ in range(50):
+            await asyncio.sleep(0.02)
+            if redis.store:
+                break
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(driver())
+    assert redis.store == {"control:alpha:config_dirty": "1"}
+    # The first failed attempt plus the successful retry must both be visible.
+    attempts = [name for name, _ in redis.calls]
+    assert attempts.count("control:alpha:config_dirty") >= 2
 
 
 def test_main_loop_spawns_watcher_task(monkeypatch: pytest.MonkeyPatch) -> None:

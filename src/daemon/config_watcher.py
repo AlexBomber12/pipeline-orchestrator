@@ -65,18 +65,27 @@ def _safe_signature(path: Path) -> str | None:
 
 async def _set_config_dirty_flags(
     redis_client: Any, repo_names: Iterable[str]
-) -> None:
-    """Mark every named runner's ``config_dirty`` flag in Redis."""
+) -> bool:
+    """Mark every named runner's ``config_dirty`` flag in Redis.
+
+    Returns ``True`` when every write succeeded, ``False`` when any write
+    raised. Callers use the return value to decide whether the watcher's
+    baseline signature can be advanced; on a partial/total failure the
+    signature stays put so the next poll retries the same change event.
+    """
+    all_ok = True
     for name in repo_names:
         key = f"control:{name}:config_dirty"
         try:
             await redis_client.set(key, "1")
         except Exception:
+            all_ok = False
             logger.warning(
-                "Failed to set %s; runner will not auto-reload this cycle",
+                "Failed to set %s; will retry on next poll",
                 key,
                 exc_info=True,
             )
+    return all_ok
 
 
 async def watch_config_file_changes(
@@ -101,12 +110,13 @@ async def watch_config_file_changes(
         current = _safe_signature(path)
         if current is None or current == last_signature:
             continue
-        last_signature = current
         names = list(get_repo_names())
         if not names:
+            last_signature = current
             continue
         logger.info(
             "Detected config.yml change; flagging %d runner(s) for reload",
             len(names),
         )
-        await _set_config_dirty_flags(redis_client, names)
+        if await _set_config_dirty_flags(redis_client, names):
+            last_signature = current
