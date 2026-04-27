@@ -493,7 +493,7 @@ def test_reset_testbed_fixture_resets_before_and_clears_after() -> None:
     ]
 
 
-def test_stop_daemon_waits_through_active_user_paused_state() -> None:
+def test_stop_daemon_waits_for_runner_pause_ack() -> None:
     module_name = "tests.e2e.conftest"
     posts: list[tuple[str, int]] = []
     opens: list[tuple[str, int]] = []
@@ -525,9 +525,15 @@ def test_stop_daemon_waits_through_active_user_paused_state() -> None:
         responses = iter(
             [
                 f'[{{"name": "{slug}", "state": "CODING", "user_paused": true}}]'.encode(),
-                f'[{{"name": "{slug}", "state": "WATCH", "user_paused": true}}]'.encode(),
-                f'[{{"name": "{slug}", "state": "MERGE", "user_paused": true}}]'.encode(),
-                f'[{{"name": "{slug}", "state": "IDLE", "user_paused": true}}]'.encode(),
+                (
+                    f'[{{"name": "{slug}", "state": "IDLE", "user_paused": true, '
+                    '"history": [{"event": "Stop requested. Aborting run; working tree may be left dirty."}]'
+                    "}]"
+                ).encode(),
+                (
+                    f'[{{"name": "{slug}", "state": "WATCH", "user_paused": true, '
+                    '"history": [{"event": "Paused. Press Play to resume."}]}]'
+                ).encode(),
             ]
         )
 
@@ -544,5 +550,5 @@ def test_stop_daemon_waits_through_active_user_paused_state() -> None:
         sys.modules.pop(module_name, None)
 
     assert posts == [(f"{e2e_conftest.TEST_DASHBOARD_URL}/repos/{slug}/stop", 10)]
-    assert opens == [(f"{e2e_conftest.TEST_DASHBOARD_URL}/api/states", 5)] * 4
-    assert sleeps == [0.5, 0.5, 0.5]
+    assert opens == [(f"{e2e_conftest.TEST_DASHBOARD_URL}/api/states", 5)] * 3
+    assert sleeps == [0.5, 0.5]
