@@ -556,7 +556,7 @@
 - Branch: pr-165-poll-github-during-fix
 
 ## PR-167: CI logs in FIX prompt and rename FIX REVIEW → FIX FEEDBACK
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-167.md
 - Branch: pr-167-fix-feedback-with-ci-logs
 
