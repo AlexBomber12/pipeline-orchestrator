@@ -25,6 +25,7 @@ from tests.e2e.lib.testbed_reset import (
     TESTBED_REPO,
     TESTBED_URL,
     _clone_url,
+    clear_testbed_redis_state,
     close_all_open_prs,
     delete_non_main_branches,
     reset_testbed_full,
@@ -34,6 +35,61 @@ from tests.e2e.lib.testbed_reset import (
 
 def _completed(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def test_clear_testbed_redis_state_runs_keys_then_del(monkeypatch) -> None:
+    calls: list[tuple[tuple[str, ...], dict]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((tuple(cmd), kwargs))
+        if len(calls) == 1:
+            return _completed(stdout="\n control:slug:a \n\ncontrol:slug:b\n")
+        return _completed(stdout="4\n")
+
+    monkeypatch.setattr(testbed_reset.subprocess, "run", fake_run)
+
+    assert clear_testbed_redis_state("slug") == 4
+
+    base_cmd = (
+        "docker",
+        "compose",
+        "-f",
+        "docker-compose.test.yml",
+        "exec",
+        "-T",
+        "redis-test",
+        "redis-cli",
+    )
+    assert calls == [
+        (
+            (*base_cmd, "KEYS", "control:slug:*"),
+            {"capture_output": True, "text": True, "check": False, "timeout": 10},
+        ),
+        (
+            (
+                *base_cmd,
+                "DEL",
+                "pipeline:slug",
+                "upload:slug:pending",
+                "control:slug:a",
+                "control:slug:b",
+            ),
+            {"capture_output": True, "text": True, "check": False, "timeout": 10},
+        ),
+    ]
+
+
+def test_clear_testbed_redis_state_returns_zero_when_keys_fails(monkeypatch) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(tuple(cmd))
+        return _completed(returncode=1, stderr="no redis")
+
+    monkeypatch.setattr(testbed_reset.subprocess, "run", fake_run)
+
+    assert clear_testbed_redis_state("slug") == 0
+    assert len(calls) == 1
 
 
 def test_close_all_open_prs_closes_each_listed_number() -> None:
@@ -319,23 +375,24 @@ def test_reset_testbed_full_aggregates_all_helpers() -> None:
         patch.object(testbed_reset, "delete_non_main_branches", return_value=3) as delete,
         patch.object(testbed_reset, "wipe_tasks_dir_on_main", return_value=True) as wipe,
     ):
-        result = reset_testbed_full()
+        result = reset_testbed_full("slug")
     assert result == {"prs_closed": 2, "branches_deleted": 3, "tasks_wiped": True}
     close.assert_called_once_with()
     delete.assert_called_once_with()
     wipe.assert_called_once_with()
 
 
-def test_reset_testbed_fixture_closes_prs_then_wipes_tasks_before_and_after() -> None:
+def test_reset_testbed_session_resets_repo_and_redis_once() -> None:
     module_name = "tests.e2e.conftest"
     calls: list[str] = []
 
-    def close_prs() -> None:
-        calls.append("close")
+    def reset_full(slug: str) -> dict:
+        calls.append(f"reset:{slug}")
+        return {"prs_closed": 0}
 
-    def wipe_tasks() -> bool:
-        calls.append("wipe")
-        return True
+    def clear_redis(slug: str) -> int:
+        calls.append(f"clear:{slug}")
+        return 2
 
     sys.modules.pop(module_name, None)
     try:
@@ -343,8 +400,39 @@ def test_reset_testbed_fixture_closes_prs_then_wipes_tasks_before_and_after() ->
             e2e_conftest = importlib.import_module(module_name)
 
         with (
-            patch.object(e2e_conftest, "_close_open_testbed_prs", side_effect=close_prs),
-            patch.object(e2e_conftest, "wipe_tasks_dir_on_main", side_effect=wipe_tasks),
+            patch.object(e2e_conftest, "reset_testbed_full", side_effect=reset_full),
+            patch.object(e2e_conftest, "clear_testbed_redis_state", side_effect=clear_redis),
+        ):
+            fixture = e2e_conftest._reset_testbed_session.__wrapped__()
+            assert next(fixture) == {"prs_closed": 0, "redis_keys_deleted": 2}
+            with pytest.raises(StopIteration):
+                next(fixture)
+    finally:
+        sys.modules.pop(module_name, None)
+
+    assert calls == [f"reset:{e2e_conftest.TESTBED_SLUG}", f"clear:{e2e_conftest.TESTBED_SLUG}"]
+
+
+def test_reset_testbed_fixture_resets_before_and_clears_after() -> None:
+    module_name = "tests.e2e.conftest"
+    calls: list[str] = []
+
+    def reset_full(slug: str) -> dict:
+        calls.append(f"reset:{slug}")
+        return {}
+
+    def clear_redis(slug: str) -> int:
+        calls.append(f"clear:{slug}")
+        return 0
+
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
+            e2e_conftest = importlib.import_module(module_name)
+
+        with (
+            patch.object(e2e_conftest, "reset_testbed_full", side_effect=reset_full),
+            patch.object(e2e_conftest, "clear_testbed_redis_state", side_effect=clear_redis),
         ):
             fixture = e2e_conftest.reset_testbed.__wrapped__()
             next(fixture)
@@ -353,4 +441,8 @@ def test_reset_testbed_fixture_closes_prs_then_wipes_tasks_before_and_after() ->
     finally:
         sys.modules.pop(module_name, None)
 
-    assert calls == ["close", "wipe", "close", "wipe"]
+    assert calls == [
+        f"reset:{e2e_conftest.TESTBED_SLUG}",
+        f"clear:{e2e_conftest.TESTBED_SLUG}",
+        f"clear:{e2e_conftest.TESTBED_SLUG}",
+    ]

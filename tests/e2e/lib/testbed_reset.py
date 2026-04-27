@@ -1,8 +1,7 @@
 """Helpers to reset the testbed repository to a known-clean state.
 
-Used by the session-scoped fixture at pytest session start. NOT used between
-individual tests; the per-test reset_testbed fixture in conftest handles the
-lighter per-test cleanup.
+Used by the session-scoped fixture at pytest session start and the per-test
+reset_testbed fixture in conftest.
 """
 
 from __future__ import annotations
@@ -16,6 +15,7 @@ from urllib.parse import quote
 
 TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
 TESTBED_URL = f"https://github.com/{TESTBED_REPO}.git"
+TESTBED_COMPOSE_FILE = "docker-compose.test.yml"
 
 
 def _clone_url() -> str:
@@ -222,8 +222,61 @@ def wipe_tasks_dir_on_main() -> bool:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def reset_testbed_full() -> dict:
+def clear_testbed_redis_state(slug: str) -> int:
+    """Clear daemon/upload state for the testbed slug through docker compose exec."""
+    base_cmd = [
+        "docker",
+        "compose",
+        "-f",
+        TESTBED_COMPOSE_FILE,
+        "exec",
+        "-T",
+        "redis-test",
+        "redis-cli",
+    ]
+    try:
+        keys_result = subprocess.run(
+            [*base_cmd, "KEYS", f"control:{slug}:*"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    if keys_result.returncode != 0:
+        return 0
+
+    control_keys = [line.strip() for line in keys_result.stdout.splitlines() if line.strip()]
+    try:
+        del_result = subprocess.run(
+            [
+                *base_cmd,
+                "DEL",
+                f"pipeline:{slug}",
+                f"upload:{slug}:pending",
+                *control_keys,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    if del_result.returncode != 0:
+        return 0
+    try:
+        return int(del_result.stdout.strip())
+    except ValueError:
+        return 0
+
+
+def reset_testbed_full(slug: str) -> dict:
     """Full reset: close PRs, delete branches, wipe tasks/. Returns counts dict.
+
+    The GitHub cleanup is repository-wide; callers pass the same slug they use
+    for paired Redis cleanup so fixture call sites reset one testbed identity.
 
     Propagates RuntimeError from any helper that detects a hard failure
     (listing call failed, clone/commit/push failed). The session-scoped
