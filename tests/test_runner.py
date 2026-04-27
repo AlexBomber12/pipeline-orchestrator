@@ -12767,18 +12767,21 @@ def test_handle_external_terminal_pr_state_swallows_mark_queue_done_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A queue-sync failure on external merge must not block the IDLE
-    transition, must log a warning, and must clear ``pending_queue_sync_*``
-    so a stale marker does not stall ``handle_idle`` (Codex P2 follow-up
-    on PR #223)."""
+    transition and must log a warning, but the
+    ``pending_queue_sync_branch`` guard MUST be preserved so a stale
+    ``DOING`` task is not redispatched on the next idle cycle —
+    ``_resolve_pending_queue_sync`` owns the retry/timeout from
+    ``handle_idle`` (Codex P2 round-2 + P1 round-3 on PR #223)."""
     runner = _make_runner()
     runner.state.current_pr = PRInfo(number=44, branch="pr-044")
+    sync_started_at = datetime.now(timezone.utc)
 
     def fake_mark_done(self: object) -> None:
         # Simulate _mark_queue_done's eager marker-then-fragile-op shape:
         # set the marker, then raise to model a fetch/checkout failure
         # mid-way through the sync.
         self.state.pending_queue_sync_branch = "queue-done-pr-044"
-        self.state.pending_queue_sync_started_at = datetime.now(timezone.utc)
+        self.state.pending_queue_sync_started_at = sync_started_at
         raise RuntimeError("queue mutation failed")
 
     monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", fake_mark_done)
@@ -12787,8 +12790,11 @@ def test_handle_external_terminal_pr_state_swallows_mark_queue_done_failure(
 
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is None
-    assert runner.state.pending_queue_sync_branch is None
-    assert runner.state.pending_queue_sync_started_at is None
+    # Marker preserved so handle_idle gates dispatch via
+    # _resolve_pending_queue_sync rather than redispatching the stale
+    # DOING task as new work.
+    assert runner.state.pending_queue_sync_branch == "queue-done-pr-044"
+    assert runner.state.pending_queue_sync_started_at == sync_started_at
     assert any(
         "_mark_queue_done failed during external-merge cleanup" in entry["event"]
         for entry in runner.state.history

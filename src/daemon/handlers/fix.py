@@ -313,19 +313,19 @@ class FixMixin(BreachMixin):
                 self._mark_queue_done()
             except Exception as exc:
                 # ``_mark_queue_done`` sets ``pending_queue_sync_branch``
-                # *before* its fragile git/GitHub ops; suppressing the
-                # exception silently would leave the runner in IDLE with
-                # a stale marker that gates ``handle_idle`` until it
-                # times out. Log the failure and clear the pending state
-                # so the next IDLE cycle is unblocked (Codex P2 follow-up
-                # on PR #223).
+                # *before* its fragile git/GitHub ops, and that marker is
+                # the guard that prevents ``handle_idle`` from
+                # redispatching a stale ``DOING`` task before queue-sync
+                # actually resolves. Log the failure for visibility but
+                # preserve the marker so ``_resolve_pending_queue_sync``
+                # owns the retry / timeout (Codex P2 round-2 + P1 round-3
+                # on PR #223: surface the failure but do not nullify the
+                # guard).
                 self.log_event(
                     "Warning: _mark_queue_done failed during external-merge "
-                    f"cleanup: {exc}; clearing pending_queue_sync_branch to "
-                    "avoid stalling handle_idle"
+                    f"cleanup: {exc}; pending_queue_sync_branch preserved "
+                    "so handle_idle resolves via _resolve_pending_queue_sync"
                 )
-                self.state.pending_queue_sync_branch = None
-                self.state.pending_queue_sync_started_at = None
             self.state.current_pr = None
             self.state.current_task = None
             self.state.error_message = None
