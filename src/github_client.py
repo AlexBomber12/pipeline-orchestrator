@@ -599,6 +599,57 @@ def _compute_review_status(
     return ReviewStatus.PENDING
 
 
+def get_latest_codex_feedback(repo: str, pr_number: int) -> str | None:
+    """Return concatenated Codex feedback comments after the latest review anchor.
+
+    Pulls from the same sources as ``_compute_review_status`` — Codex-authored
+    issue and pull review comments posted after the most recent
+    ``@codex review`` trigger by the PR author, with onboarding messages
+    filtered out — so the FIX prompt sees exactly the feedback that drove
+    ``ReviewStatus.CHANGES_REQUESTED``. Returns ``None`` when no qualifying
+    feedback exists or both comment endpoints are unreachable; the FIX
+    prompt then omits the section instead of blocking on observability.
+    """
+    pr_author = get_pr_author(repo, pr_number)
+    try:
+        issue_comments = (
+            _gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
+        )
+    except RuntimeError:
+        issue_comments = []
+    try:
+        review_comments = (
+            _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments") or []
+        )
+    except RuntimeError:
+        review_comments = []
+
+    anchor_ts = ""
+    for c in reversed(issue_comments):
+        author = (c.get("user") or {}).get("login", "")
+        if pr_author and author != pr_author:
+            continue
+        if "@codex review" in (c.get("body") or "").lower():
+            anchor_ts = c.get("created_at") or ""
+            break
+
+    sections: list[str] = []
+    for comment in issue_comments + review_comments:
+        if not _is_codex_user(comment.get("user")):
+            continue
+        if _is_codex_onboarding_comment(comment):
+            continue
+        if anchor_ts and (comment.get("created_at") or "") <= anchor_ts:
+            continue
+        body = (comment.get("body") or "").strip()
+        if body:
+            sections.append(body)
+
+    if not sections:
+        return None
+    return "\n\n".join(sections)
+
+
 def merge_pr(repo: str, pr_number: int) -> None:
     """Merge a PR using ``gh pr merge --squash --delete-branch``."""
     run_gh(["pr", "merge", str(pr_number), "--squash", "--delete-branch"], repo=repo)

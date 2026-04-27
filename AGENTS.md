@@ -20,7 +20,7 @@ Exact trigger phrases:
 Meaning:
 - `PLANNED PR`: the default mode. Use the active entry in `tasks/QUEUE.md` to locate the corresponding `tasks/PR-*.md` file, then work strictly from that task file.
 - `MICRO PR: ...`: a tiny change. Do not touch `tasks/QUEUE.md` and do not create `tasks/PR-*.md`.
-- `FIX FEEDBACK`: apply fixes based on CI failures and/or review feedback on an existing PR branch. The daemon now injects the latest CI failure logs (last 5000 chars) and the most recent CHANGES_REQUESTED review body directly into the prompt, so the coder receives that context inline; the coder may still fetch additional context via `gh` CLI when needed.
+- `FIX FEEDBACK`: apply fixes based on CI failures and/or review feedback on an existing PR branch. The daemon now injects the latest CI failure logs (last 5000 chars) and the Codex feedback comments posted after the most recent `@codex review` anchor (the same source that drives `ReviewStatus.CHANGES_REQUESTED`) directly into the prompt, so the coder receives that context inline; the coder may still fetch additional context via `gh` CLI when needed.
 
 ## Daemon Mode
 

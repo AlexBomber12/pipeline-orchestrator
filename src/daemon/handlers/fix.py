@@ -67,32 +67,6 @@ def _fetch_failed_ci_logs(repo: str, branch: str) -> str | None:
     return logs
 
 
-def _fetch_latest_review_feedback(repo: str, pr_number: int) -> str | None:
-    """Return the most recent CHANGES_REQUESTED review body, or ``None``."""
-    try:
-        raw = github_client.run_gh(
-            ["pr", "view", str(pr_number), "--json", "reviews"],
-            repo=repo,
-        )
-    except (RuntimeError, subprocess.TimeoutExpired, OSError):
-        return None
-    if not isinstance(raw, dict):
-        return None
-    reviews = raw.get("reviews")
-    if not isinstance(reviews, list):
-        return None
-    candidates = [
-        r for r in reviews
-        if isinstance(r, dict)
-        and (r.get("state") or "").upper() == "CHANGES_REQUESTED"
-    ]
-    if not candidates:
-        return None
-    candidates.sort(key=lambda r: r.get("submittedAt") or "", reverse=True)
-    body = candidates[0].get("body") or ""
-    return body or None
-
-
 class FixMixin(BreachMixin):
     """FIX FEEDBACK handler with idle timeout and breach monitoring."""
 
@@ -446,7 +420,7 @@ class FixMixin(BreachMixin):
                 )
         if current_pr.review_status == ReviewStatus.CHANGES_REQUESTED:
             feedback = await asyncio.to_thread(
-                _fetch_latest_review_feedback,
+                github_client.get_latest_codex_feedback,
                 self.owner_repo, current_pr.number,
             )
             if feedback:

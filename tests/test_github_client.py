@@ -3271,3 +3271,223 @@ def test_fetch_rate_limit_budget_returns_none_on_malformed_int(
         },
     )
     assert github_client.fetch_rate_limit_budget() is None
+
+
+def test_get_latest_codex_feedback_collects_post_anchor_codex_comments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue and review comments authored by Codex after the anchor are joined."""
+    monkeypatch.setattr(
+        github_client, "get_pr_author", lambda repo, n: "author"
+    )
+
+    def fake_paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            return [
+                {
+                    "id": 1,
+                    "user": {"login": "codex-bot"},
+                    "body": "stale before-anchor feedback",
+                    "created_at": "2026-04-26T00:00:00Z",
+                },
+                {
+                    "id": 2,
+                    "user": {"login": "author"},
+                    "body": "@codex review",
+                    "created_at": "2026-04-27T00:00:00Z",
+                },
+                {
+                    "id": 3,
+                    "user": {"login": "codex-bot"},
+                    "body": "P1: rename foo",
+                    "created_at": "2026-04-27T01:00:00Z",
+                },
+                {
+                    "id": 4,
+                    "user": {"login": "teammate"},
+                    "body": "looks good",
+                    "created_at": "2026-04-27T02:00:00Z",
+                },
+            ]
+        if path.endswith("/pulls/42/comments"):
+            return [
+                {
+                    "id": 5,
+                    "user": {"login": "codex-bot"},
+                    "body": "P2: extract helper",
+                    "created_at": "2026-04-27T03:00:00Z",
+                }
+            ]
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    out = github_client.get_latest_codex_feedback("owner/name", 42)
+    assert out == "P1: rename foo\n\nP2: extract helper"
+
+
+def test_get_latest_codex_feedback_returns_none_when_no_codex_comments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        github_client, "get_pr_author", lambda repo, n: "author"
+    )
+
+    def fake_paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            return [
+                {
+                    "id": 1,
+                    "user": {"login": "author"},
+                    "body": "@codex review",
+                    "created_at": "2026-04-27T00:00:00Z",
+                }
+            ]
+        if path.endswith("/pulls/42/comments"):
+            return []
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    assert github_client.get_latest_codex_feedback("owner/name", 42) is None
+
+
+def test_get_latest_codex_feedback_skips_onboarding_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        github_client, "get_pr_author", lambda repo, n: "author"
+    )
+
+    def fake_paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            return [
+                {
+                    "id": 1,
+                    "user": {"login": "author"},
+                    "body": "@codex review",
+                    "created_at": "2026-04-27T00:00:00Z",
+                },
+                {
+                    "id": 2,
+                    "user": {"login": "codex-bot"},
+                    "body": "Please create a Codex account and connect to github.",
+                    "created_at": "2026-04-27T01:00:00Z",
+                },
+            ]
+        if path.endswith("/pulls/42/comments"):
+            return []
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    assert github_client.get_latest_codex_feedback("owner/name", 42) is None
+
+
+def test_get_latest_codex_feedback_returns_all_codex_comments_when_no_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No PR-author ``@codex review`` trigger: every Codex comment counts."""
+    monkeypatch.setattr(
+        github_client, "get_pr_author", lambda repo, n: "author"
+    )
+
+    def fake_paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            return [
+                {
+                    "id": 1,
+                    "user": {"login": "codex-bot"},
+                    "body": "feedback before any anchor",
+                    "created_at": "2026-04-27T01:00:00Z",
+                }
+            ]
+        if path.endswith("/pulls/42/comments"):
+            return []
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    out = github_client.get_latest_codex_feedback("owner/name", 42)
+    assert out == "feedback before any anchor"
+
+
+def test_get_latest_codex_feedback_skips_non_author_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``@codex review`` posted by a teammate is not the anchor."""
+    monkeypatch.setattr(
+        github_client, "get_pr_author", lambda repo, n: "author"
+    )
+
+    def fake_paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            return [
+                {
+                    "id": 1,
+                    "user": {"login": "codex-bot"},
+                    "body": "P1: real feedback",
+                    "created_at": "2026-04-27T00:00:00Z",
+                },
+                {
+                    "id": 2,
+                    "user": {"login": "teammate"},
+                    "body": "@codex review",
+                    "created_at": "2026-04-27T02:00:00Z",
+                },
+            ]
+        if path.endswith("/pulls/42/comments"):
+            return []
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    out = github_client.get_latest_codex_feedback("owner/name", 42)
+    assert out == "P1: real feedback"
+
+
+def test_get_latest_codex_feedback_returns_none_when_endpoints_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        github_client, "get_pr_author", lambda repo, n: "author"
+    )
+
+    def fake_paginated(path: str) -> list[dict]:
+        raise RuntimeError("api blew up")
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    assert github_client.get_latest_codex_feedback("owner/name", 42) is None
+
+
+def test_get_latest_codex_feedback_skips_empty_codex_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        github_client, "get_pr_author", lambda repo, n: "author"
+    )
+
+    def fake_paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            return [
+                {
+                    "id": 1,
+                    "user": {"login": "author"},
+                    "body": "@codex review",
+                    "created_at": "2026-04-27T00:00:00Z",
+                },
+                {
+                    "id": 2,
+                    "user": {"login": "codex-bot"},
+                    "body": "   ",
+                    "created_at": "2026-04-27T01:00:00Z",
+                },
+            ]
+        if path.endswith("/pulls/42/comments"):
+            return []
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+
+    assert github_client.get_latest_codex_feedback("owner/name", 42) is None

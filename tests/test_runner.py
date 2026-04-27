@@ -2968,7 +2968,7 @@ def test_handle_fix_injects_ci_logs_when_ci_failed(
         lambda repo, branch: "pytest assertion error: boom",
     )
     monkeypatch.setattr(
-        fix_module, "_fetch_latest_review_feedback",
+        fix_module.github_client, "get_latest_codex_feedback",
         lambda repo, pr_number: None,
     )
     captured = _capture_fix_kwargs(monkeypatch)
@@ -2996,7 +2996,7 @@ def test_handle_fix_injects_review_feedback_when_changes_requested(
         lambda repo, branch: None,
     )
     monkeypatch.setattr(
-        fix_module, "_fetch_latest_review_feedback",
+        fix_module.github_client, "get_latest_codex_feedback",
         lambda repo, pr_number: "P1: please rename foo to bar",
     )
     captured = _capture_fix_kwargs(monkeypatch)
@@ -3025,7 +3025,7 @@ def test_handle_fix_injects_both_ci_logs_and_review_feedback(
         lambda repo, branch: "ci-boom",
     )
     monkeypatch.setattr(
-        fix_module, "_fetch_latest_review_feedback",
+        fix_module.github_client, "get_latest_codex_feedback",
         lambda repo, pr_number: "review-feedback-text",
     )
     captured = _capture_fix_kwargs(monkeypatch)
@@ -3176,105 +3176,6 @@ def test_fetch_failed_ci_logs_returns_none_on_run_view_failure(
 
     monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
     assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
-
-
-def test_fetch_latest_review_feedback_picks_most_recent_changes_requested(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    payload = {
-        "reviews": [
-            {
-                "state": "CHANGES_REQUESTED",
-                "submittedAt": "2026-04-20T12:00:00Z",
-                "body": "older feedback",
-            },
-            {
-                "state": "APPROVED",
-                "submittedAt": "2026-04-26T12:00:00Z",
-                "body": "looks good",
-            },
-            {
-                "state": "CHANGES_REQUESTED",
-                "submittedAt": "2026-04-25T12:00:00Z",
-                "body": "newer feedback",
-            },
-        ]
-    }
-    monkeypatch.setattr(
-        fix_module.github_client, "run_gh", lambda args, **kwargs: payload
-    )
-    assert (
-        fix_module._fetch_latest_review_feedback("octo/demo", 77)
-        == "newer feedback"
-    )
-
-
-def test_fetch_latest_review_feedback_returns_none_when_no_changes_requested(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    payload = {
-        "reviews": [
-            {
-                "state": "APPROVED",
-                "submittedAt": "2026-04-26T12:00:00Z",
-                "body": "looks good",
-            }
-        ]
-    }
-    monkeypatch.setattr(
-        fix_module.github_client, "run_gh", lambda args, **kwargs: payload
-    )
-    assert fix_module._fetch_latest_review_feedback("octo/demo", 77) is None
-
-
-def test_fetch_latest_review_feedback_returns_none_on_runtime_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
-    assert fix_module._fetch_latest_review_feedback("octo/demo", 77) is None
-
-
-def test_fetch_latest_review_feedback_returns_none_when_payload_not_dict(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        fix_module.github_client,
-        "run_gh",
-        lambda args, **kwargs: "unexpected scalar",
-    )
-    assert fix_module._fetch_latest_review_feedback("octo/demo", 77) is None
-
-
-def test_fetch_latest_review_feedback_returns_none_when_reviews_not_list(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        fix_module.github_client,
-        "run_gh",
-        lambda args, **kwargs: {"reviews": "not-a-list"},
-    )
-    assert fix_module._fetch_latest_review_feedback("octo/demo", 77) is None
-
-
-def test_fetch_latest_review_feedback_returns_none_when_body_empty(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    payload = {
-        "reviews": [
-            {
-                "state": "CHANGES_REQUESTED",
-                "submittedAt": "2026-04-26T12:00:00Z",
-                "body": "",
-            }
-        ]
-    }
-    monkeypatch.setattr(
-        fix_module.github_client, "run_gh", lambda args, **kwargs: payload
-    )
-    assert fix_module._fetch_latest_review_feedback("octo/demo", 77) is None
 
 
 def test_handle_fix_finishes_push_bookkeeping_before_post_exit_stop_pause(
