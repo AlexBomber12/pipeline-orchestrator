@@ -546,7 +546,7 @@
 - Branch: pr-163-github-api-rate-limit
 
 ## PR-164: FIX no-push deadlock circuit breaker
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-164.md
 - Branch: pr-164-fix-no-push-circuit-breaker
 
