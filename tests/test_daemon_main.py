@@ -17,6 +17,25 @@ from src.daemon import main as main_module
 from src.models import PipelineState
 
 
+@pytest.fixture(autouse=True)
+def _disable_config_watcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace the config-file watcher with a no-op for every test in this file.
+
+    The real watcher polls ``config.yml`` via ``asyncio.sleep`` which the
+    tests below replace with synchronous fakes that bookkeep call counts
+    and raise ``_StopLoop``. Letting the watcher run in that environment
+    pollutes ``sleep_calls`` and surfaces the test sentinel exception as a
+    spurious task failure.
+    """
+
+    async def _noop_watcher(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        main_module, "watch_config_file_changes", _noop_watcher
+    )
+
+
 class _FakeRedisClient:
     """Placeholder returned by the patched ``aioredis.from_url``."""
 

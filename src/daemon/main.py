@@ -38,6 +38,7 @@ from src.coders import build_coder_registry
 from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
 from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
+from src.daemon.config_watcher import watch_config_file_changes
 from src.daemon.runner import PipelineRunner
 from src.models import PipelineState
 from src.usage import UsageProvider
@@ -388,6 +389,18 @@ async def main() -> None:
         codex_usage_provider,
         registry,
     )
+
+    # Keep a strong reference: the event loop only holds weak references
+    # to tasks, so a discarded handle can be garbage-collected mid-await.
+    _background_tasks: set[asyncio.Task[None]] = set()
+    watcher_task = asyncio.create_task(
+        watch_config_file_changes(
+            redis_client,
+            get_repo_names=lambda: [runner.name for runner in runners.values()],
+        )
+    )
+    _background_tasks.add(watcher_task)
+    watcher_task.add_done_callback(_background_tasks.discard)
 
     last_run: dict[str, float] = {}
     last_config_check = time.monotonic()
