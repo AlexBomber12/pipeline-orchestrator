@@ -208,6 +208,20 @@ main() {
         exit 0
     fi
 
+    # ``handle_error`` invokes the coder with a fixed-shape diagnose prompt
+    # asking for one of FIX / SKIP / ESCALATE. The real CLI replies; the
+    # shim has no LLM so it answers SKIP, which lets the daemon clear a
+    # transient ERROR (e.g. a "Base branch was modified" merge race in a
+    # prior test) and return to IDLE before the next e2e test starts.
+    # Without this, ERROR persists and downstream tests time out waiting
+    # for IDLE.
+    for arg in "$@"; do
+        if [[ "${arg}" == *"FIX, SKIP, or ESCALATE"* ]]; then
+            printf 'SKIP\n'
+            exit 0
+        fi
+    done
+
     local scenario
     scenario="$(read_scenario)"
 
