@@ -2,9 +2,9 @@
 
 Живой документ. Обновляется после каждой merge'нутой волны и после каждой chat-session.
 
-Последнее обновление: 2026-04-26 (after Sprint F1.0 + PR-156/157 + PR-158/159 merged; Variant D direction confirmed; Development model & Layer 2 substrate observations added).
+Последнее обновление: 2026-04-27 (after Stage 1 foundation merging in progress; Multi-tier agent direction added; OBS-Y premature merge investigation logged).
 
-Предыдущие: 2026-04-24 (after code audit zip __27__, corrections applied), Day 5 closure, Day 4 auto, 2026-04-21 after PR-145..PR-150.
+Предыдущие: 2026-04-26 (after Sprint F1.0 + PR-156/157 + PR-158/159 merged; Variant D direction confirmed; Development model & Layer 2 substrate observations added), 2026-04-24 (after code audit zip __27__, corrections applied), Day 5 closure, Day 4 auto, 2026-04-21 after PR-145..PR-150.
 
 ---
 
@@ -899,6 +899,148 @@ This direction explicitly informed by **AI context limit observation** (line 745
 **Decision criteria:** investigate, then decide whether to add as standard recommendation in AGENTS.md ("for any managed repo, run /graphify on first sync") or as automatic step in `ensure_repo_cloned` (controversial — adds dependency, runtime cost). Default position: recommend manual usage by Aleksei, do not auto-install in daemon flow until proven beneficial across multiple repo types.
 
 **Priority:** Round 5+ (after Variant D + Sprint 10 + Sprint 11 stabilize). Substrate question, not blocker for any current PR. Possible earlier promotion if coder context-loss incidents become frequent post-Variant D.
+
+---
+
+---
+
+## Active investigations (added 2026-04-27)
+
+### OBS-Y: Daemon merges PR before formal APPROVED state
+
+**Observed:** PR #222 (PR-164 FIX no-push deadlock circuit breaker) merged automatically at 00:46:34 on 2026-04-27. Post-mortem analysis revealed:
+
+- Head commit `174ea408` pushed at 00:39:57
+- All 4 Codex formal reviews: `state=COMMENTED`, none `APPROVED`
+- +1 reaction on PR body: created at 00:50:20 — **4 minutes after** the merge
+- Production config `allow_merge_without_review` is unset (defaults to false)
+- Therefore daemon should NOT have merged
+
+**Two independent issues sandwiched together:**
+
+1. **Claude in FIX cycle hallucinated state.** Claude's STDOUT at 00:46:24:
+   > "Codex +1 at 2026-04-27T00:45:30Z (post round-3 push at ~00:42Z → non-stale)"
+   
+   No such +1 reaction existed at 00:45:30 (it was created at 00:50:20). Claude either fabricated the timestamp or misread an earlier signal. This is a **coder reasoning bug** — coder confidently asserted false fact about PR state.
+
+2. **Daemon also merged.** Even if coder's verdict is ignored, daemon's own `_compute_review_status` decided APPROVED was true. Without an actual +1 reaction or formal APPROVED review at that moment, the only mechanism would be:
+   - Stale cache from earlier cycle, OR
+   - Misinterpretation of body anchor parsing path (`src/github_client.py:503+`), OR
+   - Bug in threshold comparison (line 462-477)
+
+**Impact:** the PR happened to be a good merge (claude's fix was correct, Codex eventually +1'd). But the merge path was incorrect. If a real bad fix had slipped through this gap, prod main would be broken.
+
+**Action plan:**
+
+1. **Add debug logging to `_compute_review_status`** in `src/github_client.py`. Each branch (line 444-488) should log: `head_sha`, `latest_review_sha`, `latest_review_time`, `reaction_time`, `head_commit_time`, `threshold`, decision (`body_approved=True/False`). Plus log cache hits explicitly. MICRO PR (~30 LoC).
+
+2. **Add coder reasoning verification**. Coder's claims about PR state in STDOUT should be cross-checked by daemon before being acted on. If coder says "PR green" but daemon's own `_compute_review_status` returns NOT APPROVED — daemon should NOT trust coder's verdict.
+
+3. **Once 2-3 more observations of premature merge collected with debug logs** — root cause becomes diagnosable. Targeted fix follows.
+
+**Priority:** medium. Not blocking deployment, but represents trust-erosion risk in autonomous merging. Fix in batch after Stage 3 UX polish merges.
+
+**Backlog items:**
+
+- **PR-180 (next foundation batch):** Debug logging in `_compute_review_status`. MICRO PR.
+- **PR-181 (after observations):** Coder verdict verification — daemon does not trust coder's "PR is green" claim without independent confirmation.
+- **PR-182 (after debug logs collected):** Targeted fix once root cause identified.
+
+### Onboarding existing project (gap, added 2026-04-27)
+
+**Observed:** Pipeline-orchestrator currently assumes the managed repo is greenfield with full conventions in place: AGENTS.md, scripts/ci.sh, tasks/ directory, .gitignore for artifacts, GHA workflow with unit+integration jobs, Codex Connector enabled, optional branch protection. New project starting from zero — works fine.
+
+For an EXISTING project (e.g., LAN_Transcriber, AWA-App, or any of Aleksei's other repos), none of these conventions exist. Daemon clones the repo successfully but the first PLANNED PR breaks because:
+- AGENTS.md missing → coder doesn't know Work Modes / FIX FEEDBACK trigger
+- scripts/ci.sh missing → no local gate
+- tasks/ directory missing → coder doesn't know task file format
+- Existing CI workflow may conflict with pipeline conventions
+- Existing branch protection may require human reviewers (Codex can only Comment)
+- AGENTS.md / CLAUDE.md if already present → merge conflict with template
+- Non-Python stack → ci.sh template needs adaptation
+- Long history → coder context overflow risk
+
+**Chicken-and-egg:** the bootstrap convention itself requires conventions to follow. Solution direction: special bootstrap task whose body INCLUDES the AGENTS.md template inline, so coder can read it from the task body and then create the file in the repo.
+
+**Action plan (separate PR series, sized ~3-5 PRs):**
+
+1. **Onboarding runbook** (MICRO PR): `docs/onboarding-existing-project.md` — manual steps, edge cases, troubleshooting per common stack (Python, JS, Go, Rust).
+
+2. **Bootstrap task template** (config PR): `templates/PR-bootstrap.md.template` and supporting `templates/AGENTS.md.template` + `templates/ci.sh.template` (per-language variants). User copies and customizes for each new repo.
+
+3. **Stack detection helper** (medium feature): coder (or future Tier 2 architect) detects language/framework from repo files (pyproject.toml, package.json, go.mod, Cargo.toml) and adapts ci.sh template accordingly during bootstrap.
+
+4. **Bootstrap merge bypass** (small feature): config flag or per-repo setting `bootstrap_pr_count: 1` allows the first N PRs of a new repo to merge without full review/CI gate. Necessary because the gate itself doesn't exist yet on first PR.
+
+5. **Existing convention reconciliation** (medium feature): if repo already has AGENTS.md / CLAUDE.md / ci.sh, bootstrap PR merges with existing rather than overwrites. Risk-managed via 3-way diff and human review of the merge.
+
+6. **Onboarding wizard in UI** (large feature, optional): Settings page step-by-step "Add new repo" that walks user through clone, bootstrap task, first PR review, gate enable. Replaces manual runbook over time.
+
+**Testing path:** onboard one of Aleksei's existing public repos (LAN_Transcriber or AWA-App) as the first real-world test. Document what breaks, fix iteratively.
+
+**Priority:** high once Stage 1-3 stable. This unblocks "use orchestrator for multiple projects" — a strategic capability for sustained productivity. Currently the orchestrator only manages itself, which is impressive but limited.
+
+**Backlog items:**
+
+- **PR-183:** Onboarding runbook + templates (Python, JS, Go variants).
+- **PR-184:** Stack detection helper (pyproject.toml etc → adapt ci.sh).
+- **PR-185:** Bootstrap merge bypass config flag.
+- **PR-186:** Existing AGENTS.md/CLAUDE.md reconciliation — section markers approach (see detail below).
+- **PR-187+:** Onboarding wizard UI (later, optional).
+- **PR-220:** Implementation of the section-markers reconciliation logic in scaffolder.py (per spec below).
+
+#### Reconciliation strategy for existing AGENTS.md / CLAUDE.md (clarified 2026-04-27)
+
+**Problem:** scaffolder.py:260 currently SKIPS copying template if `AGENTS.md` or `CLAUDE.md` already exists. This is correct defensive behavior — we never overwrite user content. But it creates a real gap: existing repo's AGENTS.md describes the user's project conventions (code style, testing rules, framework specifics) but does NOT describe orchestrator conventions (Work Modes, FIX FEEDBACK trigger, @codex review protocol, artifacts). Coder reads existing AGENTS.md, follows project conventions correctly, but does NOT execute orchestrator protocol. Daemon waits for actions coder doesn't perform → silent breakage.
+
+**Four directions evaluated:**
+
+**A. Section markers in AGENTS.md.** Orchestrator template wrapped in HTML comments:
+```
+<!-- BEGIN: orchestrator-managed (do not edit between these markers; auto-updated by pipeline-orchestrator) -->
+## Work Modes
+... orchestrator conventions here ...
+<!-- END: orchestrator-managed -->
+```
+On scaffold: append marked section to existing file (or replace between existing markers for future updates). User content outside markers untouched. The HTML-comment markers themselves are visible in the rendered markdown explaining provenance — user is NOT surprised.
+
+**B. Separate ORCHESTRATOR.md file.** Don't touch AGENTS.md at all. Coder gets two files in prompt context. Lower reliability — coder may ignore second file.
+
+**C. Inject conventions via task body.** Every task file includes inline conventions reminder. No repo modification. Verbose, expensive in tokens, fatigue.
+
+**D. Manual AI-assisted merge with user oversight.** Bootstrap PR proposes diff (append orchestrator section); requires human review and merge. No silent modification of user's repo.
+
+**Selected approach:** **D + A combined.**
+
+- **First-time bootstrap (D):** scaffolder detects existing AGENTS.md, generates bootstrap PR with proposed diff appending the marked orchestrator section. PR has `auto_merge: false` enforced — Aleksei reviews, accepts (or modifies), merges manually. This is a **deliberate decision moment** — onboarding orchestrator into an existing project deserves explicit human review of the convention merge.
+
+- **Visible markers (A):** the appended section uses HTML comments visible to user as commentary. Quote: `<!-- BEGIN: orchestrator-managed (do not edit between these markers; auto-updated by pipeline-orchestrator) -->`. User is not surprised when they next open AGENTS.md — they see what is managed and why.
+
+- **Future automatic updates (A):** subsequent pipeline-orchestrator version bumps that update the orchestrator-managed section can do so automatically by replacing content between markers. User content outside markers stays untouched.
+
+- **Conflict resolution rules:** if user removes the BEGIN/END markers (intentionally or accidentally), scaffolder treats the file as not-managed and creates a fresh bootstrap PR rather than silently appending again. If user moves markers, scaffolder respects the new boundaries (only updates content between markers). If markers are malformed (BEGIN without END or vice versa) — scaffolder logs warning and leaves file untouched, opens fresh bootstrap PR.
+
+**PR-186 revised spec:**
+
+`src/daemon/scaffolder.py`:
+- Detect existing AGENTS.md / CLAUDE.md.
+- If file does not exist → copy template as today (current behavior preserved).
+- If file exists with valid orchestrator markers → replace content between markers with current template's marked section (silent update path).
+- If file exists without markers → do NOT modify. Instead, set a flag in repo state indicating "bootstrap reconciliation PR pending". Daemon's IDLE handler picks this up next cycle and creates a bootstrap task file with the proposed merge as a normal PR (`auto_merge: false` flag in the task header).
+- Bootstrap reconciliation PR has type `config`, priority 1, depends_on: none, body = explanation + diff preview. Coder for bootstrap is `claude` (better at multi-file merge reasoning than codex).
+
+`templates/AGENTS.md`: rewrap orchestrator-specific sections in BEGIN/END markers. Non-orchestrator-specific content (if any) outside markers.
+
+`tests/test_scaffolder_reconciliation.py` (new):
+- Existing AGENTS.md without markers + scaffold → no file modification + bootstrap flag set.
+- Existing AGENTS.md with markers + scaffold + template change → content between markers updated.
+- Existing AGENTS.md with markers, user adds text outside markers → scaffold preserves user text.
+- Existing AGENTS.md with malformed markers (BEGIN, no END) → no modification + warning logged.
+- Existing AGENTS.md with markers removed by user → treated as not-managed (no silent re-append).
+
+`docs/onboarding-existing-project.md` (PR-183 dependency): documents the markers convention, what to expect on first bootstrap, how to remove orchestrator management cleanly if user later wants to (just delete the marked section + markers).
+
+**Renumber:** PR-186 in this spec is **distinct** from the older "PR-186 Task content viewer" (which was originally a different number; the current number for that is PR-198 → PR-186 in the renumber table at line 358). To avoid confusion, this onboarding reconciliation PR is **PR-220** in the new sequence. Updated backlog item list above.
 
 ---
 
