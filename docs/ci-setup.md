@@ -21,6 +21,7 @@ Navigate to <https://github.com/settings/apps/new>. Fill in the form:
   - Contents: Read and write
   - Issues: Read and write
   - Pull requests: Read and write
+  - Commit statuses: Read and write
   - Metadata: Read-only (default, cannot be unchecked)
 - Subscribe to events: leave all unchecked.
 - Where can this GitHub App be installed: "Only on this account".
@@ -79,3 +80,4 @@ Common issues and fixes:
 - **"Bad credentials" from `gh` CLI in workflow**: the App private key in the secret is malformed. Re-do Step E, ensuring you paste the entire `.pem` contents including the BEGIN/END lines.
 - **Integration job hangs at `docker compose up -d --wait`**: the Dockerfile build is failing or a service healthcheck is failing. Check the prior step's output for image build errors, then check the redis-test healthcheck (uses `redis-cli ping`, which is in the `redis:7-alpine` image by default).
 - **"Permission denied" pushing to testbed**: the App is installed but the Contents permission is read-only. Re-do Step A, ensuring Contents is "Read and write".
+- **`tests/e2e/test_fix_external_merge.py` skipped with "Commit statuses: Write" message**: the App was provisioned before that permission was added to the documented set. In the App's "Permissions & events" page, change "Commit statuses" from no access to Read and write, then re-grant access on the install (the App owner will get an "approve permission update" prompt at the install URL).

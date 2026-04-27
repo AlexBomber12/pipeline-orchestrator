@@ -340,6 +340,46 @@ def get_merged_prs(
     return list(prs)
 
 
+def pr_state(repo: str, pr_number: int) -> dict[str, str | None] | None:
+    """Return the PR's terminal state markers, or ``None`` on lookup failure.
+
+    Returned dict shape: ``{"state": str, "mergedAt": str|None, "closedAt": str|None}``
+    where ``state`` is the GitHub-normalized ``"OPEN"``, ``"CLOSED"``, or
+    ``"MERGED"``. Used by the FIX-cycle polling task to detect external
+    merge or close events while a coder process is running.
+    """
+    try:
+        raw = run_gh(
+            [
+                "pr",
+                "view",
+                str(pr_number),
+                "--json",
+                "state,mergedAt,closedAt",
+            ],
+            repo=repo,
+        )
+    except (RuntimeError, subprocess.TimeoutExpired, OSError):
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(raw, dict):
+        return None
+    state = raw.get("state")
+    if not isinstance(state, str):
+        return None
+    merged_at = raw.get("mergedAt") if isinstance(raw.get("mergedAt"), str) else None
+    closed_at = raw.get("closedAt") if isinstance(raw.get("closedAt"), str) else None
+    return {
+        "state": state.upper(),
+        "mergedAt": merged_at,
+        "closedAt": closed_at,
+    }
+
+
 def is_pr_merged(repo: str, pr_number: int) -> bool | None:
     """Return True if PR is merged, False if closed without merge, None on lookup failure."""
     try:

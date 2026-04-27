@@ -36,6 +36,7 @@ from src.github_client import (
     is_pr_merged,
     merge_pr,
     post_comment,
+    pr_state,
     run_gh,
 )
 from src.models import CIStatus, ReviewStatus
@@ -2554,6 +2555,140 @@ def test_is_pr_merged_returns_none_for_open_unmerged_pr(
         lambda *args, **kwargs: {"state": "open", "merged": False},
     )
     assert is_pr_merged("owner/name", 42) is None
+
+
+def test_pr_state_returns_dict_for_merged_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[list[str], dict[str, Any]]] = []
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> dict[str, str | None]:
+        captured.append((args, kwargs))
+        return {
+            "state": "merged",
+            "mergedAt": "2026-04-26T12:00:00Z",
+            "closedAt": "2026-04-26T12:00:00Z",
+        }
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+
+    result = pr_state("owner/name", 42)
+
+    assert result == {
+        "state": "MERGED",
+        "mergedAt": "2026-04-26T12:00:00Z",
+        "closedAt": "2026-04-26T12:00:00Z",
+    }
+    assert captured == [(
+        ["pr", "view", "42", "--json", "state,mergedAt,closedAt"],
+        {"repo": "owner/name"},
+    )]
+
+
+def test_pr_state_returns_dict_for_open_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "src.github_client.run_gh",
+        lambda *args, **kwargs: {"state": "open", "mergedAt": None, "closedAt": None},
+    )
+
+    assert pr_state("owner/name", 42) == {
+        "state": "OPEN",
+        "mergedAt": None,
+        "closedAt": None,
+    }
+
+
+def test_pr_state_parses_string_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "src.github_client.run_gh",
+        lambda *args, **kwargs: (
+            '{"state": "closed", "mergedAt": null, '
+            '"closedAt": "2026-04-26T13:00:00Z"}'
+        ),
+    )
+
+    assert pr_state("owner/name", 42) == {
+        "state": "CLOSED",
+        "mergedAt": None,
+        "closedAt": "2026-04-26T13:00:00Z",
+    }
+
+
+def test_pr_state_returns_none_on_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    assert pr_state("owner/name", 42) is None
+
+
+def test_pr_state_returns_none_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
+        raise subprocess.TimeoutExpired(cmd=args, timeout=30)
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    assert pr_state("owner/name", 42) is None
+
+
+def test_pr_state_returns_none_on_oserror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
+        raise OSError("gh missing")
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    assert pr_state("owner/name", 42) is None
+
+
+def test_pr_state_returns_none_for_malformed_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.github_client.run_gh", lambda *args, **kwargs: "{not-json"
+    )
+    assert pr_state("owner/name", 42) is None
+
+
+def test_pr_state_returns_none_for_unexpected_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.github_client.run_gh", lambda *args, **kwargs: ["unexpected"]
+    )
+    assert pr_state("owner/name", 42) is None
+
+
+def test_pr_state_returns_none_when_state_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.github_client.run_gh",
+        lambda *args, **kwargs: {"mergedAt": None, "closedAt": None},
+    )
+    assert pr_state("owner/name", 42) is None
+
+
+def test_pr_state_normalizes_non_string_timestamps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.github_client.run_gh",
+        lambda *args, **kwargs: {
+            "state": "closed",
+            "mergedAt": 12345,
+            "closedAt": None,
+        },
+    )
+
+    assert pr_state("owner/name", 42) == {
+        "state": "CLOSED",
+        "mergedAt": None,
+        "closedAt": None,
+    }
 
 
 def test_get_pr_review_status_propagates_issue_comment_error(

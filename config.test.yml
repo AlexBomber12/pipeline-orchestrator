@@ -15,6 +15,8 @@ daemon:
   claude_model: opus
   fix_idle_timeout_sec: 60
   fix_no_push_cap: 3
+  fix_poll_interval_sec: 5
+  coder_terminate_grace_sec: 5
   planned_pr_timeout_sec: 60
   coder_priority:
     codex: 81

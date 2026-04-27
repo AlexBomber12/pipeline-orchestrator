@@ -82,7 +82,6 @@ _TRANSIENT_STATES = {
 }
 
 _HISTORY_LIMIT = 100
-_STOP_WAIT_TIMEOUT_SEC = 5
 _STOP_POLL_INTERVAL_SEC = 0.5
 
 # Timeout for ``scripts/ci.sh`` on the auto-commit path.
@@ -718,8 +717,9 @@ class PipelineRunner(
         except ProcessLookupError:
             self._current_coder_process = None
             return
+        grace = self.app_config.daemon.coder_terminate_grace_sec
         try:
-            await asyncio.wait_for(proc.wait(), timeout=_STOP_WAIT_TIMEOUT_SEC)
+            await asyncio.wait_for(proc.wait(), timeout=grace)
         except asyncio.TimeoutError:
             try:
                 proc.kill()
