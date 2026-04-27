@@ -14,6 +14,7 @@ daemon:
   error_handler_use_ai: false
   claude_model: opus
   fix_idle_timeout_sec: 60
+  fix_no_push_cap: 3
   planned_pr_timeout_sec: 60
   coder_priority:
     codex: 81

@@ -75,6 +75,71 @@ class FixMixin(BreachMixin):
                 target.cancel()
                 return
 
+    async def _escalate_fix_no_push_deadlock(self, current_pr: PRInfo) -> None:
+        """Park the PR in HUNG after consecutive no-push FIX cycles.
+
+        Logs the deadlock event with the counter value, posts an
+        explanatory comment on the PR, applies the ``escalated`` label so
+        ``get_open_prs`` rehydrates ``is_escalated`` after a daemon
+        restart (Codex P2 on PR #222), transitions to HUNG, and resets
+        the no-push counter so a future cycle out of HUNG starts fresh.
+        Comment- and label-post failures are logged but never block the
+        HUNG transition: HUNG is the safe parking state regardless, and
+        the in-memory ``is_escalated`` flag still holds for the current
+        run.
+
+        Marks ``current_pr.is_escalated`` so ``handle_hung`` keeps the
+        runner parked even when ``hung_fallback_codex_review`` is on.
+        Without this, the default fallback would post ``@codex review``
+        and bounce back to WATCH on the very next tick, immediately
+        re-entering the FIX loop the deadlock counter was meant to stop.
+        """
+        count = current_pr.no_push_fix_count
+        pr_number = current_pr.number
+        message = (
+            f"FIX deadlock: {count} consecutive no-push FIX cycles on PR "
+            f"#{pr_number}. Coder unable to identify actionable fix. "
+            "Manual review required."
+        )
+        try:
+            github_client.post_comment(self.owner_repo, pr_number, message)
+        except Exception as exc:
+            self.log_event(
+                f"Warning: failed to post FIX deadlock comment on PR "
+                f"#{pr_number}: {exc}"
+            )
+        try:
+            github_client.run_gh(
+                [
+                    "label",
+                    "create",
+                    "escalated",
+                    "--color",
+                    "B60205",
+                    "--description",
+                    "Daemon escalated, manual review required",
+                ],
+                repo=self.owner_repo,
+            )
+        except Exception as exc:
+            self.log_event(f"FIX no-push label create skipped: {exc}")
+        try:
+            github_client.run_gh(
+                ["pr", "edit", str(pr_number), "--add-label", "escalated"],
+                repo=self.owner_repo,
+            )
+        except Exception as exc:
+            self.log_event(
+                f"Warning: failed to apply escalated label to PR "
+                f"#{pr_number}: {exc}"
+            )
+        current_pr.is_escalated = True
+        current_pr.no_push_fix_count = 0
+        self.state.state = PipelineState.HUNG
+        self.state.error_message = None
+        self.log_event(message)
+        await self.publish_state()
+
     async def _escalate_fix_iteration_cap(self, current_pr: PRInfo) -> None:
         """Escalate the PR after the FIX iteration cap is reached.
 
@@ -167,6 +232,13 @@ class FixMixin(BreachMixin):
             counter_getter=lambda pr: pr.fix_iteration_count,
             counter_setter=lambda pr, n: setattr(pr, "fix_iteration_count", n),
             on_threshold=lambda pr: self._escalate_fix_iteration_cap(pr),
+        )
+        no_push_policy: BoundedRecoveryPolicy[PRInfo] = BoundedRecoveryPolicy(
+            name="fix_no_push_cap",
+            max_attempts=self.app_config.daemon.fix_no_push_cap,
+            counter_getter=lambda pr: pr.no_push_fix_count,
+            counter_setter=lambda pr, n: setattr(pr, "no_push_fix_count", n),
+            on_threshold=lambda pr: self._escalate_fix_no_push_deadlock(pr),
         )
         if current_pr is not None and await fix_iteration_policy.maybe_escalate(
             current_pr
@@ -274,6 +346,11 @@ class FixMixin(BreachMixin):
                 code, stdout, stderr = 1, "", ""
             elif breach_flag["breached"]:
                 if self.state.current_pr is not None:
+                    # Breach pause is not a no-push success; reset the
+                    # streak so a no-push success → breach → no-push
+                    # success sequence is not treated as consecutive
+                    # (Codex P2 on PR #222).
+                    no_push_policy.reset(self.state.current_pr)
                     self._rehydrate_last_push_at(self.state.current_pr)
                     try:
                         head_now = git_ops._git(
@@ -317,6 +394,10 @@ class FixMixin(BreachMixin):
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
         if breach_flag["breached"]:
             if self.state.current_pr is not None:
+                # Late-breach pause is not a no-push success; reset the
+                # streak (Codex P2 on PR #222) — same rationale as the
+                # CancelledError breach path above.
+                no_push_policy.reset(self.state.current_pr)
                 self._rehydrate_last_push_at(self.state.current_pr)
                 try:
                     head_now = git_ops._git(
@@ -448,6 +529,7 @@ class FixMixin(BreachMixin):
                 self._last_push_at_pr_number = self.state.current_pr.number
                 self.state.current_pr.push_count += 1
                 iteration = fix_iteration_policy.increment(self.state.current_pr)
+                no_push_policy.reset(self.state.current_pr)
                 self.state.current_pr.last_activity = push_time
             else:
                 iteration = 0
@@ -467,6 +549,13 @@ class FixMixin(BreachMixin):
 
         await capture_stop_requested_after_exit()
         if idle_flag["timed_out"]:
+            # Idle timeout breaks the no-push streak: the coder didn't
+            # produce a push and the daemon killed it. Reset the counter
+            # so a later "no-push success" cycle starts fresh rather
+            # than tripping the cap on a non-consecutive sequence
+            # (Codex P2 on PR #222).
+            if self.state.current_pr is not None:
+                no_push_policy.reset(self.state.current_pr)
             self.state.state = PipelineState.ERROR
             self.state.error_message = (
                 f"FIX idle timeout: no push for {idle_limit}s"
@@ -482,6 +571,11 @@ class FixMixin(BreachMixin):
             head_after = read_head_after_fix()
             if head_after is None:
                 return
+            # Stop-cancel breaks the consecutive no-push streak (Codex P2
+            # on PR #222). ``record_fix_push`` already resets on a
+            # productive push; this covers the no-push case.
+            if self.state.current_pr is not None:
+                no_push_policy.reset(self.state.current_pr)
             branch = self.state.current_pr.branch if self.state.current_pr is not None else ""
             if branch and remote_branch_contains_head(branch, head_after):
                 if not record_fix_push(
@@ -501,6 +595,12 @@ class FixMixin(BreachMixin):
             self.state.error_message = None  # pragma: no cover - defensive fallback
             return  # pragma: no cover - defensive fallback
         if code != 0:
+            # FIX failure breaks the consecutive no-push streak (Codex P2
+            # on PR #222): a sequence like no-push success → failed FIX
+            # → no-push success would otherwise still trip the deadlock
+            # cap even though the no-push cycles were not consecutive.
+            if self.state.current_pr is not None:
+                no_push_policy.reset(self.state.current_pr)
             self._detect_rate_limit(stderr, coder_name=coder_name)
             if self.state.rate_limited_until is not None:
                 self.state.state = PipelineState.PAUSED
@@ -527,7 +627,14 @@ class FixMixin(BreachMixin):
                 "FIX REVIEW exited 0 but HEAD unchanged; "
                 "no push, skipping @codex review"
             )
+            if self.state.current_pr is not None:
+                no_push_policy.increment(self.state.current_pr)
             if await pause_for_stop_after_bookkeeping():
+                return
+            if (
+                self.state.current_pr is not None
+                and await no_push_policy.maybe_escalate(self.state.current_pr)
+            ):
                 return
             self.state.state = PipelineState.WATCH
             return

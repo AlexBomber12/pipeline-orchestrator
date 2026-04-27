@@ -3315,6 +3315,7 @@ def test_handle_idle_preserves_fix_iteration_count_when_reattaching_same_pr(
         number=145,
         branch="pr-145-fix-iteration-cap",
         fix_iteration_count=15,
+        no_push_fix_count=2,
     )
 
     asyncio.run(runner.handle_idle())
@@ -3323,6 +3324,7 @@ def test_handle_idle_preserves_fix_iteration_count_when_reattaching_same_pr(
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.number == 145
     assert runner.state.current_pr.fix_iteration_count == 15
+    assert runner.state.current_pr.no_push_fix_count == 2
 
 
 def test_handle_fix_cap_sets_error_when_comment_post_fails(
@@ -3466,6 +3468,677 @@ def test_handle_fix_routes_iteration_cap_through_bounded_recovery_policy(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.is_escalated is True
+
+
+# ---------------------------------------------------------------------------
+# PR-164: FIX no-push deadlock circuit breaker
+# ---------------------------------------------------------------------------
+
+
+def _patch_no_push_fix(
+    monkeypatch: pytest.MonkeyPatch,
+    head_seq: Callable[[], str],
+) -> list[tuple[str, int, str]]:
+    """Wire fake git/CLI/comment hooks for no-push FIX cycle tests.
+
+    ``head_seq`` is a zero-arg callable that returns the SHA each time
+    ``git rev-parse HEAD`` is invoked, letting individual tests stitch
+    together arbitrary head_before/head_after sequences across many
+    consecutive ``handle_fix`` calls.
+    """
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "rev-parse"] and "HEAD" in cmd:
+            return _FakeCompletedProcess(
+                args=cmd, stdout=f"{head_seq()}\n", returncode=0
+            )
+        if cmd[:2] == ["git", "rev-list"]:
+            return _FakeCompletedProcess(args=cmd, stdout="0\n", returncode=0)
+        return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", _async_cli_result(0, "", "")
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: "",
+    )
+    return posted
+
+
+def test_handle_fix_three_no_push_cycles_transition_to_hung(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Three consecutive no-push FIX cycles must park the PR in HUNG."""
+    posted = _patch_no_push_fix(monkeypatch, head_seq=lambda: "abc123")
+
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_no_push_cap=3)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=217, branch="pr-217")
+
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.no_push_fix_count == 1
+
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr.no_push_fix_count == 2
+
+    asyncio.run(runner.handle_fix())
+    expected_msg = (
+        "FIX deadlock: 3 consecutive no-push FIX cycles on PR #217. "
+        "Coder unable to identify actionable fix. Manual review required."
+    )
+    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.current_pr.no_push_fix_count == 0
+    # is_escalated must be set so handle_hung's hung_fallback_codex_review
+    # path stays parked instead of bouncing back to WATCH.
+    assert runner.state.current_pr.is_escalated is True
+    assert posted[-1] == (runner.owner_repo, 217, expected_msg)
+    assert any(entry["event"] == expected_msg for entry in runner.state.history)
+
+
+def test_handle_fix_productive_push_resets_no_push_counter_before_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two no-push cycles followed by a productive push reset the counter."""
+    seq = iter([
+        "aaa000",  # call 1 head_before
+        "aaa000",  # call 1 head_after  → no-push
+        "aaa000",  # call 2 head_before
+        "aaa000",  # call 2 head_after  → no-push
+        "aaa000",  # call 3 head_before
+        "bbb111",  # call 3 head_after  → productive push
+    ])
+    posted = _patch_no_push_fix(monkeypatch, head_seq=lambda: next(seq))
+
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_no_push_cap=3)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=218, branch="pr-218")
+    monkeypatch.setattr(runner, "_post_codex_review", lambda pr_number: True)
+
+    asyncio.run(runner.handle_fix())
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.no_push_fix_count == 1
+
+    asyncio.run(runner.handle_fix())
+    assert runner.state.current_pr.no_push_fix_count == 2
+
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr.no_push_fix_count == 0
+    assert runner.state.current_pr.push_count == 1
+    assert all(
+        "FIX deadlock" not in entry["event"] for entry in runner.state.history
+    )
+    assert all("FIX deadlock" not in body for _repo, _num, body in posted)
+
+
+def test_handle_fix_no_push_counter_resets_between_productive_pushes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No-push, productive push, then no-push again must not trigger HUNG."""
+    seq = iter([
+        "aaa000",  # call 1 head_before
+        "aaa000",  # call 1 head_after  → no-push  (counter 0→1)
+        "aaa000",  # call 2 head_before
+        "bbb111",  # call 2 head_after  → productive push (counter 1→0)
+        "bbb111",  # call 3 head_before
+        "bbb111",  # call 3 head_after  → no-push  (counter 0→1)
+    ])
+    posted = _patch_no_push_fix(monkeypatch, head_seq=lambda: next(seq))
+
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_no_push_cap=3)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=219, branch="pr-219")
+    monkeypatch.setattr(runner, "_post_codex_review", lambda pr_number: True)
+
+    asyncio.run(runner.handle_fix())
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.no_push_fix_count == 1
+
+    asyncio.run(runner.handle_fix())
+    assert runner.state.current_pr.no_push_fix_count == 0
+
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr.no_push_fix_count == 1
+    assert all(
+        "FIX deadlock" not in entry["event"] for entry in runner.state.history
+    )
+    assert all("FIX deadlock" not in body for _repo, _num, body in posted)
+
+
+def test_handle_fix_no_push_counter_independent_of_fix_iteration_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PR can carry fix_iteration_count=2 and trip no_push_fix_count first."""
+    posted = _patch_no_push_fix(monkeypatch, head_seq=lambda: "abc123")
+
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_iteration_cap=15, fix_no_push_cap=3)
+    runner.state.state = PipelineState.WATCH
+    # fix_iteration_count=2 reflects two prior productive cycles; the no-push
+    # counter advances orthogonally and trips HUNG without touching the cap.
+    runner.state.current_pr = PRInfo(
+        number=220,
+        branch="pr-220",
+        fix_iteration_count=2,
+    )
+
+    asyncio.run(runner.handle_fix())
+    asyncio.run(runner.handle_fix())
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.current_pr is not None
+    # fix_iteration_count untouched: only productive pushes increment it.
+    assert runner.state.current_pr.fix_iteration_count == 2
+    assert runner.state.current_pr.no_push_fix_count == 0
+    assert runner.state.current_pr.is_escalated is True
+    expected_msg = (
+        "FIX deadlock: 3 consecutive no-push FIX cycles on PR #220. "
+        "Coder unable to identify actionable fix. Manual review required."
+    )
+    assert posted[-1] == (runner.owner_repo, 220, expected_msg)
+
+
+def test_handle_fix_routes_no_push_cap_through_bounded_recovery_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guard: the no-push escalation site must call
+    ``BoundedRecoveryPolicy.maybe_escalate`` rather than rebuilding
+    the threshold check inline."""
+    _patch_no_push_fix(monkeypatch, head_seq=lambda: "abc123")
+
+    maybe_escalate_calls: list[str] = []
+    orig_maybe_escalate = recovery_policy_module.BoundedRecoveryPolicy.maybe_escalate
+
+    async def spy_maybe_escalate(self: Any, ctx: Any) -> bool:
+        maybe_escalate_calls.append(self.name)
+        return await orig_maybe_escalate(self, ctx)
+
+    monkeypatch.setattr(
+        recovery_policy_module.BoundedRecoveryPolicy,
+        "maybe_escalate",
+        spy_maybe_escalate,
+    )
+
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_no_push_cap=2)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=221, branch="pr-221")
+
+    asyncio.run(runner.handle_fix())
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.HUNG
+    assert "fix_no_push_cap" in maybe_escalate_calls
+
+
+def test_handle_fix_no_push_deadlock_post_failure_still_transitions_to_hung(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed deadlock-comment post must not block the HUNG transition."""
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "rev-parse"] and "HEAD" in cmd:
+            return _FakeCompletedProcess(args=cmd, stdout="abc123\n", returncode=0)
+        if cmd[:2] == ["git", "rev-list"]:
+            return _FakeCompletedProcess(args=cmd, stdout="0\n", returncode=0)
+        return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", _async_cli_result(0, "", "")
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("gh down")),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: "",
+    )
+
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_no_push_cap=2)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=222, branch="pr-222")
+
+    asyncio.run(runner.handle_fix())
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.no_push_fix_count == 0
+    assert runner.state.current_pr.is_escalated is True
+    assert any(
+        "failed to post FIX deadlock comment" in entry["event"]
+        for entry in runner.state.history
+    )
+    assert any(
+        "FIX deadlock: 2 consecutive no-push FIX cycles on PR #222"
+        in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_fix_no_push_deadlock_applies_escalated_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The no-push escalation must add the ``escalated`` label so
+    ``get_open_prs`` rehydrates ``is_escalated`` after a daemon restart
+    (Codex P2 on PR #222)."""
+    posted = _patch_no_push_fix(monkeypatch, head_seq=lambda: "abc123")
+    gh_calls: list[list[str]] = []
+
+    def fake_run_gh(cmd: list[str], **kwargs: Any) -> str:
+        gh_calls.append(cmd)
+        return ""
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_run_gh)
+
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_no_push_cap=2)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=223, branch="pr-223")
+
+    asyncio.run(runner.handle_fix())
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.is_escalated is True
+    escalation_calls = [
+        cmd
+        for cmd in gh_calls
+        if cmd[:1] == ["label"] or cmd[:2] == ["pr", "edit"]
+    ]
+    assert escalation_calls == [
+        [
+            "label",
+            "create",
+            "escalated",
+            "--color",
+            "B60205",
+            "--description",
+            "Daemon escalated, manual review required",
+        ],
+        ["pr", "edit", "223", "--add-label", "escalated"],
+    ]
+    assert posted[-1][1] == 223
+
+
+def test_handle_fix_no_push_deadlock_label_failures_do_not_block_hung(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Label create/add failures must not block the HUNG transition; the
+    in-memory ``is_escalated`` flag is sufficient for the current run."""
+    _patch_no_push_fix(monkeypatch, head_seq=lambda: "abc123")
+
+    def fake_run_gh(cmd: list[str], **kwargs: Any) -> str:
+        if cmd[:3] == ["label", "create", "escalated"]:
+            raise RuntimeError("label already exists")
+        if cmd[:2] == ["pr", "edit"]:
+            raise RuntimeError("gh down")
+        return ""
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_run_gh)
+
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_no_push_cap=2)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=224, branch="pr-224")
+
+    asyncio.run(runner.handle_fix())
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.is_escalated is True
+    assert any(
+        "FIX no-push label create skipped: label already exists"
+        in entry["event"]
+        for entry in runner.state.history
+    )
+    assert any(
+        "failed to apply escalated label to PR #224: gh down"
+        in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_fix_failure_resets_no_push_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-zero FIX exit between two no-push successes must reset the
+    no-push counter so a non-consecutive sequence does not trip the
+    deadlock cap (Codex P2 on PR #222)."""
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "rev-parse"] and "HEAD" in cmd:
+            return _FakeCompletedProcess(args=cmd, stdout="abc123\n", returncode=0)
+        if cmd[:2] == ["git", "rev-list"]:
+            return _FakeCompletedProcess(args=cmd, stdout="0\n", returncode=0)
+        return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "run_gh", lambda *a, **kw: ""
+    )
+
+    cycles = iter([(0, "", ""), (1, "", "boom"), (0, "", "")])
+
+    async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        return next(cycles)
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_no_push_cap=2)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=225, branch="pr-225")
+
+    # Cycle 1: no-push success → counter 0→1
+    asyncio.run(runner.handle_fix())
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.no_push_fix_count == 1
+
+    # Cycle 2: non-zero exit → counter resets to 0, state ERROR
+    runner.state.state = PipelineState.WATCH
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_pr.no_push_fix_count == 0
+
+    # Cycle 3: no-push success → counter 0→1; cap=2 so still no escalation.
+    runner.state.state = PipelineState.WATCH
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr.no_push_fix_count == 1
+    assert all("FIX deadlock" not in body for _r, _n, body in posted)
+
+
+def test_handle_fix_breach_cancel_resets_no_push_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A breach pause via CancelledError breaks the no-push streak: a
+    rate-limit interruption is not a no-push success, so the counter
+    must reset (Codex P2 round 3 on PR #222)."""
+    rev_parse_calls = {"count": 0}
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_calls["count"] += 1
+            sha = "aaa111\n" if rev_parse_calls["count"] == 1 else "bbb222\n"
+            return _FakeCompletedProcess(args=["git", *args], stdout=sha, returncode=0)
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        await asyncio.Future()
+        return (0, "", "")
+
+    async def no_idle_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    async def breach_cancel_monitor(
+        self: PipelineRunner,
+        breach_dir: str,
+        run_id: str,
+        claude_task: asyncio.Task,  # type: ignore[type-arg]
+        breach_flag: dict[str, bool],
+    ) -> None:
+        self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        breach_flag["breached"] = True
+        await asyncio.sleep(0)
+        claude_task.cancel()
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_inflight_breach", breach_cancel_monitor
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=227, branch="pr-227", no_push_fix_count=2
+    )
+    monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda pr: None)
+    monkeypatch.setattr(runner, "_post_codex_review", lambda pr_number: True)
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.no_push_fix_count == 0
+
+
+def test_handle_fix_late_breach_resets_no_push_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late breach (detected after FIX completed) also breaks the
+    no-push streak — same rationale as the CancelledError breach path
+    (Codex P2 round 3 on PR #222)."""
+    rev_parse_calls = {"count": 0}
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_calls["count"] += 1
+            sha = "aaa111\n" if rev_parse_calls["count"] == 1 else "bbb222\n"
+            return _FakeCompletedProcess(args=["git", *args], stdout=sha, returncode=0)
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def no_idle_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    async def no_breach_monitor(
+        self: object,
+        breach_dir: str,
+        run_id: str,
+        claude_task: asyncio.Task,  # type: ignore[type-arg]
+        breach_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    def fake_late_breach(
+        self: PipelineRunner,
+        breach_dir: str,
+        run_id: str,
+        breach_flag: dict[str, bool],
+    ) -> None:
+        self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        breach_flag["breached"] = True
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", _async_cli_result(0, "ok", "")
+    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
+    )
+    monkeypatch.setattr(PipelineRunner, "_check_late_breach", fake_late_breach)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=228, branch="pr-228", no_push_fix_count=2
+    )
+    monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda pr: None)
+    monkeypatch.setattr(runner, "_post_codex_review", lambda pr_number: True)
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.no_push_fix_count == 0
+
+
+def test_handle_fix_stop_cancel_resets_no_push_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """User stop-cancel during FIX also breaks the no-push streak
+    (Codex P2 round 3 on PR #222). When the operator pauses mid-FIX the
+    cycle isn't a coder no-push outcome, so the counter resets."""
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        if args[:2] == ("rev-parse", "HEAD"):
+            return _FakeCompletedProcess(
+                args=["git", *args], stdout="aaa111\n", returncode=0
+            )
+        if args[:2] == ("rev-parse", "origin/pr-229"):
+            return _FakeCompletedProcess(
+                args=["git", *args], stdout="aaa111\n", returncode=0
+            )
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        await asyncio.Future()
+        return (0, "", "")
+
+    async def no_idle_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    async def no_breach_monitor(
+        self: object,
+        breach_dir: str,
+        run_id: str,
+        claude_task: asyncio.Task,  # type: ignore[type-arg]
+        breach_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=229, branch="pr-229", no_push_fix_count=2
+    )
+
+    async def stop_monitor(
+        cli_task: asyncio.Task[tuple[int, str, str]],
+    ) -> None:
+        runner._stop_requested = True
+        runner.state.user_paused = True
+        await asyncio.sleep(0)
+        cli_task.cancel()
+
+    async def save_log(stdout: str, stderr: str, label: str) -> None:
+        pass
+
+    monkeypatch.setattr(runner, "_save_cli_log", save_log)
+    monkeypatch.setattr(runner, "_monitor_stop_request", stop_monitor)
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.no_push_fix_count == 0
+
+
+def test_handle_fix_idle_timeout_resets_no_push_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FIX idle timeout breaks the no-push streak: the daemon killed the
+    coder for not progressing, which is not a consecutive no-push exit
+    and must reset the counter (Codex P2 on PR #222)."""
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "rev-parse"] and "HEAD" in cmd:
+            return _FakeCompletedProcess(args=cmd, stdout="abc123\n", returncode=0)
+        if cmd[:2] == ["git", "rev-list"]:
+            return _FakeCompletedProcess(args=cmd, stdout="0\n", returncode=0)
+        return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "run_gh", lambda *a, **kw: ""
+    )
+
+    async def idle_timeout_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        idle_flag["timed_out"] = True
+        target.cancel()
+
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_fix_idle", idle_timeout_monitor
+    )
+
+    async def slow_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        await asyncio.Future()
+        return (0, "", "")
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", slow_fix)
+
+    runner = _make_runner()
+    runner._app_config = _app_cfg(fix_no_push_cap=2)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=226, branch="pr-226", no_push_fix_count=1
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.no_push_fix_count == 0
+    assert all("FIX deadlock" not in body for _r, _n, body in posted)
 
 
 def test_handle_fix_finishes_push_bookkeeping_before_stop_cancel_pause(
@@ -4965,6 +5638,37 @@ def test_handle_watch_preserves_fix_iteration_count_for_same_pr(
     assert runner.state.current_pr.fix_iteration_count == 7
 
 
+def test_handle_watch_preserves_no_push_fix_count_for_same_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The no-push counter must survive the per-cycle PRInfo refresh from
+    ``get_open_prs``; otherwise the deadlock circuit breaker can never
+    accumulate past 1 across WATCH↔FIX cycles."""
+    pr = PRInfo(
+        number=9,
+        branch="pr-009",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=datetime.now(timezone.utc),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=9,
+        branch="pr-009",
+        no_push_fix_count=2,
+    )
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.no_push_fix_count == 2
+
+
 def test_handle_watch_no_fix_when_ci_pending_and_changes_requested(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5404,6 +6108,11 @@ def test_handle_hung_posts_codex_review_and_returns_to_watch(
         posted.append((repo, number, body))
 
     monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
 
     runner = _make_runner()
     runner.state.state = PipelineState.HUNG
@@ -5416,6 +6125,81 @@ def test_handle_hung_posts_codex_review_and_returns_to_watch(
     assert runner.state.current_pr.last_activity is not None
 
 
+def test_handle_hung_stays_hung_when_pr_is_escalated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Escalated PRs (e.g. parked here by the FIX no-push deadlock circuit
+    breaker) must stay HUNG even when ``hung_fallback_codex_review`` is on;
+    otherwise the fallback bounces back to WATCH and re-enters the loop
+    that triggered escalation in the first place."""
+    posted: list[tuple[str, int, str]] = []
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
+
+    runner = _make_runner()
+    assert runner.app_config.daemon.hung_fallback_codex_review is True
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(
+        number=217, branch="pr-217", is_escalated=True
+    )
+    asyncio.run(runner.handle_hung())
+
+    assert posted == []
+    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.is_escalated is True
+    assert any(
+        "PR #217 escalated; staying HUNG" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_hung_escalated_pr_resolved_externally_transitions_to_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An escalated PR that the operator manually merges/closes must
+    transition out of HUNG. The early-return on ``is_escalated`` used to
+    short-circuit the PR state check and trap the runner forever (Codex
+    P1 on PR #222)."""
+    posted: list[tuple[str, int, str]] = []
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: {"state": "MERGED"},
+    )
+
+    runner = _make_runner()
+    assert runner.app_config.daemon.hung_fallback_codex_review is True
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(
+        number=217, branch="pr-217", is_escalated=True
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-217", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_hung())
+
+    assert posted == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+    assert runner.state.current_task is None
+
+
 def test_handle_hung_sets_error_when_fallback_post_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5423,6 +6207,11 @@ def test_handle_hung_sets_error_when_fallback_post_fails(
         raise RuntimeError("gh unavailable")
 
     monkeypatch.setattr(runner_module.github_client, "post_comment", boom)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
 
     runner = _make_runner()
     runner.state.state = PipelineState.HUNG

@@ -186,33 +186,19 @@ class HungMixin:
 
     async def handle_hung(self) -> None:
         """Nudge the reviewer with ``@codex review`` or give up, per config."""
-        if (
-            self.app_config.daemon.hung_fallback_codex_review
-            and self.state.current_pr is not None
-        ):
-            try:
-                github_client.post_comment(
-                    self.owner_repo,
-                    self.state.current_pr.number,
-                    "@codex review",
-                )
-            except Exception as exc:
-                self.state.state = PipelineState.ERROR
-                self.state.error_message = f"post_comment failed: {exc}"
-                self.log_event(str(exc))
-                return
-            self.state.current_pr.last_activity = datetime.now(timezone.utc)
-            self.state.state = PipelineState.WATCH
-            self.log_event("posted @codex review -> WATCH")
-            return
-
-        if self.state.current_pr is not None:
+        current_pr = self.state.current_pr
+        if current_pr is not None:
+            # Always check whether the operator resolved the PR before
+            # branching on escalation/fallback. An escalated PR that gets
+            # manually merged or closed must transition out of HUNG; the
+            # prior shape returned early on ``is_escalated`` and trapped
+            # the runner there forever (Codex P1 on PR #222).
             try:
                 result = github_client.run_gh(
                     [
                         "pr",
                         "view",
-                        str(self.state.current_pr.number),
+                        str(current_pr.number),
                         "--json",
                         "state",
                     ],
@@ -230,13 +216,45 @@ class HungMixin:
 
             if pr_state in ("MERGED", "CLOSED"):
                 self.log_event(
-                    f"PR #{self.state.current_pr.number} {pr_state} "
+                    f"PR #{current_pr.number} {pr_state} "
                     "by operator -> IDLE"
                 )
                 self.state.current_pr = None
                 self.state.current_task = None
                 self.state.state = PipelineState.IDLE
                 return
+
+            if current_pr.is_escalated:
+                # Escalated PRs (e.g. parked here by the FIX no-push deadlock
+                # circuit breaker) require manual intervention. Skip the
+                # @codex review fallback so the runner stays HUNG instead of
+                # bouncing through WATCH and re-entering the loop that
+                # triggered escalation in the first place.
+                self.log_event(
+                    f"PR #{current_pr.number} escalated; staying HUNG, "
+                    "skipping @codex review fallback. Manual review required."
+                )
+                return
+
+        if (
+            self.app_config.daemon.hung_fallback_codex_review
+            and current_pr is not None
+        ):
+            try:
+                github_client.post_comment(
+                    self.owner_repo,
+                    current_pr.number,
+                    "@codex review",
+                )
+            except Exception as exc:
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = f"post_comment failed: {exc}"
+                self.log_event(str(exc))
+                return
+            current_pr.last_activity = datetime.now(timezone.utc)
+            self.state.state = PipelineState.WATCH
+            self.log_event("posted @codex review -> WATCH")
+            return
 
         self.log_event(
             "hung fallback disabled; leaving runner in HUNG for operator action. "

@@ -62,7 +62,10 @@ class WatchMixin:
             return
 
         found = found.model_copy(
-            update={"fix_iteration_count": current_pr.fix_iteration_count}
+            update={
+                "fix_iteration_count": current_pr.fix_iteration_count,
+                "no_push_fix_count": current_pr.no_push_fix_count,
+            }
         )
         self.state.current_pr = found
         # Retry rehydrate every cycle so a transient commit-time fetch

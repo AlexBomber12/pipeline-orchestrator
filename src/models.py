@@ -65,6 +65,7 @@ class PRInfo(BaseModel):
     commits_count: int = 0
     push_count: int = 0
     fix_iteration_count: int = 0
+    no_push_fix_count: int = 0
     url: str = ""
     last_activity: datetime | None = None
     is_escalated: bool = False
