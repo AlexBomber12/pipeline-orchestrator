@@ -525,6 +525,8 @@ def test_stop_daemon_waits_through_active_user_paused_state() -> None:
         responses = iter(
             [
                 f'[{{"name": "{slug}", "state": "CODING", "user_paused": true}}]'.encode(),
+                f'[{{"name": "{slug}", "state": "WATCH", "user_paused": true}}]'.encode(),
+                f'[{{"name": "{slug}", "state": "MERGE", "user_paused": true}}]'.encode(),
                 f'[{{"name": "{slug}", "state": "IDLE", "user_paused": true}}]'.encode(),
             ]
         )
@@ -542,5 +544,5 @@ def test_stop_daemon_waits_through_active_user_paused_state() -> None:
         sys.modules.pop(module_name, None)
 
     assert posts == [(f"{e2e_conftest.TEST_DASHBOARD_URL}/repos/{slug}/stop", 10)]
-    assert opens == [(f"{e2e_conftest.TEST_DASHBOARD_URL}/api/states", 5)] * 2
-    assert sleeps == [0.5]
+    assert opens == [(f"{e2e_conftest.TEST_DASHBOARD_URL}/api/states", 5)] * 4
+    assert sleeps == [0.5, 0.5, 0.5]

@@ -39,9 +39,7 @@ def _stop_daemon_and_wait_paused(slug: str, timeout_sec: int = 30) -> None:
                 if entry.get("name") == slug or entry.get("slug") == slug:
                     last_state = entry.get("state")
                     last_user_paused = entry.get("user_paused")
-                    if last_state == "PAUSED" or (
-                        last_user_paused is True and last_state in ("IDLE", "WATCH", "MERGE")
-                    ):
+                    if last_state == "PAUSED" or (last_user_paused is True and last_state == "IDLE"):
                         return
         time.sleep(0.5)
 
