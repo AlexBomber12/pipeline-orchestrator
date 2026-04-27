@@ -32,16 +32,49 @@ FIX_POLL_INTERVAL_SEC = 5
 EXTERNAL_MERGE_DETECTION_MARGIN_SEC = 10
 
 
+_PERMISSION_GAP_MESSAGE = (
+    "Testbed GitHub App is missing the 'Commit statuses: Write' "
+    "permission required to engineer the WATCH→FIX transition. "
+    "Update the App per docs/ci-setup.md Step A and re-run. "
+    "The polling behavior is exercised by the unit tests in "
+    "tests/test_runner.py."
+)
+
+
+def _preflight_status_write_permission() -> None:
+    """Skip the test BEFORE any side-effecting setup if the App can't post statuses.
+
+    A POST to ``/statuses/<invalid-sha>`` checks authorization before SHA
+    validation: a 403 ``Resource not accessible by integration`` means
+    the App lacks ``Commit statuses: Write``; a 422 ``No commit found``
+    means the permission is granted but the SHA isn't real (the desired
+    no-op outcome). Running this preflight at the very top of the test
+    keeps the daemon from starting a real PR + racing to MERGE in the
+    SKIP path, which previously cascaded ``ERROR`` into the next test.
+    """
+    invalid_sha = "0" * 40
+    result = subprocess.run(
+        [
+            "gh", "api", "-X", "POST",
+            f"repos/{TESTBED_REPO}/statuses/{invalid_sha}",
+            "-f", "state=success",
+            "-f", "context=e2e-fix-trigger-preflight",
+        ],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    if (
+        result.returncode != 0
+        and "Resource not accessible by integration" in result.stderr
+    ):
+        pytest.skip(_PERMISSION_GAP_MESSAGE)
+
+
 def _post_failed_status(head_sha: str) -> None:
     """Force a failure on the PR's head commit so WATCH transitions to FIX.
 
-    The integration job authenticates as the testbed GitHub App; posting
-    to ``/statuses/{sha}`` requires the ``Commit statuses: Write``
-    permission on that App. If the App was provisioned before that
-    requirement was documented (see ``docs/ci-setup.md`` Step A) the
-    POST returns HTTP 403 ``Resource not accessible by integration``;
-    treat this as an environment/setup gap and skip rather than fail —
-    the polling code path is also covered by ``tests/test_runner.py``.
+    The preflight at the top of the test should have already caught a
+    permission gap; this 403 branch is defense-in-depth for the case
+    where permissions changed between the preflight and the real POST.
     """
     result = subprocess.run(
         [
@@ -56,13 +89,7 @@ def _post_failed_status(head_sha: str) -> None:
     if result.returncode != 0:
         stderr = result.stderr.strip()
         if "Resource not accessible by integration" in stderr:
-            pytest.skip(
-                "Testbed GitHub App is missing the 'Commit statuses: Write' "
-                "permission required to engineer the WATCH→FIX transition. "
-                "Update the App per docs/ci-setup.md Step A and re-run. "
-                "The polling behavior is exercised by the unit tests in "
-                "tests/test_runner.py."
-            )
+            pytest.skip(_PERMISSION_GAP_MESSAGE)
         raise AssertionError(
             f"failed to post status check on {head_sha}: "
             f"rc={result.returncode}, stderr={stderr!r}"
@@ -116,6 +143,11 @@ def test_external_merge_during_fix_returns_to_idle(
     make_task_zip,
     reset_testbed,
 ):
+    # Skip BEFORE any side-effecting setup if the App can't post commit
+    # statuses; otherwise the daemon would still race a real PR through
+    # CODING → WATCH → MERGE in the skip path and leave subsequent
+    # e2e tests stranded in ERROR (observed on PR #223 round-2..4).
+    _preflight_status_write_permission()
     try:
         wait_for_state(["IDLE"], timeout_sec=30)
     except TimeoutError as exc:
