@@ -59,9 +59,15 @@ def clear_merged_prs_cache() -> None:
 
 
 def _begin_review_cache_cycle() -> None:
-    """Start a new cache cycle, invalidating all previous entries."""
+    (
+        "Mark the start of a new cycle. Cache entries are keyed on (repo, pr_number, head_sha) "
+        "and remain valid across cycles because review status cannot change without a new commit "
+        "(which produces a new head_sha and thus a new cache key). Old keys for stale head_shas "
+        "accumulate but are bounded by the number of distinct (PR, commit) pairs the daemon observes; "
+        "this is acceptable for daemon process lifetimes. Tests use clear_review_status_cache() for "
+        "explicit isolation."
+    )
     global _review_status_cache_cycle
-    _review_status_cache.clear()
     if _review_status_cache_cycle is None:
         _review_status_cache_cycle = 0
     _review_status_cache_cycle += 1

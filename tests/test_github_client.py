@@ -2422,6 +2422,37 @@ def test_begin_review_cache_cycle_initializes_and_increments() -> None:
     assert github_client._review_status_cache_cycle == 2
 
 
+def test_review_cache_persists_across_cycles(monkeypatch: pytest.MonkeyPatch) -> None:
+    clear_review_status_cache()
+    calls: list[tuple[str, int, str, str]] = []
+
+    def fake_compute_review_status(
+        repo: str,
+        pr_number: int,
+        pr_author: str,
+        head_sha: str,
+    ) -> ReviewStatus:
+        calls.append((repo, pr_number, pr_author, head_sha))
+        return ReviewStatus.APPROVED
+
+    monkeypatch.setattr(
+        "src.github_client._compute_review_status",
+        fake_compute_review_status,
+    )
+
+    result1 = get_pr_review_status(
+        "owner/name", 42, pr_author="author", head_sha="sha123"
+    )
+    github_client._begin_review_cache_cycle()
+    result2 = get_pr_review_status(
+        "owner/name", 42, pr_author="author", head_sha="sha123"
+    )
+
+    assert result1 == ReviewStatus.APPROVED
+    assert result2 == ReviewStatus.APPROVED
+    assert calls == [("owner/name", 42, "author", "sha123")]
+
+
 def test_is_reaction_content_rejects_non_dict() -> None:
     assert _is_reaction_content(None, "+1") is False
 
