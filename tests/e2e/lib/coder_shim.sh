@@ -63,6 +63,7 @@ git_setup_branch() {
     git config user.email "shim@test.invalid"
     git config user.name "Shim Coder"
     git fetch origin
+    git fetch origin "${branch}:refs/remotes/origin/${branch}" || true
     git checkout -B "${branch}" origin/main
 }
 
