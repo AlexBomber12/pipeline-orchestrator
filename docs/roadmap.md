@@ -2,14 +2,17 @@
 
 Живой документ. Обновляется после каждой merge'нутой волны и после каждой chat-session.
 
-Последнее обновление: 2026-04-27 (OBS-AA test pollution v1 misdiagnosis + v2 docker-exec fix in flight; root cause and full diagnostic walkthrough preserved).
+Последнее обновление: 2026-04-28 (sigkill recovery test multi-race resolved via PR-228/PR-232/PR-234/PR-236; production daemon deployed on fresh main with 130 commits; GraphQL quota burn analyzed and diet plan added; onboarding test subjects identified — see OBS-AB, OBS-AC, and Onboarding test subjects subsection).
 
-Предыдущие: 2026-04-27 (OBS-AA test pollution root cause located via CI evidence; PR-230 task-fixture-redis-cleanup added; earlier OBS-Y/OBS-Z investigations preserved), 2026-04-27 (OBS-Y premature merge investigation; Multi-tier agent direction; Onboarding existing project gap; OBS-Z Codex EYES race), 2026-04-26 (after Sprint F1.0 + PR-156/157 + PR-158/159 merged; Variant D direction confirmed; Development model & Layer 2 substrate observations added), 2026-04-24 (after code audit zip __27__, corrections applied), Day 5 closure, Day 4 auto, 2026-04-21 after PR-145..PR-150.
+Предыдущие: 2026-04-27 (OBS-AA test pollution v1 misdiagnosis + v2 docker-exec fix in flight; root cause and full diagnostic walkthrough preserved), 2026-04-27 (OBS-AA test pollution root cause located via CI evidence; PR-230 task-fixture-redis-cleanup added; earlier OBS-Y/OBS-Z investigations preserved), 2026-04-27 (OBS-Y premature merge investigation; Multi-tier agent direction; Onboarding existing project gap; OBS-Z Codex EYES race), 2026-04-26 (after Sprint F1.0 + PR-156/157 + PR-158/159 merged; Variant D direction confirmed; Development model & Layer 2 substrate observations added), 2026-04-24 (after code audit zip __27__, corrections applied), Day 5 closure, Day 4 auto, 2026-04-21 after PR-145..PR-150.
 
 ---
 
 ## Текущий статус
 
+- **Production deployed 2026-04-28** with 130 new commits. PR-228 (Coder ESCALATE protocol), PR-232 (test fixture isolation via /stop daemon), PR-234 (REST quota fix — drop refresh=True from IDLE merged_prs), PR-236 (shim explicit lease + entrypoint git config mutex) all merged. Test_sigkill_recovery now stable in CI after 4 sequential reruns on the fix commit. Three independent races identified and fixed; full account in OBS-AB.
+- **GraphQL quota observed as binding constraint** during heavy debug session. Diet plan and GitHub App migration path documented in OBS-AC. Concrete action items proposed as PR-237 through PR-241.
+- **Onboarding test subjects identified**: megaraid-dashboard and sms-gateway-v2 are valid candidates for testing PR-220 reconciliation logic before user-facing flow. See "Onboarding existing project → Test subjects identified" subsection below.
 - **Testing-week CLOSED** (Days 1-5 complete). Day 5 auto-run выполнен, week summary ниже.
 - **Code audit completed 2026-04-24** — verified каждый запланированный PR против actual code. Corrections applied inline. Key findings below.
 - **Real product bugs found by testing-week:** 1 confirmed (FINDING-2 coder pin → PR-194). Hypothesized OBS-13 retracted — pack bug (OBS-14), не product.
@@ -26,13 +29,27 @@
 - **Wave 5 scope REDUCED.** `rate_limited_until` уже существует в `src/models.py:103`. PR-163 нужно добавить только `awaiting_start` (rate_limited_until готов). Migration proof easier.
 - **Memory items VERIFIED done в коде:** upload zip support, QUEUE.md не required в upload, Play/Pause/Stop per repo, post-pre-merge-sync @codex re-review, Codex draft PR ready conversion. Nothing to do. Memory update needed.
 - **New task added:** PR-198 Task content viewer в repo detail page (из memory wishlist).
+- **GraphQL quota observed as binding constraint (2026-04-28).** See OBS-AC. Rate-limit work in PR-163/PR-164 (handle daemon-side rate limit pause) is correct but addresses the consequence; the **cause** is heavy GraphQL consumption in WATCH/MERGE polling. Round 4 should include Leverage 2-4 from OBS-AC before any further rate-limit-pause refinements; otherwise we keep handling the wrong layer of the problem.
 
 ### Active TODO в tasks/
 
-- **PR-151** Play/Pause/Stop buttons size responsive (Wave 2 tail, TODO)
-- **PR-152** Remove nonfunctional Start badge (Wave 2 tail, TODO)
+Confirmed via daemon's `/data/repos/AlexBomber12__pipeline-orchestrator/tasks/` (production volume, ground truth — distinct from any deploy-time checkout):
 
-PR-153 первый свободный номер для Round 3 Wave 3.
+- **PR-171** Spinners on upload and settings forms (TODO)
+- **PR-172** Spinners on _controls.html and coder selector (TODO, depends PR-171)
+- **PR-173** Fuzzy dedup in log_event (regex numeric counter parts) (TODO)
+- **PR-174** Event log dedup display (Lucide rotate-ccw + count badge) (TODO)
+- **PR-175** Light-theme dropdown fix (color-scheme dark) (TODO)
+- **PR-176** Tasks viewer in repo detail page (DOING as of 2026-04-28, currently GitHub PR #237)
+- **PR-177** HTMX whitelist 400 status for validation error display (TODO)
+- **PR-178** Pulse animation jump fix (smooth opacity transition) (TODO)
+- **PR-179** Pulse badge replaces pulse dot for active states (TODO, depends PR-178)
+
+Sprint progress at 2026-04-28 evening: 116 / 125 done across all-time queue. Remaining 9 entries above.
+
+PR-180 first free number for next batch.
+
+**Caveat for future debugging sessions:** the deploy-time checkout in `~/pipeline-orchestrator/tasks/` may show a different (often smaller) set of PR-XXX.md files than what daemon actually sees. Daemon operates from its own clone in `/data/repos/<slug>/tasks/` (docker volume), which is the ground truth for queue computation. Don't conflate the two when investigating queue discrepancies.
 
 - **Next session priorities** (см. конец документа): OBS-16 ENV-TOKEN verification, PR-194 task file первым, затем Sprint F1.0 e2e infrastructure.
 
@@ -989,6 +1006,53 @@ For an EXISTING project (e.g., LAN_Transcriber, AWA-App, or any of Aleksei's oth
 - **PR-187+:** Onboarding wizard UI (later, optional).
 - **PR-220:** Implementation of the section-markers reconciliation logic in scaffolder.py (per spec below).
 
+#### Test subjects identified (added 2026-04-28)
+
+Two real existing projects in the AlexBomber12 account are valid candidates for testing the onboarding reconciliation logic (PR-220) before we touch any user-facing flow:
+
+**megaraid-dashboard** (`github.com/AlexBomber12/megaraid-dashboard`):
+- Python project, ~27 src files, ~27 test files, Alembic migrations present
+- AGENTS.md: 67 lines, sections: Mission, Workflow Rules, Code Style, Testing, Architecture Rules, Security Model, Hardware Target, Out Of Scope, Communication
+- CLAUDE.md present, README.md present, ci.yml in `.github/workflows/`
+- Status: incomplete project (per operator), good non-greenfield baseline
+
+**sms-gateway-v2** (`github.com/AlexBomber12/sms-gateway-v2`):
+- Python project, ~24 src files, ~51 test files (notably higher test coverage), Dockerfile + deploy/
+- AGENTS.md: 61 lines, sections: Mission, Workflow, Code Style, Testing, Architecture, Security, Hardware Target
+- CLAUDE.md present, README.md present, ci.yml in `.github/workflows/`
+- Status: incomplete project (per operator), good non-greenfield baseline
+
+**Reconciliation observations (preliminary):**
+
+Both projects use a section structure that **substantially differs** from pipeline-orchestrator's AGENTS.md (which has Work Modes, Daemon Mode, CI gates, Codex Review gate, ESCALATE protocol, etc.). Test subjects use a "guidelines for AI coder" structure (Mission/Workflow/Code Style/Testing/Architecture/Security/Hardware Target). Pipeline-orchestrator's AGENTS.md is "operating manual for the daemon."
+
+This is a real test of PR-220 reconciliation: the user's existing AGENTS.md is **not wrong** — it is a different document genre serving a different purpose. The orchestrator must either:
+
+1. **Append daemon-required sections** (Work Modes, CI gates, etc.) without disturbing the user's content. Section-marker reconciliation per the existing PR-220 spec. Project's AGENTS.md keeps its identity, daemon adds what it needs in marked regions.
+2. **Refuse to onboard** if reconciliation cannot be done safely — surface to user, let them decide whether to integrate.
+3. **Migrate user's content** into the daemon's section structure — risky, destructive, not recommended.
+
+**Recommendation:** option 1 (section-marker append). PR-220's reconciliation logic should treat the user's existing AGENTS.md as authoritative for its sections and add only the daemon's required sections in clearly-marked regions (e.g., `<!-- pipeline-orchestrator: managed -->` blocks).
+
+**Hardware Target section:** both subjects have a "Hardware Target" section that pipeline-orchestrator's AGENTS.md does not have. This is project-specific (megaraid is a hardware monitoring dashboard, sms-gateway runs on specific hardware). Onboarding logic must treat such project-specific sections as user-owned and never touch them.
+
+**Test plan (when ready):**
+
+1. Clone both subjects locally.
+2. Run pipeline-orchestrator onboarding on each, dry-run mode (do not write files yet).
+3. Inspect proposed reconciliation diff for each.
+4. Verify: user content preserved, daemon sections added in marked regions, no destructive overwrites.
+5. Apply reconciliation, run daemon against the onboarded project, verify CODING/WATCH/MERGE flow works without test-only assumptions leaking through.
+
+**Multi-repo aspect:** running daemon against both projects simultaneously will validate the multi-repo path that has so far been exercised only with a single repo (pipeline-orchestrator itself). Concrete things to verify:
+- Per-repo state isolation (one repo's CODING does not block another repo's WATCH polling)
+- GraphQL quota distribution across repos (related to OBS-AC diet — burn doubles with second active repo)
+- `tasks/` directory isolation per repo
+- Slug collision handling if two repos have similar names
+- UI dashboard handles 2+ repo cards correctly
+
+**Defer until:** PR-220 reconciliation logic exists and OBS-AC diet leverages 2-3 are shipped (otherwise multi-repo will hit GraphQL quota limit immediately).
+
 #### Reconciliation strategy for existing AGENTS.md / CLAUDE.md (clarified 2026-04-27)
 
 **Problem:** scaffolder.py:260 currently SKIPS copying template if `AGENTS.md` or `CLAUDE.md` already exists. This is correct defensive behavior — we never overwrite user content. But it creates a real gap: existing repo's AGENTS.md describes the user's project conventions (code style, testing rules, framework specifics) but does NOT describe orchestrator conventions (Work Modes, FIX FEEDBACK trigger, @codex review protocol, artifacts). Coder reads existing AGENTS.md, follows project conventions correctly, but does NOT execute orchestrator protocol. Daemon waits for actions coder doesn't perform → silent breakage.
@@ -1117,6 +1181,88 @@ Combination of two approaches:
 **Second lesson:** when designing test infrastructure helpers that need to reach docker-internal services, prefer `docker compose exec -T <container> <cmd>` over python clients connecting to discovered container IPs. The subprocess approach uses the container's own network namespace and works identically from CI runner host and developer DESKTOP. The python-from-host approach requires host port mappings or `docker inspect` IP discovery, both of which add infrastructure complexity and fail in subtle ways.
 
 ---
+
+### OBS-AB: Sigkill recovery test multi-race root cause (resolved 2026-04-28)
+
+**Observed:** `tests/e2e/test_sigkill_recovery.py::test_sigkill_during_coding_recovers_correctly` had been intermittent across many sprints. Failure modes varied across runs: `(stale info)` push rejection, `Base branch was modified` mid-merge, timeout reaching `IDLE`, `claude] CLI failed`. The non-determinism made every diagnostic attempt feel like guesswork.
+
+**Root cause: three independent races layered on the same test.**
+
+1. **Shim push lease bug (deterministic when triggered).** `git checkout -B "${branch}" origin/main` in `tests/e2e/lib/coder_shim.sh::git_setup_branch` sets local upstream to `refs/heads/main`. A later `git push --force-with-lease` (no arg) reads upstream config to determine the lease check, comparing remote `pr-...` ref against local `main` HEAD — mismatch, reject. Triggered when daemon recovery's preserve-push had already created `refs/remotes/origin/<branch>` for the same branch.
+2. **Stale tracking ref on shim re-invocation (deterministic when triggered).** When shim is re-invoked for the same branch (recovery → CODING retry), local `refs/remotes/origin/<branch>` is stale because `git fetch origin` (without explicit refspec) does not reliably refresh non-default-fetched refs. Lease check uses stale local cache against actual remote tip. Reject.
+3. **Test fixture isolation race (intermittent).** Daemon mid-merge of one test's PR while next test's `reset_testbed` is concurrently wiping `main`. `gh pr merge` fails with "Base branch was modified". Cascades into all subsequent tests because daemon enters ERROR state.
+
+**Fixes shipped:**
+- PR-236 introduces `safe_push_branch` helper with explicit lease against fresh `refs/remotes/origin/<branch>` (force-fetched before lease computation). Resolves races 1 and 2.
+- PR-232 adds `/stop daemon → wait PAUSED → cleanup → resume` pattern in `reset_testbed_full`. Resolves race 3.
+- PR-236 also serializes shared `git config --global` setup in `scripts/entrypoint.sh` via `mkdir`-based mutex, eliminating a baseline `could not lock config file` race when daemon-test and web-test containers start concurrently sharing `HOME=/data/auth`.
+
+**Diagnostic approach that worked:** added `DBG_SHIM` and `DBG_RECOVERY` instrumentation to dump `git for-each-ref` snapshots, `ls-remote` ground truth, local tracking config, and the exact lease value passed to `--force-with-lease`. After 4 CI integration reruns the failure-mode distribution was clear: 2× race-1 deterministic + 1× race-3 + 1× lucky pass. Verification that the fix held: 4 sequential CI reruns on the same fixed commit, all green, before merge.
+
+**Lesson recorded:** when a flaky test's failure cause is contested across multiple debugging cycles, stop hypothesizing and add ref-state instrumentation to the suspect code paths. The trace will resolve the question deterministically. Coverage gates can be satisfied with `# pragma: no cover` on the debug exception handlers — debug instrumentation is non-production code by design. Cost of instrumentation: 2 commits + 5 lines. Time saved: hours.
+
+**Second lesson:** for race condition fixes, one green CI run is not validation. The test was passing on lucky timing some fraction of runs before the fix existed. Require N≥3 green reruns on the same commit before merge.
+
+**Third lesson:** flaky test investigations should run in **both** environments. CI runner timing differs from local Docker (CI runners are slower; sigkill landed before shim made any commit, race never triggered). Local alone may hide CI-only races; CI alone may hide local-only races. Once a hypothesis forms, validate in both contexts before declaring confidence.
+
+**Fourth lesson (operator side):** during high-stakes debugging sessions, single-step execution mode is required. Composite scripts that chain `&&` past stateful failure points (rebase, merge, deploy) caused real production damage in this session when a `git rebase` failed but the script continued through `docker compose down/up`, baking conflict markers into the running config. Each command's output must be reviewed before the next is issued.
+
+**Fifth lesson (production config gap):** during the 2026-04-28 deploy, `git reset --hard` on the production checkout reverted `config.yml` to upstream defaults that did not match the running daemon's actual configuration. The production `config.yml` had ~15 daemon overrides (review_timeout_min=20, planned_pr_timeout_sec=2400, rate_limit session/weekly split, statusline_hook, etc.) that **existed only as a local file on the production host**, never committed to the repo. Production behavior was therefore not reproducible from git alone. Action item: decide on a configuration discipline — either commit a `config.production.yml` referenced explicitly at deploy, or move all environment-specific values to environment variables, or add a deploy step that diffs the running config against expected production values.
+
+### OBS-AC: GraphQL quota burn — diet plan and GitHub App migration (added 2026-04-28)
+
+**Observed:** during the 2026-04-28 debug session, GraphQL quota (5000/hour on the personal token) exhausted twice within ~2 hours of intensive work. This blocked CI re-runs at peak debugging and forced ~13 minute wait windows for reset. The personal token is shared across daemon polling, Codex Connector reviewer activity, IDE GitHub Pull Requests extension passive polling, and CI re-run triggers from `gh` CLI.
+
+**Verified GraphQL consumers:**
+- **Daemon polling cycle:** `gh pr list --json statusCheckRollup` (heavy GraphQL, called per WATCH/MERGE poll). Approximate burn: 100-300 points per cycle depending on PR count and check rollup depth. At `poll_interval_sec: 60` and 1 active repo, this dominates daemon-side burn.
+- **Codex Connector reviewer:** posts P1/P2 review comments on every PR push. Each review post is GraphQL-heavy (PR context fetch, comment thread inspection, file diff via GraphQL).
+- **IDE GitHub Pull Requests extension (VS Code):** polls GraphQL for PR list refresh ~once per minute when window is open, regardless of user activity. **Identified as a major silent consumer; removed during 2026-04-28 session.**
+- **CI workflow `gh` usage:** workflow files use `gh api` and `gh pr list` for status checks and rollup queries. Each CI run costs additional GraphQL.
+- **Daemon `_get_codex_review_signals`:** GraphQL call per WATCH cycle to detect Codex review state transitions.
+
+**Suspected additional consumers (not yet verified, action items below):**
+- Browser tabs open on github.com PR pages (each PR view does background GraphQL refresh).
+- Other IDE extensions that integrate with GitHub (Octotree, Copilot PR features, GitHub Actions extension).
+- `gh cli` background credential refresh.
+- GitHub Desktop or any other local app polling.
+
+**Diet plan (GraphQL leverage list, ordered by ease × payoff):**
+
+1. **Leverage 0 (free, immediate):** raise `poll_interval_sec` from 60 → 180 in production for low-activity periods. Trade-off: 3× longer detection latency for state transitions. Acceptable since daemon is overnight worker, not interactive. Already deferred in earlier OBS-Y discussion; reaffirmed here.
+2. **Leverage 1.5 (PR-234, merged 2026-04-28):** drop `refresh=True` from IDLE merged_prs fetch. Cache absorbs cycles. ~10-15% GraphQL reduction during IDLE periods. Already shipped.
+3. **Leverage 2 (small, ~50 lines) — proposed PR-237:** replace `gh pr list --json statusCheckRollup` with REST `GET /repos/{owner}/{repo}/commits/{sha}/check-runs` + `GET /repos/{owner}/{repo}/commits/{sha}/status`. REST is core quota (5000/hr) which has been consistently underused (4900+ remaining at the time of GraphQL exhaustion). Eliminates the dominant GraphQL consumer in WATCH/MERGE polling paths.
+4. **Leverage 3 (medium, ~150 lines) — proposed PR-238:** add ETag conditional requests to all GitHub REST calls. `If-None-Match` returns 304 when nothing changed and **does not count against rate limit**. Most polling cycles return identical data; this is essentially free for the common case.
+5. **Leverage 4 (medium) — proposed PR-239:** adaptive polling per state. IDLE without PR → 300s. CODING/FIX → 60s. WATCH/MERGE → 30s. Cuts IDLE burn dramatically for the common case where daemon is between tasks.
+6. **Sprint-scale — proposed PR-240:** **migrate from personal access token to GitHub App authentication.** Each App installation gets its own 5000/hr quota independent of personal token. Solves the shared-quota problem at the root. Allows daemon, Codex Connector (already an App), and CI to operate on independent budgets.
+
+**GitHub App migration plan (architectural):**
+
+Three paths considered:
+
+**Path X — Centralized API server:** single Anthropic-hosted (or self-hosted) App receives all installations, daemon authenticates via this server. Rejected: GDPR concerns, infrastructure burden, single point of failure, does not match self-hosted posture.
+
+**Path Y — Manifest Flow (selected):** each user creates own App via predefined GitHub App manifest. Daemon ships with a manifest URL the user clicks to provision their own App. Each user's App gets its own 5000/hr quota. App's private key stored locally on user's server. This matches the project's self-hosted positioning and has zero centralized infrastructure. Proposed PR-241 covers manifest flow + onboarding doc + automated key handling. Defer until first external user.
+
+**Path Z — BYO PAT (current state):** user provides personal access token. Acceptable for solo use today; not scalable to third-party adoption.
+
+**Status (2026-04-28):**
+- New GitHub App `alexbomber-pipeline-orchestrator` created in account settings (App ID generated; private key not yet downloaded; permissions correct: Contents R+W, Issues R+W, Metadata R, Pull requests R+W; Repository scope "Only on this account" sufficient for personal use).
+- Existing App `pipeline-orchestrator-testbed-ci` (App ID 3502150) kept for CI testbed only.
+- Pending: generate private key, store at `/etc/pipeline-orchestrator/private-key.pem` (chmod 600) on AI-Server, install App on personal repos (knowledge-vault, LAN_Transcriber, AWA-App, pipeline-orchestrator), add `*.pem` to `.gitignore`.
+- Pending (sprint-scale): refactor daemon auth from `gh auth login` PAT path to App-installation-token path. Estimated 1-2 days work for daemon code; existing `gh` CLI calls work transparently with App tokens once env is configured.
+
+**Action items (Round 4 candidates):**
+
+- **PR-237 (proposed):** Leverage 2 — REST `check-runs`/`status` replacement for `statusCheckRollup`. Highest payoff for least code.
+- **PR-238 (proposed):** Leverage 3 — ETag conditional requests across `github_client.py`. Medium effort, high payoff.
+- **PR-239 (proposed):** Leverage 4 — adaptive polling per state. Configuration-only with state-aware multiplier in `runner.py` poll loop.
+- **PR-240 (proposed):** GitHub App auth refactor for daemon. Sprint-scale; do after the smaller leverages prove insufficient OR when third-party adoption becomes relevant.
+- **PR-241 (proposed):** Manifest flow for third-party adoption — predefined App manifest URL, onboarding doc, automated key handling. Defer until first external user.
+
+**Lesson recorded:** GraphQL quota is the binding constraint for an autonomous daemon that uses GitHub heavily, especially when the operator simultaneously runs IDE extensions and Codex Connector against the same token. Visibility into who-burns-what is essential; the IDE extension's contribution was invisible until removal made the difference observable. Recommend periodic `gh api rate_limit` checks during heavy debug sessions and instrumenting daemon to log GraphQL points consumed per cycle.
+
+**Lesson recorded (operator hygiene):** during long debug sessions, disable passive GitHub-polling extensions in the IDE (VS Code GitHub Pull Requests, GitHub Desktop, browser PR tabs left open). Each contributes silently and compounds at peak debugging when CI re-runs are most needed.
+
 
 ## Deferred / Round 4
 
