@@ -613,7 +613,7 @@
 - Branch: pr-176-tasks-viewer
 
 ## PR-177: HTMX whitelist 400 status for validation error display
-- Status: TODO
+- Status: DOING
 - Tasks file: tasks/PR-177.md
 - Branch: pr-177-htmx-400-whitelist
 
