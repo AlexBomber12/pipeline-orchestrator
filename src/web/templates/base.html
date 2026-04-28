@@ -12,7 +12,7 @@
         document.addEventListener('htmx:configRequest', function () {});
         document.addEventListener('htmx:beforeSwap', function (evt) {
             const status = evt.detail.xhr.status;
-            if (status === 404 || status === 422 || status === 503) {
+            if (status === 400 || status === 404 || status === 422 || status === 503) {
                 evt.detail.shouldSwap = true;
                 evt.detail.isError = false;
             }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import zipfile
 from pathlib import Path
 
@@ -797,6 +798,38 @@ def test_upload_surfaces_invalid_type_details(
     assert "chore" in resp.text
     assert "expected one of" in resp.text
     assert "Dismiss upload error" in resp.text
+
+
+def test_upload_invalid_zip_returns_400_with_validator_error(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    invalid_task = _task_file(task_type="bug")[1][1]
+    resp = _post_upload([_zip_file({"PR-001.md": invalid_task})])
+
+    assert resp.status_code == 400
+    assert "Task file validation failed:" in resp.text
+    assert "PR-001.md: invalid Type" in resp.text
+    assert "bug" in resp.text
+    assert "expected one of" in resp.text
+
+
+def test_base_html_htmx_whitelist_includes_400() -> None:
+    base_html = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "web"
+        / "templates"
+        / "base.html"
+    ).read_text(encoding="utf-8")
+
+    pattern = re.compile(
+        r"htmx:beforeSwap.*?status\s*===\s*400.*?status\s*===\s*404"
+        r".*?status\s*===\s*422.*?status\s*===\s*503",
+        re.DOTALL,
+    )
+    assert pattern.search(base_html), "base.html must whitelist 400 alongside 404/422/503"
 
 
 def test_upload_accepts_task_with_depends_on_none(
