@@ -91,11 +91,29 @@ ensure_pr_url() {
     gh pr create --base main --head "${branch}" --title "${pr}: shim" --body "Shim PR for testing"
 }
 
+safe_push_branch() {
+    local branch="$1"
+    # Refresh local tracking ref so the lease check below compares against
+    # current remote state, not a possibly-stale cached value from an earlier
+    # preserve push or fetch. The explicit refspec ensures we update
+    # refs/remotes/origin/<branch> even if the default fetch refspec misses
+    # branches not present locally with tracking already configured.
+    git update-ref -d "refs/remotes/origin/${branch}" 2>/dev/null || true
+    git fetch origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" 2>/dev/null || true
+    local expected
+    expected="$(git rev-parse --verify "refs/remotes/origin/${branch}" 2>/dev/null || true)"
+    if [ -n "${expected}" ]; then
+        git push -u origin "${branch}" --force-with-lease="${branch}:${expected}"
+    else
+        git push -u origin "${branch}" --force-with-lease
+    fi
+}
+
 run_success() {
     local pr="$1" branch="$2"
     git_setup_branch "${branch}"
     write_marker_and_commit "${pr}"
-    git push -u origin "${branch}" --force-with-lease
+    safe_push_branch "${branch}"
     local pr_url
     pr_url="$(ensure_pr_url "${branch}" "${pr}")"
     gh pr comment "${pr_url}" --body "@codex review"
@@ -105,7 +123,7 @@ run_no_pr() {
     local pr="$1" branch="$2"
     git_setup_branch "${branch}"
     write_marker_and_commit "${pr}"
-    git push -u origin "${branch}" --force-with-lease
+    safe_push_branch "${branch}"
 }
 
 run_malformed_pr() {
@@ -117,7 +135,7 @@ run_malformed_pr() {
     fi
     git_setup_branch "${bad_branch}"
     write_marker_and_commit "${pr}"
-    git push -u origin "${bad_branch}" --force-with-lease
+    safe_push_branch "${bad_branch}"
     local pr_url
     pr_url="$(ensure_pr_url "${bad_branch}" "${pr}")"
     gh pr comment "${pr_url}" --body "@codex review"
@@ -128,7 +146,7 @@ run_slow() {
     git_setup_branch "${branch}"
     sleep 30
     write_marker_and_commit "${pr}"
-    git push -u origin "${branch}" --force-with-lease
+    safe_push_branch "${branch}"
     local pr_url
     pr_url="$(ensure_pr_url "${branch}" "${pr}")"
     gh pr comment "${pr_url}" --body "@codex review"
