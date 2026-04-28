@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import subprocess
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -83,6 +84,13 @@ _TRANSIENT_STATES = {
 
 _HISTORY_LIMIT = 100
 _STOP_POLL_INTERVAL_SEC = 0.5
+
+_NUMERIC_RE = re.compile(r"\d+")
+
+
+def _normalize_for_dedup(event: str) -> str:
+    """Return ``event`` with numeric runs replaced by ``#`` for fuzzy matching."""
+    return _NUMERIC_RE.sub("#", event)
 
 # Timeout for ``scripts/ci.sh`` on the auto-commit path.
 _CI_SCRIPT_TIMEOUT_SEC = 1800
@@ -838,16 +846,25 @@ class PipelineRunner(
             self.log_event(f"{label}: {first_lines}")
 
     def log_event(self, event: str) -> None:
-        """Append an event to ``state.history`` (capped) and log it."""
+        """Append an event to ``state.history`` (capped) and log it.
+
+        Consecutive events whose only difference is a numeric counter
+        (e.g. ``"PR #5 waiting (1/20m)"`` vs ``"PR #5 waiting (2/20m)"``)
+        are deduped: the existing entry's ``count`` increments, its
+        ``event`` is replaced with the latest text so updated counter
+        values stay visible, and ``last_seen_at`` is refreshed.
+        """
         now = datetime.now(timezone.utc).isoformat()
         state = self.state.state.value
         last_entry = self.state.history[-1] if self.state.history else None
         if (
             last_entry is not None
             and last_entry.get("state") == state
-            and last_entry.get("event") == event
+            and _normalize_for_dedup(last_entry.get("event", ""))
+            == _normalize_for_dedup(event)
         ):
             last_entry["count"] = int(last_entry.get("count", 1)) + 1
+            last_entry["event"] = event
             last_entry["last_seen_at"] = now
         else:
             entry = {

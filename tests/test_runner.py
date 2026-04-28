@@ -694,12 +694,16 @@ def test_sync_to_main_handles_oserror(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_log_event_caps_history_at_100(monkeypatch: pytest.MonkeyPatch) -> None:
     runner = _make_runner()
 
+    def _label(idx: int) -> str:
+        # Distinct non-numeric labels so fuzzy dedup never collapses them.
+        return f"event-{chr(ord('a') + idx % 10)}-{chr(ord('a') + idx // 10)}"
+
     for i in range(150):
-        runner.log_event(f"event {i}")
+        runner.log_event(_label(i))
 
     assert len(runner.state.history) == 100
-    assert runner.state.history[0]["event"] == "event 50"
-    assert runner.state.history[-1]["event"] == "event 149"
+    assert runner.state.history[0]["event"] == _label(50)
+    assert runner.state.history[-1]["event"] == _label(149)
 
 
 def test_log_event_deduplicates_consecutive_identical_events(
@@ -759,6 +763,87 @@ def test_log_event_starts_new_counter_after_different_event() -> None:
     assert runner.state.history[1]["count"] == 1
     assert runner.state.history[2]["event"] == "No tasks available"
     assert runner.state.history[2]["count"] == 1
+
+
+def test_normalize_for_dedup_replaces_numeric_runs() -> None:
+    assert (
+        runner_module._normalize_for_dedup("PR #221 waiting 1/20m")
+        == "PR ## waiting #/#m"
+    )
+    assert runner_module._normalize_for_dedup("no numbers here") == "no numbers here"
+    assert runner_module._normalize_for_dedup("123") == "#"
+    assert runner_module._normalize_for_dedup("1a2b3") == "#a#b#"
+
+
+def test_log_event_fuzzy_dedupes_messages_differing_only_in_numbers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeDateTime:
+        _values = iter(
+            [
+                datetime(2026, 4, 28, 11, 59, 0, tzinfo=timezone.utc),
+                datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc),
+                datetime(2026, 4, 28, 12, 1, 0, tzinfo=timezone.utc),
+            ]
+        )
+
+        @classmethod
+        def now(cls, tz: timezone) -> datetime:
+            return next(cls._values).astimezone(tz)
+
+    monkeypatch.setattr(runner_module, "datetime", _FakeDateTime)
+    runner = _make_runner()
+
+    runner.log_event("PR #221 waiting (review=EYES, ci=PENDING, 1/20m)")
+    runner.log_event("PR #221 waiting (review=EYES, ci=PENDING, 2/20m)")
+
+    assert len(runner.state.history) == 1
+    entry = runner.state.history[0]
+    assert entry["count"] == 2
+    assert entry["event"] == "PR #221 waiting (review=EYES, ci=PENDING, 2/20m)"
+    assert entry["time"] == "2026-04-28T12:00:00+00:00"
+    assert entry["last_seen_at"] == "2026-04-28T12:01:00+00:00"
+
+
+def test_log_event_fuzzy_dedupes_three_in_a_row() -> None:
+    runner = _make_runner()
+
+    for i in range(1, 4):
+        runner.log_event(f"PR #221 waiting ({i}/20m)")
+
+    assert len(runner.state.history) == 1
+    assert runner.state.history[0]["count"] == 3
+    assert runner.state.history[0]["event"] == "PR #221 waiting (3/20m)"
+
+
+def test_log_event_does_not_fuzzy_dedupe_when_non_numeric_content_differs() -> None:
+    runner = _make_runner()
+
+    runner.log_event("PR #221 merged")
+    runner.log_event("PR #221 closed")
+
+    assert len(runner.state.history) == 2
+    assert runner.state.history[0]["event"] == "PR #221 merged"
+    assert runner.state.history[1]["event"] == "PR #221 closed"
+    assert runner.state.history[0]["count"] == 1
+    assert runner.state.history[1]["count"] == 1
+
+
+def test_log_event_resets_count_after_fuzzy_streak_breaks() -> None:
+    runner = _make_runner()
+
+    runner.log_event("PR #5 waiting (1/20m)")
+    runner.log_event("PR #5 waiting (2/20m)")
+    runner.log_event("PR #5 merged")
+    runner.log_event("PR #5 waiting (3/20m)")
+
+    assert len(runner.state.history) == 3
+    assert runner.state.history[0]["count"] == 2
+    assert runner.state.history[0]["event"] == "PR #5 waiting (2/20m)"
+    assert runner.state.history[1]["count"] == 1
+    assert runner.state.history[1]["event"] == "PR #5 merged"
+    assert runner.state.history[2]["count"] == 1
+    assert runner.state.history[2]["event"] == "PR #5 waiting (3/20m)"
 
 
 def test_handle_idle_no_tasks_leaves_state_idle(
