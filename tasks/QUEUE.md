@@ -586,7 +586,7 @@
 - Branch: pr-171-spinners-upload-settings
 
 ## PR-172: Spinners on _controls.html and coder selector
-- Status: DOING
+- Status: DONE
 - Tasks file: tasks/PR-172.md
 - Branch: pr-172-spinners-controls-selector
 
