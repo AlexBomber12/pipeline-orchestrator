@@ -13,6 +13,7 @@ import hashlib
 import io
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import zipfile
@@ -45,13 +46,19 @@ from src.daemon.github_rate_limit import read_budget
 from src.events import publish_repo_event
 from src.events.sse import RepoEventsUnavailableError, stream_repo_events
 from src.metrics import MetricsStore, RunRecord
-from src.models import PipelineState, RepoState
-from src.queue_parser import QueueValidationError, parse_queue_text, parse_task_header
+from src.models import PipelineState, RepoState, TaskStatus
+from src.queue_parser import (
+    QueueValidationError,
+    parse_queue,
+    parse_queue_text,
+    parse_task_header,
+)
 from src.utils import repo_slug_from_url
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 CONFIG_PATH = os.environ.get("PO_CONFIG_PATH", "config.yml")
 REPOS_DIR = "/data/repos"
+_TASK_PR_ID_PATTERN = re.compile(r"^PR-[A-Za-z0-9_.-]+$")
 logger = logging.getLogger(__name__)
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
@@ -1374,6 +1381,63 @@ async def repo_cli_log(request: Request, name: str) -> HTMLResponse:
     return HTMLResponse(
         f'<pre class="bg-black text-green-400 font-mono text-xs p-4'
         f' overflow-auto max-h-96 rounded">{escaped}</pre>'
+    )
+
+
+@app.get("/repos/{name}/tasks", response_class=HTMLResponse)
+async def list_repo_tasks(request: Request, name: str) -> Response:
+    """Return the repo's tasks grouped by status as an HTML fragment."""
+    cfg = load_config(CONFIG_PATH)
+    if _find_repo_config_by_name(cfg, name) is None:
+        return HTMLResponse(
+            '<p class="text-sm italic text-fail">Repository not found.</p>',
+            status_code=404,
+        )
+    queue_path = Path(REPOS_DIR) / name / "tasks" / "QUEUE.md"
+    tasks = parse_queue(str(queue_path))
+    grouped = {
+        "doing": [t for t in tasks if t.status == TaskStatus.DOING],
+        "todo": [t for t in tasks if t.status == TaskStatus.TODO],
+        "done": [t for t in tasks if t.status == TaskStatus.DONE],
+    }
+    return templates.TemplateResponse(
+        request,
+        "components/tasks_panel.html",
+        {
+            "repo_name": name,
+            "tasks_by_status": grouped,
+            "tasks_total": len(tasks),
+        },
+    )
+
+
+@app.get("/repos/{name}/tasks/{pr_id}", response_class=HTMLResponse)
+async def view_repo_task(
+    request: Request, name: str, pr_id: str
+) -> Response:
+    """Return one task file's contents as a preformatted HTML fragment."""
+    if not _TASK_PR_ID_PATTERN.match(pr_id):
+        return HTMLResponse(
+            '<p class="text-sm italic text-fail">Invalid task identifier.</p>',
+            status_code=400,
+        )
+    cfg = load_config(CONFIG_PATH)
+    if _find_repo_config_by_name(cfg, name) is None:
+        return HTMLResponse(
+            '<p class="text-sm italic text-fail">Repository not found.</p>',
+            status_code=404,
+        )
+    task_path = Path(REPOS_DIR) / name / "tasks" / f"{pr_id}.md"
+    if not task_path.is_file():
+        return HTMLResponse(
+            '<p class="text-sm italic text-gray-500">Task file not found.</p>',
+            status_code=404,
+        )
+    content = task_path.read_text(encoding="utf-8")
+    return templates.TemplateResponse(
+        request,
+        "components/task_content.html",
+        {"repo_name": name, "pr_id": pr_id, "content": content},
     )
 
 
