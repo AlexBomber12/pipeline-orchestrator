@@ -19,6 +19,48 @@ EVIDENCE_DIR = REPO_DIR / "tests/e2e/evidence"
 collect_ignore = ["data"]
 
 
+def _stop_daemon_and_wait_paused(slug: str, timeout_sec: int = 30) -> None:
+    response = requests.post(f"{TEST_DASHBOARD_URL}/repos/{slug}/stop", timeout=10)
+    if response.status_code not in (200, 204):
+        raise RuntimeError(f"failed to stop daemon for {slug}: status_code={response.status_code}")
+
+    deadline = time.monotonic() + timeout_sec
+    last_state = None
+    last_user_paused = None
+    last_event = None
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(f"{TEST_DASHBOARD_URL}/api/states", timeout=5) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
+            pass
+        else:
+            entries = payload if isinstance(payload, list) else payload.get("states", [])
+            for entry in entries:
+                if entry.get("name") == slug or entry.get("slug") == slug:
+                    last_state = entry.get("state")
+                    last_user_paused = entry.get("user_paused")
+                    history = entry.get("history") or []
+                    last_event = history[-1].get("event") if history and isinstance(history[-1], dict) else None
+                    if last_state == "PAUSED" or (
+                        last_user_paused is True and last_event == "Paused. Press Play to resume."
+                    ):
+                        return
+        time.sleep(0.5)
+
+    raise RuntimeError(
+        f"timed out after {timeout_sec}s waiting for daemon to pause for {slug}; "
+        f"last seen state={last_state!r}, user_paused={last_user_paused!r}, "
+        f"last event={last_event!r}"
+    )
+
+
+def _resume_daemon(slug: str) -> None:
+    response = requests.post(f"{TEST_DASHBOARD_URL}/repos/{slug}/resume", timeout=10)
+    if response.status_code not in (200, 204):
+        raise RuntimeError(f"failed to resume daemon for {slug}: status_code={response.status_code}")
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _reset_testbed_session():
     """Reset testbed to a known-clean state at session start.
@@ -156,8 +198,21 @@ def upload_zip():
 
 @pytest.fixture
 def reset_testbed():
-    reset_testbed_full(TESTBED_SLUG)
-    clear_testbed_redis_state(TESTBED_SLUG)
+    setup_error = None
+    try:
+        _stop_daemon_and_wait_paused(TESTBED_SLUG)
+        reset_testbed_full(TESTBED_SLUG)
+        clear_testbed_redis_state(TESTBED_SLUG)
+    except Exception as exc:
+        setup_error = exc
+        raise
+    finally:
+        try:
+            _resume_daemon(TESTBED_SLUG)
+        except Exception as exc:
+            if setup_error is None:
+                raise
+            setup_error.add_note(f"resume failed after reset setup error: {exc}")
     yield
     clear_testbed_redis_state(TESTBED_SLUG)
 
