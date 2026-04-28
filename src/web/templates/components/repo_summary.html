@@ -31,6 +31,7 @@
     <form hx-post="/repos/{{ repo.name }}/coder"
           hx-target="closest [data-repo-summary]"
           hx-swap="outerHTML"
+          hx-indicator="#coder-spinner-{{ css_escape(repo.name) }}"
           class="flex w-full flex-wrap items-center gap-2 rounded border border-white/10 bg-surface-3 px-2 py-1 text-xs sm:w-auto sm:flex-nowrap">
         <label for="repo-coder-{{ repo.name }}" class="font-mono text-gray-400">Coder</label>
         <select id="repo-coder-{{ repo.name }}"
@@ -46,6 +47,9 @@
             </option>
             {% endfor %}
         </select>
+        {% with spinner_id="coder-spinner-" ~ repo.name, spinner_label="Saving..." %}
+        {% include "components/_spinner.html" %}
+        {% endwith %}
         {% if selected_repo_coder == 'any' %}
         <span class="text-[11px] text-gray-500">
             inherits {{ inherit_coder|capitalize }}
