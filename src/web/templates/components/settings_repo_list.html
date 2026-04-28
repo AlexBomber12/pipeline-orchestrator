@@ -112,7 +112,8 @@
                 <form class="flex flex-wrap items-center gap-2"
                       hx-post="/settings/repos"
                       hx-target="#settings-repo-list"
-                      hx-swap="innerHTML">
+                      hx-swap="innerHTML"
+                      hx-indicator="#settings-add-repo-spinner">
                     <input type="url"
                            name="url"
                            required
@@ -126,6 +127,9 @@
                             class="primary-interactive px-3 py-1.5 rounded bg-accent/10 border border-accent/30 text-accent text-sm font-medium">
                         Add Repository
                     </button>
+                    {% with spinner_id="settings-add-repo-spinner", spinner_label="Saving..." %}
+                    {% include "components/_spinner.html" %}
+                    {% endwith %}
                 </form>
             </td>
         </tr>
