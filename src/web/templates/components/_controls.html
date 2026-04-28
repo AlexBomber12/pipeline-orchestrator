@@ -21,6 +21,7 @@
 {% set show_play = repo.user_paused or (repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done) %}
 {% set show_pause = (repo.state.value in active_states) and not repo.user_paused %}
 {% set show_stop = repo.state.value in active_states %}
+{% set escaped_name = css_escape(repo.name) %}
 <div class="flex items-center gap-3 md:gap-2 {{ extra_classes }}">
     {% if show_play %}
     <button type="button"
@@ -29,9 +30,13 @@
             class="relative inline-flex items-center justify-center h-8 w-8 md:h-7 md:w-7 rounded-md text-gray-400 hover:text-white hover:bg-white/5 transition-colors before:absolute before:-inset-1.5 before:content-[''] md:before:content-none"
             hx-post="/repos/{{ repo.name }}/resume"
             hx-swap="none"
+            hx-indicator="#controls-resume-spinner-{{ escaped_name }}"
             onclick="event.stopPropagation()">
         {{ play_icon() }}
     </button>
+    {% with spinner_id="controls-resume-spinner-" ~ repo.name %}
+    {% include "components/_spinner.html" %}
+    {% endwith %}
     {% endif %}
     {% if show_pause %}
     <button type="button"
@@ -40,9 +45,13 @@
             class="relative inline-flex items-center justify-center h-8 w-8 md:h-7 md:w-7 rounded-md text-gray-400 hover:text-white hover:bg-white/5 transition-colors before:absolute before:-inset-1.5 before:content-[''] md:before:content-none"
             hx-post="/repos/{{ repo.name }}/pause"
             hx-swap="none"
+            hx-indicator="#controls-pause-spinner-{{ escaped_name }}"
             onclick="event.stopPropagation()">
         {{ pause_icon() }}
     </button>
+    {% with spinner_id="controls-pause-spinner-" ~ repo.name %}
+    {% include "components/_spinner.html" %}
+    {% endwith %}
     {% endif %}
     {% if show_stop %}
     <button type="button"
@@ -52,9 +61,13 @@
             hx-post="/repos/{{ repo.name }}/stop"
             hx-confirm="Stop the current run? The working tree may be left dirty."
             hx-swap="none"
+            hx-indicator="#controls-stop-spinner-{{ escaped_name }}"
             onclick="event.stopPropagation()">
         {{ stop_icon() }}
     </button>
+    {% with spinner_id="controls-stop-spinner-" ~ repo.name %}
+    {% include "components/_spinner.html" %}
+    {% endwith %}
     {% endif %}
 </div>
 {%- endmacro %}

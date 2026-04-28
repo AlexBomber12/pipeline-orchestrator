@@ -2447,3 +2447,104 @@ def test_repo_cards_omit_stalled_artifacts_when_last_updated_is_old(
     assert "data-stalled-hint" not in body
     assert "data-state-indicator" not in body
     assert "data-updated-at" not in body
+
+
+def test_repo_controls_have_spinners_with_unique_ids_per_repo(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pause/Stop buttons rendered by `_controls.html` for active states must
+    each carry an `hx-indicator` pointing at a per-repo spinner partial, so two
+    repo cards on the dashboard cannot share the same in-flight indicator."""
+    now = datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc)
+    alpha = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.CODING,
+        last_updated=now,
+    )
+    beta = RepoState(
+        url="https://github.com/example/beta.git",
+        name="example__beta",
+        state=PipelineState.CODING,
+        last_updated=now,
+    )
+    fake = _FakeRedis(
+        {
+            "pipeline:example__alpha": alpha.model_dump_json(),
+            "pipeline:example__beta": beta.model_dump_json(),
+        }
+    )
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo-list")
+
+    assert response.status_code == 200
+    body = response.text
+    for name in ("example__alpha", "example__beta"):
+        assert f'hx-indicator="#controls-pause-spinner-{name}"' in body
+        assert f'hx-indicator="#controls-stop-spinner-{name}"' in body
+        assert f'id="controls-pause-spinner-{name}"' in body
+        assert f'id="controls-stop-spinner-{name}"' in body
+    assert body.count('id="controls-pause-spinner-example__alpha"') == 1
+    assert body.count('id="controls-pause-spinner-example__beta"') == 1
+    assert body.count('id="controls-stop-spinner-example__alpha"') == 1
+    assert body.count('id="controls-stop-spinner-example__beta"') == 1
+    assert body.count("htmx-indicator") >= 4
+    assert body.count("animate-spin") >= 4
+
+
+def test_repo_controls_resume_button_has_spinner(
+    two_repo_config: Path,
+) -> None:
+    """The Resume button shown for IDLE-with-queued-tasks repos must include
+    a per-repo spinner partial wired up via `hx-indicator`."""
+    now = datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc)
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        queue_done=0,
+        queue_total=3,
+        last_updated=now,
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+
+    context = asyncio.run(web_app._repo_template_context("example__alpha", fake))
+    rendered = web_app.templates.get_template(
+        "components/repo_summary.html"
+    ).render(context)
+
+    assert (
+        'hx-indicator="#controls-resume-spinner-example__alpha"' in rendered
+    )
+    assert 'id="controls-resume-spinner-example__alpha"' in rendered
+    assert "htmx-indicator" in rendered
+    assert "animate-spin" in rendered
+
+
+def test_repo_coder_selector_form_has_spinner(
+    two_repo_config: Path,
+) -> None:
+    """The per-repo coder dropdown form on the repo detail page must render
+    a `hx-indicator` plus the shared spinner partial so users see feedback
+    while the coder change is being persisted."""
+    now = datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc)
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        last_updated=now,
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+
+    context = asyncio.run(web_app._repo_template_context("example__alpha", fake))
+    rendered = web_app.templates.get_template(
+        "components/repo_summary.html"
+    ).render(context)
+
+    assert 'hx-indicator="#coder-spinner-example__alpha"' in rendered
+    assert 'id="coder-spinner-example__alpha"' in rendered
+    assert "Saving..." in rendered
+    assert "htmx-indicator" in rendered
+    assert "animate-spin" in rendered
