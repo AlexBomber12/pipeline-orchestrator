@@ -417,6 +417,89 @@ def test_view_repo_task_rejects_invalid_pr_id_with_400(
     assert "Invalid task identifier" in response.text
 
 
+def test_list_repo_tasks_returns_error_fragment_when_queue_is_non_utf8(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-UTF-8 QUEUE.md must not 500 the entire Tasks panel.
+
+    A bad manual edit, an aborted merge, or the wrong encoding being
+    written by a user can leave bytes that cannot be decoded as UTF-8.
+    The panel handler must catch the decode error and return a
+    controlled error fragment so the rest of the repo detail page
+    keeps rendering.
+    """
+    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
+    # `\xff` is invalid as the leading byte of a UTF-8 sequence.
+    (repo_dir / "tasks" / "QUEUE.md").write_bytes(b"## PR-001: \xff bad\n")
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks")
+
+    assert response.status_code == 500
+    body = response.text
+    assert "Unable to read tasks/QUEUE.md" in body
+    # The fragment must not leak the raw exception or stack trace.
+    assert "UnicodeDecodeError" not in body
+    assert "Traceback" not in body
+
+
+def test_list_repo_tasks_returns_error_fragment_when_queue_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OSError reading QUEUE.md (e.g. permissions) is also handled."""
+    _write_alpha_config(tmp_path, monkeypatch)
+
+    def _boom(_path: str, *, strict: bool = False) -> list:
+        raise PermissionError("simulated permission denied on QUEUE.md")
+
+    monkeypatch.setattr(web_app, "parse_queue", _boom)
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks")
+
+    assert response.status_code == 500
+    assert "Unable to read tasks/QUEUE.md" in response.text
+
+
+def test_view_repo_task_falls_back_when_queue_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A broken QUEUE.md must not block direct ``{pr_id}.md`` lookups.
+
+    The viewer should still serve ``tasks/PR-042.md`` even when the
+    queue file cannot be parsed; only the optional ``Tasks file:``
+    redirect is lost in that case.
+    """
+    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
+    (repo_dir / "tasks" / "QUEUE.md").write_bytes(b"\xff not utf-8\n")
+    (repo_dir / "tasks" / "PR-042.md").write_text(
+        "# PR-042: Sample\n\nbody from default file\n", encoding="utf-8"
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks/PR-042")
+
+    assert response.status_code == 200
+    assert "body from default file" in response.text
+
+
+def test_view_repo_task_returns_error_fragment_when_file_non_utf8(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-UTF-8 task file returns a controlled error fragment, not 500."""
+    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
+    (repo_dir / "tasks" / "PR-042.md").write_bytes(b"# PR-042\n\n\xff\n")
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks/PR-042")
+
+    assert response.status_code == 500
+    body = response.text
+    assert "Unable to read task file" in body
+    assert "UnicodeDecodeError" not in body
+    assert "Traceback" not in body
+
+
 def test_repo_detail_page_includes_tasks_panel_lazy_loader(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

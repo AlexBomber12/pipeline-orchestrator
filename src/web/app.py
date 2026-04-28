@@ -1394,7 +1394,17 @@ async def list_repo_tasks(request: Request, name: str) -> Response:
             status_code=404,
         )
     queue_path = Path(REPOS_DIR) / name / "tasks" / "QUEUE.md"
-    tasks = parse_queue(str(queue_path))
+    try:
+        tasks = parse_queue(str(queue_path))
+    except (OSError, UnicodeDecodeError):
+        # A non-UTF-8 or otherwise unreadable QUEUE.md (bad manual edit,
+        # interrupted merge, lost permissions) must not 500 the entire
+        # Tasks panel — return a controlled fragment instead.
+        return HTMLResponse(
+            '<p class="text-sm italic text-fail">Unable to read'
+            " tasks/QUEUE.md.</p>",
+            status_code=500,
+        )
     grouped = {
         "doing": [t for t in tasks if t.status == TaskStatus.DOING],
         "todo": [t for t in tasks if t.status == TaskStatus.TODO],
@@ -1432,7 +1442,14 @@ def _resolve_repo_task_path(name: str, pr_id: str) -> tuple[Path, str] | None:
     tasks_dir_resolved = tasks_dir.resolve()
 
     relative_str: str | None = None
-    for task in parse_queue(str(tasks_dir / "QUEUE.md")):
+    try:
+        queued_tasks = parse_queue(str(tasks_dir / "QUEUE.md"))
+    except (OSError, UnicodeDecodeError):
+        # A broken QUEUE.md must not block direct lookups by `{pr_id}.md`
+        # — fall through to the default filename so a single malformed
+        # queue file does not also kill task-file viewing.
+        queued_tasks = []
+    for task in queued_tasks:
         if task.pr_id == pr_id and task.task_file:
             relative_str = task.task_file
             break
@@ -1483,7 +1500,17 @@ async def view_repo_task(
             status_code=404,
         )
     task_path, task_filename = resolved
-    content = task_path.read_text(encoding="utf-8")
+    try:
+        content = task_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        # Permissions / non-UTF-8 / file vanished between resolution and
+        # read: surface a user-facing error fragment instead of letting
+        # HTMX swap in a 500 stack trace.
+        return HTMLResponse(
+            '<p class="text-sm italic text-fail">Unable to read task'
+            " file.</p>",
+            status_code=500,
+        )
     return templates.TemplateResponse(
         request,
         "components/task_content.html",
