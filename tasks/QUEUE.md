@@ -596,10 +596,9 @@
 - Branch: pr-173-log-event-fuzzy-dedup
 
 ## PR-174: Event log dedup display (Lucide rotate-ccw + count badge)
-- Status: TODO
+- Status: DOING
 - Tasks file: tasks/PR-174.md
 - Branch: pr-174-event-log-dedup-display
-- Depends on: PR-173
 
 ## PR-175: Light-theme dropdown fix (color-scheme dark)
 - Status: TODO
