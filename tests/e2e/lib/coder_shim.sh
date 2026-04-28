@@ -152,6 +152,13 @@ run_slow() {
     gh pr comment "${pr_url}" --body "@codex review"
 }
 
+run_escalate() {
+    # PR-166: emit the ESCALATE marker so the daemon's FIX-cycle parser
+    # transitions the runner to IDLE without further coder work.
+    printf 'shim: cannot fix this in a FIX cycle\n'
+    printf 'ESCALATE: e2e shim self-report\n'
+}
+
 main() {
     local invoked
     invoked="$(basename "$0")"
@@ -201,6 +208,20 @@ main() {
         exit 0
     fi
 
+    # ``handle_error`` invokes the coder with a fixed-shape diagnose prompt
+    # asking for one of FIX / SKIP / ESCALATE. The real CLI replies; the
+    # shim has no LLM so it answers SKIP, which lets the daemon clear a
+    # transient ERROR (e.g. a "Base branch was modified" merge race in a
+    # prior test) and return to IDLE before the next e2e test starts.
+    # Without this, ERROR persists and downstream tests time out waiting
+    # for IDLE.
+    for arg in "$@"; do
+        if [[ "${arg}" == *"FIX, SKIP, or ESCALATE"* ]]; then
+            printf 'SKIP\n'
+            exit 0
+        fi
+    done
+
     local scenario
     scenario="$(read_scenario)"
 
@@ -211,6 +232,14 @@ main() {
 
     if [[ "${scenario}" == "hang" ]]; then
         sleep 120
+        exit 0
+    fi
+
+    if [[ "${scenario}" == "escalate" ]]; then
+        # ESCALATE bypasses the testbed-repo / DOING-task plumbing: the
+        # daemon only needs the marker on stdout to enter the
+        # coder-initiated parking path (PR-166).
+        run_escalate
         exit 0
     fi
 
@@ -245,6 +274,9 @@ main() {
             ;;
         slow)
             run_slow "${pr}" "${branch}"
+            ;;
+        escalate)
+            run_escalate
             ;;
         *)
             printf 'shim: unknown scenario %s, defaulting to success\n' "${scenario}" >&2

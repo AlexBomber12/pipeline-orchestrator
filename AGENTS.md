@@ -95,6 +95,60 @@ Fix loop (used in `FIX FEEDBACK` mode)
    - if a non-stale thumbs up appears, stop
    - if a new Codex feedback comment appears after the push, repeat the loop
 
+## ESCALATE protocol (when coder cannot fix)
+
+If during a `FIX FEEDBACK` cycle you determine that the failure is genuinely
+outside your mandate to fix, output an ESCALATE marker on the LAST
+non-empty line of stdout. The marker format is exactly:
+
+  `ESCALATE: <one-line reason>`
+
+The match is strict and case-sensitive. Variants such as `escalate:`,
+`ESCALATED:`, or an ESCALATE line that is not the last non-empty line of
+stdout do NOT trigger the protocol. An empty reason
+(`ESCALATE:` alone) is accepted and the daemon substitutes
+`(no reason provided)`.
+
+Examples of reasons that warrant ESCALATE (MUST):
+
+- CI logs show "rate limit exceeded" for the GitHub API.
+- CI logs show DNS resolution failure or network unreachable.
+- CI logs show "secret not found" or auth errors with GitHub.
+- The required test fix needs production-code changes outside the stated
+  PR scope (the task's "Files NOT to touch" list).
+- Task spec contradicts existing code architecture (ambiguity, not a bug).
+- Three attempts at the same fix failed with the same error — likely the
+  root cause is not what you assumed.
+
+Examples of reasons that do NOT warrant ESCALATE (just fix):
+
+- Banal syntax errors or typos.
+- Test assertion failures with a clear, in-scope root cause.
+- Linting or formatting issues.
+- Missing imports or simple type errors.
+
+Examples that MAY warrant ESCALATE (use judgment):
+
+- Test passes locally but fails in CI consistently → infra suspect.
+- Coverage check fails for code already tested elsewhere → tooling issue.
+- Behavior matches spec but spec was wrong → architectural decision needed.
+
+After ESCALATE, the daemon will:
+
+1. Post a comment on the PR with your reason text.
+2. Apply the `escalated` label to the PR.
+3. Transition the runner to IDLE and stop further FIX cycles on this PR.
+4. Wait for human review before any further action.
+
+To resume work after a human resolves the issue, click Resume in the
+dashboard or close + reopen the PR. The `escalated` label and the
+`is_escalated` flag are cleared at that point.
+
+This is the SEMANTIC complement to the MECHANICAL no-push circuit breaker
+in PR-164: PR-164 catches stuck coders by counting non-productive cycles;
+ESCALATE catches them by listening to an explicit self-report. Both feed
+the same downstream parking machinery.
+
 ## MCP servers and tool usage
 
 Allowed MCP servers (by name)

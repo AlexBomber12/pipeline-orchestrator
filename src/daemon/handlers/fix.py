@@ -16,6 +16,28 @@ from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus
 from src.retry import retry_transient
 
 _FIX_CI_LOG_TRUNCATE_CHARS = 5000
+_ESCALATE_MARKER_PREFIX = "ESCALATE:"
+_ESCALATE_EMPTY_REASON = "(no reason provided)"
+
+
+def _parse_escalate_marker(stdout: str) -> str | None:
+    """Return the coder-supplied ESCALATE reason, or ``None``.
+
+    The marker is recognized only when the LAST non-empty line of
+    ``stdout`` starts with the literal prefix ``"ESCALATE:"`` at
+    column 0 (strict case-sensitive match — variants like
+    ``escalate:``, ``ESCALATED:``, or an indented ``"  ESCALATE:"``
+    do not trigger). An empty reason (``"ESCALATE:"`` alone, or only
+    trailing whitespace) is returned as the empty string so the caller
+    can substitute a placeholder rather than crash.
+    """
+    for line in reversed(stdout.splitlines()):
+        if not line.strip():
+            continue
+        if line.startswith(_ESCALATE_MARKER_PREFIX):
+            return line[len(_ESCALATE_MARKER_PREFIX):].strip()
+        return None
+    return None
 
 
 def _fetch_failed_ci_logs(repo: str, branch: str) -> str | None:
@@ -127,6 +149,55 @@ class FixMixin(BreachMixin):
                 target.cancel()
                 return
 
+    def _ensure_escalated_label(
+        self, pr_number: int, label_create_log_prefix: str
+    ) -> bool:
+        """Create (idempotent) and apply the ``escalated`` label.
+
+        Both ``gh`` calls soft-fail with ``log_event``: the in-memory
+        ``is_escalated`` flag remains the load-bearing signal, and the
+        label is a best-effort hint for ``get_open_prs`` rehydration
+        after a daemon restart. ``label_create_log_prefix`` keeps the
+        existing log strings stable so callers (no-push deadlock vs.
+        coder-initiated ESCALATE) remain distinguishable in history.
+
+        Returns ``True`` when ``pr edit --add-label`` succeeded and the
+        ``escalated`` label is therefore visible to ``get_open_prs``,
+        ``False`` when the apply step failed. Callers that park the
+        runner in a state which depends on label-state for durability
+        (e.g. coder-initiated ESCALATE → IDLE, where
+        ``_preserve_fix_iteration_count`` rehydrates ``is_escalated``
+        from labels on the next IDLE refresh) check this return to
+        downgrade to a parking state that does not.
+        """
+        try:
+            github_client.run_gh(
+                [
+                    "label",
+                    "create",
+                    "escalated",
+                    "--color",
+                    "B60205",
+                    "--description",
+                    "Daemon escalated, manual review required",
+                ],
+                repo=self.owner_repo,
+            )
+        except Exception as exc:
+            self.log_event(f"{label_create_log_prefix} label create skipped: {exc}")
+        try:
+            github_client.run_gh(
+                ["pr", "edit", str(pr_number), "--add-label", "escalated"],
+                repo=self.owner_repo,
+            )
+            return True
+        except Exception as exc:
+            self.log_event(
+                f"Warning: failed to apply escalated label to PR "
+                f"#{pr_number}: {exc}"
+            )
+            return False
+
     async def _escalate_fix_no_push_deadlock(self, current_pr: PRInfo) -> None:
         """Park the PR in HUNG after consecutive no-push FIX cycles.
 
@@ -160,36 +231,66 @@ class FixMixin(BreachMixin):
                 f"Warning: failed to post FIX deadlock comment on PR "
                 f"#{pr_number}: {exc}"
             )
-        try:
-            github_client.run_gh(
-                [
-                    "label",
-                    "create",
-                    "escalated",
-                    "--color",
-                    "B60205",
-                    "--description",
-                    "Daemon escalated, manual review required",
-                ],
-                repo=self.owner_repo,
-            )
-        except Exception as exc:
-            self.log_event(f"FIX no-push label create skipped: {exc}")
-        try:
-            github_client.run_gh(
-                ["pr", "edit", str(pr_number), "--add-label", "escalated"],
-                repo=self.owner_repo,
-            )
-        except Exception as exc:
-            self.log_event(
-                f"Warning: failed to apply escalated label to PR "
-                f"#{pr_number}: {exc}"
-            )
+        self._ensure_escalated_label(pr_number, "FIX no-push")
         current_pr.is_escalated = True
         current_pr.no_push_fix_count = 0
         self.state.state = PipelineState.HUNG
         self.state.error_message = None
         self.log_event(message)
+        await self.publish_state()
+
+    async def _escalate_fix_coder_initiated(
+        self, current_pr: PRInfo, reason: str
+    ) -> None:
+        """Park the PR after the coder emits an ESCALATE marker.
+
+        Posts an explanatory PR comment (soft-fail), then ensures and
+        applies the ``escalated`` label. The label apply is the
+        durable parking signal: on the success path the runner moves
+        to ``IDLE`` — the coder explicitly self-reported, so the
+        ``handle_hung`` ``@codex review`` fallback is not appropriate,
+        and the next IDLE refresh rehydrates ``is_escalated=True``
+        from the label. On the failure path the runner moves to
+        ``HUNG`` instead: ``handle_hung``'s ``is_escalated`` guard
+        keeps the PR parked using the in-memory flag, while moving to
+        IDLE would silently drop the parking signal during a GitHub
+        outage because ``_preserve_fix_iteration_count`` rehydrates
+        ``is_escalated`` from the (missing) label on the next refresh
+        (Codex P1 on PR #228).
+        """
+        pr_number = current_pr.number
+        clean_reason = reason.strip() or _ESCALATE_EMPTY_REASON
+        message = (
+            f"Coder explicitly escalated this PR. Reason: {clean_reason}. "
+            "Manual review required."
+        )
+        try:
+            github_client.post_comment(self.owner_repo, pr_number, message)
+        except Exception as exc:
+            self.log_event(
+                f"Warning: failed to post FIX coder ESCALATE comment on PR "
+                f"#{pr_number}: {exc}"
+            )
+        label_applied = self._ensure_escalated_label(
+            pr_number, "FIX coder ESCALATE"
+        )
+        current_pr.is_escalated = True
+        if not label_applied:
+            self.state.state = PipelineState.HUNG
+            self.state.error_message = (
+                f"FIX coder ESCALATE on PR #{pr_number}: failed to apply "
+                f"`escalated` label. Reason: {clean_reason}. Manual "
+                "review required."
+            )
+            self.log_event(self.state.error_message)
+            await self.publish_state()
+            return
+        self.state.state = PipelineState.IDLE
+        self.state.error_message = None
+        self.log_event(
+            f"FIX coder ESCALATE on PR #{pr_number}: {clean_reason}. "
+            "Moving to IDLE."
+        )
         await self.publish_state()
 
     async def _escalate_fix_iteration_cap(self, current_pr: PRInfo) -> None:
@@ -826,6 +927,25 @@ class FixMixin(BreachMixin):
             return
         await self._save_cli_log(stdout, stderr, f"FIX FEEDBACK output [{coder_name}]")
         await capture_stop_requested_after_exit()
+        escalate_reason = _parse_escalate_marker(stdout)
+        if escalate_reason is not None and self.state.current_pr is not None:
+            # Coder semantic circuit breaker (PR-166): an explicit
+            # self-report wins over the regular push/return-code flow.
+            # ``no_push_fix_count`` is reset because an explicit
+            # ESCALATE is not a no-push success — it is a deliberate
+            # bail-out and should not feed the deadlock counter.
+            no_push_policy.reset(self.state.current_pr)
+            await self._escalate_fix_coder_initiated(
+                self.state.current_pr, escalate_reason
+            )
+            # If a stop arrived while the coder was running, honor the
+            # deferred pause: PAUSED takes precedence over the IDLE/HUNG
+            # parking state set by ``_escalate_fix_coder_initiated`` so
+            # the operator's pause request is not silently dropped on
+            # the ESCALATE branch (Codex P1 on PR #228).
+            if await pause_for_stop_after_bookkeeping():
+                return
+            return
         if stop_cancelled:
             head_after = read_head_after_fix()
             if head_after is None:
