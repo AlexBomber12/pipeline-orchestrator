@@ -556,7 +556,7 @@
 - Branch: pr-165-poll-github-during-fix
 
 ## PR-166: Coder ESCALATE protocol in FIX cycle
-- Status: TODO
+- Status: DONE
 - Tasks file: tasks/PR-166.md
 - Branch: pr-166-coder-escalate-protocol
 
