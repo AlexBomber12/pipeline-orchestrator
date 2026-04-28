@@ -586,10 +586,9 @@
 - Branch: pr-171-spinners-upload-settings
 
 ## PR-172: Spinners on _controls.html and coder selector
-- Status: TODO
+- Status: DOING
 - Tasks file: tasks/PR-172.md
 - Branch: pr-172-spinners-controls-selector
-- Depends on: PR-171
 
 ## PR-173: Fuzzy dedup in log_event (regex numeric counter parts)
 - Status: TODO
