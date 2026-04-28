@@ -13,6 +13,7 @@ import hashlib
 import io
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import zipfile
@@ -45,13 +46,19 @@ from src.daemon.github_rate_limit import read_budget
 from src.events import publish_repo_event
 from src.events.sse import RepoEventsUnavailableError, stream_repo_events
 from src.metrics import MetricsStore, RunRecord
-from src.models import PipelineState, RepoState
-from src.queue_parser import QueueValidationError, parse_queue_text, parse_task_header
+from src.models import PipelineState, RepoState, TaskStatus
+from src.queue_parser import (
+    QueueValidationError,
+    parse_queue,
+    parse_queue_text,
+    parse_task_header,
+)
 from src.utils import repo_slug_from_url
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 CONFIG_PATH = os.environ.get("PO_CONFIG_PATH", "config.yml")
 REPOS_DIR = "/data/repos"
+_TASK_PR_ID_PATTERN = re.compile(r"^PR-[A-Za-z0-9_.-]+$")
 logger = logging.getLogger(__name__)
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
@@ -1374,6 +1381,149 @@ async def repo_cli_log(request: Request, name: str) -> HTMLResponse:
     return HTMLResponse(
         f'<pre class="bg-black text-green-400 font-mono text-xs p-4'
         f' overflow-auto max-h-96 rounded">{escaped}</pre>'
+    )
+
+
+@app.get("/repos/{name}/tasks", response_class=HTMLResponse)
+async def list_repo_tasks(request: Request, name: str) -> Response:
+    """Return the repo's tasks grouped by status as an HTML fragment."""
+    cfg = load_config(CONFIG_PATH)
+    if _find_repo_config_by_name(cfg, name) is None:
+        return HTMLResponse(
+            '<p class="text-sm italic text-fail">Repository not found.</p>',
+            status_code=404,
+        )
+    queue_path = Path(REPOS_DIR) / name / "tasks" / "QUEUE.md"
+    try:
+        tasks = parse_queue(str(queue_path))
+    except (OSError, UnicodeDecodeError):
+        # A non-UTF-8 or otherwise unreadable QUEUE.md (bad manual edit,
+        # interrupted merge, lost permissions) must not 500 the entire
+        # Tasks panel — return a controlled fragment instead. Use 503 so
+        # the global htmx:beforeSwap hook in base.html swaps the fragment
+        # in (it only enables swap for 404/422/503).
+        return HTMLResponse(
+            '<p class="text-sm italic text-fail">Unable to read'
+            " tasks/QUEUE.md.</p>",
+            status_code=503,
+        )
+    grouped = {
+        "doing": [t for t in tasks if t.status == TaskStatus.DOING],
+        "todo": [t for t in tasks if t.status == TaskStatus.TODO],
+        "done": [t for t in tasks if t.status == TaskStatus.DONE],
+    }
+    return templates.TemplateResponse(
+        request,
+        "components/tasks_panel.html",
+        {
+            "repo_name": name,
+            "tasks_by_status": grouped,
+            "tasks_total": len(tasks),
+        },
+    )
+
+
+def _resolve_repo_task_path(name: str, pr_id: str) -> tuple[Path, str] | None:
+    """Return the on-disk task file for ``pr_id`` honoring queue mappings.
+
+    Honors the queue's ``- Tasks file:`` value when present (the runner
+    accepts task files whose name differs from ``{pr_id}.md``), otherwise
+    falls back to ``tasks/{pr_id}.md``. Rejects any path that escapes the
+    repo's ``tasks/`` directory or traverses a symlink so the dashboard
+    cannot be coaxed into reading host files via a planted symlink.
+
+    Returns a ``(absolute_path, display_name)`` tuple where ``display_name``
+    is the repo-relative posix path of the resolved file, suitable for
+    showing in the viewer header so reviewers see the actual file name
+    rather than a hardcoded ``{pr_id}.md`` label.
+    """
+    repo_root = Path(REPOS_DIR) / name
+    tasks_dir = repo_root / "tasks"
+    if not tasks_dir.is_dir():
+        return None
+    tasks_dir_resolved = tasks_dir.resolve()
+
+    relative_str: str | None = None
+    try:
+        queued_tasks = parse_queue(str(tasks_dir / "QUEUE.md"))
+    except (OSError, UnicodeDecodeError):
+        # A broken QUEUE.md must not block direct lookups by `{pr_id}.md`
+        # — fall through to the default filename so a single malformed
+        # queue file does not also kill task-file viewing.
+        queued_tasks = []
+    for task in queued_tasks:
+        if task.pr_id == pr_id and task.task_file:
+            relative_str = task.task_file
+            break
+    if relative_str is None:
+        relative_str = f"tasks/{pr_id}.md"
+
+    candidate = repo_root / relative_str
+    try:
+        relative_parts = candidate.relative_to(repo_root).parts
+    except ValueError:
+        return None
+    walk = repo_root
+    for part in relative_parts:
+        walk = walk / part
+        if walk.is_symlink():
+            return None
+    if not candidate.is_file():
+        return None
+    resolved = candidate.resolve()
+    try:
+        within_tasks = resolved.relative_to(tasks_dir_resolved)
+    except ValueError:
+        return None
+    display_name = (Path("tasks") / within_tasks).as_posix()
+    return resolved, display_name
+
+
+@app.get("/repos/{name}/tasks/{pr_id}", response_class=HTMLResponse)
+async def view_repo_task(
+    request: Request, name: str, pr_id: str
+) -> Response:
+    """Return one task file's contents as a preformatted HTML fragment."""
+    if not _TASK_PR_ID_PATTERN.match(pr_id):
+        return HTMLResponse(
+            '<p class="text-sm italic text-fail">Invalid task identifier.</p>',
+            status_code=400,
+        )
+    cfg = load_config(CONFIG_PATH)
+    if _find_repo_config_by_name(cfg, name) is None:
+        return HTMLResponse(
+            '<p class="text-sm italic text-fail">Repository not found.</p>',
+            status_code=404,
+        )
+    resolved = _resolve_repo_task_path(name, pr_id)
+    if resolved is None:
+        return HTMLResponse(
+            '<p class="text-sm italic text-gray-500">Task file not found.</p>',
+            status_code=404,
+        )
+    task_path, task_filename = resolved
+    try:
+        content = task_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        # Permissions / non-UTF-8 / file vanished between resolution and
+        # read: surface a user-facing error fragment instead of letting
+        # HTMX swap in a 500 stack trace. Use 503 so the global
+        # htmx:beforeSwap hook in base.html swaps the fragment in (it
+        # only enables swap for 404/422/503).
+        return HTMLResponse(
+            '<p class="text-sm italic text-fail">Unable to read task'
+            " file.</p>",
+            status_code=503,
+        )
+    return templates.TemplateResponse(
+        request,
+        "components/task_content.html",
+        {
+            "repo_name": name,
+            "pr_id": pr_id,
+            "task_filename": task_filename,
+            "content": content,
+        },
     )
 
 

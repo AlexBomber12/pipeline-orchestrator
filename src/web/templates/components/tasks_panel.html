@@ -1,0 +1,87 @@
+{% set status_styles = {
+    'doing': 'bg-accent/10 text-accent border-accent/30',
+    'todo':  'bg-gray-500/10 text-gray-300 border-gray-500/30',
+    'done':  'bg-ok/10 text-ok border-ok/30',
+} %}
+{% macro task_row(repo_name, task, status_key) -%}
+{# Use the literal pr_id in the DOM id (HTML5-valid) and an attribute selector
+   for hx-target so a `.` in the pr_id is matched as data, not a CSS class
+   delimiter. Slugifying with `-` collides because `-` is itself a valid pr_id
+   character: PR-1.2 and PR-1-2 would otherwise share an id. #}
+{% set target_id = 'task-content-' ~ status_key ~ '-' ~ task.pr_id %}
+<li class="rounded border border-white/5 bg-surface-3 px-3 py-2">
+    <button type="button"
+            class="secondary-interactive flex w-full flex-col gap-1 text-left text-xs sm:flex-row sm:items-baseline sm:gap-3"
+            hx-get="/repos/{{ repo_name }}/tasks/{{ task.pr_id }}"
+            hx-target="[id='{{ target_id }}']"
+            hx-swap="innerHTML">
+        <span class="font-mono text-gray-200">{{ task.pr_id }}</span>
+        <span class="break-words text-gray-300 sm:flex-1">{{ task.title }}</span>
+        {% if task.branch %}
+        <span class="font-mono text-[11px] text-gray-500 sm:text-right">{{ task.branch }}</span>
+        {% endif %}
+    </button>
+    <div id="{{ target_id }}" class="mt-2 empty:hidden"></div>
+</li>
+{%- endmacro %}
+<section id="repo-tasks-panel-{{ repo_name }}" class="mt-6 rounded-lg border border-white/5 bg-surface-2 p-5">
+    <div class="mb-4 flex items-center justify-between gap-3">
+        <div>
+            <h3 class="text-sm font-semibold text-gray-300">Tasks queue</h3>
+            <p class="text-xs text-gray-500">Click a task to load its file contents.</p>
+        </div>
+        <span class="font-mono text-xs text-gray-500">{{ tasks_total }} total</span>
+    </div>
+
+    {% if tasks_total == 0 %}
+    <p class="text-sm italic text-gray-500">No tasks found in tasks/QUEUE.md.</p>
+    {% else %}
+    {% if tasks_by_status.doing %}
+    <section class="mb-4">
+        <h4 class="mb-2 inline-flex items-center gap-2 text-xs font-medium uppercase tracking-[0.16em] text-gray-400">
+            <span class="rounded border px-2 py-0.5 text-[11px] {{ status_styles.doing }}">In progress</span>
+            <span class="font-mono text-gray-500">{{ tasks_by_status.doing | length }}</span>
+        </h4>
+        <ul class="space-y-2">
+            {% for task in tasks_by_status.doing %}
+            {{ task_row(repo_name, task, 'doing') }}
+            {% endfor %}
+        </ul>
+    </section>
+    {% endif %}
+
+    <section class="mb-4">
+        <h4 class="mb-2 inline-flex items-center gap-2 text-xs font-medium uppercase tracking-[0.16em] text-gray-400">
+            <span class="rounded border px-2 py-0.5 text-[11px] {{ status_styles.todo }}">TODO</span>
+            <span class="font-mono text-gray-500">{{ tasks_by_status.todo | length }}</span>
+        </h4>
+        {% if tasks_by_status.todo %}
+        <ul class="space-y-2">
+            {% for task in tasks_by_status.todo %}
+            {{ task_row(repo_name, task, 'todo') }}
+            {% endfor %}
+        </ul>
+        {% else %}
+        <p class="text-xs italic text-gray-500">No queued tasks.</p>
+        {% endif %}
+    </section>
+
+    <section>
+        <details>
+            <summary class="secondary-interactive inline-flex cursor-pointer items-center gap-2 text-xs font-medium uppercase tracking-[0.16em] text-gray-400">
+                <span class="rounded border px-2 py-0.5 text-[11px] {{ status_styles.done }}">Done</span>
+                <span class="font-mono text-gray-500">{{ tasks_by_status.done | length }}</span>
+            </summary>
+            {% if tasks_by_status.done %}
+            <ul class="mt-2 space-y-2">
+                {% for task in tasks_by_status.done %}
+                {{ task_row(repo_name, task, 'done') }}
+                {% endfor %}
+            </ul>
+            {% else %}
+            <p class="mt-2 text-xs italic text-gray-500">No completed tasks yet.</p>
+            {% endif %}
+        </details>
+    </section>
+    {% endif %}
+</section>
