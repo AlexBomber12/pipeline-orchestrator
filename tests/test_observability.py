@@ -645,9 +645,44 @@ def test_partial_repo_events_renders_deduplicated_entry(
 
     assert response.status_code == 200
     body = response.text
-    assert "No tasks available (x9)" in body
+    assert "No tasks available" in body
+    assert "event-dedup-badge" in body
+    assert 'title="repeated 9 times"' in body
+    assert "&times;9" in body
     assert "-&gt;" in body
     assert body.count('data-ts="') == 2
+
+
+def test_partial_repo_events_omits_dedup_badge_for_single_count(
+    observability_config: Path,
+) -> None:
+    now = datetime.now(timezone.utc)
+    alpha = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        last_updated=now,
+        history=[
+            {
+                "time": _iso(now),
+                "last_seen_at": _iso(now),
+                "state": "IDLE",
+                "event": "single event",
+                "count": 1,
+            },
+        ],
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": alpha.model_dump_json()})
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.get("/partials/repo/example__alpha/events")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "single event" in body
+    assert "event-dedup-badge" not in body
+    assert "&times;" not in body
 
 
 def test_partial_repo_events_uses_mobile_stacked_layout_without_truncation(
@@ -685,7 +720,8 @@ def test_partial_repo_events_uses_mobile_stacked_layout_without_truncation(
     assert "order-1 text-[10px]" in body
     assert "min-w-0 text-gray-300 break-words" in body
     assert "truncate" not in body
-    assert "(x9)" in body
+    assert "event-dedup-badge" in body
+    assert "&times;9" in body
 
 
 def test_repo_full_page_marks_count_span_for_oob_target(

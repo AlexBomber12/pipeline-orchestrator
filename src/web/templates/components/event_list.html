@@ -44,7 +44,18 @@
             </span>
         </div>
         <span class="min-w-0 text-gray-300 break-words">
-            {{ entry.get('event', '') }}{% if entry_count > 1 %} (x{{ entry_count }}){% endif %}
+            {{ entry.get('event', '') }}
+            {% if entry_count > 1 %}
+            <span class="event-dedup-badge inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-gray-700/40 text-gray-400 align-middle"
+                  title="repeated {{ entry_count }} times"
+                  aria-label="repeated {{ entry_count }} times">
+                <svg class="h-3 w-3" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+                    <path d="M3 3v5h5"/>
+                </svg>
+                <span>&times;{{ entry_count }}</span>
+            </span>
+            {% endif %}
         </span>
     </li>
     {% endfor %}
