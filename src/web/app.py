@@ -1411,7 +1411,7 @@ async def list_repo_tasks(request: Request, name: str) -> Response:
     )
 
 
-def _resolve_repo_task_path(name: str, pr_id: str) -> Path | None:
+def _resolve_repo_task_path(name: str, pr_id: str) -> tuple[Path, str] | None:
     """Return the on-disk task file for ``pr_id`` honoring queue mappings.
 
     Honors the queue's ``- Tasks file:`` value when present (the runner
@@ -1419,6 +1419,11 @@ def _resolve_repo_task_path(name: str, pr_id: str) -> Path | None:
     falls back to ``tasks/{pr_id}.md``. Rejects any path that escapes the
     repo's ``tasks/`` directory or traverses a symlink so the dashboard
     cannot be coaxed into reading host files via a planted symlink.
+
+    Returns a ``(absolute_path, display_name)`` tuple where ``display_name``
+    is the repo-relative posix path of the resolved file, suitable for
+    showing in the viewer header so reviewers see the actual file name
+    rather than a hardcoded ``{pr_id}.md`` label.
     """
     repo_root = Path(REPOS_DIR) / name
     tasks_dir = repo_root / "tasks"
@@ -1448,10 +1453,11 @@ def _resolve_repo_task_path(name: str, pr_id: str) -> Path | None:
         return None
     resolved = candidate.resolve()
     try:
-        resolved.relative_to(tasks_dir_resolved)
+        within_tasks = resolved.relative_to(tasks_dir_resolved)
     except ValueError:
         return None
-    return resolved
+    display_name = (Path("tasks") / within_tasks).as_posix()
+    return resolved, display_name
 
 
 @app.get("/repos/{name}/tasks/{pr_id}", response_class=HTMLResponse)
@@ -1470,17 +1476,23 @@ async def view_repo_task(
             '<p class="text-sm italic text-fail">Repository not found.</p>',
             status_code=404,
         )
-    task_path = _resolve_repo_task_path(name, pr_id)
-    if task_path is None:
+    resolved = _resolve_repo_task_path(name, pr_id)
+    if resolved is None:
         return HTMLResponse(
             '<p class="text-sm italic text-gray-500">Task file not found.</p>',
             status_code=404,
         )
+    task_path, task_filename = resolved
     content = task_path.read_text(encoding="utf-8")
     return templates.TemplateResponse(
         request,
         "components/task_content.html",
-        {"repo_name": name, "pr_id": pr_id, "content": content},
+        {
+            "repo_name": name,
+            "pr_id": pr_id,
+            "task_filename": task_filename,
+            "content": content,
+        },
     )
 
 

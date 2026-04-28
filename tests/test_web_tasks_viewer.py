@@ -231,7 +231,8 @@ def test_view_repo_task_returns_file_content(
     assert response.status_code == 200
     body = response.text
     assert "<pre" in body
-    assert "PR-042.md" in body
+    # Header labels the resolved repo-relative path, not just ``{pr_id}.md``.
+    assert "tasks/PR-042.md" in body
     assert "Sample task" in body
     # Markdown content must be rendered as escaped text, not executed HTML.
     assert "<script>alert" not in body
@@ -308,6 +309,11 @@ def test_view_repo_task_uses_queued_tasks_file_when_filename_differs(
     assert response.status_code == 200
     body = response.text
     assert "body from custom file" in body
+    # The viewer header must show the resolved filename, not ``PR-555.md``,
+    # so reviewers do not edit the wrong file when the queue redirects the
+    # task to a non-default path.
+    assert "tasks/custom-name.md" in body
+    assert "PR-555.md" not in body
 
 
 def test_view_repo_task_rejects_symlink_under_tasks_dir(
