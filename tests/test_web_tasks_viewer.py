@@ -435,7 +435,10 @@ def test_list_repo_tasks_returns_error_fragment_when_queue_is_non_utf8(
     with TestClient(app) as client:
         response = client.get("/repos/example__alpha/tasks")
 
-    assert response.status_code == 500
+    # 503 (not 500) because the global htmx:beforeSwap hook in base.html
+    # only swaps fragments for 404/422/503 — a 500 would be treated as an
+    # error and the controlled fragment would never render.
+    assert response.status_code == 503
     body = response.text
     assert "Unable to read tasks/QUEUE.md" in body
     # The fragment must not leak the raw exception or stack trace.
@@ -457,7 +460,8 @@ def test_list_repo_tasks_returns_error_fragment_when_queue_unreadable(
     with TestClient(app) as client:
         response = client.get("/repos/example__alpha/tasks")
 
-    assert response.status_code == 500
+    # 503 keeps the fragment swappable by the htmx hook in base.html.
+    assert response.status_code == 503
     assert "Unable to read tasks/QUEUE.md" in response.text
 
 
@@ -493,7 +497,8 @@ def test_view_repo_task_returns_error_fragment_when_file_non_utf8(
     with TestClient(app) as client:
         response = client.get("/repos/example__alpha/tasks/PR-042")
 
-    assert response.status_code == 500
+    # 503 keeps the fragment swappable by the htmx hook in base.html.
+    assert response.status_code == 503
     body = response.text
     assert "Unable to read task file" in body
     assert "UnicodeDecodeError" not in body

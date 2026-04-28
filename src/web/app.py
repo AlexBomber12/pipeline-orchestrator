@@ -1399,11 +1399,13 @@ async def list_repo_tasks(request: Request, name: str) -> Response:
     except (OSError, UnicodeDecodeError):
         # A non-UTF-8 or otherwise unreadable QUEUE.md (bad manual edit,
         # interrupted merge, lost permissions) must not 500 the entire
-        # Tasks panel — return a controlled fragment instead.
+        # Tasks panel — return a controlled fragment instead. Use 503 so
+        # the global htmx:beforeSwap hook in base.html swaps the fragment
+        # in (it only enables swap for 404/422/503).
         return HTMLResponse(
             '<p class="text-sm italic text-fail">Unable to read'
             " tasks/QUEUE.md.</p>",
-            status_code=500,
+            status_code=503,
         )
     grouped = {
         "doing": [t for t in tasks if t.status == TaskStatus.DOING],
@@ -1505,11 +1507,13 @@ async def view_repo_task(
     except (OSError, UnicodeDecodeError):
         # Permissions / non-UTF-8 / file vanished between resolution and
         # read: surface a user-facing error fragment instead of letting
-        # HTMX swap in a 500 stack trace.
+        # HTMX swap in a 500 stack trace. Use 503 so the global
+        # htmx:beforeSwap hook in base.html swaps the fragment in (it
+        # only enables swap for 404/422/503).
         return HTMLResponse(
             '<p class="text-sm italic text-fail">Unable to read task'
             " file.</p>",
-            status_code=500,
+            status_code=503,
         )
     return templates.TemplateResponse(
         request,
