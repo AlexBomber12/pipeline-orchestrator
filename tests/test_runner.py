@@ -804,6 +804,79 @@ def test_handle_idle_no_tasks_leaves_state_idle(
     assert ["git", "clean", "-fd"] in calls
 
 
+def test_idle_uses_cached_merged_prs(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+
+    merged_pr_calls: list[dict[str, object]] = []
+
+    def fake_get_merged_prs(*args: object, **kwargs: object) -> list[PRInfo]:
+        merged_pr_calls.append(dict(kwargs))
+        return []
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        fake_get_merged_prs,
+    )
+
+    runner = _make_runner()
+    started_at = time.monotonic()
+    asyncio.run(runner.handle_idle())
+    asyncio.run(runner.handle_idle())
+
+    assert time.monotonic() - started_at < 60
+    assert len(merged_pr_calls) == 2
+    assert all(call.get("refresh", False) is False for call in merged_pr_calls)
+
+
+def test_idle_refreshes_merged_prs_when_open_pr_snapshot_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
+    open_pr_cycles = [[PRInfo(number=42, branch="pr-042-sample")], []]
+
+    def fake_get_open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
+        del repo, kwargs
+        return open_pr_cycles.pop(0)
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        fake_get_open_prs,
+    )
+    refresh_calls: list[bool] = []
+
+    def fake_get_merged_prs(
+        repo: str,
+        branch: str,
+        refresh: bool = False,
+    ) -> list[PRInfo]:
+        del repo, branch
+        refresh_calls.append(refresh)
+        return []
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        fake_get_merged_prs,
+    )
+
+    runner = _make_runner()
+    asyncio.run(runner.handle_idle())
+    asyncio.run(runner.handle_idle())
+
+    assert refresh_calls == [False, True]
+
+
 def test_handle_idle_picks_task_and_drives_coding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -10567,14 +10640,14 @@ def test_handle_idle_does_not_promote_structured_queue_task_when_dag_blocks_it(
     assert any("No tasks available" in entry["event"] for entry in runner.state.history)
 
 
-def test_handle_idle_requests_fresh_merged_prs_for_status_derivation(
+def test_handle_idle_uses_cached_merged_prs_for_status_derivation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_subprocess(monkeypatch)
     task = QueueTask(
         pr_id="PR-123",
-        title="Refresh merged PRs",
-        branch="pr-123-refresh-merged-prs",
+        title="Cached merged PRs",
+        branch="pr-123-cached-merged-prs",
         status=TaskStatus.TODO,
         task_file="tasks/PR-123.md",
     )
@@ -10612,7 +10685,7 @@ def test_handle_idle_requests_fresh_merged_prs_for_status_derivation(
     runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
     asyncio.run(runner.handle_idle())
 
-    assert refresh_calls == [True]
+    assert refresh_calls == [False]
 
 
 def test_generate_queue_md_format() -> None:
