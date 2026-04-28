@@ -255,7 +255,7 @@ class RecoveryMixin:
                 f"DBG_RECOVERY before-preserve-push branch={branch} "
                 f"refs:\n{pre.stdout.strip()}"
             )
-        except Exception as _dbg_exc:
+        except Exception as _dbg_exc:  # pragma: no cover
             self.log_event(f"DBG_RECOVERY pre-snapshot failed: {_dbg_exc}")
 
         try:
@@ -294,7 +294,7 @@ class RecoveryMixin:
             self.log_event(
                 f"DBG_RECOVERY after-preserve-push remote ls-remote:\n{ls.stdout.strip()}"
             )
-        except Exception as _dbg_exc:
+        except Exception as _dbg_exc:  # pragma: no cover
             self.log_event(f"DBG_RECOVERY post-snapshot failed: {_dbg_exc}")
 
         self.log_event(f"Preserved crashed-run commits on {branch}")
