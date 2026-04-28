@@ -93,6 +93,13 @@ ensure_pr_url() {
 
 safe_push_branch() {
     local branch="$1"
+    # Refresh local tracking ref so the lease check below compares against
+    # current remote state, not a possibly-stale cached value from an earlier
+    # preserve push or fetch. The explicit refspec ensures we update
+    # refs/remotes/origin/<branch> even if the default fetch refspec misses
+    # branches not present locally with tracking already configured.
+    git update-ref -d "refs/remotes/origin/${branch}" 2>/dev/null || true
+    git fetch origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" 2>/dev/null || true
     local expected
     expected="$(git rev-parse --verify "refs/remotes/origin/${branch}" 2>/dev/null || true)"
     if [ -n "${expected}" ]; then
