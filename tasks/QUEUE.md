@@ -591,7 +591,7 @@
 - Branch: pr-172-spinners-controls-selector
 
 ## PR-173: Fuzzy dedup in log_event (regex numeric counter parts)
-- Status: DOING
+- Status: DONE
 - Tasks file: tasks/PR-173.md
 - Branch: pr-173-log-event-fuzzy-dedup
 
