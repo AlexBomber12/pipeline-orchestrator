@@ -85,12 +85,24 @@ _TRANSIENT_STATES = {
 _HISTORY_LIMIT = 100
 _STOP_POLL_INTERVAL_SEC = 0.5
 
-_NUMERIC_RE = re.compile(r"\d+")
+# A ``PR #<number>`` token is a semantic identifier (different PRs are
+# distinct events) and is preserved verbatim. The alternation tries the
+# ``PR #N`` form first so the full PR id is consumed before generic ``\d+``
+# can match its digits.
+_PR_ID_OR_NUMERIC_RE = re.compile(r"PR #\d+|\d+")
 
 
 def _normalize_for_dedup(event: str) -> str:
-    """Return ``event`` with numeric runs replaced by ``#`` for fuzzy matching."""
-    return _NUMERIC_RE.sub("#", event)
+    """Return ``event`` with numeric runs replaced by ``#`` for fuzzy matching.
+
+    ``PR #<number>`` PR-identifier tokens are preserved so that switching
+    from one PR to another never collapses into a single history row.
+    """
+    def _replace(match: re.Match[str]) -> str:
+        token = match.group(0)
+        return token if token.startswith("PR #") else "#"
+
+    return _PR_ID_OR_NUMERIC_RE.sub(_replace, event)
 
 # Timeout for ``scripts/ci.sh`` on the auto-commit path.
 _CI_SCRIPT_TIMEOUT_SEC = 1800

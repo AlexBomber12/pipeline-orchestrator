@@ -768,11 +768,24 @@ def test_log_event_starts_new_counter_after_different_event() -> None:
 def test_normalize_for_dedup_replaces_numeric_runs() -> None:
     assert (
         runner_module._normalize_for_dedup("PR #221 waiting 1/20m")
-        == "PR ## waiting #/#m"
+        == "PR #221 waiting #/#m"
     )
     assert runner_module._normalize_for_dedup("no numbers here") == "no numbers here"
     assert runner_module._normalize_for_dedup("123") == "#"
     assert runner_module._normalize_for_dedup("1a2b3") == "#a#b#"
+
+
+def test_normalize_for_dedup_preserves_pr_identifier() -> None:
+    """``PR #<n>`` tokens are NOT normalized so different PRs stay distinct."""
+    five = runner_module._normalize_for_dedup(
+        "PR #5 waiting (review=APPROVED, ci=SUCCESS, 1/20m)"
+    )
+    six = runner_module._normalize_for_dedup(
+        "PR #6 waiting (review=APPROVED, ci=SUCCESS, 1/20m)"
+    )
+    assert five != six
+    assert "PR #5" in five
+    assert "PR #6" in six
 
 
 def test_log_event_fuzzy_dedupes_messages_differing_only_in_numbers(
@@ -825,6 +838,25 @@ def test_log_event_does_not_fuzzy_dedupe_when_non_numeric_content_differs() -> N
     assert len(runner.state.history) == 2
     assert runner.state.history[0]["event"] == "PR #221 merged"
     assert runner.state.history[1]["event"] == "PR #221 closed"
+    assert runner.state.history[0]["count"] == 1
+    assert runner.state.history[1]["count"] == 1
+
+
+def test_log_event_does_not_fuzzy_dedupe_across_pr_numbers() -> None:
+    """Switching PR numbers must produce two history rows, not one merged row.
+
+    Regression: the previous regex normalized every digit run, so consecutive
+    WATCH cycles for two different PRs (e.g., PR #5 -> PR #6) with the same
+    review/CI text would collapse and the earlier PR transition would be lost.
+    """
+    runner = _make_runner()
+
+    runner.log_event("PR #5 waiting (review=APPROVED, ci=SUCCESS, 1/20m)")
+    runner.log_event("PR #6 waiting (review=APPROVED, ci=SUCCESS, 1/20m)")
+
+    assert len(runner.state.history) == 2
+    assert "PR #5" in runner.state.history[0]["event"]
+    assert "PR #6" in runner.state.history[1]["event"]
     assert runner.state.history[0]["count"] == 1
     assert runner.state.history[1]["count"] == 1
 
