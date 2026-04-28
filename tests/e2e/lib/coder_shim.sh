@@ -94,7 +94,7 @@ ensure_pr_url() {
 safe_push_branch() {
     local branch="$1"
     local expected
-    expected="$(git rev-parse "refs/remotes/origin/${branch}" 2>/dev/null || true)"
+    expected="$(git rev-parse --verify "refs/remotes/origin/${branch}" 2>/dev/null || true)"
     if [ -n "${expected}" ]; then
         git push -u origin "${branch}" --force-with-lease="${branch}:${expected}"
     else
