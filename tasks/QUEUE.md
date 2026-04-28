@@ -581,7 +581,7 @@
 - Branch: pr-170-remove-stalled
 
 ## PR-171: Spinners on upload and settings forms
-- Status: DOING
+- Status: DONE
 - Tasks file: tasks/PR-171.md
 - Branch: pr-171-spinners-upload-settings
 
