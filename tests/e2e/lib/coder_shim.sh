@@ -60,10 +60,34 @@ parse_doing_task() {
 
 git_setup_branch() {
     local branch="$1"
+    local stamp
+    stamp="$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ')"
+    : >> /data/shim-debug.log 2>/dev/null || true
+    {
+        printf 'DBG_SHIM %s git_setup_branch ENTER branch=%s pid=%s\n' "${stamp}" "${branch}" "$$"
+        printf 'DBG_SHIM %s before-fetch refs:\n' "${stamp}"
+        git for-each-ref --format='  %(refname) %(objectname:short)' refs/heads refs/remotes/origin 2>&1 || true
+    } | tee -a /data/shim-debug.log >&2
     git config user.email "shim@test.invalid"
     git config user.name "Shim Coder"
-    git fetch origin
-    git checkout -B "${branch}" origin/main
+    {
+        printf 'DBG_SHIM %s about-to-fetch\n' "$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ')"
+    } | tee -a /data/shim-debug.log >&2
+    git fetch origin 2>&1 | tee -a /data/shim-debug.log >&2
+    {
+        stamp="$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ')"
+        printf 'DBG_SHIM %s after-fetch refs:\n' "${stamp}"
+        git for-each-ref --format='  %(refname) %(objectname:short)' refs/heads refs/remotes/origin 2>&1 || true
+    } | tee -a /data/shim-debug.log >&2
+    git checkout -B "${branch}" origin/main 2>&1 | tee -a /data/shim-debug.log >&2
+    {
+        stamp="$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ')"
+        printf 'DBG_SHIM %s after-checkout refs + tracking:\n' "${stamp}"
+        git for-each-ref --format='  %(refname) %(objectname:short)' refs/heads refs/remotes/origin 2>&1 || true
+        git config --get-regexp '^branch\..*\.(remote|merge)$' 2>&1 || true
+        printf 'DBG_SHIM %s remote-pr-ref via ls-remote:\n' "${stamp}"
+        git ls-remote origin "refs/heads/${branch}" 2>&1 || true
+    } | tee -a /data/shim-debug.log >&2
 }
 
 write_marker_and_commit() {

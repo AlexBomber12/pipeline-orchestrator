@@ -245,6 +245,20 @@ class RecoveryMixin:
             return True
 
         try:
+            pre = git_ops._git(
+                self.repo_path, "for-each-ref",
+                "--format=%(refname) %(objectname:short)",
+                "refs/heads", "refs/remotes/origin",
+                check=False, timeout=10,
+            )
+            self.log_event(
+                f"DBG_RECOVERY before-preserve-push branch={branch} "
+                f"refs:\n{pre.stdout.strip()}"
+            )
+        except Exception as _dbg_exc:
+            self.log_event(f"DBG_RECOVERY pre-snapshot failed: {_dbg_exc}")
+
+        try:
             git_ops._git(
                 self.repo_path,
                 "push",
@@ -261,6 +275,27 @@ class RecoveryMixin:
                 f"Failed to preserve unpushed commits on {branch}: {exc}"
             )
             return False
+
+        try:
+            post = git_ops._git(
+                self.repo_path, "for-each-ref",
+                "--format=%(refname) %(objectname:short)",
+                "refs/heads", "refs/remotes/origin",
+                check=False, timeout=10,
+            )
+            self.log_event(
+                f"DBG_RECOVERY after-preserve-push branch={branch} "
+                f"refs:\n{post.stdout.strip()}"
+            )
+            ls = git_ops._git(
+                self.repo_path, "ls-remote", "origin", f"refs/heads/{branch}",
+                check=False, timeout=15,
+            )
+            self.log_event(
+                f"DBG_RECOVERY after-preserve-push remote ls-remote:\n{ls.stdout.strip()}"
+            )
+        except Exception as _dbg_exc:
+            self.log_event(f"DBG_RECOVERY post-snapshot failed: {_dbg_exc}")
 
         self.log_event(f"Preserved crashed-run commits on {branch}")
         return True
