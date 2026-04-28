@@ -4,11 +4,12 @@
     'done':  'bg-ok/10 text-ok border-ok/30',
 } %}
 {% macro task_row(repo_name, task, status_key) -%}
+{% set target_id = 'task-content-' ~ status_key ~ '-' ~ task.pr_id|replace('.', '-') %}
 <li class="rounded border border-white/5 bg-surface-3 px-3 py-2">
     <button type="button"
             class="secondary-interactive flex w-full flex-col gap-1 text-left text-xs sm:flex-row sm:items-baseline sm:gap-3"
             hx-get="/repos/{{ repo_name }}/tasks/{{ task.pr_id }}"
-            hx-target="#task-content-{{ status_key }}-{{ task.pr_id }}"
+            hx-target="#{{ target_id }}"
             hx-swap="innerHTML">
         <span class="font-mono text-gray-200">{{ task.pr_id }}</span>
         <span class="break-words text-gray-300 sm:flex-1">{{ task.title }}</span>
@@ -16,7 +17,7 @@
         <span class="font-mono text-[11px] text-gray-500 sm:text-right">{{ task.branch }}</span>
         {% endif %}
     </button>
-    <div id="task-content-{{ status_key }}-{{ task.pr_id }}" class="mt-2 empty:hidden"></div>
+    <div id="{{ target_id }}" class="mt-2 empty:hidden"></div>
 </li>
 {%- endmacro %}
 <section id="repo-tasks-panel-{{ repo_name }}" class="mt-6 rounded-lg border border-white/5 bg-surface-2 p-5">

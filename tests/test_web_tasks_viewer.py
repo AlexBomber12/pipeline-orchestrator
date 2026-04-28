@@ -77,6 +77,36 @@ def test_list_repo_tasks_returns_grouped_tasks(
     assert 'hx-get="/repos/example__alpha/tasks/PR-003"' in body
 
 
+def test_list_repo_tasks_slugifies_pr_id_with_dots_for_dom_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``.`` in ``pr_id`` would break CSS selector lookup of ``hx-target``.
+
+    The id attribute is HTML5-valid with a dot, but CSS selectors interpret
+    ``.`` as a class delimiter, so ``#task-content-todo-PR-1.2`` would never
+    match the corresponding element. The macro must slugify the id token
+    consistently for both the rendered ``id`` and the ``hx-target`` selector.
+    """
+    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
+    (repo_dir / "tasks" / "QUEUE.md").write_text(
+        "## PR-1.2: Dotted task\n- Status: TODO\n- Branch: pr-1-2\n",
+        encoding="utf-8",
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks")
+
+    assert response.status_code == 200
+    body = response.text
+    # The hx-get URL keeps the raw pr_id (it is path-safe and the server
+    # validates it), but the DOM id and hx-target selector use a slugified
+    # form so the CSS selector still matches the element.
+    assert 'hx-get="/repos/example__alpha/tasks/PR-1.2"' in body
+    assert 'hx-target="#task-content-todo-PR-1-2"' in body
+    assert 'id="task-content-todo-PR-1-2"' in body
+    assert "task-content-todo-PR-1.2" not in body
+
+
 def test_list_repo_tasks_omits_doing_section_when_absent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
