@@ -239,6 +239,140 @@ def test_view_repo_task_returns_404_for_unknown_repo(
     assert "Repository not found" in response.text
 
 
+def test_view_repo_task_returns_404_when_tasks_dir_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the on-disk repo has no ``tasks/`` dir, the viewer returns 404."""
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories:\n  - url: https://github.com/example/alpha.git\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    monkeypatch.setattr(web_app, "REPOS_DIR", str(tmp_path / "repos"))
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks/PR-001")
+
+    assert response.status_code == 404
+    assert "Task file not found" in response.text
+
+
+def test_view_repo_task_uses_queued_tasks_file_when_filename_differs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A queue entry whose ``Tasks file:`` deviates from ``{pr_id}.md``
+    must drive the lookup; otherwise the viewer incorrectly reports
+    ``Task file not found`` for tasks the runner accepts.
+    """
+    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
+    (repo_dir / "tasks" / "QUEUE.md").write_text(
+        "## PR-555: Custom-name task\n"
+        "- Status: TODO\n"
+        "- Branch: pr-555\n"
+        "- Tasks file: tasks/custom-name.md\n",
+        encoding="utf-8",
+    )
+    (repo_dir / "tasks" / "custom-name.md").write_text(
+        "# PR-555: Custom-name task\n\nbody from custom file\n",
+        encoding="utf-8",
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks/PR-555")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "body from custom file" in body
+
+
+def test_view_repo_task_rejects_symlink_under_tasks_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A symlink in ``tasks/`` pointing at a host file must not be read.
+
+    Without this guard, a configured repo containing
+    ``tasks/PR-666.md -> /data/secrets/...`` would exfiltrate the symlink
+    target through the dashboard.
+    """
+    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
+    secret = tmp_path / "host-secret.txt"
+    secret.write_text("super secret host content", encoding="utf-8")
+    (repo_dir / "tasks" / "PR-666.md").symlink_to(secret)
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks/PR-666")
+
+    assert response.status_code == 404
+    assert "Task file not found" in response.text
+    assert "super secret" not in response.text
+
+
+def test_view_repo_task_rejects_queue_file_escaping_tasks_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A queue entry whose ``Tasks file:`` walks out of ``tasks/`` is rejected.
+
+    The runner only follows queue entries written by the daemon, but the
+    dashboard must defend against a tampered QUEUE.md regardless.
+    """
+    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
+    sibling = repo_dir / "secret.md"
+    sibling.write_text("repo-level secret", encoding="utf-8")
+    (repo_dir / "tasks" / "QUEUE.md").write_text(
+        "## PR-777: Escape task\n"
+        "- Status: TODO\n"
+        "- Branch: pr-777\n"
+        "- Tasks file: tasks/../secret.md\n",
+        encoding="utf-8",
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks/PR-777")
+
+    assert response.status_code == 404
+    assert "Task file not found" in response.text
+    assert "repo-level secret" not in response.text
+
+
+def test_view_repo_task_rejects_queue_file_with_absolute_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An absolute ``Tasks file:`` value must not be honored."""
+    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
+    elsewhere = tmp_path / "elsewhere.md"
+    elsewhere.write_text("absolute path target", encoding="utf-8")
+    (repo_dir / "tasks" / "QUEUE.md").write_text(
+        "## PR-888: Absolute path task\n"
+        "- Status: TODO\n"
+        "- Branch: pr-888\n"
+        f"- Tasks file: {elsewhere}\n",
+        encoding="utf-8",
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks/PR-888")
+
+    assert response.status_code == 404
+    assert "Task file not found" in response.text
+    assert "absolute path target" not in response.text
+
+
+def test_view_repo_task_rejects_directory_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the candidate path resolves to a directory, return 404."""
+    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
+    (repo_dir / "tasks" / "PR-999.md").mkdir()
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks/PR-999")
+
+    assert response.status_code == 404
+    assert "Task file not found" in response.text
+
+
 def test_view_repo_task_rejects_invalid_pr_id_with_400(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

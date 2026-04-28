@@ -1411,6 +1411,49 @@ async def list_repo_tasks(request: Request, name: str) -> Response:
     )
 
 
+def _resolve_repo_task_path(name: str, pr_id: str) -> Path | None:
+    """Return the on-disk task file for ``pr_id`` honoring queue mappings.
+
+    Honors the queue's ``- Tasks file:`` value when present (the runner
+    accepts task files whose name differs from ``{pr_id}.md``), otherwise
+    falls back to ``tasks/{pr_id}.md``. Rejects any path that escapes the
+    repo's ``tasks/`` directory or traverses a symlink so the dashboard
+    cannot be coaxed into reading host files via a planted symlink.
+    """
+    repo_root = Path(REPOS_DIR) / name
+    tasks_dir = repo_root / "tasks"
+    if not tasks_dir.is_dir():
+        return None
+    tasks_dir_resolved = tasks_dir.resolve()
+
+    relative_str: str | None = None
+    for task in parse_queue(str(tasks_dir / "QUEUE.md")):
+        if task.pr_id == pr_id and task.task_file:
+            relative_str = task.task_file
+            break
+    if relative_str is None:
+        relative_str = f"tasks/{pr_id}.md"
+
+    candidate = repo_root / relative_str
+    try:
+        relative_parts = candidate.relative_to(repo_root).parts
+    except ValueError:
+        return None
+    walk = repo_root
+    for part in relative_parts:
+        walk = walk / part
+        if walk.is_symlink():
+            return None
+    if not candidate.is_file():
+        return None
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(tasks_dir_resolved)
+    except ValueError:
+        return None
+    return resolved
+
+
 @app.get("/repos/{name}/tasks/{pr_id}", response_class=HTMLResponse)
 async def view_repo_task(
     request: Request, name: str, pr_id: str
@@ -1427,8 +1470,8 @@ async def view_repo_task(
             '<p class="text-sm italic text-fail">Repository not found.</p>',
             status_code=404,
         )
-    task_path = Path(REPOS_DIR) / name / "tasks" / f"{pr_id}.md"
-    if not task_path.is_file():
+    task_path = _resolve_repo_task_path(name, pr_id)
+    if task_path is None:
         return HTMLResponse(
             '<p class="text-sm italic text-gray-500">Task file not found.</p>',
             status_code=404,
