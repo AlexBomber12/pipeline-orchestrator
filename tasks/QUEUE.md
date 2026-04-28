@@ -616,7 +616,7 @@
 - Branch: pr-177-htmx-400-whitelist
 
 ## PR-178: Pulse animation jump fix (smooth opacity transition)
-- Status: TODO
+- Status: DOING
 - Tasks file: tasks/PR-178.md
 - Branch: pr-178-pulse-animation-jump-fix
 
