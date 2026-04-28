@@ -77,15 +77,15 @@ def test_list_repo_tasks_returns_grouped_tasks(
     assert 'hx-get="/repos/example__alpha/tasks/PR-003"' in body
 
 
-def test_list_repo_tasks_slugifies_pr_id_with_dots_for_dom_target(
+def test_list_repo_tasks_uses_collision_free_target_for_dotted_pr_ids(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A ``.`` in ``pr_id`` would break CSS selector lookup of ``hx-target``.
+    """A ``.`` in ``pr_id`` would break ``#id`` CSS selector lookup.
 
-    The id attribute is HTML5-valid with a dot, but CSS selectors interpret
-    ``.`` as a class delimiter, so ``#task-content-todo-PR-1.2`` would never
-    match the corresponding element. The macro must slugify the id token
-    consistently for both the rendered ``id`` and the ``hx-target`` selector.
+    The id attribute is HTML5-valid with a dot, but ``#task-content-todo-PR-1.2``
+    is parsed as ``#task-content-todo-PR-1`` plus a ``.2`` class. The macro
+    keeps the literal pr_id in the DOM id and uses an attribute selector for
+    ``hx-target`` so the dot is matched as data, not as a class delimiter.
     """
     repo_dir = _write_alpha_config(tmp_path, monkeypatch)
     (repo_dir / "tasks" / "QUEUE.md").write_text(
@@ -98,13 +98,36 @@ def test_list_repo_tasks_slugifies_pr_id_with_dots_for_dom_target(
 
     assert response.status_code == 200
     body = response.text
-    # The hx-get URL keeps the raw pr_id (it is path-safe and the server
-    # validates it), but the DOM id and hx-target selector use a slugified
-    # form so the CSS selector still matches the element.
     assert 'hx-get="/repos/example__alpha/tasks/PR-1.2"' in body
-    assert 'hx-target="#task-content-todo-PR-1-2"' in body
-    assert 'id="task-content-todo-PR-1-2"' in body
-    assert "task-content-todo-PR-1.2" not in body
+    assert "hx-target=\"[id='task-content-todo-PR-1.2']\"" in body
+    assert 'id="task-content-todo-PR-1.2"' in body
+
+
+def test_list_repo_tasks_target_ids_are_collision_free_across_pr_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``PR-1.2`` and ``PR-1-2`` must render distinct DOM ids and hx-targets.
+
+    A naive ``replace('.', '-')`` slugifier collapses both into the same
+    ``task-content-<status>-PR-1-2`` token, producing duplicate ids in the
+    same status bucket and making ``hx-target`` non-deterministic.
+    """
+    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
+    (repo_dir / "tasks" / "QUEUE.md").write_text(
+        "## PR-1.2: Dotted task\n- Status: TODO\n- Branch: pr-1-dot-2\n\n"
+        "## PR-1-2: Dashed task\n- Status: TODO\n- Branch: pr-1-2\n",
+        encoding="utf-8",
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks")
+
+    assert response.status_code == 200
+    body = response.text
+    assert body.count('id="task-content-todo-PR-1.2"') == 1
+    assert body.count('id="task-content-todo-PR-1-2"') == 1
+    assert "hx-target=\"[id='task-content-todo-PR-1.2']\"" in body
+    assert "hx-target=\"[id='task-content-todo-PR-1-2']\"" in body
 
 
 def test_list_repo_tasks_omits_doing_section_when_absent(
