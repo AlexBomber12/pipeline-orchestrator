@@ -608,7 +608,7 @@
 - Branch: pr-175-light-theme-dropdown-fix
 
 ## PR-176: Tasks viewer in repo detail page
-- Status: DOING
+- Status: DONE
 - Tasks file: tasks/PR-176.md
 - Branch: pr-176-tasks-viewer
 
