@@ -596,7 +596,7 @@
 - Branch: pr-173-log-event-fuzzy-dedup
 
 ## PR-174: Event log dedup display (Lucide rotate-ccw + count badge)
-- Status: DOING
+- Status: DONE
 - Tasks file: tasks/PR-174.md
 - Branch: pr-174-event-log-dedup-display
 
