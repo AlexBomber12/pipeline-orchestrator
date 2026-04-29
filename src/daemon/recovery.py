@@ -147,14 +147,34 @@ class RecoveryMixin:
             self.log_event(f"recover_state: queue validation failed: {exc}")
             return False
         if tasks is None:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = (
-                "recover_state: read QUEUE.md from working tree failed"
-            )
+            if queue_from_origin:
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = (
+                    "recover_state: read QUEUE.md from origin failed"
+                )
+                self.log_event(
+                    "recover_state: read QUEUE.md from origin failed"
+                )
+                return False
+            # Post-PR-181 repos gitignore ``tasks/QUEUE.md`` and rely on
+            # ``handle_idle`` to regenerate it from PR-*.md headers each
+            # cycle. A missing snapshot on the working tree therefore
+            # signals "scaffolding hasn't reached IDLE yet", not a fatal
+            # state. Returning False here would deadlock recovery: when
+            # the daemon restarts onto a dirty worktree,
+            # ``ensure_repo_cloned`` defers scaffolding (and so the file
+            # is never recreated), and ``run_cycle`` exits before
+            # ``preflight`` can run its dirty-tree auto-reset, so the
+            # runner would loop indefinitely in ERROR/retry. Fall
+            # through with an empty task list so the cycle reaches
+            # preflight; once the tree self-heals, ``handle_idle``
+            # rebuilds QUEUE.md and re-matches any open PR by branch.
             self.log_event(
-                "recover_state: read QUEUE.md from working tree failed"
+                "recover_state: tasks/QUEUE.md absent in working tree; "
+                "treating as empty queue and deferring to preflight + "
+                "IDLE regeneration"
             )
-            return False
+            tasks = []
 
         try:
             prs = github_client.get_open_prs(
