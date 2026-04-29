@@ -76,6 +76,13 @@ class IdleMixin:
         change, so repeated IDLE cycles on a stable queue are no-ops on
         disk.
 
+        On legacy repos that still track ``tasks/QUEUE.md`` upstream
+        (``.gitignore`` does not retroactively untrack files), writing
+        here would dirty the working tree on every cycle, push preflight
+        into ERROR, and block normal dispatch. Skip the write in that
+        case — the tracked snapshot on origin remains the source of
+        truth until the legacy repo migrates the file out of git.
+
         Returns ``True`` once the on-disk queue reflects the generated
         content. The boolean return is preserved so existing callers
         treat the operation as always-successful (no push step exists
@@ -83,6 +90,17 @@ class IdleMixin:
         """
         queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
         self._idle_generated_queue_needs_resync = False
+        if self._origin_queue_md_tracked():
+            if not getattr(self, "_legacy_tracked_queue_md_logged", False):
+                self.log_event(
+                    "Skipping QUEUE.md regeneration: still tracked on "
+                    f"origin/{self.repo_config.branch}; "
+                    "untrack via 'git rm --cached tasks/QUEUE.md' to "
+                    "enable daemon-side regeneration"
+                )
+                self._legacy_tracked_queue_md_logged = True
+            return True
+
         content = self._generate_queue_md(headers, statuses)
         existing = (
             queue_path.read_text(encoding="utf-8")

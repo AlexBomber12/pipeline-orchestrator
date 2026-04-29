@@ -380,6 +380,131 @@ def test_parse_base_queue_reads_local_working_tree_and_handles_missing_file(
     assert runner._parse_base_queue() is None
 
 
+def test_parse_base_queue_reads_origin_when_queue_md_tracked(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Legacy repos (pre-PR-181) keep ``tasks/QUEUE.md`` tracked on the
+    base ref. Recovery may run while the working tree is checked out on
+    a feature branch left behind by an interrupted cycle, so reading
+    from disk would surface a branch-local snapshot. ``_parse_base_queue``
+    must read directly from ``origin/{branch}`` whenever the file is
+    tracked there, to ensure recovery sees the authoritative base-branch
+    queue state.
+    """
+    runner = _Runner(tmp_path)
+    repo = Path(runner.repo_path)
+    repo.mkdir(parents=True, exist_ok=True)
+    # A stale, branch-local working-tree copy that recovery must NOT see.
+    (repo / "tasks").mkdir(parents=True)
+    (repo / "tasks" / "QUEUE.md").write_text(
+        "## PR-999: stale feature-branch snapshot\n- Status: DOING\n",
+        encoding="utf-8",
+    )
+
+    origin_text = (
+        "## PR-112: From origin\n"
+        "- Status: TODO\n"
+        "- Branch: pr-112-coverage-repo-ops\n"
+    )
+
+    git_calls: list[tuple[Any, ...]] = []
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        del kwargs
+        git_calls.append((repo_path, *args))
+        if args[:2] == ("cat-file", "-e"):
+            return _FakeCompletedProcess(returncode=0)
+        if args[0] == "show":
+            return _FakeCompletedProcess(stdout=origin_text)
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", fake_git)
+
+    parsed = runner._parse_base_queue()
+    assert parsed is not None
+    assert len(parsed) == 1
+    assert parsed[0].pr_id == "PR-112"
+    assert ("show",) in {tuple(call[1:2]) for call in git_calls}
+
+
+def test_parse_base_queue_origin_show_failure_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """When the file is tracked but ``git show`` fails (transient), the
+    method returns ``None`` so the caller retries instead of falling
+    back to a possibly stale working-tree snapshot.
+    """
+    runner = _Runner(tmp_path)
+    Path(runner.repo_path).mkdir(parents=True, exist_ok=True)
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        del kwargs
+        if args[:2] == ("cat-file", "-e"):
+            return _FakeCompletedProcess(returncode=0)
+        if args[0] == "show":
+            return _FakeCompletedProcess(returncode=128, stderr="fatal")
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", fake_git)
+
+    assert runner._parse_base_queue() is None
+
+
+def test_parse_base_queue_origin_show_timeout_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A stalled ``git show`` against ``origin/{branch}`` should bail
+    cleanly with ``None`` rather than escape to the caller. Covers the
+    transient outage path the recovery loop relies on for retries.
+    """
+    runner = _Runner(tmp_path)
+    Path(runner.repo_path).mkdir(parents=True, exist_ok=True)
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        del kwargs
+        if args[:2] == ("cat-file", "-e"):
+            return _FakeCompletedProcess(returncode=0)
+        if args[0] == "show":
+            raise subprocess.TimeoutExpired(["git", *args], timeout=15)
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", fake_git)
+
+    assert runner._parse_base_queue() is None
+
+
+def test_parse_base_queue_origin_probe_timeout_falls_back_to_working_tree(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A flaky ``cat-file`` probe must not permanently mistake a
+    post-PR-181 repo for a tracked-QUEUE legacy one. On timeout the
+    helper reports untracked and the working-tree path runs as usual.
+    """
+    runner = _Runner(tmp_path)
+    repo = Path(runner.repo_path)
+    (repo / "tasks").mkdir(parents=True, exist_ok=True)
+    (repo / "tasks" / "QUEUE.md").write_text(
+        "## PR-200: Working tree\n- Status: TODO\n- Branch: pr-200\n",
+        encoding="utf-8",
+    )
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        del kwargs
+        if args[:2] == ("cat-file", "-e"):
+            raise subprocess.TimeoutExpired(["git", *args], timeout=10)
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", fake_git)
+
+    parsed = runner._parse_base_queue()
+    assert parsed is not None
+    assert parsed[0].pr_id == "PR-200"
+
+
 def test_delete_upload_if_unchanged_uses_eval_and_fallback(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

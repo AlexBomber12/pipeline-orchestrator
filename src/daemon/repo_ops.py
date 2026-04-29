@@ -176,26 +176,75 @@ class RepoOpsMixin:
         except OSError as exc:
             raise RuntimeError(f"sync_to_main OS error: {exc}") from exc
 
+    def _origin_queue_md_tracked(self) -> bool:
+        """Return ``True`` only when ``origin/{branch}`` tracks ``tasks/QUEUE.md``.
+
+        PR-181 untracks the file in this repo, but managed repos that
+        have not yet adopted that migration still carry ``tasks/QUEUE.md``
+        in tree. ``.gitignore`` does not retroactively untrack files, so
+        the daemon must detect tracked-QUEUE repos and steer clear of
+        the local-write / working-tree-read paths that PR-181's design
+        otherwise relies on.
+
+        Conservative on uncertainty: a probe failure (timeout, OSError,
+        missing ref on a fresh clone) reports ``False`` so post-PR-181
+        repos cannot be permanently mistaken for legacy ones. Legacy
+        repos self-heal on the next IDLE cycle once git is responsive.
+        """
+        branch = self.repo_config.branch
+        try:
+            result = git_ops._git(
+                self.repo_path,
+                "cat-file",
+                "-e",
+                f"origin/{branch}:tasks/QUEUE.md",
+                check=False,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        return result.returncode == 0
+
     def _parse_base_queue(
         self, *, strict: bool = False
     ) -> list[QueueTask] | None:
-        """Return QUEUE.md parsed from the local working tree, or ``None``.
+        """Return QUEUE.md parsed for the active base ref, or ``None``.
 
-        Since PR-181, ``tasks/QUEUE.md`` is gitignored — the daemon
+        Post-PR-181 repos have ``tasks/QUEUE.md`` gitignored: the daemon
         regenerates it from structured task headers each IDLE cycle and
-        no longer pushes it upstream, so an origin read would see no
-        such file. ``recover_state`` reads whatever the prior cycle
-        left on disk; on a fresh clone the file does not exist yet and
-        this returns ``None``, letting the caller translate the missing
-        snapshot into a retryable ERROR until the next IDLE cycle
-        regenerates it.
+        never pushes it, so the only authoritative copy is the local
+        working tree. Pre-PR-181 (legacy) repos still track the file on
+        ``origin/{branch}``, and recovery may run while the working tree
+        is checked out on a feature branch left behind by an interrupted
+        cycle. Reading from the working tree there would return a
+        branch-local snapshot and could resurrect or misclassify
+        in-flight work; instead we read directly from
+        ``origin/{branch}`` whenever the file is tracked there.
+
+        Returns ``None`` when no snapshot can be parsed (fresh clone,
+        unreadable file, ``git show`` failure). The caller translates
+        that into a retryable ERROR so the next cycle's regenerate /
+        sync brings the snapshot back into reach.
 
         When *strict* is ``True``, ``parse_queue_text`` runs the full
-        validation suite (duplicate IDs/branches, missing deps, cycles).
-        A ``QueueValidationError`` is propagated to the caller so
-        recovery can transition to ``ERROR`` instead of driving
-        execution on a malformed queue.
+        validation suite and a ``QueueValidationError`` is propagated.
         """
+        if self._origin_queue_md_tracked():
+            branch = self.repo_config.branch
+            try:
+                result = git_ops._git(
+                    self.repo_path,
+                    "show",
+                    f"origin/{branch}:tasks/QUEUE.md",
+                    check=False,
+                    timeout=15,
+                )
+            except (subprocess.TimeoutExpired, OSError):
+                return None
+            if result.returncode != 0:
+                return None
+            return parse_queue_text(result.stdout, strict=strict)
+
         queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
         try:
             content = queue_path.read_text(encoding="utf-8")

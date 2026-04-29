@@ -529,6 +529,14 @@ def _patch_subprocess(
             return _FakeCompletedProcess(
                 args=cmd, stdout="0\n", returncode=0
             )
+        # ``git cat-file -e origin/<branch>:tasks/QUEUE.md`` is the
+        # tracked-QUEUE probe used by ``_origin_queue_md_tracked``.
+        # Default to non-zero (untracked, post-PR-181) so tests don't
+        # accidentally take the legacy-skip branch; tests that DO need
+        # to simulate the legacy tracked-QUEUE state install their own
+        # fake_run.
+        if cmd[:3] == ["git", "cat-file", "-e"]:
+            return _FakeCompletedProcess(args=cmd, returncode=1)
         # ``git merge origin/<ref>`` defaults to the up-to-date no-op
         # so handle_merge proceeds straight to ``gh pr merge``. Tests
         # that exercise the sync-push / conflict paths install their
@@ -11020,6 +11028,11 @@ def test_queue_md_not_committed_when_unchanged(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         git_calls.append(cmd)
+        # Simulate the post-PR-181 untracked state: ``git cat-file -e
+        # origin/main:tasks/QUEUE.md`` reports the file is missing from
+        # origin so the helper takes the local-write branch.
+        if cmd[1:3] == ["cat-file", "-e"]:
+            return _FakeCompletedProcess(args=cmd, returncode=1)
         return _FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(git_ops_module.subprocess, "run", fake_run)
@@ -11028,7 +11041,7 @@ def test_queue_md_not_committed_when_unchanged(
     runner.repo_path = str(tmp_path)
     runner._write_generated_queue_md(headers, statuses)
 
-    assert git_calls == []
+    assert all(call[1] == "cat-file" for call in git_calls), git_calls
     assert queue_path.read_text(encoding="utf-8") == runner._generate_queue_md(
         headers,
         statuses,
@@ -11131,6 +11144,75 @@ def test_write_generated_queue_md_creates_tasks_dir_if_missing(
 
     assert published is True
     assert (tmp_path / "tasks" / "QUEUE.md").exists()
+
+
+def test_write_generated_queue_md_skips_when_tracked_on_origin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Legacy repos (pre-PR-181) keep ``tasks/QUEUE.md`` tracked on
+    ``origin/{branch}``. ``.gitignore`` does not retroactively untrack
+    files, so a write here would dirty the working tree on every IDLE
+    cycle, push preflight into ERROR, and block dispatch. The helper
+    must detect the tracked snapshot and skip the write entirely.
+    """
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "QUEUE.md"
+    legacy_text = "# legacy on disk\n"
+    queue_path.write_text(legacy_text, encoding="utf-8")
+    headers = [
+        TaskHeader(
+            pr_id="PR-001",
+            title="Project bootstrap",
+            branch="pr-001-bootstrap",
+            task_type="feature",
+            complexity="low",
+            depends_on=[],
+            priority=1,
+            coder="any",
+        )
+    ]
+    statuses = {"PR-001": TaskStatus.DONE}
+
+    git_calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append(cmd)
+        if cmd[1:3] == ["cat-file", "-e"]:
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        return _FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(git_ops_module.subprocess, "run", fake_run)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+
+    published = runner._write_generated_queue_md(headers, statuses)
+
+    assert published is True
+    # The tracked file on disk is left alone — no dirty modification.
+    assert queue_path.read_text(encoding="utf-8") == legacy_text
+    # Only the cat-file probe runs; no further git plumbing is invoked.
+    assert git_calls == [
+        ["git", "cat-file", "-e", "origin/main:tasks/QUEUE.md"]
+    ]
+    assert any(
+        "Skipping QUEUE.md regeneration" in entry["event"]
+        and "tracked on origin/main" in entry["event"]
+        for entry in runner.state.history
+    )
+
+    # Re-running on the same legacy repo must not log the warning a
+    # second time (one-shot guard via ``_legacy_tracked_queue_md_logged``).
+    history_count_before = len(runner.state.history)
+    runner._write_generated_queue_md(headers, statuses)
+    new_logs = [
+        entry
+        for entry in runner.state.history[history_count_before:]
+        if "Skipping QUEUE.md regeneration" in entry["event"]
+    ]
+    assert new_logs == []
 
 
 def test_select_next_task_from_dag_returns_none_when_tasks_dir_missing(
