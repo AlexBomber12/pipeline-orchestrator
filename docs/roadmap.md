@@ -164,6 +164,31 @@ This is **clean separation of resources by phase**. Implications:
 
 This model also informs **multi-repo capacity planning**: two repos in CODING/FIX simultaneously do not double GitHub burn (Claude doubles instead). Two repos in WATCH simultaneously DO double GitHub burn — this is the multi-repo risk OBS-AC anticipated.
 
+### Outcome data version-drift (decided 2026-04-29)
+
+Architectural decision recorded for analytics and future self-learning capabilities.
+
+**Lessons learned from past PRs are valid only for the same coder × model × version combination.**
+
+Cross-version aggregation is **unsafe** because:
+
+- Each model version has different error distribution (Claude Sonnet 4.6 → 4.7 → 5 produces different bugs)
+- Newer training data shifts the population of issues
+- Version-specific fixes to upstream coders eliminate certain classes of failures
+- Tool-version drift (CLI extensions like `@anthropic-ai/claude-code` and `@openai/codex`) changes interaction patterns
+
+Therefore:
+
+1. **Outcome logs (PR-204) record coder/model/version explicitly** as required schema fields.
+2. **Analytics queries default-filter to current version.** Mixed-version queries are explicit opt-in with caveat warning.
+3. **Lessons learned recommendations** must be scoped by version triple. A pattern observed under `claude-opus-4-7` does not auto-apply to `claude-opus-5`.
+4. **Selector training (Thompson Sampling, etc)** must reset or heavily-discount data when underlying coder version changes. Stale posterior distributions on outdated versions are worse than no posterior at all.
+
+**Practical implication**: dataset accumulation has natural decay. After a major version change, much of the historical dataset becomes advisory rather than authoritative. This is a fundamental limitation of ML-based recommendations for AI coding tools, not a bug to fix.
+
+**Storage decision (related)**: PR-204 uses JSONL append-only files in `/data/analytics/<year>-<month>.jsonl`. SQLite migration deferred until any of: (a) cross-month queries become slow (>10s), (b) need for indexed columns on million-row tables, (c) multi-process concurrent writes that flock cannot handle. None apply at current scale (~250 PR/year, single daemon process).
+
+
 ### Testing policy для managed repos (added 2026-04-24 Day 5)
 
 Любой repo onboarded в pipeline-orchestrator должен иметь test pyramid:
@@ -222,7 +247,7 @@ Numbering продолжает существующую sequence от PR-180 (п
 
 **Exit criteria:** megaraid-dashboard onboarded в read-only/observe mode без ручного редактирования AGENTS.md. Multi-repo dashboard работает корректно. Production config reproducible from git + override file.
 
-### Polish batch (PR-195..PR-203, ~2-3 days)
+### Polish batch (PR-195..PR-204, ~2-3 days)
 
 - **PR-195** push_count desync fix. UI metric совпадает с GitHub Commits tab — single source of truth.
 - **PR-196** AGENTS.md prohibit draft PRs (text update + PR-220 reconciliation example).
@@ -244,7 +269,9 @@ Observed during 2026-04-29 task-upload session:
 
 - **PR-203** Compact resource limits row with tooltips. Replaces current single GitHub API budget bar with 4 chips: GH REST, GH GraphQL, Claude 5h, Claude weekly. Color zones by remaining percentage (green > 50%, amber 20-50%, red < 20%). Hover tooltip shows absolute values and reset time. No click action in this PR — history modal deferred (see Deferred section). Type: ux. Complexity: low. Reasoning: current visualization shows only GitHub API budget; system actually depends on 4 distinct quotas. Operator awareness gap.
 
-These add to the existing PR-195..PR-199 polish batch. Total polish batch now PR-195..PR-203.
+- **PR-204** Structured per-PR outcome logging for future analytics. Append-only JSONL at `/data/analytics/<year>-<month>.jsonl` with one record per merged PR. Schema captures coder/model/version explicitly to support future analytics that respect outcome-data version drift (see Architectural decisions section). No analysis layer, no telemetry, no upload — pure persistence with the right schema for future use. SQLite migration trigger documented as future work. Type: feature. Complexity: low. Reasoning: foundational gap for any future selector training or lessons-learned capability; storage cost is negligible (~125 KB/year), schema choice now prevents painful retroactive backfill later.
+
+These add to the existing PR-195..PR-199 polish batch. Total polish batch now PR-195..PR-204.
 
 ### Deferred (sprint-scale, не в ближайшем 2-week плане)
 
@@ -258,7 +285,7 @@ These add to the existing PR-195..PR-199 polish batch. Total polish batch now PR
 
 ---
 
-- **Resource limit history charts (PR-204+ candidate):** modal-on-click history graphs (4-hour rolling) for each of the 4 quotas surfaced in PR-203. Pending decision on storage backend — in-memory loses on daemon restart, Redis depends on RDB snapshot persistence, SQLite adds new dependency, PostgreSQL is overkill. Defer until storage decision is made or until operator concretely needs trend visibility (currently visual chip + reset time gives enough situational awareness for solo operator workflow).
+- **Resource limit history charts (future PR candidate):** modal-on-click history graphs (4-hour rolling) for each of the 4 quotas surfaced in PR-203. Pending decision on storage backend — in-memory loses on daemon restart, Redis depends on RDB snapshot persistence, SQLite adds new dependency, PostgreSQL is overkill. Defer until storage decision is made or until operator concretely needs trend visibility (currently visual chip + reset time gives enough situational awareness for solo operator workflow).
 
 ## Vision (beyond Round 4, возможно отдельный продукт)
 
@@ -938,8 +965,8 @@ GraphQL quota distribution across repos критична. Без PR-180 + PR-191
 
 - **PR-001..PR-179:** completed work. Frozen numbering.
 - **PR-180..PR-199:** active backlog batches от 2026-04-29 audit (Critical / Important / Multi-repo / Polish).
-- **PR-200..PR-203:** task-validation synonyms + dashboard UI consistency + WATCH adaptive polling + compact resource limits row (added 2026-04-29 evening).
-- **PR-204+:** future work — sprint-scale items deferred (GitHub App migration, Thompson Sampling, PAUSED removal, manifest flow, resource limit history charts pending storage decision).
+- **PR-200..PR-204:** task-validation synonyms + dashboard UI consistency + WATCH adaptive polling + compact resource limits row + outcome logging (added 2026-04-29 evening).
+- **PR-204+:** future work — sprint-scale items deferred (GitHub App migration, Thompson Sampling, PAUSED removal, manifest flow, resource limit history charts pending storage decision, JSONL → SQLite analytics migration when scale demands).
 
 Verify free numbers перед creating new task files: `ls tasks/PR-XXX.md` + `grep PR-XXX docs/roadmap.md`.
 
