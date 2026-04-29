@@ -40,6 +40,7 @@ from src.coders.codex import CodexPlugin
 from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
 from src.daemon.config_watcher import watch_config_file_changes
 from src.daemon.runner import PipelineRunner
+from src.events.wake import repo_from_channel, subscribe_wake
 from src.models import PipelineState
 from src.usage import UsageProvider
 
@@ -345,6 +346,119 @@ def _find_repo_config(config: AppConfig, url: str) -> RepoConfig | None:
     return None
 
 
+async def _close_pubsub(pubsub: Any) -> None:
+    """Best-effort close of a pubsub object, ignoring teardown errors."""
+    if pubsub is None:
+        return
+    try:
+        await pubsub.aclose()
+    except Exception:
+        pass
+
+
+def _apply_wake_message(
+    message: dict[str, Any],
+    last_run: dict[str, float],
+    slug_to_key: dict[str, str],
+) -> None:
+    """Reset ``last_run`` for the repo named on the wake channel."""
+    channel = message.get("channel")
+    if isinstance(channel, bytes):
+        channel = channel.decode("utf-8")
+    if not isinstance(channel, str):
+        return
+    slug = repo_from_channel(channel)
+    if slug is None:
+        return
+    key = slug_to_key.get(slug)
+    if key is not None:
+        last_run[key] = 0.0
+
+
+async def _drain_wake_messages(
+    pubsub: Any,
+    last_run: dict[str, float],
+    slug_to_key: dict[str, str],
+) -> None:
+    """Apply any queued wake messages without blocking."""
+    while True:
+        try:
+            extra = await pubsub.get_message(
+                ignore_subscribe_messages=True, timeout=0.0
+            )
+        except Exception:
+            return
+        if extra is None:
+            return
+        _apply_wake_message(extra, last_run, slug_to_key)
+
+
+async def _wait_or_wake(
+    pubsub: Any,
+    tick: float,
+    last_run: dict[str, float],
+    slug_to_key: dict[str, str],
+) -> bool:
+    """Sleep ``tick`` seconds or wake early on a wake-channel message.
+
+    Returns True when the pubsub stayed healthy, False when the subscriber
+    raised and the caller should rebuild it. When the subscriber errors
+    before the tick has elapsed, the function still finishes the tick
+    before returning so the caller cannot rebuild the subscriber faster
+    than the configured cadence — otherwise a Redis disconnect would
+    drive a tight reconnect loop. Falls back to a pure sleep when
+    ``pubsub`` is None so the daemon never blocks on a missing subscriber.
+    """
+    if pubsub is None:
+        await asyncio.sleep(tick)
+        return True
+
+    sleep_task = asyncio.create_task(asyncio.sleep(tick))
+    wake_task = asyncio.create_task(
+        pubsub.get_message(ignore_subscribe_messages=True, timeout=None)
+    )
+    done, pending = await asyncio.wait(
+        {sleep_task, wake_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+
+    healthy = True
+    if wake_task in done:
+        wake_exc = wake_task.exception()
+        if wake_exc is not None:
+            healthy = False
+        else:
+            msg = wake_task.result()
+            if msg is not None:
+                _apply_wake_message(msg, last_run, slug_to_key)
+                await _drain_wake_messages(pubsub, last_run, slug_to_key)
+
+    if not healthy and not sleep_task.done():
+        # Subscriber errored early; finish the tick so the caller observes
+        # the same backoff as a healthy cycle and cannot drive a tight
+        # reconnect loop while Redis is unreachable.
+        try:
+            await sleep_task
+        except BaseException:
+            pass
+
+    for task in pending:
+        if task.done():
+            continue
+        task.cancel()
+        try:
+            await task
+        except BaseException:
+            pass
+
+    if sleep_task.done() and not sleep_task.cancelled():
+        sleep_exc = sleep_task.exception()
+        if sleep_exc is not None:
+            raise sleep_exc
+
+    return healthy
+
+
 async def main() -> None:
     """Initialize runners and drive the poll loop forever."""
     gh_dir = os.environ.get("GH_CONFIG_DIR")
@@ -404,6 +518,8 @@ async def main() -> None:
 
     last_run: dict[str, float] = {}
     last_config_check = time.monotonic()
+    pubsub: Any | None = None
+    subscribed_slugs: tuple[str, ...] = ()
     while True:
         now_mono = time.monotonic()
         reload_interval = CONFIG_RELOAD_CYCLES * config.daemon.poll_interval_sec
@@ -460,14 +576,35 @@ async def main() -> None:
 
         now_after = time.monotonic()
         remaining: list[float] = []
+        slug_to_key: dict[str, str] = {}
         for key, runner in runners.items():
             if not runner.repo_config.active:
                 continue
+            slug_to_key[runner.name] = key
             due_in = (last_run.get(key, 0.0) + runner.repo_config.poll_interval_sec) - now_after
             remaining.append(max(due_in, 0.0))
         tick = min(remaining) if remaining else config.daemon.poll_interval_sec
         tick = min(tick, config.daemon.poll_interval_sec)
-        await asyncio.sleep(max(tick, 1))
+
+        desired_slugs = tuple(sorted(slug_to_key.keys()))
+        if desired_slugs != subscribed_slugs:
+            await _close_pubsub(pubsub)
+            pubsub = await subscribe_wake(redis_client, desired_slugs)
+            if pubsub is None and desired_slugs:
+                # Subscribe failed transiently; clear subscribed_slugs so the
+                # next iteration retries instead of falling back permanently
+                # to timed polling.
+                subscribed_slugs = ()
+            else:
+                subscribed_slugs = desired_slugs
+
+        healthy = await _wait_or_wake(
+            pubsub, max(tick, 1), last_run, slug_to_key
+        )
+        if not healthy:
+            await _close_pubsub(pubsub)
+            pubsub = None
+            subscribed_slugs = ()
 
 
 if __name__ == "__main__":  # pragma: no cover  # entry point invoked via python -m
