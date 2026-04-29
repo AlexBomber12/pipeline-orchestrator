@@ -34,10 +34,16 @@ INFRA_ERROR_PATTERNS: tuple[str, ...] = (
     "gh: failed to",
     "dial tcp",
     "ensure_repo_cloned",
-    "git push",
 )
 
-_INFRA_ERROR_REGEX = re.compile(r"failed after \d+ attempts")
+# retry_transient raises ``"<operation_name> failed after N attempts: <exc>"``;
+# only treat the wrapper as infra when the operation_name is a git/gh network
+# call. A bare "failed after N attempts" match would also catch unrelated
+# retry strings (API/validation/workflow loops), and "git push" alone catches
+# actionable rejections (non-fast-forward, branch protection, auth/policy).
+_INFRA_RETRY_REGEX = re.compile(
+    r"(?:git (?:clone|fetch|push)|gh api)\b[^\n]*?\bfailed after \d+ attempts"
+)
 
 
 def _is_infra_error(context: str) -> bool:
@@ -45,7 +51,7 @@ def _is_infra_error(context: str) -> bool:
     lowered = context.lower()
     if any(pattern in lowered for pattern in INFRA_ERROR_PATTERNS):
         return True
-    return _INFRA_ERROR_REGEX.search(lowered) is not None
+    return _INFRA_RETRY_REGEX.search(lowered) is not None
 
 
 class ErrorCategory(Enum):

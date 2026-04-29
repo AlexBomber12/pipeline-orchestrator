@@ -14759,8 +14759,22 @@ def test_handle_error_infra_bypass_does_not_lock_out_subsequent_errors(
         ("gh: failed to run git", True),
         ("dial tcp 1.2.3.4:443: i/o timeout", True),
         ("ensure_repo_cloned failed", True),
-        ("git push origin HEAD:foo rejected", True),
-        ("failed after 7 attempts", True),
+        (
+            "git push origin HEAD:foo failed after 3 attempts: connection reset",
+            True,
+        ),
+        ("git clone failed after 2 attempts: i/o timeout", True),
+        ("gh api repos/x/y/commits/z/check-runs failed after 3 attempts", True),
+        # Push rejections, branch-protection denials, auth/policy errors must
+        # NOT be classified as infra so diagnose_error can route FIX/ESCALATE.
+        ("git push origin HEAD:foo rejected (non-fast-forward)", False),
+        ("remote: Branch protection rule prevents push", False),
+        ("git push: 403 forbidden", False),
+        # Generic retry strings without a git/gh operation prefix must not
+        # trigger infra bypass — they may come from API/validation/workflow
+        # retry loops that need real diagnosis.
+        ("failed after 7 attempts", False),
+        ("pipeline step failed after 5 attempts", False),
         ("pytest: 3 failed in test_x.py", False),
         ("ImportError: cannot import name 'foo'", False),
         ("API rate limit exceeded", False),
