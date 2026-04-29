@@ -626,7 +626,7 @@
 - Branch: pr-179-pulse-badge-not-dot
 
 ## PR-180: REST replacement for gh pr list statusCheckRollup
-- Status: DOING
+- Status: DONE
 - Tasks file: tasks/PR-180.md
 - Branch: pr-180-rest-check-runs-replace-rollup
 
