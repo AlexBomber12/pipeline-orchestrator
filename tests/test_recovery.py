@@ -382,6 +382,76 @@ def test_recover_state_keeps_doing_entry_when_queue_sourced_from_origin(
     )
 
 
+def test_recover_state_uses_single_probe_for_parse_and_ghost_filter(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """recover_state must run ``_origin_queue_md_tracked`` exactly once
+    and feed the same result to both ``_parse_base_queue`` and the
+    ghost-filter decision. Otherwise a transient probe failure between
+    two independent probes would let the queue be parsed from
+    ``origin/{branch}`` while the ghost filter still ran on the local
+    working tree, dropping real DOING/DONE entries whose task files
+    legitimately don't exist on a feature-branch checkout and
+    detaching the daemon from in-flight PR work.
+    """
+    in_flight = QueueTask(
+        pr_id="PR-777",
+        title="In-flight on legacy tracked-QUEUE repo",
+        status=TaskStatus.DOING,
+        branch="pr-777-feature",
+        task_file="tasks/PR-777.md",
+    )
+    matching_pr = PRInfo(number=777, branch="pr-777-feature")
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [matching_pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda owner_repo, number: {"head_commit_date": ""},
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+
+    probe_calls: list[bool] = []
+    parse_kwargs: list[dict[str, object]] = []
+
+    def tracked_probe() -> bool:
+        probe_calls.append(True)
+        return True
+
+    def fake_parse(**kwargs: object) -> list[QueueTask]:
+        parse_kwargs.append(kwargs)
+        # Sanity: the caller must have supplied a single shared probe
+        # result instead of letting ``_parse_base_queue`` re-probe.
+        assert kwargs.get("queue_from_origin") is True
+        return [in_flight]
+
+    runner._origin_queue_md_tracked = tracked_probe  # type: ignore[method-assign]
+    runner._parse_base_queue = fake_parse  # type: ignore[method-assign]
+
+    result = asyncio.run(runner.recover_state())
+
+    assert result is True
+    assert len(probe_calls) == 1, (
+        "expected a single _origin_queue_md_tracked probe shared by "
+        "the parse-source and ghost-filter decisions"
+    )
+    assert len(parse_kwargs) == 1
+    assert parse_kwargs[0].get("queue_from_origin") is True
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == "PR-777"
+    assert not any(
+        "ignoring ghost QUEUE.md entry" in e["event"]
+        for e in runner.state.history
+    )
+
+
 def test_recover_doing_task_without_pr_rerun_coding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

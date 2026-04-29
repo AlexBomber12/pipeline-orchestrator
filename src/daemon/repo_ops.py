@@ -206,7 +206,7 @@ class RepoOpsMixin:
         return result.returncode == 0
 
     def _parse_base_queue(
-        self, *, strict: bool = False
+        self, *, strict: bool = False, queue_from_origin: bool | None = None,
     ) -> list[QueueTask] | None:
         """Return QUEUE.md parsed for the active base ref, or ``None``.
 
@@ -228,8 +228,20 @@ class RepoOpsMixin:
 
         When *strict* is ``True``, ``parse_queue_text`` runs the full
         validation suite and a ``QueueValidationError`` is propagated.
+
+        When *queue_from_origin* is provided, the caller has already
+        run ``_origin_queue_md_tracked()`` and wants both the parse
+        source and any downstream ghost-filter decision to come from
+        the same probe result. This avoids a transient probe failure
+        between two independent probes from desyncing the two
+        decisions (e.g., reading from origin while the caller still
+        applies the local-existence ghost filter, which would drop
+        real DOING/DONE entries on a feature-branch checkout). When
+        ``None``, the helper probes internally as before.
         """
-        if self._origin_queue_md_tracked():
+        if queue_from_origin is None:
+            queue_from_origin = self._origin_queue_md_tracked()
+        if queue_from_origin:
             branch = self.repo_config.branch
             try:
                 result = git_ops._git(

@@ -96,9 +96,21 @@ class RecoveryMixin:
         work.
         """
         strict = self.app_config.daemon.strict_queue_validation
+        # Probe the queue source ONCE and reuse the result for both the
+        # parse-source decision (origin/{branch} vs working tree) and the
+        # ghost-filter decision below. A second independent probe inside
+        # ``_parse_base_queue`` could disagree if the first probe
+        # transiently failed (timeout/OSError reports ``False``) while
+        # the second succeeded: the queue would then be parsed from
+        # ``origin/{branch}`` while recovery still applied the
+        # local-existence ghost filter, dropping real DOING/DONE entries
+        # whose task files legitimately don't exist on a feature-branch
+        # checkout and detaching the daemon from in-flight PR work.
         queue_from_origin = self._origin_queue_md_tracked()
         try:
-            tasks = self._parse_base_queue(strict=strict)
+            tasks = self._parse_base_queue(
+                strict=strict, queue_from_origin=queue_from_origin,
+            )
         except QueueValidationError as exc:
             self.state.state = PipelineState.ERROR
             self.state.error_message = (

@@ -505,6 +505,83 @@ def test_parse_base_queue_origin_probe_timeout_falls_back_to_working_tree(
     assert parsed[0].pr_id == "PR-200"
 
 
+def test_parse_base_queue_honors_explicit_queue_from_origin_without_reprobing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """When the caller threads in an already-resolved probe result via
+    ``queue_from_origin``, the helper must trust it instead of running a
+    second ``_origin_queue_md_tracked`` probe. Otherwise a transient
+    probe failure could let the parse source disagree with the caller's
+    downstream ghost-filter decision (recovery's invariant)."""
+    runner = _Runner(tmp_path)
+    repo = Path(runner.repo_path)
+    repo.mkdir(parents=True, exist_ok=True)
+    # Working-tree snapshot exists and would be returned if the helper
+    # silently re-probed and got ``False`` due to a flaky cat-file.
+    (repo / "tasks").mkdir(parents=True)
+    (repo / "tasks" / "QUEUE.md").write_text(
+        "## PR-WT: working-tree snapshot\n- Status: TODO\n- Branch: pr-wt\n",
+        encoding="utf-8",
+    )
+
+    origin_text = (
+        "## PR-ORIGIN: from origin\n- Status: TODO\n- Branch: pr-origin\n"
+    )
+    git_calls: list[tuple[Any, ...]] = []
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        del kwargs
+        git_calls.append(args)
+        if args[:2] == ("cat-file", "-e"):  # pragma: no cover - must not run
+            return _FakeCompletedProcess(returncode=0)
+        if args[0] == "show":
+            return _FakeCompletedProcess(stdout=origin_text)
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", fake_git)
+
+    parsed = runner._parse_base_queue(queue_from_origin=True)
+
+    assert parsed is not None
+    assert parsed[0].pr_id == "PR-ORIGIN"
+    assert all(
+        call[:2] != ("cat-file", "-e") for call in git_calls
+    ), "must not re-probe when caller supplied queue_from_origin"
+
+
+def test_parse_base_queue_with_explicit_false_skips_origin_show(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """When the caller declares the queue is *not* on origin, the helper
+    reads the working tree even if a re-probe would have reported
+    ``True``. Confirms the explicit ``queue_from_origin=False`` case
+    short-circuits the probe entirely."""
+    runner = _Runner(tmp_path)
+    repo = Path(runner.repo_path)
+    (repo / "tasks").mkdir(parents=True)
+    (repo / "tasks" / "QUEUE.md").write_text(
+        "## PR-WT: working-tree snapshot\n- Status: TODO\n- Branch: pr-wt\n",
+        encoding="utf-8",
+    )
+
+    git_calls: list[tuple[Any, ...]] = []
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        del kwargs
+        git_calls.append(args)
+        return _FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", fake_git)
+
+    parsed = runner._parse_base_queue(queue_from_origin=False)
+
+    assert parsed is not None
+    assert parsed[0].pr_id == "PR-WT"
+    assert git_calls == [], "must skip both probe and origin show"
+
+
 def test_delete_upload_if_unchanged_uses_eval_and_fallback(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
