@@ -402,9 +402,12 @@ async def _wait_or_wake(
     """Sleep ``tick`` seconds or wake early on a wake-channel message.
 
     Returns True when the pubsub stayed healthy, False when the subscriber
-    raised and the caller should rebuild it. Falls back to a pure sleep
-    when ``pubsub`` is None so the daemon never blocks on a missing
-    subscriber.
+    raised and the caller should rebuild it. When the subscriber errors
+    before the tick has elapsed, the function still finishes the tick
+    before returning so the caller cannot rebuild the subscriber faster
+    than the configured cadence — otherwise a Redis disconnect would
+    drive a tight reconnect loop. Falls back to a pure sleep when
+    ``pubsub`` is None so the daemon never blocks on a missing subscriber.
     """
     if pubsub is None:
         await asyncio.sleep(tick)
@@ -418,12 +421,6 @@ async def _wait_or_wake(
         {sleep_task, wake_task},
         return_when=asyncio.FIRST_COMPLETED,
     )
-    for task in pending:
-        task.cancel()
-        try:
-            await task
-        except BaseException:
-            pass
 
     healthy = True
     if wake_task in done:
@@ -436,7 +433,25 @@ async def _wait_or_wake(
                 _apply_wake_message(msg, last_run, slug_to_key)
                 await _drain_wake_messages(pubsub, last_run, slug_to_key)
 
-    if sleep_task in done:
+    if not healthy and not sleep_task.done():
+        # Subscriber errored early; finish the tick so the caller observes
+        # the same backoff as a healthy cycle and cannot drive a tight
+        # reconnect loop while Redis is unreachable.
+        try:
+            await sleep_task
+        except BaseException:
+            pass
+
+    for task in pending:
+        if task.done():
+            continue
+        task.cancel()
+        try:
+            await task
+        except BaseException:
+            pass
+
+    if sleep_task.done() and not sleep_task.cancelled():
         sleep_exc = sleep_task.exception()
         if sleep_exc is not None:
             raise sleep_exc

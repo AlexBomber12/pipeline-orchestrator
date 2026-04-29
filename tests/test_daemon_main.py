@@ -1633,11 +1633,62 @@ async def test_wait_or_wake_marks_unhealthy_on_pubsub_error() -> None:
     last_run = {"alpha-key": 100.0}
 
     healthy = await main_module._wait_or_wake(
-        pubsub, 60.0, last_run, {"alpha": "alpha-key"}
+        pubsub, 0.01, last_run, {"alpha": "alpha-key"}
     )
 
     assert healthy is False
     assert last_run["alpha-key"] == 100.0
+
+
+async def test_wait_or_wake_preserves_tick_when_subscriber_errors_early() -> None:
+    """A pubsub error must not short-circuit the tick.
+
+    Otherwise the main loop tears the subscriber down and re-subscribes
+    immediately, producing a tight reconnect loop during a Redis outage.
+    """
+    pubsub = _ScriptedPubSub([RuntimeError("connection lost")])
+    last_run = {"alpha-key": 100.0}
+
+    loop = asyncio.get_event_loop()
+    start = loop.time()
+    healthy = await main_module._wait_or_wake(
+        pubsub, 0.05, last_run, {"alpha": "alpha-key"}
+    )
+    elapsed = loop.time() - start
+
+    assert healthy is False
+    # Allow scheduler slack but require most of the tick to have elapsed.
+    assert elapsed >= 0.04, elapsed
+
+
+async def test_wait_or_wake_swallows_sleep_error_when_subscriber_errored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sleep that itself raises must surface as a propagated exception.
+
+    The unhealthy-path ``await sleep_task`` is wrapped in BaseException to
+    avoid re-raising at the await site; the trailing inspection then
+    surfaces the underlying error so it is not silently lost.
+    """
+    pubsub = _ScriptedPubSub([RuntimeError("connection lost")])
+    last_run = {"alpha-key": 100.0}
+
+    async def flaky_sleep(seconds: float) -> None:
+        # Stay pending past the FIRST_COMPLETED return so the function
+        # actually executes the unhealthy ``await sleep_task`` branch
+        # before the sleep raises.
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+        loop.call_later(0.01, fut.set_result, None)
+        await fut
+        raise RuntimeError("sleep boom")
+
+    monkeypatch.setattr(main_module.asyncio, "sleep", flaky_sleep)
+
+    with pytest.raises(RuntimeError, match="sleep boom"):
+        await main_module._wait_or_wake(
+            pubsub, 0.05, last_run, {"alpha": "alpha-key"}
+        )
 
 
 async def test_wait_or_wake_lets_sleep_win_when_no_messages() -> None:
