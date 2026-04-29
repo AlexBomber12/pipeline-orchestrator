@@ -25,6 +25,28 @@ from src.retry import retry_transient
 logger = logging.getLogger(__name__)
 _CLAUDE_CLI_COAUTHOR = "Co-authored-by: Claude CLI <noreply@anthropic.com>"
 
+INFRA_ERROR_PATTERNS: tuple[str, ...] = (
+    "git fetch origin",
+    "could not connect to",
+    "connection timed out",
+    "network is unreachable",
+    "failed to connect",
+    "gh: failed to",
+    "dial tcp",
+    "ensure_repo_cloned",
+    "git push",
+)
+
+_INFRA_ERROR_REGEX = re.compile(r"failed after \d+ attempts")
+
+
+def _is_infra_error(context: str) -> bool:
+    """True when ``context`` looks like a git/network infra failure."""
+    lowered = context.lower()
+    if any(pattern in lowered for pattern in INFRA_ERROR_PATTERNS):
+        return True
+    return _INFRA_ERROR_REGEX.search(lowered) is not None
+
 
 class ErrorCategory(Enum):
     RATE_LIMIT = "rate_limit"
@@ -83,6 +105,16 @@ class ErrorMixin:
     async def handle_error(self, error_context: str | None = None) -> None:
         """Ask the selected coder whether to FIX, SKIP, or ESCALATE the error."""
         context = error_context or self.state.error_message or "Unknown error"
+        if _is_infra_error(context):
+            self._error_skip_context = None
+            self._error_skip_count = 0
+            self._error_skip_active = False
+            self._error_diagnose_count = 99
+            truncated = context if len(context) <= 200 else context[:197] + "..."
+            self.log_event(
+                f"Infra error detected, skipping AI diagnosis: {truncated}"
+            )
+            return
         category = _classify_error(context)
         if category == ErrorCategory.RATE_LIMIT:
             self._error_skip_context = None

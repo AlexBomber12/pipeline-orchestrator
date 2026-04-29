@@ -14590,6 +14590,160 @@ def test_handle_error_skips_diagnose_for_timeout(
     assert runner._error_skip_active is False
 
 
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "ensure_repo_cloned failed: git fetch origin main failed after 3 attempts",
+        "git push origin HEAD:foo failed: Could not connect to github.com",
+        "Connection timed out reaching api.github.com",
+        "network is unreachable",
+        "Failed to connect to github.com port 443",
+        "gh: failed to run git: dial tcp 140.82.112.4:443: i/o timeout",
+        "ensure_repo_cloned: dial tcp 1.2.3.4:22: connect: network is unreachable",
+        "git fetch origin main failed after 5 attempts",
+    ],
+)
+def test_handle_error_skips_diagnose_for_infra_error(
+    msg: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Infra/network failure messages must bypass the AI diagnose CLI."""
+    _patch_subprocess(monkeypatch)
+    cli_calls: list[str] = []
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    monkeypatch.setattr(
+        codex_cli,
+        "diagnose_error_async",
+        _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = msg
+    runner._error_skip_context = "stale context"
+    runner._error_skip_count = 2
+    runner._error_skip_active = True
+    runner._error_diagnose_count = 1
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == msg
+    assert runner._error_skip_context is None
+    assert runner._error_skip_count == 0
+    assert runner._error_skip_active is False
+    assert runner._error_diagnose_count >= 4
+    assert any(
+        e["event"].startswith("Infra error detected, skipping AI diagnosis:")
+        for e in runner.state.history
+    )
+
+
+def test_handle_error_infra_bypass_truncates_long_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Very long infra error messages are truncated to 200 chars in the log."""
+    _patch_subprocess(monkeypatch)
+    cli_calls: list[str] = []
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "git fetch origin main: " + ("x" * 500)
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+    prefix = "Infra error detected, skipping AI diagnosis: "
+    log_entry = next(
+        e["event"]
+        for e in runner.state.history
+        if e["event"].startswith(prefix)
+    )
+    payload = log_entry[len(prefix):]
+    assert len(payload) == 200
+    assert payload.endswith("...")
+
+
+def test_handle_error_infra_bypass_repeats_without_invoking_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated invocations with an infra error never invoke the diagnose CLI."""
+    _patch_subprocess(monkeypatch)
+    cli_calls: list[str] = []
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = (
+        "ensure_repo_cloned failed: git fetch origin main failed after 3 attempts"
+    )
+
+    for _ in range(5):
+        asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+    assert runner.state.state == PipelineState.ERROR
+
+
+def test_handle_error_runs_diagnose_for_non_infra_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-infra errors still go through the AI diagnose path."""
+    _patch_subprocess(monkeypatch)
+    cli_calls: list[str] = []
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "pytest: 3 tests failed in test_models.py"
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == ["diagnose"]
+    assert not any(
+        e["event"].startswith("Infra error detected") for e in runner.state.history
+    )
+
+
+@pytest.mark.parametrize(
+    "msg,expected",
+    [
+        ("git fetch origin main failed after 3 attempts", True),
+        ("Could not connect to github.com", True),
+        ("Connection timed out", True),
+        ("network is unreachable", True),
+        ("Failed to connect to api.github.com", True),
+        ("gh: failed to run git", True),
+        ("dial tcp 1.2.3.4:443: i/o timeout", True),
+        ("ensure_repo_cloned failed", True),
+        ("git push origin HEAD:foo rejected", True),
+        ("failed after 7 attempts", True),
+        ("pytest: 3 failed in test_x.py", False),
+        ("ImportError: cannot import name 'foo'", False),
+        ("API rate limit exceeded", False),
+        ("", False),
+    ],
+)
+def test_is_infra_error_classifies_messages(msg: str, expected: bool) -> None:
+    """_is_infra_error classifies known infra strings, ignores everything else."""
+    from src.daemon.runner import _is_infra_error
+
+    assert _is_infra_error(msg) is expected
+
+
 def test_handle_error_preserves_error_message_on_rate_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
