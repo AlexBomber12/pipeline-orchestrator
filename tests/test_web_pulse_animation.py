@@ -17,9 +17,15 @@ def test_pulse_dot_uses_transition_not_keyframe() -> None:
 
 def test_pulse_dot_global_timer_toggles_dim_class() -> None:
     body = BASE_HTML.read_text(encoding="utf-8")
-    assert "document.querySelectorAll('.pulse-dot')" in body
-    assert "classList.toggle('dim', dim)" in body
-    assert re.search(r"setInterval\([^,]+,\s*1000\)", body) is not None
+    pulse_interval = re.search(
+        r"setInterval\(\s*\(\)\s*=>\s*\{(?P<body>[^{}]*)\},\s*1000\s*\)",
+        body,
+        re.DOTALL,
+    )
+    assert pulse_interval is not None, "Expected pulse-dot setInterval with 1000ms cadence"
+    pulse_body = pulse_interval.group("body")
+    assert "document.querySelectorAll('.pulse-dot')" in pulse_body
+    assert "classList.toggle('dim', dim)" in pulse_body
 
 
 def test_pulse_dot_uses_shared_phase_not_per_dot_toggle() -> None:
