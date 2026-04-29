@@ -1101,6 +1101,11 @@ def test_recover_crashed_preflight_task_marks_canceled_and_idles(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert runner._crashed_task_pr_ids == {"PR-042"}
+    # Codex P2: a prior ERROR transition (preflight failure) leaves
+    # ``error_message`` populated. Recovery's CANCELED+IDLE landing must
+    # clear it so the dashboard does not surface a stale failure banner
+    # against a quiesced repo.
+    assert runner.state.error_message is None
     assert any(
         "Task PR-042 crashed, marking CANCELED. "
         "Manually re-upload to retry." == e["event"]

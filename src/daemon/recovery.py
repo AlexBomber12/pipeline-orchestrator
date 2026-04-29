@@ -301,6 +301,13 @@ class RecoveryMixin:
             self.state.current_task = None
             self.state.current_pr = None
             self.state.state = PipelineState.IDLE
+            # P2 review: a prior ERROR transition (e.g. preflight failure
+            # before the crash) leaves ``error_message`` populated. Now
+            # that recovery has converged on IDLE with the crashed task
+            # parked, clear that stale text so the dashboard does not
+            # surface a misleading failure banner against a quiesced
+            # repo.
+            self.state.error_message = None
             self.log_event(
                 f"Task {doing.pr_id} crashed, marking CANCELED. "
                 "Manually re-upload to retry."

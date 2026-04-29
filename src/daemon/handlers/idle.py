@@ -300,13 +300,20 @@ class IdleMixin:
             # regenerated QUEUE.md surfaces the CANCELED state to the
             # dashboard. Existing DONE rulings (e.g. the merged PR landed
             # before recovery resumed) win — DONE is terminal, never
-            # downgraded to CANCELED.
+            # downgraded to CANCELED. A DOING ruling means
+            # ``derive_task_status`` matched a now-visible open PR (e.g.
+            # ``get_open_prs`` was stale on the recovery cycle and the PR
+            # surfaced later); preserving DOING lets the runner resume
+            # WATCH/merge for that real PR rather than stranding it
+            # behind the crashed flag, and clearing the flag ensures the
+            # next selector pick treats the task as live again.
             for pr_id in list(statuses.keys()):
-                if (
-                    pr_id in crashed_task_pr_ids
-                    and statuses[pr_id] != TaskStatus.DONE
-                ):
-                    statuses[pr_id] = TaskStatus.CANCELED
+                if pr_id not in crashed_task_pr_ids:
+                    continue
+                if statuses[pr_id] in (TaskStatus.DONE, TaskStatus.DOING):
+                    crashed_task_pr_ids.discard(pr_id)
+                    continue
+                statuses[pr_id] = TaskStatus.CANCELED
             eligible = get_eligible_tasks(dag_headers, statuses)
             stopped_eligible = [
                 header

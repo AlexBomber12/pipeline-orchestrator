@@ -110,24 +110,29 @@ def test_sigkill_during_coding_recovers_correctly(
             f"after restart; last value was {running_again!r}"
         )
 
-        # Wait for the restarted run to quiesce — i.e. for the re-picked
-        # task to reach WATCH (slow shim finishes its 30s sleep, pushes the
-        # branch, and opens the PR). Treating CODING as terminal would let
-        # the test exit mid-run, after which reset_testbed teardown could
-        # race the shim's pending PR creation and leak an open PR into
-        # later e2e tests. Allowing IDLE here would defeat the recovery
-        # contract: handle_idle is expected to re-pick the queued task
-        # within seconds. The freshness gate (ts > pre_kill_ts) still
-        # guards against accepting the pre-kill state.
+        # PR-186 changed the recovery contract: a DOING task with no
+        # matching open PR after a crash is the crash signature for a
+        # SIGKILL/OOM/restart-mid-CODING. Recovery now marks that task
+        # CANCELED and parks the runner in IDLE rather than re-running
+        # CODING (which used to loop the same crash forever); the user
+        # re-uploads the task file to retry. The slow shim was a child
+        # of the killed daemon process, so SIGKILL terminated it too —
+        # there is no orphan shim left racing teardown to push a PR,
+        # which is the leakage case the previous WATCH-only gate guarded
+        # against. Wait for IDLE with current_task cleared and a fresh
+        # last_updated; the freshness gate (ts > pre_kill_ts) still
+        # rejects the pre-kill state snapshot.
         recovered = None
-        recovered_states = ("WATCH",)
+        recovered_states = ("IDLE",)
         last_seen_state = None
         last_seen_ts: dt.datetime | None = None
+        last_seen_current_task: object = "<unset>"
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             entry = get_state()
             if entry is not None:
                 last_seen_state = entry.get("state")
+                last_seen_current_task = entry.get("current_task")
                 last_updated = entry.get("last_updated")
                 ts: dt.datetime | None = None
                 if last_updated:
@@ -140,6 +145,7 @@ def test_sigkill_during_coding_recovers_correctly(
                     ts is not None
                     and ts > pre_kill_ts
                     and last_seen_state in recovered_states
+                    and last_seen_current_task is None
                 ):
                     recovered = entry
                     break
@@ -148,19 +154,22 @@ def test_sigkill_during_coding_recovers_correctly(
             f"daemon did not quiesce in {list(recovered_states)!r} within "
             f"120s after restart; "
             f"last_seen_state={last_seen_state!r}, "
+            f"last_seen_current_task={last_seen_current_task!r}, "
             f"last_seen_last_updated={last_seen_ts.isoformat() if last_seen_ts else None!r}, "
             f"pre_kill_last_updated={pre_kill_ts.isoformat()!r}"
         )
 
-        recovered_state = recovered.get("state")
-        current_task = recovered.get("current_task")
-        assert current_task is not None, (
-            f"recovered into {recovered_state!r} with no current_task — "
-            f"daemon dropped in-flight task on restart"
+        history = recovered.get("history") or []
+        crash_event = (
+            f"Task {expected_pr_id} crashed, marking CANCELED. "
+            "Manually re-upload to retry."
         )
-        assert current_task.get("pr_id") == expected_pr_id, (
-            f"recovered {recovered_state!r} current_task={current_task!r}, "
-            f"expected pr_id={expected_pr_id!r}"
+        assert any(
+            isinstance(entry, dict) and entry.get("event") == crash_event
+            for entry in history
+        ), (
+            f"recovered IDLE without crash-mark log entry for {expected_pr_id!r}; "
+            f"history={history!r}"
         )
 
     final = get_state()

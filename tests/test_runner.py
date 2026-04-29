@@ -2335,6 +2335,97 @@ def test_select_next_task_from_dag_skips_crashed_task_marked_canceled(
     assert "- Status: CANCELED" in queue_md
 
 
+def test_select_next_task_from_dag_preserves_doing_for_crashed_task_with_visible_pr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Codex P1: a crashed task whose open PR becomes visible on a later
+    cycle (e.g. ``get_open_prs`` was stale during recovery) must not be
+    downgraded to CANCELED by the selector. Preserve the DOING ruling so
+    the runner can resume WATCH/merge for the real PR, and clear the
+    crashed flag so subsequent cycles treat the task as live again."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Crashed task with visible PR\n\n"
+        "Branch: pr-001-crashed\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = [
+        PRInfo(number=42, branch="pr-001-crashed", pr_id="PR-001")
+    ]
+    runner._idle_merged_prs = []
+    runner._crashed_task_pr_ids.add("PR-001")
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-001"
+    assert task.status == TaskStatus.DOING
+    assert runner._idle_dag_statuses == {"PR-001": TaskStatus.DOING}
+    assert "PR-001" not in runner._crashed_task_pr_ids
+
+
+def test_select_next_task_from_dag_clears_crashed_flag_when_done(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A crashed task that ends up DONE (e.g. a stale merge surfaced after
+    recovery) must clear the crashed flag so the task is not perpetually
+    marked CANCELED in regenerated QUEUE.md, and DONE remains terminal."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Crashed but merged\n\n"
+        "Branch: pr-001-merged\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        idle_module, "get_merged_pr_ids", lambda *args, **kwargs: {"PR-001"}
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+    runner._crashed_task_pr_ids.add("PR-001")
+
+    asyncio.run(runner._select_next_task_from_dag())
+
+    assert runner._idle_dag_statuses == {"PR-001": TaskStatus.DONE}
+    assert "PR-001" not in runner._crashed_task_pr_ids
+
+
 def test_select_next_task_from_dag_rejects_header_filename_mismatch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
