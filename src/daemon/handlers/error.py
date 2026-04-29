@@ -27,9 +27,16 @@ _CLAUDE_CLI_COAUTHOR = "Co-authored-by: Claude CLI <noreply@anthropic.com>"
 
 INFRA_ERROR_PATTERNS: tuple[str, ...] = (
     "git fetch origin",
-    "gh: failed to",
     "ensure_repo_cloned",
 )
+
+# ``gh: failed to ...`` is too broad to be an unconditional infra signal:
+# the same prefix appears in auth failures (``gh: failed to authenticate``)
+# and workflow rejections (``gh: failed to run git: not possible to
+# fast-forward``). Treat ``gh:`` only as a git/GitHub *context* marker
+# (via _GIT_CONTEXT_REGEX) and require a network symptom from
+# _INFRA_NETWORK_PATTERNS or a retry wrapper from _INFRA_RETRY_REGEX
+# before bypassing diagnose_error.
 
 # Generic network-symptom strings that also commonly appear in app/test
 # errors (e.g. "Failed to connect to database", "Connection timed out"

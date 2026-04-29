@@ -14754,7 +14754,6 @@ def test_handle_error_infra_bypass_does_not_lock_out_subsequent_errors(
         ("git fetch origin main failed after 3 attempts", True),
         ("Could not connect to github.com", True),
         ("Failed to connect to api.github.com", True),
-        ("gh: failed to run git", True),
         ("ensure_repo_cloned failed", True),
         (
             "git push origin HEAD:foo failed after 3 attempts: connection reset",
@@ -14770,6 +14769,17 @@ def test_handle_error_infra_bypass_does_not_lock_out_subsequent_errors(
         ),
         ("git fetch origin: dial tcp 1.2.3.4:443: i/o timeout", True),
         ("gh: network is unreachable while contacting api.github.com", True),
+        ("gh: failed to run git: dial tcp 140.82.112.4:443: i/o timeout", True),
+        # ``gh: failed to ...`` without a network symptom must NOT short-circuit
+        # diagnose_error: the same prefix is emitted for auth failures and
+        # workflow rejections that need real FIX/ESCALATE routing.
+        ("gh: failed to run git", False),
+        ("get_open_prs failed: gh: failed to authenticate to github.com", False),
+        (
+            "merge_pr failed: gh: failed to run git: "
+            "not possible to fast-forward, you may want to integrate first",
+            False,
+        ),
         # Push rejections, branch-protection denials, auth/policy errors must
         # NOT be classified as infra so diagnose_error can route FIX/ESCALATE.
         ("git push origin HEAD:foo rejected (non-fast-forward)", False),
