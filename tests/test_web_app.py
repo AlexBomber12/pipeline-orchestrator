@@ -368,6 +368,21 @@ def test_base_template_includes_theme_bootstrap_assets(
     assert "theme-icon-light" in body
 
 
+def test_base_template_declares_dark_color_scheme(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    body = response.text
+    root_block_start = body.find(":root {")
+    assert root_block_start != -1
+    root_block_end = body.find("}", root_block_start)
+    assert "color-scheme: dark" in body[root_block_start:root_block_end]
+
+
 def test_api_states_returns_json(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
