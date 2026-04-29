@@ -601,7 +601,7 @@
 - Branch: pr-174-event-log-dedup-display
 
 ## PR-175: Light-theme dropdown fix (color-scheme dark)
-- Status: DOING
+- Status: DONE
 - Tasks file: tasks/PR-175.md
 - Branch: pr-175-light-theme-dropdown-fix
 
