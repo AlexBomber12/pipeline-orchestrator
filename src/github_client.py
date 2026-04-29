@@ -1063,12 +1063,16 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
     a flat list of all check_run dicts across pages from
     ``GET /repos/{repo}/commits/{sha}/check-runs`` and ``status_payload`` is
     the ``{"state": ..., "statuses": [...]}`` shape of
-    ``GET /repos/{repo}/commits/{sha}/status``. ``fetch_ok`` is ``False`` only
-    when *both* REST calls raised ``RuntimeError`` (e.g. 403 on a private
-    fork, missing SHA, transport error); the caller uses it to distinguish
-    "this commit legitimately has no checks" from "we could not reach
-    GitHub to find out" so transport/auth failures are not silently mapped
-    to a green CI signal that satisfies the auto-merge gate.
+    ``GET /repos/{repo}/commits/{sha}/status``. ``fetch_ok`` is ``False``
+    whenever any endpoint failure leaves the combined signal empty: both
+    calls raising (e.g. 403 on a private fork, missing SHA, transport error)
+    OR one call raising while the surviving call returns no checks/statuses.
+    The caller uses it to distinguish "this commit legitimately has no
+    checks" from "we could not reach GitHub to find out" so transport/auth
+    failures cannot be silently mapped to a green CI signal that satisfies
+    the auto-merge gate — a token that can read commit statuses but not
+    check-runs (or vice versa) on a commit with no statuses on the
+    surviving endpoint must not be classified as "no checks = green".
     """
     check_runs: list[dict] = []
     status_payload: dict = {}
@@ -1127,7 +1131,14 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
         if isinstance(parsed, dict):
             status_payload = parsed
 
-    return check_runs, status_payload, check_runs_ok or status_ok
+    statuses_list = (
+        status_payload.get("statuses") if isinstance(status_payload, dict) else None
+    )
+    has_signal = bool(check_runs) or bool(
+        isinstance(statuses_list, list) and statuses_list
+    )
+    fetch_ok = (check_runs_ok and status_ok) or has_signal
+    return check_runs, status_payload, fetch_ok
 
 
 def _map_rest_ci_status_to_enum(
