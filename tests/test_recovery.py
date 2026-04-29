@@ -331,6 +331,57 @@ def test_recover_state_drops_ghost_doing_entry_with_missing_task_file(
     )
 
 
+def test_recover_state_keeps_doing_entry_when_queue_sourced_from_origin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """On legacy tracked-QUEUE repos ``_parse_base_queue`` reads the
+    authoritative queue from ``origin/{branch}``. Recovery may run while
+    the working tree is parked on a feature branch left behind by an
+    interrupted cycle, so task files referenced by the base-branch queue
+    can be absent from the local checkout. The local-existence ghost
+    filter must NOT run in that case — otherwise it discards real
+    DOING/DONE entries and detaches the daemon from in-flight work.
+    """
+    in_flight = QueueTask(
+        pr_id="PR-555",
+        title="In-flight on feature branch",
+        status=TaskStatus.DOING,
+        branch="pr-555-feature",
+        task_file="tasks/PR-555.md",
+    )
+    matching_pr = PRInfo(number=555, branch="pr-555-feature")
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [matching_pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda owner_repo, number: {"head_commit_date": ""},
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._parse_base_queue = lambda **_: [in_flight]  # type: ignore[method-assign]
+    # Simulate a legacy repo that still tracks tasks/QUEUE.md on origin.
+    runner._origin_queue_md_tracked = lambda: True  # type: ignore[method-assign]
+
+    result = asyncio.run(runner.recover_state())
+
+    assert result is True
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == "PR-555"
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 555
+    assert not any(
+        "ignoring ghost QUEUE.md entry" in e["event"]
+        for e in runner.state.history
+    )
+
+
 def test_recover_doing_task_without_pr_rerun_coding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -672,9 +723,21 @@ def test_recover_aborts_when_branch_probe_fails(
     async def fake_coding() -> None:
         coding_ran.append(True)
 
+    class _Result:
+        def __init__(self, returncode: int = 0) -> None:
+            self.returncode = returncode
+            self.stdout = ""
+            self.stderr = ""
+
     def fake_run(cmd: list[str], **kwargs: Any) -> Any:
         if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
             raise exc
+        # ``_origin_queue_md_tracked`` probes ``git cat-file -e`` to
+        # decide whether to read the queue from origin. Default to
+        # untracked (returncode != 0) so this test stays focused on
+        # the local-branch probe failure under test.
+        if cmd[:3] == ["git", "cat-file", "-e"]:
+            return _Result(returncode=1)
         raise AssertionError(f"unexpected subprocess call: {cmd}")
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)

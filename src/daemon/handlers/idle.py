@@ -503,7 +503,6 @@ class IdleMixin:
                 )
                 legacy_queue_check_succeeded = not visible_legacy_queue_entries
             else:
-                queue_task = get_next_task(tasks)
                 # Ghost entries (whose declared task file is missing on disk)
                 # are not real legacy tasks: they're stale residue from a
                 # prior cycle that survived ``sync_to_main`` because QUEUE.md
@@ -511,6 +510,9 @@ class IdleMixin:
                 # block ``_write_generated_queue_md`` from rewriting the
                 # file, leaving the shim's ``parse_doing_task`` stuck on a
                 # stale DOING entry and creating a PR for the wrong branch.
+                # Drop ghosts before ``get_next_task`` so the selector
+                # advances to a real legacy entry behind a stale DOING ghost
+                # instead of stalling IDLE on "no tasks available".
                 ghost_legacy_pr_ids = {
                     queued.pr_id
                     for queued in tasks
@@ -518,6 +520,18 @@ class IdleMixin:
                     and queued.task_file is not None
                     and not (Path(self.repo_path) / queued.task_file).is_file()
                 }
+                for queued in tasks:
+                    if queued.pr_id in ghost_legacy_pr_ids:
+                        self.log_event(
+                            f"Ignoring ghost legacy QUEUE.md entry {queued.pr_id} "
+                            f"(no {queued.task_file} on disk)"
+                        )
+                non_ghost_tasks = (
+                    [t for t in tasks if t.pr_id not in ghost_legacy_pr_ids]
+                    if ghost_legacy_pr_ids
+                    else tasks
+                )
+                queue_task = get_next_task(non_ghost_tasks)
                 visible_legacy_queue_entries = self._queue_md_contains_visible_legacy_entries(
                     queue_path,
                     structured_pr_ids,
@@ -525,33 +539,14 @@ class IdleMixin:
                 )
                 has_legacy_queue_tasks = any(
                     queued.pr_id not in structured_pr_ids
-                    and queued.pr_id not in ghost_legacy_pr_ids
-                    for queued in tasks
+                    for queued in non_ghost_tasks
                 ) or visible_legacy_queue_entries
                 legacy_queue_check_succeeded = not visible_legacy_queue_entries
 
         task = dag_task
         if queue_task is not None:
             queue_task_is_legacy = queue_task.pr_id not in structured_pr_ids
-            # PR-181: tasks/QUEUE.md is gitignored, so a "legacy" entry on
-            # disk can outlive the underlying tasks/PR-*.md (e.g. after the
-            # base branch was wiped between cycles). When the entry names
-            # a task file that no longer exists in the working tree, treat
-            # it as a ghost and skip it — otherwise the daemon would
-            # resurrect a stale DOING entry over a fresh structured TODO.
-            # Entries without an explicit "Tasks file:" line keep their
-            # pre-PR-181 fallback behaviour because we cannot verify them.
-            queue_task_is_ghost = (
-                queue_task_is_legacy
-                and queue_task.task_file is not None
-                and not (Path(self.repo_path) / queue_task.task_file).is_file()
-            )
-            if queue_task_is_ghost:
-                self.log_event(
-                    f"Ignoring ghost legacy QUEUE.md entry {queue_task.pr_id} "
-                    f"(no {queue_task.task_file} on disk)"
-                )
-            elif task is None and (dag_tasks is None or queue_task_is_legacy):
+            if task is None and (dag_tasks is None or queue_task_is_legacy):
                 task = queue_task
             elif (
                 task is not None

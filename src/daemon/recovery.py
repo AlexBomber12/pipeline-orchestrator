@@ -40,6 +40,13 @@ class RecoveryMixin:
         Entries without an explicit ``Tasks file:`` line keep their
         pre-PR-181 fallback semantics — the legacy migration paths
         cannot be verified against a file path.
+
+        The caller is responsible for skipping this filter when the queue
+        was sourced from ``origin/{branch}`` (legacy tracked-QUEUE repos):
+        in that case the working tree may be parked on a feature branch
+        whose checkout legitimately lacks task files referenced by the
+        base-branch queue, and applying this local-existence test would
+        drop in-flight work and detach the daemon from its active PR.
         """
         kept: list[QueueTask] = []
         for queued in tasks:
@@ -89,6 +96,7 @@ class RecoveryMixin:
         work.
         """
         strict = self.app_config.daemon.strict_queue_validation
+        queue_from_origin = self._origin_queue_md_tracked()
         try:
             tasks = self._parse_base_queue(strict=strict)
         except QueueValidationError as exc:
@@ -118,7 +126,15 @@ class RecoveryMixin:
             self.state.error_message = f"recover_state: get_open_prs failed: {exc}"
             self.log_event(f"recover_state failed: {exc}")
             return False
-        tasks = self._drop_ghost_queue_entries(tasks)
+        # Ghost filtering uses local task-file existence, which is only a
+        # safe signal for post-PR-181 repos (QUEUE.md gitignored, parsed
+        # from the working tree). On legacy tracked-QUEUE repos the queue
+        # we just parsed came from ``origin/{branch}``; the local checkout
+        # may legitimately be parked on a feature branch whose tree lacks
+        # task files referenced there, and dropping those entries would
+        # detach recovery from active DOING/DONE work.
+        if not queue_from_origin:
+            tasks = self._drop_ghost_queue_entries(tasks)
         self._set_queue_progress(
             sum(1 for t in tasks if t.status == TaskStatus.DONE),
             len(tasks),

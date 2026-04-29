@@ -1942,6 +1942,74 @@ def test_handle_idle_ignores_ghost_legacy_queue_task_without_task_file(
     assert "- Status: DOING" in rewritten
 
 
+def test_handle_idle_advances_to_real_legacy_after_skipping_ghost(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """When ``get_next_task`` would return a ghost legacy DOING entry,
+    dispatch must re-select from the queue with ghosts removed and
+    advance to a real legacy task that follows it. Otherwise, queues
+    with a stale ghost ahead of a runnable legacy entry stall on "no
+    tasks available" until someone manually edits QUEUE.md (PR-181
+    follow-up).
+    """
+    _patch_subprocess(monkeypatch)
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    # PR-001 is a ghost: declared task file is missing.
+    # PR-002 is a real legacy entry: its task file exists on disk and
+    # is unstructured (no Type/Complexity/Depends on header lines), so
+    # ``parse_task_header`` rejects it via the legacy-unstructured path
+    # and it is NOT considered structured — but it is still runnable.
+    (tasks_dir / "QUEUE.md").write_text(
+        "## PR-001: Ghost legacy\n"
+        "- Status: DOING\n"
+        "- Tasks file: tasks/PR-001.md\n"
+        "- Branch: pr-001-ghost\n\n"
+        "## PR-002: Real legacy\n"
+        "- Status: TODO\n"
+        "- Tasks file: tasks/PR-002.md\n"
+        "- Branch: pr-002-real-legacy\n",
+        encoding="utf-8",
+    )
+    (tasks_dir / "PR-002.md").write_text(
+        "# PR-002: Real legacy\n\n"
+        "Some legacy body without structured headers.\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    coding_called = {"v": False}
+
+    async def fake_handle_coding() -> None:
+        coding_called["v"] = True
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    asyncio.run(runner.handle_idle())
+
+    assert coding_called["v"] is True
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == "PR-002"
+    assert any(
+        "Ignoring ghost legacy QUEUE.md entry PR-001" in entry.get("event", "")
+        for entry in runner.state.history
+    )
+
+
 def test_select_next_task_from_dag_prefers_doing_task(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
