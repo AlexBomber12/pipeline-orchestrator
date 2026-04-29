@@ -64,13 +64,12 @@ class RecoveryMixin:
             self.log_event(f"recover_state: queue validation failed: {exc}")
             return False
         if tasks is None:
-            branch = self.repo_config.branch
             self.state.state = PipelineState.ERROR
             self.state.error_message = (
-                f"recover_state: read QUEUE.md from origin/{branch} failed"
+                "recover_state: read QUEUE.md from working tree failed"
             )
             self.log_event(
-                f"recover_state: read QUEUE.md from origin/{branch} failed"
+                "recover_state: read QUEUE.md from working tree failed"
             )
             return False
 
@@ -215,7 +214,7 @@ class RecoveryMixin:
         Returns ``True`` when it is safe for the caller to proceed with
         re-running CODING (no local branch to preserve, or push
         succeeded). Returns ``False`` when the caller MUST NOT proceed:
-        the task targets the base branch (malformed QUEUE.md entry that
+        the task targets the base branch (malformed task header that
         would let Claude reset ``main``) or the preserve push failed in
         a way that may have left commits orphan-only on local.
         """

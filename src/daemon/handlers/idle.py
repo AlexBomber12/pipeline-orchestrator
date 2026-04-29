@@ -15,7 +15,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from src import github_client
-from src.daemon import git_ops
 from src.dag import get_eligible_tasks
 from src.models import PipelineState, QueueTask, TaskStatus
 from src.queue_parser import (
@@ -25,7 +24,6 @@ from src.queue_parser import (
     parse_queue,
     parse_task_header,
 )
-from src.retry import is_transient_error, retry_transient
 from src.task_status import (
     derive_queue_task_statuses,
     derive_task_status,
@@ -71,13 +69,17 @@ class IdleMixin:
         headers: list[TaskHeader],
         statuses: dict[str, TaskStatus],
     ) -> bool:
-        """Write and publish QUEUE.md only when the generated report changed.
+        """Write the regenerated QUEUE.md to disk for read-side consumers.
 
-        Returns ``True`` when the generated queue is synchronized locally
-        after the call. A rejected push is treated as recoverable: the
-        helper drops the local auto-generated queue commit and returns
-        ``False`` so IDLE can continue without carrying a stray local
-        queue commit.
+        QUEUE.md is gitignored (PR-181); the daemon never commits or
+        pushes it. The file is rewritten only when its contents would
+        change, so repeated IDLE cycles on a stable queue are no-ops on
+        disk.
+
+        Returns ``True`` once the on-disk queue reflects the generated
+        content. The boolean return is preserved so existing callers
+        treat the operation as always-successful (no push step exists
+        to fail).
         """
         queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
         self._idle_generated_queue_needs_resync = False
@@ -92,107 +94,7 @@ class IdleMixin:
 
         queue_path.parent.mkdir(parents=True, exist_ok=True)
         queue_path.write_text(content, encoding="utf-8")
-        git_ops._git(self.repo_path, "add", "tasks/QUEUE.md")
-        git_ops._git(
-            self.repo_path,
-            "commit",
-            "-m",
-            "AUTO: regenerate QUEUE.md from DAG",
-        )
-
-        def _push_queue_md() -> subprocess.CompletedProcess[str]:
-            result = git_ops._git(
-                self.repo_path,
-                "push",
-                "origin",
-                self.repo_config.branch,
-                timeout=60,
-                check=False,
-            )
-            if result.returncode != 0:
-                exc = subprocess.CalledProcessError(
-                    result.returncode,
-                    result.args,
-                    output=result.stdout,
-                    stderr=result.stderr,
-                )
-                if is_transient_error(exc):
-                    raise exc
-            return result
-
-        def _rollback_generated_queue_commit() -> None:
-            local_base = "HEAD~1"
-            remote_base = f"refs/remotes/origin/{self.repo_config.branch}"
-            try:
-                fetch = git_ops._git(
-                    self.repo_path,
-                    "fetch",
-                    "origin",
-                    self.repo_config.branch,
-                    timeout=60,
-                    check=False,
-                )
-                local_base_sha = git_ops._git(
-                    self.repo_path,
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    local_base,
-                    check=False,
-                )
-                remote_base_sha = git_ops._git(
-                    self.repo_path,
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    remote_base,
-                    check=False,
-                )
-                if (
-                    fetch.returncode == 0
-                    and local_base_sha.returncode == 0
-                    and remote_base_sha.returncode == 0
-                    and local_base_sha.stdout.strip() != remote_base_sha.stdout.strip()
-                ):
-                    self._idle_generated_queue_needs_resync = True
-                    git_ops._git(
-                        self.repo_path,
-                        "reset",
-                        "--hard",
-                        remote_base,
-                    )
-                    return
-            except (OSError, subprocess.TimeoutExpired):
-                self._idle_generated_queue_needs_resync = True
-            else:
-                if (
-                    fetch.returncode != 0
-                    or local_base_sha.returncode != 0
-                    or remote_base_sha.returncode != 0
-                ):
-                    self._idle_generated_queue_needs_resync = True
-            git_ops._git(
-                self.repo_path,
-                "reset",
-                "--hard",
-                local_base,
-            )
-
-        try:
-            push_result = retry_transient(
-                _push_queue_md,
-                operation_name=f"git push origin {self.repo_config.branch}",
-            )
-        except RuntimeError as exc:
-            if not is_transient_error(exc) and not is_transient_error(exc.__cause__):
-                raise
-            _rollback_generated_queue_commit()
-            return False
-        if push_result.returncode == 0:
-            return True
-
-        _rollback_generated_queue_commit()
-        return False
+        return True
 
     @staticmethod
     def _validate_task_file_header_match(task_file: Path, header_pr_id: str) -> None:
@@ -636,32 +538,16 @@ class IdleMixin:
             and not has_legacy_queue_tasks
         ):
             try:
-                published_queue = self._write_generated_queue_md(
+                self._write_generated_queue_md(
                     generated_headers,
                     generated_statuses,
                 )
-            except (
-                OSError,
-                RuntimeError,
-                subprocess.CalledProcessError,
-                subprocess.TimeoutExpired,
-            ) as exc:
+            except OSError as exc:
                 message = f"QUEUE.md auto-generation failed: {exc}"
                 self.state.state = PipelineState.ERROR
                 self.state.error_message = message
                 self.log_event(message)
                 return
-            if not published_queue:
-                self.log_event(
-                    "QUEUE.md auto-generation push rejected; "
-                    "continuing without publishing"
-                )
-                if getattr(self, "_idle_generated_queue_needs_resync", False):
-                    self.log_event(
-                        "QUEUE.md auto-generation refreshed origin state; "
-                        "retrying task selection next cycle"
-                    )
-                    return
         if task is None:
             self.log_event("No tasks available")
             if prs:

@@ -349,10 +349,14 @@ def test_sync_to_main_runs_git_sequence_and_wraps_oserror(
         runner.sync_to_main()
 
 
-def test_parse_base_queue_returns_parsed_queue_and_none_on_git_errors(
-    monkeypatch: pytest.MonkeyPatch,
+def test_parse_base_queue_reads_local_working_tree_and_handles_missing_file(
     tmp_path: Path,
 ) -> None:
+    """PR-181: ``_parse_base_queue`` reads ``tasks/QUEUE.md`` from the
+    local working tree (gitignored) and returns ``None`` if the file is
+    absent or unreadable, letting the caller treat the missing snapshot
+    as a retryable ERROR until the next IDLE cycle regenerates it.
+    """
     runner = _Runner(tmp_path)
     queue_text = (
         "# Task Queue\n\n"
@@ -362,33 +366,17 @@ def test_parse_base_queue_returns_parsed_queue_and_none_on_git_errors(
         "- Branch: pr-112-coverage-repo-ops\n"
     )
 
-    def good_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
-        del repo_path, args, kwargs
-        return _FakeCompletedProcess(stdout=queue_text)
+    repo = Path(runner.repo_path)
+    (repo / "tasks").mkdir(parents=True)
+    queue_path = repo / "tasks" / "QUEUE.md"
+    queue_path.write_text(queue_text, encoding="utf-8")
 
-    monkeypatch.setattr(repo_ops.git_ops, "_git", good_git)
     parsed = runner._parse_base_queue(strict=True)
-
     assert parsed is not None
     assert parsed[0].pr_id == "PR-112"
     assert parsed[0].branch == "pr-112-coverage-repo-ops"
 
-    monkeypatch.setattr(
-        repo_ops.git_ops,
-        "_git",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            subprocess.CalledProcessError(1, ["git", "show"])
-        ),
-    )
-    assert runner._parse_base_queue() is None
-
-    monkeypatch.setattr(
-        repo_ops.git_ops,
-        "_git",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            subprocess.TimeoutExpired(["git", "show"], timeout=30)
-        ),
-    )
+    queue_path.unlink()
     assert runner._parse_base_queue() is None
 
 

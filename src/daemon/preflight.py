@@ -77,8 +77,8 @@ class PreflightMixin:
         resumes the state it was in before the dirty-tree stall:
         WATCH when an open PR was being tracked, IDLE otherwise.
         Dropping back to IDLE unconditionally would make the next
-        cycle re-pick the still-TODO task from
-        ``origin/{base}:tasks/QUEUE.md`` and open a duplicate PR. On
+        cycle re-pick the still-TODO task from the structured task
+        headers and open a duplicate PR. On
         failure the state is left untouched so ``preflight`` falls
         through to the usual ERROR path.
         """

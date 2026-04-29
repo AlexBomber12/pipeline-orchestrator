@@ -84,7 +84,7 @@ def _init_scaffolded_repo(tmp_path: Path) -> Path:
     )
     (repo / "scripts" / "make-review-artifacts.sh").chmod(0o755)
     (repo / "artifacts").mkdir()
-    (repo / ".gitignore").write_text("artifacts/\n")
+    (repo / ".gitignore").write_text("artifacts/\ntasks/QUEUE.md\n")
     return repo
 
 
@@ -105,14 +105,17 @@ def test_scaffold_repo_creates_all_files_when_empty(
     assert (repo / "scripts" / "make-review-artifacts.sh").exists()
     assert (repo / "artifacts").is_dir()
     assert (repo / ".gitignore").exists()
-    assert "artifacts/" in (repo / ".gitignore").read_text().splitlines()
+    gitignore_lines = (repo / ".gitignore").read_text().splitlines()
+    assert "artifacts/" in gitignore_lines
+    assert "tasks/QUEUE.md" in gitignore_lines
 
     # Shell helpers must be executable so bash can run them directly.
     assert (repo / "scripts" / "ci.sh").stat().st_mode & 0o111
     assert (repo / "scripts" / "make-review-artifacts.sh").stat().st_mode & 0o111
 
     # Every tracked path (directories filtered out) should be reported as
-    # an action so the caller can log it.
+    # an action so the caller can log it. ``tasks/QUEUE.md`` is created
+    # on disk but gitignored (PR-181), so it is not staged.
     for path in (
         "AGENTS.md",
         "tasks/QUEUE.md",
@@ -126,16 +129,16 @@ def test_scaffold_repo_creates_all_files_when_empty(
     # the configured base branch before any file is inspected or written.
     assert calls[0] == ["git", "checkout", "main"]
 
-    # git add must stage exactly the files we created, not the directory
-    # entries that appear in the action log.
+    # git add must stage every concrete file we created EXCEPT the
+    # gitignored ``tasks/QUEUE.md``.
     add_cmds = [cmd for cmd in calls if cmd[:2] == ["git", "add"]]
     assert len(add_cmds) == 1
     staged = add_cmds[0][2:]
     assert "AGENTS.md" in staged
-    assert "tasks/QUEUE.md" in staged
     assert "scripts/ci.sh" in staged
     assert "scripts/make-review-artifacts.sh" in staged
     assert ".gitignore" in staged
+    assert "tasks/QUEUE.md" not in staged
     assert "tasks/" not in staged
     assert "artifacts/" not in staged
 
@@ -389,7 +392,7 @@ def test_scaffold_repo_skips_commit_when_fully_provisioned(
     )
     (repo / "scripts" / "make-review-artifacts.sh").chmod(0o755)
     (repo / "artifacts").mkdir()
-    (repo / ".gitignore").write_text("artifacts/\n")
+    (repo / ".gitignore").write_text("artifacts/\ntasks/QUEUE.md\n")
     calls = _patch_git(monkeypatch, synced=True)
 
     actions = scaffolder.scaffold_repo(str(repo), "main")
@@ -425,7 +428,7 @@ def test_scaffold_repo_skips_git_when_only_artifacts_dir_missing(
         "#!/usr/bin/env bash\n"
     )
     (repo / "scripts" / "make-review-artifacts.sh").chmod(0o755)
-    (repo / ".gitignore").write_text("artifacts/\n")
+    (repo / ".gitignore").write_text("artifacts/\ntasks/QUEUE.md\n")
     # Note: no artifacts/ directory — this is the only gap. The remote
     # is fully in sync, so ``synced=True``.
     calls = _patch_git(monkeypatch, synced=True)
@@ -751,7 +754,7 @@ def test_scaffold_repo_retries_stranded_push_with_no_new_commit(
     )
     (repo / "scripts" / "make-review-artifacts.sh").chmod(0o755)
     (repo / "artifacts").mkdir()
-    (repo / ".gitignore").write_text("artifacts/\n")
+    (repo / ".gitignore").write_text("artifacts/\ntasks/QUEUE.md\n")
 
     calls: list[list[str]] = []
 

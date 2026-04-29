@@ -3,7 +3,7 @@
 Mixin methods:
     ensure_repo_cloned       — clone or fetch; retry scaffolding
     sync_to_main             — hard-sync working tree to origin/{branch}
-    _parse_base_queue        — parse QUEUE.md from origin/{branch}
+    _parse_base_queue        — parse QUEUE.md from the local working tree
     process_pending_uploads  — commit and push uploaded task files
     _delete_upload_if_unchanged — atomic CAS delete for Redis keys
 """
@@ -179,27 +179,16 @@ class RepoOpsMixin:
     def _parse_base_queue(
         self, *, strict: bool = False
     ) -> list[QueueTask] | None:
-        """Return QUEUE.md parsed from ``origin/{branch}``, or ``None``.
+        """Return QUEUE.md parsed from the local working tree, or ``None``.
 
-        ``recover_state`` runs before ``preflight``, so the working tree
-        may be dirty or checked out on a different branch than
-        ``repo_config.branch``:
-
-        - A fresh ``git clone`` lands HEAD on the remote's default
-          branch (``origin/HEAD``), which may not match the configured
-          base branch. ``ensure_repo_cloned`` does not checkout after
-          clone, so an un-guarded ``parse_queue`` would read the default
-          branch's QUEUE.md and miss in-flight tasks tracked on a
-          different configured branch.
-        - A crashed prior cycle may have left the tree on a feature
-          branch with uncommitted edits.
-
-        Reading via ``git show origin/{branch}:tasks/QUEUE.md`` sidesteps
-        both: it yields the authoritative queue snapshot from the
-        configured base branch without touching the working tree, so
-        recovery stays non-destructive. Returns ``None`` when the read
-        fails (ref missing, timeout, tasks/QUEUE.md absent on base),
-        letting the caller translate the failure into a retryable ERROR.
+        Since PR-181, ``tasks/QUEUE.md`` is gitignored — the daemon
+        regenerates it from structured task headers each IDLE cycle and
+        no longer pushes it upstream, so an origin read would see no
+        such file. ``recover_state`` reads whatever the prior cycle
+        left on disk; on a fresh clone the file does not exist yet and
+        this returns ``None``, letting the caller translate the missing
+        snapshot into a retryable ERROR until the next IDLE cycle
+        regenerates it.
 
         When *strict* is ``True``, ``parse_queue_text`` runs the full
         validation suite (duplicate IDs/branches, missing deps, cycles).
@@ -207,16 +196,12 @@ class RepoOpsMixin:
         recovery can transition to ``ERROR`` instead of driving
         execution on a malformed queue.
         """
-        branch = self.repo_config.branch
+        queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
         try:
-            result = git_ops._git(
-                self.repo_path,
-                "show",
-                f"origin/{branch}:tasks/QUEUE.md",
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            content = queue_path.read_text(encoding="utf-8")
+        except OSError:
             return None
-        return parse_queue_text(result.stdout, strict=strict)
+        return parse_queue_text(content, strict=strict)
 
     _DELETE_IF_UNCHANGED_LUA = """
 if redis.call("get", KEYS[1]) == ARGV[1] then
