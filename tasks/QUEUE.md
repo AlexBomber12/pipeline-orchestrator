@@ -621,6 +621,6 @@
 - Branch: pr-178-pulse-animation-jump-fix
 
 ## PR-179: Pulse badge replaces pulse dot for active states
-- Status: DOING
+- Status: DONE
 - Tasks file: tasks/PR-179.md
 - Branch: pr-179-pulse-badge-not-dot
