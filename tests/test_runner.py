@@ -14596,7 +14596,7 @@ def test_handle_error_skips_diagnose_for_timeout(
         "ensure_repo_cloned failed: git fetch origin main failed after 3 attempts",
         "git push origin HEAD:foo failed: Could not connect to github.com",
         "Connection timed out reaching api.github.com",
-        "network is unreachable",
+        "git fetch origin: network is unreachable",
         "Failed to connect to github.com port 443",
         "gh: failed to run git: dial tcp 140.82.112.4:443: i/o timeout",
         "ensure_repo_cloned: dial tcp 1.2.3.4:22: connect: network is unreachable",
@@ -14753,11 +14753,8 @@ def test_handle_error_infra_bypass_does_not_lock_out_subsequent_errors(
     [
         ("git fetch origin main failed after 3 attempts", True),
         ("Could not connect to github.com", True),
-        ("Connection timed out", True),
-        ("network is unreachable", True),
         ("Failed to connect to api.github.com", True),
         ("gh: failed to run git", True),
-        ("dial tcp 1.2.3.4:443: i/o timeout", True),
         ("ensure_repo_cloned failed", True),
         (
             "git push origin HEAD:foo failed after 3 attempts: connection reset",
@@ -14765,6 +14762,14 @@ def test_handle_error_infra_bypass_does_not_lock_out_subsequent_errors(
         ),
         ("git clone failed after 2 attempts: i/o timeout", True),
         ("gh api repos/x/y/commits/z/check-runs failed after 3 attempts", True),
+        # Network-symptom strings count as infra only when paired with an
+        # explicit git/GitHub reference in the surrounding context.
+        (
+            "fatal: unable to access 'https://github.com/o/r': Connection timed out",
+            True,
+        ),
+        ("git fetch origin: dial tcp 1.2.3.4:443: i/o timeout", True),
+        ("gh: network is unreachable while contacting api.github.com", True),
         # Push rejections, branch-protection denials, auth/policy errors must
         # NOT be classified as infra so diagnose_error can route FIX/ESCALATE.
         ("git push origin HEAD:foo rejected (non-fast-forward)", False),
@@ -14775,6 +14780,14 @@ def test_handle_error_infra_bypass_does_not_lock_out_subsequent_errors(
         # retry loops that need real diagnosis.
         ("failed after 7 attempts", False),
         ("pipeline step failed after 5 attempts", False),
+        # Bare network-symptom strings without git/GitHub context are NOT
+        # infra: they can come from app or test failures (e.g. database,
+        # Redis, third-party API clients) that need real diagnosis.
+        ("Connection timed out", False),
+        ("network is unreachable", False),
+        ("dial tcp 1.2.3.4:443: i/o timeout", False),
+        ("Failed to connect to database", False),
+        ("Could not connect to redis at localhost:6379", False),
         ("pytest: 3 failed in test_x.py", False),
         ("ImportError: cannot import name 'foo'", False),
         ("API rate limit exceeded", False),

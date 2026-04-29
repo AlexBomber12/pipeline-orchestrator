@@ -27,13 +27,25 @@ _CLAUDE_CLI_COAUTHOR = "Co-authored-by: Claude CLI <noreply@anthropic.com>"
 
 INFRA_ERROR_PATTERNS: tuple[str, ...] = (
     "git fetch origin",
+    "gh: failed to",
+    "ensure_repo_cloned",
+)
+
+# Generic network-symptom strings that also commonly appear in app/test
+# errors (e.g. "Failed to connect to database", "Connection timed out"
+# from a Redis client). Treat them as infra only when accompanied by an
+# explicit git/GitHub reference; otherwise let diagnose_error route them
+# normally so FIX/ESCALATE guidance is preserved for actionable failures.
+_INFRA_NETWORK_PATTERNS: tuple[str, ...] = (
     "could not connect to",
     "connection timed out",
     "network is unreachable",
     "failed to connect",
-    "gh: failed to",
     "dial tcp",
-    "ensure_repo_cloned",
+)
+
+_GIT_CONTEXT_REGEX = re.compile(
+    r"\b(?:git|gh|github\.com|ensure_repo_cloned)\b"
 )
 
 # retry_transient raises ``"<operation_name> failed after N attempts: <exc>"``;
@@ -51,7 +63,11 @@ def _is_infra_error(context: str) -> bool:
     lowered = context.lower()
     if any(pattern in lowered for pattern in INFRA_ERROR_PATTERNS):
         return True
-    return _INFRA_RETRY_REGEX.search(lowered) is not None
+    if _INFRA_RETRY_REGEX.search(lowered) is not None:
+        return True
+    if any(pattern in lowered for pattern in _INFRA_NETWORK_PATTERNS):
+        return _GIT_CONTEXT_REGEX.search(lowered) is not None
+    return False
 
 
 class ErrorCategory(Enum):
