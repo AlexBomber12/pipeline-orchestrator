@@ -131,13 +131,17 @@ class IdleMixin:
     def _queue_md_contains_visible_legacy_entries(
         queue_path: str | Path,
         structured_pr_ids: set[str],
+        ignored_pr_ids: set[str] | None = None,
     ) -> bool:
         path = Path(queue_path)
         if not path.is_file():
             return False
+        skip = structured_pr_ids if ignored_pr_ids is None else (
+            structured_pr_ids | ignored_pr_ids
+        )
         for raw_line in path.read_text(encoding="utf-8").splitlines():
             match = re.match(r"^##\s+(PR-[A-Za-z0-9_.-]+)\b", raw_line.rstrip())
-            if match and match.group(1) not in structured_pr_ids:
+            if match and match.group(1) not in skip:
                 return True
         return False
 
@@ -482,12 +486,29 @@ class IdleMixin:
                 legacy_queue_check_succeeded = not visible_legacy_queue_entries
             else:
                 queue_task = get_next_task(tasks)
+                # Ghost entries (whose declared task file is missing on disk)
+                # are not real legacy tasks: they're stale residue from a
+                # prior cycle that survived ``sync_to_main`` because QUEUE.md
+                # is gitignored (PR-181). Treating them as legacy would
+                # block ``_write_generated_queue_md`` from rewriting the
+                # file, leaving the shim's ``parse_doing_task`` stuck on a
+                # stale DOING entry and creating a PR for the wrong branch.
+                ghost_legacy_pr_ids = {
+                    queued.pr_id
+                    for queued in tasks
+                    if queued.pr_id not in structured_pr_ids
+                    and queued.task_file is not None
+                    and not (Path(self.repo_path) / queued.task_file).is_file()
+                }
                 visible_legacy_queue_entries = self._queue_md_contains_visible_legacy_entries(
                     queue_path,
                     structured_pr_ids,
+                    ghost_legacy_pr_ids,
                 )
                 has_legacy_queue_tasks = any(
-                    queued.pr_id not in structured_pr_ids for queued in tasks
+                    queued.pr_id not in structured_pr_ids
+                    and queued.pr_id not in ghost_legacy_pr_ids
+                    for queued in tasks
                 ) or visible_legacy_queue_entries
                 legacy_queue_check_succeeded = not visible_legacy_queue_entries
 

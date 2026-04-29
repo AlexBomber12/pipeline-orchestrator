@@ -1923,6 +1923,15 @@ def test_handle_idle_ignores_ghost_legacy_queue_task_without_task_file(
         "Ignoring ghost legacy QUEUE.md entry PR-001" in entry.get("event", "")
         for entry in runner.state.history
     )
+    # The ghost entry must not block QUEUE.md regeneration: leaving the
+    # stale ``PR-001: DOING`` block on disk would let the shim's
+    # ``parse_doing_task`` (tests/e2e/lib/coder_shim.sh) latch onto it
+    # and create a PR for the wrong branch (Codex P1 from CI run on
+    # PR-181 branch).
+    rewritten = (tasks_dir / "QUEUE.md").read_text(encoding="utf-8")
+    assert "PR-001" not in rewritten
+    assert "## PR-002: Structured task" in rewritten
+    assert "- Status: DOING" in rewritten
 
 
 def test_select_next_task_from_dag_prefers_doing_task(
@@ -10323,6 +10332,7 @@ def test_handle_idle_marks_freshly_picked_dag_task_as_doing_in_regenerated_queue
 
 def test_handle_idle_skips_queue_regeneration_when_legacy_tasks_exist(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     _patch_subprocess(monkeypatch)
     dag_task = QueueTask(
@@ -10395,6 +10405,17 @@ def test_handle_idle_skips_queue_regeneration_when_legacy_tasks_exist(
         return None
 
     runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    # PR-001 is a "real" legacy entry: its task file is present on
+    # disk, so it represents a hand-managed migration task that the
+    # daemon must not blow away. Without the file the entry would be
+    # classified as a ghost (PR-181 follow-up) and regeneration would
+    # legitimately overwrite it.
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Legacy queue task\n", encoding="utf-8"
+    )
     runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
     asyncio.run(runner.handle_idle())
 
