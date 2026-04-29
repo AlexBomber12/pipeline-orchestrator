@@ -40,6 +40,7 @@ from src.coders.codex import CodexPlugin
 from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
 from src.daemon.config_watcher import watch_config_file_changes
 from src.daemon.runner import PipelineRunner
+from src.events import subscribe_wake, wake_channel
 from src.models import PipelineState
 from src.usage import UsageProvider
 
@@ -345,6 +346,83 @@ def _find_repo_config(config: AppConfig, url: str) -> RepoConfig | None:
     return None
 
 
+async def _sync_wake_subscriptions(
+    pubsub: Any,
+    subscribed: set[str],
+    runners: dict[str, PipelineRunner],
+) -> None:
+    """Reconcile wake-channel subscriptions with the current runner set."""
+    desired = {wake_channel(runner.name) for runner in runners.values()}
+    new_channels = desired - subscribed
+    removed_channels = subscribed - desired
+    if new_channels:
+        try:
+            await pubsub.subscribe(*new_channels)
+            subscribed.update(new_channels)
+        except Exception:
+            logger.warning("wake subscribe failed", exc_info=True)
+    if removed_channels:
+        try:
+            await pubsub.unsubscribe(*removed_channels)
+            subscribed.difference_update(removed_channels)
+        except Exception:
+            logger.warning("wake unsubscribe failed", exc_info=True)
+
+
+async def _wait_for_tick_or_wake(
+    pubsub: Any,
+    tick: float,
+) -> dict[str, Any] | None:
+    """Sleep up to ``tick`` seconds, returning a wake message if one arrives.
+
+    The pub/sub subscriber is the primary timer when available — it gets
+    ``timeout=tick`` so a quiet channel falls through after the same delay
+    as a pure sleep, and a published message pre-empts the wait
+    immediately. Subscriber failures fall back to a pure sleep so a flaky
+    redis connection cannot starve the daemon.
+    """
+    if pubsub is None:
+        await asyncio.sleep(tick)
+        return None
+
+    try:
+        message = await pubsub.get_message(
+            ignore_subscribe_messages=True, timeout=tick
+        )
+    except Exception:
+        logger.warning("wake subscriber failed", exc_info=True)
+        await asyncio.sleep(tick)
+        return None
+
+    if message and message.get("type") == "message":
+        return message
+    return None
+
+
+def _apply_wake_message(
+    message: dict[str, Any],
+    runners: dict[str, PipelineRunner],
+    last_run: dict[str, float],
+) -> None:
+    """Reset ``last_run`` for the runner targeted by a wake message."""
+    raw = message.get("data")
+    if not raw:
+        return
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        logger.warning("wake message has invalid JSON payload: %r", raw)
+        return
+    repo_name = payload.get("repo")
+    if not repo_name:
+        return
+    for key, runner in runners.items():
+        if runner.name == repo_name:
+            last_run[key] = 0.0
+            logger.info("wake event received for %s", repo_name)
+            break
+
+
 async def main() -> None:
     """Initialize runners and drive the poll loop forever."""
     gh_dir = os.environ.get("GH_CONFIG_DIR")
@@ -402,6 +480,20 @@ async def main() -> None:
     _background_tasks.add(watcher_task)
     watcher_task.add_done_callback(_background_tasks.discard)
 
+    wake_pubsub: Any = None
+    subscribed_wake_channels: set[str] = set()
+    try:
+        wake_pubsub = await subscribe_wake(
+            [runner.name for runner in runners.values()],
+            redis_client=redis_client,
+        )
+        subscribed_wake_channels = {
+            wake_channel(runner.name) for runner in runners.values()
+        }
+    except Exception:
+        logger.warning("wake subscription unavailable; falling back to pure sleep", exc_info=True)
+        wake_pubsub = None
+
     last_run: dict[str, float] = {}
     last_config_check = time.monotonic()
     while True:
@@ -428,6 +520,10 @@ async def main() -> None:
                         codex_usage_provider,
                         registry,
                     )
+                    if wake_pubsub is not None:
+                        await _sync_wake_subscriptions(
+                            wake_pubsub, subscribed_wake_channels, runners
+                        )
 
         for key, runner in list(runners.items()):
             if not runner.repo_config.active:
@@ -467,7 +563,10 @@ async def main() -> None:
             remaining.append(max(due_in, 0.0))
         tick = min(remaining) if remaining else config.daemon.poll_interval_sec
         tick = min(tick, config.daemon.poll_interval_sec)
-        await asyncio.sleep(max(tick, 1))
+        sleep_for = max(tick, 1)
+        wake_message = await _wait_for_tick_or_wake(wake_pubsub, sleep_for)
+        if wake_message is not None:
+            _apply_wake_message(wake_message, runners, last_run)
 
 
 if __name__ == "__main__":  # pragma: no cover  # entry point invoked via python -m

@@ -410,6 +410,91 @@ def test_upload_stages_files_and_sets_redis_key(
     assert (staging / "QUEUE.md").read_bytes() == b"# Task Queue\n"
 
 
+def test_upload_publishes_wake_event_on_success(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    """A successful upload publishes on the orchestrator wake channel."""
+    class _PublishingRedis:
+        def __init__(self) -> None:
+            self._store: dict[str, str] = {}
+            self.published: list[tuple[str, str]] = []
+
+        async def get(self, key: str) -> str | None:
+            if key.startswith("pipeline:"):
+                return '{"url":"","name":"example__alpha","state":"IDLE"}'
+            return self._store.get(key)
+
+        async def set(self, key: str, value: str, **kwargs: object) -> None:
+            self._store[key] = value
+
+        async def scan_iter(self, match: str):
+            if False:
+                yield ""
+
+        async def publish(self, channel: str, message: str) -> int:
+            self.published.append((channel, message))
+            return 1
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(app) as client:
+        client.app.state.redis = _PublishingRedis()
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_queue_file()],
+        )
+        published = client.app.state.redis.published
+
+    assert resp.status_code == 200
+    assert len(published) == 1
+    channel, raw = published[0]
+    assert channel == "orchestrator:wake:example__alpha"
+    payload = json.loads(raw)
+    assert payload["event_type"] == "upload"
+    assert payload["repo"] == "example__alpha"
+
+
+def test_upload_swallows_wake_publish_errors(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    """Publish failures must not surface as a 5xx to the user."""
+    class _BrokenPublishRedis:
+        def __init__(self) -> None:
+            self._store: dict[str, str] = {}
+
+        async def get(self, key: str) -> str | None:
+            if key.startswith("pipeline:"):
+                return '{"url":"","name":"example__alpha","state":"IDLE"}'
+            return self._store.get(key)
+
+        async def set(self, key: str, value: str, **kwargs: object) -> None:
+            self._store[key] = value
+
+        async def scan_iter(self, match: str):
+            if False:
+                yield ""
+
+        async def publish(self, channel: str, message: str) -> int:
+            raise RuntimeError("publish exploded")
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(app) as client:
+        client.app.state.redis = _BrokenPublishRedis()
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_queue_file()],
+        )
+
+    assert resp.status_code == 200
+
+
 def test_upload_zip_with_pr_files_extracts_and_succeeds(
     one_repo_config: Path, repo_dir: Path, uploads_dir: Path
 ) -> None:

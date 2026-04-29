@@ -1496,3 +1496,400 @@ def test_main_logs_publish_state_failures_for_inactive_runner(
     runner = _FakeRunner.instances[0]
     assert runner.cycles == 0
     assert any("publish paused state failed for octo__alpha" in rec.getMessage() for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Wake pub/sub integration
+# ---------------------------------------------------------------------------
+
+
+class _FakeWakePubsub:
+    """Pubsub stub used to drive _wait_for_tick_or_wake in tests."""
+
+    def __init__(self, messages: list[Any] | None = None) -> None:
+        self.messages = list(messages or [])
+        self.subscribed: list[str] = []
+        self.unsubscribed: list[str] = []
+
+    async def subscribe(self, *channels: str) -> None:
+        self.subscribed.extend(channels)
+
+    async def unsubscribe(self, *channels: str) -> None:
+        self.unsubscribed.extend(channels)
+
+    async def get_message(
+        self, ignore_subscribe_messages: bool = True, timeout: float = 0
+    ) -> Any:
+        if not self.messages:
+            await asyncio.sleep(timeout)
+            return None
+        item = self.messages.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+def test_wait_for_tick_or_wake_returns_subscriber_message() -> None:
+    pubsub = _FakeWakePubsub(
+        messages=[
+            {
+                "type": "message",
+                "channel": "orchestrator:wake:octo__alpha",
+                "data": json.dumps(
+                    {"event_type": "upload", "repo": "octo__alpha"}
+                ),
+            }
+        ]
+    )
+
+    result = asyncio.run(main_module._wait_for_tick_or_wake(pubsub, 60.0))
+
+    assert result is not None
+    assert result["type"] == "message"
+
+
+def test_wait_for_tick_or_wake_returns_none_on_sleep() -> None:
+    pubsub = _FakeWakePubsub(messages=[None])
+
+    result = asyncio.run(main_module._wait_for_tick_or_wake(pubsub, 0.01))
+
+    assert result is None
+
+
+def test_wait_for_tick_or_wake_handles_subscriber_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    pubsub = _FakeWakePubsub(messages=[RuntimeError("disconnected")])
+
+    with caplog.at_level(logging.WARNING, logger=main_module.logger.name):
+        result = asyncio.run(main_module._wait_for_tick_or_wake(pubsub, 0.01))
+
+    assert result is None
+    assert any("wake subscriber failed" in rec.getMessage() for rec in caplog.records)
+
+
+def test_wait_for_tick_or_wake_falls_back_when_pubsub_is_none() -> None:
+    result = asyncio.run(main_module._wait_for_tick_or_wake(None, 0.001))
+
+    assert result is None
+
+
+def test_apply_wake_message_resets_last_run_for_target_repo() -> None:
+    repo = _repo("https://github.com/octo/alpha.git")
+    runner = _FakeRunner(
+        repo,
+        AppConfig(repositories=[repo], daemon=DaemonConfig(poll_interval_sec=1)),
+        _FakeRedisClient(),
+        None,
+        None,
+    )
+    runners = {"octo__alpha": runner}
+    last_run = {"octo__alpha": 123.0}
+
+    main_module._apply_wake_message(
+        {
+            "type": "message",
+            "data": json.dumps({"event_type": "upload", "repo": "octo__alpha"}),
+        },
+        runners,
+        last_run,
+    )
+
+    assert last_run["octo__alpha"] == 0.0
+
+
+def test_apply_wake_message_ignores_unknown_repo() -> None:
+    repo = _repo("https://github.com/octo/alpha.git")
+    runner = _FakeRunner(
+        repo,
+        AppConfig(repositories=[repo], daemon=DaemonConfig(poll_interval_sec=1)),
+        _FakeRedisClient(),
+        None,
+        None,
+    )
+    runners = {"octo__alpha": runner}
+    last_run = {"octo__alpha": 123.0}
+
+    main_module._apply_wake_message(
+        {
+            "type": "message",
+            "data": json.dumps({"event_type": "upload", "repo": "ghost"}),
+        },
+        runners,
+        last_run,
+    )
+
+    assert last_run["octo__alpha"] == 123.0
+
+
+def test_apply_wake_message_ignores_invalid_payloads() -> None:
+    runners: dict[str, Any] = {}
+    last_run: dict[str, float] = {}
+
+    main_module._apply_wake_message({"type": "message", "data": ""}, runners, last_run)
+    main_module._apply_wake_message(
+        {"type": "message", "data": "{not-json"}, runners, last_run
+    )
+    main_module._apply_wake_message(
+        {"type": "message", "data": json.dumps({"event_type": "upload"})},
+        runners,
+        last_run,
+    )
+
+    assert last_run == {}
+
+
+async def test_sync_wake_subscriptions_subscribes_added_repos_and_unsubscribes_removed() -> None:
+    repo_a = _repo("https://github.com/octo/alpha.git")
+    repo_b = _repo("https://github.com/octo/beta.git")
+    runner_a = _FakeRunner(
+        repo_a,
+        AppConfig(repositories=[repo_a], daemon=DaemonConfig(poll_interval_sec=1)),
+        _FakeRedisClient(),
+        None,
+        None,
+    )
+    runner_b = _FakeRunner(
+        repo_b,
+        AppConfig(repositories=[repo_b], daemon=DaemonConfig(poll_interval_sec=1)),
+        _FakeRedisClient(),
+        None,
+        None,
+    )
+
+    pubsub = _FakeWakePubsub()
+    subscribed: set[str] = {"orchestrator:wake:octo__alpha"}
+    runners = {"octo__beta": runner_b}
+
+    await main_module._sync_wake_subscriptions(pubsub, subscribed, runners)
+
+    assert subscribed == {"orchestrator:wake:octo__beta"}
+    assert pubsub.subscribed == ["orchestrator:wake:octo__beta"]
+    assert pubsub.unsubscribed == ["orchestrator:wake:octo__alpha"]
+    # Touch unused runner to keep linter quiet without altering wiring.
+    assert runner_a.repo_config is repo_a
+
+
+async def test_sync_wake_subscriptions_swallows_pubsub_errors(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _AngryPubsub:
+        async def subscribe(self, *channels: str) -> None:
+            raise RuntimeError("subscribe boom")
+
+        async def unsubscribe(self, *channels: str) -> None:
+            raise RuntimeError("unsubscribe boom")
+
+    repo = _repo("https://github.com/octo/alpha.git")
+    runner = _FakeRunner(
+        repo,
+        AppConfig(repositories=[repo], daemon=DaemonConfig(poll_interval_sec=1)),
+        _FakeRedisClient(),
+        None,
+        None,
+    )
+
+    pubsub = _AngryPubsub()
+    subscribed = {"orchestrator:wake:legacy"}
+
+    with caplog.at_level(logging.WARNING, logger=main_module.logger.name):
+        await main_module._sync_wake_subscriptions(
+            pubsub, subscribed, {"octo__alpha": runner}
+        )
+
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert any("wake subscribe failed" in m for m in messages)
+    assert any("wake unsubscribe failed" in m for m in messages)
+    # Failed mutations leave subscribed unchanged.
+    assert subscribed == {"orchestrator:wake:legacy"}
+
+
+def test_main_subscribes_to_wake_channel_at_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    _patch_main(monkeypatch, config)
+
+    captured: dict[str, Any] = {}
+    pubsub = _FakeWakePubsub()
+
+    async def _fake_subscribe_wake(repo_names: Any, redis_client: Any = None) -> Any:
+        names = list(repo_names)
+        captured["repo_names"] = names
+        captured["redis_client"] = redis_client
+        if names:
+            await pubsub.subscribe(*[main_module.wake_channel(name) for name in names])
+        return pubsub
+
+    monkeypatch.setattr(main_module, "subscribe_wake", _fake_subscribe_wake)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    assert captured["repo_names"] == ["octo__alpha"]
+    assert captured["redis_client"] is not None
+    assert pubsub.subscribed == ["orchestrator:wake:octo__alpha"]
+
+
+def test_main_falls_back_to_sleep_when_subscribe_wake_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    ctx = _patch_main(monkeypatch, config)
+
+    async def _failing_subscribe_wake(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("redis unavailable")
+
+    monkeypatch.setattr(main_module, "subscribe_wake", _failing_subscribe_wake)
+
+    with caplog.at_level(logging.WARNING, logger=main_module.logger.name):
+        with pytest.raises(_StopLoop):
+            asyncio.run(main_module.main())
+
+    assert ctx["sleep_calls"]  # sleep path executed
+    assert any(
+        "wake subscription unavailable" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_main_resets_last_run_on_wake_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wake events make a runner eligible immediately on the next iteration."""
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git", poll_interval_sec=999)],
+        daemon=DaemonConfig(poll_interval_sec=999),
+    )
+
+    _reset_fake_runner()
+    monkeypatch.setattr(main_module, "load_config", lambda: config)
+    monkeypatch.setattr(
+        main_module.aioredis,
+        "from_url",
+        lambda url, decode_responses: _FakeRedisClient(),
+    )
+    monkeypatch.setattr(main_module, "PipelineRunner", _FakeRunner)
+    monkeypatch.setattr(main_module, "_setup_git_auth", lambda: None)
+    monkeypatch.setattr(
+        main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
+    )
+    monkeypatch.setattr(main_module, "CONFIG_RELOAD_CYCLES", 1000)
+
+    pubsub = _FakeWakePubsub(
+        messages=[
+            {
+                "type": "message",
+                "channel": "orchestrator:wake:octo__alpha",
+                "data": json.dumps(
+                    {"event_type": "upload", "repo": "octo__alpha"}
+                ),
+            }
+        ]
+    )
+
+    async def _fake_subscribe_wake(repo_names: Any, redis_client: Any = None) -> Any:
+        names = list(repo_names)
+        if names:
+            await pubsub.subscribe(*[main_module.wake_channel(name) for name in names])
+        return pubsub
+
+    monkeypatch.setattr(main_module, "subscribe_wake", _fake_subscribe_wake)
+
+    # Clock starts well above the poll interval so that ``last_run = 0``
+    # (set by the wake handler) is unambiguously "overdue" on the next
+    # iteration instead of accidentally falling within the interval window.
+    clock = [10_000.0]
+    monkeypatch.setattr(main_module.time, "monotonic", lambda: clock[0])
+
+    iterations = {"n": 0}
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        iterations["n"] += 1
+        clock[0] += max(seconds, 0.001)
+        await real_sleep(0)
+        if iterations["n"] >= 2:
+            raise _StopLoop
+
+    monkeypatch.setattr(main_module.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    runner = _FakeRunner.instances[0]
+    # First cycle: initial run (last_run gets set). Wake event resets last_run
+    # to 0; second cycle re-runs immediately even though poll_interval_sec is
+    # 999 seconds.
+    assert runner.cycles >= 2
+
+
+def test_main_reload_resyncs_wake_subscriptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    second = AppConfig(
+        repositories=[
+            _repo("https://github.com/octo/alpha.git"),
+            _repo("https://github.com/octo/beta.git"),
+        ],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+
+    _reset_fake_runner()
+    load_calls = {"n": 0}
+
+    def fake_load_config() -> AppConfig:
+        load_calls["n"] += 1
+        return first if load_calls["n"] == 1 else second
+
+    monkeypatch.setattr(main_module, "load_config", fake_load_config)
+    monkeypatch.setattr(
+        main_module.aioredis,
+        "from_url",
+        lambda url, decode_responses: _FakeRedisClient(),
+    )
+    monkeypatch.setattr(main_module, "PipelineRunner", _FakeRunner)
+    monkeypatch.setattr(main_module, "_setup_git_auth", lambda: None)
+    monkeypatch.setattr(
+        main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
+    )
+    monkeypatch.setattr(main_module, "CONFIG_RELOAD_CYCLES", 1)
+
+    pubsub = _FakeWakePubsub()
+
+    async def _fake_subscribe_wake(repo_names: Any, redis_client: Any = None) -> Any:
+        names = list(repo_names)
+        if names:
+            await pubsub.subscribe(*[main_module.wake_channel(name) for name in names])
+        return pubsub
+
+    monkeypatch.setattr(main_module, "subscribe_wake", _fake_subscribe_wake)
+
+    clock = [0.0]
+    monkeypatch.setattr(main_module.time, "monotonic", lambda: clock[0])
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock[0] += seconds + 1
+        if len(sleep_calls) >= 2:
+            raise _StopLoop
+
+    monkeypatch.setattr(main_module.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    assert "orchestrator:wake:octo__beta" in pubsub.subscribed

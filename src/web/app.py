@@ -43,7 +43,7 @@ from src.config import (
     update_repository,
 )
 from src.daemon.github_rate_limit import read_budget
-from src.events import publish_repo_event
+from src.events import publish_repo_event, publish_wake
 from src.events.sse import RepoEventsUnavailableError, stream_repo_events
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState, TaskStatus
@@ -2658,6 +2658,11 @@ async def upload_tasks(
                 await asyncio.to_thread(
                     shutil.rmtree, str(staging_dir), True
                 )
+
+    try:
+        await publish_wake(name, "upload", redis_client=redis_client)
+    except Exception:
+        logger.warning("publish_wake failed for %s", name, exc_info=True)
 
     return _render_upload_success(
         request,
