@@ -624,3 +624,124 @@
 - Status: DONE
 - Tasks file: tasks/PR-179.md
 - Branch: pr-179-pulse-badge-not-dot
+
+## PR-180: REST replacement for gh pr list statusCheckRollup
+- Status: DOING
+- Tasks file: tasks/PR-180.md
+- Branch: pr-180-rest-check-runs-replace-rollup
+
+## PR-181: Remove tasks/QUEUE.md from git tracking
+- Status: TODO
+- Tasks file: tasks/PR-181.md
+- Branch: pr-181-queue-md-gitignore
+
+## PR-182: diagnose_error bypass for git infra and network errors
+- Status: TODO
+- Tasks file: tasks/PR-182.md
+- Branch: pr-182-diagnose-error-infra-bypass
+
+## PR-183: Redis pub/sub upload trigger for immediate daemon wake
+- Status: TODO
+- Tasks file: tasks/PR-183.md
+- Branch: pr-183-redis-pubsub-upload-trigger
+
+## PR-184: Adaptive IDLE polling
+- Status: TODO
+- Tasks file: tasks/PR-184.md
+- Branch: pr-184-adaptive-idle-polling
+- Depends on: PR-183
+
+## PR-185: Daemon GraphQL points consumed observability
+- Status: TODO
+- Tasks file: tasks/PR-185.md
+- Branch: pr-185-graphql-points-observability
+
+## PR-186: Recovery skip crashed-task-retry
+- Status: TODO
+- Tasks file: tasks/PR-186.md
+- Branch: pr-186-recovery-skip-crashed-retry
+
+## PR-187: Coder exit=0 diagnostic handler
+- Status: TODO
+- Tasks file: tasks/PR-187.md
+- Branch: pr-187-coder-exit-zero-diagnostic
+
+## PR-188: Codex bot error comment detection
+- Status: TODO
+- Tasks file: tasks/PR-188.md
+- Branch: pr-188-codex-bot-error-detect
+
+## PR-189: OBS-Z fix — Codex EYES race window
+- Status: TODO
+- Tasks file: tasks/PR-189.md
+- Branch: pr-189-codex-eyes-race-fix
+
+## PR-190: Asymmetric push verification in fix.py normal path
+- Status: TODO
+- Tasks file: tasks/PR-190.md
+- Branch: pr-190-asymmetric-push-verification
+
+## PR-191a: ETag conditional requests for REST GET helpers
+- Status: TODO
+- Tasks file: tasks/PR-191a.md
+- Branch: pr-191a-etag-rest-get-helpers
+- Depends on: PR-180
+
+## PR-191b: ETag conditional requests for list endpoints
+- Status: TODO
+- Tasks file: tasks/PR-191b.md
+- Branch: pr-191b-etag-list-endpoints
+- Depends on: PR-191a
+
+## PR-192a: AGENTS.md section-marker append framework
+- Status: TODO
+- Tasks file: tasks/PR-192a.md
+- Branch: pr-192a-agents-md-section-marker
+
+## PR-192b: Apply section-marker framework to AGENTS.md
+- Status: TODO
+- Tasks file: tasks/PR-192b.md
+- Branch: pr-192b-agents-md-marked-sections
+- Depends on: PR-192a
+
+## PR-192c: Onboarding doc and dry-run reconciliation mode
+- Status: TODO
+- Tasks file: tasks/PR-192c.md
+- Branch: pr-192c-onboarding-dry-run
+- Depends on: PR-192b
+
+## PR-193: Multi-repo state isolation audit and fixes
+- Status: TODO
+- Tasks file: tasks/PR-193.md
+- Branch: pr-193-multi-repo-isolation-audit
+
+## PR-194: Production config tracking via overlay file
+- Status: TODO
+- Tasks file: tasks/PR-194.md
+- Branch: pr-194-config-production-overlay
+
+## PR-195: push_count desync fix
+- Status: TODO
+- Tasks file: tasks/PR-195.md
+- Branch: pr-195-push-count-desync
+
+## PR-196: AGENTS.md prohibit draft PRs
+- Status: TODO
+- Tasks file: tasks/PR-196.md
+- Branch: pr-196-agents-md-no-draft-prs
+- Depends on: PR-192b
+
+## PR-197: Document WATCH STALLED substate
+- Status: TODO
+- Tasks file: tasks/PR-197.md
+- Branch: pr-197-document-watch-stalled
+
+## PR-198: PipelineState.MERGE dead value cleanup
+- Status: TODO
+- Tasks file: tasks/PR-198.md
+- Branch: pr-198-pipeline-state-merge-cleanup
+
+## PR-199: Event text clarity pass
+- Status: TODO
+- Tasks file: tasks/PR-199.md
+- Branch: pr-199-event-text-clarity
