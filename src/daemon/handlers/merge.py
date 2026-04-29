@@ -2,15 +2,14 @@
 
 Mixin methods:
     handle_merge                    — merge PR and return to IDLE
-    _mark_queue_done                — mark task DONE in QUEUE.md
-    _resolve_pending_queue_sync     — poll queue-sync PR status
+    _mark_queue_done                — mark task DONE in the local QUEUE.md
+    _resolve_pending_queue_sync     — poll legacy queue-sync PR status
     _escalate_queue_sync_if_expired — escalate to ERROR on timeout
 """
 
 from __future__ import annotations
 
 import logging
-import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -226,127 +225,58 @@ class MergeMixin:
         self.log_event(f"Merged PR #{number} -> IDLE")
 
     def _mark_queue_done(self) -> None:
-        """Mark the merged task DONE in QUEUE.md.
+        """Mark the merged task DONE in the local QUEUE.md only.
 
-        Tries a direct push to the base branch first. If that fails
-        (e.g. branch protection), falls back to a remediation PR on a
-        ``queue-done-{pr_id}`` branch with auto-merge. Sets
-        ``pending_queue_sync_branch`` eagerly so ``handle_idle`` gates
-        dispatch until the update lands on base.
+        QUEUE.md is gitignored (PR-181) and is regenerated each IDLE
+        cycle from structured task headers, so this update never
+        commits or pushes. The in-place tweak keeps read consumers
+        (dashboard, recovery) consistent with the just-merged status
+        between handle_merge and the next IDLE tick.
+
+        On legacy repos that still track ``tasks/QUEUE.md`` upstream
+        (``.gitignore`` does not retroactively untrack files), an
+        in-place rewrite would dirty the working tree without ever
+        being committed or pushed; the next cycle's preflight would
+        then move the runner to ERROR before ``handle_idle`` ran. Skip
+        the rewrite in that case — the tracked snapshot on origin
+        remains the source of truth until the legacy repo migrates the
+        file out of git, mirroring ``_write_generated_queue_md``.
         """
         if self.state.current_task is None:
             return
+        # ``None`` means the cat-file probe itself failed (transient git
+        # slowness); treat as if tracked so we skip the rewrite. A
+        # legacy repo with a flaky probe would otherwise dirty the
+        # working tree on every merge and trip preflight into ERROR.
+        # Post-PR-181 repos only lose one in-place tweak; the next IDLE
+        # cycle regenerates QUEUE.md from headers anyway.
+        if self._origin_queue_md_tracked() is not False:
+            return
         pr_id = self.state.current_task.pr_id
-        base = self.repo_config.branch
 
-        slug = re.sub(r"[^a-z0-9-]", "-", pr_id.lower())
-        remediation_branch = f"queue-done-{slug}"
+        queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
+        if not queue_path.exists():
+            return
+        try:
+            content = queue_path.read_text()
+        except OSError as exc:
+            self.log_event(
+                f"Warning: read QUEUE.md to mark {pr_id} DONE failed: {exc}"
+            )
+            return
 
-        self.state.pending_queue_sync_branch = remediation_branch
-        self.state.pending_queue_sync_started_at = datetime.now(timezone.utc)
+        updated = mark_task_done(content, pr_id)
+        if updated is None or updated == content:
+            return
 
         try:
-            retry_transient(
-                lambda: git_ops._git(
-                    self.repo_path, "fetch", "--prune", "origin", base
-                ),
-                operation_name=f"git fetch origin {base}",
-            )
-            git_ops._git(self.repo_path, "checkout", base)
-            git_ops._git(self.repo_path, "reset", "--hard", f"origin/{base}")
-
-            queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
-            if not queue_path.exists():
-                self.state.pending_queue_sync_branch = None
-                self.state.pending_queue_sync_started_at = None
-                return
-            content = queue_path.read_text()
-
-            updated = mark_task_done(content, pr_id)
-            if updated is None or updated == content:
-                self.state.pending_queue_sync_branch = None
-                self.state.pending_queue_sync_started_at = None
-                return
-
             queue_path.write_text(updated)
-            git_ops._git(self.repo_path, "add", "tasks/QUEUE.md")
-            git_ops._git(self.repo_path, "commit", "-m", f"{pr_id}: mark DONE")
-
-            push_result = git_ops._git(
-                self.repo_path, "push", "origin", base,
-                timeout=60, check=False,
-            )
-            if push_result.returncode == 0:
-                self.state.pending_queue_sync_branch = None
-                self.state.pending_queue_sync_started_at = None
-                self.log_event(f"Marked {pr_id} DONE in QUEUE.md")
-                git_ops._git(self.repo_path, "checkout", base, check=False)
-                return
-
+        except OSError as exc:
             self.log_event(
-                f"Direct push to {base} rejected; "
-                "falling back to remediation PR"
+                f"Warning: write QUEUE.md to mark {pr_id} DONE failed: {exc}"
             )
-            git_ops._git(self.repo_path, "checkout", "-B", remediation_branch)
-            retry_transient(
-                lambda: git_ops._git(
-                    self.repo_path,
-                    "push", "--force-with-lease", "-u",
-                    "origin", remediation_branch,
-                ),
-                operation_name=f"git push origin {remediation_branch}",
-            )
-            github_client.run_gh(
-                ["pr", "create",
-                 "--base", base,
-                 "--head", remediation_branch,
-                 "--title", f"{pr_id}: mark DONE in QUEUE.md",
-                 "--body",
-                 f"Post-merge queue sync for {pr_id} "
-                 "(auto-generated by the daemon)."],
-                repo=self.owner_repo,
-            )
-            try:
-                github_client.run_gh(
-                    ["pr", "merge", remediation_branch,
-                     "--squash", "--delete-branch", "--auto"],
-                    repo=self.owner_repo,
-                )
-            except Exception as auto_exc:
-                self.log_event(
-                    f"queue-sync --auto rejected ({auto_exc}); "
-                    "attempting immediate merge"
-                )
-                try:
-                    github_client.run_gh(
-                        ["pr", "merge", remediation_branch,
-                         "--squash", "--delete-branch"],
-                        repo=self.owner_repo,
-                    )
-                except Exception:
-                    self.log_event(
-                        "queue-sync immediate merge also failed; "
-                        "PR left open for later resolution"
-                    )
-        except Exception:
-            git_ops._git(
-                self.repo_path,
-                "reset", "--hard", f"origin/{base}",
-                check=False,
-            )
-            git_ops._git(self.repo_path, "checkout", base, check=False)
-            raise
-
-        git_ops._git(self.repo_path, "checkout", base, check=False)
-        git_ops._git(
-            self.repo_path,
-            "reset", "--hard", f"origin/{base}",
-            check=False,
-        )
-        self.log_event(
-            f"Opened queue-done PR for {pr_id} "
-            f"(branch {remediation_branch}); awaiting auto-merge"
-        )
+            return
+        self.log_event(f"Marked {pr_id} DONE in QUEUE.md")
 
     def _resolve_pending_queue_sync(self) -> bool:
         """Poll the outstanding queue-sync PR and gate IDLE dispatch.

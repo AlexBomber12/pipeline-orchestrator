@@ -15,7 +15,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from src import github_client
-from src.daemon import git_ops
 from src.dag import get_eligible_tasks
 from src.models import PipelineState, QueueTask, TaskStatus
 from src.queue_parser import (
@@ -25,7 +24,6 @@ from src.queue_parser import (
     parse_queue,
     parse_task_header,
 )
-from src.retry import is_transient_error, retry_transient
 from src.task_status import (
     derive_queue_task_statuses,
     derive_task_status,
@@ -71,16 +69,47 @@ class IdleMixin:
         headers: list[TaskHeader],
         statuses: dict[str, TaskStatus],
     ) -> bool:
-        """Write and publish QUEUE.md only when the generated report changed.
+        """Write the regenerated QUEUE.md to disk for read-side consumers.
 
-        Returns ``True`` when the generated queue is synchronized locally
-        after the call. A rejected push is treated as recoverable: the
-        helper drops the local auto-generated queue commit and returns
-        ``False`` so IDLE can continue without carrying a stray local
-        queue commit.
+        QUEUE.md is gitignored (PR-181); the daemon never commits or
+        pushes it. The file is rewritten only when its contents would
+        change, so repeated IDLE cycles on a stable queue are no-ops on
+        disk.
+
+        On legacy repos that still track ``tasks/QUEUE.md`` upstream
+        (``.gitignore`` does not retroactively untrack files), writing
+        here would dirty the working tree on every cycle, push preflight
+        into ERROR, and block normal dispatch. Skip the write in that
+        case — the tracked snapshot on origin remains the source of
+        truth until the legacy repo migrates the file out of git.
+
+        Returns ``True`` once the on-disk queue reflects the generated
+        content. The boolean return is preserved so existing callers
+        treat the operation as always-successful (no push step exists
+        to fail).
         """
         queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
         self._idle_generated_queue_needs_resync = False
+        # ``None`` means the cat-file probe itself failed (transient git
+        # slowness); treat as if tracked so the regenerate is skipped
+        # for this cycle. A legacy repo whose probe is briefly flaky
+        # would otherwise have its working tree dirtied on every IDLE
+        # tick. Post-PR-181 repos lose only one cycle of regeneration
+        # and self-heal on the next tick once the probe succeeds.
+        tracked = self._origin_queue_md_tracked()
+        if tracked is not False:
+            if tracked is True and not getattr(
+                self, "_legacy_tracked_queue_md_logged", False,
+            ):
+                self.log_event(
+                    "Skipping QUEUE.md regeneration: still tracked on "
+                    f"origin/{self.repo_config.branch}; "
+                    "untrack via 'git rm --cached tasks/QUEUE.md' to "
+                    "enable daemon-side regeneration"
+                )
+                self._legacy_tracked_queue_md_logged = True
+            return True
+
         content = self._generate_queue_md(headers, statuses)
         existing = (
             queue_path.read_text(encoding="utf-8")
@@ -92,107 +121,7 @@ class IdleMixin:
 
         queue_path.parent.mkdir(parents=True, exist_ok=True)
         queue_path.write_text(content, encoding="utf-8")
-        git_ops._git(self.repo_path, "add", "tasks/QUEUE.md")
-        git_ops._git(
-            self.repo_path,
-            "commit",
-            "-m",
-            "AUTO: regenerate QUEUE.md from DAG",
-        )
-
-        def _push_queue_md() -> subprocess.CompletedProcess[str]:
-            result = git_ops._git(
-                self.repo_path,
-                "push",
-                "origin",
-                self.repo_config.branch,
-                timeout=60,
-                check=False,
-            )
-            if result.returncode != 0:
-                exc = subprocess.CalledProcessError(
-                    result.returncode,
-                    result.args,
-                    output=result.stdout,
-                    stderr=result.stderr,
-                )
-                if is_transient_error(exc):
-                    raise exc
-            return result
-
-        def _rollback_generated_queue_commit() -> None:
-            local_base = "HEAD~1"
-            remote_base = f"refs/remotes/origin/{self.repo_config.branch}"
-            try:
-                fetch = git_ops._git(
-                    self.repo_path,
-                    "fetch",
-                    "origin",
-                    self.repo_config.branch,
-                    timeout=60,
-                    check=False,
-                )
-                local_base_sha = git_ops._git(
-                    self.repo_path,
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    local_base,
-                    check=False,
-                )
-                remote_base_sha = git_ops._git(
-                    self.repo_path,
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    remote_base,
-                    check=False,
-                )
-                if (
-                    fetch.returncode == 0
-                    and local_base_sha.returncode == 0
-                    and remote_base_sha.returncode == 0
-                    and local_base_sha.stdout.strip() != remote_base_sha.stdout.strip()
-                ):
-                    self._idle_generated_queue_needs_resync = True
-                    git_ops._git(
-                        self.repo_path,
-                        "reset",
-                        "--hard",
-                        remote_base,
-                    )
-                    return
-            except (OSError, subprocess.TimeoutExpired):
-                self._idle_generated_queue_needs_resync = True
-            else:
-                if (
-                    fetch.returncode != 0
-                    or local_base_sha.returncode != 0
-                    or remote_base_sha.returncode != 0
-                ):
-                    self._idle_generated_queue_needs_resync = True
-            git_ops._git(
-                self.repo_path,
-                "reset",
-                "--hard",
-                local_base,
-            )
-
-        try:
-            push_result = retry_transient(
-                _push_queue_md,
-                operation_name=f"git push origin {self.repo_config.branch}",
-            )
-        except RuntimeError as exc:
-            if not is_transient_error(exc) and not is_transient_error(exc.__cause__):
-                raise
-            _rollback_generated_queue_commit()
-            return False
-        if push_result.returncode == 0:
-            return True
-
-        _rollback_generated_queue_commit()
-        return False
+        return True
 
     @staticmethod
     def _validate_task_file_header_match(task_file: Path, header_pr_id: str) -> None:
@@ -229,13 +158,17 @@ class IdleMixin:
     def _queue_md_contains_visible_legacy_entries(
         queue_path: str | Path,
         structured_pr_ids: set[str],
+        ignored_pr_ids: set[str] | None = None,
     ) -> bool:
         path = Path(queue_path)
         if not path.is_file():
             return False
+        skip = structured_pr_ids if ignored_pr_ids is None else (
+            structured_pr_ids | ignored_pr_ids
+        )
         for raw_line in path.read_text(encoding="utf-8").splitlines():
             match = re.match(r"^##\s+(PR-[A-Za-z0-9_.-]+)\b", raw_line.rstrip())
-            if match and match.group(1) not in structured_pr_ids:
+            if match and match.group(1) not in skip:
                 return True
         return False
 
@@ -579,13 +512,43 @@ class IdleMixin:
                 )
                 legacy_queue_check_succeeded = not visible_legacy_queue_entries
             else:
-                queue_task = get_next_task(tasks)
+                # Ghost entries (whose declared task file is missing on disk)
+                # are not real legacy tasks: they're stale residue from a
+                # prior cycle that survived ``sync_to_main`` because QUEUE.md
+                # is gitignored (PR-181). Treating them as legacy would
+                # block ``_write_generated_queue_md`` from rewriting the
+                # file, leaving the shim's ``parse_doing_task`` stuck on a
+                # stale DOING entry and creating a PR for the wrong branch.
+                # Drop ghosts before ``get_next_task`` so the selector
+                # advances to a real legacy entry behind a stale DOING ghost
+                # instead of stalling IDLE on "no tasks available".
+                ghost_legacy_pr_ids = {
+                    queued.pr_id
+                    for queued in tasks
+                    if queued.pr_id not in structured_pr_ids
+                    and queued.task_file is not None
+                    and not (Path(self.repo_path) / queued.task_file).is_file()
+                }
+                for queued in tasks:
+                    if queued.pr_id in ghost_legacy_pr_ids:
+                        self.log_event(
+                            f"Ignoring ghost legacy QUEUE.md entry {queued.pr_id} "
+                            f"(no {queued.task_file} on disk)"
+                        )
+                non_ghost_tasks = (
+                    [t for t in tasks if t.pr_id not in ghost_legacy_pr_ids]
+                    if ghost_legacy_pr_ids
+                    else tasks
+                )
+                queue_task = get_next_task(non_ghost_tasks)
                 visible_legacy_queue_entries = self._queue_md_contains_visible_legacy_entries(
                     queue_path,
                     structured_pr_ids,
+                    ghost_legacy_pr_ids,
                 )
                 has_legacy_queue_tasks = any(
-                    queued.pr_id not in structured_pr_ids for queued in tasks
+                    queued.pr_id not in structured_pr_ids
+                    for queued in non_ghost_tasks
                 ) or visible_legacy_queue_entries
                 legacy_queue_check_succeeded = not visible_legacy_queue_entries
 
@@ -636,32 +599,16 @@ class IdleMixin:
             and not has_legacy_queue_tasks
         ):
             try:
-                published_queue = self._write_generated_queue_md(
+                self._write_generated_queue_md(
                     generated_headers,
                     generated_statuses,
                 )
-            except (
-                OSError,
-                RuntimeError,
-                subprocess.CalledProcessError,
-                subprocess.TimeoutExpired,
-            ) as exc:
+            except OSError as exc:
                 message = f"QUEUE.md auto-generation failed: {exc}"
                 self.state.state = PipelineState.ERROR
                 self.state.error_message = message
                 self.log_event(message)
                 return
-            if not published_queue:
-                self.log_event(
-                    "QUEUE.md auto-generation push rejected; "
-                    "continuing without publishing"
-                )
-                if getattr(self, "_idle_generated_queue_needs_resync", False):
-                    self.log_event(
-                        "QUEUE.md auto-generation refreshed origin state; "
-                        "retrying task selection next cycle"
-                    )
-                    return
         if task is None:
             self.log_event("No tasks available")
             if prs:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -61,13 +62,23 @@ def _repo_cfg(**overrides: Any) -> RepoConfig:
 
 
 def _make_runner() -> PipelineRunner:
-    return PipelineRunner(
+    runner = PipelineRunner(
         _repo_cfg(),
         AppConfig(repositories=[], daemon=DaemonConfig()),
         _FakeRedis(),
         _FakeUsageProvider(),
         _FakeUsageProvider(),
     )
+    # Default the tracked-QUEUE probe to ``False`` (post-PR-181) so
+    # tests that do not exercise the probe directly keep going through
+    # the working-tree path. The real probe shells out to ``git
+    # cat-file`` against ``self.repo_path``, which does not exist in
+    # these unit tests; without this stub the probe would now report
+    # ``None`` (indeterminate) and recovery would short-circuit to
+    # ERROR before the test's stubbed ``_parse_base_queue`` runs.
+    # Tests that *do* exercise the probe install their own override.
+    runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
+    return runner
 
 
 class _FakeUsageProvider:
@@ -282,6 +293,224 @@ def test_recover_state_pending_queue_sync_uses_now_when_last_activity_missing(
     asyncio.run(runner.recover_state())
 
     assert runner.state.pending_queue_sync_started_at == frozen_now
+
+
+def test_recover_state_drops_ghost_doing_entry_with_missing_task_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A QUEUE.md DOING entry whose declared task file no longer exists
+    must be ignored. After PR-181, ``tasks/QUEUE.md`` is gitignored and
+    survives ``sync_to_main``'s ``git reset --hard``/``git clean -fd``,
+    so a stale snapshot from a prior cycle (or a prior CI run sharing
+    the daemon volume) can outlive the underlying tasks/PR-*.md files
+    after the base branch was wiped. Without this filter, recovery
+    would resurrect that ghost over the live IDLE queue and drag the
+    daemon back onto a deleted task.
+    """
+    ghost = QueueTask(
+        pr_id="PR-999",
+        title="Ghost from prior run",
+        status=TaskStatus.DOING,
+        branch="pr-999-ghost",
+        task_file="tasks/PR-999.md",
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
+    )
+    coding_calls: list[str] = []
+
+    async def fake_coding() -> None:  # pragma: no cover - must not fire
+        coding_calls.append("coding")
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._parse_base_queue = lambda **_: [ghost]  # type: ignore[method-assign]
+    runner.handle_coding = fake_coding  # type: ignore[method-assign]
+
+    result = asyncio.run(runner.recover_state())
+
+    assert result is True
+    assert coding_calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.queue_total == 0
+    assert any(
+        "ignoring ghost QUEUE.md entry PR-999" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_recover_state_keeps_doing_entry_when_queue_sourced_from_origin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """On legacy tracked-QUEUE repos ``_parse_base_queue`` reads the
+    authoritative queue from ``origin/{branch}``. Recovery may run while
+    the working tree is parked on a feature branch left behind by an
+    interrupted cycle, so task files referenced by the base-branch queue
+    can be absent from the local checkout. The local-existence ghost
+    filter must NOT run in that case — otherwise it discards real
+    DOING/DONE entries and detaches the daemon from in-flight work.
+    """
+    in_flight = QueueTask(
+        pr_id="PR-555",
+        title="In-flight on feature branch",
+        status=TaskStatus.DOING,
+        branch="pr-555-feature",
+        task_file="tasks/PR-555.md",
+    )
+    matching_pr = PRInfo(number=555, branch="pr-555-feature")
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [matching_pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda owner_repo, number: {"head_commit_date": ""},
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._parse_base_queue = lambda **_: [in_flight]  # type: ignore[method-assign]
+    # Simulate a legacy repo that still tracks tasks/QUEUE.md on origin.
+    runner._origin_queue_md_tracked = lambda: True  # type: ignore[method-assign]
+
+    result = asyncio.run(runner.recover_state())
+
+    assert result is True
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == "PR-555"
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 555
+    assert not any(
+        "ignoring ghost QUEUE.md entry" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_recover_state_uses_single_probe_for_parse_and_ghost_filter(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """recover_state must run ``_origin_queue_md_tracked`` exactly once
+    and feed the same result to both ``_parse_base_queue`` and the
+    ghost-filter decision. Otherwise a transient probe failure between
+    two independent probes would let the queue be parsed from
+    ``origin/{branch}`` while the ghost filter still ran on the local
+    working tree, dropping real DOING/DONE entries whose task files
+    legitimately don't exist on a feature-branch checkout and
+    detaching the daemon from in-flight PR work.
+    """
+    in_flight = QueueTask(
+        pr_id="PR-777",
+        title="In-flight on legacy tracked-QUEUE repo",
+        status=TaskStatus.DOING,
+        branch="pr-777-feature",
+        task_file="tasks/PR-777.md",
+    )
+    matching_pr = PRInfo(number=777, branch="pr-777-feature")
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [matching_pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda owner_repo, number: {"head_commit_date": ""},
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+
+    probe_calls: list[bool] = []
+    parse_kwargs: list[dict[str, object]] = []
+
+    def tracked_probe() -> bool:
+        probe_calls.append(True)
+        return True
+
+    def fake_parse(**kwargs: object) -> list[QueueTask]:
+        parse_kwargs.append(kwargs)
+        # Sanity: the caller must have supplied a single shared probe
+        # result instead of letting ``_parse_base_queue`` re-probe.
+        assert kwargs.get("queue_from_origin") is True
+        return [in_flight]
+
+    runner._origin_queue_md_tracked = tracked_probe  # type: ignore[method-assign]
+    runner._parse_base_queue = fake_parse  # type: ignore[method-assign]
+
+    result = asyncio.run(runner.recover_state())
+
+    assert result is True
+    assert len(probe_calls) == 1, (
+        "expected a single _origin_queue_md_tracked probe shared by "
+        "the parse-source and ghost-filter decisions"
+    )
+    assert len(parse_kwargs) == 1
+    assert parse_kwargs[0].get("queue_from_origin") is True
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == "PR-777"
+    assert not any(
+        "ignoring ghost QUEUE.md entry" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_recover_doing_task_skipped_when_already_merged_on_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale DOING entry whose PR is already merged on
+    ``origin/{branch}`` must NOT trigger a CODING re-run.
+
+    On legacy tracked-QUEUE repos ``_mark_queue_done`` skips its
+    in-place rewrite to keep the working tree clean for preflight, so
+    ``origin/{branch}:tasks/QUEUE.md`` keeps the just-merged task pinned
+    at DOING. Without this guard, ``recover_state`` would treat the
+    stale entry as interrupted work and re-enter CODING for an
+    already-merged task on every daemon restart.
+    """
+    task = _doing_task()
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
+    )
+
+    coding_ran: list[bool] = []
+
+    async def fake_coding() -> None:  # pragma: no cover - must not fire
+        coding_ran.append(True)
+
+    runner = _make_runner()
+    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner.handle_coding = fake_coding  # type: ignore[method-assign]
+    runner._is_doing_already_merged = lambda doing: True  # type: ignore[method-assign]
+    # Preserve must NOT run for a merged task — the entry is stale, not
+    # interrupted work.
+    runner._preserve_crashed_run_commits = (  # type: ignore[method-assign]
+        lambda branch: pytest.fail("preserve must not run for merged task")
+    )
+
+    result = asyncio.run(runner.recover_state())
+
+    assert result is True
+    assert coding_ran == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.current_pr is None
+    assert any(
+        "ignoring stale DOING entry PR-042" in e["event"]
+        and "already merged on origin/main" in e["event"]
+        for e in runner.state.history
+    )
+    assert not any(
+        "re-running CODING" in e["event"]
+        for e in runner.state.history
+    )
 
 
 def test_recover_doing_task_without_pr_rerun_coding(
@@ -625,9 +854,26 @@ def test_recover_aborts_when_branch_probe_fails(
     async def fake_coding() -> None:
         coding_ran.append(True)
 
+    class _Result:
+        def __init__(self, returncode: int = 0) -> None:
+            self.returncode = returncode
+            self.stdout = ""
+            self.stderr = ""
+
     def fake_run(cmd: list[str], **kwargs: Any) -> Any:
         if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
             raise exc
+        # ``_origin_queue_md_tracked`` probes ``git cat-file -e`` to
+        # decide whether to read the queue from origin. Default to
+        # untracked (returncode != 0) so this test stays focused on
+        # the local-branch probe failure under test.
+        if cmd[:3] == ["git", "cat-file", "-e"]:
+            return _Result(returncode=1)
+        # ``_is_doing_already_merged`` probes ``git log origin/{branch}``
+        # for a matching merge subject. Report no merge so the test
+        # stays focused on the local-branch probe failure under test.
+        if cmd[:2] == ["git", "-C"] and len(cmd) > 3 and cmd[3] == "log":
+            return _Result(returncode=0)
         raise AssertionError(f"unexpected subprocess call: {cmd}")
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
@@ -1237,40 +1483,25 @@ def test_sync_to_main_runs_fetch_checkout_reset_in_order(
     ]
 
 
-def test_parse_base_queue_reads_from_origin_configured_branch(
-    monkeypatch: pytest.MonkeyPatch,
+def test_parse_base_queue_reads_local_working_tree(
+    tmp_path: Path,
 ) -> None:
-    """P1-G regression: _parse_base_queue must read QUEUE.md from
-    origin/{repo_config.branch} via git show, NOT from the working tree.
-    On a fresh clone ensure_repo_cloned leaves HEAD on the remote's
-    default branch (origin/HEAD), which may not be the configured base
-    branch. Reading parse_queue off the working tree in that state
-    would return the wrong queue snapshot, miss in-flight PRs, and let
-    the next cycle re-run PLANNED PR on active work."""
-    captured: list[list[str]] = []
+    """PR-181: ``_parse_base_queue`` reads ``tasks/QUEUE.md`` from the
+    local working tree. The file is gitignored — the daemon regenerates
+    it from structured task headers each IDLE cycle, so an origin read
+    would see no such file."""
+    runner = _make_runner()
+    repo_root = Path(runner.repo_path)
+    (repo_root / "tasks").mkdir(parents=True, exist_ok=True)
+    queue_text = (
+        "## PR-010: Daemon recovery and error handling\n"
+        "- Status: TODO\n"
+        "- Branch: pr-010-recovery\n"
+        "- Depends on: PR-009\n"
+    )
+    (repo_root / "tasks" / "QUEUE.md").write_text(queue_text, encoding="utf-8")
 
-    class _FakeProc:
-        stdout = (
-            "## PR-010: Daemon recovery and error handling\n"
-            "- Status: TODO\n"
-            "- Branch: pr-010-recovery\n"
-            "- Depends on: PR-009\n"
-        )
-        stderr = ""
-        returncode = 0
-
-    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeProc:
-        captured.append(cmd)
-        return _FakeProc()
-
-    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
-
-    runner = _make_runner()  # configured branch: "main"
     tasks = runner._parse_base_queue()
-
-    assert captured == [
-        ["git", "show", "origin/main:tasks/QUEUE.md"],
-    ], "must read from origin/{configured branch}, not HEAD or a file path"
     assert tasks is not None
     assert len(tasks) == 1
     assert tasks[0].pr_id == "PR-010"
@@ -1278,81 +1509,56 @@ def test_parse_base_queue_reads_from_origin_configured_branch(
     assert tasks[0].branch == "pr-010-recovery"
 
 
-def test_parse_base_queue_respects_non_default_configured_branch(
+def test_parse_base_queue_returns_none_when_queue_md_missing(
+    tmp_path: Path,
+) -> None:
+    """A fresh clone has no ``tasks/QUEUE.md`` yet (it is gitignored and
+    regenerated by the daemon). ``_parse_base_queue`` must surface this
+    as ``None`` so ``recover_state`` translates it into a retryable
+    ERROR rather than driving execution on an empty queue snapshot."""
+    runner = _make_runner()
+    assert runner._parse_base_queue() is None
+
+
+def test_recover_state_local_queue_missing_falls_back_to_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Same guarantee when repo_config.branch is not 'main' — the git
-    show ref must track the configured branch, not a hardcoded default."""
-    captured: list[list[str]] = []
-
-    class _FakeProc:
-        stdout = ""
-        stderr = ""
-        returncode = 0
-
-    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeProc:
-        captured.append(cmd)
-        return _FakeProc()
-
-    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
-
-    runner = PipelineRunner(
-        _repo_cfg(branch="release/2026.04"),
-        AppConfig(repositories=[], daemon=DaemonConfig()),
-        _FakeRedis(),
-        _FakeUsageProvider(),
-        _FakeUsageProvider(),
+    """Post-PR-181: a missing local ``tasks/QUEUE.md`` is a normal
+    intermediate state (gitignored, regenerated by IDLE). Recovery must
+    NOT fail-closed here — returning False would deadlock the runner on
+    a dirty worktree, where ``ensure_repo_cloned`` defers scaffolding
+    and ``run_cycle`` exits before ``preflight`` can auto-reset. Instead
+    recovery completes with an empty queue + IDLE so the next cycle
+    runs preflight and self-heals."""
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
     )
-    runner._parse_base_queue()
-
-    assert captured == [
-        ["git", "show", "origin/release/2026.04:tasks/QUEUE.md"],
-    ]
-
-
-def test_parse_base_queue_returns_none_on_git_show_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """git show failing (ref missing, tasks/QUEUE.md absent on base, or
-    subprocess timeout) must surface as None so recover_state can
-    translate it into a retryable ERROR rather than silently proceeding
-    with an empty queue snapshot and losing track of in-flight work."""
-
-    def fake_run(cmd: list[str], **kwargs: Any) -> None:
-        raise subprocess.CalledProcessError(
-            128, cmd, stderr="fatal: invalid object name 'origin/main'"
-        )
-
-    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
 
     runner = _make_runner()
-    assert runner._parse_base_queue() is None
+    runner._parse_base_queue = lambda **_: None  # type: ignore[method-assign]
+    runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
+
+    result = asyncio.run(runner.recover_state())
+
+    assert result is True
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None
+    assert runner.state.current_task is None
+    assert runner.state.current_pr is None
+    assert any(
+        "tasks/QUEUE.md absent in working tree" in e["event"]
+        for e in runner.state.history
+    )
 
 
-def test_parse_base_queue_returns_none_on_git_show_timeout(
+def test_recover_state_origin_queue_read_failure_sets_error_and_returns_false(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Same surface for TimeoutExpired — recover_state must not
-    distinguish the two in its retry handling."""
-
-    def fake_run(cmd: list[str], **kwargs: Any) -> None:
-        raise subprocess.TimeoutExpired(cmd, 30)
-
-    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
-
-    runner = _make_runner()
-    assert runner._parse_base_queue() is None
-
-
-def test_recover_state_queue_read_failure_sets_error_and_returns_false(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When _parse_base_queue returns None (git show failed), recovery
-    must set ERROR and return False so _recovered stays unset and the
-    next cycle retries discovery. Proceeding with an empty list would
-    let the runner fall through to clean-slate IDLE and pick new work
-    even if an in-flight PR still exists on the configured branch."""
-    # get_open_prs is irrelevant here — we must bail before reaching it.
+    """Legacy tracked-QUEUE repos read from ``origin/{branch}``. When
+    that read fails (transient git/network), recovery must set ERROR
+    and return False so the next cycle retries discovery rather than
+    detaching from real in-flight work referenced by the upstream
+    queue."""
     gh_calls: list[str] = []
 
     def spy_gh(repo: str, **kw: Any) -> list[PRInfo]:
@@ -1363,13 +1569,54 @@ def test_recover_state_queue_read_failure_sets_error_and_returns_false(
 
     runner = _make_runner()
     runner._parse_base_queue = lambda **_: None  # type: ignore[method-assign]
+    runner._origin_queue_md_tracked = lambda: True  # type: ignore[method-assign]
 
     result = asyncio.run(runner.recover_state())
 
     assert result is False
     assert runner.state.state == PipelineState.ERROR
     assert "read QUEUE.md" in (runner.state.error_message or "")
-    assert "origin/main" in (runner.state.error_message or "")
+    assert "origin" in (runner.state.error_message or "")
+    assert gh_calls == [], "must bail before probing GitHub"
+
+
+def test_recover_state_probe_failure_errors_instead_of_walking_working_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the ``cat-file`` probe itself fails (timeout/OSError) the
+    tracked-QUEUE state is genuinely unknown. Treating the failure as
+    "untracked" would route a legacy repo into the working-tree parse
+    path — where a feature-branch checkout or a missing
+    ``tasks/QUEUE.md`` yields a stale/empty queue and the daemon
+    detaches from real in-flight DOING work. Recovery must ERROR so
+    the next cycle retries the probe once git is responsive, and must
+    not call ``_parse_base_queue`` or hit GitHub at all."""
+    parse_calls: list[dict[str, object]] = []
+    gh_calls: list[str] = []
+
+    def fake_parse(**kwargs: object) -> list[QueueTask]:  # pragma: no cover - must not run
+        parse_calls.append(kwargs)
+        return []
+
+    def spy_gh(repo: str, **kw: Any) -> list[PRInfo]:  # pragma: no cover - must not run
+        gh_calls.append(repo)
+        return []
+
+    monkeypatch.setattr(runner_module.github_client, "get_open_prs", spy_gh)
+
+    runner = _make_runner()
+    runner._parse_base_queue = fake_parse  # type: ignore[method-assign]
+    runner._origin_queue_md_tracked = lambda: None  # type: ignore[method-assign,return-value]
+
+    result = asyncio.run(runner.recover_state())
+
+    assert result is False
+    assert runner.state.state == PipelineState.ERROR
+    assert "tracking probe failed" in (runner.state.error_message or "")
+    assert parse_calls == [], (
+        "must not parse queue when probe is indeterminate — origin vs "
+        "working-tree decision is unsafe"
+    )
     assert gh_calls == [], "must bail before probing GitHub"
 
 

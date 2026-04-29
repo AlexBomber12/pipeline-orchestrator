@@ -81,7 +81,7 @@ def _base_branch_ahead_of_origin(repo_path: str, branch: str) -> bool:
     or defer on a dirty tree. Returning False on a probe error
     would let the runner declare scaffolding done while the remote
     is actually behind, and ``recover_state`` would keep reading
-    stale data from ``origin/{branch}:tasks/QUEUE.md``.
+    stale data from the local working tree's ``tasks/QUEUE.md``.
     """
     try:
         local = _git(

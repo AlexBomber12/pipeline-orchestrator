@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent.parent / "templates"
 
-_GITIGNORE_ENTRY = "artifacts/"
+_GITIGNORE_ENTRIES = ("artifacts/", "tasks/QUEUE.md")
 _COMMIT_MESSAGE = "chore: initialize pipeline orchestrator structure"
 
 # Timeouts for git subprocess calls, mirroring the limits used elsewhere
@@ -298,12 +298,15 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
     if gitignore.exists():
         existing = gitignore.read_text()
         lines = existing.splitlines()
-        if _GITIGNORE_ENTRY not in lines:
+        missing = [entry for entry in _GITIGNORE_ENTRIES if entry not in lines]
+        if missing:
             suffix = "" if existing.endswith("\n") or existing == "" else "\n"
-            gitignore.write_text(existing + suffix + _GITIGNORE_ENTRY + "\n")
+            gitignore.write_text(
+                existing + suffix + "\n".join(missing) + "\n"
+            )
             gitignore_touched = True
     else:
-        gitignore.write_text(_GITIGNORE_ENTRY + "\n")
+        gitignore.write_text("\n".join(_GITIGNORE_ENTRIES) + "\n")
         gitignore_touched = True
     if gitignore_touched:
         created.append(".gitignore")
@@ -314,8 +317,14 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
     # directories, and new directories become visible through the files
     # inside them that we also created above. ``artifacts/`` in
     # particular is an empty directory covered by the ``.gitignore``
-    # entry, so there is nothing for git to track there.
-    to_stage = [path for path in created if not path.endswith("/")]
+    # entry, so there is nothing for git to track there. ``tasks/QUEUE.md``
+    # is created on disk for read consumers (dashboard, recovery) but is
+    # gitignored too (PR-181) — the daemon regenerates it deterministically
+    # each IDLE cycle, so committing it would just create push noise.
+    to_stage = [
+        path for path in created
+        if not path.endswith("/") and path not in _GITIGNORE_ENTRIES
+    ]
     committed_new_files = False
 
     if to_stage:
