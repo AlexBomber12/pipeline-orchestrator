@@ -43,10 +43,32 @@ _MERGED_PRS_CACHE_TTL_SECONDS = 60.0
 #: prior result; CI transitions on the same SHA are observed within
 #: ``_CI_STATUS_CACHE_TTL_SECONDS`` of when GitHub publishes them, which is
 #: well under the typical CI run length.
+#:
+#: Expired entries are swept on every write (i.e. on every cache miss).
+#: Without that sweep the cache grows by one entry per push for every
+#: watched repo — long-running daemons would retain full check-run
+#: payloads for SHAs that will never be queried again. Sweeping on write
+#: keeps the resident set ~O(unique SHAs queried within one TTL window).
 _ci_status_cache: dict[
     tuple[str, str], tuple[float, list[dict], dict, bool]
 ] = {}
 _CI_STATUS_CACHE_TTL_SECONDS = 15.0
+
+
+def _evict_expired_ci_status_cache(now: float) -> None:
+    """Drop ``_ci_status_cache`` entries older than the TTL.
+
+    Called from the cache-miss write path so the working set is bounded
+    by the number of unique SHAs polled within a single TTL window
+    rather than growing once per push for every watched repo.
+    """
+    expired = [
+        key
+        for key, entry in _ci_status_cache.items()
+        if (now - entry[0]) >= _CI_STATUS_CACHE_TTL_SECONDS
+    ]
+    for key in expired:
+        _ci_status_cache.pop(key, None)
 
 
 def _is_http_404_error(exc: RuntimeError) -> bool:
@@ -1159,6 +1181,7 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
             status_payload = parsed
 
     fetch_ok = check_runs_ok or status_ok
+    _evict_expired_ci_status_cache(now)
     _ci_status_cache[cache_key] = (now, list(check_runs), dict(status_payload), fetch_ok)
     return check_runs, status_payload, fetch_ok
 

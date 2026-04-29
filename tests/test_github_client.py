@@ -3699,6 +3699,70 @@ def test_clear_ci_status_cache_forces_refetch(
     assert state["calls"] == 2
 
 
+def test_fetch_ci_status_rest_evicts_expired_entries_for_old_shas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expired entries for previous head SHAs must be dropped when a new
+    SHA misses the cache.
+
+    Regression guard: without sweeping, a long-running daemon would leak
+    one entry (with its full check-run payload) per push for every
+    watched repo, since lookups only touch the currently requested key.
+    """
+    from src.github_client import _ci_status_cache
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if "check-runs" in args[-1]:
+            return [{"check_runs": [{"conclusion": "success"}]}]
+        return {"state": "success", "statuses": [{"state": "success"}]}
+
+    fake_now = {"value": 1000.0}
+
+    def fake_monotonic() -> float:
+        return fake_now["value"]
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github_client.time.monotonic", fake_monotonic)
+
+    _fetch_ci_status_rest("owner/name", "sha-old")
+    assert ("owner/name", "sha-old") in _ci_status_cache
+
+    fake_now["value"] += 100.0  # past 15s TTL
+    _fetch_ci_status_rest("owner/name", "sha-new")
+
+    # Old key swept on the new write; only the fresh entry remains.
+    assert ("owner/name", "sha-old") not in _ci_status_cache
+    assert ("owner/name", "sha-new") in _ci_status_cache
+
+
+def test_fetch_ci_status_rest_eviction_preserves_unexpired_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Entries that are still inside the TTL must not be swept when a
+    cache miss for a different SHA triggers eviction."""
+    from src.github_client import _ci_status_cache
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if "check-runs" in args[-1]:
+            return [{"check_runs": [{"conclusion": "success"}]}]
+        return {"state": "success", "statuses": [{"state": "success"}]}
+
+    fake_now = {"value": 1000.0}
+
+    def fake_monotonic() -> float:
+        return fake_now["value"]
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github_client.time.monotonic", fake_monotonic)
+
+    _fetch_ci_status_rest("owner/name", "sha-fresh")
+    fake_now["value"] += 1.0  # still well inside the 15s TTL
+    _fetch_ci_status_rest("owner/name", "sha-other")
+
+    assert ("owner/name", "sha-fresh") in _ci_status_cache
+    assert ("owner/name", "sha-other") in _ci_status_cache
+
+
 def test_parse_iso_returns_none_for_invalid_string() -> None:
     assert _parse_iso("not-a-date") is None
 
