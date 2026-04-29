@@ -148,6 +148,34 @@ def test_list_repo_tasks_omits_doing_section_when_absent(
     assert "In progress" not in body
 
 
+def test_list_repo_tasks_renders_canceled_section(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR-186 Codex P2: CANCELED tasks must be visible in the panel so
+    operators can see which task was canceled and click through to its
+    file. Without the dedicated section, canceled tasks were hidden from
+    every group while still counted in the total — leaving operators no
+    way to discover or re-upload them from the dashboard."""
+    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
+    (repo_dir / "tasks" / "QUEUE.md").write_text(
+        "## PR-400: Crashed earlier\n- Status: CANCELED\n- Branch: pr-400\n\n"
+        "## PR-401: Next up\n- Status: TODO\n- Branch: pr-401\n",
+        encoding="utf-8",
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "2 total" in body
+    assert "Canceled" in body
+    assert "PR-400" in body
+    assert "Crashed earlier" in body
+    assert 'hx-get="/repos/example__alpha/tasks/PR-400"' in body
+    assert "re-upload" in body.lower()
+
+
 def test_list_repo_tasks_returns_friendly_message_when_no_queue_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

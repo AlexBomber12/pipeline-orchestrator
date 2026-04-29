@@ -547,6 +547,42 @@ def test_recover_doing_task_without_pr_marks_canceled_and_idles(
     )
 
 
+def test_recover_seeds_crashed_set_from_canceled_queue_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-186 Codex P1: After a daemon restart that follows an IDLE cycle
+    which already wrote CANCELED to QUEUE.md, ``recover_state`` no longer
+    sees a DOING entry but must still know the task was crashed. Otherwise
+    the next ``_select_next_task_from_dag`` would recompute the task as
+    TODO and dispatch it again, defeating the manual-re-upload contract.
+    The fix re-seeds ``_crashed_task_pr_ids`` from any CANCELED queue
+    entry so the cancellation persists across restarts until the user
+    re-uploads."""
+    canceled = QueueTask(
+        pr_id="PR-042",
+        title="Crashed earlier",
+        status=TaskStatus.CANCELED,
+        branch="pr-042-inflight",
+    )
+    todo = _todo_task()
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
+    )
+
+    runner = _make_runner()
+    runner._parse_base_queue = lambda **_: [canceled, todo]  # type: ignore[method-assign]
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    # The crashed-task set must include the CANCELED entry so the next
+    # IDLE cycle's selector overrides its derived status to CANCELED
+    # rather than re-dispatching it as TODO.
+    assert runner._crashed_task_pr_ids == {"PR-042"}
+    # The TODO task is unaffected by the rehydrate.
+    assert "PR-043" not in runner._crashed_task_pr_ids
+
+
 def test_recover_paused_doing_task_without_pr_defers_coding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

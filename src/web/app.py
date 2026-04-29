@@ -1411,6 +1411,7 @@ async def list_repo_tasks(request: Request, name: str) -> Response:
         "doing": [t for t in tasks if t.status == TaskStatus.DOING],
         "todo": [t for t in tasks if t.status == TaskStatus.TODO],
         "done": [t for t in tasks if t.status == TaskStatus.DONE],
+        "canceled": [t for t in tasks if t.status == TaskStatus.CANCELED],
     }
     return templates.TemplateResponse(
         request,

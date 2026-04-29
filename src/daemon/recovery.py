@@ -215,6 +215,20 @@ class RecoveryMixin:
             len(tasks),
         )
 
+        # PR-186 Codex P1: rehydrate the crashed-task set from any CANCELED
+        # entries in the parsed queue. The crashed-task cancellation is what
+        # tells ``_select_next_task_from_dag`` to skip the task on the next
+        # IDLE cycle; without this rehydrate, a daemon restart after one
+        # IDLE cycle has already written CANCELED to QUEUE.md would start
+        # with an empty set, ``recover_state`` would see no DOING entry to
+        # re-mark, and the selector would recompute the task as TODO and
+        # dispatch it again — defeating the "manual re-upload required"
+        # contract and reintroducing the crash loop. The set is cleared
+        # only when the user re-uploads the task file (see ``repo_ops``).
+        for queued in tasks:
+            if queued.status == TaskStatus.CANCELED:
+                self._crashed_task_pr_ids.add(queued.pr_id)
+
         doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
 
         pending_sync = next(
