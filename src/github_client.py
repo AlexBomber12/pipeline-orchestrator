@@ -1145,10 +1145,15 @@ def _map_rest_ci_status_to_enum(
     required checks can still merge.
 
     When ``fetch_ok`` is ``False`` and there is no observable check data,
-    the result is ``CIStatus.FAILURE`` regardless of ``empty_is_success``:
-    a both-endpoints-failed REST fetch (auth/permission error, missing fork
-    SHA) must surface as an explicit failure rather than be silently mapped
-    to a green CI signal that would satisfy the auto-merge gate.
+    the result is ``CIStatus.PENDING`` regardless of ``empty_is_success``:
+    a both-endpoints-failed REST fetch (rate limit, auth/permission error,
+    missing fork SHA, transient transport error) blocks the auto-merge gate
+    just like any other PENDING signal — SUCCESS would silently merge an
+    unverified PR, while FAILURE would push WATCH into a FIX cycle that
+    burns more API budget on each retry and never converges. PENDING keeps
+    the daemon polling the same SHA without escalating; if the failure is
+    permanent ``review_timeout_min`` eventually escalates to HUNG, which is
+    the correct fallback for "we cannot verify CI."
 
     The combined commit-status endpoint embeds at most the first page of
     ``statuses`` while ``status_payload["state"]`` reflects the aggregate
@@ -1175,7 +1180,7 @@ def _map_rest_ci_status_to_enum(
 
     if not check_runs and not statuses:
         if not fetch_ok:
-            return CIStatus.FAILURE
+            return CIStatus.PENDING
         return CIStatus.SUCCESS if empty_is_success else CIStatus.PENDING
 
     states: list[str] = []

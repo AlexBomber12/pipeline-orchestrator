@@ -2374,24 +2374,23 @@ def test_map_rest_ci_status_handles_non_dict_status_payload() -> None:
 
 
 def test_map_rest_ci_status_failed_fetch_overrides_empty_is_success() -> None:
-    """``fetch_ok=False`` with empty payloads must return FAILURE, not SUCCESS.
+    """``fetch_ok=False`` with empty payloads must return PENDING.
 
-    A both-endpoints-failed REST fetch (auth/permission error, missing fork
-    SHA) must surface as an explicit failure rather than be silently mapped
-    to a green CI signal that would slip past the auto-merge gate when
-    ``allow_merge_without_checks`` is enabled.
+    PENDING blocks the auto-merge gate the same way FAILURE does, but it
+    keeps WATCH polling the same SHA instead of escalating to a FIX cycle
+    that would burn more API budget on each retry without ever converging.
     """
     assert (
         _map_rest_ci_status_to_enum(
             [], {}, empty_is_success=True, fetch_ok=False
         )
-        == CIStatus.FAILURE
+        == CIStatus.PENDING
     )
     assert (
         _map_rest_ci_status_to_enum(
             [], {}, empty_is_success=False, fetch_ok=False
         )
-        == CIStatus.FAILURE
+        == CIStatus.PENDING
     )
 
 
@@ -2557,8 +2556,9 @@ def test_get_open_prs_does_not_treat_rest_fetch_failure_as_success(
 
     Regression guard: when ``_fetch_ci_status_rest`` reports both endpoints
     failed, ``get_open_prs(allow_merge_without_checks=True)`` must surface
-    ``CIStatus.FAILURE`` so the WATCH auto-merge gate does not consume an
-    auth/permission error as a green CI signal.
+    ``CIStatus.PENDING`` so the WATCH auto-merge gate does not consume an
+    auth/permission error as a green CI signal — and does not push WATCH
+    into a FIX cycle that would compound the same transient failure.
     """
     raw = [
         {
@@ -2587,7 +2587,7 @@ def test_get_open_prs_does_not_treat_rest_fetch_failure_as_success(
 
     prs = get_open_prs("owner/name", allow_merge_without_checks=True)
 
-    assert prs[0].ci_status == CIStatus.FAILURE
+    assert prs[0].ci_status == CIStatus.PENDING
 
 
 def test_get_open_prs_falls_back_to_rest_on_graphql_rate_limit(
