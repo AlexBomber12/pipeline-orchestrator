@@ -232,8 +232,19 @@ class MergeMixin:
         commits or pushes. The in-place tweak keeps read consumers
         (dashboard, recovery) consistent with the just-merged status
         between handle_merge and the next IDLE tick.
+
+        On legacy repos that still track ``tasks/QUEUE.md`` upstream
+        (``.gitignore`` does not retroactively untrack files), an
+        in-place rewrite would dirty the working tree without ever
+        being committed or pushed; the next cycle's preflight would
+        then move the runner to ERROR before ``handle_idle`` ran. Skip
+        the rewrite in that case — the tracked snapshot on origin
+        remains the source of truth until the legacy repo migrates the
+        file out of git, mirroring ``_write_generated_queue_md``.
         """
         if self.state.current_task is None:
+            return
+        if self._origin_queue_md_tracked():
             return
         pr_id = self.state.current_task.pr_id
 

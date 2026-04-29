@@ -7465,6 +7465,39 @@ def test_mark_queue_done_writes_updated_queue_to_disk(tmp_path: Path) -> None:
     assert runner.state.pending_queue_sync_started_at is None
 
 
+def test_mark_queue_done_skips_when_origin_queue_md_tracked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Legacy repos that still track ``tasks/QUEUE.md`` on origin must
+    not have the local file rewritten — an unstaged rewrite would
+    dirty the working tree, push the next-cycle preflight to ERROR,
+    and block normal IDLE dispatch. Mirrors the
+    ``_write_generated_queue_md`` skip in IDLE."""
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "QUEUE.md"
+    original = (
+        "## PR-001: first\n- Status: DOING\n\n"
+        "## PR-002: second\n- Status: TODO\n"
+    )
+    queue_path.write_text(original)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="first", status=TaskStatus.DOING
+    )
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_origin_queue_md_tracked",
+        lambda self: True,
+    )
+
+    runner._mark_queue_done()
+
+    assert queue_path.read_text() == original
+
+
 def test_mark_queue_done_returns_without_current_task() -> None:
     runner = _make_runner()
     runner._mark_queue_done()
