@@ -3474,15 +3474,20 @@ def test_fetch_ci_status_rest_marks_fetch_failure_when_both_endpoints_fail(
     assert fetch_ok is False
 
 
-def test_fetch_ci_status_rest_partial_failure_with_empty_survivor_blocks_merge(
+def test_fetch_ci_status_rest_partial_failure_trusts_empty_survivor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One endpoint raising while the survivor is empty must surface ``fetch_ok=False``.
+    """One endpoint raising while the survivor returns an empty signal must
+    still surface ``fetch_ok=True``.
 
-    Tokens with split read permissions (can read commit statuses but not
-    check-runs, or vice versa) would otherwise produce ``check_runs=[]`` and
-    ``statuses=[]`` with ``fetch_ok=True`` and silently auto-merge an
-    unverifiable commit when ``allow_merge_without_checks=True``.
+    The testbed's GitHub App grants ``Commit statuses`` but not ``Checks``, so
+    ``check-runs`` raises 403 while ``status`` legitimately reports zero
+    contexts. Treating that as a fetch failure permanently blocked the
+    auto-merge gate even when the operator opted into
+    ``allow_merge_without_checks``. Trusting the surviving endpoint's empty
+    report restores the previous "no checks = green when explicitly allowed"
+    semantics; the both-endpoints-failed case below remains the fetch-failure
+    safety net.
     """
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
@@ -3496,13 +3501,13 @@ def test_fetch_ci_status_rest_partial_failure_with_empty_survivor_blocks_merge(
     check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
     assert check_runs == []
     assert status_payload == {"state": "pending", "statuses": []}
-    assert fetch_ok is False
+    assert fetch_ok is True
 
 
 def test_fetch_ci_status_rest_partial_failure_status_side_with_empty_check_runs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Mirror of the above for the opposite split: status fails, check-runs empty."""
+    """Mirror: ``status`` fails, ``check-runs`` returns empty — fetch still ok."""
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         if "check-runs" in args[-1]:
@@ -3515,7 +3520,7 @@ def test_fetch_ci_status_rest_partial_failure_status_side_with_empty_check_runs(
     check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
     assert check_runs == []
     assert status_payload == {}
-    assert fetch_ok is False
+    assert fetch_ok is True
 
 
 def test_fetch_ci_status_rest_parses_string_status_payload(
