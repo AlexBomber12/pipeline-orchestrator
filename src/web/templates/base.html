@@ -441,10 +441,14 @@
     <script>
         (function () {
             let dim = false;
+            function syncPulseDots() {
+                document.querySelectorAll('.pulse-dot').forEach(dot => dot.classList.toggle('dim', dim));
+            }
             setInterval(() => {
                 dim = !dim;
-                document.querySelectorAll('.pulse-dot').forEach(dot => dot.classList.toggle('dim', dim));
+                syncPulseDots();
             }, 1000);
+            document.body.addEventListener('htmx:afterSwap', syncPulseDots);
         })();
     </script>
 
