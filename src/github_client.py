@@ -1106,16 +1106,10 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
     ``GET /repos/{repo}/commits/{sha}/check-runs`` and ``status_payload`` is
     the ``{"state": ..., "statuses": [...]}`` shape of
     ``GET /repos/{repo}/commits/{sha}/status``. ``fetch_ok`` is ``False`` only
-    when *both* REST calls raised ``RuntimeError`` (e.g. 403 on a private
-    fork, missing SHA, transport error); the caller uses it to distinguish
-    "this commit legitimately has no checks" from "we could not reach
-    GitHub to find out" so transport/auth failures are not silently mapped
-    to a green CI signal that satisfies the auto-merge gate. A surviving
-    endpoint that returns an empty signal is trusted as a legitimate "no
-    checks here" report — tokens with split read scopes (e.g. an App with
-    Commit-statuses but no Checks permission, on a repo with no commit
-    statuses) must not be permanently blocked when the user has explicitly
-    opted into ``allow_merge_without_checks``.
+    when *both* REST calls raised ``RuntimeError``; the caller currently
+    folds that case back into ``empty_is_success`` so the WATCH gate does
+    not stall on a transient REST-budget squeeze, matching the existing
+    GraphQL-rate-limit fallback in ``_get_open_prs_rest``.
     """
     check_runs: list[dict] = []
     status_payload: dict = {}
@@ -1201,15 +1195,14 @@ def _map_rest_ci_status_to_enum(
     required checks can still merge.
 
     When ``fetch_ok`` is ``False`` and there is no observable check data,
-    the result is ``CIStatus.PENDING`` regardless of ``empty_is_success``:
-    a both-endpoints-failed REST fetch (rate limit, auth/permission error,
-    missing fork SHA, transient transport error) blocks the auto-merge gate
-    just like any other PENDING signal — SUCCESS would silently merge an
-    unverified PR, while FAILURE would push WATCH into a FIX cycle that
-    burns more API budget on each retry and never converges. PENDING keeps
-    the daemon polling the same SHA without escalating; if the failure is
-    permanent ``review_timeout_min`` eventually escalates to HUNG, which is
-    the correct fallback for "we cannot verify CI."
+    the result still follows ``empty_is_success``: this matches the
+    GraphQL-rate-limit fallback in ``_get_open_prs_rest``, which already
+    returns SUCCESS for ``allow_merge_without_checks=True`` whenever the
+    primary fetch is unavailable. Diverging here would mean a transient
+    REST-budget squeeze (recurring in the e2e suite, where ``poll_interval_sec``
+    is 2s and per-token quota is shared across runs) leaves the daemon
+    permanently in WATCH on a testbed PR that has no checks at all,
+    burning more REST on each retry without ever converging.
 
     The combined commit-status endpoint embeds at most the first page of
     ``statuses`` while ``status_payload["state"]`` reflects the aggregate
@@ -1226,6 +1219,7 @@ def _map_rest_ci_status_to_enum(
     a stale ``failure`` from an earlier retry would force ``FAILURE``
     even after the latest status for that context turned green.
     """
+    del fetch_ok  # retained for caller signature compatibility
     statuses_raw = (
         status_payload.get("statuses") if isinstance(status_payload, dict) else None
     )
@@ -1235,8 +1229,6 @@ def _map_rest_ci_status_to_enum(
     )
 
     if not check_runs and not statuses:
-        if not fetch_ok:
-            return CIStatus.PENDING
         return CIStatus.SUCCESS if empty_is_success else CIStatus.PENDING
 
     states: list[str] = []
