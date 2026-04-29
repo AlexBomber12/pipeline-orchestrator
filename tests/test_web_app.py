@@ -1738,7 +1738,7 @@ def test_repo_detail_state_badge_pulses_only_for_active_states(
     assert response.status_code == 200
     body = response.text
     assert state.value in body
-    assert body.count("pulse-dot") == (1 if should_pulse else 0)
+    assert body.count("pulse-badge") == (1 if should_pulse else 0)
 
 
 def test_index_shows_warning_when_redis_key_missing(
