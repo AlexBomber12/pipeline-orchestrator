@@ -2373,6 +2373,28 @@ def test_map_rest_ci_status_handles_non_dict_status_payload() -> None:
     )
 
 
+def test_map_rest_ci_status_failed_fetch_overrides_empty_is_success() -> None:
+    """``fetch_ok=False`` with empty payloads must return FAILURE, not SUCCESS.
+
+    A both-endpoints-failed REST fetch (auth/permission error, missing fork
+    SHA) must surface as an explicit failure rather than be silently mapped
+    to a green CI signal that would slip past the auto-merge gate when
+    ``allow_merge_without_checks`` is enabled.
+    """
+    assert (
+        _map_rest_ci_status_to_enum(
+            [], {}, empty_is_success=True, fetch_ok=False
+        )
+        == CIStatus.FAILURE
+    )
+    assert (
+        _map_rest_ci_status_to_enum(
+            [], {}, empty_is_success=False, fetch_ok=False
+        )
+        == CIStatus.FAILURE
+    )
+
+
 # ---------------------------------------------------------------------------
 # retry integration tests (PR-054)
 # ---------------------------------------------------------------------------
@@ -2462,7 +2484,7 @@ def test_get_open_prs_returns_prinfo_objects(
     monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
     monkeypatch.setattr(
         "src.github_client._fetch_ci_status_rest",
-        lambda repo, sha: ([], {}),
+        lambda repo, sha: ([], {}, True),
     )
     monkeypatch.setattr(
         "src.github_client.get_pr_review_status",
@@ -2507,9 +2529,13 @@ def test_get_open_prs_invokes_rest_helper_with_head_sha(
     ]
     captured: list[tuple[str, str]] = []
 
-    def fake_fetch(repo: str, sha: str) -> tuple[list[dict], dict]:
+    def fake_fetch(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
         captured.append((repo, sha))
-        return [{"conclusion": "failure"}], {"state": "failure", "statuses": []}
+        return (
+            [{"conclusion": "failure"}],
+            {"state": "failure", "statuses": []},
+            True,
+        )
 
     monkeypatch.setattr("src.github_client.run_gh", lambda *a, **kw: raw)
     monkeypatch.setattr("src.github_client._fetch_ci_status_rest", fake_fetch)
@@ -2521,6 +2547,46 @@ def test_get_open_prs_invokes_rest_helper_with_head_sha(
     prs = get_open_prs("owner/name")
 
     assert captured == [("owner/name", "deadbeef")]
+    assert prs[0].ci_status == CIStatus.FAILURE
+
+
+def test_get_open_prs_does_not_treat_rest_fetch_failure_as_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REST CI fetch failure must not map to SUCCESS even with the merge flag.
+
+    Regression guard: when ``_fetch_ci_status_rest`` reports both endpoints
+    failed, ``get_open_prs(allow_merge_without_checks=True)`` must surface
+    ``CIStatus.FAILURE`` so the WATCH auto-merge gate does not consume an
+    auth/permission error as a green CI signal.
+    """
+    raw = [
+        {
+            "number": 7,
+            "title": "PR-7: foo",
+            "headRefName": "bar",
+            "headRefOid": "deadbeef",
+            "url": "u",
+            "updatedAt": "2026-04-18T00:00:00Z",
+            "commits": [],
+            "author": {"login": "a"},
+            "labels": [],
+            "isCrossRepository": False,
+        }
+    ]
+
+    monkeypatch.setattr("src.github_client.run_gh", lambda *a, **kw: raw)
+    monkeypatch.setattr(
+        "src.github_client._fetch_ci_status_rest",
+        lambda repo, sha: ([], {}, False),
+    )
+    monkeypatch.setattr(
+        "src.github_client.get_pr_review_status",
+        lambda repo, number, pr_author, head_sha: ReviewStatus.PENDING,
+    )
+
+    prs = get_open_prs("owner/name", allow_merge_without_checks=True)
+
     assert prs[0].ci_status == CIStatus.FAILURE
 
 
@@ -3252,16 +3318,17 @@ def test_fetch_ci_status_rest_combines_check_runs_and_status(
 
     monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
 
-    check_runs, status_payload = _fetch_ci_status_rest("owner/name", "abc123")
+    check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
 
     assert [r["id"] for r in check_runs] == [1, 2, 3]
     assert status_payload == {"state": "pending", "statuses": [{"state": "pending"}]}
     assert any("--paginate" in c for c in calls)
+    assert fetch_ok is True
 
 
 def test_fetch_ci_status_rest_returns_empty_for_blank_sha() -> None:
     """A missing SHA short-circuits both REST calls."""
-    assert _fetch_ci_status_rest("owner/name", "") == ([], {})
+    assert _fetch_ci_status_rest("owner/name", "") == ([], {}, True)
 
 
 def test_fetch_ci_status_rest_degrades_on_check_runs_failure(
@@ -3277,9 +3344,10 @@ def test_fetch_ci_status_rest_degrades_on_check_runs_failure(
     monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
     monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
 
-    check_runs, status_payload = _fetch_ci_status_rest("owner/name", "abc123")
+    check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
     assert check_runs == []
     assert status_payload == {"state": "success", "statuses": [{"state": "success"}]}
+    assert fetch_ok is True
 
 
 def test_fetch_ci_status_rest_degrades_on_status_failure(
@@ -3295,9 +3363,32 @@ def test_fetch_ci_status_rest_degrades_on_status_failure(
     monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
     monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
 
-    check_runs, status_payload = _fetch_ci_status_rest("owner/name", "abc123")
+    check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
     assert check_runs == [{"conclusion": "success"}]
     assert status_payload == {}
+    assert fetch_ok is True
+
+
+def test_fetch_ci_status_rest_marks_fetch_failure_when_both_endpoints_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both endpoints raising must surface as ``fetch_ok=False``.
+
+    Guards against the regression where 403/network failures on both REST
+    calls collapsed into empty payloads that were then mapped to SUCCESS
+    via ``empty_is_success`` and slipped past the auto-merge gate.
+    """
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        raise RuntimeError("HTTP 403")
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
+
+    check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
+    assert check_runs == []
+    assert status_payload == {}
+    assert fetch_ok is False
 
 
 def test_fetch_ci_status_rest_parses_string_status_payload(
@@ -3312,7 +3403,7 @@ def test_fetch_ci_status_rest_parses_string_status_payload(
 
     monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
 
-    _, status_payload = _fetch_ci_status_rest("owner/name", "abc123")
+    _, status_payload, _ = _fetch_ci_status_rest("owner/name", "abc123")
     assert status_payload == {"state": "success", "statuses": [{"state": "success"}]}
 
 
@@ -3328,7 +3419,7 @@ def test_fetch_ci_status_rest_string_status_invalid_json_falls_back(
 
     monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
 
-    _, status_payload = _fetch_ci_status_rest("owner/name", "abc123")
+    _, status_payload, _ = _fetch_ci_status_rest("owner/name", "abc123")
     assert status_payload == {}
 
 
@@ -3344,7 +3435,7 @@ def test_fetch_ci_status_rest_ignores_non_list_pages(
 
     monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
 
-    check_runs, _ = _fetch_ci_status_rest("owner/name", "abc123")
+    check_runs, _, _ = _fetch_ci_status_rest("owner/name", "abc123")
     assert check_runs == []
 
 
@@ -3364,7 +3455,7 @@ def test_fetch_ci_status_rest_skips_non_dict_pages(
 
     monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
 
-    check_runs, _ = _fetch_ci_status_rest("owner/name", "abc123")
+    check_runs, _, _ = _fetch_ci_status_rest("owner/name", "abc123")
     assert check_runs == [{"conclusion": "success"}]
 
 

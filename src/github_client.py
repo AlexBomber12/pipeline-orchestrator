@@ -192,7 +192,9 @@ def get_open_prs(
         commits = entry.get("commits") or []
         head_sha = entry.get("headRefOid", "")
         title = entry.get("title", "")
-        check_runs, status_payload = _fetch_ci_status_rest(repo, head_sha)
+        check_runs, status_payload, fetch_ok = _fetch_ci_status_rest(
+            repo, head_sha
+        )
         prs.append(
             PRInfo(
                 number=number,
@@ -203,6 +205,7 @@ def get_open_prs(
                     check_runs,
                     status_payload,
                     empty_is_success=allow_merge_without_checks,
+                    fetch_ok=fetch_ok,
                 ),
                 review_status=get_pr_review_status(
                     repo,
@@ -1053,23 +1056,26 @@ _REST_CI_FAILURE_STATES = {
 _REST_CI_SUCCESS_STATES = {"SUCCESS", "COMPLETED", "NEUTRAL", "SKIPPED"}
 
 
-def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict]:
+def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
     """Fetch combined CI signals for ``sha`` via the REST API.
 
-    Returns ``(check_runs, status_payload)`` where ``check_runs`` is a flat
-    list of all check_run dicts across pages from
+    Returns ``(check_runs, status_payload, fetch_ok)`` where ``check_runs`` is
+    a flat list of all check_run dicts across pages from
     ``GET /repos/{repo}/commits/{sha}/check-runs`` and ``status_payload`` is
     the ``{"state": ..., "statuses": [...]}`` shape of
-    ``GET /repos/{repo}/commits/{sha}/status``. Either component degrades to
-    its empty default when the underlying ``gh api`` call fails so the
-    caller can still produce a safe ``CIStatus`` mapping rather than
-    aborting the whole PR list refresh.
+    ``GET /repos/{repo}/commits/{sha}/status``. ``fetch_ok`` is ``False`` only
+    when *both* REST calls raised ``RuntimeError`` (e.g. 403 on a private
+    fork, missing SHA, transport error); the caller uses it to distinguish
+    "this commit legitimately has no checks" from "we could not reach
+    GitHub to find out" so transport/auth failures are not silently mapped
+    to a green CI signal that satisfies the auto-merge gate.
     """
     check_runs: list[dict] = []
     status_payload: dict = {}
     if not sha:
-        return check_runs, status_payload
+        return check_runs, status_payload, True
 
+    check_runs_ok = False
     try:
         pages = retry_transient(
             lambda: run_gh(
@@ -1084,6 +1090,8 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict]:
         )
     except RuntimeError:
         pages = None
+    else:
+        check_runs_ok = True
     if isinstance(pages, list):
         for page in pages:
             if not isinstance(page, dict):
@@ -1092,6 +1100,7 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict]:
             if isinstance(runs, list):
                 check_runs.extend(r for r in runs if isinstance(r, dict))
 
+    status_ok = False
     try:
         raw_status = retry_transient(
             lambda: run_gh(
@@ -1106,6 +1115,8 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict]:
         )
     except RuntimeError:
         raw_status = None
+    else:
+        status_ok = True
     if isinstance(raw_status, dict):
         status_payload = raw_status
     elif isinstance(raw_status, str) and raw_status:
@@ -1116,13 +1127,14 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict]:
         if isinstance(parsed, dict):
             status_payload = parsed
 
-    return check_runs, status_payload
+    return check_runs, status_payload, check_runs_ok or status_ok
 
 
 def _map_rest_ci_status_to_enum(
     check_runs: list[dict],
     status_payload: dict,
     empty_is_success: bool = False,
+    fetch_ok: bool = True,
 ) -> CIStatus:
     """Combine REST ``check-runs`` + commit ``status`` payloads into a ``CIStatus``.
 
@@ -1131,6 +1143,12 @@ def _map_rest_ci_status_to_enum(
     otherwise PENDING. When neither check-runs nor commit statuses are
     present the result follows ``empty_is_success`` so repos without
     required checks can still merge.
+
+    When ``fetch_ok`` is ``False`` and there is no observable check data,
+    the result is ``CIStatus.FAILURE`` regardless of ``empty_is_success``:
+    a both-endpoints-failed REST fetch (auth/permission error, missing fork
+    SHA) must surface as an explicit failure rather than be silently mapped
+    to a green CI signal that would satisfy the auto-merge gate.
     """
     statuses_raw = (
         status_payload.get("statuses") if isinstance(status_payload, dict) else None
@@ -1138,6 +1156,8 @@ def _map_rest_ci_status_to_enum(
     statuses = statuses_raw if isinstance(statuses_raw, list) else []
 
     if not check_runs and not statuses:
+        if not fetch_ok:
+            return CIStatus.FAILURE
         return CIStatus.SUCCESS if empty_is_success else CIStatus.PENDING
 
     states: list[str] = []
