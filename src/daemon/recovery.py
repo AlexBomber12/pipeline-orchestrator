@@ -127,14 +127,29 @@ class RecoveryMixin:
         # Probe the queue source ONCE and reuse the result for both the
         # parse-source decision (origin/{branch} vs working tree) and the
         # ghost-filter decision below. A second independent probe inside
-        # ``_parse_base_queue`` could disagree if the first probe
-        # transiently failed (timeout/OSError reports ``False``) while
-        # the second succeeded: the queue would then be parsed from
-        # ``origin/{branch}`` while recovery still applied the
-        # local-existence ghost filter, dropping real DOING/DONE entries
-        # whose task files legitimately don't exist on a feature-branch
-        # checkout and detaching the daemon from in-flight PR work.
+        # ``_parse_base_queue`` could disagree under transient git
+        # slowness, parsing the queue from ``origin/{branch}`` while
+        # recovery still applied the local-existence ghost filter and
+        # dropped real DOING/DONE entries on a feature-branch checkout.
+        # The probe can also report ``None`` (timeout/OSError) — that is
+        # genuinely "unknown", not "untracked": collapsing it to
+        # ``False`` would route a legacy repo into the working-tree path
+        # where a feature-branch checkout (or missing ``tasks/QUEUE.md``)
+        # would yield a stale/empty queue and detach the daemon from
+        # in-flight DOING work. Treat ``None`` as ERROR so the next
+        # cycle re-probes once git is responsive.
         queue_from_origin = self._origin_queue_md_tracked()
+        if queue_from_origin is None:
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = (
+                "recover_state: tasks/QUEUE.md tracking probe failed; "
+                "retrying next cycle"
+            )
+            self.log_event(
+                "recover_state: tasks/QUEUE.md tracking probe failed; "
+                "retrying next cycle"
+            )
+            return False
         try:
             tasks = self._parse_base_queue(
                 strict=strict, queue_from_origin=queue_from_origin,

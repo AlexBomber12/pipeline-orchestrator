@@ -7498,6 +7498,39 @@ def test_mark_queue_done_skips_when_origin_queue_md_tracked(
     assert queue_path.read_text() == original
 
 
+def test_mark_queue_done_skips_when_tracking_probe_indeterminate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If the tracked-QUEUE probe itself failed (``None``), ``_mark_queue_done``
+    must skip the in-place rewrite. Conservatively treating ``None`` as
+    "tracked" protects legacy repos with a transiently flaky probe from
+    a dirtied working tree on every merge; post-PR-181 repos lose only
+    one in-place tweak and the next IDLE cycle regenerates QUEUE.md."""
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "QUEUE.md"
+    original = (
+        "## PR-001: first\n- Status: DOING\n\n"
+        "## PR-002: second\n- Status: TODO\n"
+    )
+    queue_path.write_text(original)
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="first", status=TaskStatus.DOING
+    )
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_origin_queue_md_tracked",
+        lambda self: None,
+    )
+
+    runner._mark_queue_done()
+
+    assert queue_path.read_text() == original
+
+
 def test_mark_queue_done_returns_without_current_task() -> None:
     runner = _make_runner()
     runner._mark_queue_done()
@@ -11314,6 +11347,58 @@ def test_write_generated_queue_md_skips_when_tracked_on_origin(
         if "Skipping QUEUE.md regeneration" in entry["event"]
     ]
     assert new_logs == []
+
+
+def test_write_generated_queue_md_skips_when_probe_indeterminate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """When the tracked-QUEUE probe itself is indeterminate (timeout /
+    OSError reports ``None``), ``_write_generated_queue_md`` skips the
+    write conservatively. Treating ``None`` as "not tracked" would
+    let a legacy repo's working tree be dirtied on every IDLE tick
+    while the probe was flaky; treating it as "tracked" only loses one
+    cycle of regeneration on post-PR-181 repos and self-heals next
+    tick. The legacy-tracked log line must NOT fire — it would mislead
+    operators into untracking a file that's actually fine."""
+    queue_dir = tmp_path / "tasks"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "QUEUE.md"
+    existing = "# existing on disk\n"
+    queue_path.write_text(existing, encoding="utf-8")
+    headers = [
+        TaskHeader(
+            pr_id="PR-001",
+            title="Project bootstrap",
+            branch="pr-001-bootstrap",
+            task_type="feature",
+            complexity="low",
+            depends_on=[],
+            priority=1,
+            coder="any",
+        )
+    ]
+    statuses = {"PR-001": TaskStatus.DONE}
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_origin_queue_md_tracked",
+        lambda self: None,
+    )
+
+    published = runner._write_generated_queue_md(headers, statuses)
+
+    assert published is True
+    # The on-disk file is left alone — no rewrite, no dirty tree.
+    assert queue_path.read_text(encoding="utf-8") == existing
+    # The "tracked on origin" log line must NOT fire under indeterminate
+    # probe results — that message tells operators to untrack the file.
+    assert not any(
+        "Skipping QUEUE.md regeneration" in entry["event"]
+        for entry in runner.state.history
+    )
 
 
 def test_select_next_task_from_dag_returns_none_when_tasks_dir_missing(

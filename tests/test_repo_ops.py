@@ -476,13 +476,84 @@ def test_parse_base_queue_origin_show_timeout_returns_none(
     assert runner._parse_base_queue() is None
 
 
-def test_parse_base_queue_origin_probe_timeout_falls_back_to_working_tree(
+def test_origin_queue_md_tracked_returns_true_when_cat_file_succeeds(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A flaky ``cat-file`` probe must not permanently mistake a
-    post-PR-181 repo for a tracked-QUEUE legacy one. On timeout the
-    helper reports untracked and the working-tree path runs as usual.
+    """A clean ``returncode == 0`` from ``cat-file -e`` means the file
+    exists on ``origin/{branch}`` — the legacy tracked-QUEUE state."""
+    runner = _Runner(tmp_path)
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        del kwargs
+        assert args[:2] == ("cat-file", "-e")
+        return _FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", fake_git)
+
+    assert runner._origin_queue_md_tracked() is True
+
+
+def test_origin_queue_md_tracked_returns_false_when_cat_file_reports_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A non-zero ``returncode`` is a definitive "file not on origin" —
+    the post-PR-181 state — and must stay distinguishable from probe
+    failures so the daemon can take the gitignored/regenerate path."""
+    runner = _Runner(tmp_path)
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        del kwargs
+        assert args[:2] == ("cat-file", "-e")
+        return _FakeCompletedProcess(returncode=1)
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", fake_git)
+
+    assert runner._origin_queue_md_tracked() is False
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        subprocess.TimeoutExpired(
+            ["git", "cat-file", "-e", "origin/main:tasks/QUEUE.md"], timeout=10,
+        ),
+        OSError("git binary missing"),
+    ],
+)
+def test_origin_queue_md_tracked_returns_none_on_probe_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    exc: BaseException,
+) -> None:
+    """Probe failures are genuinely indeterminate. Returning ``False``
+    here would make legacy repos look post-PR-181 and route recovery
+    into the working-tree path — where a feature-branch checkout (or
+    missing ``tasks/QUEUE.md``) would yield a stale/empty queue and
+    detach the daemon from in-flight DOING work. Returning ``None``
+    lets each caller pick its own conservative fallback."""
+    runner = _Runner(tmp_path)
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        del kwargs
+        raise exc
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", fake_git)
+
+    assert runner._origin_queue_md_tracked() is None
+
+
+def test_parse_base_queue_origin_probe_timeout_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A flaky ``cat-file`` probe is genuinely indeterminate, not
+    "untracked". Falling back to the working tree on probe failure
+    would route a legacy repo's recovery into a feature-branch
+    snapshot and detach the daemon from in-flight DOING work. Instead
+    the helper returns ``None`` so the caller (recovery) can ERROR
+    and retry once git is responsive.
     """
     runner = _Runner(tmp_path)
     repo = Path(runner.repo_path)
@@ -491,18 +562,23 @@ def test_parse_base_queue_origin_probe_timeout_falls_back_to_working_tree(
         "## PR-200: Working tree\n- Status: TODO\n- Branch: pr-200\n",
         encoding="utf-8",
     )
+    show_calls: list[tuple[str, ...]] = []
 
     def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
         del kwargs
         if args[:2] == ("cat-file", "-e"):
             raise subprocess.TimeoutExpired(["git", *args], timeout=10)
+        if args[0] == "show":
+            show_calls.append(args)
         return _FakeCompletedProcess()
 
     monkeypatch.setattr(repo_ops.git_ops, "_git", fake_git)
 
-    parsed = runner._parse_base_queue()
-    assert parsed is not None
-    assert parsed[0].pr_id == "PR-200"
+    assert runner._parse_base_queue() is None
+    assert show_calls == [], (
+        "must not silently fall back to origin or working-tree on "
+        "indeterminate probe result"
+    )
 
 
 def test_parse_base_queue_honors_explicit_queue_from_origin_without_reprobing(

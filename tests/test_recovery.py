@@ -62,13 +62,23 @@ def _repo_cfg(**overrides: Any) -> RepoConfig:
 
 
 def _make_runner() -> PipelineRunner:
-    return PipelineRunner(
+    runner = PipelineRunner(
         _repo_cfg(),
         AppConfig(repositories=[], daemon=DaemonConfig()),
         _FakeRedis(),
         _FakeUsageProvider(),
         _FakeUsageProvider(),
     )
+    # Default the tracked-QUEUE probe to ``False`` (post-PR-181) so
+    # tests that do not exercise the probe directly keep going through
+    # the working-tree path. The real probe shells out to ``git
+    # cat-file`` against ``self.repo_path``, which does not exist in
+    # these unit tests; without this stub the probe would now report
+    # ``None`` (indeterminate) and recovery would short-circuit to
+    # ERROR before the test's stubbed ``_parse_base_queue`` runs.
+    # Tests that *do* exercise the probe install their own override.
+    runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
+    return runner
 
 
 class _FakeUsageProvider:
@@ -1567,6 +1577,46 @@ def test_recover_state_origin_queue_read_failure_sets_error_and_returns_false(
     assert runner.state.state == PipelineState.ERROR
     assert "read QUEUE.md" in (runner.state.error_message or "")
     assert "origin" in (runner.state.error_message or "")
+    assert gh_calls == [], "must bail before probing GitHub"
+
+
+def test_recover_state_probe_failure_errors_instead_of_walking_working_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the ``cat-file`` probe itself fails (timeout/OSError) the
+    tracked-QUEUE state is genuinely unknown. Treating the failure as
+    "untracked" would route a legacy repo into the working-tree parse
+    path — where a feature-branch checkout or a missing
+    ``tasks/QUEUE.md`` yields a stale/empty queue and the daemon
+    detaches from real in-flight DOING work. Recovery must ERROR so
+    the next cycle retries the probe once git is responsive, and must
+    not call ``_parse_base_queue`` or hit GitHub at all."""
+    parse_calls: list[dict[str, object]] = []
+    gh_calls: list[str] = []
+
+    def fake_parse(**kwargs: object) -> list[QueueTask]:  # pragma: no cover - must not run
+        parse_calls.append(kwargs)
+        return []
+
+    def spy_gh(repo: str, **kw: Any) -> list[PRInfo]:  # pragma: no cover - must not run
+        gh_calls.append(repo)
+        return []
+
+    monkeypatch.setattr(runner_module.github_client, "get_open_prs", spy_gh)
+
+    runner = _make_runner()
+    runner._parse_base_queue = fake_parse  # type: ignore[method-assign]
+    runner._origin_queue_md_tracked = lambda: None  # type: ignore[method-assign,return-value]
+
+    result = asyncio.run(runner.recover_state())
+
+    assert result is False
+    assert runner.state.state == PipelineState.ERROR
+    assert "tracking probe failed" in (runner.state.error_message or "")
+    assert parse_calls == [], (
+        "must not parse queue when probe is indeterminate — origin vs "
+        "working-tree decision is unsafe"
+    )
     assert gh_calls == [], "must bail before probing GitHub"
 
 

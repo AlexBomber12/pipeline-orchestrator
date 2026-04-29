@@ -244,7 +244,13 @@ class MergeMixin:
         """
         if self.state.current_task is None:
             return
-        if self._origin_queue_md_tracked():
+        # ``None`` means the cat-file probe itself failed (transient git
+        # slowness); treat as if tracked so we skip the rewrite. A
+        # legacy repo with a flaky probe would otherwise dirty the
+        # working tree on every merge and trip preflight into ERROR.
+        # Post-PR-181 repos only lose one in-place tweak; the next IDLE
+        # cycle regenerates QUEUE.md from headers anyway.
+        if self._origin_queue_md_tracked() is not False:
             return
         pr_id = self.state.current_task.pr_id
 

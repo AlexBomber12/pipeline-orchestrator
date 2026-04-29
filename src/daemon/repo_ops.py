@@ -176,20 +176,28 @@ class RepoOpsMixin:
         except OSError as exc:
             raise RuntimeError(f"sync_to_main OS error: {exc}") from exc
 
-    def _origin_queue_md_tracked(self) -> bool:
-        """Return ``True`` only when ``origin/{branch}`` tracks ``tasks/QUEUE.md``.
+    def _origin_queue_md_tracked(self) -> bool | None:
+        """Return ``True``/``False`` for tracked-on-origin, ``None`` on probe failure.
 
-        PR-181 untracks the file in this repo, but managed repos that
-        have not yet adopted that migration still carry ``tasks/QUEUE.md``
-        in tree. ``.gitignore`` does not retroactively untrack files, so
-        the daemon must detect tracked-QUEUE repos and steer clear of
-        the local-write / working-tree-read paths that PR-181's design
-        otherwise relies on.
+        PR-181 untracks ``tasks/QUEUE.md`` in this repo, but managed
+        repos that have not yet adopted that migration still carry the
+        file in tree. ``.gitignore`` does not retroactively untrack
+        files, so the daemon must detect tracked-QUEUE repos and steer
+        clear of the local-write / working-tree-read paths that PR-181's
+        design otherwise relies on.
 
-        Conservative on uncertainty: a probe failure (timeout, OSError,
-        missing ref on a fresh clone) reports ``False`` so post-PR-181
-        repos cannot be permanently mistaken for legacy ones. Legacy
-        repos self-heal on the next IDLE cycle once git is responsive.
+        Tristate on purpose. A transient ``cat-file`` failure (timeout,
+        OSError) is genuinely indeterminate: collapsing it to ``False``
+        would make legacy repos look post-PR-181 and route recovery into
+        the working-tree path, where a feature-branch checkout (or a
+        missing ``tasks/QUEUE.md``) would yield a stale/empty queue and
+        detach the daemon from real in-flight DOING work. Returning
+        ``None`` lets each caller pick its own conservative fallback:
+        recovery escalates to ERROR and retries; the IDLE/merge handlers
+        skip their writes (treat as tracked) and self-heal next cycle.
+
+        A non-zero ``returncode`` (file genuinely absent on origin) is
+        still a definitive ``False``.
         """
         branch = self.repo_config.branch
         try:
@@ -202,7 +210,7 @@ class RepoOpsMixin:
                 timeout=10,
             )
         except (subprocess.TimeoutExpired, OSError):
-            return False
+            return None
         return result.returncode == 0
 
     def _parse_base_queue(
@@ -237,10 +245,15 @@ class RepoOpsMixin:
         decisions (e.g., reading from origin while the caller still
         applies the local-existence ghost filter, which would drop
         real DOING/DONE entries on a feature-branch checkout). When
-        ``None``, the helper probes internally as before.
+        ``None``, the helper probes internally; an indeterminate probe
+        result (``None``) is treated as "no snapshot can be parsed" so
+        the helper does not silently fall back to a possibly-stale
+        working-tree copy on legacy repos.
         """
         if queue_from_origin is None:
             queue_from_origin = self._origin_queue_md_tracked()
+            if queue_from_origin is None:
+                return None
         if queue_from_origin:
             branch = self.repo_config.branch
             try:

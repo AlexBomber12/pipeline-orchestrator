@@ -90,8 +90,17 @@ class IdleMixin:
         """
         queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
         self._idle_generated_queue_needs_resync = False
-        if self._origin_queue_md_tracked():
-            if not getattr(self, "_legacy_tracked_queue_md_logged", False):
+        # ``None`` means the cat-file probe itself failed (transient git
+        # slowness); treat as if tracked so the regenerate is skipped
+        # for this cycle. A legacy repo whose probe is briefly flaky
+        # would otherwise have its working tree dirtied on every IDLE
+        # tick. Post-PR-181 repos lose only one cycle of regeneration
+        # and self-heal on the next tick once the probe succeeds.
+        tracked = self._origin_queue_md_tracked()
+        if tracked is not False:
+            if tracked is True and not getattr(
+                self, "_legacy_tracked_queue_md_logged", False,
+            ):
                 self.log_event(
                     "Skipping QUEUE.md regeneration: still tracked on "
                     f"origin/{self.repo_config.branch}; "
