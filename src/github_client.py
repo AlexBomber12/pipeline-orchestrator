@@ -1156,6 +1156,14 @@ def _map_rest_ci_status_to_enum(
     embedded list can omit a failing context entirely; honoring the
     aggregate ``state`` whenever any status context is reported keeps the
     pagination-capped failure from being silently classified SUCCESS.
+
+    The ``statuses`` list itself is reverse-chronological history across
+    contexts — the same context can appear multiple times with older
+    states first overwritten by newer ones. ``state`` already reduces
+    those entries to the latest per context, so the per-entry list is
+    deliberately not consulted for the FAILURE/SUCCESS rollup; otherwise
+    a stale ``failure`` from an earlier retry would force ``FAILURE``
+    even after the latest status for that context turned green.
     """
     statuses_raw = (
         status_payload.get("statuses") if isinstance(status_payload, dict) else None
@@ -1177,13 +1185,6 @@ def _map_rest_ci_status_to_enum(
         value = run.get("conclusion") or run.get("status")
         if value:
             states.append(str(value).upper())
-
-    for status in statuses:
-        if not isinstance(status, dict):
-            continue
-        state_val = status.get("state")
-        if state_val:
-            states.append(str(state_val).upper())
 
     if statuses and isinstance(combined_state, str) and combined_state:
         states.append(combined_state.upper())

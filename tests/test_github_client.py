@@ -3351,6 +3351,33 @@ def test_map_rest_ci_status_combined_state_ignored_when_no_statuses() -> None:
     )
 
 
+def test_map_rest_ci_status_stale_failure_in_history_does_not_override_combined_success() -> None:
+    """Reverse-chronological ``statuses`` history must not force FAILURE.
+
+    The combined-status endpoint returns every per-context status in
+    reverse chronological order, so a context that flipped failure ->
+    success on retry shows both entries with the failure listed first.
+    The aggregate ``state`` already reduces to the latest per context;
+    iterating over the full history and treating any ``failure`` as
+    terminal would block green PRs whose latest statuses are all
+    success. Trusting ``state`` and ignoring the per-entry list keeps
+    that path green.
+    """
+    assert (
+        _map_rest_ci_status_to_enum(
+            [{"conclusion": "success"}],
+            {
+                "state": "success",
+                "statuses": [
+                    {"context": "ci/foo", "state": "success"},
+                    {"context": "ci/foo", "state": "failure"},
+                ],
+            },
+        )
+        == CIStatus.SUCCESS
+    )
+
+
 def test_fetch_ci_status_rest_combines_check_runs_and_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
