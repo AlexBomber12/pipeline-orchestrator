@@ -10,15 +10,50 @@ from __future__ import annotations
 
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 
 from src import github_client
 from src.daemon import git_ops
-from src.models import PipelineState, PRInfo, TaskStatus
+from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 from src.queue_parser import QueueValidationError
 
 
 class RecoveryMixin:
     """State recovery on daemon startup."""
+
+    def _drop_ghost_queue_entries(
+        self, tasks: list[QueueTask]
+    ) -> list[QueueTask]:
+        """Drop QUEUE.md entries whose declared task file is missing.
+
+        Since PR-181, ``tasks/QUEUE.md`` is gitignored and survives
+        ``sync_to_main``'s ``git reset --hard`` + ``git clean -fd``. A
+        snapshot from a prior cycle (or a prior CI run sharing the
+        daemon volume) can therefore reference tasks/PR-*.md files that
+        no longer exist after the base branch was wiped. ``handle_idle``
+        already filters such ghosts before dispatch (see PR-181 follow-
+        up); recovery must apply the same rule before deciding to
+        resurrect a DOING task or match a DONE task to an open PR,
+        otherwise a stale DOING entry from a previous test would drag
+        the daemon back onto a deleted task instead of staying IDLE.
+
+        Entries without an explicit ``Tasks file:`` line keep their
+        pre-PR-181 fallback semantics — the legacy migration paths
+        cannot be verified against a file path.
+        """
+        kept: list[QueueTask] = []
+        for queued in tasks:
+            if (
+                queued.task_file is not None
+                and not (Path(self.repo_path) / queued.task_file).is_file()
+            ):
+                self.log_event(
+                    f"recover_state: ignoring ghost QUEUE.md entry "
+                    f"{queued.pr_id} (no {queued.task_file} on disk)"
+                )
+                continue
+            kept.append(queued)
+        return kept
 
     async def recover_state(self) -> bool:
         """Reconstruct state from QUEUE.md + GitHub on daemon startup.
@@ -83,6 +118,7 @@ class RecoveryMixin:
             self.state.error_message = f"recover_state: get_open_prs failed: {exc}"
             self.log_event(f"recover_state failed: {exc}")
             return False
+        tasks = self._drop_ghost_queue_entries(tasks)
         self._set_queue_progress(
             sum(1 for t in tasks if t.status == TaskStatus.DONE),
             len(tasks),

@@ -285,6 +285,52 @@ def test_recover_state_pending_queue_sync_uses_now_when_last_activity_missing(
     assert runner.state.pending_queue_sync_started_at == frozen_now
 
 
+def test_recover_state_drops_ghost_doing_entry_with_missing_task_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A QUEUE.md DOING entry whose declared task file no longer exists
+    must be ignored. After PR-181, ``tasks/QUEUE.md`` is gitignored and
+    survives ``sync_to_main``'s ``git reset --hard``/``git clean -fd``,
+    so a stale snapshot from a prior cycle (or a prior CI run sharing
+    the daemon volume) can outlive the underlying tasks/PR-*.md files
+    after the base branch was wiped. Without this filter, recovery
+    would resurrect that ghost over the live IDLE queue and drag the
+    daemon back onto a deleted task.
+    """
+    ghost = QueueTask(
+        pr_id="PR-999",
+        title="Ghost from prior run",
+        status=TaskStatus.DOING,
+        branch="pr-999-ghost",
+        task_file="tasks/PR-999.md",
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
+    )
+    coding_calls: list[str] = []
+
+    async def fake_coding() -> None:  # pragma: no cover - must not fire
+        coding_calls.append("coding")
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._parse_base_queue = lambda **_: [ghost]  # type: ignore[method-assign]
+    runner.handle_coding = fake_coding  # type: ignore[method-assign]
+
+    result = asyncio.run(runner.recover_state())
+
+    assert result is True
+    assert coding_calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.queue_total == 0
+    assert any(
+        "ignoring ghost QUEUE.md entry PR-999" in e["event"]
+        for e in runner.state.history
+    )
+
+
 def test_recover_doing_task_without_pr_rerun_coding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

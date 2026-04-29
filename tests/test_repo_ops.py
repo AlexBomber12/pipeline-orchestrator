@@ -474,10 +474,12 @@ def test_process_pending_uploads_success_and_nothing_to_commit(
 
     assert _run(runner.process_pending_uploads()) is True
 
-    assert (repo_dir / "tasks" / "QUEUE.md").read_text(encoding="utf-8") == "# Queue\n"
+    # QUEUE.md is gitignored; it must NOT be copied to the working
+    # tree or staged, otherwise ``git add`` would abort the upload.
+    assert not (repo_dir / "tasks" / "QUEUE.md").exists()
     assert (repo_dir / "AGENTS.md").read_text(encoding="utf-8") == "# AGENTS\n"
     assert git_calls == [
-        (runner.repo_path, "add", "tasks/QUEUE.md", "AGENTS.md"),
+        (runner.repo_path, "add", "AGENTS.md"),
         (
             runner.repo_path,
             "commit",
@@ -488,6 +490,9 @@ def test_process_pending_uploads_success_and_nothing_to_commit(
     ]
     assert removed == [staging]
     assert key not in runner.redis.store
+    assert any(
+        "Skipping QUEUE.md from upload" in event for event in runner.events
+    )
     assert any(
         "Uploaded 0 task files to tasks/ and pushed to main" in event
         for event in runner.events
@@ -502,9 +507,9 @@ def test_process_pending_uploads_returns_none_when_newer_manifest_exists(
     Path(runner.repo_path).mkdir(parents=True)
     staging = tmp_path / "uploads" / "demo"
     staging.mkdir(parents=True)
-    (staging / "QUEUE.md").write_text("# Queue\n", encoding="utf-8")
+    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
     key = f"upload:{runner.name}:pending"
-    old_manifest = json.dumps({"files": ["QUEUE.md"], "staging_dir": str(staging)})
+    old_manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
     runner.redis.store[key] = old_manifest
 
     monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
@@ -529,9 +534,9 @@ def test_process_pending_uploads_reports_configured_push_branch(
     Path(runner.repo_path).mkdir(parents=True)
     staging = tmp_path / "uploads" / "demo"
     staging.mkdir(parents=True)
-    (staging / "QUEUE.md").write_text("# Queue\n", encoding="utf-8")
+    (staging / "AGENTS.md").write_text("# AGENTS\n", encoding="utf-8")
     key = f"upload:{runner.name}:pending"
-    manifest = json.dumps({"files": ["QUEUE.md"], "staging_dir": str(staging)})
+    manifest = json.dumps({"files": ["AGENTS.md"], "staging_dir": str(staging)})
     runner.redis.store[key] = manifest
 
     monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
@@ -615,6 +620,46 @@ def test_process_pending_uploads_logs_overwrite_collision_hashes(
     )
 
 
+def test_process_pending_uploads_skips_queue_md_only_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A manifest containing only QUEUE.md must be discarded without
+    touching git: QUEUE.md is gitignored (PR-181) and ``git add`` would
+    abort the whole upload, blocking dispatch retries indefinitely.
+    """
+    runner = _Runner(tmp_path)
+    Path(runner.repo_path).mkdir(parents=True)
+    staging = tmp_path / "uploads" / "demo"
+    staging.mkdir(parents=True)
+    (staging / "QUEUE.md").write_text("# Queue\n", encoding="utf-8")
+    manifest = json.dumps({"files": ["QUEUE.md"], "staging_dir": str(staging)})
+    key = f"upload:{runner.name}:pending"
+    runner.redis.store[key] = manifest
+    git_calls: list[tuple[Any, ...]] = []
+    removed: list[Path] = []
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append((repo_path, *args))
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", fake_git)
+    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
+    monkeypatch.setattr(
+        repo_ops.shutil,
+        "rmtree",
+        lambda path, ignore_errors=True: removed.append(Path(path)),
+    )
+
+    assert _run(runner.process_pending_uploads()) is False
+    assert git_calls == []
+    assert removed == [staging]
+    assert key not in runner.redis.store
+    assert any(
+        "Skipping QUEUE.md from upload" in event for event in runner.events
+    )
+
+
 def test_process_pending_uploads_handles_failures_and_safe_mode(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -623,8 +668,8 @@ def test_process_pending_uploads_handles_failures_and_safe_mode(
     Path(runner.repo_path).mkdir(parents=True)
     staging = tmp_path / "uploads" / "demo"
     staging.mkdir(parents=True)
-    (staging / "QUEUE.md").write_text("# Queue\n", encoding="utf-8")
-    manifest = json.dumps({"files": ["QUEUE.md"], "staging_dir": str(staging)})
+    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
+    manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
     key = f"upload:{runner.name}:pending"
     runner.redis.store[key] = manifest
     git_calls: list[tuple[Any, ...]] = []

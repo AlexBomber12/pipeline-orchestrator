@@ -5331,6 +5331,7 @@ def test_fix_increments_iterations(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_fix_iterations_survive_recovery_until_merge(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     parsed_tasks = [
         QueueTask(
@@ -5341,6 +5342,8 @@ def test_fix_iterations_survive_recovery_until_merge(
             task_file="tasks/PR-001.md",
         )
     ]
+    (tmp_path / "tasks").mkdir(parents=True)
+    (tmp_path / "tasks" / "PR-001.md").write_text("# PR-001\n")
 
     def fake_git(repo_path: str, *args: str, **kw: Any) -> Any:
         if args[:2] == ("rev-parse", "HEAD"):
@@ -5401,6 +5404,7 @@ def test_fix_iterations_survive_recovery_until_merge(
         claude_provider,
         codex_provider,
     )
+    runner.repo_path = str(tmp_path)
     runner.state.current_task = QueueTask(
         pr_id="PR-001",
         title="t",
@@ -5421,6 +5425,7 @@ def test_fix_iterations_survive_recovery_until_merge(
         redis,
         *_usage_providers(),
     )
+    recovered.repo_path = str(tmp_path)
     asyncio.run(recovered.recover_state())
 
     assert recovered.state.state == PipelineState.WATCH
@@ -11285,9 +11290,9 @@ def test_process_pending_uploads_preserves_upload_on_git_failure(
 
     staging = tmp_path.parent / "uploads" / runner.name / "abc123"
     staging.mkdir(parents=True)
-    (staging / "QUEUE.md").write_text("- PR-001")
+    (staging / "PR-001.md").write_text("- PR-001")
 
-    manifest = json.dumps({"files": ["QUEUE.md"], "staging_dir": str(staging)})
+    manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
     key = f"upload:{runner.name}:pending"
     asyncio.run(runner.redis.set(key, manifest))
 
@@ -11309,11 +11314,11 @@ def test_process_pending_uploads_cas_delete_skips_newer_manifest(
 
     staging = tmp_path.parent / "uploads" / runner.name / "old123"
     staging.mkdir(parents=True, exist_ok=True)
-    (staging / "QUEUE.md").write_text("- PR-001")
+    (staging / "PR-001.md").write_text("- PR-001")
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir(exist_ok=True)
 
-    old_manifest = json.dumps({"files": ["QUEUE.md"], "staging_dir": str(staging)})
+    old_manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
     new_manifest = json.dumps({"files": ["PR-099.md"]})
     key = f"upload:{runner.name}:pending"
     asyncio.run(runner.redis.set(key, old_manifest))
@@ -11361,7 +11366,10 @@ def test_process_pending_uploads_routes_root_instruction_files(
     result = asyncio.run(runner.process_pending_uploads())
 
     assert result is True
-    assert (tmp_path / "tasks" / "QUEUE.md").read_text(encoding="utf-8") == "# Task Queue\n"
+    # QUEUE.md is gitignored (PR-181) and must NOT be staged or copied
+    # to the working tree from an upload, otherwise ``git add`` would
+    # abort the whole batch and block subsequent dispatches.
+    assert not (tmp_path / "tasks" / "QUEUE.md").exists()
     assert (tmp_path / "AGENTS.md").read_text(encoding="utf-8") == "# AGENTS\n"
     assert (tmp_path / "CLAUDE.md").read_text(encoding="utf-8") == "Read AGENTS.md\n"
     assert not (tmp_path / "tasks" / "AGENTS.md").exists()
@@ -13987,6 +13995,7 @@ def test_handle_watch_retries_rehydrate_last_push_at(
 
 def test_recover_state_rehydrates_last_push_at(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """recover_state must rehydrate _last_push_at when matching to an
     in-flight DOING task's open PR so the first post-restart handle_watch
@@ -14000,6 +14009,8 @@ def test_recover_state_rehydrates_last_push_at(
             task_file="tasks/PR-001.md",
         )
     ]
+    (tmp_path / "tasks").mkdir(parents=True)
+    (tmp_path / "tasks" / "PR-001.md").write_text("# PR-001\n")
 
     head_iso = "2026-04-10T12:00:00Z"
     monkeypatch.setattr(
@@ -14014,6 +14025,7 @@ def test_recover_state_rehydrates_last_push_at(
     )
 
     runner = _make_runner()
+    runner.repo_path = str(tmp_path)
     runner._parse_base_queue = lambda **_: parsed_tasks  # type: ignore[method-assign]
     assert runner._last_push_at is None
     asyncio.run(runner.recover_state())
