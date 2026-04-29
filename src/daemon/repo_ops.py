@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -409,15 +410,23 @@ return 0
             # PR-186: Re-uploading a task file is the user's signal to retry
             # a previously-crashed task. Clear the in-memory CANCELED mark
             # for any uploaded PR-id so the next IDLE cycle picks the task
-            # again instead of treating it as still crashed.
+            # again instead of treating it as still crashed. Also flip the
+            # working-tree ``tasks/QUEUE.md`` row from CANCELED to TODO for
+            # those PR-ids: the next IDLE regenerates the queue from
+            # headers, but a daemon restart between this upload and that
+            # regeneration would otherwise see the stale CANCELED row,
+            # rehydrate ``_crashed_task_pr_ids`` from it, and re-cancel the
+            # task — losing the retry signal until the user uploads again.
+            uploaded_pr_ids = {
+                Path(name).stem
+                for name in stageable_filenames
+                if name.startswith("PR-") and name.endswith(".md")
+            }
             crashed_pr_ids = getattr(self, "_crashed_task_pr_ids", None)
             if crashed_pr_ids:
-                uploaded_pr_ids = {
-                    Path(name).stem
-                    for name in stageable_filenames
-                    if name.startswith("PR-") and name.endswith(".md")
-                }
                 crashed_pr_ids.difference_update(uploaded_pr_ids)
+            if uploaded_pr_ids:
+                self._clear_canceled_queue_rows(uploaded_pr_ids)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
             logger.error("%s: upload git operations failed: %s", self.name, exc)
             self.log_event(f"Upload push failed: {exc}")
@@ -441,3 +450,56 @@ return 0
 
         self.log_event("Newer upload pending; blocking dispatch to process it next cycle")
         return None
+
+    def _clear_canceled_queue_rows(self, uploaded_pr_ids: set[str]) -> None:
+        """Flip CANCELED → TODO in the working-tree QUEUE.md for re-uploads.
+
+        Bridges the gap between an upload landing (which the user uses to
+        retry a previously-crashed task) and the next IDLE regeneration of
+        ``tasks/QUEUE.md``. Without this, a daemon restart in that window
+        would re-read the stale CANCELED row from QUEUE.md and re-add the
+        PR-id to ``_crashed_task_pr_ids`` via ``recover_state``'s
+        rehydrate, silently dropping the retry signal.
+
+        Best-effort: missing or unreadable QUEUE.md is a no-op (the next
+        IDLE cycle regenerates from scratch and there is no stale row to
+        clear). Legacy tracked-QUEUE repos see only a working-tree change
+        here; recovery on those repos still parses ``origin/{branch}``,
+        so the user must also keep the upstream queue in sync as before.
+        """
+        queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
+        try:
+            text = queue_path.read_text(encoding="utf-8")
+        except (FileNotFoundError, OSError):
+            return
+
+        new_lines: list[str] = []
+        current_pr_id: str | None = None
+        changed = False
+        header_re = re.compile(r"^##\s+(PR-[A-Za-z0-9_.-]+)\b")
+        status_re = re.compile(r"^(\s*-\s*Status\s*:\s*)CANCELED(\s*)$")
+        for line in text.splitlines(keepends=True):
+            stripped = line.rstrip("\n").rstrip("\r")
+            header_match = header_re.match(stripped)
+            if header_match:
+                current_pr_id = header_match.group(1)
+                new_lines.append(line)
+                continue
+            if current_pr_id in uploaded_pr_ids:
+                status_match = status_re.match(stripped)
+                if status_match:
+                    eol = line[len(stripped):]
+                    new_lines.append(
+                        f"{status_match.group(1)}TODO{status_match.group(2)}{eol}"
+                    )
+                    changed = True
+                    continue
+            new_lines.append(line)
+
+        if changed:
+            try:
+                queue_path.write_text("".join(new_lines), encoding="utf-8")
+            except OSError as exc:
+                self.log_event(
+                    f"Failed to clear stale CANCELED rows in QUEUE.md: {exc}"
+                )
