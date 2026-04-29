@@ -67,6 +67,7 @@ class _Runner(repo_ops.RepoOpsMixin):
         self.redis = _FakeRedis()
         self.name = "demo"
         self.events: list[str] = []
+        self._crashed_task_pr_ids: set[str] = set()
 
     def log_event(self, message: str) -> None:
         self.events.append(message)
@@ -857,6 +858,33 @@ def test_process_pending_uploads_counts_unique_task_filenames_in_log_event(
         "Uploaded 2 task files to tasks/ and pushed to main" in event
         for event in runner.events
     )
+
+
+def test_process_pending_uploads_clears_crashed_pr_ids_on_reupload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """PR-186: Re-uploading a previously-crashed task file is the user's
+    signal to retry. The crashed-pr-ids set on the runner must be
+    cleared for any uploaded PR-id so the next IDLE cycle picks the
+    task again instead of treating it as still CANCELED. Other
+    crashed entries that were not re-uploaded must remain intact."""
+    runner = _Runner(tmp_path)
+    runner._crashed_task_pr_ids.update({"PR-001", "PR-999"})
+    Path(runner.repo_path).mkdir(parents=True)
+    staging = tmp_path / "uploads" / "demo"
+    staging.mkdir(parents=True)
+    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
+    key = f"upload:{runner.name}:pending"
+    manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
+    runner.redis.store[key] = manifest
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
+    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
+    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
+
+    assert _run(runner.process_pending_uploads()) is True
+    assert runner._crashed_task_pr_ids == {"PR-999"}
 
 
 def test_process_pending_uploads_logs_overwrite_collision_hashes(

@@ -279,23 +279,32 @@ class RecoveryMixin:
                 )
                 return True
 
-            self.state.state = PipelineState.CODING
-            self.log_event(
-                f"Recovered: DOING task {doing.pr_id}, no PR "
-                "-> re-running CODING"
-            )
+            # PR-186: A DOING task with no matching PR after recovery is a
+            # crash signature (subprocess kill, OOM, daemon restart mid-
+            # CODING). Re-running CODING here used to loop the same crash
+            # forever; instead preserve any unpushed commits on origin so
+            # the work is not lost, then mark the task crashed/CANCELED so
+            # the next IDLE cycle skips it. The user re-uploads the task
+            # file to retry.
             if doing.branch and not self._preserve_crashed_run_commits(
                 doing.branch
             ):
                 self.state.state = PipelineState.ERROR
                 self.state.error_message = (
                     f"recover_state: could not preserve crashed-run "
-                    f"commits on {doing.branch!r}; refusing to re-run "
-                    "CODING"
+                    f"commits on {doing.branch!r}; refusing to mark "
+                    "CANCELED"
                 )
                 self.log_event(self.state.error_message)
                 return True
-            await self.handle_coding()
+            self._crashed_task_pr_ids.add(doing.pr_id)
+            self.state.current_task = None
+            self.state.current_pr = None
+            self.state.state = PipelineState.IDLE
+            self.log_event(
+                f"Task {doing.pr_id} crashed, marking CANCELED. "
+                "Manually re-upload to retry."
+            )
             return True
 
         queued_by_branch = {

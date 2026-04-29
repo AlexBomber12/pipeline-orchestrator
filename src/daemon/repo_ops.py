@@ -406,6 +406,18 @@ return 0
             self.log_event(
                 f"Uploaded {task_count} task files to tasks/ and pushed to {branch}"
             )
+            # PR-186: Re-uploading a task file is the user's signal to retry
+            # a previously-crashed task. Clear the in-memory CANCELED mark
+            # for any uploaded PR-id so the next IDLE cycle picks the task
+            # again instead of treating it as still crashed.
+            crashed_pr_ids = getattr(self, "_crashed_task_pr_ids", None)
+            if crashed_pr_ids:
+                uploaded_pr_ids = {
+                    Path(name).stem
+                    for name in stageable_filenames
+                    if name.startswith("PR-") and name.endswith(".md")
+                }
+                crashed_pr_ids.difference_update(uploaded_pr_ids)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
             logger.error("%s: upload git operations failed: %s", self.name, exc)
             self.log_event(f"Upload push failed: {exc}")

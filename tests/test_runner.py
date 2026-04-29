@@ -2271,6 +2271,70 @@ def test_select_next_task_from_dag_watches_user_stopped_task_with_open_pr(
     assert runner._user_stopped_task_pr_ids == set()
 
 
+def test_select_next_task_from_dag_skips_crashed_task_marked_canceled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """PR-186: After recovery marks a task crashed, the next IDLE cycle's
+    selector must override its derived status to CANCELED so
+    get_eligible_tasks excludes it. Without the override the same crashed
+    task would be re-picked as TODO and dispatched into another doomed
+    CODING run on the very next cycle."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Crashed task\n\n"
+        "Branch: pr-001-crashed\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+    (tasks_dir / "PR-002.md").write_text(
+        "# PR-002: Healthy follow-up\n\n"
+        "Branch: pr-002-healthy\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+    runner._crashed_task_pr_ids.add("PR-001")
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-002"
+    assert task.status == TaskStatus.TODO
+    assert runner._idle_dag_statuses == {
+        "PR-001": TaskStatus.CANCELED,
+        "PR-002": TaskStatus.TODO,
+    }
+    queue_md = runner._generate_queue_md(
+        runner._idle_dag_headers,
+        runner._idle_dag_statuses,
+    )
+    assert "## PR-001" in queue_md
+    assert "- Status: CANCELED" in queue_md
+
+
 def test_select_next_task_from_dag_rejects_header_filename_mismatch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -254,6 +254,11 @@ class PipelineRunner(
         self._current_coder_process: asyncio.subprocess.Process | None = None
         self._stop_requested = False
         self._user_stopped_task_pr_ids: set[str] = set()
+        # PR-186: Tasks marked CANCELED by recovery after a crash. The next
+        # IDLE cycle treats these as CANCELED and skips them so the same
+        # task is not re-picked into a crash loop. Cleared when the user
+        # re-uploads the task file.
+        self._crashed_task_pr_ids: set[str] = set()
         self._user_pause_logged = False
         self._pending_repo_config: RepoConfig | None = None
         self._pending_app_config: AppConfig | None = None
