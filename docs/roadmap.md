@@ -201,7 +201,7 @@ Numbering продолжает существующую sequence от PR-180 (п
 
 **Exit criteria:** megaraid-dashboard onboarded в read-only/observe mode без ручного редактирования AGENTS.md. Multi-repo dashboard работает корректно. Production config reproducible from git + override file.
 
-### Polish batch (PR-195..PR-199, ~2-3 days)
+### Polish batch (PR-195..PR-201, ~2-3 days)
 
 - **PR-195** push_count desync fix. UI metric совпадает с GitHub Commits tab — single source of truth.
 - **PR-196** AGENTS.md prohibit draft PRs (text update + PR-220 reconciliation example).
@@ -210,6 +210,16 @@ Numbering продолжает существующую sequence от PR-180 (п
 - **PR-199** Event text clarity pass — audit log_event calls, normalize messages, remove ambiguity (Sprint F3.3 PR-184).
 
 **Exit criteria:** UI polished, documentation caught up, dead code removed.
+
+### Polish batch addendum (added 2026-04-29 evening)
+
+Observed during 2026-04-29 task-upload session:
+
+- **PR-200** Task header validation — synonyms map + multi-error report. Map common synonyms to canonical enum values (`bug` → `bugfix`, `fix` → `bugfix`, `chore` → `refactor`, `feat` → `feature`, `task` → `feature`). Continue validation past first error so user sees all problems in single upload attempt rather than fix-one-at-a-time. Update `docs/TASK_SCHEMA.md` with synonym mappings as alternative input form. Type: refactor. Complexity: low. Priority: 3. Reasoning: AI assistants and humans both regularly use looser vocabulary than the strict enum; rejecting on first hit is annoying for batch uploads.
+
+- **PR-201** Dashboard control row visual consistency. Current state (observed 2026-04-29): repo card top-right has Pause/Stop as flat icon buttons (no border, hover-only highlight) while Upload tasks button has solid border + padding + text label. Mixed visual language. Decision: align all controls in row to one style. Recommendation: keep flat-icon style for control actions (Pause/Stop), but Upload tasks is fundamentally a different action (CRUD on queue, not state control) — surface as small text button with consistent border-less hover style, OR move Upload tasks to a different region (dropdown menu, secondary toolbar). Either way, design pass needed before "feels polished" criteria is met. Type: ux. Complexity: low. Priority: 3.
+
+These add to the existing PR-195..PR-199 polish batch. Total polish batch now PR-195..PR-201.
 
 ### Deferred (sprint-scale, не в ближайшем 2-week плане)
 
@@ -850,7 +860,8 @@ GraphQL quota distribution across repos критична. Без PR-180 + PR-191
 
 - **PR-001..PR-179:** completed work. Frozen numbering.
 - **PR-180..PR-199:** active backlog batches от 2026-04-29 audit (Critical / Important / Multi-repo / Polish).
-- **PR-200+:** future work — sprint-scale items deferred (GitHub App migration, Thompson Sampling, PAUSED removal, manifest flow).
+- **PR-200..PR-201:** task-validation synonyms + dashboard control row visual consistency (added 2026-04-29 evening).
+- **PR-202+:** future work — sprint-scale items deferred (GitHub App migration, Thompson Sampling, PAUSED removal, manifest flow).
 
 Verify free numbers перед creating new task files: `ls tasks/PR-XXX.md` + `grep PR-XXX docs/roadmap.md`.
 
