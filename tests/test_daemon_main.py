@@ -1496,3 +1496,228 @@ def test_main_logs_publish_state_failures_for_inactive_runner(
     runner = _FakeRunner.instances[0]
     assert runner.cycles == 0
     assert any("publish paused state failed for octo__alpha" in rec.getMessage() for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Wake-on-pubsub tests
+# ---------------------------------------------------------------------------
+
+
+def test_apply_wake_message_resets_last_run() -> None:
+    last_run = {"alpha-key": 100.0, "beta-key": 200.0}
+    slug_to_key = {"alpha": "alpha-key", "beta": "beta-key"}
+
+    main_module._apply_wake_message(
+        {"channel": "orchestrator:wake:alpha"}, last_run, slug_to_key
+    )
+
+    assert last_run["alpha-key"] == 0.0
+    assert last_run["beta-key"] == 200.0
+
+
+def test_apply_wake_message_decodes_bytes_channel() -> None:
+    last_run = {"alpha-key": 100.0}
+    slug_to_key = {"alpha": "alpha-key"}
+
+    main_module._apply_wake_message(
+        {"channel": b"orchestrator:wake:alpha"}, last_run, slug_to_key
+    )
+    assert last_run["alpha-key"] == 0.0
+
+
+def test_apply_wake_message_ignores_non_string_channel() -> None:
+    last_run = {"alpha-key": 100.0}
+    slug_to_key = {"alpha": "alpha-key"}
+
+    main_module._apply_wake_message({"channel": 42}, last_run, slug_to_key)
+    main_module._apply_wake_message({}, last_run, slug_to_key)
+    assert last_run["alpha-key"] == 100.0
+
+
+def test_apply_wake_message_ignores_unknown_channel() -> None:
+    last_run = {"alpha-key": 100.0}
+    slug_to_key = {"alpha": "alpha-key"}
+
+    main_module._apply_wake_message(
+        {"channel": "repo-events:something"}, last_run, slug_to_key
+    )
+    main_module._apply_wake_message(
+        {"channel": "orchestrator:wake:other"}, last_run, slug_to_key
+    )
+    assert last_run["alpha-key"] == 100.0
+
+
+class _ScriptedPubSub:
+    """A pubsub stub that returns scripted ``get_message`` results."""
+
+    def __init__(self, results: list[Any]) -> None:
+        self._results = list(results)
+        self.closed = False
+        self.cancelled_calls = 0
+
+    async def get_message(self, ignore_subscribe_messages: bool = True, timeout: Any = None) -> Any:
+        if not self._results:
+            # Block "forever" so asyncio.wait can let sleep_task win.
+            await asyncio.sleep(3600)
+            return None
+        item = self._results.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+async def test_wait_or_wake_falls_back_to_sleep_when_pubsub_none() -> None:
+    last_run: dict[str, float] = {"k": 5.0}
+    slept = []
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        await real_sleep(0)
+
+    with patch.object(main_module.asyncio, "sleep", fake_sleep):
+        healthy = await main_module._wait_or_wake(None, 7.0, last_run, {})
+
+    assert healthy is True
+    assert slept == [7.0]
+
+
+async def test_wait_or_wake_resets_last_run_on_message() -> None:
+    pubsub = _ScriptedPubSub([{"channel": "orchestrator:wake:alpha"}, None])
+    last_run = {"alpha-key": 100.0}
+    slug_to_key = {"alpha": "alpha-key"}
+
+    healthy = await main_module._wait_or_wake(pubsub, 60.0, last_run, slug_to_key)
+
+    assert healthy is True
+    assert last_run["alpha-key"] == 0.0
+
+
+async def test_wait_or_wake_drains_buffered_messages() -> None:
+    pubsub = _ScriptedPubSub(
+        [
+            {"channel": "orchestrator:wake:alpha"},
+            {"channel": "orchestrator:wake:beta"},
+            None,
+        ]
+    )
+    last_run = {"alpha-key": 100.0, "beta-key": 200.0}
+    slug_to_key = {"alpha": "alpha-key", "beta": "beta-key"}
+
+    await main_module._wait_or_wake(pubsub, 60.0, last_run, slug_to_key)
+
+    assert last_run == {"alpha-key": 0.0, "beta-key": 0.0}
+
+
+async def test_wait_or_wake_drain_swallows_get_message_errors() -> None:
+    pubsub = _ScriptedPubSub(
+        [
+            {"channel": "orchestrator:wake:alpha"},
+            RuntimeError("drain boom"),
+        ]
+    )
+    last_run = {"alpha-key": 100.0}
+    slug_to_key = {"alpha": "alpha-key"}
+
+    healthy = await main_module._wait_or_wake(pubsub, 60.0, last_run, slug_to_key)
+    assert healthy is True
+    assert last_run["alpha-key"] == 0.0
+
+
+async def test_wait_or_wake_marks_unhealthy_on_pubsub_error() -> None:
+    pubsub = _ScriptedPubSub([RuntimeError("connection lost")])
+    last_run = {"alpha-key": 100.0}
+
+    healthy = await main_module._wait_or_wake(
+        pubsub, 60.0, last_run, {"alpha": "alpha-key"}
+    )
+
+    assert healthy is False
+    assert last_run["alpha-key"] == 100.0
+
+
+async def test_wait_or_wake_lets_sleep_win_when_no_messages() -> None:
+    pubsub = _ScriptedPubSub([])
+    last_run = {"alpha-key": 100.0}
+
+    healthy = await main_module._wait_or_wake(
+        pubsub, 0.01, last_run, {"alpha": "alpha-key"}
+    )
+
+    assert healthy is True
+    assert last_run["alpha-key"] == 100.0
+
+
+async def test_close_pubsub_handles_none_and_errors() -> None:
+    await main_module._close_pubsub(None)
+
+    class _Boom:
+        async def aclose(self) -> None:
+            raise RuntimeError("close boom")
+
+    await main_module._close_pubsub(_Boom())
+
+
+def test_main_loop_subscribes_to_active_runners(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When subscribe_wake returns a pubsub, the loop uses it."""
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    _patch_main(monkeypatch, config)
+
+    subscribed_with: list[tuple[str, ...]] = []
+    closed_pubsubs: list[_ScriptedPubSub] = []
+
+    async def fake_subscribe_wake(redis_client: Any, slugs: tuple[str, ...]) -> Any:
+        subscribed_with.append(tuple(slugs))
+        if not slugs:
+            return None
+        ps = _ScriptedPubSub([{"channel": "orchestrator:wake:octo__alpha"}, None])
+        return ps
+
+    monkeypatch.setattr(main_module, "subscribe_wake", fake_subscribe_wake)
+
+    async def tracking_close(pubsub: Any) -> None:
+        if pubsub is not None:
+            closed_pubsubs.append(pubsub)
+
+    monkeypatch.setattr(main_module, "_close_pubsub", tracking_close)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    assert subscribed_with == [("octo__alpha",)]
+
+
+def test_main_loop_recovers_after_unhealthy_pubsub(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unhealthy pubsub should be torn down and re-subscribed on next tick."""
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    _patch_main(monkeypatch, config, sleep_iterations=2)
+
+    subscriptions: list[tuple[str, ...]] = []
+
+    async def fake_subscribe_wake(redis_client: Any, slugs: tuple[str, ...]) -> Any:
+        subscriptions.append(tuple(slugs))
+        if not slugs:
+            return None
+        return _ScriptedPubSub([RuntimeError("conn lost")])
+
+    monkeypatch.setattr(main_module, "subscribe_wake", fake_subscribe_wake)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    # First subscription on cycle 1, re-subscription on cycle 2 after unhealthy.
+    assert subscriptions == [("octo__alpha",), ("octo__alpha",)]

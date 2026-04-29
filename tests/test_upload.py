@@ -1181,6 +1181,93 @@ def test_upload_ignores_invalid_existing_manifest_payload(
     assert resp.status_code == 200
 
 
+def test_upload_publishes_wake_message(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    """A successful upload must publish on the wake channel for the repo."""
+    class _PublishingRedis:
+        def __init__(self) -> None:
+            self.published: list[tuple[str, str]] = []
+
+        async def get(self, key: str) -> str | None:
+            if key == "pipeline:example__alpha":
+                return '{"url":"","name":"example__alpha","state":"IDLE"}'
+            return None
+
+        async def set(self, key: str, value: str, **kwargs: object) -> None:
+            return None
+
+        async def scan_iter(self, match: str):
+            if False:  # pragma: no cover
+                yield ""
+
+        async def publish(self, channel: str, message: str) -> int:
+            self.published.append((channel, message))
+            return 1
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(app) as client:
+        client.app.state.redis = _PublishingRedis()
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_queue_file()],
+        )
+        redis_client = client.app.state.redis
+
+    assert resp.status_code == 200
+    assert len(redis_client.published) == 1
+    channel, message = redis_client.published[0]
+    assert channel == "orchestrator:wake:example__alpha"
+    parsed = json.loads(message)
+    assert parsed["event_type"] == "upload"
+    assert parsed["repo"] == "example__alpha"
+
+
+def test_upload_succeeds_when_publish_wake_fails(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A publish failure must not block the upload — it logs and returns 200."""
+    class _PublishFailRedis:
+        async def get(self, key: str) -> str | None:
+            if key == "pipeline:example__alpha":
+                return '{"url":"","name":"example__alpha","state":"IDLE"}'
+            return None
+
+        async def set(self, key: str, value: str, **kwargs: object) -> None:
+            return None
+
+        async def scan_iter(self, match: str):
+            if False:  # pragma: no cover
+                yield ""
+
+        async def publish(self, channel: str, message: str) -> int:
+            raise RuntimeError("publish boom")
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(app) as client:
+        client.app.state.redis = _PublishFailRedis()
+        with caplog.at_level("WARNING", logger=web_app.logger.name):
+            resp = client.post(
+                "/repos/example__alpha/upload-tasks",
+                files=[_queue_file()],
+            )
+
+    assert resp.status_code == 200
+    assert any(
+        "publish_wake failed for example__alpha" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
 # ---------------------------------------------------------------------------
 # Sweep tests
 # ---------------------------------------------------------------------------
