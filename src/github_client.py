@@ -1149,11 +1149,21 @@ def _map_rest_ci_status_to_enum(
     a both-endpoints-failed REST fetch (auth/permission error, missing fork
     SHA) must surface as an explicit failure rather than be silently mapped
     to a green CI signal that would satisfy the auto-merge gate.
+
+    The combined commit-status endpoint embeds at most the first page of
+    ``statuses`` while ``status_payload["state"]`` reflects the aggregate
+    across every context. In repos with many legacy status contexts the
+    embedded list can omit a failing context entirely; honoring the
+    aggregate ``state`` whenever any status context is reported keeps the
+    pagination-capped failure from being silently classified SUCCESS.
     """
     statuses_raw = (
         status_payload.get("statuses") if isinstance(status_payload, dict) else None
     )
     statuses = statuses_raw if isinstance(statuses_raw, list) else []
+    combined_state = (
+        status_payload.get("state") if isinstance(status_payload, dict) else None
+    )
 
     if not check_runs and not statuses:
         if not fetch_ok:
@@ -1174,6 +1184,9 @@ def _map_rest_ci_status_to_enum(
         state_val = status.get("state")
         if state_val:
             states.append(str(state_val).upper())
+
+    if statuses and isinstance(combined_state, str) and combined_state:
+        states.append(combined_state.upper())
 
     if not states:
         return CIStatus.PENDING

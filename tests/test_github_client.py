@@ -3295,6 +3295,62 @@ def test_map_rest_ci_status_skips_non_dict_entries() -> None:
     )
 
 
+def test_map_rest_ci_status_combined_state_failure_overrides_paginated_statuses() -> None:
+    """``status_payload['state']`` must outrank the embedded statuses list.
+
+    The combined-status endpoint caps ``statuses`` at the first page while
+    ``state`` aggregates every context. A repo with many legacy status
+    contexts can show success-only entries on page 1 with ``state='failure'``
+    surfaced from a context past the cap; honoring ``state`` keeps that
+    failure from slipping past WATCH/MERGE.
+    """
+    assert (
+        _map_rest_ci_status_to_enum(
+            [{"conclusion": "success"}],
+            {"state": "failure", "statuses": [{"state": "success"}]},
+        )
+        == CIStatus.FAILURE
+    )
+
+
+def test_map_rest_ci_status_combined_state_error_treated_as_failure() -> None:
+    """The combined ``state='error'`` value must map to FAILURE."""
+    assert (
+        _map_rest_ci_status_to_enum(
+            [],
+            {"state": "error", "statuses": [{"state": "success"}]},
+        )
+        == CIStatus.FAILURE
+    )
+
+
+def test_map_rest_ci_status_combined_state_pending_keeps_rollup_pending() -> None:
+    """A combined ``state='pending'`` keeps the rollup PENDING."""
+    assert (
+        _map_rest_ci_status_to_enum(
+            [{"conclusion": "success"}],
+            {"state": "pending", "statuses": [{"state": "success"}]},
+        )
+        == CIStatus.PENDING
+    )
+
+
+def test_map_rest_ci_status_combined_state_ignored_when_no_statuses() -> None:
+    """Synthetic ``state='pending'`` from an empty statuses list is ignored.
+
+    GitHub returns ``state='pending'`` by default when a commit has zero
+    legacy statuses; that synthetic value must not override successful
+    check-runs as the only signal.
+    """
+    assert (
+        _map_rest_ci_status_to_enum(
+            [{"conclusion": "success"}],
+            {"state": "pending", "statuses": []},
+        )
+        == CIStatus.SUCCESS
+    )
+
+
 def test_fetch_ci_status_rest_combines_check_runs_and_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
