@@ -143,6 +143,27 @@ Key insight: агенты (Claude Code, Codex CLI, Aider, Cline, goose, OpenHand
 
 **Positioning evolution:** раньше формулировал как "cross-vendor routing for Claude + Codex". Теперь точнее — "agentic coding routing с поддержкой local inference". Добавляет privacy/offline/cost reduction dimensions.
 
+### Phase-resource separation (observed 2026-04-29)
+
+Empirical observation from production daemon: GitHub API quota и Claude API quota burn в **non-overlapping phases**.
+
+```
+CODING/FIX:  Claude API up    GitHub API flat   (coder subprocess eating Claude tokens, daemon only watches stdout)
+WATCH:       Claude API flat  GitHub API up     (daemon polls CI status, review state, comments; no Claude calls)
+IDLE:        Claude API flat  GitHub API low    (baseline polling without active PR)
+MERGE:       Claude API flat  GitHub API short  (short burst for merge checks)
+```
+
+This is **clean separation of resources by phase**. Implications:
+
+- **Adaptive polling cannot use one global multiplier.** Each phase has different polling cost characteristics; tuning one without considering the other is wrong layer.
+- **WATCH is the dominant GitHub burn**, not IDLE. Optimization priority should reflect this.
+- **CODING/FIX is dominant Claude burn**, but Claude quota is per-account и harder to control architecturally (can only choose model, not skip calls).
+- **OBS-AC GraphQL diet leverages**: PR-180 (REST replacement) targets the WATCH-dominant burn; PR-184 (IDLE adaptive) targets baseline. Both are valid because they hit different phases.
+- **Future PR-202 (WATCH adaptive)** specifically targets the dominant burn phase, with phase-aware polling logic that differs from generic exponential backoff (slow-start instead of fast-start; rationale в task spec).
+
+This model also informs **multi-repo capacity planning**: two repos in CODING/FIX simultaneously do not double GitHub burn (Claude doubles instead). Two repos in WATCH simultaneously DO double GitHub burn — this is the multi-repo risk OBS-AC anticipated.
+
 ### Testing policy для managed repos (added 2026-04-24 Day 5)
 
 Любой repo onboarded в pipeline-orchestrator должен иметь test pyramid:
@@ -201,7 +222,7 @@ Numbering продолжает существующую sequence от PR-180 (п
 
 **Exit criteria:** megaraid-dashboard onboarded в read-only/observe mode без ручного редактирования AGENTS.md. Multi-repo dashboard работает корректно. Production config reproducible from git + override file.
 
-### Polish batch (PR-195..PR-201, ~2-3 days)
+### Polish batch (PR-195..PR-202, ~2-3 days)
 
 - **PR-195** push_count desync fix. UI metric совпадает с GitHub Commits tab — single source of truth.
 - **PR-196** AGENTS.md prohibit draft PRs (text update + PR-220 reconciliation example).
@@ -219,7 +240,9 @@ Observed during 2026-04-29 task-upload session:
 
 - **PR-201** Dashboard control row visual consistency. Current state (observed 2026-04-29): repo card top-right has Pause/Stop as flat icon buttons (no border, hover-only highlight) while Upload tasks button has solid border + padding + text label. Mixed visual language. Decision: align all controls in row to one style. Recommendation: keep flat-icon style for control actions (Pause/Stop), but Upload tasks is fundamentally a different action (CRUD on queue, not state control) — surface as small text button with consistent border-less hover style, OR move Upload tasks to a different region (dropdown menu, secondary toolbar). Either way, design pass needed before "feels polished" criteria is met. Type: ux. Complexity: low. Priority: 3.
 
-These add to the existing PR-195..PR-199 polish batch. Total polish batch now PR-195..PR-201.
+- **PR-202** WATCH adaptive polling — slow-start, fast-tail. Empirical observation 2026-04-29: WATCH state polls GitHub heavily but Codex Review + CI typically take 2-7 min and 5-15 min respectively to respond. Polling every 30s for the first 5 min is wasted quota on a scheduled wait. Logic: WATCH entry → slow 300s for first 5 min; after 5 min without event → fast 30-60s; on event detected → reset to slow start. Inverted from standard exponential backoff (which is fast-start, slow-tail). Combined with PR-184 IDLE adaptive: IDLE worker pattern (fast → slow on inactivity) and WATCH response-anticipation pattern (slow → fast on expected wait window passage) cover both dominant burn phases per Phase-resource separation observation. Type: feature. Complexity: low. Priority: 2. Depends on PR-180 (REST replacement) so the WATCH polling is already on REST core quota.
+
+These add to the existing PR-195..PR-199 polish batch. Total polish batch now PR-195..PR-202.
 
 ### Deferred (sprint-scale, не в ближайшем 2-week плане)
 
@@ -860,8 +883,8 @@ GraphQL quota distribution across repos критична. Без PR-180 + PR-191
 
 - **PR-001..PR-179:** completed work. Frozen numbering.
 - **PR-180..PR-199:** active backlog batches от 2026-04-29 audit (Critical / Important / Multi-repo / Polish).
-- **PR-200..PR-201:** task-validation synonyms + dashboard control row visual consistency (added 2026-04-29 evening).
-- **PR-202+:** future work — sprint-scale items deferred (GitHub App migration, Thompson Sampling, PAUSED removal, manifest flow).
+- **PR-200..PR-202:** task-validation synonyms + dashboard UI consistency + WATCH adaptive polling (added 2026-04-29 evening).
+- **PR-203+:** future work — sprint-scale items deferred (GitHub App migration, Thompson Sampling, PAUSED removal, manifest flow).
 
 Verify free numbers перед creating new task files: `ls tasks/PR-XXX.md` + `grep PR-XXX docs/roadmap.md`.
 
