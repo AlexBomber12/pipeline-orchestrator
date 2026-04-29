@@ -62,10 +62,16 @@ async def subscribe_wake(redis_client: Any, repo_names: Iterable[str]) -> Any:
     channels = [_channel_name(name) for name in repo_names]
     if not channels:
         return None
+    pubsub = None
     try:
         pubsub = redis_client.pubsub()
         await pubsub.subscribe(*channels)
     except Exception:
+        if pubsub is not None:
+            try:
+                await pubsub.aclose()
+            except Exception:
+                pass
         return None
     return pubsub
 

@@ -11,9 +11,15 @@ from src.events import wake
 
 
 class _FakePubSub:
-    def __init__(self, *, fail_subscribe: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_subscribe: bool = False,
+        fail_aclose: bool = False,
+    ) -> None:
         self.subscribed: list[str] = []
         self._fail_subscribe = fail_subscribe
+        self._fail_aclose = fail_aclose
         self.closed = False
 
     async def subscribe(self, *channels: str) -> None:
@@ -23,6 +29,8 @@ class _FakePubSub:
 
     async def aclose(self) -> None:
         self.closed = True
+        if self._fail_aclose:
+            raise RuntimeError("aclose failed")
 
 
 class _FakeRedis:
@@ -102,6 +110,15 @@ async def test_subscribe_wake_returns_none_when_subscribe_fails() -> None:
     redis = _FakeRedis(pubsub_obj=failing)
     pubsub = await wake.subscribe_wake(redis, ("a",))
     assert pubsub is None
+    assert failing.closed is True
+
+
+async def test_subscribe_wake_swallows_aclose_error_after_subscribe_failure() -> None:
+    failing = _FakePubSub(fail_subscribe=True, fail_aclose=True)
+    redis = _FakeRedis(pubsub_obj=failing)
+    pubsub = await wake.subscribe_wake(redis, ("a",))
+    assert pubsub is None
+    assert failing.closed is True
 
 
 def test_repo_from_channel_extracts_slug() -> None:
