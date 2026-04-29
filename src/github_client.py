@@ -33,6 +33,21 @@ _last_known_sha: dict[str, str] = {}
 _merged_prs_cache: dict[tuple[str, str], tuple[float, list["PRInfo"]]] = {}
 _MERGED_PRS_CACHE_TTL_SECONDS = 60.0
 
+#: Per-(repo, sha) cache for the REST CI status fetch. The two REST calls
+#: (``commits/{sha}/check-runs`` + ``commits/{sha}/status``) are the dominant
+#: REST consumer in the daemon poll loop now that ``statusCheckRollup`` has
+#: been removed. With ``poll_interval_sec`` as low as 2s in the e2e config,
+#: refetching on every cycle exhausts the 5000/hour REST budget within
+#: minutes — even one open PR at 2s polling burns 3600 calls/hour. The
+#: cache key embeds ``head_sha`` so a new push immediately invalidates the
+#: prior result; CI transitions on the same SHA are observed within
+#: ``_CI_STATUS_CACHE_TTL_SECONDS`` of when GitHub publishes them, which is
+#: well under the typical CI run length.
+_ci_status_cache: dict[
+    tuple[str, str], tuple[float, list[dict], dict, bool]
+] = {}
+_CI_STATUS_CACHE_TTL_SECONDS = 15.0
+
 
 def _is_http_404_error(exc: RuntimeError) -> bool:
     return ("HTTP" + " 404") in str(exc)
@@ -56,6 +71,11 @@ def clear_review_status_cache() -> None:
 def clear_merged_prs_cache() -> None:
     """Clear merged PR lookup cache (used in tests)."""
     _merged_prs_cache.clear()
+
+
+def clear_ci_status_cache() -> None:
+    """Clear the REST CI status cache (used in tests)."""
+    _ci_status_cache.clear()
 
 
 def _begin_review_cache_cycle() -> None:
@@ -1080,6 +1100,12 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
     if not sha:
         return check_runs, status_payload, True
 
+    cache_key = (repo, sha)
+    cached = _ci_status_cache.get(cache_key)
+    now = time.monotonic()
+    if cached is not None and (now - cached[0]) < _CI_STATUS_CACHE_TTL_SECONDS:
+        return list(cached[1]), dict(cached[2]), cached[3]
+
     check_runs_ok = False
     try:
         pages = retry_transient(
@@ -1132,7 +1158,9 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
         if isinstance(parsed, dict):
             status_payload = parsed
 
-    return check_runs, status_payload, check_runs_ok or status_ok
+    fetch_ok = check_runs_ok or status_ok
+    _ci_status_cache[cache_key] = (now, list(check_runs), dict(status_payload), fetch_ok)
+    return check_runs, status_payload, fetch_ok
 
 
 def _map_rest_ci_status_to_enum(

@@ -21,6 +21,7 @@ from src.github_client import (
     _is_reaction_content,
     _map_rest_ci_status_to_enum,
     _parse_iso,
+    clear_ci_status_cache,
     clear_last_known_sha,
     clear_merged_prs_cache,
     clear_review_status_cache,
@@ -56,6 +57,13 @@ class _FakeCompletedProcess:
         self.stdout = stdout
         self.stderr = stderr
         self.returncode = returncode
+
+
+@pytest.fixture(autouse=True)
+def _clear_ci_status_cache_between_tests() -> None:
+    """Drop the (repo, sha) CI status cache so per-test ``run_gh`` patches
+    are not shadowed by a result a previous test populated."""
+    clear_ci_status_cache()
 
 
 def test_get_repo_full_name_with_git_suffix() -> None:
@@ -3589,6 +3597,106 @@ def test_fetch_ci_status_rest_skips_non_dict_pages(
 
     check_runs, _, _ = _fetch_ci_status_rest("owner/name", "abc123")
     assert check_runs == [{"conclusion": "success"}]
+
+
+def test_fetch_ci_status_rest_caches_per_repo_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeat calls within the TTL must not re-issue ``gh api`` requests.
+
+    Regression guard: at ``poll_interval_sec=2`` (test config), refetching
+    on every cycle exhausts the 5000/hour REST budget within minutes and
+    pauses the daemon, blocking integration tests that wait for the
+    runner to log ``Paused. Press Play to resume.`` after a ``/stop``.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        calls.append(list(args))
+        if "check-runs" in args[-1]:
+            return [{"check_runs": [{"conclusion": "success"}]}]
+        return {"state": "success", "statuses": [{"state": "success"}]}
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+
+    first = _fetch_ci_status_rest("owner/name", "abc123")
+    second = _fetch_ci_status_rest("owner/name", "abc123")
+    third = _fetch_ci_status_rest("owner/name", "abc123")
+
+    assert first == second == third
+    assert len(calls) == 2  # one check-runs + one status, served from cache after
+
+
+def test_fetch_ci_status_rest_cache_misses_on_new_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A different head SHA (e.g. after a push) must bypass the cache."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if "check-runs" in args[-1]:
+            sha = args[-1].split("/")[-2]
+            return [{"check_runs": [{"conclusion": "success", "id": sha}]}]
+        return {"state": "success", "statuses": [{"state": "success"}]}
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+
+    first_runs, _, _ = _fetch_ci_status_rest("owner/name", "abc123")
+    second_runs, _, _ = _fetch_ci_status_rest("owner/name", "def456")
+
+    assert first_runs[0]["id"] == "abc123"
+    assert second_runs[0]["id"] == "def456"
+
+
+def test_fetch_ci_status_rest_cache_expires_after_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cached entry older than the TTL must be refetched, so PENDING -> SUCCESS
+    transitions on the same SHA are observed without an upstream push."""
+    state = {"calls": 0}
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if "check-runs" in args[-1]:
+            state["calls"] += 1
+            return [{"check_runs": [{"conclusion": f"call_{state['calls']}"}]}]
+        return {"state": "pending", "statuses": []}
+
+    fake_now = {"value": 1000.0}
+
+    def fake_monotonic() -> float:
+        return fake_now["value"]
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github_client.time.monotonic", fake_monotonic)
+
+    first, _, _ = _fetch_ci_status_rest("owner/name", "abc123")
+    fake_now["value"] += 5.0
+    cached, _, _ = _fetch_ci_status_rest("owner/name", "abc123")
+    assert first == cached  # within TTL: cached
+
+    fake_now["value"] += 100.0  # past 15s TTL
+    refreshed, _, _ = _fetch_ci_status_rest("owner/name", "abc123")
+    assert refreshed != first
+
+
+def test_clear_ci_status_cache_forces_refetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``clear_ci_status_cache`` drops the in-memory entries (used by tests)."""
+    state = {"calls": 0}
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if "check-runs" in args[-1]:
+            state["calls"] += 1
+            return [{"check_runs": [{"conclusion": f"call_{state['calls']}"}]}]
+        return {}
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+
+    _fetch_ci_status_rest("owner/name", "abc123")
+    clear_ci_status_cache()
+    _fetch_ci_status_rest("owner/name", "abc123")
+
+    assert state["calls"] == 2
 
 
 def test_parse_iso_returns_none_for_invalid_string() -> None:
