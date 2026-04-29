@@ -345,13 +345,13 @@
             color: var(--accent) !important;
         }
 
-        @keyframes pulse-dot {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.3; }
+        .pulse-dot {
+            opacity: 1;
+            transition: opacity 1s ease-in-out;
         }
 
-        .pulse-dot {
-            animation: pulse-dot 2s ease-in-out infinite;
+        .pulse-dot.dim {
+            opacity: 0.3;
         }
     </style>
 </head>
@@ -435,6 +435,20 @@
                     applyTheme(nextTheme, true);
                 });
             }
+        })();
+    </script>
+
+    <script>
+        (function () {
+            let dim = false;
+            function syncPulseDots() {
+                document.querySelectorAll('.pulse-dot').forEach(dot => dot.classList.toggle('dim', dim));
+            }
+            setInterval(() => {
+                dim = !dim;
+                syncPulseDots();
+            }, 1000);
+            document.body.addEventListener('htmx:afterSwap', syncPulseDots);
         })();
     </script>
 
