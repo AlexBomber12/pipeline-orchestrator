@@ -14635,7 +14635,9 @@ def test_handle_error_skips_diagnose_for_infra_error(
     assert runner._error_skip_context is None
     assert runner._error_skip_count == 0
     assert runner._error_skip_active is False
-    assert runner._error_diagnose_count >= 4
+    # Counter is preserved (not poisoned): a later non-infra error must still
+    # be eligible for diagnosis.
+    assert runner._error_diagnose_count == 1
     assert any(
         e["event"].startswith("Infra error detected, skipping AI diagnosis:")
         for e in runner.state.history
@@ -14716,6 +14718,34 @@ def test_handle_error_runs_diagnose_for_non_infra_error(
     assert not any(
         e["event"].startswith("Infra error detected") for e in runner.state.history
     )
+
+
+def test_handle_error_infra_bypass_does_not_lock_out_subsequent_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Infra bypass must not poison the diagnose counter for later non-infra errors."""
+    _patch_subprocess(monkeypatch)
+    cli_calls: list[str] = []
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = (
+        "ensure_repo_cloned failed: git fetch origin main failed after 3 attempts"
+    )
+
+    asyncio.run(runner.handle_error())
+    assert cli_calls == []
+
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "working tree dirty: M src/foo.py"
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == ["diagnose"]
 
 
 @pytest.mark.parametrize(

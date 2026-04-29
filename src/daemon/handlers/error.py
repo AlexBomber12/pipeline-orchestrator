@@ -109,7 +109,6 @@ class ErrorMixin:
             self._error_skip_context = None
             self._error_skip_count = 0
             self._error_skip_active = False
-            self._error_diagnose_count = 99
             truncated = context if len(context) <= 200 else context[:197] + "..."
             self.log_event(
                 f"Infra error detected, skipping AI diagnosis: {truncated}"
