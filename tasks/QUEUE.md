@@ -631,7 +631,7 @@
 - Branch: pr-180-rest-check-runs-replace-rollup
 
 ## PR-181: Remove tasks/QUEUE.md from git tracking
-- Status: TODO
+- Status: DOING
 - Tasks file: tasks/PR-181.md
 - Branch: pr-181-queue-md-gitignore
 
@@ -685,7 +685,6 @@
 - Status: TODO
 - Tasks file: tasks/PR-191a.md
 - Branch: pr-191a-etag-rest-get-helpers
-- Depends on: PR-180
 
 ## PR-191b: ETag conditional requests for list endpoints
 - Status: TODO
@@ -745,3 +744,13 @@
 - Status: TODO
 - Tasks file: tasks/PR-199.md
 - Branch: pr-199-event-text-clarity
+
+## PR-200: Task header validation — synonyms map and multi-error report
+- Status: TODO
+- Tasks file: tasks/PR-200.md
+- Branch: pr-200-task-header-synonyms-multi-error
+
+## PR-201: Dashboard control row visual consistency
+- Status: TODO
+- Tasks file: tasks/PR-201.md
+- Branch: pr-201-dashboard-control-row-consistency
