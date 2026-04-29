@@ -164,6 +164,31 @@ This is **clean separation of resources by phase**. Implications:
 
 This model also informs **multi-repo capacity planning**: two repos in CODING/FIX simultaneously do not double GitHub burn (Claude doubles instead). Two repos in WATCH simultaneously DO double GitHub burn — this is the multi-repo risk OBS-AC anticipated.
 
+### Outcome data version-drift (decided 2026-04-29)
+
+Architectural decision recorded for analytics and future self-learning capabilities.
+
+**Lessons learned from past PRs are valid only for the same coder × model × version combination.**
+
+Cross-version aggregation is **unsafe** because:
+
+- Each model version has different error distribution (Claude Sonnet 4.6 → 4.7 → 5 produces different bugs)
+- Newer training data shifts the population of issues
+- Version-specific fixes to upstream coders eliminate certain classes of failures
+- Tool-version drift (CLI extensions like `@anthropic-ai/claude-code` and `@openai/codex`) changes interaction patterns
+
+Therefore:
+
+1. **Outcome logs (PR-204) record coder/model/version explicitly** as required schema fields.
+2. **Analytics queries default-filter to current version.** Mixed-version queries are explicit opt-in with caveat warning.
+3. **Lessons learned recommendations** must be scoped by version triple. A pattern observed under `claude-opus-4-7` does not auto-apply to `claude-opus-5`.
+4. **Selector training (Thompson Sampling, etc)** must reset or heavily-discount data when underlying coder version changes. Stale posterior distributions on outdated versions are worse than no posterior at all.
+
+**Practical implication**: dataset accumulation has natural decay. After a major version change, much of the historical dataset becomes advisory rather than authoritative. This is a fundamental limitation of ML-based recommendations for AI coding tools, not a bug to fix.
+
+**Storage decision (related)**: PR-204 uses JSONL append-only files in `/data/analytics/<year>-<month>.jsonl`. SQLite migration deferred until any of: (a) cross-month queries become slow (>10s), (b) need for indexed columns on million-row tables, (c) multi-process concurrent writes that flock cannot handle. None apply at current scale (~250 PR/year, single daemon process).
+
+
 ### Testing policy для managed repos (added 2026-04-24 Day 5)
 
 Любой repo onboarded в pipeline-orchestrator должен иметь test pyramid:
@@ -222,7 +247,7 @@ Numbering продолжает существующую sequence от PR-180 (п
 
 **Exit criteria:** megaraid-dashboard onboarded в read-only/observe mode без ручного редактирования AGENTS.md. Multi-repo dashboard работает корректно. Production config reproducible from git + override file.
 
-### Polish batch (PR-195..PR-202, ~2-3 days)
+### Polish batch (PR-195..PR-204, ~2-3 days)
 
 - **PR-195** push_count desync fix. UI metric совпадает с GitHub Commits tab — single source of truth.
 - **PR-196** AGENTS.md prohibit draft PRs (text update + PR-220 reconciliation example).
@@ -242,7 +267,11 @@ Observed during 2026-04-29 task-upload session:
 
 - **PR-202** WATCH adaptive polling — slow-start, fast-tail. Empirical observation 2026-04-29: WATCH state polls GitHub heavily but Codex Review + CI typically take 2-7 min and 5-15 min respectively to respond. Polling every 30s for the first 5 min is wasted quota on a scheduled wait. Logic: WATCH entry → slow 300s for first 5 min; after 5 min without event → fast 30-60s; on event detected → reset to slow start. Inverted from standard exponential backoff (which is fast-start, slow-tail). Combined with PR-184 IDLE adaptive: IDLE worker pattern (fast → slow on inactivity) and WATCH response-anticipation pattern (slow → fast on expected wait window passage) cover both dominant burn phases per Phase-resource separation observation. Type: feature. Complexity: low. Priority: 2. Depends on PR-180 (REST replacement) so the WATCH polling is already on REST core quota.
 
-These add to the existing PR-195..PR-199 polish batch. Total polish batch now PR-195..PR-202.
+- **PR-203** Compact resource limits row with tooltips. Replaces current single GitHub API budget bar with 4 chips: GH REST, GH GraphQL, Claude 5h, Claude weekly. Color zones by remaining percentage (green > 50%, amber 20-50%, red < 20%). Hover tooltip shows absolute values and reset time. No click action in this PR — history modal deferred (see Deferred section). Type: ux. Complexity: low. Reasoning: current visualization shows only GitHub API budget; system actually depends on 4 distinct quotas. Operator awareness gap.
+
+- **PR-204** Structured per-PR outcome logging for future analytics. Append-only JSONL at `/data/analytics/<year>-<month>.jsonl` with one record per merged PR. Schema captures coder/model/version explicitly to support future analytics that respect outcome-data version drift (see Architectural decisions section). No analysis layer, no telemetry, no upload — pure persistence with the right schema for future use. SQLite migration trigger documented as future work. Type: feature. Complexity: low. Reasoning: foundational gap for any future selector training or lessons-learned capability; storage cost is negligible (~125 KB/year), schema choice now prevents painful retroactive backfill later.
+
+These add to the existing PR-195..PR-199 polish batch. Total polish batch now PR-195..PR-204.
 
 ### Deferred (sprint-scale, не в ближайшем 2-week плане)
 
@@ -255,6 +284,8 @@ These add to the existing PR-195..PR-199 polish batch. Total polish batch now PR
 - **OBS-5 gh credential helper instrumentation (PR-191 candidate):** intermittent, low-impact. Investigation PR, not immediate fix. Defer until other items closed.
 
 ---
+
+- **Resource limit history charts (future PR candidate):** modal-on-click history graphs (4-hour rolling) for each of the 4 quotas surfaced in PR-203. Pending decision on storage backend — in-memory loses on daemon restart, Redis depends on RDB snapshot persistence, SQLite adds new dependency, PostgreSQL is overkill. Defer until storage decision is made or until operator concretely needs trend visibility (currently visual chip + reset time gives enough situational awareness for solo operator workflow).
 
 ## Vision (beyond Round 4, возможно отдельный продукт)
 
@@ -818,6 +849,57 @@ Three paths considered:
 
 ---
 
+### OBS-AD: PR-180 self-healing convergence pattern (recorded 2026-04-29, autonomous merge confirmed)
+
+**Observed:** PR-180 (REST replacement for `gh pr list --json statusCheckRollup`) was merged to main at 14:25 UTC after autonomous convergence. Timeline:
+
+- 10:31 — first CI run, integration job FAILED (timeout waiting for IDLE state, last seen WATCH).
+- 10:50, 11:07, 11:39, 11:58, 12:30, 12:52, 13:13 — seven additional FAILED runs, same symptom.
+- Between 13:13 and 14:09 daemon committed 4 fix commits via FIX iterations:
+  1. `5f1ced0` PR-180: trust combined commit-status state, ignore stale history
+  2. `22c82a1` PR-180: map fetch failure to PENDING, not FAILURE, to avoid FIX storm
+  3. `0b23c45` PR-180: treat partial REST fetch failures with empty signal as PENDING
+  4. `e6c42c4` PR-180: trust empty surviving signal on partial REST fetch failure
+- 14:09 — first GREEN CI run.
+- 14:17 — second GREEN CI run (daemon verification rerun before merge).
+- 14:25 — daemon auto-merged the PR.
+
+**Each fix commit addressed a real edge case** in the new REST mapping function — not a cosmetic patch. Specifically the four edge cases the PR-180 task spec mentioned generically as "edge cases (empty rollup, mixed statuses, в WATCH STALLED case)" but did NOT enumerate explicitly:
+
+1. **Stale check-run history interpretation:** REST `/check-runs` returns history including expired/stale runs. Naive mapping interpreted stale FAILURE entries as current state. Fix: trust the combined commit-status state, ignore historical entries when current status is available.
+2. **Partial REST fetch failure on FIX storm:** when one of two REST endpoints (check-runs or status) failed transiently, naive mapping returned FAILURE. This triggered FIX iterations which made more REST calls which had higher failure rate. Self-amplifying loop. Fix: map partial failure to PENDING, not FAILURE.
+3. **Empty signal on combined-fetch partial failure:** edge case where one endpoint returns empty (no checks) and the other fails. Naive mapping treated empty + failure as FAILURE. Fix: empty + failure = PENDING.
+4. **Trust empty surviving signal:** if check-runs returned empty AND status returned partial-failure, the surviving "no checks" signal should be trusted (likely a fresh PR with no CI yet) rather than escalated as failure.
+
+**Validates:**
+
+The autonomous loop converges on real bugs, not just cosmetic patches. Daemon used FIX iteration as designed: each cycle interpreted CI failure → asked Claude to fix → committed → waited for next CI signal. Convergence on a 4-step edge-case staircase is exactly the use case the system was built for.
+
+**Cost paid:**
+
+- ~3.9 hours wall-clock (10:31 → 14:25).
+- 8 integration job runs (each ~10 minutes) = ~80 minutes CI runner time.
+- 4 Claude FIX iterations on Claude Pro quota.
+- ~30 minutes operator time (interrupted twice to triage what was happening).
+
+**Lessons recorded:**
+
+1. **Initial assessment was wrong.** The operator and assistant initially read the 8 fails + 2 greens as "flaky test" pattern from OBS-AB sigkill multi-race, where lucky timing determined results. The truth was different — every fail was deterministic on the same root cause (REST mapping edge cases) and the greens came after real fixes. Confirming via `git log --since/--until` on the failure window resolved the question definitively. **Future debugging should always check git log on the affected branch before declaring "flaky" — fix commits in the failure window mean the failures were deterministic.**
+
+2. **Edge cases in task spec must be enumerated explicitly with test fixtures** if we want to short-circuit discovery cost. The PR-180 spec mentioned "edge cases (empty rollup, mixed statuses, в WATCH STALLED case)" generically but did not provide concrete fixtures. Daemon discovered them through trial, costing 4 FIX iterations. For future REST/API replacement PRs, the task spec should include explicit fixture data for each edge case identified during the original API analysis. This converts a 4-cycle discovery into a 1-cycle implementation.
+
+3. **Autonomous merge worked correctly.** Daemon waited for 2 consecutive green CI runs (14:09 + 14:17) before merging at 14:25. This matches the N≥2 verification policy the operator and assistant established after OBS-AB sigkill resolution. The merge gate is functioning as designed.
+
+4. **GraphQL/CI quota cost of FIX iterations is real.** Each FIX cycle re-runs the full CI integration job (10 minutes) and consumes Claude tokens. PR-180's own purpose (reduce GraphQL burn) was paid for during convergence. Net win still positive — PR-180 in steady state saves much more than it cost during convergence — but worth recording the meta-cost so we know the price of underspecified task files.
+
+5. **The "quick merge despite flaky CI" advice would have been wrong here.** Assistant initially recommended "merge anyway, it is flaky" based on incomplete evidence. If operator had merged at run #9 (14:09 green), the merge would have succeeded but bypassed the verification rerun — which would have been okay in this specific case but would be wrong policy. Operator did the right thing waiting for daemon's second green confirmation.
+
+**Action items:**
+
+- For PR-191a/PR-191b (ETag — also REST/API surface) and PR-202 (WATCH adaptive polling — depends on PR-180): ensure task specs include explicit edge case fixtures derived from PR-180 lessons (stale history, partial fetch failure, empty signal interpretation).
+- No production fix needed; PR-180 is merged in correct final form.
+
+
 ## Deferred / Round 4
 
 - **Sprint 10 direct task injection.** Daemon передаёт pr_id + task_file path + task body в prompt coder'у напрямую. Снижен в приоритете: Wave 2 прошёл без AGENTS.md fixes вообще, значит текущая indirection работает приемлемо. Вернуть в Tier 1 только если incident повторится несколько раз.
@@ -883,8 +965,8 @@ GraphQL quota distribution across repos критична. Без PR-180 + PR-191
 
 - **PR-001..PR-179:** completed work. Frozen numbering.
 - **PR-180..PR-199:** active backlog batches от 2026-04-29 audit (Critical / Important / Multi-repo / Polish).
-- **PR-200..PR-202:** task-validation synonyms + dashboard UI consistency + WATCH adaptive polling (added 2026-04-29 evening).
-- **PR-203+:** future work — sprint-scale items deferred (GitHub App migration, Thompson Sampling, PAUSED removal, manifest flow).
+- **PR-200..PR-204:** task-validation synonyms + dashboard UI consistency + WATCH adaptive polling + compact resource limits row + outcome logging (added 2026-04-29 evening).
+- **PR-204+:** future work — sprint-scale items deferred (GitHub App migration, Thompson Sampling, PAUSED removal, manifest flow, resource limit history charts pending storage decision, JSONL → SQLite analytics migration when scale demands).
 
 Verify free numbers перед creating new task files: `ls tasks/PR-XXX.md` + `grep PR-XXX docs/roadmap.md`.
 
