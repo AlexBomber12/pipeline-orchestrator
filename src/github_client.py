@@ -167,7 +167,7 @@ def get_open_prs(
                 "--state",
                 "open",
                 "--json",
-                "number,title,headRefName,headRefOid,statusCheckRollup,url,updatedAt,commits,author,isCrossRepository,labels",
+                "number,title,headRefName,headRefOid,url,updatedAt,commits,author,isCrossRepository,labels",
             ],
             repo=repo,
         )
@@ -192,14 +192,16 @@ def get_open_prs(
         commits = entry.get("commits") or []
         head_sha = entry.get("headRefOid", "")
         title = entry.get("title", "")
+        check_runs, status_payload = _fetch_ci_status_rest(repo, head_sha)
         prs.append(
             PRInfo(
                 number=number,
                 branch=entry.get("headRefName", ""),
                 title=title,
                 pr_id=extract_queue_pr_id(title),
-                ci_status=_ci_status_from_rollup(
-                    entry.get("statusCheckRollup"),
+                ci_status=_map_rest_ci_status_to_enum(
+                    check_runs,
+                    status_payload,
                     empty_is_success=allow_merge_without_checks,
                 ),
                 review_status=get_pr_review_status(
@@ -1040,29 +1042,124 @@ def _get_latest_codex_review_info(
     return str(latest_sha or ""), latest_time if isinstance(latest_time, datetime) else None
 
 
-def _ci_status_from_rollup(
-    rollup: object,
+_REST_CI_FAILURE_STATES = {
+    "FAILURE",
+    "FAILED",
+    "ERROR",
+    "CANCELLED",
+    "TIMED_OUT",
+    "ACTION_REQUIRED",
+}
+_REST_CI_SUCCESS_STATES = {"SUCCESS", "COMPLETED", "NEUTRAL", "SKIPPED"}
+
+
+def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict]:
+    """Fetch combined CI signals for ``sha`` via the REST API.
+
+    Returns ``(check_runs, status_payload)`` where ``check_runs`` is a flat
+    list of all check_run dicts across pages from
+    ``GET /repos/{repo}/commits/{sha}/check-runs`` and ``status_payload`` is
+    the ``{"state": ..., "statuses": [...]}`` shape of
+    ``GET /repos/{repo}/commits/{sha}/status``. Either component degrades to
+    its empty default when the underlying ``gh api`` call fails so the
+    caller can still produce a safe ``CIStatus`` mapping rather than
+    aborting the whole PR list refresh.
+    """
+    check_runs: list[dict] = []
+    status_payload: dict = {}
+    if not sha:
+        return check_runs, status_payload
+
+    try:
+        pages = retry_transient(
+            lambda: run_gh(
+                [
+                    "api",
+                    "--paginate",
+                    "--slurp",
+                    f"repos/{repo}/commits/{sha}/check-runs",
+                ]
+            ),
+            operation_name=f"gh api repos/{repo}/commits/{sha}/check-runs",
+        )
+    except RuntimeError:
+        pages = None
+    if isinstance(pages, list):
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            runs = page.get("check_runs")
+            if isinstance(runs, list):
+                check_runs.extend(r for r in runs if isinstance(r, dict))
+
+    try:
+        raw_status = retry_transient(
+            lambda: run_gh(
+                [
+                    "api",
+                    f"repos/{repo}/commits/{sha}/status",
+                    "--jq",
+                    "{state: .state, statuses: .statuses}",
+                ]
+            ),
+            operation_name=f"gh api repos/{repo}/commits/{sha}/status",
+        )
+    except RuntimeError:
+        raw_status = None
+    if isinstance(raw_status, dict):
+        status_payload = raw_status
+    elif isinstance(raw_status, str) and raw_status:
+        try:
+            parsed = json.loads(raw_status)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            status_payload = parsed
+
+    return check_runs, status_payload
+
+
+def _map_rest_ci_status_to_enum(
+    check_runs: list[dict],
+    status_payload: dict,
     empty_is_success: bool = False,
 ) -> CIStatus:
-    """Map a ``statusCheckRollup`` payload to a single ``CIStatus`` value."""
-    if not isinstance(rollup, list):
-        return CIStatus.PENDING
-    if not rollup:
+    """Combine REST ``check-runs`` + commit ``status`` payloads into a ``CIStatus``.
+
+    Mirrors the semantics of the previous rollup mapping: any failure-like
+    state wins; SUCCESS only when every observed state is success-like;
+    otherwise PENDING. When neither check-runs nor commit statuses are
+    present the result follows ``empty_is_success`` so repos without
+    required checks can still merge.
+    """
+    statuses_raw = (
+        status_payload.get("statuses") if isinstance(status_payload, dict) else None
+    )
+    statuses = statuses_raw if isinstance(statuses_raw, list) else []
+
+    if not check_runs and not statuses:
         return CIStatus.SUCCESS if empty_is_success else CIStatus.PENDING
 
     states: list[str] = []
-    for check in rollup:
-        if not isinstance(check, dict):
+    for run in check_runs:
+        if not isinstance(run, dict):
             continue
-        value = check.get("conclusion") or check.get("state") or check.get("status")
+        value = run.get("conclusion") or run.get("status")
         if value:
             states.append(str(value).upper())
 
+    for status in statuses:
+        if not isinstance(status, dict):
+            continue
+        state_val = status.get("state")
+        if state_val:
+            states.append(str(state_val).upper())
+
     if not states:
         return CIStatus.PENDING
-    if any(s in {"FAILURE", "FAILED", "ERROR", "CANCELLED", "TIMED_OUT"} for s in states):
+    if any(s in _REST_CI_FAILURE_STATES for s in states):
         return CIStatus.FAILURE
-    if all(s in {"SUCCESS", "COMPLETED", "NEUTRAL", "SKIPPED"} for s in states):
+    if all(s in _REST_CI_SUCCESS_STATES for s in states):
         return CIStatus.SUCCESS
     return CIStatus.PENDING
 

@@ -11,14 +11,15 @@ from typing import Any
 import pytest
 import src.github_client as github_client
 from src.github_client import (
-    _ci_status_from_rollup,
     _compute_review_status,
+    _fetch_ci_status_rest,
     _get_codex_issue_reactions,
     _get_codex_review_signals,
     _get_latest_codex_review_info,
     _is_codex_user,
     _is_plus_one,
     _is_reaction_content,
+    _map_rest_ci_status_to_enum,
     _parse_iso,
     clear_last_known_sha,
     clear_merged_prs_cache,
@@ -2345,25 +2346,31 @@ def test_get_pr_metadata_returns_empty_on_error(
 
 
 # ---------------------------------------------------------------------------
-# _ci_status_from_rollup tests
+# _map_rest_ci_status_to_enum tests
 # ---------------------------------------------------------------------------
 
 
-def test_ci_status_empty_rollup_defaults_to_pending() -> None:
-    """Empty rollup list with default flag must return PENDING."""
-    assert _ci_status_from_rollup([]) == CIStatus.PENDING
+def test_map_rest_ci_status_empty_defaults_to_pending() -> None:
+    """No check-runs and no commit statuses must default to PENDING."""
+    assert _map_rest_ci_status_to_enum([], {"state": "pending", "statuses": []}) == CIStatus.PENDING
+    assert _map_rest_ci_status_to_enum([], {}) == CIStatus.PENDING
 
 
-def test_ci_status_empty_rollup_with_flag_returns_success() -> None:
-    """Empty rollup list with empty_is_success=True must return SUCCESS."""
-    assert _ci_status_from_rollup([], empty_is_success=True) == CIStatus.SUCCESS
+def test_map_rest_ci_status_empty_with_flag_returns_success() -> None:
+    """Empty REST signals with empty_is_success=True must return SUCCESS."""
+    assert (
+        _map_rest_ci_status_to_enum([], {"state": "pending", "statuses": []}, empty_is_success=True)
+        == CIStatus.SUCCESS
+    )
 
 
-def test_ci_status_non_list_returns_pending() -> None:
-    """Non-list input (None, dict, etc.) must return PENDING regardless of flag."""
-    assert _ci_status_from_rollup(None) == CIStatus.PENDING
-    assert _ci_status_from_rollup({}) == CIStatus.PENDING
-    assert _ci_status_from_rollup(None, empty_is_success=True) == CIStatus.PENDING
+def test_map_rest_ci_status_handles_non_dict_status_payload() -> None:
+    """A non-dict status payload (e.g. ``None``) collapses to PENDING/SUCCESS."""
+    assert _map_rest_ci_status_to_enum([], None) == CIStatus.PENDING  # type: ignore[arg-type]
+    assert (
+        _map_rest_ci_status_to_enum([], None, empty_is_success=True)  # type: ignore[arg-type]
+        == CIStatus.SUCCESS
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2436,7 +2443,6 @@ def test_get_open_prs_returns_prinfo_objects(
             "title": "PR-110: Add coverage",
             "headRefName": "feature-branch",
             "headRefOid": "abc123",
-            "statusCheckRollup": [],
             "url": "https://example.test/pr/42",
             "updatedAt": "2026-04-18T11:22:33Z",
             "commits": [{}, {}],
@@ -2445,7 +2451,19 @@ def test_get_open_prs_returns_prinfo_objects(
             "isCrossRepository": True,
         },
     ]
-    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: raw)
+    captured_pr_list_args: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if args and args[0] == "pr":
+            captured_pr_list_args.append(list(args))
+            return raw
+        raise AssertionError(f"unexpected run_gh call: {args}")
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr(
+        "src.github_client._fetch_ci_status_rest",
+        lambda repo, sha: ([], {}),
+    )
     monkeypatch.setattr(
         "src.github_client.get_pr_review_status",
         lambda repo, number, pr_author, head_sha: ReviewStatus.APPROVED,
@@ -2464,6 +2482,46 @@ def test_get_open_prs_returns_prinfo_objects(
     assert prs[0].last_activity == datetime(2026, 4, 18, 11, 22, 33, tzinfo=_tz.utc)
     assert prs[0].is_escalated is True
     assert prs[0].is_cross_repository is True
+    assert len(captured_pr_list_args) == 1
+    fields_arg = captured_pr_list_args[0][captured_pr_list_args[0].index("--json") + 1]
+    assert "statusCheckRollup" not in fields_arg
+
+
+def test_get_open_prs_invokes_rest_helper_with_head_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each PR's head SHA is passed through to the REST CI status fetch."""
+    raw = [
+        {
+            "number": 7,
+            "title": "PR-7: foo",
+            "headRefName": "bar",
+            "headRefOid": "deadbeef",
+            "url": "u",
+            "updatedAt": "2026-04-18T00:00:00Z",
+            "commits": [],
+            "author": {"login": "a"},
+            "labels": [],
+            "isCrossRepository": False,
+        }
+    ]
+    captured: list[tuple[str, str]] = []
+
+    def fake_fetch(repo: str, sha: str) -> tuple[list[dict], dict]:
+        captured.append((repo, sha))
+        return [{"conclusion": "failure"}], {"state": "failure", "statuses": []}
+
+    monkeypatch.setattr("src.github_client.run_gh", lambda *a, **kw: raw)
+    monkeypatch.setattr("src.github_client._fetch_ci_status_rest", fake_fetch)
+    monkeypatch.setattr(
+        "src.github_client.get_pr_review_status",
+        lambda repo, number, pr_author, head_sha: ReviewStatus.PENDING,
+    )
+
+    prs = get_open_prs("owner/name")
+
+    assert captured == [("owner/name", "deadbeef")]
+    assert prs[0].ci_status == CIStatus.FAILURE
 
 
 def test_get_open_prs_falls_back_to_rest_on_graphql_rate_limit(
@@ -3094,31 +3152,220 @@ def test_get_latest_codex_review_info_returns_tuple(
     assert _get_latest_codex_review_info("owner/name", 42) == ("sha123", submitted_at)
 
 
-def test_ci_status_failure_states_take_precedence() -> None:
-    assert _ci_status_from_rollup(
-        [
-            "ignore-me",
-            {"conclusion": "failure"},
-            {"state": "success"},
-        ]
-    ) == CIStatus.FAILURE
+def test_map_rest_ci_status_failure_states_take_precedence() -> None:
+    assert (
+        _map_rest_ci_status_to_enum(
+            ["ignore-me", {"conclusion": "failure"}, {"conclusion": "success"}],
+            {"state": "success", "statuses": [{"state": "success"}]},
+        )
+        == CIStatus.FAILURE
+    )
 
 
-def test_ci_status_success_requires_all_states_success_like() -> None:
-    assert _ci_status_from_rollup(
-        [
-            {"state": "completed"},
-            {"status": "skipped"},
-            {"conclusion": "neutral"},
-        ]
-    ) == CIStatus.SUCCESS
+def test_map_rest_ci_status_failure_from_commit_status_only() -> None:
+    """A failing legacy commit status alone is enough to map to FAILURE."""
+    assert (
+        _map_rest_ci_status_to_enum(
+            [{"conclusion": "success"}],
+            {"state": "failure", "statuses": [{"state": "failure"}]},
+        )
+        == CIStatus.FAILURE
+    )
 
 
-def test_ci_status_pending_when_states_missing_or_mixed() -> None:
-    assert _ci_status_from_rollup([{}, {"status": ""}]) == CIStatus.PENDING
-    assert _ci_status_from_rollup(
-        [{"state": "success"}, {"status": "in_progress"}]
-    ) == CIStatus.PENDING
+def test_map_rest_ci_status_action_required_treated_as_failure() -> None:
+    """``action_required`` is a check-run failure conclusion in REST."""
+    assert (
+        _map_rest_ci_status_to_enum(
+            [{"conclusion": "action_required"}], {}
+        )
+        == CIStatus.FAILURE
+    )
+
+
+def test_map_rest_ci_status_success_requires_all_states_success_like() -> None:
+    assert (
+        _map_rest_ci_status_to_enum(
+            [
+                {"conclusion": "neutral"},
+                {"conclusion": "skipped"},
+                {"status": "completed"},
+            ],
+            {"state": "success", "statuses": [{"state": "success"}]},
+        )
+        == CIStatus.SUCCESS
+    )
+
+
+def test_map_rest_ci_status_pending_when_states_missing_or_mixed() -> None:
+    assert _map_rest_ci_status_to_enum([{}, {"conclusion": ""}], {}) == CIStatus.PENDING
+    assert (
+        _map_rest_ci_status_to_enum(
+            [{"conclusion": "success"}, {"status": "in_progress"}], {}
+        )
+        == CIStatus.PENDING
+    )
+
+
+def test_map_rest_ci_status_pending_from_status_in_progress() -> None:
+    """A check-run still ``in_progress`` keeps the rollup PENDING."""
+    assert (
+        _map_rest_ci_status_to_enum(
+            [{"status": "in_progress"}],
+            {"state": "pending", "statuses": [{"state": "pending"}]},
+        )
+        == CIStatus.PENDING
+    )
+
+
+def test_map_rest_ci_status_skips_non_dict_entries() -> None:
+    """Garbage entries in either list are tolerated and ignored."""
+    assert (
+        _map_rest_ci_status_to_enum(
+            [{"conclusion": "success"}, "garbage"],
+            {"state": "success", "statuses": [{"state": "success"}, 7]},
+        )
+        == CIStatus.SUCCESS
+    )
+
+
+def test_fetch_ci_status_rest_combines_check_runs_and_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_fetch_ci_status_rest`` flattens paginated check-runs and parses status."""
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        calls.append(list(args))
+        if "check-runs" in args[-1]:
+            return [
+                {"total_count": 3, "check_runs": [{"id": 1, "conclusion": "success"}]},
+                {
+                    "total_count": 3,
+                    "check_runs": [
+                        {"id": 2, "conclusion": "neutral"},
+                        {"id": 3, "status": "in_progress"},
+                    ],
+                },
+            ]
+        return {"state": "pending", "statuses": [{"state": "pending"}]}
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+
+    check_runs, status_payload = _fetch_ci_status_rest("owner/name", "abc123")
+
+    assert [r["id"] for r in check_runs] == [1, 2, 3]
+    assert status_payload == {"state": "pending", "statuses": [{"state": "pending"}]}
+    assert any("--paginate" in c for c in calls)
+
+
+def test_fetch_ci_status_rest_returns_empty_for_blank_sha() -> None:
+    """A missing SHA short-circuits both REST calls."""
+    assert _fetch_ci_status_rest("owner/name", "") == ([], {})
+
+
+def test_fetch_ci_status_rest_degrades_on_check_runs_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A check-runs API failure leaves an empty list but still fetches status."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if "check-runs" in args[-1]:
+            raise RuntimeError("HTTP 503")
+        return {"state": "success", "statuses": [{"state": "success"}]}
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
+
+    check_runs, status_payload = _fetch_ci_status_rest("owner/name", "abc123")
+    assert check_runs == []
+    assert status_payload == {"state": "success", "statuses": [{"state": "success"}]}
+
+
+def test_fetch_ci_status_rest_degrades_on_status_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A combined-status API failure leaves an empty status payload."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if "check-runs" in args[-1]:
+            return [{"check_runs": [{"conclusion": "success"}]}]
+        raise RuntimeError("HTTP 503")
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
+
+    check_runs, status_payload = _fetch_ci_status_rest("owner/name", "abc123")
+    assert check_runs == [{"conclusion": "success"}]
+    assert status_payload == {}
+
+
+def test_fetch_ci_status_rest_parses_string_status_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``run_gh`` may return raw JSON text; ``_fetch_ci_status_rest`` parses it."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if "check-runs" in args[-1]:
+            return [{"check_runs": []}]
+        return '{"state": "success", "statuses": [{"state": "success"}]}'
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+
+    _, status_payload = _fetch_ci_status_rest("owner/name", "abc123")
+    assert status_payload == {"state": "success", "statuses": [{"state": "success"}]}
+
+
+def test_fetch_ci_status_rest_string_status_invalid_json_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed string status payload degrades to an empty dict."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if "check-runs" in args[-1]:
+            return [{"check_runs": []}]
+        return "not-json"
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+
+    _, status_payload = _fetch_ci_status_rest("owner/name", "abc123")
+    assert status_payload == {}
+
+
+def test_fetch_ci_status_rest_ignores_non_list_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``gh api --slurp`` returns an unexpected shape, fall back to empty."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if "check-runs" in args[-1]:
+            return {"unexpected": True}
+        return {"state": "pending", "statuses": []}
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+
+    check_runs, _ = _fetch_ci_status_rest("owner/name", "abc123")
+    assert check_runs == []
+
+
+def test_fetch_ci_status_rest_skips_non_dict_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-dict and non-list ``check_runs`` entries are tolerated."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if "check-runs" in args[-1]:
+            return [
+                "garbage",
+                {"check_runs": "also-garbage"},
+                {"check_runs": [{"conclusion": "success"}, "junk"]},
+            ]
+        return {}
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+
+    check_runs, _ = _fetch_ci_status_rest("owner/name", "abc123")
+    assert check_runs == [{"conclusion": "success"}]
 
 
 def test_parse_iso_returns_none_for_invalid_string() -> None:
