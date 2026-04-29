@@ -357,6 +357,17 @@
         .pulse-dot.dim {
             opacity: 0.3;
         }
+
+        .pulse-badge {
+            opacity: 1;
+            box-shadow: 0 0 8px 0 currentColor;
+            transition: box-shadow 1s ease-in-out, opacity 1s ease-in-out;
+        }
+
+        .pulse-badge.dim {
+            opacity: 0.75;
+            box-shadow: 0 0 0 0 transparent;
+        }
     </style>
 </head>
 <body class="bg-surface-1 text-gray-200 min-h-screen">
@@ -447,6 +458,7 @@
             let dim = false;
             function syncPulseDots() {
                 document.querySelectorAll('.pulse-dot').forEach(dot => dot.classList.toggle('dim', dim));
+                document.querySelectorAll('.pulse-badge').forEach(badge => badge.classList.toggle('dim', dim));
             }
             setInterval(() => {
                 dim = !dim;
