@@ -494,7 +494,25 @@ class IdleMixin:
         task = dag_task
         if queue_task is not None:
             queue_task_is_legacy = queue_task.pr_id not in structured_pr_ids
-            if task is None and (dag_tasks is None or queue_task_is_legacy):
+            # PR-181: tasks/QUEUE.md is gitignored, so a "legacy" entry on
+            # disk can outlive the underlying tasks/PR-*.md (e.g. after the
+            # base branch was wiped between cycles). When the entry names
+            # a task file that no longer exists in the working tree, treat
+            # it as a ghost and skip it — otherwise the daemon would
+            # resurrect a stale DOING entry over a fresh structured TODO.
+            # Entries without an explicit "Tasks file:" line keep their
+            # pre-PR-181 fallback behaviour because we cannot verify them.
+            queue_task_is_ghost = (
+                queue_task_is_legacy
+                and queue_task.task_file is not None
+                and not (Path(self.repo_path) / queue_task.task_file).is_file()
+            )
+            if queue_task_is_ghost:
+                self.log_event(
+                    f"Ignoring ghost legacy QUEUE.md entry {queue_task.pr_id} "
+                    f"(no {queue_task.task_file} on disk)"
+                )
+            elif task is None and (dag_tasks is None or queue_task_is_legacy):
                 task = queue_task
             elif (
                 task is not None
