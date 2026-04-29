@@ -189,6 +189,31 @@ Therefore:
 **Storage decision (related)**: PR-204 uses JSONL append-only files in `/data/analytics/<year>-<month>.jsonl`. SQLite migration deferred until any of: (a) cross-month queries become slow (>10s), (b) need for indexed columns on million-row tables, (c) multi-process concurrent writes that flock cannot handle. None apply at current scale (~250 PR/year, single daemon process).
 
 
+### Defense-in-depth confirms architectural approach (observed 2026-04-29 evening)
+
+A real instance validated that bounded-everything design choices are paying off, even when the immediate logic underneath has a bug.
+
+**The case:** PR-181 (Remove tasks/QUEUE.md from git tracking) merged earlier in the day. `_mark_queue_done` had been written before PR-181 and assumed `git add tasks/QUEUE.md` would always succeed. After PR-181 made QUEUE.md gitignored, the `git add` started returning exit 1 silently inside an exception path, leaving `pending_queue_sync_branch` set to a non-existent branch (`queue-done-pr-N`). Every subsequent IDLE cycle polled this fictional PR via `gh pr view`. Result: livelock.
+
+**The defense that worked:** `_escalate_queue_sync_if_expired` with `_QUEUE_SYNC_MAX_WAIT_SEC = 3600`. After 1 hour of polling, daemon escalated to ERROR with explicit message `queue-sync PR ... unresolved after 3647s (max 3600s)`, cleared the stuck field, and recovered. No human intervention needed for unblocking. Operator (and assistant) noticed via dashboard, but only because of the ERROR badge — daemon would have eventually recovered alone.
+
+**Why this matters:** nobody anticipated PR-181 × `_mark_queue_done` interaction. Defense-in-depth covered the unknown failure mode anyway. This is the value of bounded-everything design.
+
+**Principles that fired here:**
+
+1. **Bounded everything.** Every wait has a timeout. Every retry has a cap. Every poll has an escape hatch. Same principle as `BoundedRecoveryPolicy` framework from PR-160 — different surface, same idea.
+
+2. **State machine with explicit ERROR.** Daemon has no "stuck forever" state. Any impasse → ERROR with `error_message`. Operator can see and intervene; code can self-recover from ERROR to IDLE on next tick.
+
+3. **Self-recovery without operator.** Restart, timeout, escalate — three mechanisms that close unknown failure modes. PR-181/queue-sync interaction was unknown ahead of time; recovery worked anyway, costing only 1 hour latency and ~60 wasted GraphQL calls.
+
+4. **Honest logging.** `queue-sync PR queue-done-pr-182 view failed: gh pr view ... no pull requests found for branch "queue-done-pr-182"` — exact cause in log, not generic "something went wrong". Operator reconstructed the full sequence through `grep` retroactively.
+
+**Implication for future design decisions:** when adding any new wait/retry/poll loop, the timeout/cap/escape-hatch must be designed in from day one, not added later. Adding bounds retroactively to a long-running loop usually requires understanding all paths into and out of it — easier to bake in upfront.
+
+**This is industrial control system orthodoxy** ported to autonomous software. Operator's industrial B2B background (chiller/HVAC equipment) directly informed the daemon's defense-in-depth posture. AI coding tools as a category are still rediscovering principles that industrial automation solidified decades ago. This is the same calibration-as-engineering thesis recorded in 2026-04-17 strategy session ("Industrial engineering solved good-enough 30 years ago. AI coding is repeating the mistake."), surfaced here as direct evidence in production code.
+
+
 ### Testing policy для managed repos (added 2026-04-24 Day 5)
 
 Любой repo onboarded в pipeline-orchestrator должен иметь test pyramid:
@@ -898,6 +923,34 @@ The autonomous loop converges on real bugs, not just cosmetic patches. Daemon us
 
 - For PR-191a/PR-191b (ETag — also REST/API surface) and PR-202 (WATCH adaptive polling — depends on PR-180): ensure task specs include explicit edge case fixtures derived from PR-180 lessons (stale history, partial fetch failure, empty signal interpretation).
 - No production fix needed; PR-180 is merged in correct final form.
+
+
+### OBS-AE: Coder opens PR for wrong task (observed 2026-04-29 evening)
+
+**Observed:** daemon picked task PR-182 (diagnose_error infra bypass) at 18:42. Coder ran, but the resulting PR was opened as **PR-183 (Redis pub/sub upload trigger)** on branch `pr-183-redis-pubsub-upload-trigger` as GitHub PR #248. Daemon correctly classified this as failure (diagnose_error: FIX → IDLE twice) and re-picked PR-182 at 19:05, on the second attempt coder opened the correct PR #249 on `pr-182-diagnose-error-infra-bypass` branch.
+
+**Root cause hypothesis:** coder has freedom to interpret which task to work on rather than receiving the exact task file path as a non-negotiable instruction. Several possible failure modes:
+
+1. Coder reads `QUEUE.md` itself and picks the next task by its own logic, not respecting daemon's selection.
+2. Coder receives task file path but ignores it under certain conditions (multiple TODO entries near top of QUEUE confuse it).
+3. Coder pattern-matches task content and decides to do "what looks easier" first.
+
+This is the same class of problem as Sprint F2.1 SoT (Source of Truth direct instructions) which is currently NOT STARTED. The current path lets coder participate in task selection; the fix is to make daemon authoritative and coder mechanical.
+
+**Side effect:** PR #248 became an orphan — open on GitHub, but daemon does not track it in state, no task file points to it, no FIX iterations happen on it. Codex did one review on it (COMMENTED) and nothing else moves forward. Manual operator action required to close or reassign.
+
+**Related observation:** at the same time as this happened, `tasks/PR-183.md` is NOT present on production server (`cat: tasks/PR-183.md: No such file or directory`). The task file may have been lost during a previous upload (transient git error during zip extraction, partial commit). This means even when coder eventually picks PR-183 by its own logic, it does not have a task spec to work from. **Two failures stacked:** lost task file AND coder pick-without-instruction freedom.
+
+**Action items proposed:**
+
+- **PR-205 (proposed):** Mandatory task_file injection into coder prompt. Daemon constructs the coder invocation with explicit `--task-file=<path>` argument. AGENTS.md adds a hard rule: "Coder MUST work only on the task at the given path. If the path is missing or unreadable, ESCALATE — never pick another task." This is a Sprint F2.1 building block — minimal version that closes the immediate hole without requiring the full SoT refactor.
+- **PR-206 (proposed):** Upload integrity verification — after upload commit, daemon verifies all listed task files in QUEUE.md exist on disk. If any missing, log error and surface to operator before daemon picks any next task. Closes the lost-task-file failure mode.
+
+**Lessons recorded:**
+
+1. **Coder freedom to interpret task selection is a critical bug surface.** Even though one bad outcome happened in 250+ PRs (low frequency), the consequence is significant — orphan PR, wasted Codex review cycle, operator confusion when investigating. Defense in depth needed: both task spec injection (PR-205 above) and post-upload verification (PR-206 above).
+2. **Symptom looked like daemon abandoned a task mid-flight, root cause was different.** Initial hypothesis was that daemon manually serialized only one PR at a time and lost track of the second. Reading logs carefully showed the actual sequence: coder created wrong PR, daemon recovered correctly, picked task again, second attempt succeeded. **Lesson: read the logs around the suspected event window before forming hypothesis from current state alone.**
+3. **Lost task file went undetected for hours.** Operator only noticed because they were debugging a different issue. Add proactive integrity check at upload time so this surfaces immediately, not via second-order observation.
 
 
 ## Deferred / Round 4
