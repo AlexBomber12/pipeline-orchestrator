@@ -222,7 +222,7 @@ Numbering продолжает существующую sequence от PR-180 (п
 
 **Exit criteria:** megaraid-dashboard onboarded в read-only/observe mode без ручного редактирования AGENTS.md. Multi-repo dashboard работает корректно. Production config reproducible from git + override file.
 
-### Polish batch (PR-195..PR-202, ~2-3 days)
+### Polish batch (PR-195..PR-203, ~2-3 days)
 
 - **PR-195** push_count desync fix. UI metric совпадает с GitHub Commits tab — single source of truth.
 - **PR-196** AGENTS.md prohibit draft PRs (text update + PR-220 reconciliation example).
@@ -242,7 +242,9 @@ Observed during 2026-04-29 task-upload session:
 
 - **PR-202** WATCH adaptive polling — slow-start, fast-tail. Empirical observation 2026-04-29: WATCH state polls GitHub heavily but Codex Review + CI typically take 2-7 min and 5-15 min respectively to respond. Polling every 30s for the first 5 min is wasted quota on a scheduled wait. Logic: WATCH entry → slow 300s for first 5 min; after 5 min without event → fast 30-60s; on event detected → reset to slow start. Inverted from standard exponential backoff (which is fast-start, slow-tail). Combined with PR-184 IDLE adaptive: IDLE worker pattern (fast → slow on inactivity) and WATCH response-anticipation pattern (slow → fast on expected wait window passage) cover both dominant burn phases per Phase-resource separation observation. Type: feature. Complexity: low. Priority: 2. Depends on PR-180 (REST replacement) so the WATCH polling is already on REST core quota.
 
-These add to the existing PR-195..PR-199 polish batch. Total polish batch now PR-195..PR-202.
+- **PR-203** Compact resource limits row with tooltips. Replaces current single GitHub API budget bar with 4 chips: GH REST, GH GraphQL, Claude 5h, Claude weekly. Color zones by remaining percentage (green > 50%, amber 20-50%, red < 20%). Hover tooltip shows absolute values and reset time. No click action in this PR — history modal deferred (see Deferred section). Type: ux. Complexity: low. Reasoning: current visualization shows only GitHub API budget; system actually depends on 4 distinct quotas. Operator awareness gap.
+
+These add to the existing PR-195..PR-199 polish batch. Total polish batch now PR-195..PR-203.
 
 ### Deferred (sprint-scale, не в ближайшем 2-week плане)
 
@@ -255,6 +257,8 @@ These add to the existing PR-195..PR-199 polish batch. Total polish batch now PR
 - **OBS-5 gh credential helper instrumentation (PR-191 candidate):** intermittent, low-impact. Investigation PR, not immediate fix. Defer until other items closed.
 
 ---
+
+- **Resource limit history charts (PR-204+ candidate):** modal-on-click history graphs (4-hour rolling) for each of the 4 quotas surfaced in PR-203. Pending decision on storage backend — in-memory loses on daemon restart, Redis depends on RDB snapshot persistence, SQLite adds new dependency, PostgreSQL is overkill. Defer until storage decision is made or until operator concretely needs trend visibility (currently visual chip + reset time gives enough situational awareness for solo operator workflow).
 
 ## Vision (beyond Round 4, возможно отдельный продукт)
 
@@ -934,8 +938,8 @@ GraphQL quota distribution across repos критична. Без PR-180 + PR-191
 
 - **PR-001..PR-179:** completed work. Frozen numbering.
 - **PR-180..PR-199:** active backlog batches от 2026-04-29 audit (Critical / Important / Multi-repo / Polish).
-- **PR-200..PR-202:** task-validation synonyms + dashboard UI consistency + WATCH adaptive polling (added 2026-04-29 evening).
-- **PR-203+:** future work — sprint-scale items deferred (GitHub App migration, Thompson Sampling, PAUSED removal, manifest flow).
+- **PR-200..PR-203:** task-validation synonyms + dashboard UI consistency + WATCH adaptive polling + compact resource limits row (added 2026-04-29 evening).
+- **PR-204+:** future work — sprint-scale items deferred (GitHub App migration, Thompson Sampling, PAUSED removal, manifest flow, resource limit history charts pending storage decision).
 
 Verify free numbers перед creating new task files: `ls tasks/PR-XXX.md` + `grep PR-XXX docs/roadmap.md`.
 
