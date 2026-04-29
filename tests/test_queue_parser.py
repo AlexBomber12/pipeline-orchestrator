@@ -482,10 +482,29 @@ def test_get_next_task_returns_todo_when_dependency_done(tmp_path: Path) -> None
     assert nxt.pr_id == "PR-003"
 
 
-def test_parse_real_queue_file() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    real_queue = repo_root / "tasks" / "QUEUE.md"
-    queue_text = real_queue.read_text(encoding="utf-8")
+def test_parse_real_queue_file(tmp_path: Path) -> None:
+    queue_text = (
+        "# Task Queue\n"
+        "\n"
+        "## PR-001: Bootstrap\n"
+        "- Status: DONE\n"
+        "- Tasks file: tasks/PR-001.md\n"
+        "- Branch: pr-001-bootstrap\n"
+        "\n"
+        "## PR-002: Models\n"
+        "- Status: DONE\n"
+        "- Tasks file: tasks/PR-002.md\n"
+        "- Branch: pr-002-models\n"
+        "- Depends on: PR-001\n"
+        "\n"
+        "## PR-003: Parser\n"
+        "- Status: TODO\n"
+        "- Tasks file: tasks/PR-003.md\n"
+        "- Branch: pr-003-parser\n"
+        "- Depends on: PR-002\n"
+    )
+    real_queue = tmp_path / "QUEUE.md"
+    real_queue.write_text(queue_text, encoding="utf-8")
     tasks = parse_queue(str(real_queue))
     status_lines = [
         line.split(":", 1)[1].strip()
