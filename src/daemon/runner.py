@@ -51,7 +51,13 @@ from src.daemon.github_rate_limit import (
     write_budget,
 )
 from src.daemon.handlers.coding import CodingMixin
-from src.daemon.handlers.error import ErrorCategory, ErrorMixin, _classify_error  # noqa: F401 — re-exported for tests
+from src.daemon.handlers.error import (  # noqa: F401 — re-exported for tests
+    INFRA_ERROR_PATTERNS,
+    ErrorCategory,
+    ErrorMixin,
+    _classify_error,
+    _is_infra_error,
+)
 from src.daemon.handlers.fix import FixMixin
 from src.daemon.handlers.hung import HungMixin
 from src.daemon.handlers.idle import IdleMixin

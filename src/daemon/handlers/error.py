@@ -25,6 +25,57 @@ from src.retry import retry_transient
 logger = logging.getLogger(__name__)
 _CLAUDE_CLI_COAUTHOR = "Co-authored-by: Claude CLI <noreply@anthropic.com>"
 
+INFRA_ERROR_PATTERNS: tuple[str, ...] = (
+    "git fetch origin",
+    "ensure_repo_cloned",
+)
+
+# ``gh: failed to ...`` is too broad to be an unconditional infra signal:
+# the same prefix appears in auth failures (``gh: failed to authenticate``)
+# and workflow rejections (``gh: failed to run git: not possible to
+# fast-forward``). Treat ``gh:`` only as a git/GitHub *context* marker
+# (via _GIT_CONTEXT_REGEX) and require a network symptom from
+# _INFRA_NETWORK_PATTERNS or a retry wrapper from _INFRA_RETRY_REGEX
+# before bypassing diagnose_error.
+
+# Generic network-symptom strings that also commonly appear in app/test
+# errors (e.g. "Failed to connect to database", "Connection timed out"
+# from a Redis client). Treat them as infra only when accompanied by an
+# explicit git/GitHub reference; otherwise let diagnose_error route them
+# normally so FIX/ESCALATE guidance is preserved for actionable failures.
+_INFRA_NETWORK_PATTERNS: tuple[str, ...] = (
+    "could not connect to",
+    "connection timed out",
+    "network is unreachable",
+    "failed to connect",
+    "dial tcp",
+)
+
+_GIT_CONTEXT_REGEX = re.compile(
+    r"\b(?:git|gh|github\.com|ensure_repo_cloned)\b"
+)
+
+# retry_transient raises ``"<operation_name> failed after N attempts: <exc>"``;
+# only treat the wrapper as infra when the operation_name is a git/gh network
+# call. A bare "failed after N attempts" match would also catch unrelated
+# retry strings (API/validation/workflow loops), and "git push" alone catches
+# actionable rejections (non-fast-forward, branch protection, auth/policy).
+_INFRA_RETRY_REGEX = re.compile(
+    r"(?:git (?:clone|fetch|push)|gh api)\b[^\n]*?\bfailed after \d+ attempts"
+)
+
+
+def _is_infra_error(context: str) -> bool:
+    """True when ``context`` looks like a git/network infra failure."""
+    lowered = context.lower()
+    if any(pattern in lowered for pattern in INFRA_ERROR_PATTERNS):
+        return True
+    if _INFRA_RETRY_REGEX.search(lowered) is not None:
+        return True
+    if any(pattern in lowered for pattern in _INFRA_NETWORK_PATTERNS):
+        return _GIT_CONTEXT_REGEX.search(lowered) is not None
+    return False
+
 
 class ErrorCategory(Enum):
     RATE_LIMIT = "rate_limit"
@@ -83,6 +134,15 @@ class ErrorMixin:
     async def handle_error(self, error_context: str | None = None) -> None:
         """Ask the selected coder whether to FIX, SKIP, or ESCALATE the error."""
         context = error_context or self.state.error_message or "Unknown error"
+        if _is_infra_error(context):
+            self._error_skip_context = None
+            self._error_skip_count = 0
+            self._error_skip_active = False
+            truncated = context if len(context) <= 200 else context[:197] + "..."
+            self.log_event(
+                f"Infra error detected, skipping AI diagnosis: {truncated}"
+            )
+            return
         category = _classify_error(context)
         if category == ErrorCategory.RATE_LIMIT:
             self._error_skip_context = None
