@@ -575,7 +575,13 @@ async def main() -> None:
         if desired_slugs != subscribed_slugs:
             await _close_pubsub(pubsub)
             pubsub = await subscribe_wake(redis_client, desired_slugs)
-            subscribed_slugs = desired_slugs
+            if pubsub is None and desired_slugs:
+                # Subscribe failed transiently; clear subscribed_slugs so the
+                # next iteration retries instead of falling back permanently
+                # to timed polling.
+                subscribed_slugs = ()
+            else:
+                subscribed_slugs = desired_slugs
 
         healthy = await _wait_or_wake(
             pubsub, max(tick, 1), last_run, slug_to_key

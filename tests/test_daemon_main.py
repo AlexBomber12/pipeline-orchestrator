@@ -1721,3 +1721,34 @@ def test_main_loop_recovers_after_unhealthy_pubsub(
 
     # First subscription on cycle 1, re-subscription on cycle 2 after unhealthy.
     assert subscriptions == [("octo__alpha",), ("octo__alpha",)]
+
+
+def test_main_loop_retries_subscribe_when_initial_attempt_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient ``subscribe_wake`` failure must not park the loop on timed polling."""
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    _patch_main(monkeypatch, config, sleep_iterations=3)
+
+    subscriptions: list[tuple[str, ...]] = []
+
+    async def fake_subscribe_wake(redis_client: Any, slugs: tuple[str, ...]) -> Any:
+        subscriptions.append(tuple(slugs))
+        # First call simulates a transient Redis hiccup. Subsequent calls
+        # succeed so we can confirm the retry actually happens.
+        if len(subscriptions) == 1:
+            return None
+        return _ScriptedPubSub([])
+
+    monkeypatch.setattr(main_module, "subscribe_wake", fake_subscribe_wake)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    # The first subscribe returned None, so the loop must keep attempting
+    # to subscribe on subsequent cycles instead of latching the slug set.
+    assert len(subscriptions) >= 2
+    assert all(slugs == ("octo__alpha",) for slugs in subscriptions)
