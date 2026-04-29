@@ -16,6 +16,7 @@ from src import github_client
 from src.daemon import git_ops
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 from src.queue_parser import QueueValidationError
+from src.task_status import get_merged_pr_ids
 
 
 class RecoveryMixin:
@@ -61,6 +62,33 @@ class RecoveryMixin:
                 continue
             kept.append(queued)
         return kept
+
+    def _is_doing_already_merged(self, doing: QueueTask) -> bool:
+        """Return ``True`` when ``doing``'s PR is already merged on origin.
+
+        The QUEUE.md snapshot consulted by ``recover_state`` can lag the
+        true merge state: on legacy tracked-QUEUE repos
+        ``_mark_queue_done`` skips its in-place rewrite to keep the
+        working tree clean for preflight, so origin/{branch}'s queue
+        keeps the just-merged task pinned at DOING. Without this probe,
+        ``recover_state`` would treat the stale entry as interrupted
+        work and re-enter CODING for an already-merged task on every
+        daemon restart, redoing completed work and creating duplicate
+        follow-up activity.
+
+        Probe failures (missing ref, transient git error) report
+        ``False`` so the caller falls through to the existing recovery
+        paths instead of dropping a real interrupted DOING entry.
+        """
+        try:
+            merged = get_merged_pr_ids(
+                self.repo_path,
+                self.repo_config.branch,
+                {doing.pr_id},
+            )
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            return False
+        return doing.pr_id in merged
 
     async def recover_state(self) -> bool:
         """Reconstruct state from QUEUE.md + GitHub on daemon startup.
@@ -186,6 +214,16 @@ class RecoveryMixin:
                 )
                 return True
 
+            if self._is_doing_already_merged(doing):
+                self.log_event(
+                    f"recover_state: ignoring stale DOING entry "
+                    f"{doing.pr_id} (already merged on "
+                    f"origin/{self.repo_config.branch})"
+                )
+                self.state.current_task = None
+                doing = None
+
+        if doing is not None:
             if self.state.user_paused:
                 if doing.branch and not self._preserve_crashed_run_commits(
                     doing.branch

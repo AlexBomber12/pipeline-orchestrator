@@ -452,6 +452,57 @@ def test_recover_state_uses_single_probe_for_parse_and_ghost_filter(
     )
 
 
+def test_recover_doing_task_skipped_when_already_merged_on_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale DOING entry whose PR is already merged on
+    ``origin/{branch}`` must NOT trigger a CODING re-run.
+
+    On legacy tracked-QUEUE repos ``_mark_queue_done`` skips its
+    in-place rewrite to keep the working tree clean for preflight, so
+    ``origin/{branch}:tasks/QUEUE.md`` keeps the just-merged task pinned
+    at DOING. Without this guard, ``recover_state`` would treat the
+    stale entry as interrupted work and re-enter CODING for an
+    already-merged task on every daemon restart.
+    """
+    task = _doing_task()
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
+    )
+
+    coding_ran: list[bool] = []
+
+    async def fake_coding() -> None:  # pragma: no cover - must not fire
+        coding_ran.append(True)
+
+    runner = _make_runner()
+    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner.handle_coding = fake_coding  # type: ignore[method-assign]
+    runner._is_doing_already_merged = lambda doing: True  # type: ignore[method-assign]
+    # Preserve must NOT run for a merged task — the entry is stale, not
+    # interrupted work.
+    runner._preserve_crashed_run_commits = (  # type: ignore[method-assign]
+        lambda branch: pytest.fail("preserve must not run for merged task")
+    )
+
+    result = asyncio.run(runner.recover_state())
+
+    assert result is True
+    assert coding_ran == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.current_pr is None
+    assert any(
+        "ignoring stale DOING entry PR-042" in e["event"]
+        and "already merged on origin/main" in e["event"]
+        for e in runner.state.history
+    )
+    assert not any(
+        "re-running CODING" in e["event"]
+        for e in runner.state.history
+    )
+
+
 def test_recover_doing_task_without_pr_rerun_coding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -808,6 +859,11 @@ def test_recover_aborts_when_branch_probe_fails(
         # the local-branch probe failure under test.
         if cmd[:3] == ["git", "cat-file", "-e"]:
             return _Result(returncode=1)
+        # ``_is_doing_already_merged`` probes ``git log origin/{branch}``
+        # for a matching merge subject. Report no merge so the test
+        # stays focused on the local-branch probe failure under test.
+        if cmd[:2] == ["git", "-C"] and len(cmd) > 3 and cmd[3] == "log":
+            return _Result(returncode=0)
         raise AssertionError(f"unexpected subprocess call: {cmd}")
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
