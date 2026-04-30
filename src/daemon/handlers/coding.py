@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+from typing import Awaitable, Callable
 
 from src import github_client
 from src.daemon import git_ops
@@ -298,7 +299,9 @@ class CodingMixin:
         if await pause_for_stop_if_requested():
             return
         if candidate is None:
-            await self._diagnose_exit_zero_no_pr(target_branch, coder_name)
+            await self._diagnose_exit_zero_no_pr(
+                target_branch, coder_name, pause_for_stop_if_requested
+            )
             return
 
         self.state.current_pr = candidate
@@ -312,6 +315,7 @@ class CodingMixin:
         self,
         target_branch: str,
         coder_name: str,
+        pause_for_stop_if_requested: Callable[[], Awaitable[bool]],
     ) -> None:
         """Resolve the "coder exited 0 but no PR" outcome by branch state.
 
@@ -323,6 +327,12 @@ class CodingMixin:
         or push outcome without inspection. Case C is auto-recoverable —
         the daemon issues ``gh pr create`` itself and hands off to WATCH on
         success, falling back to HUNG when PR creation fails.
+
+        ``pause_for_stop_if_requested`` is rechecked before any state-changing
+        side effect (PR creation, sleep between visibility retries, final
+        WATCH transition) so a user stop pressed after coder exit but before
+        the daemon's own PR creation is honored — otherwise the daemon would
+        open an unwanted PR after an explicit stop.
         """
         local_exists = _local_branch_exists(self.repo_path, target_branch)
         remote_exists = _remote_branch_exists(self.repo_path, target_branch)
@@ -344,6 +354,9 @@ class CodingMixin:
             self.log_event(message)
             return
 
+        if await pause_for_stop_if_requested():
+            return
+
         self.log_event(
             f"[{coder_name}] Coder exited 0 with branch but no PR — "
             f"daemon creating PR"
@@ -356,9 +369,13 @@ class CodingMixin:
         # GitHub's PR list endpoints are eventually consistent, so a PR
         # that gh pr create just opened may be temporarily absent. Retry
         # the same bounded 3x/5s schedule used earlier in handle_coding
-        # before declaring the PR missing.
+        # before declaring the PR missing. Each iteration honors a pending
+        # stop request so a user pressing stop during the visibility window
+        # is not overridden by a WATCH handoff.
         candidate = None
         for attempt in range(3):
+            if await pause_for_stop_if_requested():
+                return
             try:
                 prs = github_client.get_open_prs(
                     self.owner_repo,
@@ -384,6 +401,8 @@ class CodingMixin:
                 )
                 await asyncio.sleep(5)
 
+        if await pause_for_stop_if_requested():
+            return
         if candidate is None:
             message = (
                 f"[{coder_name}] Daemon-created PR not found for branch "
@@ -412,10 +431,15 @@ class CodingMixin:
     ) -> bool:
         """Run ``gh pr create`` against an already-pushed branch.
 
-        Returns ``True`` on success. On failure the runner is transitioned
-        to HUNG with the gh error and the run record saved, matching the
-        ESCALATE-style handling the diagnostic uses for cases A and B —
-        a failed creation is not silently retried.
+        Returns ``True`` on success. ``gh pr create`` exits non-zero with an
+        "already exists" message when a PR for the same head branch is
+        already open (often because the earlier list lagged GitHub PR
+        visibility); that case is treated as success so the caller's
+        post-create visibility loop can pick up the existing PR rather than
+        parking the runner as HUNG. On any other failure the runner is
+        transitioned to HUNG with the gh error and the run record saved,
+        matching the ESCALATE-style handling the diagnostic uses for cases
+        A and B — a failed creation is not silently retried.
         """
         task = self.state.current_task
         # The diagnostic only runs after handle_coding's target_branch guard,
@@ -451,6 +475,12 @@ class CodingMixin:
                 repo=self.owner_repo,
             )
         except (RuntimeError, subprocess.SubprocessError, OSError) as exc:
+            if "already exists" in str(exc).lower():
+                self.log_event(
+                    f"[{coder_name}] gh pr create reports PR already exists "
+                    f"for {target_branch!r}; reusing existing PR"
+                )
+                return True
             message = (
                 f"[{coder_name}] Daemon PR creation failed for "
                 f"{target_branch!r}: {exc}"

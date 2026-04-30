@@ -286,3 +286,156 @@ def test_daemon_create_pr_uses_pr_id_when_title_missing(
     assert create_args[title_idx] == "PR-001"
     body_idx = create_args.index("--body") + 1
     assert "with no PR" in create_args[body_idx]
+
+
+def test_case_c_already_exists_error_recovers_to_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``gh pr create`` returns non-zero when a PR for the same head branch
+    already exists (e.g. PR visibility lagged the earlier list). The
+    diagnostic must treat that as recoverable and hand off to WATCH using
+    the existing PR rather than parking the runner as HUNG."""
+    existing = PRInfo(number=314, branch="pr-001")
+    runner = _runner(monkeypatch, open_prs_after_create=[existing])
+    _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **_kw: Any):
+        raise RuntimeError(
+            'gh pr create failed (exit 1): a pull request for branch '
+            '"pr-001" into branch "main" already exists: '
+            'https://github.com/octo/demo/pull/314'
+        )
+
+    monkeypatch.setattr(github_client, "run_gh", fake_run_gh)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 314
+    assert any(
+        "already exists" in entry["event"].lower()
+        for entry in runner.state.history
+    )
+
+
+def test_case_c_already_exists_error_falls_through_when_pr_invisible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``gh`` reports the PR exists but the post-create list never
+    surfaces it, the diagnostic should still escalate after the bounded
+    retry window — the recovery path defers to the existing 'PR not found'
+    HUNG branch rather than silently swallowing the error."""
+    runner = _runner(monkeypatch, open_prs_after_create=[])
+    _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **_kw: Any):
+        raise RuntimeError("already exists: https://example/pull/1")
+
+    monkeypatch.setattr(github_client, "run_gh", fake_run_gh)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.HUNG
+    assert "Daemon-created PR not found" in (runner.state.error_message or "")
+
+
+def test_diagnose_honors_stop_request_before_pr_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user stop pressed after coder exit but before the daemon creates
+    its own PR must be honored: the runner pauses without invoking
+    ``gh pr create`` and without transitioning to WATCH."""
+    runner = _runner(monkeypatch)
+    _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
+
+    pop_calls = {"n": 0}
+
+    async def fake_pop_stop_request() -> bool:
+        pop_calls["n"] += 1
+        # Calls 1-6 cover the pause checks in handle_coding (around CLI
+        # exit and the PR-visibility retry loop). Call 7 is the new check
+        # the diagnostic performs immediately before daemon-side PR
+        # creation; return True there to simulate a stop pressed during
+        # that window.
+        return pop_calls["n"] == 7
+
+    monkeypatch.setattr(runner, "_pop_stop_request", fake_pop_stop_request)
+
+    create_calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **_kw: Any):
+        create_calls.append(args)
+        return ""
+
+    monkeypatch.setattr(github_client, "run_gh", fake_run_gh)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.current_pr is None
+    assert create_calls == []
+
+
+def test_diagnose_honors_stop_request_during_post_create_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user stop pressed after the daemon called ``gh pr create`` but
+    while still polling for PR visibility must short-circuit the retry
+    loop and pause the runner instead of completing the WATCH handoff."""
+    created = PRInfo(number=42, branch="pr-001")
+    runner = _runner(
+        monkeypatch,
+        open_prs_after_create=[created],
+        post_create_empty_attempts=2,
+    )
+    _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
+
+    pop_calls = {"n": 0}
+
+    async def fake_pop_stop_request() -> bool:
+        pop_calls["n"] += 1
+        # Allow the pre-create pause check (call 7) to pass so PR creation
+        # actually runs, then trip the second retry-loop pause (call 9)
+        # to simulate a stop pressed mid-retry. Calls 1-6 belong to
+        # handle_coding's earlier pause checks.
+        return pop_calls["n"] == 9
+
+    monkeypatch.setattr(runner, "_pop_stop_request", fake_pop_stop_request)
+    monkeypatch.setattr(github_client, "run_gh", lambda *a, **kw: "")
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.current_pr is None
+
+
+def test_diagnose_honors_stop_request_after_post_create_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop pressed after the post-create retry loop has located the PR
+    but before the WATCH transition must still pause the runner — the
+    daemon should not complete the WATCH handoff once an explicit stop is
+    pending."""
+    created = PRInfo(number=51, branch="pr-001")
+    runner = _runner(monkeypatch, open_prs_after_create=[created])
+    _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
+
+    pop_calls = {"n": 0}
+
+    async def fake_pop_stop_request() -> bool:
+        pop_calls["n"] += 1
+        # Calls 1-6: handle_coding pauses (CLI exit + pre-list retries +
+        # final post-loop check). Call 7: pre-create pause inside the
+        # diagnostic. Call 8: pause before the first post-create list
+        # (which finds the PR immediately). Call 9: the new post-loop
+        # pause check that gates the WATCH transition.
+        return pop_calls["n"] == 9
+
+    monkeypatch.setattr(runner, "_pop_stop_request", fake_pop_stop_request)
+    monkeypatch.setattr(github_client, "run_gh", lambda *a, **kw: "")
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.current_pr is None
