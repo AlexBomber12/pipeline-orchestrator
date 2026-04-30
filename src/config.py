@@ -5,12 +5,15 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import typing
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
+
+OVERLAY_FILENAME = "config.production.yml"
 
 
 class CoderType(str, Enum):
@@ -198,12 +201,132 @@ def load_config(path: str | None = None) -> AppConfig:
     ``"config.yml"`` when the variable is unset. Explicit paths are
     honored as-is so callers that pin a config file (e.g. unit tests,
     settings writers) keep their existing semantics.
+
+    If a sibling ``config.production.yml`` exists next to the resolved
+    base path, it is deep-merged on top of the base (overlay wins for
+    scalars and lists; nested mappings merge recursively). The overlay
+    is gitignored by convention so production overrides survive
+    ``git reset`` without polluting the committed config.
     """
     resolved_path = path if path is not None else os.environ.get("PO_CONFIG_PATH", "config.yml")
     raw = _load_config_raw(resolved_path)
+
+    overlay = _load_overlay_raw(Path(resolved_path))
+    if overlay:
+        unknown = _collect_unknown_overlay_keys(overlay, AppConfig)
+        for key in unknown:
+            logger.warning(
+                "Overlay %s contains unknown field '%s' — ignored",
+                OVERLAY_FILENAME,
+                key,
+            )
+        raw = _deep_merge(raw, overlay)
+        applied = _applied_overlay_paths(overlay)
+        if applied:
+            logger.info(
+                "Applied %s overlay fields: %s",
+                OVERLAY_FILENAME,
+                ", ".join(sorted(applied)),
+            )
+
     _apply_daemon_env_overrides(raw)
 
     return AppConfig.model_validate(raw)
+
+
+def _load_overlay_raw(base_path: Path) -> dict[str, Any]:
+    """Return overlay mapping if sibling ``config.production.yml`` exists.
+
+    Resolves the overlay strictly as a sibling of ``base_path`` so
+    operators cannot accidentally point the daemon at an overlay in an
+    unrelated directory. Returns an empty mapping when the overlay does
+    not exist or is empty.
+    """
+    overlay_path = base_path.parent / OVERLAY_FILENAME
+    if not overlay_path.is_file():
+        return {}
+
+    with overlay_path.open("r", encoding="utf-8") as fh:
+        return yaml.safe_load(fh) or {}
+
+
+def _deep_merge(
+    base: dict[str, Any], overlay: dict[str, Any]
+) -> dict[str, Any]:
+    """Return ``overlay`` merged into ``base``.
+
+    Nested dicts merge recursively. Lists in the overlay replace lists
+    in the base (no concat) so an operator can shrink a list without
+    fighting accumulated entries.
+    """
+    merged: dict[str, Any] = dict(base)
+    for key, value in overlay.items():
+        if (
+            key in merged
+            and isinstance(merged[key], dict)
+            and isinstance(value, dict)
+        ):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _resolve_nested_model(annotation: Any) -> type[BaseModel] | None:
+    """Return the BaseModel subclass embedded in ``annotation`` if any.
+
+    Recognizes plain ``Model`` and ``Optional[Model]`` / ``Model | None``
+    forms. Container types like ``list[Model]`` are intentionally left
+    alone — overlay validation does not descend into list items.
+    """
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    if typing.get_origin(annotation) is list:
+        return None
+    for arg in typing.get_args(annotation):
+        if isinstance(arg, type) and issubclass(arg, BaseModel):
+            return arg
+    return None
+
+
+def _collect_unknown_overlay_keys(
+    overlay: dict[str, Any],
+    model_cls: type[BaseModel],
+    prefix: str = "",
+) -> list[str]:
+    """Return dotted overlay paths that do not match ``model_cls`` schema."""
+    unknown: list[str] = []
+    if not isinstance(overlay, dict):
+        return unknown
+    for key, value in overlay.items():
+        path = f"{prefix}.{key}" if prefix else key
+        field = model_cls.model_fields.get(key)
+        if field is None:
+            unknown.append(path)
+            continue
+        if isinstance(value, dict):
+            inner = _resolve_nested_model(field.annotation)
+            if inner is not None:
+                unknown.extend(
+                    _collect_unknown_overlay_keys(value, inner, path)
+                )
+    return unknown
+
+
+def _applied_overlay_paths(
+    overlay: dict[str, Any], prefix: str = ""
+) -> list[str]:
+    """Flatten ``overlay`` to dotted paths for the info log."""
+    paths: list[str] = []
+    if not isinstance(overlay, dict):
+        return paths
+    for key, value in overlay.items():
+        new_path = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict) and value:
+            paths.extend(_applied_overlay_paths(value, new_path))
+        else:
+            paths.append(new_path)
+    return paths
 
 
 def _apply_daemon_env_overrides(raw: dict[str, Any]) -> None:

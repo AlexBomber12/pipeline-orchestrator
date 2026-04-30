@@ -1,0 +1,31 @@
+# Production overlay template for pipeline-orchestrator.
+#
+# Copy this file to ``config.production.yml`` next to ``config.yml`` on the
+# production host. The daemon loads ``config.yml`` first and then deep-merges
+# this overlay over it. Lists in the overlay replace lists in the base; nested
+# dicts merge recursively. Values listed below are illustrative — set only the
+# keys you want to override and delete the rest.
+#
+# The overlay file is gitignored so production overrides survive ``git reset``
+# without being committed to the repo. Unknown overlay keys are logged as
+# warnings and ignored, so it is safe to add forward-compatible fields.
+
+daemon:
+  # Tighter review SLA for production: page operators sooner if a Codex
+  # review stalls past the cutoff.
+  review_timeout_min: 45
+
+  # Production rate-limit splits — keep room for emergencies on the session
+  # quota and refuse to burn the weekly bucket below 100%.
+  rate_limit_session_pause_percent: 90
+  rate_limit_weekly_pause_percent: 100
+
+  # Larger cap for long FIX cycles when running against bigger repos.
+  fix_iteration_cap: 25
+
+  # Production statusline hook: install the dashboard ticker on the daemon
+  # host so ``claude`` sessions show coder/state inline.
+  install_statusline_hook: true
+
+  # Raise the planned-PR timeout for slower production hardware.
+  planned_pr_timeout_sec: 1800

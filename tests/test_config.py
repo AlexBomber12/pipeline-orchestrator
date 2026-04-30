@@ -886,3 +886,234 @@ def test_update_repository_coder_clear(tmp_path: Path) -> None:
         "https://github.com/octo/alpha.git", str(path), coder=None
     )
     assert cfg.repositories[0].coder is None
+
+
+def test_load_config_no_overlay_uses_base(tmp_path: Path) -> None:
+    base = tmp_path / "config.yml"
+    base.write_text(
+        "daemon:\n  poll_interval_sec: 45\n", encoding="utf-8"
+    )
+
+    cfg = load_config(str(base))
+
+    assert cfg.daemon.poll_interval_sec == 45
+    # Defaults remain intact for fields the base does not pin.
+    assert cfg.daemon.fix_iteration_cap == 15
+
+
+def test_load_config_overlay_merges_over_base(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    base = tmp_path / "config.yml"
+    base.write_text(
+        "daemon:\n"
+        "  poll_interval_sec: 45\n"
+        "  fix_iteration_cap: 8\n"
+        "web:\n"
+        "  host: 127.0.0.1\n"
+        "  port: 9000\n",
+        encoding="utf-8",
+    )
+    overlay = tmp_path / "config.production.yml"
+    overlay.write_text(
+        "daemon:\n"
+        "  fix_iteration_cap: 25\n"
+        "  rate_limit_session_pause_percent: 90\n"
+        "web:\n"
+        "  port: 9100\n",
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("INFO", logger="src.config"):
+        cfg = load_config(str(base))
+
+    # Overlay wins per-field; base values for un-overridden fields survive.
+    assert cfg.daemon.fix_iteration_cap == 25
+    assert cfg.daemon.rate_limit_session_pause_percent == 90
+    assert cfg.daemon.poll_interval_sec == 45
+    assert cfg.web.host == "127.0.0.1"
+    assert cfg.web.port == 9100
+
+    info_messages = [
+        rec.getMessage() for rec in caplog.records if rec.levelname == "INFO"
+    ]
+    applied_msg = next(
+        (m for m in info_messages if "overlay fields" in m), None
+    )
+    assert applied_msg is not None, info_messages
+    assert "daemon.fix_iteration_cap" in applied_msg
+    assert "web.port" in applied_msg
+
+
+def test_load_config_overlay_unknown_field_warns_and_ignored(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    base = tmp_path / "config.yml"
+    base.write_text(
+        "daemon:\n  poll_interval_sec: 45\n", encoding="utf-8"
+    )
+    overlay = tmp_path / "config.production.yml"
+    overlay.write_text(
+        "daemon:\n"
+        "  future_only_field: 1\n"
+        "totally_unknown_section:\n"
+        "  whatever: true\n",
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING", logger="src.config"):
+        cfg = load_config(str(base))
+
+    # Base values unchanged — the unknown overlay keys are forward-compat
+    # noise and pydantic's default extra="ignore" drops them at validation.
+    assert cfg.daemon.poll_interval_sec == 45
+    warnings = [
+        rec.getMessage() for rec in caplog.records if rec.levelname == "WARNING"
+    ]
+    assert any("daemon.future_only_field" in m for m in warnings), warnings
+    assert any("totally_unknown_section" in m for m in warnings), warnings
+
+
+def test_load_config_overlay_must_be_sibling_of_base(tmp_path: Path) -> None:
+    nested = tmp_path / "etc"
+    nested.mkdir()
+    base = nested / "config.yml"
+    base.write_text(
+        "daemon:\n  fix_iteration_cap: 8\n", encoding="utf-8"
+    )
+    # An overlay placed outside the base directory must NOT be picked up,
+    # so an operator cannot accidentally point at the wrong file from a
+    # different working directory.
+    far_overlay = tmp_path / "config.production.yml"
+    far_overlay.write_text(
+        "daemon:\n  fix_iteration_cap: 25\n", encoding="utf-8"
+    )
+
+    cfg = load_config(str(base))
+
+    assert cfg.daemon.fix_iteration_cap == 8
+
+    # The sibling overlay IS picked up.
+    sibling_overlay = nested / "config.production.yml"
+    sibling_overlay.write_text(
+        "daemon:\n  fix_iteration_cap: 25\n", encoding="utf-8"
+    )
+
+    cfg = load_config(str(base))
+    assert cfg.daemon.fix_iteration_cap == 25
+
+
+def test_load_config_overlay_empty_file_is_noop(tmp_path: Path) -> None:
+    base = tmp_path / "config.yml"
+    base.write_text(
+        "daemon:\n  poll_interval_sec: 45\n", encoding="utf-8"
+    )
+    overlay = tmp_path / "config.production.yml"
+    overlay.write_text("", encoding="utf-8")
+
+    cfg = load_config(str(base))
+
+    assert cfg.daemon.poll_interval_sec == 45
+
+
+def test_load_config_overlay_replaces_lists(tmp_path: Path) -> None:
+    base = tmp_path / "config.yml"
+    base.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/octo/alpha.git\n"
+        "  - url: https://github.com/octo/beta.git\n",
+        encoding="utf-8",
+    )
+    overlay = tmp_path / "config.production.yml"
+    overlay.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/octo/gamma.git\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(str(base))
+
+    assert [r.url for r in cfg.repositories] == [
+        "https://github.com/octo/gamma.git"
+    ]
+
+
+def test_resolve_nested_model_handles_optional_and_list() -> None:
+    from src.config import (
+        AppConfig,
+        DaemonConfig,
+        RepoConfig,
+        _resolve_nested_model,
+    )
+
+    daemon_field = AppConfig.model_fields["daemon"]
+    assert _resolve_nested_model(daemon_field.annotation) is DaemonConfig
+
+    coder_field = RepoConfig.model_fields["coder"]
+    # Optional[CoderType] is not a BaseModel — must return None, not a guess.
+    assert _resolve_nested_model(coder_field.annotation) is None
+
+    repos_field = AppConfig.model_fields["repositories"]
+    # list[RepoConfig] must NOT recurse into the model — overlay validation
+    # does not descend into list items.
+    assert _resolve_nested_model(repos_field.annotation) is None
+
+    # Optional[BaseModel] / ``Model | None`` must unwrap to the model. None
+    # of the existing schema fields use this shape, so build it inline to
+    # exercise the union-arg branch.
+    assert (
+        _resolve_nested_model(DaemonConfig | None) is DaemonConfig
+    )
+
+
+def test_collect_unknown_overlay_keys_walks_nested_models() -> None:
+    from src.config import AppConfig, _collect_unknown_overlay_keys
+
+    overlay = {
+        "daemon": {
+            "poll_interval_sec": 45,
+            "made_up_field": True,
+        },
+        "extras": {"x": 1},
+    }
+    paths = _collect_unknown_overlay_keys(overlay, AppConfig)
+
+    assert "daemon.made_up_field" in paths
+    assert "extras" in paths
+    assert "daemon.poll_interval_sec" not in paths
+
+
+def test_collect_unknown_overlay_keys_handles_non_dict_input() -> None:
+    from src.config import AppConfig, _collect_unknown_overlay_keys
+
+    assert _collect_unknown_overlay_keys("not-a-dict", AppConfig) == []  # type: ignore[arg-type]
+
+
+def test_applied_overlay_paths_flattens_nested() -> None:
+    from src.config import _applied_overlay_paths
+
+    overlay = {
+        "daemon": {"a": 1, "b": {"c": 2}},
+        "x": 9,
+        "empty": {},
+    }
+    paths = sorted(_applied_overlay_paths(overlay))
+
+    assert paths == ["daemon.a", "daemon.b.c", "empty", "x"]
+
+
+def test_applied_overlay_paths_handles_non_dict_input() -> None:
+    from src.config import _applied_overlay_paths
+
+    assert _applied_overlay_paths("not-a-dict") == []  # type: ignore[arg-type]
+
+
+def test_deep_merge_overlay_replaces_scalar_with_dict(tmp_path: Path) -> None:
+    from src.config import _deep_merge
+
+    base = {"daemon": "scalar-base"}
+    overlay = {"daemon": {"poll_interval_sec": 45}}
+
+    merged = _deep_merge(base, overlay)
+
+    assert merged == {"daemon": {"poll_interval_sec": 45}}
