@@ -65,6 +65,12 @@ class PRInfo(BaseModel):
     review_status: ReviewStatus = ReviewStatus.PENDING
     commits_count: int = 0
     push_count: int = 0
+    # Distinct head SHAs the daemon has observed for this PR. ``push_count``
+    # is derived from the cardinality of this set so a force-push that
+    # rewrites remote history (and shrinks ``commits_count``) does not
+    # silently shrink the dashboard "Pushes" reading too — each push that
+    # the daemon actually witnessed stays counted.
+    observed_head_shas: set[str] = Field(default_factory=set)
     fix_iteration_count: int = 0
     no_push_fix_count: int = 0
     url: str = ""
@@ -75,6 +81,55 @@ class PRInfo(BaseModel):
     # fork (no credentials, different remote), so it must refuse
     # rather than silently publish to the wrong branch on origin.
     is_cross_repository: bool = False
+
+    def record_observed_head(self, sha: str) -> None:
+        """Add ``sha`` to ``observed_head_shas`` and refresh ``push_count``.
+
+        Empty ``sha`` is a deliberate no-op: the post-push ``git rev-parse
+        HEAD`` lookup failed (timeout, ``OSError``, or non-zero exit), so
+        the daemon does not yet know which SHA the push landed at. The
+        next poll cycle observes the real SHA and
+        ``merge_observed_pushes`` increments ``push_count`` for it.
+        Bumping ``push_count`` here would double-count the same real
+        push because the polling merge would then count the freshly
+        observed SHA as new again (Codex P2 follow-up: empty-SHA
+        fallback + WATCH/IDLE refresh counting one push twice).
+
+        On upgrade from pre-PR-195 state, persisted ``PRInfo`` entries
+        can have ``push_count > 0`` while ``observed_head_shas`` is
+        empty (the field default). Bumping ``push_count`` by 1 for each
+        previously-unseen SHA preserves the legacy count *and* ensures
+        every genuine post-upgrade push is registered, instead of
+        being suppressed until the set cardinality catches up to the
+        old counter (the ``max(len(set), push_count)`` pitfall).
+        """
+        if not sha:
+            return
+        if sha in self.observed_head_shas:
+            return
+        self.observed_head_shas.add(sha)
+        self.push_count += 1
+
+    def merge_observed_pushes(
+        self, other: "PRInfo"
+    ) -> tuple[set[str], int]:
+        """Return ``(observed_head_shas, push_count)`` after merging ``other``.
+
+        ``self`` is the daemon's persisted PR state; ``other`` is a
+        fresh GitHub observation. The merged SHA set is the union;
+        ``push_count`` is ``self.push_count`` plus one for every
+        previously-unseen SHA observed in ``other``. The earlier
+        ``max(len(merged), self.push_count, other.push_count)`` formula
+        froze the counter on upgrade from pre-PR-195 state
+        (``push_count > 0`` with an empty ``observed_head_shas``):
+        a single newly observed SHA produced ``len(merged) == 1`` while
+        the legacy count won the ``max`` and dropped the push. Counting
+        newly observed SHAs against the legacy base keeps polling-only
+        push detection accurate after an upgrade.
+        """
+        new_shas = other.observed_head_shas - self.observed_head_shas
+        merged_shas = self.observed_head_shas | other.observed_head_shas
+        return merged_shas, self.push_count + len(new_shas)
 
 
 class EventEntry(TypedDict, total=False):

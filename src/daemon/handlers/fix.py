@@ -942,7 +942,7 @@ class FixMixin(BreachMixin):
             self._last_push_at = push_time
             if self.state.current_pr is not None:
                 self._last_push_at_pr_number = self.state.current_pr.number
-                self.state.current_pr.push_count += 1
+                self.state.current_pr.record_observed_head(head_after)
                 iteration = fix_iteration_policy.increment(self.state.current_pr)
                 no_push_policy.reset(self.state.current_pr)
                 self.state.current_pr.last_activity = push_time

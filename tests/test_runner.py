@@ -585,6 +585,7 @@ def _patch_subprocess(
     returncode: int = 0,
 ) -> list[list[str]]:
     calls: list[list[str]] = []
+    rev_parse_head_calls = {"n": 0}
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         calls.append(cmd)
@@ -618,6 +619,38 @@ def _patch_subprocess(
         ):
             return _FakeCompletedProcess(
                 args=cmd, stdout="Already up to date.\n", returncode=0
+            )
+        # ``git rev-parse HEAD`` must return a real-looking SHA: the
+        # FIX path's ``record_observed_head`` adds the SHA to a set
+        # and the empty string is now a deliberate no-op (a rev-parse
+        # failure that polling reconciles on the next refresh, see
+        # ``PRInfo.record_observed_head``). Returning a deterministic
+        # head_before / head_after pair keeps the default FIX mock
+        # exercising the productive-push path, the same way it
+        # implicitly did before via the empty-SHA fallback.
+        if cmd[:3] == ["git", "rev-parse", "HEAD"]:
+            rev_parse_head_calls["n"] += 1
+            sha = (
+                "head-before-abc"
+                if rev_parse_head_calls["n"] == 1
+                else "head-after-def"
+            )
+            return _FakeCompletedProcess(
+                args=cmd, stdout=f"{sha}\n", returncode=0
+            )
+        # ``git rev-parse origin/<branch>`` answers
+        # ``_verify_pushes_since`` after the FIX push. Match
+        # head_after so verification short-circuits to ``True`` —
+        # otherwise the merge-base fallback fires unnecessarily and
+        # tests that capture the call sequence have to reason about
+        # extra git plumbing.
+        if (
+            cmd[:2] == ["git", "rev-parse"]
+            and len(cmd) >= 3
+            and cmd[2].startswith("origin/")
+        ):
+            return _FakeCompletedProcess(
+                args=cmd, stdout="head-after-def\n", returncode=0
             )
         return _FakeCompletedProcess(
             args=cmd, stdout=stdout, returncode=returncode
@@ -6870,6 +6903,71 @@ def test_handle_watch_preserves_no_push_fix_count_for_same_pr(
     assert runner.state.current_pr.no_push_fix_count == 2
 
 
+def test_handle_watch_counts_new_head_sha_after_pre_pr195_upgrade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-PR-195 persisted ``current_pr`` (``push_count > 0`` with empty
+    ``observed_head_shas``) must register a freshly polled head SHA as a
+    new push. The earlier ``max(len(merged), push_count)`` formula left
+    the legacy counter winning until the SHA set caught up, dropping the
+    polled push.
+    """
+    polled = PRInfo(
+        number=15,
+        branch="pr-015",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=datetime.now(timezone.utc),
+        observed_head_shas={"polled-head-sha"},
+        push_count=1,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [polled]
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=15,
+        branch="pr-015",
+        push_count=4,
+        observed_head_shas=set(),
+    )
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.observed_head_shas == {"polled-head-sha"}
+    assert runner.state.current_pr.push_count == 5
+
+
+def test_preserve_fix_iteration_count_counts_new_head_sha_after_upgrade() -> None:
+    """``_preserve_fix_iteration_count`` is the IDLE-side mirror of the
+    WATCH merge. A pre-PR-195 ``current_pr`` carrying a legacy
+    ``push_count`` with empty ``observed_head_shas`` must bump the
+    counter when IDLE rehydrates a freshly fetched PRInfo with a new
+    head SHA — same regression, different polling path.
+    """
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(
+        number=21,
+        branch="pr-021",
+        push_count=7,
+        observed_head_shas=set(),
+    )
+    polled = PRInfo(
+        number=21,
+        branch="pr-021",
+        push_count=1,
+        observed_head_shas={"new-polled-sha"},
+    )
+
+    rehydrated = runner._preserve_fix_iteration_count(polled)
+
+    assert rehydrated.observed_head_shas == {"new-polled-sha"}
+    assert rehydrated.push_count == 8
+
+
 def test_handle_watch_no_fix_when_ci_pending_and_changes_requested(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9038,6 +9136,7 @@ def test_handle_error_commits_and_pushes_diagnose_fixes(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.push_count == 1
+    assert runner.state.current_pr.observed_head_shas == {"abc123"}
     assert runner.state.current_pr.last_activity is not None
     assert runner._last_push_at is not None
     assert runner._last_push_at_pr_number == 119
@@ -9050,8 +9149,9 @@ def test_handle_error_commits_and_pushes_diagnose_fixes(
         "add",
         "commit",
         "push",
+        "rev-parse",
     ]
-    assert calls[-1] == (
+    assert calls[-2] == (
         "push",
         "origin",
         "HEAD:fix/diagnose-error-commits-fixes",
@@ -9092,6 +9192,7 @@ def test_handle_error_errors_when_review_trigger_fails_after_diagnose_push(
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.push_count == 1
+    assert runner.state.current_pr.observed_head_shas == {"abc123"}
     assert runner._last_push_at is not None
     assert runner._last_push_at_pr_number == 119
     assert review_requests == [119]
@@ -9103,6 +9204,7 @@ def test_handle_error_errors_when_review_trigger_fails_after_diagnose_push(
         "add",
         "commit",
         "push",
+        "rev-parse",
     ]
     assert (
         runner.state.error_message
@@ -9184,9 +9286,94 @@ def test_handle_error_head_before_defaults_empty_when_rev_parse_fails(
         "add",
         "commit",
         "push",
+        "rev-parse",
     ]
     assert not any(cmd[:1] == ("reset",) for cmd in calls)
     assert not any(cmd[:1] == ("clean",) for cmd in calls)
+
+
+def test_handle_error_post_push_rev_parse_failure_defers_count_to_polling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Empty-SHA after a diagnose-error push must not bump ``push_count``.
+
+    Regression: the previous fix bumped ``push_count`` directly inside
+    ``record_observed_head("")``. On the next WATCH/IDLE refresh the
+    polling merge would see the real head SHA as a new observation
+    and increment ``push_count`` a second time for the same real push.
+    The corrected behavior leaves ``push_count`` unchanged on the
+    empty-SHA path; the next poll cycle resolves the real SHA and
+    counts the push exactly once via ``merge_observed_pushes``.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    changed = repo / "fix.txt"
+    calls: list[tuple[str, ...]] = []
+    rev_parse_head_calls = {"n": 0}
+    review_requests: list[int] = []
+
+    async def fake_diag(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        changed.write_text("fixed\n")
+        return (0, "FIX\nrepair broken config", "")
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(args)
+        if args[:2] == ("status", "--porcelain"):
+            status = ""
+            if changed.exists():
+                status = " M fix.txt\n"
+            return _FakeCompletedProcess(stdout=status)
+        if args[:3] == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return _FakeCompletedProcess(
+                stdout="fix/diagnose-error-commits-fixes\n"
+            )
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_head_calls["n"] += 1
+            if rev_parse_head_calls["n"] == 1:
+                return _FakeCompletedProcess(stdout="abc123\n")
+            raise subprocess.CalledProcessError(
+                128, ["git", *args], stderr="fatal: rev-parse intermittent"
+            )
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake_diag)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(error_module, "retry_transient", lambda op, **_: op())
+    runner = _make_runner()
+    monkeypatch.setattr(
+        runner,
+        "_post_codex_review",
+        lambda pr_number: review_requests.append(pr_number) or True,
+    )
+    runner.repo_path = str(repo)
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+    runner.state.current_pr = PRInfo(
+        number=119,
+        branch="fix/diagnose-error-commits-fixes",
+        observed_head_shas={"earlier-sha"},
+        push_count=1,
+    )
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.observed_head_shas == {"earlier-sha"}
+    assert runner.state.current_pr.push_count == 1
+    assert review_requests == [119]
+
+    polled = PRInfo(
+        number=119,
+        branch="fix/diagnose-error-commits-fixes",
+        observed_head_shas={"post-rev-parse-failure-sha"},
+        push_count=1,
+    )
+    merged_shas, merged_push_count = runner.state.current_pr.merge_observed_pushes(
+        polled
+    )
+    assert merged_shas == {"earlier-sha", "post-rev-parse-failure-sha"}
+    assert merged_push_count == 2
 
 
 def test_handle_error_uses_current_task_branch_when_no_current_pr_and_task_branch_differs(
