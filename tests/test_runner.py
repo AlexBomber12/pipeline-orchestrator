@@ -22173,3 +22173,228 @@ def test_check_budget_no_skip_when_state_is_watch() -> None:
     assert decisions == [True] * 5
     assert runner._github_api_slowdown_cycle == 0
     assert runner._github_api_slowdown_attempts == 5
+
+
+# ---------------------------------------------------------------------------
+# PR-190: Asymmetric push verification on the normal FIX exit path
+# ---------------------------------------------------------------------------
+
+
+async def _pr190_no_idle_monitor_async(
+    self: object,
+    pr_number: int,
+    idle_limit: int,
+    target: asyncio.Task,  # type: ignore[type-arg]
+    idle_flag: dict[str, bool],
+) -> None:
+    await asyncio.sleep(0)
+
+
+async def _pr190_no_breach_monitor_async(
+    self: object,
+    breach_dir: str,
+    run_id: str,
+    claude_task: asyncio.Task,  # type: ignore[type-arg]
+    breach_flag: dict[str, bool],
+) -> None:
+    await asyncio.sleep(0)
+
+
+def test_handle_fix_normal_exit_records_push_when_remote_contains_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Normal FIX exit + ``_verify_pushes_since`` confirms origin has the
+    new commit: the runner records the push, posts ``@codex review``, and
+    transitions to WATCH (the existing happy path is unchanged)."""
+    rev_parse_calls = {"count": 0}
+    posted: list[int] = []
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_calls["count"] += 1
+            sha = "aaa111\n" if rev_parse_calls["count"] == 1 else "bbb222\n"
+            return _FakeCompletedProcess(args=["git", *args], stdout=sha, returncode=0)
+        if args[:2] == ("rev-parse", "origin/pr-190"):
+            return _FakeCompletedProcess(
+                args=["git", *args], stdout="bbb222\n", returncode=0,
+            )
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        return (0, "", "")
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_fix_idle", _pr190_no_idle_monitor_async
+    )
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_inflight_breach", _pr190_no_breach_monitor_async
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=190, branch="pr-190")
+    monkeypatch.setattr(
+        runner,
+        "_post_codex_review",
+        lambda pr_number: posted.append(pr_number) or True,
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.push_count == 1
+    assert runner.state.current_pr.fix_iteration_count == 1
+    assert runner.state.current_pr.no_push_fix_count == 0
+    assert posted == [190]
+
+
+def test_handle_fix_normal_exit_treats_unverified_push_as_no_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Normal FIX exit + the local HEAD moved but ``origin/<branch>`` is
+    still at the pre-FIX SHA: the daemon must log the no-push event,
+    increment ``no_push_fix_count``, skip ``@codex review``, and return
+    to WATCH (no inadvertent fix/push loop)."""
+    rev_parse_calls = {"count": 0}
+    posted: list[int] = []
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_calls["count"] += 1
+            sha = "aaa111\n" if rev_parse_calls["count"] == 1 else "bbb222\n"
+            return _FakeCompletedProcess(args=["git", *args], stdout=sha, returncode=0)
+        if args[:2] == ("rev-parse", "origin/pr-190"):
+            return _FakeCompletedProcess(
+                args=["git", *args], stdout="aaa111\n", returncode=0,
+            )
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        return (0, "", "")
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_fix_idle", _pr190_no_idle_monitor_async
+    )
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_inflight_breach", _pr190_no_breach_monitor_async
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=190, branch="pr-190")
+    monkeypatch.setattr(
+        runner,
+        "_post_codex_review",
+        lambda pr_number: posted.append(pr_number) or True,
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.push_count == 0
+    assert runner.state.current_pr.fix_iteration_count == 0
+    assert runner.state.current_pr.no_push_fix_count == 1
+    assert posted == []
+    assert any(
+        "Coder exited cleanly but no push detected" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_fix_normal_exit_fails_open_when_verification_fetch_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Normal FIX exit + verification fetch fails: per the fail-open
+    rule shared with PR-189, ``handle_fix`` logs a warning and proceeds
+    optimistically, treating the FIX as a successful push."""
+    rev_parse_calls = {"count": 0}
+    fetch_calls = {"count": 0}
+    posted: list[int] = []
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        if args and args[0] == "fetch":
+            fetch_calls["count"] += 1
+            # The first fetch is the pre-FIX checkout/reset prep; the
+            # second fetch is the verification fetch we want to fail.
+            if fetch_calls["count"] == 2:
+                raise subprocess.CalledProcessError(
+                    1, ["git", *args], stderr="fetch fail",
+                )
+            return _FakeCompletedProcess(args=["git", *args], returncode=0)
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_calls["count"] += 1
+            sha = "aaa111\n" if rev_parse_calls["count"] == 1 else "bbb222\n"
+            return _FakeCompletedProcess(args=["git", *args], stdout=sha, returncode=0)
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        return (0, "", "")
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_fix_idle", _pr190_no_idle_monitor_async
+    )
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_inflight_breach", _pr190_no_breach_monitor_async
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=190, branch="pr-190")
+    monkeypatch.setattr(
+        runner,
+        "_post_codex_review",
+        lambda pr_number: posted.append(pr_number) or True,
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.push_count == 1
+    assert runner.state.current_pr.fix_iteration_count == 1
+    assert posted == [190]
+    assert any(
+        "FIX push verification unavailable; proceeding optimistically"
+        in e["event"]
+        for e in runner.state.history
+    )
+    assert any(
+        "fetch pr-190 failed after FIX exit" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_verify_pushes_since_returns_false_when_remote_diverged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_verify_pushes_since`` returns ``False`` when the remote moved
+    to a SHA that does not contain ``head_after`` (e.g. force-pushed
+    over the FIX commit). This exercises the merge-base branch where
+    the early-out shortcut against ``last_known_sha`` does not apply."""
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        if args and args[0] == "fetch":
+            return _FakeCompletedProcess(args=["git", *args], returncode=0)
+        if args[:2] == ("rev-parse", "origin/pr-190"):
+            return _FakeCompletedProcess(
+                args=["git", *args], stdout="ddd444\n", returncode=0,
+            )
+        if args[:2] == ("merge-base", "--is-ancestor"):
+            return _FakeCompletedProcess(args=["git", *args], returncode=1)
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+
+    runner = _make_runner()
+    result = runner._verify_pushes_since(
+        "pr-190", "aaa111", "bbb222", context="after FIX exit",
+    )
+
+    assert result is False
