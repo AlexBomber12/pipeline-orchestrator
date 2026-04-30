@@ -135,7 +135,10 @@ class WatchMixin:
             )
             self._maybe_retrigger_stale_review(found.number)
 
-        self._maybe_retrigger_on_codex_bot_error(found.number)
+        # EYES is the only state where the bot may have errored mid-review;
+        # gating avoids paginating issue comments on every WATCH poll.
+        if review == ReviewStatus.EYES:
+            self._maybe_retrigger_on_codex_bot_error(found.number)
 
         last_activity = found.last_activity or self.state.last_updated
         if last_activity.tzinfo is None:

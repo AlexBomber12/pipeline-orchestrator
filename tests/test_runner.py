@@ -21268,3 +21268,60 @@ def test_repo_state_resets_codex_retrigger_on_pr_transition() -> None:
     state.current_pr = PRInfo(number=2, branch="pr-002")
 
     assert state.last_codex_retrigger_at is None
+
+
+@pytest.mark.parametrize(
+    "review",
+    [ReviewStatus.PENDING, ReviewStatus.APPROVED, ReviewStatus.CHANGES_REQUESTED],
+)
+def test_handle_watch_skips_codex_bot_error_check_outside_eyes(
+    monkeypatch: pytest.MonkeyPatch,
+    review: ReviewStatus,
+) -> None:
+    """The codex-bot-error fetch must be gated to ``review == EYES`` so
+    the daemon does not paginate ``issues/{pr}/comments`` on every WATCH
+    poll during normal CI=PENDING/PR-waiting states."""
+    pr = _codex_bot_pr(review=review)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+
+    api_calls: list[str] = []
+
+    def fake_paginated(path: str) -> list[dict[str, Any]]:
+        api_calls.append(path)
+        return []
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        fake_paginated,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, number: None,
+    )
+
+    posted: list[int] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        posted.append(number)
+        return True, True, None
+
+    runner = _make_runner()
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert posted == []
+    assert all("issues/42/comments" not in path for path in api_calls)
+    assert runner.state.last_codex_retrigger_at is None
