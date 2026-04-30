@@ -20616,6 +20616,22 @@ def test_update_idle_streak_caps_at_sane_ceiling() -> None:
     assert runner._idle_streak == runner_module._IDLE_STREAK_CAP
 
 
+def test_update_idle_streak_cap_respects_high_configured_threshold() -> None:
+    """A configured threshold above the static cap must still be reachable."""
+    runner = _make_runner()
+    runner.app_config.daemon.idle_extended_after_cycles = 250
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_pr = None
+
+    runner._idle_streak = runner_module._IDLE_STREAK_CAP
+    runner._update_idle_streak_after_cycle(PipelineState.IDLE)
+    assert runner._idle_streak == runner_module._IDLE_STREAK_CAP + 1
+
+    runner._idle_streak = 250
+    runner._update_idle_streak_after_cycle(PipelineState.IDLE)
+    assert runner._idle_streak == 250
+
+
 def test_reset_idle_streak_clears_counter() -> None:
     """``reset_idle_streak`` is the wake-event entry point."""
     runner = _make_runner()

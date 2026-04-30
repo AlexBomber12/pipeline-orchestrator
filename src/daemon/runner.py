@@ -1073,7 +1073,11 @@ class PipelineRunner(
             and self.state.current_pr is None
             and not dispatch_deferred
         ):
-            if self._idle_streak < _IDLE_STREAK_CAP:
+            cap = max(
+                _IDLE_STREAK_CAP,
+                self.app_config.daemon.idle_extended_after_cycles,
+            )
+            if self._idle_streak < cap:
                 self._idle_streak += 1
         else:
             self._idle_streak = 0
