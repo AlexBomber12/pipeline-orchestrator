@@ -52,14 +52,18 @@ def test_repeated_same_sha_does_not_inflate_count() -> None:
     assert pr.push_count == 1
 
 
-def test_empty_sha_after_known_push_still_increments_count() -> None:
-    """Rev-parse failure after a real push must not drop the increment.
+def test_empty_sha_is_noop_until_polling_catches_up() -> None:
+    """Rev-parse failure after a real push must not double-count.
 
-    Regression for the diagnose-error auto-fix path: after a successful
-    push, ``git rev-parse HEAD`` can intermittently fail (timeout,
-    ``OSError``, non-zero exit) and the daemon then calls
-    ``record_observed_head("")``. The set's cardinality is unchanged,
-    so the legacy ``push_count += 1`` must still fire.
+    The diagnose-error auto-fix path can call
+    ``record_observed_head("")`` when ``git rev-parse HEAD`` fails
+    after a successful push (timeout, ``OSError``, non-zero exit).
+    Bumping ``push_count`` here would double-count: on the next poll,
+    ``merge_observed_pushes`` sees the real head SHA as a new
+    observation and would increment ``push_count`` a second time for
+    the same real push. The fix is to make the empty-SHA case a
+    deliberate no-op and rely on the polling merge to count the push
+    exactly once when the real SHA is observed.
     """
     pr = PRInfo(number=4, branch="pr-004")
     pr.record_observed_head("first-sha")
@@ -68,12 +72,42 @@ def test_empty_sha_after_known_push_still_increments_count() -> None:
     pr.record_observed_head("")
 
     assert pr.observed_head_shas == {"first-sha"}
-    assert pr.push_count == 2
+    assert pr.push_count == 1
 
     pr.record_observed_head("")
 
     assert pr.observed_head_shas == {"first-sha"}
-    assert pr.push_count == 3
+    assert pr.push_count == 1
+
+
+def test_empty_sha_then_polled_real_sha_counts_push_exactly_once() -> None:
+    """Regression: empty-SHA fallback + polling merge previously double-counted.
+
+    The diagnose-error auto-fix path pushes, then the post-push
+    ``git rev-parse HEAD`` fails and the daemon calls
+    ``record_observed_head("")``. On the next WATCH/IDLE refresh,
+    ``get_open_prs`` returns the real head SHA and
+    ``merge_observed_pushes`` is called. The previous implementation
+    bumped ``push_count`` from both sites, counting one real push
+    twice. After the fix the empty-SHA case is a no-op and the polling
+    merge alone counts the push once.
+    """
+    persisted = PRInfo(number=10, branch="pr-010")
+    persisted.record_observed_head("")
+    assert persisted.push_count == 0
+    assert persisted.observed_head_shas == set()
+
+    polled = PRInfo(
+        number=10,
+        branch="pr-010",
+        push_count=1,
+        observed_head_shas={"real-head-sha"},
+    )
+
+    merged_shas, push_count = persisted.merge_observed_pushes(polled)
+
+    assert merged_shas == {"real-head-sha"}
+    assert push_count == 1
 
 
 def test_upgrade_from_pre_pr195_state_counts_new_pushes() -> None:
@@ -110,7 +144,7 @@ def test_upgrade_from_pre_pr195_state_counts_new_pushes() -> None:
     assert pr.push_count == 7
 
     pr.record_observed_head("")
-    assert pr.push_count == 8
+    assert pr.push_count == 7
 
 
 def test_merge_observed_pushes_counts_new_sha_against_legacy_count() -> None:

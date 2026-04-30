@@ -585,6 +585,7 @@ def _patch_subprocess(
     returncode: int = 0,
 ) -> list[list[str]]:
     calls: list[list[str]] = []
+    rev_parse_head_calls = {"n": 0}
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         calls.append(cmd)
@@ -618,6 +619,38 @@ def _patch_subprocess(
         ):
             return _FakeCompletedProcess(
                 args=cmd, stdout="Already up to date.\n", returncode=0
+            )
+        # ``git rev-parse HEAD`` must return a real-looking SHA: the
+        # FIX path's ``record_observed_head`` adds the SHA to a set
+        # and the empty string is now a deliberate no-op (a rev-parse
+        # failure that polling reconciles on the next refresh, see
+        # ``PRInfo.record_observed_head``). Returning a deterministic
+        # head_before / head_after pair keeps the default FIX mock
+        # exercising the productive-push path, the same way it
+        # implicitly did before via the empty-SHA fallback.
+        if cmd[:3] == ["git", "rev-parse", "HEAD"]:
+            rev_parse_head_calls["n"] += 1
+            sha = (
+                "head-before-abc"
+                if rev_parse_head_calls["n"] == 1
+                else "head-after-def"
+            )
+            return _FakeCompletedProcess(
+                args=cmd, stdout=f"{sha}\n", returncode=0
+            )
+        # ``git rev-parse origin/<branch>`` answers
+        # ``_verify_pushes_since`` after the FIX push. Match
+        # head_after so verification short-circuits to ``True`` —
+        # otherwise the merge-base fallback fires unnecessarily and
+        # tests that capture the call sequence have to reason about
+        # extra git plumbing.
+        if (
+            cmd[:2] == ["git", "rev-parse"]
+            and len(cmd) >= 3
+            and cmd[2].startswith("origin/")
+        ):
+            return _FakeCompletedProcess(
+                args=cmd, stdout="head-after-def\n", returncode=0
             )
         return _FakeCompletedProcess(
             args=cmd, stdout=stdout, returncode=returncode
@@ -9259,15 +9292,18 @@ def test_handle_error_head_before_defaults_empty_when_rev_parse_fails(
     assert not any(cmd[:1] == ("clean",) for cmd in calls)
 
 
-def test_handle_error_increments_push_count_when_post_push_rev_parse_fails(
+def test_handle_error_post_push_rev_parse_failure_defers_count_to_polling(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Successful diagnose-error push must still bump push_count when
-    the post-push ``git rev-parse HEAD`` lookup fails. Regression: when
-    ``observed_head_shas`` is already populated from prior pushes,
-    swallowing the rev-parse failure used to leave the set unchanged
-    and recompute ``push_count`` from its size, silently dropping the
-    just-completed push.
+    """Empty-SHA after a diagnose-error push must not bump ``push_count``.
+
+    Regression: the previous fix bumped ``push_count`` directly inside
+    ``record_observed_head("")``. On the next WATCH/IDLE refresh the
+    polling merge would see the real head SHA as a new observation
+    and increment ``push_count`` a second time for the same real push.
+    The corrected behavior leaves ``push_count`` unchanged on the
+    empty-SHA path; the next poll cycle resolves the real SHA and
+    counts the push exactly once via ``merge_observed_pushes``.
     """
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -9324,8 +9360,20 @@ def test_handle_error_increments_push_count_when_post_push_rev_parse_fails(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.observed_head_shas == {"earlier-sha"}
-    assert runner.state.current_pr.push_count == 2
+    assert runner.state.current_pr.push_count == 1
     assert review_requests == [119]
+
+    polled = PRInfo(
+        number=119,
+        branch="fix/diagnose-error-commits-fixes",
+        observed_head_shas={"post-rev-parse-failure-sha"},
+        push_count=1,
+    )
+    merged_shas, merged_push_count = runner.state.current_pr.merge_observed_pushes(
+        polled
+    )
+    assert merged_shas == {"earlier-sha", "post-rev-parse-failure-sha"}
+    assert merged_push_count == 2
 
 
 def test_handle_error_uses_current_task_branch_when_no_current_pr_and_task_branch_differs(

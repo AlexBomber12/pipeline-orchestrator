@@ -85,11 +85,15 @@ class PRInfo(BaseModel):
     def record_observed_head(self, sha: str) -> None:
         """Add ``sha`` to ``observed_head_shas`` and refresh ``push_count``.
 
-        Empty ``sha`` means the post-push ``git rev-parse HEAD`` lookup
-        failed (timeout, ``OSError``, or non-zero exit). Fall back to
-        ``push_count += 1`` so an intermittent rev-parse failure during
-        a real auto-fix push is still counted — recomputing from the
-        unchanged set size would otherwise silently drop the push.
+        Empty ``sha`` is a deliberate no-op: the post-push ``git rev-parse
+        HEAD`` lookup failed (timeout, ``OSError``, or non-zero exit), so
+        the daemon does not yet know which SHA the push landed at. The
+        next poll cycle observes the real SHA and
+        ``merge_observed_pushes`` increments ``push_count`` for it.
+        Bumping ``push_count`` here would double-count the same real
+        push because the polling merge would then count the freshly
+        observed SHA as new again (Codex P2 follow-up: empty-SHA
+        fallback + WATCH/IDLE refresh counting one push twice).
 
         On upgrade from pre-PR-195 state, persisted ``PRInfo`` entries
         can have ``push_count > 0`` while ``observed_head_shas`` is
@@ -100,7 +104,6 @@ class PRInfo(BaseModel):
         old counter (the ``max(len(set), push_count)`` pitfall).
         """
         if not sha:
-            self.push_count += 1
             return
         if sha in self.observed_head_shas:
             return
