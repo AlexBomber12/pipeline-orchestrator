@@ -139,6 +139,7 @@ class WatchMixin:
         # gating avoids paginating issue comments on every WATCH poll.
         if review == ReviewStatus.EYES:
             self._maybe_retrigger_on_codex_bot_error(found.number)
+            self._maybe_retrigger_stale_review(found.number)
 
         last_activity = found.last_activity or self.state.last_updated
         if last_activity.tzinfo is None:
@@ -209,11 +210,24 @@ class WatchMixin:
         return FeedbackCheckResult.NONE
 
     def _maybe_retrigger_stale_review(self, pr_number: int) -> None:
-        """Re-trigger ``@codex review`` when a stale review blocks progress."""
+        """Re-trigger ``@codex review`` when a stale review blocks progress.
+
+        EYES is the OBS-Z race-window state — Codex acknowledged the
+        request with the eyes reaction but never posted a verdict, often
+        because the auto-trigger and our mention raced and one was
+        dropped. EYES recovery is fast, so it uses a shorter threshold
+        (``stale_review_threshold_eyes_min``) than the legitimate-review
+        case (``stale_review_threshold_min``) where the human reviewer
+        may simply be slow.
+        """
         current_pr = self.state.current_pr
         if current_pr is None:
             return
-        if current_pr.review_status != ReviewStatus.CHANGES_REQUESTED:
+        if current_pr.review_status == ReviewStatus.CHANGES_REQUESTED:
+            stale_minutes = self.app_config.daemon.stale_review_threshold_min
+        elif current_pr.review_status == ReviewStatus.EYES:
+            stale_minutes = self.app_config.daemon.stale_review_threshold_eyes_min
+        else:
             return
 
         last_push_age_seconds = github_client.get_last_push_age_seconds(
@@ -224,9 +238,7 @@ class WatchMixin:
             return
 
         now = datetime.now(timezone.utc)
-        stale_after = timedelta(
-            minutes=self.app_config.daemon.stale_review_threshold_min
-        )
+        stale_after = timedelta(minutes=stale_minutes)
         if last_push_age_seconds < stale_after.total_seconds():
             return
 

@@ -309,7 +309,13 @@ class CodingMixin:
         self._rehydrate_last_push_at(candidate)
         await self._save_current_run_record("coding_complete")
         self.log_event(f"Opened PR #{candidate.number} -> WATCH")
-        self._post_codex_review(candidate.number)
+        if self._should_skip_codex_review_post(candidate.number):
+            self.log_event(
+                "Codex auto-trigger detected, skipping duplicate "
+                "@codex review post"
+            )
+        else:
+            self._post_codex_review(candidate.number)
 
     async def _diagnose_exit_zero_no_pr(
         self,
@@ -444,7 +450,13 @@ class CodingMixin:
             f"Daemon opened PR #{candidate.number} for {target_branch!r} "
             f"-> WATCH"
         )
-        self._post_codex_review(candidate.number)
+        if self._should_skip_codex_review_post(candidate.number):
+            self.log_event(
+                "Codex auto-trigger detected, skipping duplicate "
+                "@codex review post"
+            )
+        else:
+            self._post_codex_review(candidate.number)
 
     async def _daemon_create_pr_for_branch(
         self,

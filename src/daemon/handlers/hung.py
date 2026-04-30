@@ -1,8 +1,9 @@
 """HUNG state handler and Codex review posting.
 
 Mixin methods:
-    handle_hung        — nudge reviewer or escalate
-    _post_codex_review — post @codex review on a PR
+    handle_hung                   — nudge reviewer or escalate
+    _post_codex_review            — post @codex review on a PR
+    _should_skip_codex_review_post — fail-open EYES race-window dedup gate
 """
 
 from __future__ import annotations
@@ -52,6 +53,30 @@ def _author_recent_review_requested_at(
 
 class HungMixin:
     """Nudge the reviewer with ``@codex review`` or give up, per config."""
+
+    def _should_skip_codex_review_post(self, pr_number: int) -> bool:
+        """Return ``True`` when Codex already reacted with EYES on the PR body.
+
+        Handles the OBS-Z race: Codex's auto-trigger on PR creation and the
+        daemon's own ``@codex review`` mention can fire near-simultaneously
+        and Codex sometimes drops one request silently, leaving the PR
+        stuck in EYES until the general stale-review threshold fires. A
+        pre-post probe of the PR body's reactions lets the daemon skip the
+        duplicate when the auto-trigger already landed.
+
+        Fails open (returns ``False``) on any GitHub API error so a
+        transient outage cannot suppress a needed mention.
+        """
+        try:
+            codex_reactions = github_client._get_codex_issue_reactions(
+                self.owner_repo, pr_number,
+            )
+        except Exception:
+            return False
+        return any(
+            github_client._is_reaction_content(reaction, "eyes")
+            for reaction in codex_reactions
+        )
 
     def _post_codex_review_result(
         self,

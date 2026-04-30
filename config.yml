@@ -6,6 +6,7 @@ repositories:
 daemon:
   poll_interval_sec: 60
   review_timeout_min: 60
+  stale_review_threshold_eyes_min: 5
   auto_fallback: true
   hung_fallback_codex_review: true
   error_handler_use_ai: true

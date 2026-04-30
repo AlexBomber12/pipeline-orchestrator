@@ -710,7 +710,14 @@ class FixMixin(BreachMixin):
                     except Exception:
                         head_now = ""
                     if head_before and head_now and head_before != head_now:
-                        if not self._post_codex_review(
+                        if self._should_skip_codex_review_post(
+                            self.state.current_pr.number
+                        ):
+                            self.log_event(
+                                "Codex auto-trigger detected, skipping "
+                                "duplicate @codex review post"
+                            )
+                        elif not self._post_codex_review(
                             self.state.current_pr.number
                         ):
                             self.state.state = PipelineState.ERROR
@@ -766,7 +773,14 @@ class FixMixin(BreachMixin):
                 except Exception:
                     head_now = ""
                 if head_before and head_now and head_before != head_now:
-                    if not self._post_codex_review(
+                    if self._should_skip_codex_review_post(
+                        self.state.current_pr.number
+                    ):
+                        self.log_event(
+                            "Codex auto-trigger detected, skipping "
+                            "duplicate @codex review post"
+                        )
+                    elif not self._post_codex_review(
                         self.state.current_pr.number
                     ):
                         self.state.state = PipelineState.ERROR
@@ -895,16 +909,23 @@ class FixMixin(BreachMixin):
                 iteration = 0
 
             self.log_event(f"Fix pushed, iteration #{iteration}")
-            if (
-                self.state.current_pr is not None
-                and not self._post_codex_review(self.state.current_pr.number)
-            ):
-                self.state.state = PipelineState.ERROR
-                self.state.error_message = (
-                    f"Failed to post @codex review on PR "
-                    f"#{self.state.current_pr.number} {failure_detail}"
-                )
-                return False
+            if self.state.current_pr is not None:
+                if self._should_skip_codex_review_post(
+                    self.state.current_pr.number
+                ):
+                    self.log_event(
+                        "Codex auto-trigger detected, skipping "
+                        "duplicate @codex review post"
+                    )
+                elif not self._post_codex_review(
+                    self.state.current_pr.number
+                ):
+                    self.state.state = PipelineState.ERROR
+                    self.state.error_message = (
+                        f"Failed to post @codex review on PR "
+                        f"#{self.state.current_pr.number} {failure_detail}"
+                    )
+                    return False
             return True
 
         await capture_stop_requested_after_exit()

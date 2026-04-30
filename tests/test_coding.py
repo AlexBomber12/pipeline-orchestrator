@@ -506,3 +506,98 @@ def test_diagnose_honors_stop_request_after_post_create_loop(
 
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.current_pr is None
+
+
+def _patch_codex_reactions(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    eyes_present: bool,
+) -> None:
+    """Stub ``_get_codex_issue_reactions`` for the EYES-skip pre-push gate."""
+    payload = (
+        [{"content": "eyes", "user": {"login": "chatgpt-codex-connector[bot]"}}]
+        if eyes_present
+        else []
+    )
+    monkeypatch.setattr(
+        github_client, "_get_codex_issue_reactions",
+        lambda repo, number: payload,
+    )
+
+
+def test_handle_coding_skips_codex_review_when_eyes_already_reacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OBS-Z: Codex auto-trigger already landed → skip duplicate mention."""
+    pr = PRInfo(number=42, branch="pr-001")
+    runner = _runner(monkeypatch, open_prs_initial=[pr])
+    _patch_codex_reactions(monkeypatch, eyes_present=True)
+    posted: list[int] = []
+    runner._post_codex_review = lambda pr_number: (  # type: ignore[method-assign]
+        posted.append(pr_number) or True
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert posted == []
+    assert any(
+        "Codex auto-trigger detected, skipping duplicate "
+        "@codex review post" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_coding_posts_codex_review_when_no_eyes_reaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = PRInfo(number=42, branch="pr-001")
+    runner = _runner(monkeypatch, open_prs_initial=[pr])
+    _patch_codex_reactions(monkeypatch, eyes_present=False)
+    posted: list[int] = []
+    runner._post_codex_review = lambda pr_number: (  # type: ignore[method-assign]
+        posted.append(pr_number) or True
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert posted == [42]
+
+
+def test_should_skip_codex_review_post_fails_open_on_api_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A GitHub API failure must not suppress the mention — fail open."""
+    runner = h._make_runner()
+
+    def boom(*_a: Any, **_kw: Any) -> list[dict]:
+        raise RuntimeError("api boom")
+
+    monkeypatch.setattr(github_client, "_get_codex_issue_reactions", boom)
+    assert runner._should_skip_codex_review_post(42) is False
+
+
+def test_diagnose_case_c_skips_codex_review_when_eyes_already_reacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Daemon-created PR (case C) also honors the EYES race-window dedup."""
+    created = PRInfo(number=99, branch="pr-001")
+    runner = _runner(monkeypatch, open_prs_after_create=[created])
+    _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
+    _patch_codex_reactions(monkeypatch, eyes_present=True)
+    monkeypatch.setattr(github_client, "run_gh", lambda *a, **kw: "")
+    posted: list[int] = []
+    runner._post_codex_review = lambda pr_number: (  # type: ignore[method-assign]
+        posted.append(pr_number) or True
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert posted == []
+    assert any(
+        "Codex auto-trigger detected, skipping duplicate "
+        "@codex review post" in entry["event"]
+        for entry in runner.state.history
+    )
