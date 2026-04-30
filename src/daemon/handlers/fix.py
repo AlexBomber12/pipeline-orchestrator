@@ -405,6 +405,85 @@ class FixMixin(BreachMixin):
             target.cancel()
             return
 
+    def _verify_pushes_since(
+        self,
+        branch: str,
+        last_known_sha: str,
+        head_after: str,
+        *,
+        context: str,
+    ) -> bool | None:
+        """Verify that ``head_after`` reached ``origin/{branch}``.
+
+        Returns ``True`` when origin contains ``head_after`` (either
+        equal to it or fast-forwarded past it), ``False`` when origin
+        is still at ``last_known_sha`` (no push happened), and ``None``
+        when the verification itself could not run (fetch / rev-parse /
+        merge-base failure). Callers decide whether ``None`` should
+        be treated as a hard failure (stop-cancel path: skip
+        bookkeeping) or as fail-open (normal-exit path: proceed
+        optimistically) — this helper only reports what it observed.
+
+        ``context`` is appended to the log lines emitted on git
+        failures so the same helper can serve both call sites without
+        the event log losing the distinguishing prefix
+        (``"after FIX stop"`` vs ``"after FIX exit"``).
+        """
+        try:
+            git_ops._git(
+                self.repo_path,
+                "fetch",
+                "--prune",
+                "origin",
+                f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+                timeout=60,
+            )
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ) as exc:
+            self.log_event(f"fetch {branch} failed {context}: {exc}")
+            return None
+        try:
+            remote_head = git_ops._git(
+                self.repo_path,
+                "rev-parse",
+                f"origin/{branch}",
+            ).stdout.strip()
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ) as exc:
+            self.log_event(
+                f"rev-parse origin/{branch} failed {context}: {exc}"
+            )
+            return None
+        if (
+            last_known_sha
+            and head_after != last_known_sha
+            and remote_head == last_known_sha
+        ):
+            return False
+        if remote_head == head_after:
+            return True
+        try:
+            is_ancestor = git_ops._git(
+                self.repo_path,
+                "merge-base",
+                "--is-ancestor",
+                head_after,
+                remote_head,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            self.log_event(
+                f"merge-base ancestry check failed {context}: {exc}"
+            )
+            return None
+        return is_ancestor.returncode == 0
+
     def _github_api_budget_paused(self) -> bool:
         """Return ``True`` when the cached GH API budget is below pause threshold."""
         budget = self._github_api_budget_cache
@@ -845,53 +924,15 @@ class FixMixin(BreachMixin):
                 return None
 
         def remote_branch_contains_head(branch: str, head_after: str) -> bool:
-            try:
-                git_ops._git(
-                    self.repo_path,
-                    "fetch",
-                    "origin",
-                    f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
-                    timeout=60,
-                )
-            except (
-                subprocess.CalledProcessError,
-                subprocess.TimeoutExpired,
-                OSError,
-            ) as exc:
-                self.log_event(f"fetch {branch} failed after FIX stop: {exc}")
-                return False
-            try:
-                remote_head = git_ops._git(
-                    self.repo_path,
-                    "rev-parse",
-                    f"origin/{branch}",
-                ).stdout.strip()
-            except (
-                subprocess.CalledProcessError,
-                subprocess.TimeoutExpired,
-                OSError,
-            ) as exc:
-                self.log_event(
-                    f"rev-parse origin/{branch} failed after FIX stop: {exc}"
-                )
-                return False
-            if remote_head == head_after:
-                return True
-            try:
-                is_ancestor = git_ops._git(
-                    self.repo_path,
-                    "merge-base",
-                    "--is-ancestor",
+            return (
+                self._verify_pushes_since(
+                    branch,
+                    head_before,
                     head_after,
-                    remote_head,
-                    check=False,
+                    context="after FIX stop",
                 )
-            except (subprocess.TimeoutExpired, OSError) as exc:
-                self.log_event(
-                    f"merge-base ancestry check failed after FIX stop: {exc}"
-                )
-                return False
-            return is_ancestor.returncode == 0
+                is True
+            )
 
         def record_fix_push(head_after: str, failure_detail: str) -> bool:
             if head_before and head_before == head_after:
@@ -1021,12 +1062,44 @@ class FixMixin(BreachMixin):
         if head_after is None:
             return
 
-        if head_before and head_before == head_after:
-            self._last_push_at = datetime.now(timezone.utc)
-            self.log_event(
-                "FIX FEEDBACK exited 0 but HEAD unchanged; "
-                "no push, skipping @codex review"
+        local_no_push = bool(head_before) and head_before == head_after
+        remote_no_push = False
+        if not local_no_push:
+            verify_branch = (
+                self.state.current_pr.branch
+                if self.state.current_pr is not None
+                else ""
             )
+            verification = (
+                self._verify_pushes_since(
+                    verify_branch,
+                    head_before,
+                    head_after,
+                    context="after FIX exit",
+                )
+                if verify_branch
+                else None
+            )
+            if verification is False:
+                remote_no_push = True
+            elif verification is None and verify_branch:
+                self.log_event(
+                    "FIX push verification unavailable; "
+                    "proceeding optimistically"
+                )
+
+        if local_no_push or remote_no_push:
+            self._last_push_at = datetime.now(timezone.utc)
+            if local_no_push:
+                self.log_event(
+                    "FIX FEEDBACK exited 0 but HEAD unchanged; "
+                    "no push, skipping @codex review"
+                )
+            else:
+                self.log_event(
+                    "Coder exited cleanly but no push detected; "
+                    "treating as no-push, skipping @codex review"
+                )
             if self.state.current_pr is not None:
                 no_push_policy.increment(self.state.current_pr)
             if await pause_for_stop_after_bookkeeping():
