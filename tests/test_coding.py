@@ -512,16 +512,36 @@ def _patch_codex_reactions(
     monkeypatch: pytest.MonkeyPatch,
     *,
     eyes_present: bool,
+    eyes_stale: bool = False,
 ) -> None:
-    """Stub ``_get_codex_issue_reactions`` for the EYES-skip pre-push gate."""
+    """Stub ``_get_codex_issue_reactions`` for the EYES-skip pre-push gate.
+
+    ``eyes_stale=True`` returns an EYES reaction whose ``created_at``
+    predates the head commit, exercising the head-freshness gate added
+    after the OBS-Z fix to avoid suppressing review on a brand-new push.
+    """
+    head_commit_iso = "2026-04-30T12:00:00Z"
+    reaction_iso = (
+        "2026-04-30T11:00:00Z" if eyes_stale else "2026-04-30T12:30:00Z"
+    )
     payload = (
-        [{"content": "eyes", "user": {"login": "chatgpt-codex-connector[bot]"}}]
+        [
+            {
+                "content": "eyes",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "created_at": reaction_iso,
+            }
+        ]
         if eyes_present
         else []
     )
     monkeypatch.setattr(
         github_client, "_get_codex_issue_reactions",
         lambda repo, number: payload,
+    )
+    monkeypatch.setattr(
+        github_client, "get_pr_head_commit_iso",
+        lambda repo, number: head_commit_iso,
     )
 
 
@@ -575,6 +595,126 @@ def test_should_skip_codex_review_post_fails_open_on_api_error(
         raise RuntimeError("api boom")
 
     monkeypatch.setattr(github_client, "_get_codex_issue_reactions", boom)
+    assert runner._should_skip_codex_review_post(42) is False
+
+
+def test_should_skip_codex_review_post_fails_open_on_head_commit_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unresolvable head commit time must not suppress the mention."""
+    runner = h._make_runner()
+
+    monkeypatch.setattr(
+        github_client,
+        "_get_codex_issue_reactions",
+        lambda repo, number: [
+            {
+                "content": "eyes",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "created_at": "2026-04-30T12:30:00Z",
+            }
+        ],
+    )
+
+    def boom(*_a: Any, **_kw: Any) -> str:
+        raise RuntimeError("head boom")
+
+    monkeypatch.setattr(github_client, "get_pr_head_commit_iso", boom)
+    assert runner._should_skip_codex_review_post(42) is False
+
+
+def test_should_skip_codex_review_post_fails_open_on_empty_head_iso(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty head commit ISO (gh degraded) must fail open."""
+    runner = h._make_runner()
+    monkeypatch.setattr(
+        github_client,
+        "_get_codex_issue_reactions",
+        lambda repo, number: [
+            {
+                "content": "eyes",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "created_at": "2026-04-30T12:30:00Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        github_client,
+        "get_pr_head_commit_iso",
+        lambda repo, number: "",
+    )
+    assert runner._should_skip_codex_review_post(42) is False
+
+
+def test_should_skip_codex_review_post_skips_when_eyes_after_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh EYES reaction (after head commit) suppresses the mention."""
+    runner = h._make_runner()
+    monkeypatch.setattr(
+        github_client,
+        "_get_codex_issue_reactions",
+        lambda repo, number: [
+            {
+                "content": "eyes",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "created_at": "2026-04-30T12:30:00Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        github_client,
+        "get_pr_head_commit_iso",
+        lambda repo, number: "2026-04-30T12:00:00Z",
+    )
+    assert runner._should_skip_codex_review_post(42) is True
+
+
+def test_should_skip_codex_review_post_does_not_skip_when_eyes_predates_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale EYES reaction must not suppress review on a new head."""
+    runner = h._make_runner()
+    monkeypatch.setattr(
+        github_client,
+        "_get_codex_issue_reactions",
+        lambda repo, number: [
+            {
+                "content": "eyes",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "created_at": "2026-04-30T11:00:00Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        github_client,
+        "get_pr_head_commit_iso",
+        lambda repo, number: "2026-04-30T12:00:00Z",
+    )
+    assert runner._should_skip_codex_review_post(42) is False
+
+
+def test_should_skip_codex_review_post_ignores_eyes_without_created_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reaction missing ``created_at`` cannot prove freshness; do not skip."""
+    runner = h._make_runner()
+    monkeypatch.setattr(
+        github_client,
+        "_get_codex_issue_reactions",
+        lambda repo, number: [
+            {
+                "content": "eyes",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        github_client,
+        "get_pr_head_commit_iso",
+        lambda repo, number: "2026-04-30T12:00:00Z",
+    )
     assert runner._should_skip_codex_review_post(42) is False
 
 

@@ -16641,13 +16641,44 @@ def test_handle_fix_pauses_when_late_breach_rev_parse_fails(
 def _patch_eyes_reaction_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Stub ``_get_codex_issue_reactions`` to return an EYES reaction."""
+    """Stub the EYES-skip pre-push gate to fire (fresh EYES on head)."""
     monkeypatch.setattr(
         runner_module.github_client,
         "_get_codex_issue_reactions",
         lambda repo, number: [
-            {"content": "eyes", "user": {"login": "chatgpt-codex-connector[bot]"}}
+            {
+                "content": "eyes",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "created_at": "2026-04-30T12:30:00Z",
+            }
         ],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_head_commit_iso",
+        lambda repo, number: "2026-04-30T12:00:00Z",
+    )
+
+
+def _patch_eyes_reaction_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stub a stale EYES reaction (predates head) — gate must NOT skip."""
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_get_codex_issue_reactions",
+        lambda repo, number: [
+            {
+                "content": "eyes",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "created_at": "2026-04-30T11:00:00Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_head_commit_iso",
+        lambda repo, number: "2026-04-30T12:00:00Z",
     )
 
 
@@ -16816,6 +16847,42 @@ def test_handle_fix_normal_push_skips_codex_review_when_eyes_already_reacted(
 
     assert posted == []
     assert any(
+        "Codex auto-trigger detected, skipping duplicate "
+        "@codex review post" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_fix_normal_push_posts_codex_review_when_eyes_predates_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OBS-Z: a stale EYES (predates new head) must NOT suppress the post.
+
+    Without head-freshness gating, a prior EYES reaction would silently
+    suppress ``_post_codex_review`` after every FIX push, leaving the
+    new commit without a review trigger until the 1-hour stale-retrigger
+    debounce in ``watch.py`` recovered.
+    """
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", _async_cli_result(0, "", "")
+    )
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    _patch_eyes_reaction_stale(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019")
+
+    asyncio.run(runner.handle_fix())
+
+    assert posted == [(runner.owner_repo, 77, "@codex review")]
+    assert not any(
         "Codex auto-trigger detected, skipping duplicate "
         "@codex review post" in e["event"]
         for e in runner.state.history

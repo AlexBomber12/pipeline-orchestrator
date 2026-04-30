@@ -55,7 +55,7 @@ class HungMixin:
     """Nudge the reviewer with ``@codex review`` or give up, per config."""
 
     def _should_skip_codex_review_post(self, pr_number: int) -> bool:
-        """Return ``True`` when Codex already reacted with EYES on the PR body.
+        """Return ``True`` when a fresh Codex EYES reaction covers the head.
 
         Handles the OBS-Z race: Codex's auto-trigger on PR creation and the
         daemon's own ``@codex review`` mention can fire near-simultaneously
@@ -64,8 +64,16 @@ class HungMixin:
         pre-post probe of the PR body's reactions lets the daemon skip the
         duplicate when the auto-trigger already landed.
 
-        Fails open (returns ``False``) on any GitHub API error so a
-        transient outage cannot suppress a needed mention.
+        Gates the dedup on head freshness: an EYES reaction that predates
+        the current head commit is stale and does not count, because a
+        FIX push creates a new head that still needs its own review
+        trigger. Without this gate, any prior EYES reaction would
+        permanently suppress ``_post_codex_review`` and recovery would
+        depend on the 1-hour stale-retrigger debounce in ``watch.py``.
+
+        Fails open (returns ``False``) on any GitHub API error or when
+        the head commit time cannot be resolved, so a transient outage
+        cannot suppress a needed mention.
         """
         try:
             codex_reactions = github_client._get_codex_issue_reactions(
@@ -73,10 +81,28 @@ class HungMixin:
             )
         except Exception:
             return False
-        return any(
-            github_client._is_reaction_content(reaction, "eyes")
-            for reaction in codex_reactions
-        )
+        eyes_reactions = [
+            reaction for reaction in codex_reactions
+            if github_client._is_reaction_content(reaction, "eyes")
+        ]
+        if not eyes_reactions:
+            return False
+        try:
+            head_commit_iso = github_client.get_pr_head_commit_iso(
+                self.owner_repo, pr_number,
+            )
+        except Exception:
+            return False
+        head_commit_time = github_client._parse_iso(head_commit_iso)
+        if head_commit_time is None:
+            return False
+        for reaction in eyes_reactions:
+            reaction_time = github_client._parse_iso(
+                reaction.get("created_at")
+            )
+            if reaction_time is not None and reaction_time >= head_commit_time:
+                return True
+        return False
 
     def _post_codex_review_result(
         self,
