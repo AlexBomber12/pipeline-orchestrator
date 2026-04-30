@@ -20462,3 +20462,139 @@ def test_run_cycle_swallows_burn_recording_failure(
 
     # Must not raise even though the recorder itself is broken.
     asyncio.run(runner.run_cycle())
+
+
+# ---------------------------------------------------------------------------
+# PR-184: adaptive IDLE polling
+# ---------------------------------------------------------------------------
+
+
+def test_effective_idle_poll_interval_uses_base_below_threshold() -> None:
+    """First two consecutive IDLE cycles still poll at the base interval."""
+    runner = _make_runner(poll_interval_sec=60)
+    runner.app_config.daemon.idle_extended_after_cycles = 3
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 300
+
+    runner._idle_streak = 1
+    assert runner.effective_idle_poll_interval == 60
+    runner._idle_streak = 2
+    assert runner.effective_idle_poll_interval == 60
+
+
+def test_effective_idle_poll_interval_uses_extended_at_threshold() -> None:
+    """Third+ consecutive IDLE cycle drops to the extended interval."""
+    runner = _make_runner(poll_interval_sec=60)
+    runner.app_config.daemon.idle_extended_after_cycles = 3
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 300
+
+    runner._idle_streak = 3
+    assert runner.effective_idle_poll_interval == 300
+    runner._idle_streak = 50
+    assert runner.effective_idle_poll_interval == 300
+
+
+def test_effective_idle_poll_interval_stacks_with_rate_limit_slowdown() -> None:
+    """Adaptive and rate-limit slowdown stack via max() of candidates."""
+    runner = _make_runner(poll_interval_sec=60)
+    runner.app_config.daemon.idle_extended_after_cycles = 3
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 200
+    runner.app_config.daemon.github_api_slowdown_multiplier = 5
+
+    runner._idle_streak = 3
+    runner._github_api_slowdown_attempts = 0
+    assert runner.effective_idle_poll_interval == 200
+
+    runner._idle_streak = 0
+    runner._github_api_slowdown_attempts = 2
+    assert runner.effective_idle_poll_interval == 300
+
+    runner._idle_streak = 3
+    runner._github_api_slowdown_attempts = 2
+    assert runner.effective_idle_poll_interval == 300
+
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 400
+    assert runner.effective_idle_poll_interval == 400
+
+
+def test_update_idle_streak_increments_on_idle_with_no_pr() -> None:
+    """The streak grows by one each cycle that ends in IDLE with no PR."""
+    runner = _make_runner()
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_pr = None
+
+    for expected in range(1, 6):
+        runner._update_idle_streak_after_cycle()
+        assert runner._idle_streak == expected
+
+
+def test_update_idle_streak_resets_when_state_leaves_idle() -> None:
+    """Transitioning out of IDLE clears the streak so polling stays fast."""
+    runner = _make_runner()
+    runner._idle_streak = 5
+    runner.state.state = PipelineState.WATCH
+
+    runner._update_idle_streak_after_cycle()
+    assert runner._idle_streak == 0
+
+
+def test_update_idle_streak_resets_when_idle_attaches_open_pr() -> None:
+    """An IDLE-with-open-PR cycle is real work: reset the streak too."""
+    runner = _make_runner()
+    runner._idle_streak = 4
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_pr = PRInfo(number=42, branch="pr-042")
+
+    runner._update_idle_streak_after_cycle()
+    assert runner._idle_streak == 0
+
+
+def test_update_idle_streak_caps_at_sane_ceiling() -> None:
+    """``_idle_streak`` does not grow without bound across long uptimes."""
+    runner = _make_runner()
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_pr = None
+
+    runner._idle_streak = runner_module._IDLE_STREAK_CAP
+    runner._update_idle_streak_after_cycle()
+    assert runner._idle_streak == runner_module._IDLE_STREAK_CAP
+
+
+def test_reset_idle_streak_clears_counter() -> None:
+    """``reset_idle_streak`` is the wake-event entry point."""
+    runner = _make_runner()
+    runner._idle_streak = 7
+    runner.reset_idle_streak()
+    assert runner._idle_streak == 0
+
+
+def test_run_cycle_grows_idle_streak_across_consecutive_idle_cycles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: three IDLE-ending cycles flip to extended polling."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner(poll_interval_sec=60)
+    runner.app_config.daemon.idle_extended_after_cycles = 3
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 300
+    runner._recovered = True
+    runner._scaffolded = True
+
+    async def fake_handle_idle() -> None:
+        runner.state.state = PipelineState.IDLE
+        runner.state.current_pr = None
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", _preflight_true_stub)
+
+    runner.state.state = PipelineState.IDLE
+    intervals: list[int] = []
+    for _ in range(4):
+        asyncio.run(runner.run_cycle())
+        intervals.append(runner.effective_idle_poll_interval)
+
+    assert intervals == [60, 60, 300, 300]
+    assert runner._idle_streak == 4

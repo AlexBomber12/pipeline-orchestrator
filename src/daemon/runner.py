@@ -91,6 +91,7 @@ _TRANSIENT_STATES = {
 
 _HISTORY_LIMIT = 100
 _STOP_POLL_INTERVAL_SEC = 0.5
+_IDLE_STREAK_CAP = 100
 
 # A ``PR #<number>`` token is a semantic identifier (different PRs are
 # distinct events) and is preserved verbatim. The alternation tries the
@@ -274,6 +275,13 @@ class PipelineRunner(
         self._github_api_pause_attempts = 0
         self._github_api_slowdown_attempts = 0
         self._github_api_slowdown_cycle = 0
+        # PR-184: count consecutive cycles ending in IDLE with no PR in
+        # flight. Once the streak reaches ``idle_extended_after_cycles``
+        # the daemon main loop polls this runner on the slower
+        # ``idle_extended_poll_interval_sec`` cadence; the streak is
+        # cleared by either a Redis wake event or any state transition
+        # out of the no-work IDLE shape.
+        self._idle_streak = 0
         self._github_api_pause_policy: BoundedRecoveryPolicy[
             "PipelineRunner"
         ] = BoundedRecoveryPolicy(
@@ -994,6 +1002,55 @@ class PipelineRunner(
             f"slowing polling to {effective_interval}s"
         )
 
+    @property
+    def effective_idle_poll_interval(self) -> int:
+        """Return the IDLE poll interval after adaptive and rate-limit slowdowns.
+
+        Stacks two independent slow-down sources by returning the
+        maximum of the candidate intervals: the configured base, the
+        adaptive ``idle_extended_poll_interval_sec`` once
+        ``_idle_streak`` reaches ``idle_extended_after_cycles``, and the
+        GitHub-API rate-limit multiplier when
+        ``_github_api_slowdown_attempts`` is non-zero. Using the maximum
+        guarantees neither source is silently overridden when both are
+        active.
+        """
+        base = self.repo_config.poll_interval_sec
+        candidates = [base]
+        threshold = self.app_config.daemon.idle_extended_after_cycles
+        if self._idle_streak >= threshold:
+            candidates.append(
+                self.app_config.daemon.idle_extended_poll_interval_sec
+            )
+        if self._github_api_slowdown_attempts > 0:
+            multiplier = max(
+                1, self.app_config.daemon.github_api_slowdown_multiplier
+            )
+            candidates.append(base * multiplier)
+        return max(candidates)
+
+    def reset_idle_streak(self) -> None:
+        """Reset the adaptive IDLE-polling streak (e.g. on wake)."""
+        self._idle_streak = 0
+
+    def _update_idle_streak_after_cycle(self) -> None:
+        """Bump or clear ``_idle_streak`` based on the post-cycle state.
+
+        A cycle counts toward the streak only when the runner ends in
+        IDLE with no PR pinned (``current_pr is None``). Any other
+        outcome — transition to a working state, or attaching to an open
+        PR for manual work — resets the streak so the next cycle polls
+        on the fast cadence again.
+        """
+        if (
+            self.state.state == PipelineState.IDLE
+            and self.state.current_pr is None
+        ):
+            if self._idle_streak < _IDLE_STREAK_CAP:
+                self._idle_streak += 1
+        else:
+            self._idle_streak = 0
+
     async def _check_github_api_budget(self) -> bool:
         """Return ``True`` if the cycle may proceed; ``False`` to skip it.
 
@@ -1202,4 +1259,5 @@ class PipelineRunner(
             self._error_skip_count = 0
             self._error_skip_active = False
 
+        self._update_idle_streak_after_cycle()
         await self.publish_state()

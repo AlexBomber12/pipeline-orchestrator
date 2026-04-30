@@ -61,6 +61,8 @@ _DAEMON_FIELDS = {
     "github_api_pause_threshold_percent",
     "github_api_slowdown_threshold_percent",
     "github_api_slowdown_multiplier",
+    "idle_extended_poll_interval_sec",
+    "idle_extended_after_cycles",
 }
 
 _DAEMON_ENV_OVERRIDES = {
@@ -133,6 +135,8 @@ class DaemonConfig(BaseModel):
     github_api_pause_threshold_percent: int = Field(default=5, ge=0, le=100)
     github_api_slowdown_threshold_percent: int = Field(default=20, ge=0, le=100)
     github_api_slowdown_multiplier: int = Field(default=5, ge=1, le=60)
+    idle_extended_poll_interval_sec: int = Field(default=300, ge=1)
+    idle_extended_after_cycles: int = Field(default=3, ge=1)
 
 
 class WebConfig(BaseModel):

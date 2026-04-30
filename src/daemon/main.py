@@ -75,6 +75,24 @@ def _runner_requires_idle_boundary(runner: Any) -> bool:
     return state in _DEFERRED_RUNNER_CONFIG_STATES
 
 
+def _runner_poll_interval(runner: Any) -> int:
+    """Return the next-cycle poll interval for ``runner``.
+
+    IDLE runners use the adaptive ``effective_idle_poll_interval`` so a
+    repo that has been quiet long enough drops to the slower cadence
+    configured by ``daemon.idle_extended_poll_interval_sec``. Every
+    other state keeps the static ``poll_interval_sec`` so active work
+    is not artificially throttled. Falls back to the static base if the
+    runner is missing the property (e.g. test stubs predating PR-184).
+    """
+    state = getattr(getattr(runner, "state", None), "state", None)
+    if state == PipelineState.IDLE and hasattr(
+        runner, "effective_idle_poll_interval"
+    ):
+        return runner.effective_idle_poll_interval
+    return runner.repo_config.poll_interval_sec
+
+
 def _repo_config_differs_only_in_coder(current: RepoConfig, updated: RepoConfig) -> bool:
     """Return whether the repo delta is limited to the coder selection."""
     if current.coder == updated.coder:
@@ -360,8 +378,16 @@ def _apply_wake_message(
     message: dict[str, Any],
     last_run: dict[str, float],
     slug_to_key: dict[str, str],
+    runners: dict[str, PipelineRunner] | None = None,
 ) -> None:
-    """Reset ``last_run`` for the repo named on the wake channel."""
+    """Reset ``last_run`` for the repo named on the wake channel.
+
+    Also clears the runner's adaptive ``_idle_streak`` so the next
+    cycle on a long-idle repo polls on the fast cadence again — without
+    this, a wake event would set ``last_run`` to 0 but the next sleep
+    would still use ``effective_idle_poll_interval`` reflecting the
+    prior streak.
+    """
     channel = message.get("channel")
     if isinstance(channel, bytes):
         channel = channel.decode("utf-8")
@@ -373,12 +399,17 @@ def _apply_wake_message(
     key = slug_to_key.get(slug)
     if key is not None:
         last_run[key] = 0.0
+        if runners is not None:
+            runner = runners.get(key)
+            if runner is not None and hasattr(runner, "reset_idle_streak"):
+                runner.reset_idle_streak()
 
 
 async def _drain_wake_messages(
     pubsub: Any,
     last_run: dict[str, float],
     slug_to_key: dict[str, str],
+    runners: dict[str, PipelineRunner] | None = None,
 ) -> None:
     """Apply any queued wake messages without blocking."""
     while True:
@@ -390,7 +421,7 @@ async def _drain_wake_messages(
             return
         if extra is None:
             return
-        _apply_wake_message(extra, last_run, slug_to_key)
+        _apply_wake_message(extra, last_run, slug_to_key, runners)
 
 
 async def _wait_or_wake(
@@ -398,6 +429,7 @@ async def _wait_or_wake(
     tick: float,
     last_run: dict[str, float],
     slug_to_key: dict[str, str],
+    runners: dict[str, PipelineRunner] | None = None,
 ) -> bool:
     """Sleep ``tick`` seconds or wake early on a wake-channel message.
 
@@ -430,8 +462,10 @@ async def _wait_or_wake(
         else:
             msg = wake_task.result()
             if msg is not None:
-                _apply_wake_message(msg, last_run, slug_to_key)
-                await _drain_wake_messages(pubsub, last_run, slug_to_key)
+                _apply_wake_message(msg, last_run, slug_to_key, runners)
+                await _drain_wake_messages(
+                    pubsub, last_run, slug_to_key, runners
+                )
 
     if not healthy and not sleep_task.done():
         # Subscriber errored early; finish the tick so the caller observes
@@ -558,7 +592,7 @@ async def main() -> None:
                     )
                 continue
             now = time.monotonic()
-            interval = runner.repo_config.poll_interval_sec
+            interval = _runner_poll_interval(runner)
             if key in last_run and now - last_run[key] < interval:
                 continue
             last_run[key] = now
@@ -581,7 +615,7 @@ async def main() -> None:
             if not runner.repo_config.active:
                 continue
             slug_to_key[runner.name] = key
-            due_in = (last_run.get(key, 0.0) + runner.repo_config.poll_interval_sec) - now_after
+            due_in = (last_run.get(key, 0.0) + _runner_poll_interval(runner)) - now_after
             remaining.append(max(due_in, 0.0))
         tick = min(remaining) if remaining else config.daemon.poll_interval_sec
         tick = min(tick, config.daemon.poll_interval_sec)
@@ -599,7 +633,7 @@ async def main() -> None:
                 subscribed_slugs = desired_slugs
 
         healthy = await _wait_or_wake(
-            pubsub, max(tick, 1), last_run, slug_to_key
+            pubsub, max(tick, 1), last_run, slug_to_key, runners
         )
         if not healthy:
             await _close_pubsub(pubsub)

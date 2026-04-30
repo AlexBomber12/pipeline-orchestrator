@@ -1803,3 +1803,101 @@ def test_main_loop_retries_subscribe_when_initial_attempt_returns_none(
     # to subscribe on subsequent cycles instead of latching the slug set.
     assert len(subscriptions) >= 2
     assert all(slugs == ("octo__alpha",) for slugs in subscriptions)
+
+
+# ---------------------------------------------------------------------------
+# PR-184: adaptive IDLE polling — main-loop wiring
+# ---------------------------------------------------------------------------
+
+
+class _FakeIdleRunner:
+    """Minimal runner double exposing the PR-184 adaptive interval API."""
+
+    def __init__(
+        self,
+        *,
+        state: PipelineState = PipelineState.IDLE,
+        base: int = 60,
+        effective: int = 60,
+    ) -> None:
+        self.repo_config = types.SimpleNamespace(poll_interval_sec=base)
+        self.state = types.SimpleNamespace(state=state)
+        self.effective_idle_poll_interval = effective
+        self.idle_streak_resets = 0
+
+    def reset_idle_streak(self) -> None:
+        self.idle_streak_resets += 1
+
+
+def test_runner_poll_interval_returns_effective_interval_when_idle() -> None:
+    runner = _FakeIdleRunner(
+        state=PipelineState.IDLE, base=60, effective=300
+    )
+    assert main_module._runner_poll_interval(runner) == 300
+
+
+def test_runner_poll_interval_returns_static_interval_when_not_idle() -> None:
+    runner = _FakeIdleRunner(
+        state=PipelineState.WATCH, base=60, effective=300
+    )
+    assert main_module._runner_poll_interval(runner) == 60
+
+
+def test_runner_poll_interval_falls_back_when_runner_lacks_property() -> None:
+    """Test stubs predating PR-184 keep using the static interval."""
+    legacy = types.SimpleNamespace(
+        repo_config=types.SimpleNamespace(poll_interval_sec=42),
+        state=types.SimpleNamespace(state=PipelineState.IDLE),
+    )
+    assert main_module._runner_poll_interval(legacy) == 42
+
+
+def test_apply_wake_message_resets_runner_idle_streak() -> None:
+    runner = _FakeIdleRunner()
+    last_run = {"alpha-key": 100.0}
+    slug_to_key = {"alpha": "alpha-key"}
+    runners = {"alpha-key": runner}
+
+    main_module._apply_wake_message(
+        {"channel": "orchestrator:wake:alpha"},
+        last_run,
+        slug_to_key,
+        runners,
+    )
+
+    assert last_run["alpha-key"] == 0.0
+    assert runner.idle_streak_resets == 1
+
+
+def test_apply_wake_message_skips_runners_missing_reset_method() -> None:
+    """Legacy runner stubs without ``reset_idle_streak`` are tolerated."""
+    legacy = types.SimpleNamespace()
+    last_run = {"alpha-key": 100.0}
+    slug_to_key = {"alpha": "alpha-key"}
+    runners: dict[str, Any] = {"alpha-key": legacy}
+
+    main_module._apply_wake_message(
+        {"channel": "orchestrator:wake:alpha"},
+        last_run,
+        slug_to_key,
+        runners,
+    )
+
+    assert last_run["alpha-key"] == 0.0
+
+
+async def test_wait_or_wake_resets_runner_idle_streak() -> None:
+    """Wake-on-pubsub also clears ``_idle_streak`` so the next cycle is fast."""
+    pubsub = _ScriptedPubSub([{"channel": "orchestrator:wake:alpha"}, None])
+    last_run = {"alpha-key": 100.0}
+    slug_to_key = {"alpha": "alpha-key"}
+    runner = _FakeIdleRunner()
+    runners = {"alpha-key": runner}
+
+    healthy = await main_module._wait_or_wake(
+        pubsub, 60.0, last_run, slug_to_key, runners
+    )
+
+    assert healthy is True
+    assert last_run["alpha-key"] == 0.0
+    assert runner.idle_streak_resets == 1
