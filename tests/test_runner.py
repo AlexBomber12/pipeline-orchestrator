@@ -14651,10 +14651,14 @@ def test_recover_state_rehydrates_last_push_at(
     runner.repo_path = str(tmp_path)
     runner._parse_base_queue = lambda **_: parsed_tasks  # type: ignore[method-assign]
     assert runner._last_push_at is None
+    assert runner._watch_entered_at is None
     asyncio.run(runner.recover_state())
     assert runner.state.state == PipelineState.WATCH
     assert runner._last_push_at is not None
     assert runner._last_push_at.isoformat() == "2026-04-10T12:00:00+00:00"
+    # PR-202: recovery anchors the slow-start window so the first
+    # post-restart poll already uses the slow cadence.
+    assert runner._watch_entered_at is not None
 
 
 def test_rehydrate_replaces_last_push_at_on_different_pr(
@@ -22019,3 +22023,83 @@ def test_run_cycle_resets_watch_anchors_when_state_leaves_watch(
     assert runner._watch_entered_at is None
     assert runner._watch_last_event_at is None
     assert runner._watch_last_event_signature is None
+
+
+def test_run_cycle_anchors_watch_entered_at_on_transition_into_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_run_cycle_body`` anchors ``_watch_entered_at`` at the transition.
+
+    A handler that pushes the runner from a non-WATCH state into WATCH
+    must leave the anchor set before ``_run_cycle_body`` returns so the
+    daemon's *next* call to ``_runner_poll_interval`` already sees the
+    slow cadence — otherwise the first interval after entry uses the
+    fast base poll and the slow-start window is wasted.
+    """
+    runner = _make_runner(poll_interval_sec=60)
+    _configure_watch_adaptive_defaults(runner)
+    runner._recovered = True
+    runner.state.state = PipelineState.IDLE
+    assert runner._watch_entered_at is None
+
+    async def _noop_cloned(self: PipelineRunner) -> None:
+        return None
+
+    async def _budget_ok(self: PipelineRunner) -> bool:
+        return True
+
+    async def _no_user_paused(self: PipelineRunner) -> None:
+        self.state.user_paused = False
+
+    async def _preflight_ok(self: PipelineRunner) -> bool:
+        return True
+
+    async def _idle_to_watch(self: PipelineRunner) -> None:
+        self.state.state = PipelineState.WATCH
+
+    async def _publish_state(self: PipelineRunner) -> None:
+        return None
+
+    monkeypatch.setattr(PipelineRunner, "ensure_repo_cloned", _noop_cloned)
+    monkeypatch.setattr(PipelineRunner, "_check_github_api_budget", _budget_ok)
+    monkeypatch.setattr(
+        PipelineRunner, "_refresh_user_paused_from_redis", _no_user_paused
+    )
+    monkeypatch.setattr(PipelineRunner, "preflight", _preflight_ok)
+    monkeypatch.setattr(PipelineRunner, "handle_idle", _idle_to_watch)
+    monkeypatch.setattr(PipelineRunner, "publish_state", _publish_state)
+
+    asyncio.run(runner._run_cycle_body())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._watch_entered_at is not None
+    # The next poll interval — computed by the daemon main loop *after*
+    # this cycle — already sees the slow cadence, not the base fallback.
+    assert runner.effective_watch_poll_interval == 300
+
+
+def test_check_budget_no_skip_when_state_is_watch() -> None:
+    """WATCH cadence already absorbs the slowdown; do not skip cycles.
+
+    ``effective_watch_poll_interval`` already takes
+    ``max(target, base * multiplier)`` when the rate-limit slowdown is
+    active. If ``_check_github_api_budget`` also skipped (multiplier-1)
+    out of every multiplier cycles, the effective poll spacing would
+    become ``effective_watch_poll_interval * multiplier`` and could
+    delay merge/fix transitions by an hour or more when quota is low.
+    """
+    runner = _make_runner(poll_interval_sec=60)
+    runner.app_config.daemon.github_api_pause_threshold_percent = 5
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+    runner.app_config.daemon.github_api_slowdown_multiplier = 10
+    _set_budget(runner, _budget(remaining=500, limit=5000))  # 10%
+
+    runner.state.state = PipelineState.WATCH
+
+    decisions = [
+        asyncio.run(runner._check_github_api_budget()) for _ in range(5)
+    ]
+
+    assert decisions == [True] * 5
+    assert runner._github_api_slowdown_cycle == 0
+    assert runner._github_api_slowdown_attempts == 5

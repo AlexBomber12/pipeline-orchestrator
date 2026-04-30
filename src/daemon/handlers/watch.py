@@ -38,20 +38,26 @@ class WatchMixin:
         """Return the WATCH poll interval after slow-start adaptive logic.
 
         Anchors at ``max(_watch_entered_at, _watch_last_event_at)``.
-        Within ``watch_slow_window_sec`` of the anchor, returns
-        ``watch_slow_poll_interval_sec`` — Codex Review and CI rarely
-        respond in the first few minutes, so polling fast there wastes
-        GitHub API quota on a scheduled wait. Past the window, returns
-        ``watch_fast_poll_interval_sec`` since the result may arrive
-        any second.
+        ``_watch_entered_at`` is set the moment the runner transitions
+        into WATCH (in ``_run_cycle_body`` for handler-driven
+        transitions, in ``recover_state`` for startup recovery), so
+        the first poll interval after entry already reflects the slow
+        cadence. Within ``watch_slow_window_sec`` of the anchor,
+        returns ``watch_slow_poll_interval_sec`` — Codex Review and CI
+        rarely respond in the first few minutes, so polling fast there
+        wastes GitHub API quota on a scheduled wait. Past the window,
+        returns ``watch_fast_poll_interval_sec`` since the result may
+        arrive any second.
 
-        Falls back to the static ``repo_config.poll_interval_sec`` when
-        no anchor is set (e.g. before ``handle_watch`` has run for the
-        first time after entering WATCH).
+        Falls back to the static ``repo_config.poll_interval_sec`` only
+        in defensive corner cases where no anchor is set (e.g. legacy
+        test stubs) — production WATCH cycles always have an anchor.
 
         Stacks with the rate-limit slowdown by taking the larger of
         the watch interval and ``base * github_api_slowdown_multiplier``;
-        the rate-limit ceiling always wins.
+        the rate-limit ceiling always wins. ``_check_github_api_budget``
+        suppresses its one-in-N cycle skip while WATCH is active so the
+        slowdown is not double-applied.
         """
         anchors = [
             t
@@ -84,10 +90,6 @@ class WatchMixin:
             self.state.state = PipelineState.IDLE
             self.log_event("WATCH without current_pr -> IDLE")
             return
-
-        # PR-202: Anchor the slow-start window on first WATCH cycle.
-        if self._watch_entered_at is None:
-            self._watch_entered_at = datetime.now(timezone.utc)
 
         try:
             prs = github_client.get_open_prs(
