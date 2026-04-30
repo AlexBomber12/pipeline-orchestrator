@@ -2506,6 +2506,125 @@ def test_sync_runners_defers_swap_when_cycle_is_in_flight() -> None:
     asyncio.run(scenario())
 
 
+def test_sync_runners_marks_in_flight_only_staging_as_safe_to_drain() -> None:
+    """When staging is forced solely by an in-flight cycle (not by a
+    coder-only change) ``_sync_runners`` must signal that the post-cycle
+    drain may apply the change immediately. Without this signal a non-coder
+    change like ``active=False`` staged during a long WATCH cycle would
+    never apply: the daemon's ``config`` snapshot was already swapped at
+    reload time so subsequent ``_sync_runners`` calls see no diff to
+    re-stage, and ``reload_repo_config_if_dirty`` only fires at IDLE."""
+
+    class _StagingRunner(_FakeRunner):
+        def __init__(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            redis_client: Any,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+        ) -> None:
+            super().__init__(
+                repo_config,
+                app_config,
+                redis_client,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+            self.staged_kwargs: dict[str, Any] | None = None
+
+        def stage_config_reload(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+            *,
+            requires_idle_boundary: bool = False,
+        ) -> None:
+            self.staged_kwargs = {
+                "repo_config": repo_config,
+                "app_config": app_config,
+                "requires_idle_boundary": requires_idle_boundary,
+            }
+
+    daemon_config = DaemonConfig(poll_interval_sec=1)
+
+    def make_runner(repo: RepoConfig) -> _StagingRunner:
+        runner = _StagingRunner(
+            repo,
+            AppConfig(repositories=[repo], daemon=daemon_config),
+            _FakeRedisClient(),
+            "old-claude-provider",
+            "old-codex-provider",
+        )
+        runner.state.state = PipelineState.WATCH
+        return runner
+
+    base_kwargs = dict(coder="claude", active=True, auto_merge=True)
+
+    async def scenario() -> None:
+        async def long_cycle() -> None:
+            await asyncio.Event().wait()
+
+        cycle = asyncio.create_task(long_cycle())
+        try:
+            await asyncio.sleep(0)
+            in_flight: dict[str, asyncio.Task[None]] = {
+                "https://github.com/octo/alpha": cycle,
+            }
+
+            non_coder_runner = make_runner(
+                _repo("https://github.com/octo/alpha.git", **base_kwargs)
+            )
+            non_coder_repo = _repo(
+                "https://github.com/octo/alpha.git",
+                coder="claude",
+                active=True,
+                auto_merge=False,
+            )
+            main_module._sync_runners(
+                {"https://github.com/octo/alpha": non_coder_runner},
+                AppConfig(repositories=[non_coder_repo], daemon=daemon_config),
+                _FakeRedisClient(),
+                "claude-provider",
+                "codex-provider",
+                registry=None,  # type: ignore[arg-type]
+                in_flight=in_flight,
+            )
+            assert non_coder_runner.staged_kwargs is not None
+            assert non_coder_runner.staged_kwargs["requires_idle_boundary"] is False
+
+            coder_only_runner = make_runner(
+                _repo("https://github.com/octo/alpha.git", **base_kwargs)
+            )
+            coder_only_repo = _repo(
+                "https://github.com/octo/alpha.git",
+                coder="codex",
+                active=True,
+                auto_merge=True,
+            )
+            main_module._sync_runners(
+                {"https://github.com/octo/alpha": coder_only_runner},
+                AppConfig(repositories=[coder_only_repo], daemon=daemon_config),
+                _FakeRedisClient(),
+                "claude-provider",
+                "codex-provider",
+                registry=None,  # type: ignore[arg-type]
+                in_flight=in_flight,
+            )
+            assert coder_only_runner.staged_kwargs is not None
+            assert coder_only_runner.staged_kwargs["requires_idle_boundary"] is True
+        finally:
+            cycle.cancel()
+            try:
+                await cycle
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(scenario())
+
+
 def test_sync_runners_applies_in_place_when_cycle_already_done() -> None:
     """A finished task in ``in_flight`` (not yet drained) is not a reason
     to defer — the cycle has already returned, so its ``repo_config``
@@ -2639,12 +2758,10 @@ def test_drain_finished_cycle_applies_pending_in_flight_config() -> None:
 
 
 def test_drain_finished_cycle_defers_apply_when_runner_below_idle_boundary() -> None:
-    """A cycle that finishes in WATCH/FIX/MERGE/CODING/PAUSED/HUNG must
-    leave the staged config in place — ``_sync_runners`` also uses
-    staging for coder-only changes that are supposed to wait until IDLE,
-    so the post-cycle drain applying immediately would let a coder
-    swap mid-PR-lifecycle. ``reload_repo_config_if_dirty`` will pick up
-    the staged config at the next IDLE entry."""
+    """A coder-only change staged because the runner is mid-PR must keep
+    deferring even after the cycle drains — applying it now would swap
+    coders mid-PR-lifecycle. ``reload_repo_config_if_dirty`` will pick
+    up the staged config at the next IDLE entry."""
 
     applied = {"called": 0}
 
@@ -2653,6 +2770,7 @@ def test_drain_finished_cycle_defers_apply_when_runner_below_idle_boundary() -> 
 
         def __init__(self, state: PipelineState) -> None:
             self.state = types.SimpleNamespace(state=state)
+            self._pending_requires_idle_boundary = True
 
         def _apply_staged_config_reload(self) -> None:
             applied["called"] += 1
@@ -2682,6 +2800,58 @@ def test_drain_finished_cycle_defers_apply_when_runner_below_idle_boundary() -> 
             assert in_flight == {}
             assert applied["called"] == 0, (
                 f"staged config must not be applied while runner is in {state}"
+            )
+
+    asyncio.run(scenario())
+
+
+def test_drain_finished_cycle_applies_non_idle_staging_after_cycle() -> None:
+    """Staging triggered solely by an in-flight cycle (e.g. ``active=False``
+    or any non-coder-only change) must apply as soon as the cycle finishes,
+    regardless of the runner's current state. Without this, the staged
+    update sits forever for runners that never re-enter IDLE — the daemon
+    already swapped its ``config`` snapshot at reload time, so a follow-up
+    ``_sync_runners`` will not see a diff to re-stage."""
+
+    applied = {"called": 0}
+
+    class _Runner:
+        name = "octo__alpha"
+
+        def __init__(self, state: PipelineState) -> None:
+            self.state = types.SimpleNamespace(state=state)
+            self._pending_requires_idle_boundary = False
+
+        def _apply_staged_config_reload(self) -> None:
+            applied["called"] += 1
+
+    async def scenario() -> None:
+        async def quick() -> None:
+            return None
+
+        for state in (
+            PipelineState.CODING,
+            PipelineState.WATCH,
+            PipelineState.FIX,
+            PipelineState.MERGE,
+            PipelineState.PAUSED,
+            PipelineState.HUNG,
+            PipelineState.IDLE,
+            PipelineState.ERROR,
+        ):
+            applied["called"] = 0
+            task = asyncio.create_task(quick())
+            await task
+
+            in_flight: dict[str, asyncio.Task[None]] = {"key": task}
+            runners = {"key": _Runner(state)}
+
+            popped = main_module._drain_finished_cycle("key", in_flight, runners)
+
+            assert popped is True
+            assert in_flight == {}
+            assert applied["called"] == 1, (
+                f"non-coder staging must apply post-cycle in state {state}"
             )
 
     asyncio.run(scenario())

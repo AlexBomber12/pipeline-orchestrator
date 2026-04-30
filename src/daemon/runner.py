@@ -267,6 +267,15 @@ class PipelineRunner(
         self._pending_usage_providers: (
             tuple[UsageProvider, UsageProvider] | None
         ) = None
+        # True iff the staged change is one that intentionally needs to
+        # land on an IDLE boundary (currently: coder-only swaps mid-PR).
+        # False marks staging that exists purely because a cycle was in
+        # flight at reload time — those are safe to apply as soon as the
+        # cycle drains, regardless of the resulting state. Without this
+        # split, a non-coder change like ``active=False`` staged during
+        # an in-flight cycle would be left pending forever if the cycle
+        # finished in WATCH/FIX/MERGE/CODING.
+        self._pending_requires_idle_boundary: bool = False
         # GitHub API rate-limit budget tracking. The budget is refreshed
         # at most once per minute; counters drive the BoundedRecoveryPolicy
         # transitions for the slowdown/pause threshold actions.
@@ -348,14 +357,23 @@ class PipelineRunner(
         app_config: AppConfig,
         claude_usage_provider: UsageProvider,
         codex_usage_provider: UsageProvider,
+        *,
+        requires_idle_boundary: bool = False,
     ) -> None:
-        """Queue config changes to apply at the next safe task-pickup boundary."""
+        """Queue config changes to apply at the next safe task-pickup boundary.
+
+        ``requires_idle_boundary=True`` means the change must wait for an
+        IDLE-equivalent state before swapping (e.g. a mid-PR coder swap).
+        ``False`` means staging is just an in-flight-cycle precaution and
+        the post-cycle drain may apply the change regardless of state.
+        """
         self._pending_repo_config = repo_config
         self._pending_app_config = app_config
         self._pending_usage_providers = (
             claude_usage_provider,
             codex_usage_provider,
         )
+        self._pending_requires_idle_boundary = requires_idle_boundary
 
     def _build_usage_providers_for_app_config(
         self,
@@ -388,6 +406,7 @@ class PipelineRunner(
         self._pending_repo_config = None
         self._pending_app_config = None
         self._pending_usage_providers = None
+        self._pending_requires_idle_boundary = False
 
     async def reload_repo_config_if_dirty(self) -> None:
         """Hot-reload repo config at the idle boundary when flagged by the web UI."""

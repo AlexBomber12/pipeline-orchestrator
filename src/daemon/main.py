@@ -334,11 +334,20 @@ def _sync_runners(
             )
             must_defer = cycle_in_flight or needs_idle_boundary_defer
             if must_defer and hasattr(runner, "stage_config_reload"):
+                stage_kwargs: dict[str, Any] = {}
+                params = inspect.signature(
+                    runner.stage_config_reload
+                ).parameters
+                if "requires_idle_boundary" in params:
+                    stage_kwargs["requires_idle_boundary"] = (
+                        needs_idle_boundary_defer
+                    )
                 runner.stage_config_reload(
                     repo,
                     config,
                     claude_usage_provider,
                     codex_usage_provider,
+                    **stage_kwargs,
                 )
             else:
                 runner.repo_config = repo
@@ -413,6 +422,26 @@ def _apply_pending_in_flight_config(runner: PipelineRunner) -> None:
         )
 
 
+def _staged_config_can_apply_after_cycle(runner: Any) -> bool:
+    """Return whether a runner's staged config is safe to apply post-cycle.
+
+    Two reasons drive staging in ``_sync_runners``: (a) a cycle was
+    in flight, in which case staging is just a snapshot guard and the
+    swap is safe as soon as the cycle drains; or (b) the change is a
+    coder-only swap that must wait for IDLE so the runner is not
+    mid-PR-lifecycle when the coder flips. Only (b) needs to keep
+    deferring once the cycle has finished — runners flag this case via
+    ``_pending_requires_idle_boundary``. When the runner does not
+    expose the flag (older test stubs), fall back to the previous
+    state-only check so behavior is unchanged for them.
+    """
+    if not hasattr(runner, "_pending_requires_idle_boundary"):
+        return not _runner_requires_idle_boundary(runner)
+    if not getattr(runner, "_pending_requires_idle_boundary", False):
+        return True
+    return not _runner_requires_idle_boundary(runner)
+
+
 def _drain_finished_cycle(
     key: str,
     in_flight: dict[str, asyncio.Task[None]],
@@ -433,14 +462,17 @@ def _drain_finished_cycle(
             "run_cycle failed for %s", runner_name, exc_info=True
         )
     del in_flight[key]
-    # Only apply the staged config when the runner has reached an
-    # idle-equivalent state. ``_sync_runners`` also uses staging for
-    # coder-only changes that must wait until IDLE, and a cycle finishing
-    # in WATCH/FIX/MERGE/CODING does not satisfy that boundary —
-    # ``reload_repo_config_if_dirty`` will pick the staged config up at
-    # the next IDLE entry instead.
-    if runner is not None and not _runner_requires_idle_boundary(runner):
-        _apply_pending_in_flight_config(runner)
+    # Apply the staged config unless it was explicitly tagged as
+    # requiring an IDLE boundary (currently: a coder-only swap that must
+    # not land mid-PR). Without this distinction, a non-coder change
+    # such as ``active=False`` staged purely because a cycle was in
+    # flight would sit pending forever if the cycle finished in
+    # WATCH/FIX/MERGE/CODING — ``reload_repo_config_if_dirty`` only runs
+    # at IDLE entry, and ``_sync_runners`` will not re-stage because the
+    # daemon's ``config`` snapshot was already swapped at reload time.
+    if runner is not None:
+        if _staged_config_can_apply_after_cycle(runner):
+            _apply_pending_in_flight_config(runner)
     return True
 
 
