@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from src.onboarding.agents_md_template import (
     AGENTS_MD_PATH,
     MANAGED_SECTIONS,
@@ -49,3 +50,8 @@ def test_round_trip_extract_then_apply_is_identity() -> None:
     regions = daemon_managed_content()
     assert regions == extract_managed_regions(original)
     assert apply_managed_regions(original, regions) == original
+
+
+def test_daemon_managed_content_rejects_unknown_override_keys() -> None:
+    with pytest.raises(ValueError, match="work_mode"):
+        daemon_managed_content({"work_mode": "typo, should not be accepted"})

@@ -40,9 +40,18 @@ def daemon_managed_content(
     template stays in lock-step with the source of truth. Pass
     ``repo_specific_overrides`` to replace individual sections (for
     example with ``{repo_slug}`` already filled in) before applying the
-    regions to a target repo's AGENTS.md.
+    regions to a target repo's AGENTS.md. Override keys must be members
+    of ``MANAGED_SECTIONS``; unknown keys raise ``ValueError`` so a typo
+    cannot silently introduce an extra marker block.
     """
     regions = extract_managed_regions(AGENTS_MD_PATH.read_text())
     if repo_specific_overrides is not None:
+        unknown = set(repo_specific_overrides) - set(MANAGED_SECTIONS)
+        if unknown:
+            raise ValueError(
+                "unknown managed section name(s) in "
+                f"repo_specific_overrides: {sorted(unknown)!r}; "
+                f"expected one of {list(MANAGED_SECTIONS)!r}"
+            )
         regions.update(repo_specific_overrides)
     return regions
