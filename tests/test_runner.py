@@ -2889,7 +2889,7 @@ def test_handle_idle_sets_error_when_queue_validation_fails_without_dag_tasks(
     assert any("tasks/QUEUE.md: malformed status" in e["event"] for e in runner.state.history)
 
 
-def test_handle_coding_errors_when_no_pr_found(
+def test_handle_coding_no_pr_routes_to_diagnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_subprocess(monkeypatch)
@@ -2904,6 +2904,11 @@ def test_handle_coding_errors_when_no_pr_found(
         lambda repo, **kw: [],
     )
 
+    def fake_git(repo_path: str, *args: str, **kwargs: Any):
+        return _FakeCompletedProcess(args=list(args), returncode=1)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+
     async def instant_sleep(_seconds: float) -> None:
         return None
 
@@ -2915,8 +2920,8 @@ def test_handle_coding_errors_when_no_pr_found(
     )
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.ERROR
-    assert "no PR found" in (runner.state.error_message or "")
+    assert runner.state.state == PipelineState.HUNG
+    assert "did nothing" in (runner.state.error_message or "")
 
 
 def test_handle_coding_creates_run_record(
@@ -3048,7 +3053,8 @@ def test_handle_coding_rejects_unmatched_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When no open PR matches current_task.branch, fail fast instead of
-    attaching to an unrelated newest open PR."""
+    attaching to an unrelated newest open PR. The diagnostic handler then
+    routes the no-PR outcome to HUNG via case A/B/C."""
     _patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
@@ -3062,6 +3068,11 @@ def test_handle_coding_rejects_unmatched_branch(
         lambda repo, **kw: [unrelated],
     )
 
+    def fake_git(repo_path: str, *args: str, **kwargs: Any):
+        return _FakeCompletedProcess(args=list(args), returncode=1)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+
     async def instant_sleep(_seconds: float) -> None:
         return None
 
@@ -3073,9 +3084,9 @@ def test_handle_coding_rejects_unmatched_branch(
     )
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.state == PipelineState.HUNG
     assert runner.state.current_pr is None
-    assert "pr-001" in (runner.state.error_message or "")
+    assert "did nothing" in (runner.state.error_message or "")
 
 
 def test_handle_coding_posts_codex_review_after_pr_found(
@@ -6536,12 +6547,13 @@ def test_handle_coding_retries_pr_detection(
     )
 
 
-def test_handle_coding_errors_after_all_retries(
+def test_handle_coding_runs_three_retries_before_diagnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """After 3 consecutive empty get_open_prs results the runner must
-    flip to ERROR so operators see that Claude exited 0 without opening
-    a PR."""
+    invoke ``_diagnose_exit_zero_no_pr`` rather than flipping straight
+    to ERROR. That diagnostic distinguishes A/B/C and routes to HUNG
+    when the coder did nothing observable upstream."""
     _patch_subprocess(monkeypatch)
     call_count = {"n": 0}
 
@@ -6552,6 +6564,11 @@ def test_handle_coding_errors_after_all_retries(
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", always_empty
     )
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any):
+        return _FakeCompletedProcess(args=list(args), returncode=1)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
 
     slept: list[float] = []
 
@@ -6576,10 +6593,8 @@ def test_handle_coding_errors_after_all_retries(
     )
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.ERROR
-    assert runner.state.error_message == (
-        "[codex] coder succeeded but no PR found for branch 'pr-001'"
-    )
+    assert runner.state.state == PipelineState.HUNG
+    assert "[codex]" in (runner.state.error_message or "")
     assert call_count["n"] == 3
     assert slept.count(5) == 2
 

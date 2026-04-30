@@ -7,25 +7,58 @@ Mixin methods:
 from __future__ import annotations
 
 import asyncio
+import subprocess
 
 from src import github_client
+from src.daemon import git_ops
 from src.models import PipelineState
 
-"""In-memory counter of consecutive coder-exit-without-PR failures per task.
-Resets on daemon restart; upgrade to Redis persistence in later PR."""
-_NO_PR_RETRY_COUNTS: dict[str, int] = {}
+
+def _local_branch_exists(repo_path: str, branch: str) -> bool:
+    """Return ``True`` if ``refs/heads/{branch}`` exists in ``repo_path``.
+
+    A non-zero exit (or any git-side error) is treated as "not present" so
+    the diagnostic conservatively reports a missing branch when the probe
+    itself is unreliable.
+    """
+    try:
+        probe = git_ops._git(
+            repo_path,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+            timeout=10,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return probe.returncode == 0
 
 
-def _clear_stale_no_pr_retry_count(runner: object, current_pr_id: str | None) -> None:
-    """Drop stale no-PR retry state when CODING starts for another task."""
-    if current_pr_id is None:
-        return
-    last_failed_pr_id = getattr(runner, "_last_no_pr_failed_pr_id", None)
-    if last_failed_pr_id == current_pr_id:
-        return
-    _NO_PR_RETRY_COUNTS.pop(last_failed_pr_id or current_pr_id, None)
-    if last_failed_pr_id is not None:
-        runner._last_no_pr_failed_pr_id = None
+def _remote_branch_exists(repo_path: str, branch: str) -> bool:
+    """Return ``True`` if ``origin`` reports ``refs/heads/{branch}`` exists.
+
+    Uses ``git ls-remote --exit-code`` so a missing ref returns rc=2 and a
+    transient transport failure returns rc>=128 — both interpreted as "not
+    visible upstream" by the caller, which routes A/B to HUNG without
+    risking a false-positive PR-creation attempt against a non-existent
+    upstream branch.
+    """
+    try:
+        probe = git_ops._git(
+            repo_path,
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            f"refs/heads/{branch}",
+            timeout=30,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return probe.returncode == 0 and bool(probe.stdout.strip())
 
 
 class CodingMixin:
@@ -43,7 +76,6 @@ class CodingMixin:
         """
         self._stop_requested = False
         current_pr_id = self.state.current_task.pr_id if self.state.current_task is not None else None
-        _clear_stale_no_pr_retry_count(self, current_pr_id)
         await self._refresh_auth_status_cache()
         coder_name, plugin = self._get_coder()
         model = (
@@ -266,29 +298,7 @@ class CodingMixin:
         if await pause_for_stop_if_requested():
             return
         if candidate is None:
-            no_pr_message = (
-                f"[{coder_name}] coder succeeded but no PR found for branch "
-                f"{target_branch!r}"
-            )
-            retry_count = 0
-            if current_pr_id is not None:
-                retry_count = _NO_PR_RETRY_COUNTS.get(current_pr_id, 0) + 1
-                _NO_PR_RETRY_COUNTS[current_pr_id] = retry_count
-                self._last_no_pr_failed_pr_id = current_pr_id
-            self.log_event(no_pr_message)
-            if retry_count >= 2 and current_pr_id is not None:
-                blocked_message = (
-                    f"Task {current_pr_id} blocked: coder failed to create PR "
-                    "2 times in a row. Manual intervention required."
-                )
-                self.state.state = PipelineState.HUNG
-                self.state.error_message = blocked_message
-                await self._save_current_run_record("error")
-                self.log_event(blocked_message)
-                return
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = no_pr_message
-            await self._save_current_run_record("error")
+            await self._diagnose_exit_zero_no_pr(target_branch, coder_name)
             return
 
         self.state.current_pr = candidate
@@ -297,3 +307,143 @@ class CodingMixin:
         await self._save_current_run_record("coding_complete")
         self.log_event(f"Opened PR #{candidate.number} -> WATCH")
         self._post_codex_review(candidate.number)
+
+    async def _diagnose_exit_zero_no_pr(
+        self,
+        target_branch: str,
+        coder_name: str,
+    ) -> None:
+        """Resolve the "coder exited 0 but no PR" outcome by branch state.
+
+        Distinguishes three cases the runner used to collapse into a single
+        HUNG transition: (A) coder did nothing — neither a local branch nor
+        an upstream ref exists; (B) coder created the branch locally but
+        never pushed; (C) coder pushed a branch but failed to open the PR.
+        Cases A and B route to HUNG because we cannot trust the local tree
+        or push outcome without inspection. Case C is auto-recoverable —
+        the daemon issues ``gh pr create`` itself and hands off to WATCH on
+        success, falling back to HUNG when PR creation fails.
+        """
+        local_exists = _local_branch_exists(self.repo_path, target_branch)
+        remote_exists = _remote_branch_exists(self.repo_path, target_branch)
+
+        if not remote_exists:
+            if not local_exists:
+                message = (
+                    f"[{coder_name}] Coder exited 0 but did nothing — "
+                    f"escalating"
+                )
+            else:
+                message = (
+                    f"[{coder_name}] Coder exited 0 with local branch but "
+                    f"no push — escalating"
+                )
+            self.state.state = PipelineState.HUNG
+            self.state.error_message = message
+            await self._save_current_run_record("error")
+            self.log_event(message)
+            return
+
+        self.log_event(
+            f"[{coder_name}] Coder exited 0 with branch but no PR — "
+            f"daemon creating PR"
+        )
+        if not await self._daemon_create_pr_for_branch(
+            target_branch, coder_name
+        ):
+            return
+
+        try:
+            prs = github_client.get_open_prs(
+                self.owner_repo,
+                allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+            )
+        except Exception as exc:
+            self.state.state = PipelineState.HUNG
+            self.state.error_message = (
+                f"[{coder_name}] Daemon-created PR not visible: {exc}"
+            )
+            await self._save_current_run_record("error")
+            self.log_event(self.state.error_message)
+            return
+
+        candidate = next(
+            (pr for pr in prs if pr.branch == target_branch), None
+        )
+        if candidate is None:
+            message = (
+                f"[{coder_name}] Daemon-created PR not found for branch "
+                f"{target_branch!r}"
+            )
+            self.state.state = PipelineState.HUNG
+            self.state.error_message = message
+            await self._save_current_run_record("error")
+            self.log_event(message)
+            return
+
+        self.state.current_pr = candidate
+        self.state.state = PipelineState.WATCH
+        self._rehydrate_last_push_at(candidate)
+        await self._save_current_run_record("coding_complete")
+        self.log_event(
+            f"Daemon opened PR #{candidate.number} for {target_branch!r} "
+            f"-> WATCH"
+        )
+        self._post_codex_review(candidate.number)
+
+    async def _daemon_create_pr_for_branch(
+        self,
+        target_branch: str,
+        coder_name: str,
+    ) -> bool:
+        """Run ``gh pr create`` against an already-pushed branch.
+
+        Returns ``True`` on success. On failure the runner is transitioned
+        to HUNG with the gh error and the run record saved, matching the
+        ESCALATE-style handling the diagnostic uses for cases A and B —
+        a failed creation is not silently retried.
+        """
+        task = self.state.current_task
+        # The diagnostic only runs after handle_coding's target_branch guard,
+        # so current_task is always populated when we reach this method.
+        assert task is not None
+        pr_title = f"{task.pr_id}: {task.title}" if task.title else task.pr_id
+        if task.task_file:
+            body = (
+                f"Auto-created by pipeline-orchestrator after coder exit=0 "
+                f"with no PR. See `{task.task_file}` for the planned scope."
+            )
+        else:
+            body = (
+                "Auto-created by pipeline-orchestrator after coder exit=0 "
+                "with no PR."
+            )
+
+        base_branch = self.repo_config.branch
+        try:
+            github_client.run_gh(
+                [
+                    "pr",
+                    "create",
+                    "--base",
+                    base_branch,
+                    "--head",
+                    target_branch,
+                    "--title",
+                    pr_title,
+                    "--body",
+                    body,
+                ],
+                repo=self.owner_repo,
+            )
+        except (RuntimeError, subprocess.SubprocessError, OSError) as exc:
+            message = (
+                f"[{coder_name}] Daemon PR creation failed for "
+                f"{target_branch!r}: {exc}"
+            )
+            self.state.state = PipelineState.HUNG
+            self.state.error_message = message
+            await self._save_current_run_record("error")
+            self.log_event(message)
+            return False
+        return True
