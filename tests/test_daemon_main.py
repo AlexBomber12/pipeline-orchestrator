@@ -1843,6 +1843,15 @@ def test_runner_poll_interval_returns_static_interval_when_not_idle() -> None:
     assert main_module._runner_poll_interval(runner) == 60
 
 
+def test_runner_poll_interval_returns_effective_watch_interval_when_watching() -> None:
+    """PR-202: WATCH runners use ``effective_watch_poll_interval``."""
+    runner = _FakeIdleRunner(
+        state=PipelineState.WATCH, base=60, effective=60
+    )
+    runner.effective_watch_poll_interval = 300
+    assert main_module._runner_poll_interval(runner) == 300
+
+
 def test_runner_poll_interval_falls_back_when_runner_lacks_property() -> None:
     """Test stubs predating PR-184 keep using the static interval."""
     legacy = types.SimpleNamespace(

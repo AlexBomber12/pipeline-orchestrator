@@ -290,6 +290,16 @@ class PipelineRunner(
         # outstanding upload retry is not folded into the slower
         # extended-idle cadence.
         self._idle_dispatch_deferred = False
+        # PR-202: WATCH adaptive polling. ``_watch_entered_at`` is set
+        # by ``handle_watch`` on its first cycle after entry. Each WATCH
+        # cycle records the polled PR signature; when that signature
+        # changes between cycles a real GitHub event arrived and
+        # ``_watch_last_event_at`` advances. Both are cleared by
+        # ``_reset_watch_polling`` on transition out of WATCH so a
+        # stale anchor cannot leak into the next WATCH session.
+        self._watch_entered_at: datetime | None = None
+        self._watch_last_event_at: datetime | None = None
+        self._watch_last_event_signature: tuple[Any, ...] | None = None
         self._github_api_pause_policy: BoundedRecoveryPolicy[
             "PipelineRunner"
         ] = BoundedRecoveryPolicy(
@@ -1299,4 +1309,9 @@ class PipelineRunner(
             self._error_skip_active = False
 
         self._update_idle_streak_after_cycle(pre_state)
+        if (
+            pre_state == PipelineState.WATCH
+            and self.state.state != PipelineState.WATCH
+        ):
+            self._reset_watch_polling()
         await self.publish_state()

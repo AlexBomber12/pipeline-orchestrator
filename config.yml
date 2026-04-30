@@ -26,6 +26,13 @@ daemon:
   github_api_slowdown_multiplier: 5
   idle_extended_poll_interval_sec: 300
   idle_extended_after_cycles: 3
+  # PR-202 WATCH adaptive polling. Codex Review (~2-7 min) and CI
+  # (~5-15 min) rarely respond in the first 5 minutes; slow polling
+  # there saves GitHub quota on a scheduled wait. After the window
+  # opens we poll fast since the result may arrive any second.
+  watch_slow_window_sec: 300
+  watch_slow_poll_interval_sec: 300
+  watch_fast_poll_interval_sec: 45
 web:
   host: 0.0.0.0
   port: 8000
