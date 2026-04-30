@@ -340,6 +340,36 @@ def test_case_c_already_exists_error_falls_through_when_pr_invisible(
     assert "Daemon-created PR not found" in (runner.state.error_message or "")
 
 
+def test_diagnose_honors_stop_request_during_remote_probe_for_case_a(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_remote_branch_exists`` blocks up to 30s; a stop pressed during
+    that window must route to PAUSED rather than the A/B HUNG branch.
+    Previously the diagnostic called ``pause_for_stop_if_requested`` only
+    on the C path, so a user stop coinciding with cases A/B was silently
+    swallowed and the task was parked as HUNG."""
+    runner = _runner(monkeypatch)
+    _patch_branch_state(monkeypatch, local_exists=False, remote_exists=False)
+
+    pop_calls = {"n": 0}
+
+    async def fake_pop_stop_request() -> bool:
+        pop_calls["n"] += 1
+        # Calls 1-6 belong to handle_coding (CLI exit + PR-visibility
+        # retry loop). Call 7 is the diagnostic's new pre-decision pause
+        # check covering the A/B/C fork; tripping it must route to
+        # PAUSED before HUNG is recorded.
+        return pop_calls["n"] == 7
+
+    monkeypatch.setattr(runner, "_pop_stop_request", fake_pop_stop_request)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.current_pr is None
+    assert "did nothing" not in (runner.state.error_message or "")
+
+
 def test_diagnose_honors_stop_request_before_pr_creation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

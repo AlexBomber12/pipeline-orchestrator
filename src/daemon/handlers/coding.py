@@ -337,6 +337,13 @@ class CodingMixin:
         local_exists = _local_branch_exists(self.repo_path, target_branch)
         remote_exists = _remote_branch_exists(self.repo_path, target_branch)
 
+        # ``_remote_branch_exists`` can block up to its 30s timeout; a stop
+        # pressed during that window must still be honored before either A/B
+        # routes to HUNG or C proceeds to PR creation, otherwise the user's
+        # stop is silently overridden by an unwanted state transition.
+        if await pause_for_stop_if_requested():
+            return
+
         if not remote_exists:
             if not local_exists:
                 message = (
@@ -352,9 +359,6 @@ class CodingMixin:
             self.state.error_message = message
             await self._save_current_run_record("error")
             self.log_event(message)
-            return
-
-        if await pause_for_stop_if_requested():
             return
 
         self.log_event(
