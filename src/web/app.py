@@ -2775,6 +2775,13 @@ def _resolve_onboarding_target(repo_name: str) -> Path | None:
     # file under operator control.
     if target.is_symlink():
         return None
+    # ``read_text`` on a directory or other non-regular path raises
+    # ``IsADirectoryError`` / ``OSError`` rather than ``FileNotFoundError``,
+    # which would bubble up as a 500. A repo can legitimately contain an
+    # ``AGENTS.md/`` directory, so reject any non-regular existing target
+    # at the resolver to keep the endpoints' 4xx contract intact.
+    if target.exists() and not target.is_file():
+        return None
     return target
 
 

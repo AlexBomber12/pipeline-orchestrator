@@ -327,6 +327,45 @@ def test_apply_rejects_when_repo_directory_is_not_a_git_checkout(
     assert not (repo_dir / "AGENTS.md").exists()
 
 
+def test_preview_rejects_agents_md_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repo can contain an ``AGENTS.md/`` directory. ``read_text`` on a
+    directory raises ``IsADirectoryError`` (not ``FileNotFoundError``),
+    which would bubble up as a 500. The resolver must reject the target
+    so preview returns a controlled 4xx instead."""
+    repo_dir = _stub_repo(tmp_path, monkeypatch)
+    (repo_dir / "AGENTS.md").mkdir()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/onboarding/preview", data={"repo_name": "example__alpha"}
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"error": "Unknown or invalid repo_name"}
+    assert (repo_dir / "AGENTS.md").is_dir()
+
+
+def test_apply_rejects_agents_md_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Apply must also refuse when AGENTS.md is a directory; otherwise
+    ``write_text`` would raise ``IsADirectoryError`` and surface as a
+    500 rather than a structured operator-facing error."""
+    repo_dir = _stub_repo(tmp_path, monkeypatch)
+    (repo_dir / "AGENTS.md").mkdir()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/onboarding/apply", data={"repo_name": "example__alpha"}
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"error": "Unknown or invalid repo_name"}
+    assert (repo_dir / "AGENTS.md").is_dir()
+
+
 _MALFORMED_AGENTS_MD = (
     "# AGENTS\n\n"
     "<!-- pipeline-orchestrator: managed BEGIN work_modes -->\n"
