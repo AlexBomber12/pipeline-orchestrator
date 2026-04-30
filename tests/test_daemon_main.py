@@ -3164,3 +3164,89 @@ def test_main_drains_cycle_finished_during_scheduling_step(
     # scheduled the next cycle in the same pass, so we observe at
     # least 2 cycles.
     assert beta.cycles >= 2
+
+
+def test_main_skips_scheduling_when_drain_deactivates_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: when ``_drain_finished_cycle`` applies a staged config
+    that flips ``active`` from ``True`` to ``False`` during the scheduling
+    step, the loop must re-check activity before enqueuing a new cycle.
+    Without the re-check, a repo deactivated during an in-flight cycle
+    gets one extra unintended ``run_cycle()`` call right after the drain
+    just because the poll interval has elapsed."""
+
+    proceed = asyncio.Event()
+    inactive_publish_calls = {"n": 0}
+
+    class _Runner(_FakeRunner):
+        def __init__(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            redis_client: Any,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+        ) -> None:
+            super().__init__(
+                repo_config,
+                app_config,
+                redis_client,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+            # Pre-stage a config flip that the post-cycle drain will apply.
+            # ``_pending_requires_idle_boundary = False`` mirrors the
+            # ``_sync_runners`` path for non-coder changes (e.g. a user
+            # toggling ``active=False`` while a cycle is in flight) so the
+            # drain's apply-after-cycle gate clears regardless of state.
+            self._pending_requires_idle_boundary = False
+            self._has_staged_deactivation = repo_config.url.endswith(
+                "beta.git"
+            )
+
+        async def run_cycle(self) -> None:
+            self.cycles += 1
+            if self.repo_config.url.endswith("beta.git"):
+                await proceed.wait()
+
+        async def publish_state(self) -> None:
+            if not self.repo_config.active and self.repo_config.url.endswith(
+                "alpha.git"
+            ):
+                inactive_publish_calls["n"] += 1
+                if inactive_publish_calls["n"] >= 2:
+                    # Unblock beta's blocked cycle and yield twice so it
+                    # has a chance to finish before control returns to
+                    # the scheduling loop's beta step.
+                    proceed.set()
+                    await _REAL_ASYNCIO_SLEEP(0)
+                    await _REAL_ASYNCIO_SLEEP(0)
+
+        def _apply_staged_config_reload(self) -> None:
+            if not self._has_staged_deactivation:
+                return
+            self.repo_config = self.repo_config.model_copy(
+                update={"active": False}
+            )
+            self._has_staged_deactivation = False
+
+    config = AppConfig(
+        repositories=[
+            _repo("https://github.com/octo/alpha.git", active=False),
+            _repo("https://github.com/octo/beta.git", active=True),
+        ],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    _patch_main(monkeypatch, config, runner_cls=_Runner, sleep_iterations=3)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    beta = next(r for r in _FakeRunner.instances if r.name == "octo__beta")
+    # Beta's only cycle is the one scheduled in iter 1; iter 2's mid-loop
+    # drain flips it inactive and the post-drain re-check skips
+    # scheduling. Without the re-check, beta would get an unwanted
+    # second cycle on the same pass.
+    assert beta.cycles == 1
+    assert beta.repo_config.active is False

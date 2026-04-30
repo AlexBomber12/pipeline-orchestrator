@@ -780,6 +780,14 @@ async def main() -> None:
                 # one, so any config staged during the cycle is applied
                 # and the new cycle starts from the latest snapshot.
                 _drain_finished_cycle(key, in_flight, runners)
+                # The drain may have applied a staged config that flipped
+                # ``active`` to False (e.g. the user deactivated the repo
+                # while the cycle was in flight). Re-check before scheduling
+                # so a deactivated runner does not get one more cycle just
+                # because the poll interval happened to elapse.
+                if not runner.repo_config.active:
+                    last_run.pop(key, None)
+                    continue
             now = time.monotonic()
             interval = _runner_poll_interval(runner)
             if key in last_run and now - last_run[key] < interval:
