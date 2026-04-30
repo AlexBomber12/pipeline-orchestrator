@@ -67,6 +67,9 @@ _DAEMON_FIELDS = {
     "github_api_slowdown_multiplier",
     "idle_extended_poll_interval_sec",
     "idle_extended_after_cycles",
+    "watch_slow_window_sec",
+    "watch_slow_poll_interval_sec",
+    "watch_fast_poll_interval_sec",
 }
 
 _DAEMON_ENV_OVERRIDES = {
@@ -142,6 +145,9 @@ class DaemonConfig(BaseModel):
     github_api_slowdown_multiplier: int = Field(default=5, ge=1, le=60)
     idle_extended_poll_interval_sec: int = Field(default=300, ge=1)
     idle_extended_after_cycles: int = Field(default=3, ge=1)
+    watch_slow_window_sec: int = Field(default=300, ge=1)
+    watch_slow_poll_interval_sec: int = Field(default=300, ge=1)
+    watch_fast_poll_interval_sec: int = Field(default=45, ge=1)
 
 
 class WebConfig(BaseModel):

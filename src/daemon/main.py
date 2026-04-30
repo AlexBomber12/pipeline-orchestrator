@@ -80,16 +80,23 @@ def _runner_poll_interval(runner: Any) -> int:
 
     IDLE runners use the adaptive ``effective_idle_poll_interval`` so a
     repo that has been quiet long enough drops to the slower cadence
-    configured by ``daemon.idle_extended_poll_interval_sec``. Every
-    other state keeps the static ``poll_interval_sec`` so active work
-    is not artificially throttled. Falls back to the static base if the
-    runner is missing the property (e.g. test stubs predating PR-184).
+    configured by ``daemon.idle_extended_poll_interval_sec``. WATCH
+    runners use ``effective_watch_poll_interval`` so the slow-start
+    window after entering WATCH avoids burning GitHub quota on the
+    typical Codex/CI response gap (PR-202). Every other state keeps
+    the static ``poll_interval_sec`` so active work is not artificially
+    throttled. Falls back to the static base if the runner is missing
+    the property (e.g. test stubs predating PR-184/PR-202).
     """
     state = getattr(getattr(runner, "state", None), "state", None)
     if state == PipelineState.IDLE and hasattr(
         runner, "effective_idle_poll_interval"
     ):
         return runner.effective_idle_poll_interval
+    if state == PipelineState.WATCH and hasattr(
+        runner, "effective_watch_poll_interval"
+    ):
+        return runner.effective_watch_poll_interval
     return runner.repo_config.poll_interval_sec
 
 

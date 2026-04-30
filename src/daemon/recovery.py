@@ -256,6 +256,13 @@ class RecoveryMixin:
                 self.state.current_pr = matching
                 await self._restore_current_run_record()
                 self.state.state = PipelineState.WATCH
+                # PR-202: anchor the slow-start window at recovery
+                # time so the daemon's next poll interval already uses
+                # the slow cadence (the cycle-end transition detector
+                # in ``_run_cycle_body`` does not see this transition
+                # because recovery returns before ``pre_state`` is
+                # captured).
+                self._watch_entered_at = datetime.now(timezone.utc)
                 self._rehydrate_last_push_at(matching)
                 self.log_event(
                     f"Recovered: DOING task {doing.pr_id} "
@@ -347,6 +354,8 @@ class RecoveryMixin:
             self.state.current_task = matched_task
             await self._restore_current_run_record()
             self.state.state = PipelineState.WATCH
+            # PR-202: see DOING-recovery branch above for rationale.
+            self._watch_entered_at = datetime.now(timezone.utc)
             self._rehydrate_last_push_at(matched_pr)
             self.log_event(
                 f"Recovered: {matched_task.status.value} task "

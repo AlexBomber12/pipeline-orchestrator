@@ -290,6 +290,20 @@ class PipelineRunner(
         # outstanding upload retry is not folded into the slower
         # extended-idle cadence.
         self._idle_dispatch_deferred = False
+        # PR-202: WATCH adaptive polling. ``_watch_entered_at`` is set
+        # at the moment the state transitions into WATCH, either by
+        # ``_run_cycle_body`` (handler-driven transitions) or by
+        # ``recover_state`` (startup recovery). Anchoring at transition
+        # time — not on the first WATCH cycle — ensures the daemon's
+        # *next* poll interval already reflects the slow cadence. Each
+        # WATCH cycle records the polled PR signature; when that
+        # signature changes between cycles a real GitHub event arrived
+        # and ``_watch_last_event_at`` advances. All three are cleared
+        # by ``_reset_watch_polling`` on transition out of WATCH so a
+        # stale anchor cannot leak into the next WATCH session.
+        self._watch_entered_at: datetime | None = None
+        self._watch_last_event_at: datetime | None = None
+        self._watch_last_event_signature: tuple[Any, ...] | None = None
         self._github_api_pause_policy: BoundedRecoveryPolicy[
             "PipelineRunner"
         ] = BoundedRecoveryPolicy(
@@ -1123,8 +1137,16 @@ class PipelineRunner(
             # cadence, ``effective_idle_poll_interval`` has folded the
             # slowdown into the sleep duration. Skipping cycles here
             # would compound the two slowdowns; instead, let every
-            # cycle proceed and rely on the longer interval.
-            if self._is_extended_idle_active():
+            # cycle proceed and rely on the longer interval. The same
+            # applies to WATCH: ``effective_watch_poll_interval`` takes
+            # ``max(target, base * multiplier)``, so an additional
+            # one-in-N skip would space WATCH polls at
+            # ``effective_watch_poll_interval * multiplier`` and could
+            # delay merge/fix transitions by an hour or more.
+            if (
+                self._is_extended_idle_active()
+                or self.state.state == PipelineState.WATCH
+            ):
                 return True
             proceed = self._github_api_slowdown_cycle % multiplier == 0
             self._github_api_slowdown_cycle += 1
@@ -1299,4 +1321,20 @@ class PipelineRunner(
             self._error_skip_active = False
 
         self._update_idle_streak_after_cycle(pre_state)
+        if (
+            pre_state == PipelineState.WATCH
+            and self.state.state != PipelineState.WATCH
+        ):
+            self._reset_watch_polling()
+        elif (
+            pre_state != PipelineState.WATCH
+            and self.state.state == PipelineState.WATCH
+        ):
+            # PR-202: anchor the slow-start window at the moment of the
+            # state transition. The daemon main loop computes the next
+            # poll interval *before* the next ``run_cycle`` runs, so
+            # deferring this to ``handle_watch`` would leave the first
+            # interval after WATCH entry on the fast base cadence and
+            # waste the quota the slow-start is meant to save.
+            self._watch_entered_at = datetime.now(timezone.utc)
         await self.publish_state()

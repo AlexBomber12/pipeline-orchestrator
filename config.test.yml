@@ -27,6 +27,13 @@ daemon:
   github_api_pause_threshold_percent: 5
   github_api_slowdown_threshold_percent: 20
   github_api_slowdown_multiplier: 5
+  # PR-202 adaptive WATCH polling defaults (300s slow window, 300s slow
+  # cadence) would block e2e tests whose ``wait_for_state(['IDLE'])``
+  # budget is 180s. Match the test-wide ``poll_interval_sec`` of 2s so
+  # WATCH polls remain fast enough for the merge-detection assertions.
+  watch_slow_window_sec: 2
+  watch_slow_poll_interval_sec: 2
+  watch_fast_poll_interval_sec: 2
 
 web:
   host: 0.0.0.0

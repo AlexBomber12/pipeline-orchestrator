@@ -33,6 +33,57 @@ CODEX_BOT_ERROR_PATTERNS = (
 class WatchMixin:
     """Poll PR status and decide whether to merge, fix, hang, or wait."""
 
+    @property
+    def effective_watch_poll_interval(self) -> int:
+        """Return the WATCH poll interval after slow-start adaptive logic.
+
+        Anchors at ``max(_watch_entered_at, _watch_last_event_at)``.
+        ``_watch_entered_at`` is set the moment the runner transitions
+        into WATCH (in ``_run_cycle_body`` for handler-driven
+        transitions, in ``recover_state`` for startup recovery), so
+        the first poll interval after entry already reflects the slow
+        cadence. Within ``watch_slow_window_sec`` of the anchor,
+        returns ``watch_slow_poll_interval_sec`` — Codex Review and CI
+        rarely respond in the first few minutes, so polling fast there
+        wastes GitHub API quota on a scheduled wait. Past the window,
+        returns ``watch_fast_poll_interval_sec`` since the result may
+        arrive any second.
+
+        Falls back to the static ``repo_config.poll_interval_sec`` only
+        in defensive corner cases where no anchor is set (e.g. legacy
+        test stubs) — production WATCH cycles always have an anchor.
+
+        Stacks with the rate-limit slowdown by taking the larger of
+        the watch interval and ``base * github_api_slowdown_multiplier``;
+        the rate-limit ceiling always wins. ``_check_github_api_budget``
+        suppresses its one-in-N cycle skip while WATCH is active so the
+        slowdown is not double-applied.
+        """
+        anchors = [
+            t
+            for t in (self._watch_entered_at, self._watch_last_event_at)
+            if t is not None
+        ]
+        if not anchors:
+            return self.repo_config.poll_interval_sec
+        anchor = max(anchors)
+        daemon = self.app_config.daemon
+        elapsed = (datetime.now(timezone.utc) - anchor).total_seconds()
+        if elapsed < daemon.watch_slow_window_sec:
+            target = daemon.watch_slow_poll_interval_sec
+        else:
+            target = daemon.watch_fast_poll_interval_sec
+        if self._github_api_slowdown_attempts > 0:
+            multiplier = max(1, daemon.github_api_slowdown_multiplier)
+            target = max(target, self.repo_config.poll_interval_sec * multiplier)
+        return target
+
+    def _reset_watch_polling(self) -> None:
+        """Clear WATCH adaptive polling anchors when leaving WATCH."""
+        self._watch_entered_at = None
+        self._watch_last_event_at = None
+        self._watch_last_event_signature = None
+
     async def handle_watch(self) -> None:
         """Poll PR status and decide whether to merge, fix, hang, or wait."""
         if self.state.current_pr is None:
@@ -54,6 +105,8 @@ class WatchMixin:
         current_pr = self.state.current_pr
         current_number = current_pr.number
         found = next((p for p in prs if p.number == current_number), None)
+        if found is not None:
+            self._observe_watch_event_signature(found)
         if found is None:
             merged = github_client.is_pr_merged(self.owner_repo, current_number)
             if merged is True:
@@ -172,6 +225,31 @@ class WatchMixin:
                 f"(review={review.value}, ci={ci.value}, "
                 f"{elapsed_min:.0f}/{timeout_min}m)"
             )
+
+    def _observe_watch_event_signature(self, found: object) -> None:
+        """Update ``_watch_last_event_at`` when polled PR signature changes.
+
+        The signature combines the fields ``handle_watch`` already keys
+        state transitions off of: PR number, CI conclusion, review
+        status, and ``last_activity``. A change in any of them between
+        cycles means a real GitHub event arrived (push, review, comment,
+        CI conclusion change), so the slow-start window restarts from
+        ``now`` and the next interval check uses the fast-tail cadence.
+
+        First-cycle observation only records the baseline signature; an
+        event is reported only on the second-and-later cycle when the
+        signature differs from the prior one.
+        """
+        signature = (
+            getattr(found, "number", None),
+            getattr(found, "ci_status", None),
+            getattr(found, "review_status", None),
+            getattr(found, "last_activity", None),
+        )
+        prior = self._watch_last_event_signature
+        self._watch_last_event_signature = signature
+        if prior is not None and prior != signature:
+            self._watch_last_event_at = datetime.now(timezone.utc)
 
     def _has_new_codex_feedback_since_last_push(self) -> FeedbackCheckResult:
         """Check whether Codex posted any comment after ``self._last_push_at``.
