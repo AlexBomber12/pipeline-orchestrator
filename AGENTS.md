@@ -228,6 +228,7 @@ Artifacts are generated for Codex review but excluded from commits by .gitignore
 - Implement only the scope defined in `TASK_FILE`. No extra refactors, upgrades, or bundled features.
 - During the PR, do not edit `tasks/PR-*.md` unless the user explicitly requests it.
 - CI and artifacts are mandatory.
+- **PR state:** PRs must be created in ready state, not draft. Use `gh pr create` without `--draft` flag. If accidentally created as draft (e.g. by mistake), run `gh pr ready <PR_NUMBER>` immediately to convert.
 
 ### Checklist
 - [ ] Preflight clean
@@ -269,6 +270,7 @@ If any condition fails, MICRO is not allowed. Use PLANNED PR.
 ### Rules
 - Do not create `tasks/PR-*.md`
 - Do not edit `tasks/QUEUE.md` (auto-generated; manual edits are overwritten on next IDLE cycle)
+- **PR state:** PRs must be created in ready state, not draft. Use `gh pr create` without `--draft` flag. If accidentally created as draft (e.g. by mistake), run `gh pr ready <PR_NUMBER>` immediately to convert.
 
 ### Checklist
 - [ ] Preflight clean
@@ -293,6 +295,7 @@ If any condition fails, MICRO is not allowed. Use PLANNED PR.
 - Run `scripts/ci.sh` to exit 0
 - Generate review artifacts (not committed, excluded by .gitignore)
 - Commit and push to the same PR branch
+- **PR state:** PRs must be created in ready state, not draft. Use `gh pr create` without `--draft` flag. If accidentally created as draft (e.g. by mistake), run `gh pr ready <PR_NUMBER>` immediately to convert.
 <!-- pipeline-orchestrator: managed END review_fix_runbook -->
 
 <!-- pipeline-orchestrator: managed BEGIN queue_stability_rules -->
