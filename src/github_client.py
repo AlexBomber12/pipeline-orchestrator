@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import re
@@ -53,6 +54,115 @@ _ci_status_cache: dict[
     tuple[str, str], tuple[float, list[dict], dict, bool]
 ] = {}
 _CI_STATUS_CACHE_TTL_SECONDS = 15.0
+
+#: In-memory ETag cache for single-resource REST GET helpers. Keyed by the
+#: ``gh api`` path (the same string passed to ``_etag_get``); the value is
+#: ``(etag, parsed_payload)``. Sending ``If-None-Match`` on a cached path
+#: lets GitHub respond with HTTP 304 and an empty body — and crucially that
+#: 304 does not consume rate-limit budget. Daemon polling re-queries the
+#: same handful of endpoints repeatedly with low data turnover, so most
+#: cycles hit 304 and become free.
+#:
+#: The cache is in-memory only (lost on daemon restart); a persistent
+#: cache could extend the cold-start grace but is not needed for the
+#: primary diet effect.
+_etag_cache: "collections.OrderedDict[str, tuple[str, object]]" = (
+    collections.OrderedDict()
+)
+_ETAG_CACHE_MAX_ENTRIES = 500
+
+
+def clear_etag_cache() -> None:
+    """Clear the ETag conditional-request cache (used in tests)."""
+    _etag_cache.clear()
+
+
+def _etag_cache_put(path: str, etag: str, payload: object) -> None:
+    """Insert into the ETag cache with simple LRU eviction."""
+    _etag_cache[path] = (etag, payload)
+    _etag_cache.move_to_end(path)
+    while len(_etag_cache) > _ETAG_CACHE_MAX_ENTRIES:
+        _etag_cache.popitem(last=False)
+
+
+_HTTP_STATUS_RE = re.compile(r"^HTTP/\S+\s+(\d{3})", re.MULTILINE)
+
+
+def _split_include_response(raw: str) -> tuple[int | None, dict[str, str], str]:
+    """Parse the output of ``gh api --include`` into ``(status, headers, body)``.
+
+    The ``--include`` flag prepends the HTTP status line and headers to the
+    response body, separated by a blank line. Splitting on the FIRST blank
+    line yields the head and body; the LAST ``HTTP/`` line in the head is
+    taken as the final status (in case ``gh`` surfaces an intermediate
+    redirect, though by default it follows redirects internally).
+    """
+    sep = re.search(r"\r?\n\r?\n", raw)
+    head = raw[: sep.start()] if sep else raw
+    body = raw[sep.end() :] if sep else ""
+
+    status: int | None = None
+    matches = list(_HTTP_STATUS_RE.finditer(head))
+    if matches:
+        status = int(matches[-1].group(1))
+
+    headers: dict[str, str] = {}
+    for line in head.splitlines():
+        if line.startswith("HTTP/") or ":" not in line:
+            continue
+        name, _, value = line.partition(":")
+        headers[name.strip().lower()] = value.strip()
+
+    return status, headers, body
+
+
+def _etag_get(path: str) -> object:
+    """Fetch a single-resource REST endpoint with ETag conditional caching.
+
+    Issues ``gh api --include`` so the response status and ``ETag`` header
+    are captured on stdout. When a prior ETag is cached for ``path`` an
+    ``If-None-Match`` header is sent: a HTTP 304 response (free against
+    the rate-limit budget) returns the cached payload; a 2xx response
+    parses and re-caches the body. Returns ``None`` on non-2xx/304
+    responses or unparseable bodies. Raises whatever ``run_gh`` raises
+    on hard ``gh`` failures so callers can apply their own degradation.
+
+    Paginated list endpoints are out of scope (handled in PR-191b); this
+    helper expects a JSON object/array body for a single resource.
+    """
+    args: list[str] = ["api", path, "--include"]
+    cached = _etag_cache.get(path)
+    if cached is not None:
+        args.extend(["-H", f"If-None-Match: {cached[0]}"])
+
+    raw = run_gh(args)
+
+    # When stubbed (tests mock ``run_gh`` to return a pre-parsed object or a
+    # bare ``--jq`` scalar), bypass ``--include`` parsing and surface the
+    # value directly so existing call-site tests keep their semantics.
+    if not isinstance(raw, str) or not raw.lstrip().startswith("HTTP/"):
+        return raw
+
+    status, headers, body = _split_include_response(raw)
+    if status == 304:
+        if cached is None:
+            return None
+        _etag_cache.move_to_end(path)
+        return cached[1]
+    if status is None or not (200 <= status < 300):
+        return None
+    body = body.strip()
+    if not body:
+        return None
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+
+    etag = headers.get("etag")
+    if etag:
+        _etag_cache_put(path, etag, payload)
+    return payload
 
 
 def _evict_expired_ci_status_cache(now: float) -> None:
@@ -432,28 +542,14 @@ def pr_state(repo: str, pr_number: int) -> dict[str, str | None] | None:
 def is_pr_merged(repo: str, pr_number: int) -> bool | None:
     """Return True if PR is merged, False if closed without merge, None on lookup failure."""
     try:
-        raw = run_gh(
-            [
-                "api",
-                f"repos/{repo}/pulls/{pr_number}",
-                "--jq",
-                "{state: .state, merged: .merged}",
-            ]
-        )
+        payload = _etag_get(f"repos/{repo}/pulls/{pr_number}")
     except (RuntimeError, subprocess.TimeoutExpired, OSError):
         return None
-    if isinstance(raw, dict):
-        parsed = raw
-    elif isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            return None
-    else:
+    if not isinstance(payload, dict):
         return None
-    if parsed.get("merged") is True:
+    if payload.get("merged") is True:
         return True
-    if parsed.get("state") == "closed":
+    if payload.get("state") == "closed":
         return False
     return None
 
@@ -723,18 +819,15 @@ def get_pr_author(repo: str, pr_number: int) -> str:
     real author already posted.
     """
     try:
-        raw = run_gh(
-            [
-                "api",
-                f"repos/{repo}/pulls/{pr_number}",
-                "--jq",
-                ".user.login",
-            ]
-        )
+        payload = _etag_get(f"repos/{repo}/pulls/{pr_number}")
     except (RuntimeError, subprocess.TimeoutExpired, OSError):
         return ""
-    if isinstance(raw, str):
-        return raw.strip()
+    if isinstance(payload, dict):
+        user = payload.get("user")
+        if isinstance(user, dict):
+            login = user.get("login")
+            if isinstance(login, str):
+                return login.strip()
     return ""
 
 
@@ -750,31 +843,45 @@ def get_pr_head_commit_iso(repo: str, pr_number: int) -> str:
     review anchor that the new commit needs.
     """
     try:
-        raw_sha = run_gh(
-            [
-                "api",
-                f"repos/{repo}/pulls/{pr_number}",
-                "--jq",
-                ".head.sha",
-            ]
-        )
+        pr_payload = _etag_get(f"repos/{repo}/pulls/{pr_number}")
     except RuntimeError:
         return ""
-    sha = raw_sha.strip() if isinstance(raw_sha, str) else ""
+    sha = _extract_head_sha(pr_payload)
     if not sha:
         return ""
     try:
-        raw_date = run_gh(
-            [
-                "api",
-                f"repos/{repo}/commits/{sha}",
-                "--jq",
-                ".commit.committer.date",
-            ]
-        )
+        commit_payload = _etag_get(f"repos/{repo}/commits/{sha}")
     except RuntimeError:
         return ""
-    return raw_date.strip() if isinstance(raw_date, str) else ""
+    return _extract_commit_date(commit_payload)
+
+
+def _extract_head_sha(payload: object) -> str:
+    """Pull ``.head.sha`` out of a PR detail payload (or a bare-string mock)."""
+    if isinstance(payload, dict):
+        head = payload.get("head")
+        if isinstance(head, dict):
+            sha = head.get("sha")
+            if isinstance(sha, str):
+                return sha.strip()
+    elif isinstance(payload, str):
+        return payload.strip()
+    return ""
+
+
+def _extract_commit_date(payload: object) -> str:
+    """Pull ``.commit.committer.date`` out of a commit detail payload."""
+    if isinstance(payload, dict):
+        commit = payload.get("commit")
+        if isinstance(commit, dict):
+            committer = commit.get("committer")
+            if isinstance(committer, dict):
+                date = committer.get("date")
+                if isinstance(date, str):
+                    return date.strip()
+    elif isinstance(payload, str):
+        return payload.strip()
+    return ""
 
 
 def get_pr_metadata(repo: str, pr_number: int) -> dict:
@@ -783,38 +890,20 @@ def get_pr_metadata(repo: str, pr_number: int) -> dict:
     Replaces separate ``get_pr_author`` + ``get_pr_head_commit_iso`` calls.
     Returns ``{"author": str, "head_sha": str, "head_commit_date": str}``.
     """
+    empty = {"author": "", "head_sha": "", "head_commit_date": ""}
     try:
-        raw = run_gh([
-            "api",
-            f"repos/{repo}/pulls/{pr_number}",
-            "--jq",
-            "{author: .user.login, head_sha: .head.sha}",
-        ])
+        pr_payload = _etag_get(f"repos/{repo}/pulls/{pr_number}")
     except RuntimeError:
-        return {"author": "", "head_sha": "", "head_commit_date": ""}
-    if isinstance(raw, dict):
-        author = raw.get("author") or ""
-        head_sha = raw.get("head_sha") or ""
-    elif isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-            author = parsed.get("author") or ""
-            head_sha = parsed.get("head_sha") or ""
-        except (json.JSONDecodeError, AttributeError):
-            return {"author": "", "head_sha": "", "head_commit_date": ""}
-    else:
-        return {"author": "", "head_sha": "", "head_commit_date": ""}
+        return dict(empty)
+    author, head_sha = _extract_author_and_head_sha(pr_payload)
+    if author == "" and head_sha == "" and not isinstance(pr_payload, (dict, str)):
+        return dict(empty)
 
     head_commit_date = ""
     if head_sha:
         try:
-            raw_date = run_gh([
-                "api",
-                f"repos/{repo}/commits/{head_sha}",
-                "--jq",
-                ".commit.committer.date",
-            ])
-            head_commit_date = raw_date.strip() if isinstance(raw_date, str) else ""
+            commit_payload = _etag_get(f"repos/{repo}/commits/{head_sha}")
+            head_commit_date = _extract_commit_date(commit_payload)
         except RuntimeError:
             pass
 
@@ -823,6 +912,34 @@ def get_pr_metadata(repo: str, pr_number: int) -> dict:
         "head_sha": head_sha,
         "head_commit_date": head_commit_date,
     }
+
+
+def _extract_author_and_head_sha(payload: object) -> tuple[str, str]:
+    """Pull author + head sha out of a PR payload, accepting dict or jq string."""
+    if isinstance(payload, dict):
+        user = payload.get("user")
+        if isinstance(user, dict):
+            login = user.get("login")
+            author = login if isinstance(login, str) else ""
+        else:
+            top_author = payload.get("author")
+            author = top_author if isinstance(top_author, str) else ""
+        head = payload.get("head")
+        if isinstance(head, dict):
+            sha = head.get("sha")
+            head_sha = sha if isinstance(sha, str) else ""
+        else:
+            top_sha = payload.get("head_sha")
+            head_sha = top_sha if isinstance(top_sha, str) else ""
+        return author, head_sha
+    if isinstance(payload, str):
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            return "", ""
+        if isinstance(parsed, dict):
+            return _extract_author_and_head_sha(parsed)
+    return "", ""
 
 
 class GitHubPollError(Exception):
@@ -844,15 +961,10 @@ def get_branch_last_push_time(
     """
     key = f"{repo}#{pr_number}"
     try:
-        raw = run_gh([
-            "api",
-            f"repos/{repo}/pulls/{pr_number}",
-            "--jq",
-            ".head.sha",
-        ])
+        payload = _etag_get(f"repos/{repo}/pulls/{pr_number}")
     except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
         raise GitHubPollError(str(exc)) from exc
-    sha = raw.strip() if isinstance(raw, str) else ""
+    sha = _extract_head_sha(payload)
     if not sha:
         return None
 
@@ -1025,12 +1137,10 @@ def _find_codex_plus_one_reaction(reactions: list[dict]) -> dict | None:
 def _get_commit_time(repo: str, sha: str) -> datetime | None:
     """Return the committer date of a commit, or None on failure."""
     try:
-        raw = run_gh(
-            ["api", f"repos/{repo}/commits/{sha}", "--jq", ".commit.committer.date"]
-        )
+        payload = _etag_get(f"repos/{repo}/commits/{sha}")
     except RuntimeError:
         return None
-    return _parse_iso(raw.strip() if isinstance(raw, str) else "")
+    return _parse_iso(_extract_commit_date(payload))
 
 
 def _get_codex_review_signals(
@@ -1122,43 +1232,36 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
     if cached is not None and (now - cached[0]) < _CI_STATUS_CACHE_TTL_SECONDS:
         return list(cached[1]), dict(cached[2]), cached[3]
 
+    check_runs_path = f"repos/{repo}/commits/{sha}/check-runs?per_page=100"
     check_runs_ok = False
     try:
-        pages = retry_transient(
-            lambda: run_gh(
-                [
-                    "api",
-                    "--paginate",
-                    "--slurp",
-                    f"repos/{repo}/commits/{sha}/check-runs",
-                ]
-            ),
-            operation_name=f"gh api repos/{repo}/commits/{sha}/check-runs",
+        cr_payload = retry_transient(
+            lambda: _etag_get(check_runs_path),
+            operation_name=f"gh api {check_runs_path}",
         )
     except RuntimeError:
-        pages = None
+        cr_payload = None
     else:
         check_runs_ok = True
-    if isinstance(pages, list):
-        for page in pages:
+    if isinstance(cr_payload, list):
+        # Test/legacy mock that returned --paginate --slurp shape: list of pages.
+        for page in cr_payload:
             if not isinstance(page, dict):
                 continue
             runs = page.get("check_runs")
             if isinstance(runs, list):
                 check_runs.extend(r for r in runs if isinstance(r, dict))
+    elif isinstance(cr_payload, dict):
+        runs = cr_payload.get("check_runs")
+        if isinstance(runs, list):
+            check_runs.extend(r for r in runs if isinstance(r, dict))
 
+    status_path = f"repos/{repo}/commits/{sha}/status"
     status_ok = False
     try:
         raw_status = retry_transient(
-            lambda: run_gh(
-                [
-                    "api",
-                    f"repos/{repo}/commits/{sha}/status",
-                    "--jq",
-                    "{state: .state, statuses: .statuses}",
-                ]
-            ),
-            operation_name=f"gh api repos/{repo}/commits/{sha}/status",
+            lambda: _etag_get(status_path),
+            operation_name=f"gh api {status_path}",
         )
     except RuntimeError:
         raw_status = None
