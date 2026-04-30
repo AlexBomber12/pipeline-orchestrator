@@ -260,15 +260,6 @@ async def _update_repo_pause_state(
             redis_client,
         )
 
-    try:
-        await publish_wake(redis_client, name, "control")
-    except Exception:
-        logger.warning(
-            "publish_wake failed for %s; daemon will pick up control change on next tick",
-            name,
-            exc_info=True,
-        )
-
     return state
 
 
@@ -1188,6 +1179,16 @@ async def pause_repo(request: Request, name: str) -> Response:
     )
     if isinstance(result, Response):
         return result
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is not None:
+        try:
+            await publish_wake(redis_client, name, "pause")
+        except Exception:
+            logger.warning(
+                "publish_wake failed for %s; daemon will pick up pause on next tick",
+                name,
+                exc_info=True,
+            )
     return JSONResponse({"ok": True, "user_paused": True})
 
 
@@ -1202,6 +1203,16 @@ async def resume_repo(request: Request, name: str) -> Response:
     )
     if isinstance(result, Response):
         return result
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is not None:
+        try:
+            await publish_wake(redis_client, name, "resume")
+        except Exception:
+            logger.warning(
+                "publish_wake failed for %s; daemon will pick up resume on next tick",
+                name,
+                exc_info=True,
+            )
     return JSONResponse({"ok": True, "user_paused": False})
 
 
@@ -1216,6 +1227,16 @@ async def stop_repo(request: Request, name: str) -> Response:
     )
     if isinstance(result, Response):
         return result
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is not None:
+        try:
+            await publish_wake(redis_client, name, "stop")
+        except Exception:
+            logger.warning(
+                "publish_wake failed for %s; daemon will pick up stop on next tick",
+                name,
+                exc_info=True,
+            )
     return JSONResponse({"ok": True, "user_paused": True})
 
 
