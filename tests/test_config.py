@@ -1108,6 +1108,32 @@ def test_applied_overlay_paths_handles_non_dict_input() -> None:
     assert _applied_overlay_paths("not-a-dict") == []  # type: ignore[arg-type]
 
 
+def test_load_config_overlay_top_level_list_raises(tmp_path: Path) -> None:
+    base = tmp_path / "config.yml"
+    base.write_text(
+        "daemon:\n  poll_interval_sec: 45\n", encoding="utf-8"
+    )
+    overlay = tmp_path / "config.production.yml"
+    overlay.write_text(
+        "- daemon:\n    poll_interval_sec: 90\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="must be a YAML mapping"):
+        load_config(str(base))
+
+
+def test_load_config_overlay_top_level_scalar_raises(tmp_path: Path) -> None:
+    base = tmp_path / "config.yml"
+    base.write_text(
+        "daemon:\n  poll_interval_sec: 45\n", encoding="utf-8"
+    )
+    overlay = tmp_path / "config.production.yml"
+    overlay.write_text("just-a-string\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must be a YAML mapping"):
+        load_config(str(base))
+
+
 def test_deep_merge_overlay_replaces_scalar_with_dict(tmp_path: Path) -> None:
     from src.config import _deep_merge
 

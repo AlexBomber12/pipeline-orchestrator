@@ -241,13 +241,28 @@ def _load_overlay_raw(base_path: Path) -> dict[str, Any]:
     operators cannot accidentally point the daemon at an overlay in an
     unrelated directory. Returns an empty mapping when the overlay does
     not exist or is empty.
+
+    Raises ``ValueError`` if the overlay file is present but its
+    top-level YAML is not a mapping. ``yaml.safe_load`` happily returns
+    a list or scalar for a malformed file; without this guard the merge
+    would later trip an ``AttributeError`` on ``.items()`` and take down
+    daemon startup with an opaque traceback instead of a clear error.
     """
     overlay_path = base_path.parent / OVERLAY_FILENAME
     if not overlay_path.is_file():
         return {}
 
     with overlay_path.open("r", encoding="utf-8") as fh:
-        return yaml.safe_load(fh) or {}
+        loaded = yaml.safe_load(fh)
+
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        raise ValueError(
+            f"Overlay {OVERLAY_FILENAME} must be a YAML mapping at the "
+            f"top level, got {type(loaded).__name__}"
+        )
+    return loaded
 
 
 def _deep_merge(
