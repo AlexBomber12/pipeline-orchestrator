@@ -20004,6 +20004,33 @@ def test_check_budget_slowdown_runs_one_in_n_cycles() -> None:
     assert len(slowdown_logs) == 1
 
 
+def test_check_budget_no_skip_when_extended_idle_active() -> None:
+    """Extended-idle cadence already absorbs the slowdown; do not skip cycles.
+
+    With both slowdowns active, real cycles must space at
+    ``max(extended, base * multiplier)`` — not their product. The
+    extended-idle interval already handles the spacing, so the
+    budget check proceeds every cycle in this branch.
+    """
+    runner = _make_runner(poll_interval_sec=60)
+    runner.app_config.daemon.github_api_pause_threshold_percent = 5
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+    runner.app_config.daemon.github_api_slowdown_multiplier = 5
+    runner.app_config.daemon.idle_extended_after_cycles = 3
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 300
+    _set_budget(runner, _budget(remaining=500, limit=5000))  # 10%
+
+    runner._idle_streak = 5  # past idle_extended_after_cycles
+
+    decisions = [
+        asyncio.run(runner._check_github_api_budget()) for _ in range(6)
+    ]
+
+    assert decisions == [True] * 6
+    assert runner._github_api_slowdown_cycle == 0
+    assert runner._github_api_slowdown_attempts == 6
+
+
 def test_check_budget_slowdown_resets_on_recovery() -> None:
     runner = _make_runner()
     runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
@@ -20462,3 +20489,347 @@ def test_run_cycle_swallows_burn_recording_failure(
 
     # Must not raise even though the recorder itself is broken.
     asyncio.run(runner.run_cycle())
+
+
+# ---------------------------------------------------------------------------
+# PR-184: adaptive IDLE polling
+# ---------------------------------------------------------------------------
+
+
+def test_effective_idle_poll_interval_uses_base_below_threshold() -> None:
+    """First two consecutive IDLE cycles still poll at the base interval."""
+    runner = _make_runner(poll_interval_sec=60)
+    runner.app_config.daemon.idle_extended_after_cycles = 3
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 300
+
+    runner._idle_streak = 1
+    assert runner.effective_idle_poll_interval == 60
+    runner._idle_streak = 2
+    assert runner.effective_idle_poll_interval == 60
+
+
+def test_effective_idle_poll_interval_uses_extended_at_threshold() -> None:
+    """Third+ consecutive IDLE cycle drops to the extended interval."""
+    runner = _make_runner(poll_interval_sec=60)
+    runner.app_config.daemon.idle_extended_after_cycles = 3
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 300
+
+    runner._idle_streak = 3
+    assert runner.effective_idle_poll_interval == 300
+    runner._idle_streak = 50
+    assert runner.effective_idle_poll_interval == 300
+
+
+def test_effective_idle_poll_interval_takes_larger_of_two_slowdowns() -> None:
+    """Rate-limit slowdown is folded in as ``max(extended, base*multiplier)``.
+
+    Below the IDLE-streak threshold the slowdown does not affect the
+    interval — the budget-check skip logic still throttles work to one
+    in ``multiplier`` cycles. At/above the threshold the property
+    returns the larger of the extended interval and ``base*multiplier``
+    so the two slowdowns do not compound (the budget check then
+    proceeds every cycle on the extended cadence, see
+    ``test_check_budget_no_skip_when_extended_idle_active``).
+    """
+    runner = _make_runner(poll_interval_sec=60)
+    runner.app_config.daemon.idle_extended_after_cycles = 3
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 200
+    runner.app_config.daemon.github_api_slowdown_multiplier = 5
+
+    runner._idle_streak = 0
+    runner._github_api_slowdown_attempts = 2
+    assert runner.effective_idle_poll_interval == 60
+
+    # extended=200 < base*multiplier=300 → take the larger (300).
+    runner._idle_streak = 3
+    runner._github_api_slowdown_attempts = 2
+    assert runner.effective_idle_poll_interval == 300
+
+    # extended=400 > base*multiplier=300 → stay at extended.
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 400
+    assert runner.effective_idle_poll_interval == 400
+
+    # No slowdown active: extended interval applies as-is.
+    runner._github_api_slowdown_attempts = 0
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 200
+    assert runner.effective_idle_poll_interval == 200
+
+
+def test_update_idle_streak_increments_on_idle_with_no_pr() -> None:
+    """The streak grows by one each cycle that ends in IDLE with no PR."""
+    runner = _make_runner()
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_pr = None
+
+    for expected in range(1, 6):
+        runner._update_idle_streak_after_cycle(PipelineState.IDLE)
+        assert runner._idle_streak == expected
+
+
+def test_update_idle_streak_resets_when_state_leaves_idle() -> None:
+    """Transitioning out of IDLE clears the streak so polling stays fast."""
+    runner = _make_runner()
+    runner._idle_streak = 5
+    runner.state.state = PipelineState.WATCH
+
+    runner._update_idle_streak_after_cycle(PipelineState.IDLE)
+    assert runner._idle_streak == 0
+
+
+def test_update_idle_streak_resets_when_cycle_started_outside_idle() -> None:
+    """A cycle that began in an active state and ended in IDLE resets the streak."""
+    runner = _make_runner()
+    runner._idle_streak = 5
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_pr = None
+
+    for active in (
+        PipelineState.WATCH,
+        PipelineState.FIX,
+        PipelineState.MERGE,
+        PipelineState.CODING,
+    ):
+        runner._idle_streak = 5
+        runner._update_idle_streak_after_cycle(active)
+        assert runner._idle_streak == 0
+
+
+def test_update_idle_streak_resets_when_idle_attaches_open_pr() -> None:
+    """An IDLE-with-open-PR cycle is real work: reset the streak too."""
+    runner = _make_runner()
+    runner._idle_streak = 4
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_pr = PRInfo(number=42, branch="pr-042")
+
+    runner._update_idle_streak_after_cycle(PipelineState.IDLE)
+    assert runner._idle_streak == 0
+
+
+def test_update_idle_streak_caps_at_sane_ceiling() -> None:
+    """``_idle_streak`` does not grow without bound across long uptimes."""
+    runner = _make_runner()
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_pr = None
+
+    runner._idle_streak = runner_module._IDLE_STREAK_CAP
+    runner._update_idle_streak_after_cycle(PipelineState.IDLE)
+    assert runner._idle_streak == runner_module._IDLE_STREAK_CAP
+
+
+def test_update_idle_streak_cap_respects_high_configured_threshold() -> None:
+    """A configured threshold above the static cap must still be reachable."""
+    runner = _make_runner()
+    runner.app_config.daemon.idle_extended_after_cycles = 250
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_pr = None
+
+    runner._idle_streak = runner_module._IDLE_STREAK_CAP
+    runner._update_idle_streak_after_cycle(PipelineState.IDLE)
+    assert runner._idle_streak == runner_module._IDLE_STREAK_CAP + 1
+
+    runner._idle_streak = 250
+    runner._update_idle_streak_after_cycle(PipelineState.IDLE)
+    assert runner._idle_streak == 250
+
+
+def test_reset_idle_streak_clears_counter() -> None:
+    """``reset_idle_streak`` is the wake-event entry point."""
+    runner = _make_runner()
+    runner._idle_streak = 7
+    runner.reset_idle_streak()
+    assert runner._idle_streak == 0
+
+
+def test_run_cycle_grows_idle_streak_across_consecutive_idle_cycles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: three IDLE-ending cycles flip to extended polling."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner(poll_interval_sec=60)
+    runner.app_config.daemon.idle_extended_after_cycles = 3
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 300
+    runner._recovered = True
+    runner._scaffolded = True
+
+    async def fake_handle_idle() -> None:
+        runner.state.state = PipelineState.IDLE
+        runner.state.current_pr = None
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", _preflight_true_stub)
+
+    runner.state.state = PipelineState.IDLE
+    intervals: list[int] = []
+    for _ in range(4):
+        asyncio.run(runner.run_cycle())
+        intervals.append(runner.effective_idle_poll_interval)
+
+    assert intervals == [60, 60, 300, 300]
+    assert runner._idle_streak == 4
+
+
+def test_run_cycle_resets_idle_streak_on_transition_into_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A WATCH→IDLE cycle must reset the streak, not increment it."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner(poll_interval_sec=60)
+    runner.app_config.daemon.idle_extended_after_cycles = 3
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 300
+    runner._recovered = True
+    runner._scaffolded = True
+    runner._idle_streak = 2
+
+    async def fake_handle_watch() -> None:
+        runner.state.state = PipelineState.IDLE
+        runner.state.current_pr = None
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "handle_watch", fake_handle_watch)
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", _preflight_true_stub)
+
+    runner.state.state = PipelineState.WATCH
+    asyncio.run(runner.run_cycle())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner._idle_streak == 0
+
+
+def test_update_idle_streak_resets_when_pending_upload_deferred() -> None:
+    """A cycle that deferred a pending upload must not grow the streak."""
+    runner = _make_runner()
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_pr = None
+    runner._idle_streak = 2
+    runner._idle_dispatch_deferred = True
+
+    runner._update_idle_streak_after_cycle(PipelineState.IDLE)
+
+    assert runner._idle_streak == 0
+    assert runner._idle_dispatch_deferred is False
+
+
+def test_update_idle_streak_clears_deferred_flag_after_consuming() -> None:
+    """The deferred flag is one-shot: cleared regardless of streak path."""
+    runner = _make_runner()
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_pr = None
+    runner._idle_dispatch_deferred = True
+    runner._update_idle_streak_after_cycle(PipelineState.IDLE)
+    assert runner._idle_dispatch_deferred is False
+
+    runner._update_idle_streak_after_cycle(PipelineState.IDLE)
+    assert runner._idle_streak == 1
+
+
+def test_handle_idle_marks_upload_deferred_when_processing_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``handle_idle`` flags the cycle so the streak skips this IDLE tick."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+
+    async def fake_uploads() -> None:
+        return None
+
+    runner.process_pending_uploads = fake_uploads  # type: ignore[method-assign]
+
+    asyncio.run(runner.handle_idle())
+
+    assert runner._idle_dispatch_deferred is True
+
+
+def test_handle_idle_marks_dispatch_deferred_on_open_prs_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``get_open_prs`` exception leaves queue/PR status unknown: skip the streak."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: (_ for _ in ()).throw(RuntimeError("API down")),
+    )
+
+    runner = _make_runner()
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+    assert runner._idle_dispatch_deferred is True
+
+
+def test_run_cycle_open_prs_failures_keep_polling_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated GitHub read failures must not flip the runner to extended IDLE."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner(poll_interval_sec=60)
+    runner.app_config.daemon.idle_extended_after_cycles = 3
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 300
+    runner._recovered = True
+    runner._scaffolded = True
+
+    async def fake_handle_idle() -> None:
+        runner.state.state = PipelineState.IDLE
+        runner.state.current_pr = None
+        runner._idle_dispatch_deferred = True
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", _preflight_true_stub)
+
+    runner.state.state = PipelineState.IDLE
+    intervals: list[int] = []
+    for _ in range(5):
+        asyncio.run(runner.run_cycle())
+        intervals.append(runner.effective_idle_poll_interval)
+
+    assert intervals == [60, 60, 60, 60, 60]
+    assert runner._idle_streak == 0
+
+
+def test_run_cycle_pending_upload_retries_keep_polling_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pending-upload retries do not slow the runner into extended IDLE."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner(poll_interval_sec=60)
+    runner.app_config.daemon.idle_extended_after_cycles = 3
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 300
+    runner._recovered = True
+    runner._scaffolded = True
+
+    async def fake_handle_idle() -> None:
+        runner.state.state = PipelineState.IDLE
+        runner.state.current_pr = None
+        runner._idle_dispatch_deferred = True
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", _preflight_true_stub)
+
+    runner.state.state = PipelineState.IDLE
+    intervals: list[int] = []
+    for _ in range(5):
+        asyncio.run(runner.run_cycle())
+        intervals.append(runner.effective_idle_poll_interval)
+
+    assert intervals == [60, 60, 60, 60, 60]
+    assert runner._idle_streak == 0

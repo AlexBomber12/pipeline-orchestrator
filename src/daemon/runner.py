@@ -91,6 +91,7 @@ _TRANSIENT_STATES = {
 
 _HISTORY_LIMIT = 100
 _STOP_POLL_INTERVAL_SEC = 0.5
+_IDLE_STREAK_CAP = 100
 
 # A ``PR #<number>`` token is a semantic identifier (different PRs are
 # distinct events) and is preserved verbatim. The alternation tries the
@@ -274,6 +275,21 @@ class PipelineRunner(
         self._github_api_pause_attempts = 0
         self._github_api_slowdown_attempts = 0
         self._github_api_slowdown_cycle = 0
+        # PR-184: count consecutive cycles ending in IDLE with no PR in
+        # flight. Once the streak reaches ``idle_extended_after_cycles``
+        # the daemon main loop polls this runner on the slower
+        # ``idle_extended_poll_interval_sec`` cadence; the streak is
+        # cleared by either a Redis wake event or any state transition
+        # out of the no-work IDLE shape.
+        self._idle_streak = 0
+        # Set by ``handle_idle`` when the cycle ended without a clean
+        # IDLE verdict — either ``process_pending_uploads`` deferred
+        # work to the next cycle (returning ``None``) or a GitHub read
+        # (``get_open_prs``) raised, leaving queue/PR status unknown.
+        # Suppresses the streak increment so a transient outage or an
+        # outstanding upload retry is not folded into the slower
+        # extended-idle cadence.
+        self._idle_dispatch_deferred = False
         self._github_api_pause_policy: BoundedRecoveryPolicy[
             "PipelineRunner"
         ] = BoundedRecoveryPolicy(
@@ -994,6 +1010,78 @@ class PipelineRunner(
             f"slowing polling to {effective_interval}s"
         )
 
+    def _is_extended_idle_active(self) -> bool:
+        """Return whether the runner is on the slower extended-idle cadence."""
+        return (
+            self._idle_streak
+            >= self.app_config.daemon.idle_extended_after_cycles
+        )
+
+    @property
+    def effective_idle_poll_interval(self) -> int:
+        """Return the IDLE poll interval after the adaptive slow-down.
+
+        Returns the configured base unless ``_idle_streak`` has reached
+        ``idle_extended_after_cycles``, in which case the longer
+        ``idle_extended_poll_interval_sec`` cadence applies. When the
+        rate-limit slowdown is also active, returns the larger of the
+        two slowdowns (``max(extended, base * multiplier)``) rather
+        than letting ``_check_github_api_budget``'s skip-every-Nth
+        logic stack on top — which would compound the two into
+        ``extended * multiplier`` between real cycles. The skip logic
+        is suppressed in that branch so spacing equals this interval.
+        """
+        base = self.repo_config.poll_interval_sec
+        if not self._is_extended_idle_active():
+            return base
+        target = max(
+            base,
+            self.app_config.daemon.idle_extended_poll_interval_sec,
+        )
+        if self._github_api_slowdown_attempts > 0:
+            multiplier = max(
+                1, self.app_config.daemon.github_api_slowdown_multiplier
+            )
+            target = max(target, base * multiplier)
+        return target
+
+    def reset_idle_streak(self) -> None:
+        """Reset the adaptive IDLE-polling streak (e.g. on wake)."""
+        self._idle_streak = 0
+
+    def _update_idle_streak_after_cycle(
+        self, pre_state: PipelineState | None = None
+    ) -> None:
+        """Bump or clear ``_idle_streak`` based on the cycle outcome.
+
+        A cycle counts toward the streak only when the runner both
+        STARTED and ENDED the cycle in IDLE with no PR pinned
+        (``current_pr is None``) AND the cycle produced a clean idle
+        verdict (``_idle_dispatch_deferred`` is false). Any other
+        outcome — a transition into IDLE from an active state
+        (WATCH/FIX/MERGE/CODING/etc.), attaching to an open PR for
+        manual work, a pending upload retry, or a GitHub read
+        failure that left queue/PR status unknown — resets the
+        streak so the next cycle polls on the fast cadence again
+        and recovers quickly from transient outages.
+        """
+        dispatch_deferred = self._idle_dispatch_deferred
+        self._idle_dispatch_deferred = False
+        if (
+            pre_state == PipelineState.IDLE
+            and self.state.state == PipelineState.IDLE
+            and self.state.current_pr is None
+            and not dispatch_deferred
+        ):
+            cap = max(
+                _IDLE_STREAK_CAP,
+                self.app_config.daemon.idle_extended_after_cycles,
+            )
+            if self._idle_streak < cap:
+                self._idle_streak += 1
+        else:
+            self._idle_streak = 0
+
     async def _check_github_api_budget(self) -> bool:
         """Return ``True`` if the cycle may proceed; ``False`` to skip it.
 
@@ -1031,6 +1119,13 @@ class PipelineRunner(
             self._github_api_slowdown_policy.increment(self)
             if was_zero:
                 await self._github_api_slowdown_policy.maybe_escalate(self)
+            # When the runner is already polling on the extended-idle
+            # cadence, ``effective_idle_poll_interval`` has folded the
+            # slowdown into the sleep duration. Skipping cycles here
+            # would compound the two slowdowns; instead, let every
+            # cycle proceed and rely on the longer interval.
+            if self._is_extended_idle_active():
+                return True
             proceed = self._github_api_slowdown_cycle % multiplier == 0
             self._github_api_slowdown_cycle += 1
             return proceed
@@ -1157,6 +1252,7 @@ class PipelineRunner(
             await self.publish_state()
             return
 
+        pre_state = self.state.state
         if self.state.state in _TRANSIENT_STATES:
             self.log_event(
                 f"resetting stale transient state {self.state.state.value} -> IDLE"
@@ -1202,4 +1298,5 @@ class PipelineRunner(
             self._error_skip_count = 0
             self._error_skip_active = False
 
+        self._update_idle_streak_after_cycle(pre_state)
         await self.publish_state()

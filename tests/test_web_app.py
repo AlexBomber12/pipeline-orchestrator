@@ -44,6 +44,7 @@ class _FakeRedis:
     ) -> None:
         self.store = store or {}
         self.lists = lists or {}
+        self.published: list[tuple[str, str]] = []
 
     async def ping(self) -> bool:
         return True
@@ -58,6 +59,10 @@ class _FakeRedis:
         existed = key in self.store
         self.store.pop(key, None)
         return int(existed)
+
+    async def publish(self, channel: str, message: str) -> int:
+        self.published.append((channel, message))
+        return 1
 
     async def transaction(
         self,
@@ -516,6 +521,49 @@ def test_pause_resume_stop_endpoints_update_repo_state(
             fake,
         ),
     ]
+    # All three control endpoints wake the daemon via PR-183 pub/sub so an
+    # adaptive-IDLE runner reacts within the next loop tick instead of
+    # waiting up to ``idle_extended_poll_interval_sec``.
+    channels = [channel for channel, _ in fake.published]
+    assert channels == [
+        "orchestrator:wake:example__alpha",
+        "orchestrator:wake:example__alpha",
+        "orchestrator:wake:example__alpha",
+    ]
+    payloads = [json.loads(message) for _, message in fake.published]
+    assert {payload["event_type"] for payload in payloads} == {"control"}
+
+
+def test_stop_endpoint_succeeds_when_publish_wake_fails(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Wake-publish failures must not block the control-plane response."""
+
+    class _PublishBoomRedis(_FakeRedis):
+        async def publish(self, channel: str, message: str) -> int:
+            raise RuntimeError("publish boom")
+
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+    )
+    fake = _PublishBoomRedis({"pipeline:example__alpha": stored.model_dump_json()})
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
+
+    with TestClient(app) as client:
+        with caplog.at_level("WARNING", logger=web_app.logger.name):
+            response = client.post("/repos/example__alpha/stop")
+
+    assert response.status_code == 200
+    stopped = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+    assert stopped.user_paused is True
+    assert any(
+        "publish_wake failed for example__alpha" in rec.getMessage()
+        for rec in caplog.records
+    )
 
 
 def test_resume_endpoint_cancels_pending_pause_for_active_run(
