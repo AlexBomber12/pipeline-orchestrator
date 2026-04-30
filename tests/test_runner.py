@@ -21162,6 +21162,46 @@ def test_handle_watch_codex_bot_error_skips_unparseable_created_at(
     assert runner.state.last_codex_retrigger_at is None
 
 
+def test_handle_watch_codex_bot_error_skips_marker_on_post_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed @codex review post must not update
+    ``last_codex_retrigger_at``, so a later cycle can retry the same
+    error comment instead of treating it as already handled.
+    """
+    pr = _codex_bot_pr()
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [_codex_bot_error_comment()],
+    )
+
+    posted: list[int] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        posted.append(number)
+        return False, False, None
+
+    runner = _make_runner()
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert posted == [42]
+    assert runner.state.last_codex_retrigger_at is None
+
+
 def test_handle_watch_codex_bot_error_normalizes_naive_timestamps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

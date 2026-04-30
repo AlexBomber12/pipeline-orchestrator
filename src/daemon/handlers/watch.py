@@ -301,8 +301,9 @@ class WatchMixin:
             f"Codex bot error comment on PR #{pr_number}; "
             "re-triggering @codex review."
         )
-        self._post_codex_review_result(
+        success, _posted, _retry_at = self._post_codex_review_result(
             pr_number,
             bypass_same_head_dedup=True,
         )
-        self.state.last_codex_retrigger_at = datetime.now(timezone.utc)
+        if success:
+            self.state.last_codex_retrigger_at = datetime.now(timezone.utc)
