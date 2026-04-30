@@ -433,7 +433,13 @@ def _drain_finished_cycle(
             "run_cycle failed for %s", runner_name, exc_info=True
         )
     del in_flight[key]
-    if runner is not None:
+    # Only apply the staged config when the runner has reached an
+    # idle-equivalent state. ``_sync_runners`` also uses staging for
+    # coder-only changes that must wait until IDLE, and a cycle finishing
+    # in WATCH/FIX/MERGE/CODING does not satisfy that boundary —
+    # ``reload_repo_config_if_dirty`` will pick the staged config up at
+    # the next IDLE entry instead.
+    if runner is not None and not _runner_requires_idle_boundary(runner):
         _apply_pending_in_flight_config(runner)
     return True
 

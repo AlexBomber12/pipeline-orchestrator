@@ -2638,6 +2638,55 @@ def test_drain_finished_cycle_applies_pending_in_flight_config() -> None:
     asyncio.run(scenario())
 
 
+def test_drain_finished_cycle_defers_apply_when_runner_below_idle_boundary() -> None:
+    """A cycle that finishes in WATCH/FIX/MERGE/CODING/PAUSED/HUNG must
+    leave the staged config in place — ``_sync_runners`` also uses
+    staging for coder-only changes that are supposed to wait until IDLE,
+    so the post-cycle drain applying immediately would let a coder
+    swap mid-PR-lifecycle. ``reload_repo_config_if_dirty`` will pick up
+    the staged config at the next IDLE entry."""
+
+    applied = {"called": 0}
+
+    class _Runner:
+        name = "octo__alpha"
+
+        def __init__(self, state: PipelineState) -> None:
+            self.state = types.SimpleNamespace(state=state)
+
+        def _apply_staged_config_reload(self) -> None:
+            applied["called"] += 1
+
+    async def scenario() -> None:
+        async def quick() -> None:
+            return None
+
+        for state in (
+            PipelineState.CODING,
+            PipelineState.WATCH,
+            PipelineState.FIX,
+            PipelineState.MERGE,
+            PipelineState.PAUSED,
+            PipelineState.HUNG,
+        ):
+            applied["called"] = 0
+            task = asyncio.create_task(quick())
+            await task
+
+            in_flight: dict[str, asyncio.Task[None]] = {"key": task}
+            runners = {"key": _Runner(state)}
+
+            popped = main_module._drain_finished_cycle("key", in_flight, runners)
+
+            assert popped is True
+            assert in_flight == {}
+            assert applied["called"] == 0, (
+                f"staged config must not be applied while runner is in {state}"
+            )
+
+    asyncio.run(scenario())
+
+
 def test_drain_finished_cycle_skips_running_task() -> None:
     """A still-running task is not popped and its staged config is not
     yet applied — the running cycle is still using the old snapshot."""
