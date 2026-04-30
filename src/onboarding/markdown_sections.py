@@ -39,9 +39,12 @@ def validate_no_user_content_inside_markers(content: str) -> None:
 
     Detects: a BEGIN inside another open region (nested), an END that
     does not close the currently-open BEGIN (missing or mismatched
-    BEGIN), and a BEGIN that is never closed before end of file.
+    BEGIN), a BEGIN that is never closed before end of file, and a
+    duplicate section name (a second BEGIN with a name already used by
+    an earlier closed region).
     """
     open_name: str | None = None
+    seen_names: set[str] = set()
     for match in _MARKER_RE.finditer(content):
         kind, name = match.group(1), match.group(2)
         if kind == "BEGIN":
@@ -50,6 +53,11 @@ def validate_no_user_content_inside_markers(content: str) -> None:
                     f"nested marker: BEGIN {name!r} opened while "
                     f"{open_name!r} is still open"
                 )
+            if name in seen_names:
+                raise MarkerError(
+                    f"duplicate managed section name {name!r}"
+                )
+            seen_names.add(name)
             open_name = name
         else:
             if open_name != name:

@@ -125,6 +125,29 @@ def test_validate_raises_on_end_without_begin() -> None:
         validate_no_user_content_inside_markers(content)
 
 
+def test_validate_raises_on_duplicate_section_name() -> None:
+    content = (
+        "<!-- pipeline-orchestrator: managed BEGIN ci -->\nfirst\n"
+        "<!-- pipeline-orchestrator: managed END ci -->\n"
+        "user notes\n"
+        "<!-- pipeline-orchestrator: managed BEGIN ci -->\nsecond\n"
+        "<!-- pipeline-orchestrator: managed END ci -->\n"
+    )
+    with pytest.raises(MarkerError, match="duplicate managed section name"):
+        validate_no_user_content_inside_markers(content)
+
+
+def test_extract_raises_on_duplicate_section_name() -> None:
+    content = (
+        "<!-- pipeline-orchestrator: managed BEGIN ci -->\nfirst\n"
+        "<!-- pipeline-orchestrator: managed END ci -->\n"
+        "<!-- pipeline-orchestrator: managed BEGIN ci -->\nsecond\n"
+        "<!-- pipeline-orchestrator: managed END ci -->\n"
+    )
+    with pytest.raises(MarkerError, match="duplicate managed section name"):
+        extract_managed_regions(content)
+
+
 def test_apply_appends_when_content_lacks_trailing_newline() -> None:
     updated = apply_managed_regions(
         "no newline here", {"sec": "\nbody\n"}
