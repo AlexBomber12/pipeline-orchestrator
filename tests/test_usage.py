@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -543,3 +545,85 @@ class TestOpenAIProviderTokenReading:
             },
         )
         assert provider._read_token() == "codex-tok"
+
+
+class TestOAuthProviderConcurrency:
+    """Shared usage providers must be thread-safe.
+
+    Per-runner ``run_cycle`` tasks dispatch ``fetch()`` via
+    ``asyncio.to_thread``; concurrent cache misses on the same shared
+    instance must not race ``_cached`` / ``_consecutive_failures`` nor
+    fan out duplicate outbound HTTP calls.
+    """
+
+    def test_concurrent_cache_miss_yields_single_http_call(
+        self, tmp_path: Path
+    ) -> None:
+        provider = _make_provider(
+            tmp_path, creds={"accessToken": "tok"}, cache_ttl_sec=300
+        )
+        gate = threading.Event()
+        call_count = 0
+
+        def gated_get(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            # Block the first responder until all threads are queued so a
+            # missing lock would let every thread fall through the cache
+            # check and issue its own request.
+            gate.wait(timeout=2.0)
+            return _mock_response()
+
+        with patch.object(httpx, "get", side_effect=gated_get):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = [pool.submit(provider.fetch) for _ in range(8)]
+                # Give worker threads a moment to all enter fetch().
+                gate.set()
+                results = [f.result() for f in futures]
+
+        assert call_count == 1
+        assert all(r is not None for r in results)
+        # All callers see the same cached snapshot.
+        assert len({id(r) for r in results}) == 1
+
+    def test_concurrent_failures_increment_once_per_call(
+        self, tmp_path: Path
+    ) -> None:
+        provider = _make_provider(tmp_path, creds=None, cache_ttl_sec=0)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(provider.fetch) for _ in range(4)]
+            results = [f.result() for f in futures]
+
+        assert all(r is None for r in results)
+        # Lost-update on _consecutive_failures would surface as < 4.
+        assert provider.consecutive_failures == 4
+
+
+class TestOpenAIProviderConcurrency:
+    def test_concurrent_cache_miss_yields_single_http_call(
+        self, tmp_path: Path
+    ) -> None:
+        provider = _make_openai_provider(
+            tmp_path,
+            creds={"tokens": {"access_token": "tok"}},
+            cache_ttl_sec=300,
+        )
+        gate = threading.Event()
+        call_count = 0
+
+        def gated_get(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            gate.wait(timeout=2.0)
+            return _mock_openai_response()
+
+        with patch.object(httpx, "get", side_effect=gated_get):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = [pool.submit(provider.fetch) for _ in range(8)]
+                gate.set()
+                results = [f.result() for f in futures]
+
+        assert call_count == 1
+        assert all(r is not None for r in results)
+        assert len({id(r) for r in results}) == 1
