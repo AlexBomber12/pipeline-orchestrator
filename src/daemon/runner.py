@@ -46,6 +46,7 @@ from src.daemon.git_ops import _repo_looks_scaffolded, repo_owner_from_url
 from src.daemon.github_rate_limit import (
     RateLimitBudget,
     read_budget,
+    record_cycle_burn,
     release_refresh_lock,
     try_claim_refresh_lock,
     write_budget,
@@ -1039,8 +1040,56 @@ class PipelineRunner(
             self._github_api_slowdown_cycle = 0
         return True
 
+    async def _capture_budget_remaining_for_burn(self) -> int | None:
+        """Return the latest known remaining budget for cycle-burn tracking.
+
+        Reads the shared snapshot when available so multi-runner
+        deployments still observe deltas across the same lock-holder
+        probes; falls back to the runner-local cache otherwise. Returns
+        ``None`` when no observation has been seen yet — the cycle-burn
+        recorder treats that as ``0``.
+        """
+        budget = await read_budget(self.redis)
+        if budget is None:
+            budget = self._github_api_budget_cache
+        return budget.remaining if budget is not None else None
+
     async def run_cycle(self) -> None:
         """Advance the state machine by one step."""
+        before_remaining = await self._capture_budget_remaining_for_burn()
+        try:
+            await self._run_cycle_body()
+        finally:
+            await self._record_cycle_burn(before_remaining)
+
+    async def _record_cycle_burn(self, before_remaining: int | None) -> None:
+        """Persist GraphQL points consumed by this cycle for the dashboard.
+
+        Reads the budget cache after the cycle has finished, computes the
+        delta against ``before_remaining``, and forwards the result to
+        :func:`record_cycle_burn`. A negative delta (the rate-limit window
+        reset between the two observations) is normalised to ``0`` so a
+        reset never appears as a spurious "burn". Both reads use the
+        cached snapshot, so cycles where the cache was not refreshed in
+        this window record ``0`` — the metric tracks observed deltas, not
+        attributed-per-call consumption.
+        """
+        try:
+            after_remaining = await self._capture_budget_remaining_for_burn()
+            if before_remaining is None or after_remaining is None:
+                delta = 0
+            else:
+                delta = max(0, before_remaining - after_remaining)
+            await record_cycle_burn(self.redis, self.name, delta)
+        except Exception:
+            logger.warning(
+                "Failed to record GraphQL cycle burn for %s",
+                self.name,
+                exc_info=True,
+            )
+
+    async def _run_cycle_body(self) -> None:
+        """Inner state-machine step; ``run_cycle`` wraps it for burn tracking."""
         try:
             await self.ensure_repo_cloned()
         except RuntimeError as exc:

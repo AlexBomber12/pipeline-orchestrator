@@ -20333,3 +20333,132 @@ def test_refresh_github_api_budget_advances_ttl_on_shared_read(
     assert result is not None
     assert result.remaining == persisted.remaining
     assert runner._github_api_budget_last_fetched is not None
+
+
+def test_run_cycle_records_graphql_burn_when_budget_drops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A drop in remaining between before/after observations is captured.
+
+    The burn-record wrapper observes the shared snapshot before the cycle
+    body runs and again after, so a sibling-published refresh that lowers
+    the remaining count surfaces as a non-zero per-cycle delta.
+    """
+    from src.daemon.github_rate_limit import (
+        BUDGET_REDIS_KEY,
+        BURNS_REDIS_KEY_PREFIX,
+    )
+
+    runner = _make_runner()
+    runner._scaffolded = True
+    runner._recovered = True
+    runner.redis.store[BUDGET_REDIS_KEY] = _budget(remaining=4500).to_redis_payload()
+
+    async def fake_run_cycle_body() -> None:
+        # Simulate API consumption observed via a sibling refresh mid-cycle.
+        runner.redis.store[BUDGET_REDIS_KEY] = _budget(
+            remaining=4480
+        ).to_redis_payload()
+
+    monkeypatch.setattr(runner, "_run_cycle_body", fake_run_cycle_body)
+
+    asyncio.run(runner.run_cycle())
+
+    bucket = runner.redis.lists.get(f"{BURNS_REDIS_KEY_PREFIX}{runner.name}")
+    assert bucket == ["20"]
+
+
+def test_run_cycle_records_zero_burn_when_window_resets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A negative delta (rate-limit window reset) clamps to zero, never -N."""
+    from src.daemon.github_rate_limit import (
+        BUDGET_REDIS_KEY,
+        BURNS_REDIS_KEY_PREFIX,
+    )
+
+    runner = _make_runner()
+    runner._scaffolded = True
+    runner._recovered = True
+    runner.redis.store[BUDGET_REDIS_KEY] = _budget(remaining=120).to_redis_payload()
+
+    async def fake_run_cycle_body() -> None:
+        runner.redis.store[BUDGET_REDIS_KEY] = _budget(
+            remaining=5000
+        ).to_redis_payload()
+
+    monkeypatch.setattr(runner, "_run_cycle_body", fake_run_cycle_body)
+
+    asyncio.run(runner.run_cycle())
+
+    bucket = runner.redis.lists.get(f"{BURNS_REDIS_KEY_PREFIX}{runner.name}")
+    assert bucket == ["0"]
+
+
+def test_run_cycle_records_zero_burn_when_no_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No budget snapshot anywhere means we record zero rather than crashing."""
+    from src.daemon.github_rate_limit import BURNS_REDIS_KEY_PREFIX
+
+    runner = _make_runner()
+    runner._scaffolded = True
+    runner._recovered = True
+
+    async def fake_run_cycle_body() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_run_cycle_body", fake_run_cycle_body)
+
+    asyncio.run(runner.run_cycle())
+
+    bucket = runner.redis.lists.get(f"{BURNS_REDIS_KEY_PREFIX}{runner.name}")
+    assert bucket == ["0"]
+
+
+def test_run_cycle_records_burn_even_when_body_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Burn recording lives in a finally block so transient body errors do not
+    silently suppress observability for the whole next polling cycle."""
+    from src.daemon.github_rate_limit import (
+        BUDGET_REDIS_KEY,
+        BURNS_REDIS_KEY_PREFIX,
+    )
+
+    runner = _make_runner()
+    runner._scaffolded = True
+    runner._recovered = True
+    runner.redis.store[BUDGET_REDIS_KEY] = _budget(remaining=4500).to_redis_payload()
+
+    async def fake_run_cycle_body() -> None:
+        raise RuntimeError("body failed mid-cycle")
+
+    monkeypatch.setattr(runner, "_run_cycle_body", fake_run_cycle_body)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(runner.run_cycle())
+
+    bucket = runner.redis.lists.get(f"{BURNS_REDIS_KEY_PREFIX}{runner.name}")
+    assert bucket == ["0"]
+
+
+def test_run_cycle_swallows_burn_recording_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recording failures must never propagate; observability is best-effort."""
+    runner = _make_runner()
+    runner._scaffolded = True
+    runner._recovered = True
+
+    async def fake_run_cycle_body() -> None:
+        return None
+
+    async def boom_recorder(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("redis exploded")
+
+    monkeypatch.setattr(runner, "_run_cycle_body", fake_run_cycle_body)
+    monkeypatch.setattr(runner_module, "record_cycle_burn", boom_recorder)
+
+    # Must not raise even though the recorder itself is broken.
+    asyncio.run(runner.run_cycle())
