@@ -366,6 +366,14 @@ class PipelineRunner(
         IDLE-equivalent state before swapping (e.g. a mid-PR coder swap).
         ``False`` means staging is just an in-flight-cycle precaution and
         the post-cycle drain may apply the change regardless of state.
+
+        The IDLE-boundary requirement is sticky across overlapping calls:
+        if a prior call within the same staging window flagged the swap as
+        coder-sensitive, a later ``False`` reload (e.g. an unrelated
+        daemon-setting change reloaded while the cycle is still in flight)
+        must not downgrade the deferral. The flag is cleared only when the
+        staged config is consumed via ``_apply_staged_config_reload`` or
+        dropped via ``clear_staged_config_reload``.
         """
         self._pending_repo_config = repo_config
         self._pending_app_config = app_config
@@ -373,7 +381,9 @@ class PipelineRunner(
             claude_usage_provider,
             codex_usage_provider,
         )
-        self._pending_requires_idle_boundary = requires_idle_boundary
+        self._pending_requires_idle_boundary = (
+            self._pending_requires_idle_boundary or requires_idle_boundary
+        )
 
     def _build_usage_providers_for_app_config(
         self,

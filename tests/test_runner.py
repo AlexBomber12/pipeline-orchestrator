@@ -365,6 +365,41 @@ def test_stage_config_reload_tracks_idle_boundary_flag() -> None:
     assert runner._pending_requires_idle_boundary is False
 
 
+def test_stage_config_reload_preserves_idle_boundary_across_updates() -> None:
+    """A later ``requires_idle_boundary=False`` reload must not downgrade
+    a pending coder-swap deferral that was staged earlier in the same
+    in-flight window."""
+
+    runner = _make_runner()
+    next_repo_config = RepoConfig.model_validate(
+        {**runner.repo_config.model_dump(), "coder": "codex"}
+    )
+    next_app_config = AppConfig(
+        repositories=[next_repo_config],
+        daemon=runner.app_config.daemon,
+    )
+
+    runner.stage_config_reload(
+        next_repo_config,
+        next_app_config,
+        _FakeUsageProvider(snapshot="claude"),
+        _FakeUsageProvider(snapshot="codex"),
+        requires_idle_boundary=True,
+    )
+    assert runner._pending_requires_idle_boundary is True
+
+    runner.stage_config_reload(
+        next_repo_config,
+        next_app_config,
+        _FakeUsageProvider(snapshot="claude-2"),
+        _FakeUsageProvider(snapshot="codex-2"),
+    )
+    assert runner._pending_requires_idle_boundary is True
+
+    runner.clear_staged_config_reload()
+    assert runner._pending_requires_idle_boundary is False
+
+
 def test_staged_config_reload_waits_until_idle_boundary() -> None:
     runner = _make_runner()
     original_coder = runner.repo_config.coder
