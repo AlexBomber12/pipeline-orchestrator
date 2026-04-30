@@ -109,7 +109,7 @@ def _invalidate_etag_cache(prefix: str) -> None:
 _ETAG_PAGINATED_PATH_RE = re.compile(
     r"^repos/[^/]+/[^/]+/pulls(?:\?[^#]*)?$"
 )
-_ETAG_PAGINATED_DEFAULT_PER_PAGE = 100
+_ETAG_PAGINATED_DEFAULT_PER_PAGE = 30
 _ETAG_PAGINATED_MAX_PAGES = 100
 
 
