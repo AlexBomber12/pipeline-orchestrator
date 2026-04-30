@@ -420,6 +420,13 @@ async def test_run_claude_async_generates_breach_run_id_when_missing(
         captured["kwargs"] = kwargs
         return fake_proc
 
+    # When the daemon itself runs the test suite, its own breach env vars
+    # leak into os.environ and thus into the spawned subprocess; clear them
+    # so the assertions reflect what run_claude_async injects, not what was
+    # inherited.
+    monkeypatch.delenv("PIPELINE_SESSION_THRESHOLD", raising=False)
+    monkeypatch.delenv("PIPELINE_WEEKLY_THRESHOLD", raising=False)
+    monkeypatch.delenv("PIPELINE_RUN_ID", raising=False)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
     monkeypatch.setattr("src.claude_cli.uuid.uuid4", lambda: MagicMock(hex="abcdef1234567890"))
 

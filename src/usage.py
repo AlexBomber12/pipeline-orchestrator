@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -58,76 +59,109 @@ class OAuthUsageProvider:
         self._cached: UsageSnapshot | None = None
         self._consecutive_failures = 0
         self._last_failure_at: float = 0.0
+        # _lock guards cache/failure state mutation only (microsecond hold).
+        # Reads from the event-loop thread (consecutive_failures,
+        # invalidate_cache) must never block on outbound HTTP.
+        self._lock = threading.Lock()
+        # _request_lock serializes outbound HTTP across worker threads so a
+        # concurrent burst of cache misses still fans out into a single
+        # request. It is acquired only by fetch() (worker threads via
+        # asyncio.to_thread); the event-loop thread never takes it.
+        self._request_lock = threading.Lock()
 
     @property
     def consecutive_failures(self) -> int:
-        return self._consecutive_failures
+        with self._lock:
+            return self._consecutive_failures
+
+    def _cache_or_backoff(self) -> tuple[bool, UsageSnapshot | None]:
+        """Return (handled, value) under _lock for cache/backoff checks.
+
+        ``handled=True`` means fetch() should return ``value`` immediately
+        (either a fresh cached snapshot or ``None`` during a backoff window).
+        """
+        with self._lock:
+            if self._cached is not None:
+                age = time.time() - self._cached.fetched_at
+                if age < self._cache_ttl:
+                    return True, self._cached
+            # Backoff on repeated failures: wait cache_ttl * min(failures, 5)
+            # before retrying, capping at 5x the normal TTL.  Return None
+            # (not stale cached data) to preserve fail-open behavior.
+            if self._consecutive_failures > 0:
+                backoff = self._cache_ttl * min(self._consecutive_failures, 5)
+                if time.time() - self._last_failure_at < backoff:
+                    return True, None
+        return False, None
 
     def fetch(self) -> UsageSnapshot | None:
-        if self._cached is not None:
-            age = time.time() - self._cached.fetched_at
-            if age < self._cache_ttl:
-                return self._cached
-        # Backoff on repeated failures: wait cache_ttl * min(failures, 5)
-        # before retrying, capping at 5x the normal TTL.  Return None
-        # (not stale cached data) to preserve fail-open behavior.
-        if self._consecutive_failures > 0:
-            backoff = self._cache_ttl * min(self._consecutive_failures, 5)
-            if time.time() - self._last_failure_at < backoff:
+        handled, value = self._cache_or_backoff()
+        if handled:
+            return value
+        # Serialize HTTP requests so concurrent cache misses share one
+        # outbound call. The state lock is NOT held during HTTP — the
+        # event-loop thread can still read consecutive_failures or call
+        # invalidate_cache without blocking on a slow request.
+        with self._request_lock:
+            handled, value = self._cache_or_backoff()
+            if handled:
+                return value
+            token = self._read_token()
+            if token is None:
+                self._record_failure()
                 return None
-        token = self._read_token()
-        if token is None:
-            self._record_failure()
-            return None
-        try:
-            response = httpx.get(
-                self.ENDPOINT,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "anthropic-beta": self._beta_header,
-                    "User-Agent": self._user_agent,
-                    "Accept": "application/json",
-                },
-                timeout=self._timeout,
-            )
-        except (httpx.HTTPError, OSError) as exc:
-            logger.warning("usage endpoint request failed: %s", exc)
-            self._record_failure()
-            return None
-        if response.status_code != 200:
-            logger.warning(
-                "usage endpoint returned %s (check anthropic-beta header)",
-                response.status_code,
-            )
-            self._record_failure()
-            return None
-        try:
-            data = response.json()
-            snap = UsageSnapshot(
-                session_percent=int(data["five_hour"]["utilization"]),
-                session_resets_at=int(
-                    datetime.fromisoformat(data["five_hour"]["resets_at"]).timestamp()
-                ),
-                weekly_percent=int(data["seven_day"]["utilization"]),
-                weekly_resets_at=int(
-                    datetime.fromisoformat(data["seven_day"]["resets_at"]).timestamp()
-                ),
-                fetched_at=time.time(),
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            logger.warning("usage endpoint returned unexpected shape: %s", exc)
-            self._record_failure()
-            return None
-        self._cached = snap
-        self._consecutive_failures = 0
-        return snap
+            try:
+                response = httpx.get(
+                    self.ENDPOINT,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "anthropic-beta": self._beta_header,
+                        "User-Agent": self._user_agent,
+                        "Accept": "application/json",
+                    },
+                    timeout=self._timeout,
+                )
+            except (httpx.HTTPError, OSError) as exc:
+                logger.warning("usage endpoint request failed: %s", exc)
+                self._record_failure()
+                return None
+            if response.status_code != 200:
+                logger.warning(
+                    "usage endpoint returned %s (check anthropic-beta header)",
+                    response.status_code,
+                )
+                self._record_failure()
+                return None
+            try:
+                data = response.json()
+                snap = UsageSnapshot(
+                    session_percent=int(data["five_hour"]["utilization"]),
+                    session_resets_at=int(
+                        datetime.fromisoformat(data["five_hour"]["resets_at"]).timestamp()
+                    ),
+                    weekly_percent=int(data["seven_day"]["utilization"]),
+                    weekly_resets_at=int(
+                        datetime.fromisoformat(data["seven_day"]["resets_at"]).timestamp()
+                    ),
+                    fetched_at=time.time(),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("usage endpoint returned unexpected shape: %s", exc)
+                self._record_failure()
+                return None
+            with self._lock:
+                self._cached = snap
+                self._consecutive_failures = 0
+            return snap
 
     def _record_failure(self) -> None:
-        self._consecutive_failures += 1
-        self._last_failure_at = time.time()
+        with self._lock:
+            self._consecutive_failures += 1
+            self._last_failure_at = time.time()
 
     def invalidate_cache(self) -> None:
-        self._cached = None
+        with self._lock:
+            self._cached = None
 
     def _read_token(self) -> str | None:
         if not self._credentials_path.is_file():
@@ -173,88 +207,107 @@ class OpenAIUsageProvider:
         self._cached: UsageSnapshot | None = None
         self._consecutive_failures = 0
         self._last_failure_at: float = 0.0
+        # See OAuthUsageProvider for rationale; HTTP must run outside _lock
+        # so the event-loop thread is never blocked behind a slow request.
+        self._lock = threading.Lock()
+        self._request_lock = threading.Lock()
 
     @property
     def consecutive_failures(self) -> int:
-        return self._consecutive_failures
+        with self._lock:
+            return self._consecutive_failures
+
+    def _cache_or_backoff(self) -> tuple[bool, UsageSnapshot | None]:
+        with self._lock:
+            if self._cached is not None:
+                age = time.time() - self._cached.fetched_at
+                if age < self._cache_ttl:
+                    return True, self._cached
+            if self._consecutive_failures > 0:
+                backoff = self._cache_ttl * min(self._consecutive_failures, 5)
+                if time.time() - self._last_failure_at < backoff:
+                    return True, None
+        return False, None
 
     def fetch(self) -> UsageSnapshot | None:
-        if self._cached is not None:
-            age = time.time() - self._cached.fetched_at
-            if age < self._cache_ttl:
-                return self._cached
-        if self._consecutive_failures > 0:
-            backoff = self._cache_ttl * min(self._consecutive_failures, 5)
-            if time.time() - self._last_failure_at < backoff:
+        handled, value = self._cache_or_backoff()
+        if handled:
+            return value
+        with self._request_lock:
+            handled, value = self._cache_or_backoff()
+            if handled:
+                return value
+            token, account_id = self._read_credentials()
+            if token is None:
+                self._record_failure()
                 return None
-        token, account_id = self._read_credentials()
-        if token is None:
-            self._record_failure()
-            return None
-        try:
-            headers: dict[str, str] = {
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json",
-            }
-            if account_id:
-                headers["ChatGPT-Account-Id"] = account_id
-            response = httpx.get(
-                self.ENDPOINT,
-                headers=headers,
-                timeout=self._timeout,
-            )
-        except (httpx.HTTPError, OSError) as exc:
-            logger.warning("OpenAI usage endpoint request failed: %s", exc)
-            self._record_failure()
-            return None
-        if response.status_code != 200:
-            logger.warning(
-                "OpenAI usage endpoint returned %s",
-                response.status_code,
-            )
-            self._record_failure()
-            return None
-        try:
-            data = response.json()
-            rl = data.get("rate_limit") or {}
-            primary = rl.get("primary_window") or {}
-            secondary = rl.get("secondary_window") or {}
-            if "used_percent" not in primary or "used_percent" not in secondary:
-                logger.warning(
-                    "OpenAI usage response missing used_percent fields"
+            try:
+                headers: dict[str, str] = {
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                }
+                if account_id:
+                    headers["ChatGPT-Account-Id"] = account_id
+                response = httpx.get(
+                    self.ENDPOINT,
+                    headers=headers,
+                    timeout=self._timeout,
                 )
+            except (httpx.HTTPError, OSError) as exc:
+                logger.warning("OpenAI usage endpoint request failed: %s", exc)
+                self._record_failure()
+                return None
+            if response.status_code != 200:
+                logger.warning(
+                    "OpenAI usage endpoint returned %s",
+                    response.status_code,
+                )
+                self._record_failure()
+                return None
+            try:
+                data = response.json()
+                rl = data.get("rate_limit") or {}
+                primary = rl.get("primary_window") or {}
+                secondary = rl.get("secondary_window") or {}
+                if "used_percent" not in primary or "used_percent" not in secondary:
+                    logger.warning(
+                        "OpenAI usage response missing used_percent fields"
+                    )
+                    logger.debug("OpenAI usage response body: %s", response.text[:500])
+                    self._record_failure()
+                    return None
+                if "reset_at" not in primary or "reset_at" not in secondary:
+                    logger.warning(
+                        "OpenAI usage response missing reset_at fields"
+                    )
+                    logger.debug("OpenAI usage response body: %s", response.text[:500])
+                    self._record_failure()
+                    return None
+                snap = UsageSnapshot(
+                    session_percent=int(primary["used_percent"]),
+                    session_resets_at=int(primary["reset_at"]),
+                    weekly_percent=int(secondary["used_percent"]),
+                    weekly_resets_at=int(secondary["reset_at"]),
+                    fetched_at=time.time(),
+                )
+            except (KeyError, TypeError, ValueError, AttributeError) as exc:
+                logger.warning("OpenAI usage endpoint returned unexpected shape: %s", exc)
                 logger.debug("OpenAI usage response body: %s", response.text[:500])
                 self._record_failure()
                 return None
-            if "reset_at" not in primary or "reset_at" not in secondary:
-                logger.warning(
-                    "OpenAI usage response missing reset_at fields"
-                )
-                logger.debug("OpenAI usage response body: %s", response.text[:500])
-                self._record_failure()
-                return None
-            snap = UsageSnapshot(
-                session_percent=int(primary["used_percent"]),
-                session_resets_at=int(primary["reset_at"]),
-                weekly_percent=int(secondary["used_percent"]),
-                weekly_resets_at=int(secondary["reset_at"]),
-                fetched_at=time.time(),
-            )
-        except (KeyError, TypeError, ValueError, AttributeError) as exc:
-            logger.warning("OpenAI usage endpoint returned unexpected shape: %s", exc)
-            logger.debug("OpenAI usage response body: %s", response.text[:500])
-            self._record_failure()
-            return None
-        self._cached = snap
-        self._consecutive_failures = 0
-        return snap
+            with self._lock:
+                self._cached = snap
+                self._consecutive_failures = 0
+            return snap
 
     def _record_failure(self) -> None:
-        self._consecutive_failures += 1
-        self._last_failure_at = time.time()
+        with self._lock:
+            self._consecutive_failures += 1
+            self._last_failure_at = time.time()
 
     def invalidate_cache(self) -> None:
-        self._cached = None
+        with self._lock:
+            self._cached = None
 
     def _read_credentials(self) -> tuple[str | None, str | None]:
         """Return ``(access_token, account_id)`` from Codex auth file."""

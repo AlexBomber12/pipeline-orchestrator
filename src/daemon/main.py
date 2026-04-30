@@ -280,13 +280,19 @@ def _sync_runners(
     claude_usage_provider: UsageProvider,
     codex_usage_provider: UsageProvider,
     registry: CoderRegistry,
+    in_flight: dict[str, asyncio.Task[None]] | None = None,
 ) -> None:
     """Reconcile ``runners`` with ``config.repositories`` in place.
 
     * New URLs get a freshly constructed :class:`PipelineRunner`.
     * Removed URLs are dropped from the dict.
-    * Surviving URLs have their ``repo_config`` and ``app_config``
-      swapped in place so settings changes take effect on the next cycle.
+    * Surviving URLs whose runner has no cycle in flight have their
+      ``repo_config`` and ``app_config`` swapped in place so settings
+      changes take effect on the next cycle.
+    * Surviving URLs whose runner is mid-cycle route the change through
+      ``stage_config_reload`` instead, so the running cycle cannot
+      observe a mixed old/new config across awaits. The staged config
+      is applied by ``_drain_finished_cycle`` once the cycle completes.
 
     Runners are keyed by normalized URL so that equivalent forms of the
     same GitHub URL (``.git`` suffix, trailing slash) do not create or
@@ -306,6 +312,11 @@ def _sync_runners(
     for key, repo in desired.items():
         if key in runners:
             runner = runners[key]
+            cycle_in_flight = (
+                in_flight is not None
+                and key in in_flight
+                and not in_flight[key].done()
+            )
             active_changed = runner.repo_config.active != repo.active
             defer_coder_only_reload = (
                 _runner_requires_idle_boundary(runner)
@@ -316,25 +327,27 @@ def _sync_runners(
                     key,
                 )
             )
-            if (
-                not runner.repo_config.active
-                or active_changed
-                or not defer_coder_only_reload
-            ):
-                runner.repo_config = repo
-                runner.app_config = config
-                runner.set_usage_providers(
-                    claude_usage_provider,
-                    codex_usage_provider,
-                )
-                if hasattr(runner, "clear_staged_config_reload"):
-                    runner.clear_staged_config_reload()
-            elif hasattr(runner, "stage_config_reload"):
+            needs_idle_boundary_defer = (
+                runner.repo_config.active
+                and not active_changed
+                and defer_coder_only_reload
+            )
+            must_defer = cycle_in_flight or needs_idle_boundary_defer
+            if must_defer and hasattr(runner, "stage_config_reload"):
+                stage_kwargs: dict[str, Any] = {}
+                params = inspect.signature(
+                    runner.stage_config_reload
+                ).parameters
+                if "requires_idle_boundary" in params:
+                    stage_kwargs["requires_idle_boundary"] = (
+                        needs_idle_boundary_defer
+                    )
                 runner.stage_config_reload(
                     repo,
                     config,
                     claude_usage_provider,
                     codex_usage_provider,
+                    **stage_kwargs,
                 )
             else:
                 runner.repo_config = repo
@@ -343,6 +356,8 @@ def _sync_runners(
                     claude_usage_provider,
                     codex_usage_provider,
                 )
+                if hasattr(runner, "clear_staged_config_reload"):
+                    runner.clear_staged_config_reload()
             continue
         runner = _build_runner(
             repo,
@@ -379,6 +394,150 @@ async def _close_pubsub(pubsub: Any) -> None:
         await pubsub.aclose()
     except Exception:
         pass
+
+
+def _apply_pending_in_flight_config(runner: PipelineRunner) -> None:
+    """Apply any config staged while a cycle was in flight.
+
+    ``_sync_runners`` defers the in-place ``repo_config``/``app_config``
+    swap when a cycle is still running, routing the new config through
+    ``stage_config_reload`` so the running cycle cannot observe a mixed
+    old/new snapshot across awaits. The staged config is then applied
+    once the cycle finishes — either here, after ``_drain_finished_cycle``
+    pops the task, or at the next IDLE handler entry via
+    ``reload_repo_config_if_dirty``. The two paths are idempotent because
+    ``_apply_staged_config_reload`` clears the pending fields after the
+    swap.
+    """
+    apply = getattr(runner, "_apply_staged_config_reload", None)
+    if apply is None:
+        return
+    try:
+        apply()
+    except Exception:
+        logger.error(
+            "Failed to apply deferred config for %s",
+            getattr(runner, "name", "?"),
+            exc_info=True,
+        )
+
+
+def _staged_config_can_apply_after_cycle(runner: Any) -> bool:
+    """Return whether a runner's staged config is safe to apply post-cycle.
+
+    Two reasons drive staging in ``_sync_runners``: (a) a cycle was
+    in flight, in which case staging is just a snapshot guard and the
+    swap is safe as soon as the cycle drains; or (b) the change is a
+    coder-only swap that must wait for IDLE so the runner is not
+    mid-PR-lifecycle when the coder flips. Only (b) needs to keep
+    deferring once the cycle has finished — runners flag this case via
+    ``_pending_requires_idle_boundary``. When the runner does not
+    expose the flag (older test stubs), fall back to the previous
+    state-only check so behavior is unchanged for them.
+    """
+    if not hasattr(runner, "_pending_requires_idle_boundary"):
+        return not _runner_requires_idle_boundary(runner)
+    if not getattr(runner, "_pending_requires_idle_boundary", False):
+        return True
+    return not _runner_requires_idle_boundary(runner)
+
+
+def _drain_finished_cycle(
+    key: str,
+    in_flight: dict[str, asyncio.Task[None]],
+    runners: dict[str, PipelineRunner],
+) -> bool:
+    """Drain ``key``'s completed cycle if present. Return whether it was popped."""
+    task = in_flight.get(key)
+    if task is None or not task.done():
+        return False
+    runner = runners.get(key)
+    runner_name = runner.name if runner is not None else key
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.error(
+            "run_cycle failed for %s", runner_name, exc_info=True
+        )
+    del in_flight[key]
+    # Apply the staged config unless it was explicitly tagged as
+    # requiring an IDLE boundary (currently: a coder-only swap that must
+    # not land mid-PR). Without this distinction, a non-coder change
+    # such as ``active=False`` staged purely because a cycle was in
+    # flight would sit pending forever if the cycle finished in
+    # WATCH/FIX/MERGE/CODING — ``reload_repo_config_if_dirty`` only runs
+    # at IDLE entry, and ``_sync_runners`` will not re-stage because the
+    # daemon's ``config`` snapshot was already swapped at reload time.
+    if runner is not None:
+        if _staged_config_can_apply_after_cycle(runner):
+            _apply_pending_in_flight_config(runner)
+    return True
+
+
+def _drain_finished_cycles(
+    in_flight: dict[str, asyncio.Task[None]],
+    runners: dict[str, PipelineRunner],
+) -> None:
+    """Pop completed cycle tasks from ``in_flight`` and log exceptions.
+
+    Cancellations are intentional (config reload removed the runner) and
+    are not logged; any other exception is reported with the runner name
+    so a crash inside a per-runner task is not silently swallowed. Any
+    config that was staged while the cycle was running is applied here
+    so the next cycle starts with the new snapshot.
+    """
+    for key in list(in_flight.keys()):
+        _drain_finished_cycle(key, in_flight, runners)
+
+
+async def _cleanup_in_flight_for_removed(
+    in_flight: dict[str, asyncio.Task[None]],
+    removed_keys: set[str],
+) -> None:
+    """Cancel still-running cycles for removed runners and drain finished ones.
+
+    Called after ``_sync_runners`` drops a repo from the live set: a long
+    CODING/FIX cycle on the removed runner must not keep a stale task alive
+    on the loop. Cancellation propagates ``asyncio.CancelledError`` into the
+    coder subprocess wait, which existing handlers already catch.
+
+    Caller cancellation (SIGINT/SIGTERM landing on the daemon's main task,
+    whether before this helper is entered or while we await the cancelled
+    cycle) is re-raised. Catching it here would swallow the shutdown
+    signal and leave the daemon unresponsive to the first ``Ctrl-C``
+    whenever it arrived during a config-reload cleanup.
+    """
+    cur = asyncio.current_task()
+    for key in list(removed_keys):
+        task = in_flight.pop(key, None)
+        if task is None:
+            continue
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                if cur is not None and cur.cancelling() > 0:
+                    raise
+            except Exception:
+                logger.error(
+                    "run_cycle failed for %s (runner removed)",
+                    key,
+                    exc_info=True,
+                )
+            continue
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.error(
+                "run_cycle failed for %s (runner removed)",
+                key,
+                exc_info=True,
+            )
 
 
 def _apply_wake_message(
@@ -536,6 +695,7 @@ async def main() -> None:
         )
 
     runners: dict[str, PipelineRunner] = {}
+    in_flight: dict[str, asyncio.Task[None]] = {}
     _sync_runners(
         runners,
         config,
@@ -543,6 +703,7 @@ async def main() -> None:
         claude_usage_provider,
         codex_usage_provider,
         registry,
+        in_flight,
     )
 
     # Keep a strong reference: the event loop only holds weak references
@@ -577,6 +738,7 @@ async def main() -> None:
                     )
                     config = new_config
                     claude_usage_provider, codex_usage_provider = _create_usage_providers(config)
+                    prev_keys = set(runners.keys())
                     _sync_runners(
                         runners,
                         config,
@@ -584,7 +746,13 @@ async def main() -> None:
                         claude_usage_provider,
                         codex_usage_provider,
                         registry,
+                        in_flight,
                     )
+                    removed_keys = prev_keys - set(runners.keys())
+                    if removed_keys:
+                        await _cleanup_in_flight_for_removed(
+                            in_flight, removed_keys
+                        )
 
         for key, runner in list(runners.items()):
             if not runner.repo_config.active:
@@ -598,17 +766,38 @@ async def main() -> None:
                         exc_info=True,
                     )
                 continue
+            existing = in_flight.get(key)
+            if existing is not None:
+                if not existing.done():
+                    # Previous cycle still running; do not pile up another
+                    # one on top of it. last_run is left untouched so the
+                    # new cycle will be scheduled as soon as the in-flight
+                    # task finishes and the next interval is due.
+                    continue
+                # Drain a cycle that finished between iterations (e.g.
+                # during ``await runner.publish_state()`` for an inactive
+                # peer earlier in this loop) before scheduling the next
+                # one, so any config staged during the cycle is applied
+                # and the new cycle starts from the latest snapshot.
+                _drain_finished_cycle(key, in_flight, runners)
+                # The drain may have applied a staged config that flipped
+                # ``active`` to False (e.g. the user deactivated the repo
+                # while the cycle was in flight). Re-check before scheduling
+                # so a deactivated runner does not get one more cycle just
+                # because the poll interval happened to elapse.
+                if not runner.repo_config.active:
+                    last_run.pop(key, None)
+                    continue
             now = time.monotonic()
             interval = _runner_poll_interval(runner)
             if key in last_run and now - last_run[key] < interval:
                 continue
+            # last_run is stamped at scheduling time, not completion time.
+            # Otherwise a 30-minute CODING cycle would re-schedule itself
+            # the moment it returns and the per-runner interval would be
+            # ignored on long jobs.
             last_run[key] = now
-            try:
-                await runner.run_cycle()
-            except Exception:
-                logger.error(
-                    "run_cycle failed for %s", runner.name, exc_info=True
-                )
+            in_flight[key] = asyncio.create_task(runner.run_cycle())
 
         # Clean up last_run entries for removed runners.
         for key in list(last_run.keys()):
@@ -639,9 +828,17 @@ async def main() -> None:
             else:
                 subscribed_slugs = desired_slugs
 
-        healthy = await _wait_or_wake(
-            pubsub, max(tick, 1), last_run, slug_to_key, runners
-        )
+        try:
+            healthy = await _wait_or_wake(
+                pubsub, max(tick, 1), last_run, slug_to_key, runners
+            )
+        finally:
+            # Wait_or_wake yields to the event loop, giving any newly
+            # spawned per-runner cycle tasks a chance to run. Drain whatever
+            # finished during the wait so a runner crash is logged in the
+            # same iteration it occurred — even if wait_or_wake propagated
+            # an exception (e.g. the test sentinel).
+            _drain_finished_cycles(in_flight, runners)
         if not healthy:
             await _close_pubsub(pubsub)
             pubsub = None

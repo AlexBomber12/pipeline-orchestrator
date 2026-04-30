@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 HOOK_SCRIPT = str(
     Path(__file__).resolve().parent.parent / "scripts" / "statusline_hook.py"
 )
@@ -145,20 +147,24 @@ def test_hook_uses_env_thresholds(tmp_path: Path) -> None:
     assert marker.is_file()
 
 
-def test_hook_skips_marker_when_no_run_id(tmp_path: Path) -> None:
+def test_hook_skips_marker_when_no_run_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     data = {
         "rate_limits": {
             "five_hour": {"used_percentage": 99, "resets_at": 9999},
             "seven_day": {"used_percentage": 30, "resets_at": 8888},
         }
     }
+    # When the daemon runs the test suite, its own PIPELINE_RUN_ID leaks
+    # via os.environ into the subprocess _run_hook spawns; strip it so the
+    # hook actually sees an unset run id, not the daemon's own.
+    monkeypatch.delenv("PIPELINE_RUN_ID", raising=False)
     env = {
         "PIPELINE_BREACH_DIR": str(tmp_path),
         "PIPELINE_SESSION_THRESHOLD": "95",
         "PIPELINE_WEEKLY_THRESHOLD": "100",
     }
-    # Remove PIPELINE_RUN_ID so the hook skips writing the marker
-    env.pop("PIPELINE_RUN_ID", None)
     result = _run_hook(json.dumps(data), env_overrides=env)
     assert result.returncode == 0
     assert not list(tmp_path.glob("*.breach"))
