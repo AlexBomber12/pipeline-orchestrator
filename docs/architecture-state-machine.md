@@ -11,18 +11,37 @@ these values per repo at any given time; there are no compound states.
 
 | State       | Meaning                                                                                                |
 | ----------- | ------------------------------------------------------------------------------------------------------ |
-| `PREFLIGHT` | Daemon is verifying repo prerequisites (clone, auth, queue parse) before accepting work.               |
 | `IDLE`      | No active task. Daemon polls `tasks/QUEUE.md` plus GitHub for new work at `poll_interval_sec` cadence. |
 | `CODING`    | Coder subprocess is running for a freshly selected task; daemon watches its stdout.                    |
-| `WATCH`     | A PR is open. Daemon polls CI status, review state, and review comments until a verdict is reached.    |
+| `WATCH`     | A PR is open. Daemon polls CI status, review state, and review comments; when CI is green and review approves, `handle_watch` calls `handle_merge` inline (no `MERGE` transition) and then returns to `IDLE`. |
 | `FIX`       | Coder subprocess is running in `FIX FEEDBACK` mode against an existing PR branch.                      |
-| `MERGE`     | A PR is approved and CI is green; daemon is performing the merge.                                      |
 | `HUNG`      | Daemon detected a stuck WATCH cycle and is running the hung-recovery routine.                          |
 | `ERROR`     | An error occurred during task processing. May persist across ticks; see [ERROR state details](#error-state-details). |
 | `PAUSED`    | Operator pressed Pause. No state advancement until Resume.                                             |
 
 Operators see the canonical state in the repo card badge; semantic detail
 (CI status, review status, last push age) appears in the PR panel below it.
+
+### `PipelineState` values that are not live daemon-run states
+
+The enum also defines `PREFLIGHT` and `MERGE`, but the daemon does not assign
+either during a normal run cycle. They appear in dashboards or stale-state
+cleanup only:
+
+- **`PREFLIGHT`** is a synthetic dashboard fallback. `src/web/app.py`
+  substitutes `PREFLIGHT` when Redis is unreachable or no state has been
+  published yet for a repo (`Redis unavailable — state unknown` /
+  `Waiting for daemon to initialize`). The daemon's pre-tick checks live in
+  `Runner.preflight()` but never write `PipelineState.PREFLIGHT` to
+  `state.state`. If you see `PREFLIGHT` on a card, look at Redis health, not
+  daemon progress.
+- **`MERGE`** is a legacy enum value with no live transition path. No handler
+  under `src/daemon/handlers/` sets `state.state = PipelineState.MERGE`;
+  merges happen inline inside `handle_watch` (see `src/daemon/handlers/watch.py`)
+  by calling `handle_merge` directly. `MERGE` only appears in
+  `_TRANSIENT_STATES` in `src/daemon/runner.py`, which resets any stale
+  pre-existing `MERGE` value to `IDLE` on the next tick. Triage as if the
+  repo were in `WATCH`.
 
 ## WATCH state details
 
@@ -57,8 +76,8 @@ continues to show `WATCH`.
 
 ERROR is entered when any handler sets `state.state = PipelineState.ERROR` and
 writes a context string to `state.error_message`. Unlike the transient states
-that `_run_cycle_body` resets on each tick (`PREFLIGHT`, `CODING`, `FIX`,
-`MERGE`), ERROR is *not* auto-cleared. Each tick dispatches `handle_error`
+that `_run_cycle_body` resets on each tick (`CODING`, `FIX`, `MERGE`), ERROR
+is *not* auto-cleared. Each tick dispatches `handle_error`
 (in `src/daemon/handlers/error.py`) when `daemon.error_handler_use_ai` is
 enabled, and the state changes only based on the diagnosis outcome:
 
