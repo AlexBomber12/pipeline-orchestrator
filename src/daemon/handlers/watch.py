@@ -15,6 +15,19 @@ from src.models import CIStatus, FeedbackCheckResult, PipelineState, ReviewStatu
 
 logger = logging.getLogger(__name__)
 _STALE_RETRIGGER_DEBOUNCE = timedelta(hours=1)
+_CODEX_BOT_ERROR_RETRIGGER_COOLDOWN = timedelta(minutes=5)
+_CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
+# Substring patterns matching known chatgpt-codex-connector[bot] error
+# comments. When the bot fails its own review and posts one of these,
+# review_status stays as EYES and the WATCH timeout would otherwise burn
+# 21+ minutes; detecting the pattern lets us re-trigger @codex review
+# immediately.
+CODEX_BOT_ERROR_PATTERNS = (
+    "Something went wrong while reviewing",
+    "error reviewing this PR",
+    "Please try again",
+    "unable to complete review",
+)
 
 
 class WatchMixin:
@@ -121,6 +134,11 @@ class WatchMixin:
                 "Codex feedback since last push; waiting for fresh review"
             )
             self._maybe_retrigger_stale_review(found.number)
+
+        # EYES is the only state where the bot may have errored mid-review;
+        # gating avoids paginating issue comments on every WATCH poll.
+        if review == ReviewStatus.EYES:
+            self._maybe_retrigger_on_codex_bot_error(found.number)
 
         last_activity = found.last_activity or self.state.last_updated
         if last_activity.tzinfo is None:
@@ -230,3 +248,65 @@ class WatchMixin:
             bypass_same_head_dedup=True,
         )
         self.state.last_stale_retrigger_at = now
+
+    def _maybe_retrigger_on_codex_bot_error(self, pr_number: int) -> None:
+        """Re-trigger ``@codex review`` when chatgpt-codex-connector[bot]
+        posted an error comment (e.g. "Something went wrong while reviewing")
+        instead of a verdict. Only matches comments authored by the codex bot
+        itself, and applies a 5-minute per-PR cooldown to avoid loops on a
+        permanent Codex outage.
+        """
+        try:
+            comments = github_client._gh_api_paginated(
+                f"repos/{self.owner_repo}/issues/{pr_number}/comments"
+            ) or []
+        except Exception:
+            logger.warning(
+                "GitHub API error checking codex bot error comments for "
+                "PR #%s",
+                pr_number,
+                exc_info=True,
+            )
+            return
+
+        latest_error_at: datetime | None = None
+        for c in comments:
+            user = (c.get("user") or {}).get("login", "")
+            if user != _CODEX_BOT_LOGIN:
+                continue
+            body = c.get("body") or ""
+            if not any(pat in body for pat in CODEX_BOT_ERROR_PATTERNS):
+                continue
+            created = github_client._parse_iso(c.get("created_at"))
+            if created is None:
+                continue
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if latest_error_at is None or created > latest_error_at:
+                latest_error_at = created
+
+        if latest_error_at is None:
+            return
+
+        last_retrigger_at = self.state.last_codex_retrigger_at
+        if last_retrigger_at is not None:
+            if last_retrigger_at.tzinfo is None:
+                last_retrigger_at = last_retrigger_at.replace(
+                    tzinfo=timezone.utc
+                )
+            if latest_error_at <= last_retrigger_at:
+                return
+            now = datetime.now(timezone.utc)
+            if now - last_retrigger_at < _CODEX_BOT_ERROR_RETRIGGER_COOLDOWN:
+                return
+
+        self.log_event(
+            f"Codex bot error comment on PR #{pr_number}; "
+            "re-triggering @codex review."
+        )
+        success, _posted, _retry_at = self._post_codex_review_result(
+            pr_number,
+            bypass_same_head_dedup=True,
+        )
+        if success:
+            self.state.last_codex_retrigger_at = datetime.now(timezone.utc)
