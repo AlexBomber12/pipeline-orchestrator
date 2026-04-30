@@ -2402,6 +2402,37 @@ def test_cleanup_in_flight_for_removed_propagates_caller_cancellation() -> None:
     asyncio.run(scenario())
 
 
+def test_cleanup_in_flight_for_removed_propagates_pre_existing_cancellation() -> None:
+    """If the daemon task is already cancelled before the helper runs (a
+    SIGINT lands in the moment between scheduling cleanup and entering
+    it), the awaited child cancellation must not mask the caller's
+    pending cancel. The helper must propagate the shutdown signal even
+    though ``cur.cancelling()`` was non-zero on entry."""
+
+    async def long_cycle() -> None:
+        await asyncio.Event().wait()
+
+    async def scenario() -> None:
+        cycle_task = asyncio.create_task(long_cycle())
+        await asyncio.sleep(0)
+
+        async def outer() -> None:
+            in_flight: dict[str, asyncio.Task[None]] = {"removed-key": cycle_task}
+            # Cancel ourselves before the first await inside the helper
+            # so ``cur.cancelling()`` is already 1 on entry.
+            asyncio.current_task().cancel()
+            await main_module._cleanup_in_flight_for_removed(
+                in_flight, {"removed-key"}
+            )
+
+        outer_task = asyncio.create_task(outer())
+
+        with pytest.raises(asyncio.CancelledError):
+            await outer_task
+
+    asyncio.run(scenario())
+
+
 def test_sync_runners_defers_swap_when_cycle_is_in_flight() -> None:
     """While a cycle is mid-execution, in-place mutation of repo_config
     or app_config could let the running cycle observe a mixed old/new

@@ -503,14 +503,13 @@ async def _cleanup_in_flight_for_removed(
     on the loop. Cancellation propagates ``asyncio.CancelledError`` into the
     coder subprocess wait, which existing handlers already catch.
 
-    Caller cancellation (SIGINT/SIGTERM landing on the daemon's main task
-    while we await the cancelled cycle) is re-raised. Catching it here
-    would swallow the shutdown signal and leave the daemon unresponsive
-    to the first ``Ctrl-C`` whenever it arrived during a config-reload
-    cleanup.
+    Caller cancellation (SIGINT/SIGTERM landing on the daemon's main task,
+    whether before this helper is entered or while we await the cancelled
+    cycle) is re-raised. Catching it here would swallow the shutdown
+    signal and leave the daemon unresponsive to the first ``Ctrl-C``
+    whenever it arrived during a config-reload cleanup.
     """
     cur = asyncio.current_task()
-    initial_cancelling = cur.cancelling() if cur is not None else 0
     for key in list(removed_keys):
         task = in_flight.pop(key, None)
         if task is None:
@@ -520,10 +519,7 @@ async def _cleanup_in_flight_for_removed(
             try:
                 await task
             except asyncio.CancelledError:
-                if (
-                    cur is not None
-                    and cur.cancelling() > initial_cancelling
-                ):
+                if cur is not None and cur.cancelling() > 0:
                     raise
             except Exception:
                 logger.error(
