@@ -8,9 +8,12 @@ from typing import Any
 
 from src.daemon.github_rate_limit import (
     BUDGET_REDIS_KEY,
+    BURNS_REDIS_KEY_PREFIX,
     REFRESH_LOCK_REDIS_KEY,
     RateLimitBudget,
     read_budget,
+    recent_cycle_burns,
+    record_cycle_burn,
     release_refresh_lock,
     try_claim_refresh_lock,
     write_budget,
@@ -112,9 +115,12 @@ def test_from_redis_payload_returns_none_for_malformed_int() -> None:
 class _FakeRedis:
     def __init__(self) -> None:
         self.store: dict[str, str] = {}
+        self.lists: dict[str, list[str]] = {}
         self.set_failure = False
         self.get_failure = False
         self.delete_failure = False
+        self.lpush_failure = False
+        self.lrange_failure = False
 
     async def set(
         self,
@@ -142,6 +148,27 @@ class _FakeRedis:
             del self.store[key]
             return 1
         return 0
+
+    async def lpush(self, key: str, value: str) -> int:
+        if self.lpush_failure:
+            raise RuntimeError("redis offline")
+        bucket = self.lists.setdefault(key, [])
+        bucket.insert(0, value)
+        return len(bucket)
+
+    async def ltrim(self, key: str, start: int, stop: int) -> None:
+        values = self.lists.get(key, [])
+        if stop < 0:
+            stop = len(values) + stop
+        self.lists[key] = values[start : stop + 1]
+
+    async def lrange(self, key: str, start: int, stop: int) -> list[str]:
+        if self.lrange_failure:
+            raise RuntimeError("redis offline")
+        values = self.lists.get(key, [])
+        if stop < 0:
+            stop = len(values) + stop
+        return values[start : stop + 1]
 
 
 def test_write_and_read_budget_roundtrip() -> None:
@@ -228,3 +255,75 @@ def test_release_refresh_lock_swallows_redis_failure() -> None:
     asyncio.run(release_refresh_lock(redis))
     # The lock was not removed, but TTL on the underlying key still applies.
     assert REFRESH_LOCK_REDIS_KEY in redis.store
+
+
+def test_record_cycle_burn_pushes_normalized_delta() -> None:
+    redis = _FakeRedis()
+    asyncio.run(record_cycle_burn(redis, "octo__demo", 42))
+    assert redis.lists[f"{BURNS_REDIS_KEY_PREFIX}octo__demo"] == ["42"]
+
+
+def test_record_cycle_burn_clamps_negative_delta_to_zero() -> None:
+    redis = _FakeRedis()
+    asyncio.run(record_cycle_burn(redis, "octo__demo", -100))
+    assert redis.lists[f"{BURNS_REDIS_KEY_PREFIX}octo__demo"] == ["0"]
+
+
+def test_record_cycle_burn_handles_non_integer_delta() -> None:
+    """Bad input must not crash the runner; observability is best-effort."""
+    redis = _FakeRedis()
+    asyncio.run(record_cycle_burn(redis, "octo__demo", "abc"))  # type: ignore[arg-type]
+    assert redis.lists[f"{BURNS_REDIS_KEY_PREFIX}octo__demo"] == ["0"]
+
+
+def test_record_cycle_burn_caps_at_max_entries() -> None:
+    redis = _FakeRedis()
+    for n in range(25):
+        asyncio.run(record_cycle_burn(redis, "octo__demo", n, max_entries=20))
+    bucket = redis.lists[f"{BURNS_REDIS_KEY_PREFIX}octo__demo"]
+    assert len(bucket) == 20
+    # Newest entry is at the head; the first five (0..4) were trimmed off the tail.
+    assert bucket[0] == "24"
+    assert bucket[-1] == "5"
+
+
+def test_record_cycle_burn_no_op_when_redis_is_none() -> None:
+    asyncio.run(record_cycle_burn(None, "octo__demo", 5))
+
+
+def test_record_cycle_burn_swallows_redis_failure() -> None:
+    redis = _FakeRedis()
+    redis.lpush_failure = True
+    asyncio.run(record_cycle_burn(redis, "octo__demo", 5))
+    assert f"{BURNS_REDIS_KEY_PREFIX}octo__demo" not in redis.lists
+
+
+def test_recent_cycle_burns_returns_newest_first_list() -> None:
+    redis = _FakeRedis()
+    asyncio.run(record_cycle_burn(redis, "octo__demo", 1))
+    asyncio.run(record_cycle_burn(redis, "octo__demo", 2))
+    asyncio.run(record_cycle_burn(redis, "octo__demo", 3))
+    burns = asyncio.run(recent_cycle_burns(redis, "octo__demo"))
+    assert burns == [3, 2, 1]
+
+
+def test_recent_cycle_burns_returns_empty_when_redis_is_none() -> None:
+    assert asyncio.run(recent_cycle_burns(None, "octo__demo")) == []
+
+
+def test_recent_cycle_burns_returns_empty_when_no_observation() -> None:
+    redis = _FakeRedis()
+    assert asyncio.run(recent_cycle_burns(redis, "octo__demo")) == []
+
+
+def test_recent_cycle_burns_swallows_redis_failure() -> None:
+    redis = _FakeRedis()
+    redis.lrange_failure = True
+    assert asyncio.run(recent_cycle_burns(redis, "octo__demo")) == []
+
+
+def test_recent_cycle_burns_skips_malformed_entries() -> None:
+    """A single corrupted payload must not blank the metric for the operator."""
+    redis = _FakeRedis()
+    redis.lists[f"{BURNS_REDIS_KEY_PREFIX}octo__demo"] = ["3", "not-a-number", "1"]
+    assert asyncio.run(recent_cycle_burns(redis, "octo__demo")) == [3, 1]

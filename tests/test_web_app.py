@@ -24,6 +24,7 @@ from src.web import app as web_app
 from src.web.app import (
     _active_rate_limit_coder,
     _build_github_api_budget_view,
+    _build_recent_graphql_burns_view,
     _find_repo_config_by_name,
     _format_duration_ms,
     _get_repo_state_safe,
@@ -2398,6 +2399,103 @@ def test_build_github_api_budget_view_bucket_ok_when_reset_window_elapsed() -> N
 
     assert view is not None
     assert view["bucket"] == "ok"
+
+
+def test_build_recent_graphql_burns_view_returns_none_without_data() -> None:
+    assert (
+        asyncio.run(_build_recent_graphql_burns_view(_FakeRedis(), "octo__demo"))
+        is None
+    )
+
+
+def test_build_recent_graphql_burns_view_computes_avg_and_max() -> None:
+    from src.daemon.github_rate_limit import BURNS_REDIS_KEY_PREFIX
+
+    redis = _FakeRedis(
+        lists={f"{BURNS_REDIS_KEY_PREFIX}octo__demo": ["10", "20", "0"]}
+    )
+
+    view = asyncio.run(_build_recent_graphql_burns_view(redis, "octo__demo"))
+
+    assert view is not None
+    assert view["burns"] == [10, 20, 0]
+    assert view["max"] == 20
+    assert view["avg"] == 10.0
+
+
+def test_repo_template_context_exposes_recent_graphql_burns(
+    two_repo_config: Path,
+) -> None:
+    """The per-repo render context surfaces the burn summary when present."""
+    from src.daemon.github_rate_limit import BURNS_REDIS_KEY_PREFIX
+
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+    )
+    fake = _FakeRedis(
+        store={"pipeline:example__alpha": stored.model_dump_json()},
+        lists={f"{BURNS_REDIS_KEY_PREFIX}example__alpha": ["7", "13"]},
+    )
+
+    context = asyncio.run(web_app._repo_template_context("example__alpha", fake))
+
+    assert context["recent_graphql_burns"] == {
+        "burns": [7, 13],
+        "avg": 10.0,
+        "max": 13,
+    }
+
+
+def test_repo_summary_renders_recent_graphql_burns(
+    two_repo_config: Path,
+) -> None:
+    """The detail page surfaces avg/max without breaking the existing layout."""
+    from src.daemon.github_rate_limit import BURNS_REDIS_KEY_PREFIX
+
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+    )
+    fake = _FakeRedis(
+        store={"pipeline:example__alpha": stored.model_dump_json()},
+        lists={f"{BURNS_REDIS_KEY_PREFIX}example__alpha": ["20", "10"]},
+    )
+
+    context = asyncio.run(web_app._repo_template_context("example__alpha", fake))
+    rendered = web_app.templates.get_template(
+        "components/repo_summary.html"
+    ).render(context)
+
+    assert "data-recent-graphql-burns" in rendered
+    assert "GraphQL/cycle: avg 15.0 (max 20)" in rendered
+    # Existing Current Task / Current PR layout still intact.
+    assert "Current Task" in rendered
+    assert "Current PR" in rendered
+
+
+def test_repo_summary_hides_recent_graphql_burns_when_absent(
+    two_repo_config: Path,
+) -> None:
+    """No burns recorded yet — the metric block is hidden, layout intact."""
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+    )
+    fake = _FakeRedis(store={"pipeline:example__alpha": stored.model_dump_json()})
+
+    context = asyncio.run(web_app._repo_template_context("example__alpha", fake))
+    rendered = web_app.templates.get_template(
+        "components/repo_summary.html"
+    ).render(context)
+
+    assert "data-recent-graphql-burns" not in rendered
+    assert "GraphQL/cycle" not in rendered
+    assert "Current Task" in rendered
+    assert "Current PR" in rendered
 
 
 def test_repo_summary_omits_stalled_artifacts_when_last_updated_is_old(

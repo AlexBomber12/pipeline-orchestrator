@@ -28,6 +28,16 @@ BUDGET_REDIS_KEY = "github_rate_limit_budget"
 #: count and can itself exhaust the rate limit it is meant to protect.
 REFRESH_LOCK_REDIS_KEY = "github_rate_limit_refresh_lock"
 
+#: Per-repo Redis list of recent GraphQL points burned per polling cycle.
+#: One key per repo so the list survives daemon restarts and stays bounded
+#: independently from the global budget snapshot.
+BURNS_REDIS_KEY_PREFIX = "github_rate_limit_burns:"
+
+#: Default cap on the per-repo cycle-burn list. Twenty entries spans roughly
+#: twenty minutes of polling at the default cadence — enough to read the
+#: trend after a config change without unbounded memory growth.
+BURNS_MAX_ENTRIES = 20
+
 
 @dataclass(frozen=True)
 class RateLimitBudget:
@@ -143,6 +153,66 @@ async def try_claim_refresh_lock(redis_client: Any, ttl_seconds: int) -> bool:
     except Exception:
         return True
     return bool(result)
+
+
+async def record_cycle_burn(
+    redis_client: Any,
+    repo_name: str,
+    delta: int,
+    *,
+    max_entries: int = BURNS_MAX_ENTRIES,
+) -> None:
+    """Persist ``delta`` to the bounded recent-burn list for ``repo_name``.
+
+    ``delta`` is the GraphQL points consumed during one polling cycle,
+    derived from ``budget_before.remaining - budget_after.remaining``.
+    Negative values (the rate-limit window reset between observations) and
+    non-integer inputs are normalised to ``0`` so the metric never drives
+    operators to spurious decisions. The Redis list is trimmed to
+    ``max_entries`` entries to bound memory. Failures are swallowed:
+    observability code must never crash the runner.
+    """
+    if redis_client is None:
+        return
+    try:
+        normalized = max(0, int(delta))
+    except (TypeError, ValueError):
+        normalized = 0
+    key = f"{BURNS_REDIS_KEY_PREFIX}{repo_name}"
+    try:
+        await redis_client.lpush(key, str(normalized))
+        await redis_client.ltrim(key, 0, max_entries - 1)
+    except Exception:
+        logger.warning(
+            "Failed to record GraphQL cycle burn for %s", repo_name, exc_info=True
+        )
+
+
+async def recent_cycle_burns(
+    redis_client: Any,
+    repo_name: str,
+    *,
+    max_entries: int = BURNS_MAX_ENTRIES,
+) -> list[int]:
+    """Return the last ``max_entries`` cycle deltas (newest-first), or ``[]``.
+
+    Malformed entries are skipped so a single corrupted payload cannot blank
+    the metric for the operator.
+    """
+    if redis_client is None:
+        return []
+    key = f"{BURNS_REDIS_KEY_PREFIX}{repo_name}"
+    try:
+        raw = await redis_client.lrange(key, 0, max_entries - 1)
+    except Exception:
+        return []
+    result: list[int] = []
+    for item in raw or []:
+        try:
+            result.append(max(0, int(item)))
+        except (TypeError, ValueError):
+            continue
+    return result
 
 
 async def release_refresh_lock(redis_client: Any) -> None:

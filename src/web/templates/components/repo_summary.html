@@ -82,6 +82,14 @@
 </div>
 {% endif %}
 
+{% if recent_graphql_burns %}
+<div class="flex flex-wrap items-center gap-2 mb-4 text-xs font-mono text-gray-400"
+     data-recent-graphql-burns
+     title="GraphQL points consumed per polling cycle (last {{ recent_graphql_burns.burns|length }} cycles)">
+    <span>GraphQL/cycle: avg {{ recent_graphql_burns.avg }} (max {{ recent_graphql_burns.max }})</span>
+</div>
+{% endif %}
+
 {% if repo.state.value == 'PAUSED' %}
 <div class="mb-6 rounded-lg border border-warn/30 bg-warn/10 px-4 py-3">
     {% if repo.rate_limited_until and repo.rate_limited_until > utcnow() %}

@@ -42,7 +42,7 @@ from src.config import (
     update_daemon_config,
     update_repository,
 )
-from src.daemon.github_rate_limit import read_budget
+from src.daemon.github_rate_limit import read_budget, recent_cycle_burns
 from src.events import publish_repo_event, publish_wake
 from src.events.sse import RepoEventsUnavailableError, stream_repo_events
 from src.metrics import MetricsStore, RunRecord
@@ -362,6 +362,28 @@ def _coder_rate_limit_supported(coder: str | None) -> bool:
     return coder in {"claude", "codex"}
 
 
+async def _build_recent_graphql_burns_view(
+    redis_client: aioredis.Redis | None,
+    repo_name: str,
+) -> dict[str, Any] | None:
+    """Return the recent GraphQL cycle-burn summary for ``repo_name``.
+
+    Returns ``None`` when no cycle burns have been recorded yet so the
+    template can hide the inline metric. ``avg`` and ``max`` are computed
+    here for dashboard convenience and rounded so the display is stable
+    across renders.
+    """
+    burns = await recent_cycle_burns(redis_client, repo_name)
+    if not burns:
+        return None
+    avg = sum(burns) / len(burns)
+    return {
+        "burns": burns,
+        "avg": round(avg, 1),
+        "max": max(burns),
+    }
+
+
 async def _build_github_api_budget_view(
     redis_client: aioredis.Redis | None,
     config: AppConfig,
@@ -510,8 +532,12 @@ async def _repo_template_context(
         or state.usage_weekly_percent is not None
         or state.usage_api_degraded
     )
+    recent_graphql_burns = await _build_recent_graphql_burns_view(
+        redis_client, name
+    )
     return {
         "repo": state,
+        "recent_graphql_burns": recent_graphql_burns,
         "repo_config": repo_config,
         "daemon": config.daemon,
         "coders": build_coder_registry().list_coders(),
