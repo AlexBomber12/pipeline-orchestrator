@@ -260,6 +260,15 @@ async def _update_repo_pause_state(
             redis_client,
         )
 
+    try:
+        await publish_wake(redis_client, name, "control")
+    except Exception:
+        logger.warning(
+            "publish_wake failed for %s; daemon will pick up control change on next tick",
+            name,
+            exc_info=True,
+        )
+
     return state
 
 

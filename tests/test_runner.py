@@ -20493,24 +20493,25 @@ def test_effective_idle_poll_interval_uses_extended_at_threshold() -> None:
     assert runner.effective_idle_poll_interval == 300
 
 
-def test_effective_idle_poll_interval_stacks_with_rate_limit_slowdown() -> None:
-    """Adaptive and rate-limit slowdown stack via max() of candidates."""
+def test_effective_idle_poll_interval_ignores_rate_limit_slowdown() -> None:
+    """Rate-limit slowdown does not feed back into the IDLE interval.
+
+    ``_check_github_api_budget`` already throttles work to one in
+    ``github_api_slowdown_multiplier`` cycles. Folding the multiplier in
+    here too would stack to ``base * multiplier^2`` between real cycles.
+    """
     runner = _make_runner(poll_interval_sec=60)
     runner.app_config.daemon.idle_extended_after_cycles = 3
     runner.app_config.daemon.idle_extended_poll_interval_sec = 200
     runner.app_config.daemon.github_api_slowdown_multiplier = 5
 
-    runner._idle_streak = 3
-    runner._github_api_slowdown_attempts = 0
-    assert runner.effective_idle_poll_interval == 200
-
     runner._idle_streak = 0
     runner._github_api_slowdown_attempts = 2
-    assert runner.effective_idle_poll_interval == 300
+    assert runner.effective_idle_poll_interval == 60
 
     runner._idle_streak = 3
     runner._github_api_slowdown_attempts = 2
-    assert runner.effective_idle_poll_interval == 300
+    assert runner.effective_idle_poll_interval == 200
 
     runner.app_config.daemon.idle_extended_poll_interval_sec = 400
     assert runner.effective_idle_poll_interval == 400

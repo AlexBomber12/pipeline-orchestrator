@@ -1004,30 +1004,26 @@ class PipelineRunner(
 
     @property
     def effective_idle_poll_interval(self) -> int:
-        """Return the IDLE poll interval after adaptive and rate-limit slowdowns.
+        """Return the IDLE poll interval after the adaptive slow-down.
 
-        Stacks two independent slow-down sources by returning the
-        maximum of the candidate intervals: the configured base, the
-        adaptive ``idle_extended_poll_interval_sec`` once
-        ``_idle_streak`` reaches ``idle_extended_after_cycles``, and the
-        GitHub-API rate-limit multiplier when
-        ``_github_api_slowdown_attempts`` is non-zero. Using the maximum
-        guarantees neither source is silently overridden when both are
-        active.
+        Returns the configured base unless ``_idle_streak`` has reached
+        ``idle_extended_after_cycles``, in which case the longer
+        ``idle_extended_poll_interval_sec`` cadence applies. The
+        GitHub-API rate-limit slowdown is intentionally NOT folded in
+        here: ``_check_github_api_budget`` already throttles by skipping
+        ``github_api_slowdown_multiplier - 1`` of every multiplier
+        cycles, so multiplying the poll interval too would compound the
+        slowdown into ``base * multiplier^2`` between cycles that do
+        real work.
         """
         base = self.repo_config.poll_interval_sec
-        candidates = [base]
         threshold = self.app_config.daemon.idle_extended_after_cycles
         if self._idle_streak >= threshold:
-            candidates.append(
-                self.app_config.daemon.idle_extended_poll_interval_sec
+            return max(
+                base,
+                self.app_config.daemon.idle_extended_poll_interval_sec,
             )
-        if self._github_api_slowdown_attempts > 0:
-            multiplier = max(
-                1, self.app_config.daemon.github_api_slowdown_multiplier
-            )
-            candidates.append(base * multiplier)
-        return max(candidates)
+        return base
 
     def reset_idle_streak(self) -> None:
         """Reset the adaptive IDLE-polling streak (e.g. on wake)."""
