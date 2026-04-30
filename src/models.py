@@ -114,12 +114,14 @@ class RepoState(BaseModel):
     usage_api_degraded: bool = False
     coder: str | None = None
     last_stale_retrigger_at: datetime | None = None
+    last_codex_retrigger_at: datetime | None = None
 
     def __setattr__(self, name: str, value: object) -> None:
         if name == "current_pr":
             current_pr = getattr(self, "current_pr", None)
             if self._is_new_pr_transition(current_pr, value):
                 super().__setattr__("last_stale_retrigger_at", None)
+                super().__setattr__("last_codex_retrigger_at", None)
         super().__setattr__(name, value)
 
     @staticmethod

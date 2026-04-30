@@ -20848,3 +20848,383 @@ def test_run_cycle_pending_upload_retries_keep_polling_fast(
 
     assert intervals == [60, 60, 60, 60, 60]
     assert runner._idle_streak == 0
+
+
+def _codex_bot_pr(review: ReviewStatus = ReviewStatus.EYES) -> PRInfo:
+    """PRInfo in a state where the WATCH cycle would otherwise hit the
+    review-timeout branch (review is EYES/PENDING, not CHANGES_REQUESTED)."""
+    return PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.PENDING,
+        review_status=review,
+        last_activity=datetime.now(timezone.utc),
+    )
+
+
+def _codex_bot_error_comment(
+    body: str = "Something went wrong while reviewing this PR. Please try again.",
+    *,
+    user: str = "chatgpt-codex-connector[bot]",
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "user": {"login": user},
+        "body": body,
+        "created_at": created_at or "2026-04-30T12:00:00Z",
+    }
+
+
+def test_handle_watch_retriggers_on_codex_bot_error_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = _codex_bot_pr()
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [_codex_bot_error_comment()],
+    )
+
+    posted: list[tuple[int, bool]] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        posted.append((number, bypass_same_head_dedup))
+        return True, True, None
+
+    runner = _make_runner()
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert posted == [(42, True)]
+    assert runner.state.last_codex_retrigger_at is not None
+    assert any(
+        "Codex bot error comment on PR #42" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_watch_does_not_retrigger_on_non_matching_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = _codex_bot_pr()
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [
+            _codex_bot_error_comment(body="LGTM, all clear from Codex"),
+        ],
+    )
+
+    posted: list[int] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        posted.append(number)
+        return True, True, None
+
+    runner = _make_runner()
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert posted == []
+    assert runner.state.last_codex_retrigger_at is None
+
+
+def test_handle_watch_does_not_retrigger_on_non_bot_author(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = _codex_bot_pr()
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [
+            _codex_bot_error_comment(user="some-human"),
+        ],
+    )
+
+    posted: list[int] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        posted.append(number)
+        return True, True, None
+
+    runner = _make_runner()
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert posted == []
+    assert runner.state.last_codex_retrigger_at is None
+
+
+def test_handle_watch_codex_bot_error_cooldown_blocks_rapid_retriggers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 4, 30, 12, 0, tzinfo=timezone.utc)
+    pr = _codex_bot_pr()
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [
+            _codex_bot_error_comment(
+                created_at=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            ),
+        ],
+    )
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
+
+    posted: list[int] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        posted.append(number)
+        return True, True, None
+
+    runner = _make_runner()
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.state.last_codex_retrigger_at = now - timedelta(minutes=2)
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert posted == []
+    assert runner.state.last_codex_retrigger_at == now - timedelta(minutes=2)
+
+
+def test_handle_watch_codex_bot_error_skips_already_handled_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An error comment older than ``last_codex_retrigger_at`` was already
+    handled in a prior cycle and must not retrigger again."""
+    pr = _codex_bot_pr()
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [
+            _codex_bot_error_comment(
+                created_at="2026-04-30T11:00:00Z",
+            ),
+        ],
+    )
+
+    posted: list[int] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        posted.append(number)
+        return True, True, None
+
+    runner = _make_runner()
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.state.last_codex_retrigger_at = datetime(
+        2026, 4, 30, 12, 0, tzinfo=timezone.utc
+    )
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert posted == []
+
+
+def test_handle_watch_codex_bot_error_comment_api_failure_logs(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    pr = _codex_bot_pr()
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+
+    def _raise(path: str) -> list[dict[str, Any]]:
+        raise RuntimeError("api boom")
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        _raise,
+    )
+
+    runner = _make_runner()
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+
+    with caplog.at_level("WARNING", logger=watch_module.logger.name):
+        asyncio.run(runner.handle_watch())
+
+    assert any(
+        "codex bot error comments for PR #42" in record.message
+        for record in caplog.records
+    )
+    assert runner.state.last_codex_retrigger_at is None
+
+
+def test_handle_watch_codex_bot_error_skips_unparseable_created_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = _codex_bot_pr()
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_parse_iso",
+        lambda value: None,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [
+            _codex_bot_error_comment(),
+            _codex_bot_error_comment(),
+        ],
+    )
+
+    posted: list[int] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        posted.append(number)
+        return True, True, None
+
+    runner = _make_runner()
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert posted == []
+    assert runner.state.last_codex_retrigger_at is None
+
+
+def test_handle_watch_codex_bot_error_normalizes_naive_timestamps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Naive timestamps from GitHub and naive ``last_codex_retrigger_at``
+    are both treated as UTC, so the cooldown comparison still works."""
+    pr = _codex_bot_pr()
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+
+    naive_created = datetime(2026, 4, 30, 13, 0)
+    frozen_now = datetime(2026, 4, 30, 13, 30, tzinfo=timezone.utc)
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return frozen_now if tz is None else frozen_now.astimezone(tz)
+
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_parse_iso",
+        lambda value: naive_created if value else None,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [_codex_bot_error_comment()],
+    )
+
+    posted: list[int] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        posted.append(number)
+        return True, True, None
+
+    runner = _make_runner()
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.state.last_codex_retrigger_at = datetime(2026, 4, 30, 12, 0)
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert posted == [42]
+    assert runner.state.last_codex_retrigger_at == frozen_now
+
+
+def test_repo_state_resets_codex_retrigger_on_pr_transition() -> None:
+    state = RepoState(
+        url="https://github.com/octo/demo",
+        name="octo__demo",
+        last_updated=datetime.now(timezone.utc),
+    )
+    state.current_pr = PRInfo(number=1, branch="pr-001")
+    state.last_codex_retrigger_at = datetime.now(timezone.utc)
+
+    state.current_pr = PRInfo(number=2, branch="pr-002")
+
+    assert state.last_codex_retrigger_at is None
