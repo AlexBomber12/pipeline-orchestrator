@@ -90,12 +90,22 @@ class PRInfo(BaseModel):
         ``push_count += 1`` so an intermittent rev-parse failure during
         a real auto-fix push is still counted — recomputing from the
         unchanged set size would otherwise silently drop the push.
+
+        On upgrade from pre-PR-195 state, persisted ``PRInfo`` entries
+        can have ``push_count > 0`` while ``observed_head_shas`` is
+        empty (the field default). Bumping ``push_count`` by 1 for each
+        previously-unseen SHA preserves the legacy count *and* ensures
+        every genuine post-upgrade push is registered, instead of
+        being suppressed until the set cardinality catches up to the
+        old counter (the ``max(len(set), push_count)`` pitfall).
         """
-        if sha:
-            self.observed_head_shas.add(sha)
-            self.push_count = max(len(self.observed_head_shas), self.push_count)
-        else:
+        if not sha:
             self.push_count += 1
+            return
+        if sha in self.observed_head_shas:
+            return
+        self.observed_head_shas.add(sha)
+        self.push_count += 1
 
 
 class EventEntry(TypedDict, total=False):

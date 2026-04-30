@@ -76,6 +76,43 @@ def test_empty_sha_after_known_push_still_increments_count() -> None:
     assert pr.push_count == 3
 
 
+def test_upgrade_from_pre_pr195_state_counts_new_pushes() -> None:
+    """Pre-PR-195 PRInfo (push_count > 0, empty SHA set) must keep counting.
+
+    Persisted dashboards that pre-date PR-195 carry ``push_count`` from
+    the legacy ``+= 1`` accounting but ``observed_head_shas`` defaults
+    to an empty set after the schema bump. The first new push records a
+    fresh SHA whose set cardinality (1) is below the legacy
+    ``push_count``; the previous ``max(len, push_count)`` formula left
+    the counter frozen for many real pushes. Each new SHA must bump
+    ``push_count`` by 1 from its current value so the dashboard
+    ``Pushes`` metric stays in sync after upgrade.
+    """
+    pr = PRInfo(
+        number=9,
+        branch="pr-009",
+        push_count=5,
+        observed_head_shas=set(),
+    )
+
+    pr.record_observed_head("post-upgrade-sha-1")
+    assert pr.push_count == 6
+    assert pr.observed_head_shas == {"post-upgrade-sha-1"}
+
+    pr.record_observed_head("post-upgrade-sha-2")
+    assert pr.push_count == 7
+    assert pr.observed_head_shas == {
+        "post-upgrade-sha-1",
+        "post-upgrade-sha-2",
+    }
+
+    pr.record_observed_head("post-upgrade-sha-2")
+    assert pr.push_count == 7
+
+    pr.record_observed_head("")
+    assert pr.push_count == 8
+
+
 def test_cross_restart_persistence_preserves_observed_set() -> None:
     """RepoState round-trips through Redis as JSON; the SHA set must survive."""
     state = RepoState(
