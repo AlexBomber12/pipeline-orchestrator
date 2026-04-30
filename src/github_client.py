@@ -1232,29 +1232,25 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
     if cached is not None and (now - cached[0]) < _CI_STATUS_CACHE_TTL_SECONDS:
         return list(cached[1]), dict(cached[2]), cached[3]
 
+    # check-runs is a paginated endpoint (per_page max 100). A commit can
+    # carry more than 100 runs, and ``_map_rest_ci_status_to_enum`` reads
+    # every entry — truncating to page 1 would let a failing or pending
+    # run beyond the cap masquerade as SUCCESS and misclassify the PR as
+    # mergeable, so we walk every page rather than relying on ETag-cached
+    # single-page reads.
     check_runs_path = f"repos/{repo}/commits/{sha}/check-runs?per_page=100"
     check_runs_ok = False
     try:
-        cr_payload = retry_transient(
-            lambda: _etag_get(check_runs_path),
-            operation_name=f"gh api {check_runs_path}",
-        )
+        cr_pages = _gh_api_paginated(check_runs_path)
     except RuntimeError:
-        cr_payload = None
+        cr_pages = None
     else:
         check_runs_ok = True
-    if isinstance(cr_payload, list):
-        # Test/legacy mock that returned --paginate --slurp shape: list of pages.
-        for page in cr_payload:
-            if not isinstance(page, dict):
-                continue
+    if isinstance(cr_pages, list):
+        for page in cr_pages:
             runs = page.get("check_runs")
             if isinstance(runs, list):
                 check_runs.extend(r for r in runs if isinstance(r, dict))
-    elif isinstance(cr_payload, dict):
-        runs = cr_payload.get("check_runs")
-        if isinstance(runs, list):
-            check_runs.extend(r for r in runs if isinstance(r, dict))
 
     status_path = f"repos/{repo}/commits/{sha}/status"
     status_ok = False

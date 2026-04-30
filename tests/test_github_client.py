@@ -3407,14 +3407,21 @@ def test_fetch_ci_status_rest_combines_check_runs_and_status(
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         calls.append(list(args))
         if any("check-runs" in a for a in args):
-            return {
-                "total_count": 3,
-                "check_runs": [
-                    {"id": 1, "conclusion": "success"},
-                    {"id": 2, "conclusion": "neutral"},
-                    {"id": 3, "status": "in_progress"},
-                ],
-            }
+            return [
+                {
+                    "total_count": 2,
+                    "check_runs": [
+                        {"id": 1, "conclusion": "success"},
+                        {"id": 2, "conclusion": "neutral"},
+                    ],
+                },
+                {
+                    "total_count": 1,
+                    "check_runs": [
+                        {"id": 3, "status": "in_progress"},
+                    ],
+                },
+            ]
         return {"state": "pending", "statuses": [{"state": "pending"}]}
 
     monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
@@ -3423,6 +3430,8 @@ def test_fetch_ci_status_rest_combines_check_runs_and_status(
 
     assert [r["id"] for r in check_runs] == [1, 2, 3]
     assert status_payload == {"state": "pending", "statuses": [{"state": "pending"}]}
+    assert any("--paginate" in c for c in calls)
+    assert any("per_page=100" in a for c in calls for a in c)
     assert any("--include" in c for c in calls)
     assert fetch_ok is True
 
