@@ -62,7 +62,7 @@ PR-187/188/189/190/191 — все 5 не начаты. Sprint целиком def
 
 ### Sprint F4.2 — Testing infra + cleanup (PARTIAL)
 - **DONE:** PR-193 upload locks (`_upload_locks` dict в `app.py`).
-- **NOT DONE:** PR-192 nightly e2e schedule, PR-194 STALLED documentation, PR-195 MERGE dead value cleanup.
+- **NOT DONE:** PR-192 nightly e2e schedule, PR-194 STALLED documentation, PR-195 MERGE dead value cleanup (PR-195 → renumbered PR-198 in current backlog; verification 2026-04-30 rejected the cleanup, see Polish batch PR-198 below).
 
 ### Sigkill multi-race fixes (2026-04-28 session)
 PR-228 (Coder ESCALATE), PR-232 (test fixture isolation /stop), PR-234 (REST quota), PR-236 (shim explicit lease + entrypoint mutex) все merged. Test_sigkill_recovery deterministically green в CI.
@@ -277,7 +277,7 @@ Numbering продолжает существующую sequence от PR-180 (п
 - **PR-195** push_count desync fix. UI metric совпадает с GitHub Commits tab — single source of truth.
 - **PR-196** AGENTS.md prohibit draft PRs (text update + PR-220 reconciliation example).
 - **PR-197** Document WATCH STALLED substate (Sprint F4.2 PR-194). Confirm intentional vs bug, document semantics в architecture docs.
-- **PR-198** PipelineState.MERGE dead value cleanup (Sprint F4.2 PR-195).
+- **PR-198** PipelineState.MERGE dead value cleanup (Sprint F4.2 PR-195). **REJECTED — value is reachable.** Verification (2026-04-30): no production code path assigns `state.state = PipelineState.MERGE`, but comparison sites exist in `_TRANSIENT_STATES` (`src/daemon/runner.py:89`), the pause-substate set (`src/daemon/runner.py:1293`), `_DEFERRED_RUNNER_CONFIG_STATES` (`src/daemon/main.py:66`), two state sets in `src/web/app.py`, and four jinja templates. These defensive references guard `RepoState.model_validate_json` against stale Redis payloads written by older daemon binaries that may carry `state == "MERGE"`. Removing the enum value would break that backward-compatibility path. Architectural truth (MERGE has no live transition; merges happen inline inside `handle_watch`) is already documented in `docs/architecture-state-machine.md`.
 - **PR-199** Event text clarity pass — audit log_event calls, normalize messages, remove ambiguity (Sprint F3.3 PR-184).
 
 **Exit criteria:** UI polished, documentation caught up, dead code removed.
