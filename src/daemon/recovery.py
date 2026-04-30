@@ -215,6 +215,20 @@ class RecoveryMixin:
             len(tasks),
         )
 
+        # PR-186 Codex P1: rehydrate the crashed-task set from any CANCELED
+        # entries in the parsed queue. The crashed-task cancellation is what
+        # tells ``_select_next_task_from_dag`` to skip the task on the next
+        # IDLE cycle; without this rehydrate, a daemon restart after one
+        # IDLE cycle has already written CANCELED to QUEUE.md would start
+        # with an empty set, ``recover_state`` would see no DOING entry to
+        # re-mark, and the selector would recompute the task as TODO and
+        # dispatch it again — defeating the "manual re-upload required"
+        # contract and reintroducing the crash loop. The set is cleared
+        # only when the user re-uploads the task file (see ``repo_ops``).
+        for queued in tasks:
+            if queued.status == TaskStatus.CANCELED:
+                self._crashed_task_pr_ids.add(queued.pr_id)
+
         doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
 
         pending_sync = next(
@@ -279,23 +293,39 @@ class RecoveryMixin:
                 )
                 return True
 
-            self.state.state = PipelineState.CODING
-            self.log_event(
-                f"Recovered: DOING task {doing.pr_id}, no PR "
-                "-> re-running CODING"
-            )
+            # PR-186: A DOING task with no matching PR after recovery is a
+            # crash signature (subprocess kill, OOM, daemon restart mid-
+            # CODING). Re-running CODING here used to loop the same crash
+            # forever; instead preserve any unpushed commits on origin so
+            # the work is not lost, then mark the task crashed/CANCELED so
+            # the next IDLE cycle skips it. The user re-uploads the task
+            # file to retry.
             if doing.branch and not self._preserve_crashed_run_commits(
                 doing.branch
             ):
                 self.state.state = PipelineState.ERROR
                 self.state.error_message = (
                     f"recover_state: could not preserve crashed-run "
-                    f"commits on {doing.branch!r}; refusing to re-run "
-                    "CODING"
+                    f"commits on {doing.branch!r}; refusing to mark "
+                    "CANCELED"
                 )
                 self.log_event(self.state.error_message)
                 return True
-            await self.handle_coding()
+            self._crashed_task_pr_ids.add(doing.pr_id)
+            self.state.current_task = None
+            self.state.current_pr = None
+            self.state.state = PipelineState.IDLE
+            # P2 review: a prior ERROR transition (e.g. preflight failure
+            # before the crash) leaves ``error_message`` populated. Now
+            # that recovery has converged on IDLE with the crashed task
+            # parked, clear that stale text so the dashboard does not
+            # surface a misleading failure banner against a quiesced
+            # repo.
+            self.state.error_message = None
+            self.log_event(
+                f"Task {doing.pr_id} crashed, marking CANCELED. "
+                "Manually re-upload to retry."
+            )
             return True
 
         queued_by_branch = {

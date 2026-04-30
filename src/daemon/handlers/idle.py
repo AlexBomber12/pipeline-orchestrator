@@ -283,6 +283,7 @@ class IdleMixin:
             stopped_task_pr_ids = getattr(self, "_user_stopped_task_pr_ids", set())
             if current_task_pr_id in stopped_task_pr_ids:
                 current_task_pr_id = None
+            crashed_task_pr_ids = getattr(self, "_crashed_task_pr_ids", set())
             statuses = {
                 header.pr_id: derive_task_status(
                     header,
@@ -293,6 +294,26 @@ class IdleMixin:
                 )
                 for header in headers
             }
+            # PR-186: Recovery marks DOING-without-PR tasks crashed before
+            # transitioning to IDLE. Override their derived status to
+            # CANCELED here so get_eligible_tasks excludes them and the
+            # regenerated QUEUE.md surfaces the CANCELED state to the
+            # dashboard. Existing DONE rulings (e.g. the merged PR landed
+            # before recovery resumed) win — DONE is terminal, never
+            # downgraded to CANCELED. A DOING ruling means
+            # ``derive_task_status`` matched a now-visible open PR (e.g.
+            # ``get_open_prs`` was stale on the recovery cycle and the PR
+            # surfaced later); preserving DOING lets the runner resume
+            # WATCH/merge for that real PR rather than stranding it
+            # behind the crashed flag, and clearing the flag ensures the
+            # next selector pick treats the task as live again.
+            for pr_id in list(statuses.keys()):
+                if pr_id not in crashed_task_pr_ids:
+                    continue
+                if statuses[pr_id] in (TaskStatus.DONE, TaskStatus.DOING):
+                    crashed_task_pr_ids.discard(pr_id)
+                    continue
+                statuses[pr_id] = TaskStatus.CANCELED
             eligible = get_eligible_tasks(dag_headers, statuses)
             stopped_eligible = [
                 header

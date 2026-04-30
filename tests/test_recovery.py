@@ -513,41 +513,74 @@ def test_recover_doing_task_skipped_when_already_merged_on_origin(
     )
 
 
-def test_recover_doing_task_without_pr_rerun_coding(
+def test_recover_doing_task_without_pr_marks_canceled_and_idles(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """DOING task + no matching PR -> CODING + re-run handle_coding()."""
+    """PR-186: DOING task + no matching PR is a crash signature; recovery
+    must mark it CANCELED and stay IDLE rather than re-running CODING in a
+    loop."""
     task = _doing_task()
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo, **kw: []
     )
 
-    coding_calls: list[PipelineState] = []
+    coding_calls: list[str] = []
 
-    async def fake_coding() -> None:
-        # Capture the state at the moment handle_coding was invoked so the
-        # test can prove recover_state transitioned to CODING before
-        # calling.
-        coding_calls.append(runner.state.state)
+    async def fake_coding() -> None:  # pragma: no cover - must not fire
+        coding_calls.append("coding")
 
     runner = _make_runner()
     runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
-    # Stub out the preserve helper so this test focuses on the
-    # state-transition contract. A dedicated test below covers its
-    # ordering relative to handle_coding.
     runner._preserve_crashed_run_commits = lambda branch: True  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
-    assert coding_calls == [PipelineState.CODING]
-    assert runner.state.current_task is not None
-    assert runner.state.current_task.pr_id == "PR-042"
+    assert coding_calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
     assert runner.state.current_pr is None
+    assert runner._crashed_task_pr_ids == {"PR-042"}
     assert any(
-        "Recovered: DOING task PR-042" in e["event"]
-        and "re-running CODING" in e["event"]
+        "Task PR-042 crashed, marking CANCELED. "
+        "Manually re-upload to retry." == e["event"]
         for e in runner.state.history
     )
+
+
+def test_recover_seeds_crashed_set_from_canceled_queue_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-186 Codex P1: After a daemon restart that follows an IDLE cycle
+    which already wrote CANCELED to QUEUE.md, ``recover_state`` no longer
+    sees a DOING entry but must still know the task was crashed. Otherwise
+    the next ``_select_next_task_from_dag`` would recompute the task as
+    TODO and dispatch it again, defeating the manual-re-upload contract.
+    The fix re-seeds ``_crashed_task_pr_ids`` from any CANCELED queue
+    entry so the cancellation persists across restarts until the user
+    re-uploads."""
+    canceled = QueueTask(
+        pr_id="PR-042",
+        title="Crashed earlier",
+        status=TaskStatus.CANCELED,
+        branch="pr-042-inflight",
+    )
+    todo = _todo_task()
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
+    )
+
+    runner = _make_runner()
+    runner._parse_base_queue = lambda **_: [canceled, todo]  # type: ignore[method-assign]
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    # The crashed-task set must include the CANCELED entry so the next
+    # IDLE cycle's selector overrides its derived status to CANCELED
+    # rather than re-dispatching it as TODO.
+    assert runner._crashed_task_pr_ids == {"PR-042"}
+    # The TODO task is unaffected by the rehydrate.
+    assert "PR-043" not in runner._crashed_task_pr_ids
 
 
 def test_recover_paused_doing_task_without_pr_defers_coding(
@@ -616,14 +649,13 @@ def test_recover_paused_doing_task_without_pr_errors_when_preserve_fails(
     )
 
 
-def test_recover_preserves_crashed_run_commits_before_coding(
+def test_recover_preserves_crashed_run_commits_before_canceling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Codex P1: Claude's PLANNED PR flow recreates the task branch from
-    ``origin/main``, which would orphan unpushed local commits from a
-    crashed run. ``recover_state`` must push the local task branch before
-    handing off to ``handle_coding`` so the work is durable on origin.
-    """
+    """PR-186: Even when recovery now marks the crashed task CANCELED
+    instead of re-running CODING, any unpushed local commits from the
+    crashed run must still be preserved on origin first so the work is
+    not lost when the user re-uploads to retry."""
     task = _doing_task()
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo, **kw: []
@@ -631,7 +663,7 @@ def test_recover_preserves_crashed_run_commits_before_coding(
 
     events: list[str] = []
 
-    async def fake_coding() -> None:
+    async def fake_coding() -> None:  # pragma: no cover - must not fire
         events.append("coding")
 
     def fake_run(cmd: list[str], **kwargs: Any) -> Any:
@@ -663,16 +695,16 @@ def test_recover_preserves_crashed_run_commits_before_coding(
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
-    # Preserve push must happen before handle_coding re-runs CODING.
-    push_idx = next(i for i, e in enumerate(events) if e.startswith("push:"))
-    coding_idx = events.index("coding")
-    assert push_idx < coding_idx
-    # Must push the exact task branch.
+    # Preserve push must happen before recovery transitions to IDLE so
+    # the work is durable on origin even when the task is CANCELED.
+    assert "coding" not in events
     assert "push:pr-042-inflight:pr-042-inflight" in events
     assert any(
         "Preserved crashed-run commits on pr-042-inflight" in e["event"]
         for e in runner.state.history
     )
+    assert runner.state.state == PipelineState.IDLE
+    assert "PR-042" in runner._crashed_task_pr_ids
 
 
 def test_recover_preserve_tolerates_missing_local_branch(
@@ -715,8 +747,12 @@ def test_recover_preserve_tolerates_missing_local_branch(
 
     # No push when local branch doesn't exist.
     assert pushes == []
-    assert runner.state.current_task is not None
-    assert runner.state.current_task.pr_id == "PR-042"
+    # PR-186: Even with no commits to preserve, the crashed task is
+    # still marked CANCELED and recovery returns IDLE rather than
+    # leaving the DOING task attached to be re-picked.
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner._crashed_task_pr_ids == {"PR-042"}
 
 
 def test_recover_preserve_refuses_base_branch(
@@ -1054,8 +1090,61 @@ def test_recover_no_doing_no_prs_stays_idle(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert runner.state.current_pr is None
+    # PR-186: A clean-slate IDLE shutdown must not mark anything CANCELED.
+    # The crashed-set is only populated when recovery detects a DOING task
+    # without a matching PR (the crash signature).
+    assert runner._crashed_task_pr_ids == set()
     assert any(
         "no DOING tasks, no open PRs" in e["event"]
+        for e in runner.state.history
+    )
+    assert not any(
+        "crashed, marking CANCELED" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_recover_crashed_preflight_task_marks_canceled_and_idles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-186: A task that crashed during PREFLIGHT (preflight check
+    failed mid-task and the daemon restarted) leaves the same crash
+    signature as a CODING crash: a DOING task in QUEUE.md with no
+    matching PR. Recovery must mark it CANCELED and stay IDLE rather
+    than re-running the failing task. The crashed-task set must persist
+    so the next IDLE cycle's selector skips it instead of dispatching
+    another doomed run."""
+    task = _doing_task()
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
+    )
+
+    coding_calls: list[str] = []
+
+    async def fake_coding() -> None:  # pragma: no cover - must not fire
+        coding_calls.append("coding")
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "preflight failed: working tree dirty"
+    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner.handle_coding = fake_coding  # type: ignore[method-assign]
+    runner._preserve_crashed_run_commits = lambda branch: True  # type: ignore[method-assign]
+
+    asyncio.run(runner.recover_state())
+
+    assert coding_calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner._crashed_task_pr_ids == {"PR-042"}
+    # Codex P2: a prior ERROR transition (preflight failure) leaves
+    # ``error_message`` populated. Recovery's CANCELED+IDLE landing must
+    # clear it so the dashboard does not surface a stale failure banner
+    # against a quiesced repo.
+    assert runner.state.error_message is None
+    assert any(
+        "Task PR-042 crashed, marking CANCELED. "
+        "Manually re-upload to retry." == e["event"]
         for e in runner.state.history
     )
 
@@ -1385,14 +1474,14 @@ def test_run_cycle_transient_discovery_failure_stays_retryable(
     assert runner.state.current_task.pr_id == "PR-042"
 
 
-def test_run_cycle_coding_failure_during_recovery_is_not_retried(
+def test_run_cycle_recovery_never_invokes_handle_coding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If recover_state decides CODING and the re-run of handle_coding
-    then fails, discovery has nevertheless completed and _recovered must
-    be set. Re-running handle_coding on the next cycle would be unsafe
-    (it could create a duplicate PR for the same task); the failure
-    belongs to the normal ERROR path, not to a second recovery attempt."""
+    """PR-186 (was: coding-failure-during-recovery): recovery no longer
+    re-runs CODING on a crashed DOING task. Discovery still completes
+    (``_recovered`` is set), but the crashed task is marked CANCELED and
+    handle_coding is never called from recover_state, so a CODING crash
+    cannot loop on the same task across recovery cycles."""
     task = _doing_task()
     monkeypatch.setattr(
         runner_module.github_client, "get_open_prs", lambda repo, **kw: []
@@ -1400,10 +1489,8 @@ def test_run_cycle_coding_failure_during_recovery_is_not_retried(
 
     coding_calls: list[int] = []
 
-    async def failing_coding() -> None:
+    async def failing_coding() -> None:  # pragma: no cover - must not fire
         coding_calls.append(1)
-        runner.state.state = PipelineState.ERROR
-        runner.state.error_message = "claude CLI crashed"
 
     runner = _make_runner()
     runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
@@ -1412,10 +1499,10 @@ def test_run_cycle_coding_failure_during_recovery_is_not_retried(
 
     result = asyncio.run(runner.recover_state())
 
-    assert result is True  # discovery completed, do not retry recovery
-    assert coding_calls == [1]
-    assert runner.state.state == PipelineState.ERROR
-    assert "claude CLI crashed" in (runner.state.error_message or "")
+    assert result is True
+    assert coding_calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert "PR-042" in runner._crashed_task_pr_ids
 
 
 def test_run_cycle_subsequent_cycle_still_runs_preflight(
