@@ -4630,6 +4630,39 @@ def test_etag_get_paginated_stops_when_short_page(
     assert len(captured) == 1
 
 
+def test_etag_get_paginated_walks_past_legacy_100_page_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The walk must follow ``gh api --paginate`` semantics: no hard page cap.
+
+    Capping at 100 pages with ``per_page=100`` would silently truncate
+    ``repos/{repo}/pulls?state=closed`` lookups on large repos at 10,000
+    items, hiding merged history that ``get_merged_prs`` relies on. The
+    short-page heuristic is the only termination signal.
+    """
+    full_pages = 150  # well past the removed 100-page cap
+    full_body = '[{"n": 1}, {"n": 2}]'  # per_page=2 to keep memory small
+    short_body = '[{"n": 99}]'
+    state = {"calls": 0}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        state["calls"] += 1
+        body = full_body if state["calls"] <= full_pages else short_body
+        return _FakeCompletedProcess(
+            stdout=_build_include_response(body, etag=f'W/"p{state["calls"]}"')
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    items = github_client._etag_get_paginated(
+        "repos/owner/name/pulls?state=closed&per_page=2"
+    )
+
+    assert items is not None
+    assert len(items) == full_pages * 2 + 1
+    assert state["calls"] == full_pages + 1
+
+
 def test_etag_get_paginated_uses_default_per_page_when_unspecified(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

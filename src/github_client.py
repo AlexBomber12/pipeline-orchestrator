@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import itertools
 import json
 import logging
 import re
@@ -110,7 +111,6 @@ _ETAG_PAGINATED_PATH_RE = re.compile(
     r"^repos/[^/]+/[^/]+/pulls(?:\?[^#]*)?$"
 )
 _ETAG_PAGINATED_DEFAULT_PER_PAGE = 30
-_ETAG_PAGINATED_MAX_PAGES = 100
 
 
 _HTTP_STATUS_RE = re.compile(r"^HTTP/\S+\s+(\d{3})", re.MULTILINE)
@@ -1190,11 +1190,14 @@ def _etag_get_paginated(path: str) -> list[dict] | None:
     is free against the rate-limit budget. Pages with real changes
     round-trip a fresh 200 and refresh the cache.
 
-    Stops early when a page returns fewer items than the per-page size
-    declared in the URL (the GitHub convention for "last page"); when the
-    URL does not declare ``per_page=`` the helper assumes the GitHub
-    default (30). A bounded ``_ETAG_PAGINATED_MAX_PAGES`` keeps the loop
-    finite if the upstream signals an oversized list.
+    Stops when a page returns fewer items than the per-page size declared
+    in the URL (the GitHub convention for "last page"); when the URL does
+    not declare ``per_page=`` the helper assumes the GitHub default (30).
+    No hard page cap: ``repos/{owner}/{name}/pulls?state=closed`` for a
+    large repo can exceed 10,000 PRs, and the legacy ``gh api --paginate``
+    walked until exhausted — capping at 100 pages would silently truncate
+    merged history on those repos and let ``get_merged_prs`` derive
+    queue/task status from an incomplete view.
 
     Returns ``None`` only when the very first page cannot be fetched or
     parsed; partial results from later pages are surfaced as-is so a
@@ -1212,7 +1215,7 @@ def _etag_get_paginated(path: str) -> list[dict] | None:
         else _ETAG_PAGINATED_DEFAULT_PER_PAGE
     )
     items: list[dict] = []
-    for page_num in range(1, _ETAG_PAGINATED_MAX_PAGES + 1):
+    for page_num in itertools.count(1):
         url = f"{path}{sep}page={page_num}"
         try:
             payload = retry_transient(
