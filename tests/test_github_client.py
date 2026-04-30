@@ -4533,6 +4533,390 @@ def test_etag_get_empty_200_body_returns_none(
     assert github_client._etag_get("repos/owner/name/pulls/9") is None
 
 
+# ---------------------------------------------------------------------------
+# _etag_get_paginated + _invalidate_etag_cache (PR-191b: list endpoints)
+# ---------------------------------------------------------------------------
+
+
+def test_etag_get_paginated_walks_pages_and_caches_each(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each page must round-trip its own ETag and land in ``_etag_cache``."""
+    captured: list[list[str]] = []
+    page1_body = "[" + ",".join(f'{{"n": {i}}}' for i in range(100)) + "]"
+    page2_body = '[{"n": 100}, {"n": 101}]'
+    responses = iter(
+        [
+            _build_include_response(page1_body, etag='W/"p1"'),
+            _build_include_response(page2_body, etag='W/"p2"'),
+        ]
+    )
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured.append(cmd)
+        return _FakeCompletedProcess(stdout=next(responses))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    items = github_client._etag_get_paginated(
+        "repos/owner/name/pulls?state=open&per_page=100"
+    )
+
+    assert items is not None
+    assert [item["n"] for item in items] == list(range(102))
+    assert len(captured) == 2
+    assert (
+        "repos/owner/name/pulls?state=open&per_page=100&page=1"
+        in github_client._etag_cache
+    )
+    assert (
+        "repos/owner/name/pulls?state=open&per_page=100&page=2"
+        in github_client._etag_cache
+    )
+
+
+def test_etag_get_paginated_304_returns_cached_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 304 on a previously-fetched page must surface the cached payload."""
+    page1_body = "[" + ",".join(f'{{"n": {i}}}' for i in range(100)) + "]"
+    page2_body = '[{"n": 100}]'
+    responses = iter(
+        [
+            _build_include_response(page1_body, etag='W/"p1"'),
+            _build_include_response(page2_body, etag='W/"p2"'),
+            _build_include_response("", status=304, etag='W/"p1"'),
+            _build_include_response("", status=304, etag='W/"p2"'),
+        ]
+    )
+    captured: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured.append(cmd)
+        return _FakeCompletedProcess(stdout=next(responses))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    base = "repos/owner/name/pulls?state=open&per_page=100"
+    first = github_client._etag_get_paginated(base)
+    second = github_client._etag_get_paginated(base)
+
+    assert first == [{"n": i} for i in range(101)]
+    assert second == first
+    # Second walk must echo the cached ETags via If-None-Match.
+    assert any('If-None-Match: W/"p1"' in arg for arg in captured[2])
+    assert any('If-None-Match: W/"p2"' in arg for arg in captured[3])
+
+
+def test_etag_get_paginated_stops_when_short_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page shorter than ``per_page`` ends the walk without an extra call."""
+    captured: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured.append(cmd)
+        return _FakeCompletedProcess(
+            stdout=_build_include_response('[{"n": 1}]', etag='W/"only"')
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    items = github_client._etag_get_paginated(
+        "repos/owner/name/pulls?state=closed&per_page=100"
+    )
+
+    assert items == [{"n": 1}]
+    assert len(captured) == 1
+
+
+def test_etag_get_paginated_walks_past_legacy_100_page_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The walk must follow ``gh api --paginate`` semantics: no hard page cap.
+
+    Capping at 100 pages with ``per_page=100`` would silently truncate
+    ``repos/{repo}/pulls?state=closed`` lookups on large repos at 10,000
+    items, hiding merged history that ``get_merged_prs`` relies on. The
+    short-page heuristic is the only termination signal.
+    """
+    full_pages = 150  # well past the removed 100-page cap
+    full_body = '[{"n": 1}, {"n": 2}]'  # per_page=2 to keep memory small
+    short_body = '[{"n": 99}]'
+    state = {"calls": 0}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        state["calls"] += 1
+        body = full_body if state["calls"] <= full_pages else short_body
+        return _FakeCompletedProcess(
+            stdout=_build_include_response(body, etag=f'W/"p{state["calls"]}"')
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    items = github_client._etag_get_paginated(
+        "repos/owner/name/pulls?state=closed&per_page=2"
+    )
+
+    assert items is not None
+    assert len(items) == full_pages * 2 + 1
+    assert state["calls"] == full_pages + 1
+
+
+def test_etag_get_paginated_uses_default_per_page_when_unspecified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without ``per_page=`` in the URL, GitHub's 30-default terminates the walk."""
+    body = "[" + ",".join(f'{{"n": {i}}}' for i in range(15)) + "]"
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(
+            stdout=_build_include_response(body, etag='W/"single"')
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    items = github_client._etag_get_paginated("repos/owner/name/pulls")
+
+    assert items == [{"n": i} for i in range(15)]
+
+
+def test_etag_get_paginated_first_page_none_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A None payload on the first page (e.g. 5xx) yields None overall."""
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(
+            stdout=_build_include_response("server error", status=500, etag=None)
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        github_client._etag_get_paginated(
+            "repos/owner/name/pulls?state=open&per_page=100"
+        )
+        is None
+    )
+
+
+def test_etag_get_paginated_first_page_non_list_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An object body (not a JSON array) on the first page yields None."""
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(
+            stdout=_build_include_response('{"unexpected": true}', etag='W/"v1"')
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        github_client._etag_get_paginated(
+            "repos/owner/name/pulls?state=open&per_page=100"
+        )
+        is None
+    )
+
+
+def test_etag_get_paginated_later_page_none_surfaces_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-walk failure surfaces the items collected so far rather than dropping all."""
+    page1_body = "[" + ",".join(f'{{"n": {i}}}' for i in range(100)) + "]"
+    responses = iter(
+        [
+            _build_include_response(page1_body, etag='W/"p1"'),
+            _build_include_response("server error", status=500, etag=None),
+        ]
+    )
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(stdout=next(responses))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    items = github_client._etag_get_paginated(
+        "repos/owner/name/pulls?state=open&per_page=100"
+    )
+    assert items == [{"n": i} for i in range(100)]
+
+
+def test_etag_get_paginated_later_page_non_list_breaks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-list response on a later page stops the walk with what was collected."""
+    page1_body = "[" + ",".join(f'{{"n": {i}}}' for i in range(100)) + "]"
+    responses = iter(
+        [
+            _build_include_response(page1_body, etag='W/"p1"'),
+            _build_include_response('{"oops": 1}', etag='W/"p2"'),
+        ]
+    )
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(stdout=next(responses))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    items = github_client._etag_get_paginated(
+        "repos/owner/name/pulls?state=open&per_page=100"
+    )
+    assert items == [{"n": i} for i in range(100)]
+
+
+def test_etag_get_paginated_first_page_runtime_error_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first-page hard ``gh`` failure must propagate so callers can react."""
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(stderr="boom", returncode=1)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        github_client._etag_get_paginated(
+            "repos/owner/name/pulls?state=open&per_page=100"
+        )
+
+
+def test_etag_get_paginated_later_page_runtime_error_breaks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later-page hard failure leaves earlier items intact."""
+    page1_body = "[" + ",".join(f'{{"n": {i}}}' for i in range(100)) + "]"
+    state = {"calls": 0}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return _FakeCompletedProcess(
+                stdout=_build_include_response(page1_body, etag='W/"p1"')
+            )
+        return _FakeCompletedProcess(stderr="transient", returncode=1)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        "src.github_client.is_transient_error", lambda exc: False
+    )
+
+    items = github_client._etag_get_paginated(
+        "repos/owner/name/pulls?state=open&per_page=100"
+    )
+    assert items == [{"n": i} for i in range(100)]
+
+
+def test_gh_api_paginated_routes_pulls_list_through_etag_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_gh_api_paginated`` must dispatch top-level pulls list paths to ``_etag_get_paginated``."""
+    routed: list[str] = []
+
+    monkeypatch.setattr(
+        "src.github_client._etag_get_paginated",
+        lambda path: routed.append(path) or [{"n": 1}],
+    )
+
+    result = github_client._gh_api_paginated(
+        "repos/owner/name/pulls?state=open&per_page=100"
+    )
+
+    assert result == [{"n": 1}]
+    assert routed == ["repos/owner/name/pulls?state=open&per_page=100"]
+
+
+def test_gh_api_paginated_keeps_legacy_slurp_for_other_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sub-resource lists (comments, reactions) must keep the slurp flow."""
+    routed: list[str] = []
+
+    def fake_etag_helper(path: str) -> list[dict]:
+        routed.append(path)
+        raise AssertionError("should not be called for sub-resource paths")
+
+    monkeypatch.setattr("src.github_client._etag_get_paginated", fake_etag_helper)
+    monkeypatch.setattr(
+        "src.github_client.run_gh",
+        lambda args: [[{"id": 1}], [{"id": 2}]],
+    )
+
+    result = github_client._gh_api_paginated(
+        "repos/owner/name/issues/42/comments"
+    )
+
+    assert result == [{"id": 1}, {"id": 2}]
+    assert routed == []
+
+
+def test_invalidate_etag_cache_drops_matching_prefixes_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_invalidate_etag_cache`` must remove only the prefix-matching entries."""
+    github_client._etag_cache_put(
+        "repos/owner/name/pulls?state=open&per_page=100&page=1",
+        'W/"a"',
+        [{"n": 1}],
+    )
+    github_client._etag_cache_put(
+        "repos/owner/name/pulls?state=closed&page=1",
+        'W/"b"',
+        [{"n": 2}],
+    )
+    github_client._etag_cache_put(
+        "repos/owner/name/issues/42/comments",
+        'W/"c"',
+        [{"id": 3}],
+    )
+
+    github_client._invalidate_etag_cache("repos/owner/name/pulls")
+
+    assert "repos/owner/name/issues/42/comments" in github_client._etag_cache
+    assert not any(
+        key.startswith("repos/owner/name/pulls")
+        for key in github_client._etag_cache
+    )
+
+
+def test_invalidate_etag_cache_no_op_when_prefix_absent() -> None:
+    """A prefix that matches nothing must leave the cache untouched."""
+    github_client._etag_cache_put(
+        "repos/owner/name/pulls?state=open&page=1",
+        'W/"a"',
+        [{"n": 1}],
+    )
+
+    github_client._invalidate_etag_cache("repos/different/repo/pulls")
+
+    assert "repos/owner/name/pulls?state=open&page=1" in github_client._etag_cache
+
+
+def test_merge_pr_invalidates_pulls_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful ``merge_pr`` drops cached ``repos/{repo}/pulls`` entries."""
+    github_client._etag_cache_put(
+        "repos/owner/name/pulls?state=open&per_page=100&page=1",
+        'W/"a"',
+        [{"n": 1}],
+    )
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(stdout="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    github_client.merge_pr("owner/name", 42)
+
+    assert (
+        "repos/owner/name/pulls?state=open&per_page=100&page=1"
+        not in github_client._etag_cache
+    )
+
+
 def test_get_pr_metadata_extracts_nested_user_and_head(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
