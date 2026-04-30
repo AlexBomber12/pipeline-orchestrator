@@ -20,6 +20,7 @@ def _runner(
     open_prs_initial: list[PRInfo] | None = None,
     raise_on_post_create_list: bool = False,
     post_create_empty_attempts: int = 0,
+    post_create_failure_attempts: int = 0,
 ):
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
@@ -34,7 +35,9 @@ def _runner(
         if raise_on_post_create_list:
             raise RuntimeError("list-post-create boom")
         post_idx = pr_list_calls["n"] - 4
-        if post_idx < post_create_empty_attempts:
+        if post_idx < post_create_failure_attempts:
+            raise RuntimeError("transient list boom")
+        if post_idx < post_create_failure_attempts + post_create_empty_attempts:
             return []
         return open_prs_after_create or []
 
@@ -167,9 +170,14 @@ def test_case_c_create_pr_failure_marks_hung(
     assert "Daemon PR creation failed" in (runner.state.error_message or "")
 
 
-def test_case_c_post_create_list_failure_marks_hung(
+def test_case_c_post_create_list_failure_persists_marks_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """When every post-create list attempt raises, the diagnostic must
+    degrade to ERROR rather than HUNG. The PR was created by ``gh pr
+    create`` and is likely present; ERROR lets the daemon retry the
+    cycle, while HUNG would strand the task in manual-intervention
+    state on a purely transient read outage."""
     runner = _runner(monkeypatch, raise_on_post_create_list=True)
     _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
     monkeypatch.setattr(
@@ -178,8 +186,37 @@ def test_case_c_post_create_list_failure_marks_hung(
 
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.HUNG
-    assert "Daemon-created PR not visible" in (runner.state.error_message or "")
+    assert runner.state.state == PipelineState.ERROR
+    assert "list failed after 3 attempts" in (
+        runner.state.error_message or ""
+    )
+
+
+def test_case_c_post_create_list_transient_failure_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single transient ``get_open_prs`` failure after ``gh pr create``
+    must not park the runner. The diagnostic retries on exception within
+    the same bounded 3x/5s schedule it uses for empty-list eventual
+    consistency, and proceeds to WATCH once the PR becomes visible."""
+    created = PRInfo(number=77, branch="pr-001")
+    runner = _runner(
+        monkeypatch,
+        open_prs_after_create=[created],
+        post_create_failure_attempts=1,
+    )
+    _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
+    monkeypatch.setattr(github_client, "run_gh", lambda *a, **kw: "")
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 77
+    assert any(
+        "Daemon-created PR list failed" in entry["event"]
+        for entry in runner.state.history
+    )
 
 
 def test_case_c_pr_not_found_after_create_marks_hung(

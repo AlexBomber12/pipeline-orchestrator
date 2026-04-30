@@ -375,8 +375,13 @@ class CodingMixin:
         # the same bounded 3x/5s schedule used earlier in handle_coding
         # before declaring the PR missing. Each iteration honors a pending
         # stop request so a user pressing stop during the visibility window
-        # is not overridden by a WATCH handoff.
+        # is not overridden by a WATCH handoff. A transient exception from
+        # ``get_open_prs`` (network blip, rate-limit fallback) is folded
+        # into the same loop so a single failure cannot park the runner as
+        # HUNG when the PR has already been created and only the read path
+        # is briefly unhealthy.
         candidate = None
+        last_list_exc: Exception | None = None
         for attempt in range(3):
             if await pause_for_stop_if_requested():
                 return
@@ -386,13 +391,15 @@ class CodingMixin:
                     allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
                 )
             except Exception as exc:
-                self.state.state = PipelineState.HUNG
-                self.state.error_message = (
-                    f"[{coder_name}] Daemon-created PR not visible: {exc}"
+                last_list_exc = exc
+                self.log_event(
+                    f"[{coder_name}] Daemon-created PR list failed for "
+                    f"{target_branch!r}: {exc} ({attempt + 1}/3)"
                 )
-                await self._save_current_run_record("error")
-                self.log_event(self.state.error_message)
-                return
+                if attempt < 2:
+                    await asyncio.sleep(5)
+                continue
+            last_list_exc = None
             candidate = next(
                 (pr for pr in prs if pr.branch == target_branch), None
             )
@@ -408,11 +415,22 @@ class CodingMixin:
         if await pause_for_stop_if_requested():
             return
         if candidate is None:
-            message = (
-                f"[{coder_name}] Daemon-created PR not found for branch "
-                f"{target_branch!r}"
-            )
-            self.state.state = PipelineState.HUNG
+            if last_list_exc is not None:
+                # Every list attempt raised — the PR was created but we
+                # cannot confirm its visibility. Degrade to ERROR (which
+                # the daemon retries) rather than HUNG (manual park) so a
+                # transient read outage does not strand the task.
+                message = (
+                    f"[{coder_name}] Daemon-created PR list failed after "
+                    f"3 attempts: {last_list_exc}"
+                )
+                self.state.state = PipelineState.ERROR
+            else:
+                message = (
+                    f"[{coder_name}] Daemon-created PR not found for branch "
+                    f"{target_branch!r}"
+                )
+                self.state.state = PipelineState.HUNG
             self.state.error_message = message
             await self._save_current_run_record("error")
             self.log_event(message)
