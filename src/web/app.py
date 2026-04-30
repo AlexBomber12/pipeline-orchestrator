@@ -2740,12 +2740,17 @@ def _resolve_onboarding_target(repo_name: str) -> Path | None:
     """Return the AGENTS.md path for ``repo_name`` if it is safe to touch.
 
     Returns ``None`` when ``repo_name`` fails the slug regex, is not
-    listed in ``config.yml``, or would resolve outside ``REPOS_DIR``.
-    The combination of regex, config-membership check, and
-    ``relative_to`` resolution is the path-traversal sandbox: any single
-    layer alone would be insufficient because a malformed config entry,
-    a permissive regex, or a symlink under ``REPOS_DIR`` could each
-    individually allow escape.
+    listed in ``config.yml``, would resolve outside ``REPOS_DIR``, or
+    the on-disk repo directory is not an existing git checkout (no
+    ``.git`` entry). The combination of regex, config-membership check,
+    and ``relative_to`` resolution is the path-traversal sandbox: any
+    single layer alone would be insufficient because a malformed config
+    entry, a permissive regex, or a symlink under ``REPOS_DIR`` could
+    each individually allow escape. The ``.git`` check additionally
+    prevents apply from creating a fresh non-git directory under
+    ``REPOS_DIR`` — that would later trip ``ensure_repo_cloned`` into
+    running ``git fetch`` against a non-repo and parking the daemon in
+    an error state.
     """
     if not _REPO_SLUG_PATTERN.fullmatch(repo_name):
         return None
@@ -2754,10 +2759,13 @@ def _resolve_onboarding_target(repo_name: str) -> Path | None:
     if repo_name not in known_slugs:
         return None
     repos_root = Path(REPOS_DIR).resolve()
-    target = (Path(REPOS_DIR) / repo_name / "AGENTS.md").resolve()
+    repo_dir = (Path(REPOS_DIR) / repo_name).resolve()
+    target = repo_dir / "AGENTS.md"
     try:
         target.relative_to(repos_root)
     except ValueError:
+        return None
+    if not repo_dir.is_dir() or not (repo_dir / ".git").exists():
         return None
     return target
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -150,6 +151,10 @@ def _stub_repo(
     monkeypatch.setattr(web_app, "REPOS_DIR", str(tmp_path / "repos"))
     repo_dir = tmp_path / "repos" / slug
     repo_dir.mkdir(parents=True)
+    # The onboarding endpoints only operate on existing git checkouts, so
+    # the stub clone needs a ``.git`` marker for the resolver to accept
+    # it. A directory marker is enough — the endpoints never invoke git.
+    (repo_dir / ".git").mkdir()
     return repo_dir
 
 
@@ -229,7 +234,8 @@ def test_preview_rejects_path_traversal_via_symlink_escape(
     # Replace the slug directory with a symlink that escapes REPOS_DIR.
     target_outside = tmp_path / "outside"
     target_outside.mkdir()
-    (repos_dir / "example__alpha").rmdir()
+    (target_outside / ".git").mkdir()
+    shutil.rmtree(repos_dir / "example__alpha")
     (repos_dir / "example__alpha").symlink_to(target_outside)
 
     with TestClient(app) as client:
@@ -239,3 +245,41 @@ def test_preview_rejects_path_traversal_via_symlink_escape(
 
     assert response.status_code == 422
     assert not (target_outside / "AGENTS.md").exists()
+
+
+def test_apply_rejects_when_repo_directory_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Apply must not create a brand-new directory under REPOS_DIR for a
+    config-listed slug that has not been cloned yet. Doing so would
+    leave a non-git path that ``ensure_repo_cloned`` later trips on."""
+    repo_dir = _stub_repo(tmp_path, monkeypatch)
+    shutil.rmtree(repo_dir)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/onboarding/apply", data={"repo_name": "example__alpha"}
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"error": "Unknown or invalid repo_name"}
+    assert not repo_dir.exists()
+
+
+def test_apply_rejects_when_repo_directory_is_not_a_git_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Apply must reject a slug whose directory exists but lacks
+    ``.git`` — writing AGENTS.md there would still leave a non-repo
+    that breaks subsequent daemon cycles."""
+    repo_dir = _stub_repo(tmp_path, monkeypatch)
+    shutil.rmtree(repo_dir / ".git")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/onboarding/apply", data={"repo_name": "example__alpha"}
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"error": "Unknown or invalid repo_name"}
+    assert not (repo_dir / "AGENTS.md").exists()

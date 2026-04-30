@@ -98,8 +98,13 @@ repo.
 
 The endpoints accept only repo slugs that match `owner__repo` and that
 are listed in `config.yml`. The resolved path must remain inside
-`/data/repos`. A request that fails any of those checks returns HTTP
-422 without touching the filesystem.
+`/data/repos`, and `/data/repos/<slug>` must already be an existing
+git checkout (its `.git` entry is present). A request that fails any
+of those checks returns HTTP 422 without touching the filesystem. The
+`.git` precondition matters because creating AGENTS.md under a slug
+that has not been cloned yet would leave a non-repo directory that the
+daemon later tries to `git fetch`, parking the repo in an error state
+until an operator removes the directory by hand.
 
 ## Example walkthrough — `my-app`
 
