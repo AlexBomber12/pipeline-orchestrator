@@ -11,6 +11,7 @@ Quick rules
 - Codex Review is "green" only when the Codex bot reacts with thumbs up (`+1`) on the PR body or the review anchor comment (see Codex Review gate). Do not use screenshots.
 - Do not drift from the plan and do not add "nice-to-have" work.
 
+<!-- pipeline-orchestrator: managed BEGIN work_modes -->
 ## Work Modes
 Exact trigger phrases:
 - `PLANNED PR`
@@ -21,7 +22,9 @@ Meaning:
 - `PLANNED PR`: the default mode. Use the active entry in `tasks/QUEUE.md` to locate the corresponding `tasks/PR-*.md` file, then work strictly from that task file.
 - `MICRO PR: ...`: a tiny change. Do not touch `tasks/QUEUE.md` and do not create `tasks/PR-*.md`.
 - `FIX FEEDBACK`: apply fixes based on CI failures and/or review feedback on an existing PR branch. The daemon now injects the latest CI failure logs (last 5000 chars) and the Codex feedback comments posted after the most recent `@codex review` anchor (the same source that drives `ReviewStatus.CHANGES_REQUESTED`) directly into the prompt, so the coder receives that context inline; the coder may still fetch additional context via `gh` CLI when needed.
+<!-- pipeline-orchestrator: managed END work_modes -->
 
+<!-- pipeline-orchestrator: managed BEGIN daemon_mode -->
 ## Daemon Mode
 
 When triggered by the pipeline orchestrator daemon (non-interactive):
@@ -31,7 +34,9 @@ When triggered by the pipeline orchestrator daemon (non-interactive):
 - NEVER use `git add -f` or explicitly stage files matched by .gitignore.
 - Artifacts (ci.log, pr.patch, structure.txt) are generated for Codex review but must not appear in commits. The .gitignore already excludes them.
 - NEVER commit .patch files to the repository under any circumstances.
+<!-- pipeline-orchestrator: managed END daemon_mode -->
 
+<!-- pipeline-orchestrator: managed BEGIN ci_gates -->
 ## CI gates and merge criteria
 
 The pipeline-orchestrator repo runs CI on GitHub Actions for every pull request. The workflow has two jobs that both must pass for merge eligibility, in addition to the existing Codex review +1 requirement.
@@ -53,7 +58,9 @@ Merge contract: a PR is merge-eligible when all three are true. (1) Unit job gre
 Failure handling: if the unit job fails, the coder fixes it the same as `scripts/ci.sh` local failures (FIX FEEDBACK driven by Codex feedback or by the human reviewer pointing at the GHA log). If the integration job fails, the failure is treated identically to a Codex review failure: the coder enters FIX FEEDBACK mode, examines the GHA run logs and uploaded `e2e-evidence` artifact, fixes the issue, pushes, and waits for the re-run. Integration test failures must be fixed by code change, never by disabling or skipping the test. If a test is genuinely flaky and the failure is not reproducible, the human reviewer may rerun the failed job manually via the GHA UI.
 
 Setup prerequisite: `docs/ci-setup.md` describes the one-time setup of the GitHub App that powers integration tests. New deployments of pipeline-orchestrator must complete that setup before the integration job will function on their fork.
+<!-- pipeline-orchestrator: managed END ci_gates -->
 
+<!-- pipeline-orchestrator: managed BEGIN codex_review_gate -->
 ## Codex Review gate (GitHub PR)
 
 This repo treats Codex Review as a single pass/fail signal.
@@ -94,7 +101,9 @@ Fix loop (used in `FIX FEEDBACK` mode)
 10. Poll the PR for up to 15 minutes:
    - if a non-stale thumbs up appears, stop
    - if a new Codex feedback comment appears after the push, repeat the loop
+<!-- pipeline-orchestrator: managed END codex_review_gate -->
 
+<!-- pipeline-orchestrator: managed BEGIN escalate_protocol -->
 ## ESCALATE protocol (when coder cannot fix)
 
 If during a `FIX FEEDBACK` cycle you determine that the failure is genuinely
@@ -148,6 +157,7 @@ This is the SEMANTIC complement to the MECHANICAL no-push circuit breaker
 in PR-164: PR-164 catches stuck coders by counting non-productive cycles;
 ESCALATE catches them by listening to an explicit self-report. Both feed
 the same downstream parking machinery.
+<!-- pipeline-orchestrator: managed END escalate_protocol -->
 
 ## MCP servers and tool usage
 
@@ -197,6 +207,7 @@ If the script does not exist yet, manual fallback:
 
 Artifacts are generated for Codex review but excluded from commits by .gitignore. Do not use `git add -f` to override this.
 
+<!-- pipeline-orchestrator: managed BEGIN branch_naming -->
 ## Branch naming
 - PLANNED: use `Branch:` from the active `tasks/PR-*.md` as the source of truth.
 - If `Branch:` is missing, use `pr-<sanitized-pr-id>`:
@@ -204,7 +215,9 @@ Artifacts are generated for Codex review but excluded from commits by .gitignore
   - replace `.` with `-`
   - allow only `[a-z0-9-]`
 - MICRO: `micro-YYYYMMDD-<short-slug>`
+<!-- pipeline-orchestrator: managed END branch_naming -->
 
+<!-- pipeline-orchestrator: managed BEGIN planned_pr_runbook -->
 ## PLANNED PR runbook (queue-selected)
 
 ### Rules
@@ -238,7 +251,9 @@ Artifacts are generated for Codex review but excluded from commits by .gitignore
 - How verified (exact command)
 - Artifacts: `artifacts/ci.log`, `artifacts/pr.patch`, `artifacts/structure.txt`
 - Manual test steps (if applicable)
+<!-- pipeline-orchestrator: managed END planned_pr_runbook -->
 
+<!-- pipeline-orchestrator: managed BEGIN micro_pr_runbook -->
 ## MICRO PR runbook
 
 ### Eligibility (all must be true)
@@ -265,7 +280,9 @@ If any condition fails, MICRO is not allowed. Use PLANNED PR.
 - [ ] Commit: `MICRO: <short summary>`
 - [ ] Posted `@codex review` comment on the PR (body must be exactly `@codex review`, no other text, prefix, or artifact list)
 - [ ] Pushed branch and opened PR
+<!-- pipeline-orchestrator: managed END micro_pr_runbook -->
 
+<!-- pipeline-orchestrator: managed BEGIN review_fix_runbook -->
 ## REVIEW FIX runbook (existing PR branch)
 - Do not select a new task from `tasks/QUEUE.md` (auto-generated; manual edits are overwritten on next IDLE cycle)
 - Do not create a new branch
@@ -276,11 +293,14 @@ If any condition fails, MICRO is not allowed. Use PLANNED PR.
 - Run `scripts/ci.sh` to exit 0
 - Generate review artifacts (not committed, excluded by .gitignore)
 - Commit and push to the same PR branch
+<!-- pipeline-orchestrator: managed END review_fix_runbook -->
 
+<!-- pipeline-orchestrator: managed BEGIN queue_stability_rules -->
 ## Queue stability rules (PLANNED PR only)
 - `tasks/PR-*.md` files are the source of truth; `tasks/QUEUE.md` is a derived artifact.
 - Do not rewrite tasks retroactively during a PR.
 - If the user updates `tasks/` while you are working, stop and ask for explicit direction: continue as-is, incorporate changes, or revert.
+<!-- pipeline-orchestrator: managed END queue_stability_rules -->
 
 ## Coverage sprint conventions (PR-094 through PR-123)
 - These conventions apply to coverage sprint PRs in this range, including sprint 9 coverage work.
