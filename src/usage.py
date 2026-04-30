@@ -59,31 +59,53 @@ class OAuthUsageProvider:
         self._cached: UsageSnapshot | None = None
         self._consecutive_failures = 0
         self._last_failure_at: float = 0.0
-        # Serializes fetch/invalidate across worker threads. Per-runner
-        # run_cycle tasks dispatch fetch() via asyncio.to_thread, so two
-        # cache misses in the same tick can otherwise race on _cached and
-        # _consecutive_failures, defeating the shared cache and emitting
-        # duplicate outbound requests.
+        # _lock guards cache/failure state mutation only (microsecond hold).
+        # Reads from the event-loop thread (consecutive_failures,
+        # invalidate_cache) must never block on outbound HTTP.
         self._lock = threading.Lock()
+        # _request_lock serializes outbound HTTP across worker threads so a
+        # concurrent burst of cache misses still fans out into a single
+        # request. It is acquired only by fetch() (worker threads via
+        # asyncio.to_thread); the event-loop thread never takes it.
+        self._request_lock = threading.Lock()
 
     @property
     def consecutive_failures(self) -> int:
         with self._lock:
             return self._consecutive_failures
 
-    def fetch(self) -> UsageSnapshot | None:
+    def _cache_or_backoff(self) -> tuple[bool, UsageSnapshot | None]:
+        """Return (handled, value) under _lock for cache/backoff checks.
+
+        ``handled=True`` means fetch() should return ``value`` immediately
+        (either a fresh cached snapshot or ``None`` during a backoff window).
+        """
         with self._lock:
             if self._cached is not None:
                 age = time.time() - self._cached.fetched_at
                 if age < self._cache_ttl:
-                    return self._cached
+                    return True, self._cached
             # Backoff on repeated failures: wait cache_ttl * min(failures, 5)
             # before retrying, capping at 5x the normal TTL.  Return None
             # (not stale cached data) to preserve fail-open behavior.
             if self._consecutive_failures > 0:
                 backoff = self._cache_ttl * min(self._consecutive_failures, 5)
                 if time.time() - self._last_failure_at < backoff:
-                    return None
+                    return True, None
+        return False, None
+
+    def fetch(self) -> UsageSnapshot | None:
+        handled, value = self._cache_or_backoff()
+        if handled:
+            return value
+        # Serialize HTTP requests so concurrent cache misses share one
+        # outbound call. The state lock is NOT held during HTTP — the
+        # event-loop thread can still read consecutive_failures or call
+        # invalidate_cache without blocking on a slow request.
+        with self._request_lock:
+            handled, value = self._cache_or_backoff()
+            if handled:
+                return value
             token = self._read_token()
             if token is None:
                 self._record_failure()
@@ -127,13 +149,15 @@ class OAuthUsageProvider:
                 logger.warning("usage endpoint returned unexpected shape: %s", exc)
                 self._record_failure()
                 return None
-            self._cached = snap
-            self._consecutive_failures = 0
+            with self._lock:
+                self._cached = snap
+                self._consecutive_failures = 0
             return snap
 
     def _record_failure(self) -> None:
-        self._consecutive_failures += 1
-        self._last_failure_at = time.time()
+        with self._lock:
+            self._consecutive_failures += 1
+            self._last_failure_at = time.time()
 
     def invalidate_cache(self) -> None:
         with self._lock:
@@ -183,25 +207,36 @@ class OpenAIUsageProvider:
         self._cached: UsageSnapshot | None = None
         self._consecutive_failures = 0
         self._last_failure_at: float = 0.0
-        # See OAuthUsageProvider for rationale; fetch() is dispatched via
-        # asyncio.to_thread from concurrent run_cycle tasks.
+        # See OAuthUsageProvider for rationale; HTTP must run outside _lock
+        # so the event-loop thread is never blocked behind a slow request.
         self._lock = threading.Lock()
+        self._request_lock = threading.Lock()
 
     @property
     def consecutive_failures(self) -> int:
         with self._lock:
             return self._consecutive_failures
 
-    def fetch(self) -> UsageSnapshot | None:
+    def _cache_or_backoff(self) -> tuple[bool, UsageSnapshot | None]:
         with self._lock:
             if self._cached is not None:
                 age = time.time() - self._cached.fetched_at
                 if age < self._cache_ttl:
-                    return self._cached
+                    return True, self._cached
             if self._consecutive_failures > 0:
                 backoff = self._cache_ttl * min(self._consecutive_failures, 5)
                 if time.time() - self._last_failure_at < backoff:
-                    return None
+                    return True, None
+        return False, None
+
+    def fetch(self) -> UsageSnapshot | None:
+        handled, value = self._cache_or_backoff()
+        if handled:
+            return value
+        with self._request_lock:
+            handled, value = self._cache_or_backoff()
+            if handled:
+                return value
             token, account_id = self._read_credentials()
             if token is None:
                 self._record_failure()
@@ -260,13 +295,15 @@ class OpenAIUsageProvider:
                 logger.debug("OpenAI usage response body: %s", response.text[:500])
                 self._record_failure()
                 return None
-            self._cached = snap
-            self._consecutive_failures = 0
+            with self._lock:
+                self._cached = snap
+                self._consecutive_failures = 0
             return snap
 
     def _record_failure(self) -> None:
-        self._consecutive_failures += 1
-        self._last_failure_at = time.time()
+        with self._lock:
+            self._consecutive_failures += 1
+            self._last_failure_at = time.time()
 
     def invalidate_cache(self) -> None:
         with self._lock:

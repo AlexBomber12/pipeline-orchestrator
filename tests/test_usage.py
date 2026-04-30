@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -599,6 +600,42 @@ class TestOAuthProviderConcurrency:
         # Lost-update on _consecutive_failures would surface as < 4.
         assert provider.consecutive_failures == 4
 
+    def test_state_reads_do_not_block_on_in_flight_http(
+        self, tmp_path: Path
+    ) -> None:
+        """consecutive_failures and invalidate_cache must not wait for HTTP.
+
+        Regression: if fetch() held _lock for the full request, the daemon
+        event loop would stall up to request_timeout_sec while reading the
+        provider's failure counter or invalidating the cache from the
+        rate-limit bookkeeping path.
+        """
+        provider = _make_provider(
+            tmp_path, creds={"accessToken": "tok"}, cache_ttl_sec=300
+        )
+        in_flight = threading.Event()
+        release = threading.Event()
+
+        def slow_get(*args, **kwargs):
+            in_flight.set()
+            release.wait(timeout=5.0)
+            return _mock_response()
+
+        with patch.object(httpx, "get", side_effect=slow_get):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                fetch_future = pool.submit(provider.fetch)
+                assert in_flight.wait(timeout=2.0)
+                # Both calls below would block on _lock if it were held
+                # for the whole request; with the split-lock fix they
+                # complete in microseconds.
+                start = time.monotonic()
+                assert provider.consecutive_failures == 0
+                provider.invalidate_cache()
+                elapsed = time.monotonic() - start
+                assert elapsed < 0.5, f"state reads blocked on HTTP: {elapsed}s"
+                release.set()
+                fetch_future.result(timeout=5.0)
+
 
 class TestOpenAIProviderConcurrency:
     def test_concurrent_cache_miss_yields_single_http_call(
@@ -627,3 +664,31 @@ class TestOpenAIProviderConcurrency:
         assert call_count == 1
         assert all(r is not None for r in results)
         assert len({id(r) for r in results}) == 1
+
+    def test_state_reads_do_not_block_on_in_flight_http(
+        self, tmp_path: Path
+    ) -> None:
+        provider = _make_openai_provider(
+            tmp_path,
+            creds={"tokens": {"access_token": "tok"}},
+            cache_ttl_sec=300,
+        )
+        in_flight = threading.Event()
+        release = threading.Event()
+
+        def slow_get(*args, **kwargs):
+            in_flight.set()
+            release.wait(timeout=5.0)
+            return _mock_openai_response()
+
+        with patch.object(httpx, "get", side_effect=slow_get):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                fetch_future = pool.submit(provider.fetch)
+                assert in_flight.wait(timeout=2.0)
+                start = time.monotonic()
+                assert provider.consecutive_failures == 0
+                provider.invalidate_cache()
+                elapsed = time.monotonic() - start
+                assert elapsed < 0.5, f"state reads blocked on HTTP: {elapsed}s"
+                release.set()
+                fetch_future.result(timeout=5.0)
