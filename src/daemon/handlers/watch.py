@@ -127,10 +127,15 @@ class WatchMixin:
             self.state.state = PipelineState.IDLE
             return
 
+        merged_shas = current_pr.observed_head_shas | found.observed_head_shas
         found = found.model_copy(
             update={
                 "fix_iteration_count": current_pr.fix_iteration_count,
                 "no_push_fix_count": current_pr.no_push_fix_count,
+                "observed_head_shas": merged_shas,
+                "push_count": (
+                    len(merged_shas) if merged_shas else found.push_count
+                ),
             }
         )
         self.state.current_pr = found

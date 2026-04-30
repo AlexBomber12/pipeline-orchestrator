@@ -328,7 +328,18 @@ class ErrorMixin:
                         push_time = datetime.now(timezone.utc)
                         self._last_push_at = push_time
                         self._last_push_at_pr_number = self.state.current_pr.number
-                        self.state.current_pr.push_count += 1
+                        head_after = ""
+                        try:
+                            head_after = git_ops._git(
+                                self.repo_path, "rev-parse", "HEAD"
+                            ).stdout.strip()
+                        except (
+                            subprocess.CalledProcessError,
+                            subprocess.TimeoutExpired,
+                            OSError,
+                        ):
+                            pass
+                        self.state.current_pr.record_observed_head(head_after)
                         self.state.current_pr.last_activity = push_time
                         if not self._post_codex_review(self.state.current_pr.number):
                             self.state.state = PipelineState.ERROR

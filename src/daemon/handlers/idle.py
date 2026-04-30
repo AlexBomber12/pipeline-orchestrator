@@ -40,10 +40,15 @@ class IdleMixin:
         current_pr = self.state.current_pr
         if current_pr is None or current_pr.number != pr.number:
             return pr
+        merged_shas = current_pr.observed_head_shas | pr.observed_head_shas
         return pr.model_copy(
             update={
                 "fix_iteration_count": current_pr.fix_iteration_count,
                 "no_push_fix_count": current_pr.no_push_fix_count,
+                "observed_head_shas": merged_shas,
+                "push_count": (
+                    len(merged_shas) if merged_shas else pr.push_count
+                ),
             }
         )
 

@@ -9038,6 +9038,7 @@ def test_handle_error_commits_and_pushes_diagnose_fixes(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.push_count == 1
+    assert runner.state.current_pr.observed_head_shas == {"abc123"}
     assert runner.state.current_pr.last_activity is not None
     assert runner._last_push_at is not None
     assert runner._last_push_at_pr_number == 119
@@ -9050,8 +9051,9 @@ def test_handle_error_commits_and_pushes_diagnose_fixes(
         "add",
         "commit",
         "push",
+        "rev-parse",
     ]
-    assert calls[-1] == (
+    assert calls[-2] == (
         "push",
         "origin",
         "HEAD:fix/diagnose-error-commits-fixes",
@@ -9092,6 +9094,7 @@ def test_handle_error_errors_when_review_trigger_fails_after_diagnose_push(
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.push_count == 1
+    assert runner.state.current_pr.observed_head_shas == {"abc123"}
     assert runner._last_push_at is not None
     assert runner._last_push_at_pr_number == 119
     assert review_requests == [119]
@@ -9103,6 +9106,7 @@ def test_handle_error_errors_when_review_trigger_fails_after_diagnose_push(
         "add",
         "commit",
         "push",
+        "rev-parse",
     ]
     assert (
         runner.state.error_message
@@ -9184,6 +9188,7 @@ def test_handle_error_head_before_defaults_empty_when_rev_parse_fails(
         "add",
         "commit",
         "push",
+        "rev-parse",
     ]
     assert not any(cmd[:1] == ("reset",) for cmd in calls)
     assert not any(cmd[:1] == ("clean",) for cmd in calls)

@@ -65,6 +65,12 @@ class PRInfo(BaseModel):
     review_status: ReviewStatus = ReviewStatus.PENDING
     commits_count: int = 0
     push_count: int = 0
+    # Distinct head SHAs the daemon has observed for this PR. ``push_count``
+    # is derived from the cardinality of this set so a force-push that
+    # rewrites remote history (and shrinks ``commits_count``) does not
+    # silently shrink the dashboard "Pushes" reading too — each push that
+    # the daemon actually witnessed stays counted.
+    observed_head_shas: set[str] = Field(default_factory=set)
     fix_iteration_count: int = 0
     no_push_fix_count: int = 0
     url: str = ""
@@ -75,6 +81,21 @@ class PRInfo(BaseModel):
     # fork (no credentials, different remote), so it must refuse
     # rather than silently publish to the wrong branch on origin.
     is_cross_repository: bool = False
+
+    def record_observed_head(self, sha: str) -> None:
+        """Add ``sha`` to ``observed_head_shas`` and refresh ``push_count``.
+
+        Empty ``sha`` is ignored — only test shims surface that case, and
+        a real push always carries a SHA. The fallback +1 keeps legacy
+        coverage paths green when the set is empty (no SHA seen yet).
+        """
+        if sha:
+            self.observed_head_shas.add(sha)
+        self.push_count = (
+            len(self.observed_head_shas)
+            if self.observed_head_shas
+            else self.push_count + 1
+        )
 
 
 class EventEntry(TypedDict, total=False):

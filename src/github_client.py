@@ -394,7 +394,8 @@ def get_open_prs(
                     head_sha=head_sha,
                 ),
                 commits_count=len(commits),
-                push_count=len(commits),
+                push_count=1 if head_sha else 0,
+                observed_head_shas={head_sha} if head_sha else set(),
                 url=entry.get("url", ""),
                 last_activity=_parse_iso(entry.get("updatedAt")),
                 is_escalated=any(
@@ -447,6 +448,7 @@ def _get_open_prs_rest(
                 ),
                 commits_count=1 if head_sha else 0,
                 push_count=1 if head_sha else 0,
+                observed_head_shas={head_sha} if head_sha else set(),
                 url=entry.get("html_url", ""),
                 last_activity=_parse_iso(entry.get("updated_at")),
                 is_escalated=any(
