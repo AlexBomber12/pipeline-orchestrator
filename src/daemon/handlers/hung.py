@@ -1,8 +1,9 @@
 """HUNG state handler and Codex review posting.
 
 Mixin methods:
-    handle_hung        — nudge reviewer or escalate
-    _post_codex_review — post @codex review on a PR
+    handle_hung                   — nudge reviewer or escalate
+    _post_codex_review            — post @codex review on a PR
+    _should_skip_codex_review_post — fail-open EYES race-window dedup gate
 """
 
 from __future__ import annotations
@@ -52,6 +53,62 @@ def _author_recent_review_requested_at(
 
 class HungMixin:
     """Nudge the reviewer with ``@codex review`` or give up, per config."""
+
+    def _should_skip_codex_review_post(self, pr_number: int) -> bool:
+        """Return ``True`` when a fresh Codex EYES reaction covers the head.
+
+        Handles the OBS-Z race: Codex's auto-trigger on PR creation and the
+        daemon's own ``@codex review`` mention can fire near-simultaneously
+        and Codex sometimes drops one request silently, leaving the PR
+        stuck in EYES until the general stale-review threshold fires. A
+        pre-post probe of the PR body's reactions lets the daemon skip the
+        duplicate when the auto-trigger already landed.
+
+        Anchors freshness on the branch's last push time, not the head
+        commit's committer date. Cherry-picked, amended, and rebased
+        commits routinely carry committer dates older than the push that
+        actually published them, so committer-date gating could classify
+        a stale EYES reaction as fresh on a brand-new push and silently
+        skip the trigger. The activity API's ``pushed_at`` reflects when
+        the branch was actually updated, which is what the gate needs.
+
+        Fails open (returns ``False``) on any GitHub API error or when
+        the push time cannot be resolved, so a transient outage cannot
+        suppress a needed mention.
+        """
+        try:
+            codex_reactions = github_client._get_codex_issue_reactions(
+                self.owner_repo, pr_number,
+            )
+        except Exception:
+            return False
+        eyes_reactions = [
+            reaction for reaction in codex_reactions
+            if github_client._is_reaction_content(reaction, "eyes")
+        ]
+        if not eyes_reactions:
+            return False
+        try:
+            last_push_time = github_client.get_pr_last_push_time(
+                self.owner_repo, pr_number,
+            )
+        except Exception:
+            return False
+        if last_push_time is None:
+            return False
+        if last_push_time.tzinfo is None:
+            last_push_time = last_push_time.replace(tzinfo=timezone.utc)
+        for reaction in eyes_reactions:
+            reaction_time = github_client._parse_iso(
+                reaction.get("created_at")
+            )
+            if reaction_time is None:
+                continue
+            if reaction_time.tzinfo is None:
+                reaction_time = reaction_time.replace(tzinfo=timezone.utc)
+            if reaction_time >= last_push_time:
+                return True
+        return False
 
     def _post_codex_review_result(
         self,

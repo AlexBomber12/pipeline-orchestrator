@@ -506,3 +506,311 @@ def test_diagnose_honors_stop_request_after_post_create_loop(
 
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.current_pr is None
+
+
+def _patch_codex_reactions(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    eyes_present: bool,
+    eyes_stale: bool = False,
+) -> None:
+    """Stub ``_get_codex_issue_reactions`` for the EYES-skip pre-push gate.
+
+    ``eyes_stale=True`` returns an EYES reaction whose ``created_at``
+    predates the last push time, exercising the push-time freshness
+    gate that prevents stale reactions from suppressing the review on
+    a brand-new push.
+    """
+    last_push_iso = "2026-04-30T12:00:00Z"
+    reaction_iso = (
+        "2026-04-30T11:00:00Z" if eyes_stale else "2026-04-30T12:30:00Z"
+    )
+    payload = (
+        [
+            {
+                "content": "eyes",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "created_at": reaction_iso,
+            }
+        ]
+        if eyes_present
+        else []
+    )
+    monkeypatch.setattr(
+        github_client, "_get_codex_issue_reactions",
+        lambda repo, number: payload,
+    )
+    monkeypatch.setattr(
+        github_client, "get_pr_last_push_time",
+        lambda repo, number: github_client._parse_iso(last_push_iso),
+    )
+
+
+def test_handle_coding_skips_codex_review_when_eyes_already_reacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OBS-Z: Codex auto-trigger already landed → skip duplicate mention."""
+    pr = PRInfo(number=42, branch="pr-001")
+    runner = _runner(monkeypatch, open_prs_initial=[pr])
+    _patch_codex_reactions(monkeypatch, eyes_present=True)
+    posted: list[int] = []
+    runner._post_codex_review = lambda pr_number: (  # type: ignore[method-assign]
+        posted.append(pr_number) or True
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert posted == []
+    assert any(
+        "Codex auto-trigger detected, skipping duplicate "
+        "@codex review post" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_coding_posts_codex_review_when_no_eyes_reaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = PRInfo(number=42, branch="pr-001")
+    runner = _runner(monkeypatch, open_prs_initial=[pr])
+    _patch_codex_reactions(monkeypatch, eyes_present=False)
+    posted: list[int] = []
+    runner._post_codex_review = lambda pr_number: (  # type: ignore[method-assign]
+        posted.append(pr_number) or True
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert posted == [42]
+
+
+def test_should_skip_codex_review_post_fails_open_on_api_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A GitHub API failure must not suppress the mention — fail open."""
+    runner = h._make_runner()
+
+    def boom(*_a: Any, **_kw: Any) -> list[dict]:
+        raise RuntimeError("api boom")
+
+    monkeypatch.setattr(github_client, "_get_codex_issue_reactions", boom)
+    assert runner._should_skip_codex_review_post(42) is False
+
+
+def test_should_skip_codex_review_post_fails_open_on_push_time_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unresolvable last-push time must not suppress the mention."""
+    runner = h._make_runner()
+
+    monkeypatch.setattr(
+        github_client,
+        "_get_codex_issue_reactions",
+        lambda repo, number: [
+            {
+                "content": "eyes",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "created_at": "2026-04-30T12:30:00Z",
+            }
+        ],
+    )
+
+    def boom(*_a: Any, **_kw: Any) -> Any:
+        raise RuntimeError("push-time boom")
+
+    monkeypatch.setattr(github_client, "get_pr_last_push_time", boom)
+    assert runner._should_skip_codex_review_post(42) is False
+
+
+def test_should_skip_codex_review_post_fails_open_on_missing_push_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``None`` last-push time (activity API degraded) must fail open."""
+    runner = h._make_runner()
+    monkeypatch.setattr(
+        github_client,
+        "_get_codex_issue_reactions",
+        lambda repo, number: [
+            {
+                "content": "eyes",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "created_at": "2026-04-30T12:30:00Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        github_client,
+        "get_pr_last_push_time",
+        lambda repo, number: None,
+    )
+    assert runner._should_skip_codex_review_post(42) is False
+
+
+def test_should_skip_codex_review_post_skips_when_eyes_after_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh EYES reaction (after the last push) suppresses the mention."""
+    runner = h._make_runner()
+    monkeypatch.setattr(
+        github_client,
+        "_get_codex_issue_reactions",
+        lambda repo, number: [
+            {
+                "content": "eyes",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "created_at": "2026-04-30T12:30:00Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        github_client,
+        "get_pr_last_push_time",
+        lambda repo, number: github_client._parse_iso(
+            "2026-04-30T12:00:00Z"
+        ),
+    )
+    assert runner._should_skip_codex_review_post(42) is True
+
+
+def test_should_skip_codex_review_post_does_not_skip_when_eyes_predates_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale EYES reaction must not suppress review after a new push."""
+    runner = h._make_runner()
+    monkeypatch.setattr(
+        github_client,
+        "_get_codex_issue_reactions",
+        lambda repo, number: [
+            {
+                "content": "eyes",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "created_at": "2026-04-30T11:00:00Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        github_client,
+        "get_pr_last_push_time",
+        lambda repo, number: github_client._parse_iso(
+            "2026-04-30T12:00:00Z"
+        ),
+    )
+    assert runner._should_skip_codex_review_post(42) is False
+
+
+def test_should_skip_codex_review_post_does_not_skip_on_backdated_head_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An EYES reaction older than push time must not suppress the mention,
+    even when the head commit's committer date is older still.
+
+    A cherry-picked or amended commit can carry a committer date that
+    predates the actual push that put it on the branch. The earlier
+    head-commit-date gating treated such a stale EYES as fresh; the
+    push-time gate must reject it.
+    """
+    runner = h._make_runner()
+    monkeypatch.setattr(
+        github_client,
+        "_get_codex_issue_reactions",
+        lambda repo, number: [
+            {
+                "content": "eyes",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "created_at": "2026-04-30T11:30:00Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        github_client,
+        "get_pr_last_push_time",
+        lambda repo, number: github_client._parse_iso(
+            "2026-04-30T12:00:00Z"
+        ),
+    )
+    assert runner._should_skip_codex_review_post(42) is False
+
+
+def test_should_skip_codex_review_post_normalizes_naive_timestamps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Naive timestamps from upstream parsers are coerced to UTC so the
+    comparison still fires correctly."""
+    from datetime import datetime as _dt
+
+    runner = h._make_runner()
+    monkeypatch.setattr(
+        github_client,
+        "_get_codex_issue_reactions",
+        lambda repo, number: [
+            {
+                "content": "eyes",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "created_at": "2026-04-30T12:30:00",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        github_client,
+        "get_pr_last_push_time",
+        lambda repo, number: _dt(2026, 4, 30, 12, 0, 0),
+    )
+    monkeypatch.setattr(
+        github_client,
+        "_parse_iso",
+        lambda value: _dt(2026, 4, 30, 12, 30, 0) if value else None,
+    )
+
+    assert runner._should_skip_codex_review_post(42) is True
+
+
+def test_should_skip_codex_review_post_ignores_eyes_without_created_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reaction missing ``created_at`` cannot prove freshness; do not skip."""
+    runner = h._make_runner()
+    monkeypatch.setattr(
+        github_client,
+        "_get_codex_issue_reactions",
+        lambda repo, number: [
+            {
+                "content": "eyes",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        github_client,
+        "get_pr_last_push_time",
+        lambda repo, number: github_client._parse_iso(
+            "2026-04-30T12:00:00Z"
+        ),
+    )
+    assert runner._should_skip_codex_review_post(42) is False
+
+
+def test_diagnose_case_c_skips_codex_review_when_eyes_already_reacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Daemon-created PR (case C) also honors the EYES race-window dedup."""
+    created = PRInfo(number=99, branch="pr-001")
+    runner = _runner(monkeypatch, open_prs_after_create=[created])
+    _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
+    _patch_codex_reactions(monkeypatch, eyes_present=True)
+    monkeypatch.setattr(github_client, "run_gh", lambda *a, **kw: "")
+    posted: list[int] = []
+    runner._post_codex_review = lambda pr_number: (  # type: ignore[method-assign]
+        posted.append(pr_number) or True
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert posted == []
+    assert any(
+        "Codex auto-trigger detected, skipping duplicate "
+        "@codex review post" in entry["event"]
+        for entry in runner.state.history
+    )

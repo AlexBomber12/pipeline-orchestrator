@@ -14249,6 +14249,170 @@ def test_handle_watch_normalizes_naive_stale_retrigger_timestamps(
     assert retriggers == []
 
 
+def test_handle_watch_retriggers_stale_eyes_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OBS-Z: EYES persisting past stale_review_threshold_eyes_min retriggers."""
+    now = datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.EYES,
+        last_activity=now,
+    )
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, number: 6 * 60,
+    )
+
+    retriggers: list[int] = []
+    bypass_flags: list[bool] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        retriggers.append(number)
+        bypass_flags.append(bypass_same_head_dedup)
+        return True, True, None
+
+    runner = _make_runner(review_timeout_min=120)
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = now - timedelta(minutes=6)
+    runner._last_push_at_pr_number = pr.number
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert retriggers == [42]
+    assert bypass_flags == [True]
+    assert runner.state.last_stale_retrigger_at == now
+
+
+def test_handle_watch_does_not_retrigger_eyes_below_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EYES younger than stale_review_threshold_eyes_min must not retrigger."""
+    now = datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.EYES,
+        last_activity=now,
+    )
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, number: 2 * 60,
+    )
+
+    retriggers: list[int] = []
+    runner = _make_runner(review_timeout_min=120)
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = now - timedelta(minutes=2)
+    runner._last_push_at_pr_number = pr.number
+    runner._post_codex_review = retriggers.append  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert retriggers == []
+    assert runner.state.last_stale_retrigger_at is None
+
+
+def test_handle_watch_does_not_retrigger_changes_requested_below_default_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CHANGES_REQUESTED below the default 10-minute threshold must not retrigger.
+
+    Confirms EYES's shorter 5-minute threshold is not applied to
+    CHANGES_REQUESTED — a push 6 minutes old is past the EYES threshold
+    but still inside the CHANGES_REQUESTED threshold, so no retrigger.
+    """
+    now = datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=now,
+    )
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, number: 6 * 60,
+    )
+
+    retriggers: list[int] = []
+    runner = _make_runner(review_timeout_min=120)
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = now - timedelta(minutes=6)
+    runner._last_push_at_pr_number = pr.number
+    runner._post_codex_review = retriggers.append  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert retriggers == []
+    assert runner.state.last_stale_retrigger_at is None
+
+
 @pytest.mark.parametrize(
     "review_status",
     [ReviewStatus.APPROVED, ReviewStatus.PENDING],
@@ -16472,6 +16636,261 @@ def test_handle_fix_pauses_when_late_breach_rev_parse_fails(
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.error_message is None
     assert any("FIX paused: late in-flight rate limit breach" in e["event"] for e in runner.state.history)
+
+
+def _patch_eyes_reaction_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stub the EYES-skip pre-push gate to fire (fresh EYES after push)."""
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_get_codex_issue_reactions",
+        lambda repo, number: [
+            {
+                "content": "eyes",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "created_at": "2026-04-30T12:30:00Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_last_push_time",
+        lambda repo, number: runner_module.github_client._parse_iso(
+            "2026-04-30T12:00:00Z"
+        ),
+    )
+
+
+def _patch_eyes_reaction_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stub a stale EYES reaction (predates push) — gate must NOT skip."""
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_get_codex_issue_reactions",
+        lambda repo, number: [
+            {
+                "content": "eyes",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "created_at": "2026-04-30T11:00:00Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_last_push_time",
+        lambda repo, number: runner_module.github_client._parse_iso(
+            "2026-04-30T12:00:00Z"
+        ),
+    )
+
+
+def test_handle_fix_breach_cancel_skips_codex_review_when_eyes_already_reacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OBS-Z: breach-cancel push path honors the EYES race-window dedup."""
+    rev_parse_calls = {"count": 0}
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_calls["count"] += 1
+            sha = "aaa111\n" if rev_parse_calls["count"] == 1 else "bbb222\n"
+            return _FakeCompletedProcess(args=["git", *args], stdout=sha, returncode=0)
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        await asyncio.Future()
+        return (0, "", "")
+
+    async def no_idle_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    async def breach_cancel_monitor(
+        self: PipelineRunner,
+        breach_dir: str,
+        run_id: str,
+        claude_task: asyncio.Task,  # type: ignore[type-arg]
+        breach_flag: dict[str, bool],
+    ) -> None:
+        self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        breach_flag["breached"] = True
+        await asyncio.sleep(0)
+        claude_task.cancel()
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_inflight_breach", breach_cancel_monitor
+    )
+    _patch_eyes_reaction_present(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=42, branch="pr-042-fix")
+    monkeypatch.setattr(
+        runner, "_rehydrate_last_push_at", lambda pr: None
+    )
+    monkeypatch.setattr(
+        runner,
+        "_post_codex_review",
+        lambda pr_number: pytest.fail("post must be skipped when EYES already present"),
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert any(
+        "Codex auto-trigger detected, skipping duplicate "
+        "@codex review post" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_fix_late_breach_skips_codex_review_when_eyes_already_reacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OBS-Z: late-breach push path honors the EYES race-window dedup."""
+    rev_parse_calls = {"count": 0}
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_calls["count"] += 1
+            sha = "aaa111\n" if rev_parse_calls["count"] == 1 else "bbb222\n"
+            return _FakeCompletedProcess(args=["git", *args], stdout=sha, returncode=0)
+        return _FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def no_idle_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    async def no_breach_monitor(
+        self: object,
+        breach_dir: str,
+        run_id: str,
+        claude_task: asyncio.Task,  # type: ignore[type-arg]
+        breach_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+
+    def fake_late_breach(
+        self: PipelineRunner,
+        breach_dir: str,
+        run_id: str,
+        breach_flag: dict[str, bool],
+    ) -> None:
+        self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        breach_flag["breached"] = True
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", _async_cli_result(0, "ok", "")
+    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
+    )
+    monkeypatch.setattr(PipelineRunner, "_check_late_breach", fake_late_breach)
+    _patch_eyes_reaction_present(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=42, branch="pr-042-fix")
+    monkeypatch.setattr(
+        runner, "_rehydrate_last_push_at", lambda pr: None
+    )
+    monkeypatch.setattr(
+        runner,
+        "_post_codex_review",
+        lambda pr_number: pytest.fail("post must be skipped when EYES already present"),
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert any(
+        "Codex auto-trigger detected, skipping duplicate "
+        "@codex review post" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_fix_normal_push_skips_codex_review_when_eyes_already_reacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OBS-Z: normal fix-push path honors the EYES race-window dedup."""
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", _async_cli_result(0, "", "")
+    )
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    _patch_eyes_reaction_present(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019")
+
+    asyncio.run(runner.handle_fix())
+
+    assert posted == []
+    assert any(
+        "Codex auto-trigger detected, skipping duplicate "
+        "@codex review post" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_fix_normal_push_posts_codex_review_when_eyes_predates_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OBS-Z: a stale EYES (predates new head) must NOT suppress the post.
+
+    Without head-freshness gating, a prior EYES reaction would silently
+    suppress ``_post_codex_review`` after every FIX push, leaving the
+    new commit without a review trigger until the 1-hour stale-retrigger
+    debounce in ``watch.py`` recovered.
+    """
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", _async_cli_result(0, "", "")
+    )
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    _patch_eyes_reaction_stale(monkeypatch)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019")
+
+    asyncio.run(runner.handle_fix())
+
+    assert posted == [(runner.owner_repo, 77, "@codex review")]
+    assert not any(
+        "Codex auto-trigger detected, skipping duplicate "
+        "@codex review post" in e["event"]
+        for e in runner.state.history
+    )
 
 
 def test_handle_fix_sets_error_on_non_rate_limit_cli_failure(
@@ -21254,6 +21673,126 @@ def test_handle_watch_codex_bot_error_normalizes_naive_timestamps(
 
     assert posted == [42]
     assert runner.state.last_codex_retrigger_at == frozen_now
+
+
+def test_handle_watch_eyes_skips_stale_review_after_bot_error_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a Codex bot-error retrigger fires in the EYES branch, the stale-
+    review retrigger must not also fire in the same cycle. Both paths post
+    ``@codex review`` with ``bypass_same_head_dedup=True``; without
+    mutual exclusion the daemon would emit two trigger comments back-to-
+    back when both conditions are simultaneously true (e.g. an error
+    comment plus a push old enough to cross the EYES threshold).
+    """
+    now = datetime(2026, 4, 30, 12, 0, tzinfo=timezone.utc)
+    pr = _codex_bot_pr()
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [_codex_bot_error_comment()],
+    )
+    # Push age well past the EYES stale threshold so the stale path WOULD
+    # otherwise fire if it were called.
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, number: 10 * 60,
+    )
+
+    posts: list[tuple[int, bool]] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        posts.append((number, bypass_same_head_dedup))
+        return True, True, None
+
+    runner = _make_runner(review_timeout_min=120)
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = now - timedelta(minutes=10)
+    runner._last_push_at_pr_number = pr.number
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert posts == [(42, True)]
+    assert runner.state.last_codex_retrigger_at == now
+    assert runner.state.last_stale_retrigger_at is None
+
+
+def test_handle_watch_eyes_runs_stale_review_when_bot_error_does_not_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the Codex bot-error retrigger does not post (e.g. cooldown blocked
+    after a prior retrigger), the stale-review retrigger must still run as
+    a fallback so a stuck EYES review eventually recovers."""
+    now = datetime(2026, 4, 30, 12, 0, tzinfo=timezone.utc)
+    pr = _codex_bot_pr()
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    # An error comment older than ``last_codex_retrigger_at`` is treated
+    # as already handled, so bot-error returns without posting.
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [
+            _codex_bot_error_comment(created_at="2026-04-30T11:00:00Z"),
+        ],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, number: 6 * 60,
+    )
+
+    posts: list[tuple[int, bool]] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        posts.append((number, bypass_same_head_dedup))
+        return True, True, None
+
+    runner = _make_runner(review_timeout_min=120)
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.state.last_codex_retrigger_at = now - timedelta(minutes=30)
+    runner._last_push_at = now - timedelta(minutes=6)
+    runner._last_push_at_pr_number = pr.number
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert posts == [(42, True)]
+    assert runner.state.last_stale_retrigger_at == now
 
 
 def test_repo_state_resets_codex_retrigger_on_pr_transition() -> None:

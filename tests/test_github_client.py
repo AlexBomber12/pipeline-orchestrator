@@ -27,6 +27,7 @@ from src.github_client import (
     clear_review_status_cache,
     get_branch_last_push_time,
     get_last_push_age_seconds,
+    get_pr_last_push_time,
     get_merged_prs,
     get_open_prs,
     get_pr_author,
@@ -3097,6 +3098,56 @@ def test_get_last_push_age_seconds_returns_none_on_parse_error(
     responses = iter(["feature-branch", "not-a-date"])
     monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: next(responses))
     assert get_last_push_age_seconds("owner/name", 42) is None
+
+
+def test_get_pr_last_push_time_returns_parsed_datetime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = iter(["feature-branch", "2026-04-30T11:59:30Z"])
+    monkeypatch.setattr(
+        "src.github_client.run_gh", lambda *args, **kwargs: next(responses)
+    )
+
+    result = get_pr_last_push_time("owner/name", 42)
+
+    assert result == datetime(2026, 4, 30, 11, 59, 30, tzinfo=_tz.utc)
+
+
+def test_get_pr_last_push_time_returns_none_without_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: "")
+    assert get_pr_last_push_time("owner/name", 42) is None
+
+
+def test_get_pr_last_push_time_returns_none_when_activity_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = iter(["feature-branch", ""])
+    monkeypatch.setattr(
+        "src.github_client.run_gh", lambda *args, **kwargs: next(responses)
+    )
+    assert get_pr_last_push_time("owner/name", 42) is None
+
+
+def test_get_pr_last_push_time_returns_none_on_parse_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = iter(["feature-branch", "not-a-date"])
+    monkeypatch.setattr(
+        "src.github_client.run_gh", lambda *args, **kwargs: next(responses)
+    )
+    assert get_pr_last_push_time("owner/name", 42) is None
+
+
+def test_get_pr_last_push_time_returns_none_on_run_gh_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(*_a: Any, **_kw: Any) -> str:
+        raise RuntimeError("gh boom")
+
+    monkeypatch.setattr("src.github_client.run_gh", boom)
+    assert get_pr_last_push_time("owner/name", 42) is None
 
 
 def test_has_recent_codex_review_request_returns_false_on_404(
