@@ -523,7 +523,8 @@ def test_pause_resume_stop_endpoints_update_repo_state(
     ]
     # All three control endpoints wake the daemon via PR-183 pub/sub so an
     # adaptive-IDLE runner reacts within the next loop tick instead of
-    # waiting up to ``idle_extended_poll_interval_sec``.
+    # waiting up to ``idle_extended_poll_interval_sec``. Each endpoint
+    # publishes its own event_type so subscribers can distinguish causes.
     channels = [channel for channel, _ in fake.published]
     assert channels == [
         "orchestrator:wake:example__alpha",
@@ -531,7 +532,149 @@ def test_pause_resume_stop_endpoints_update_repo_state(
         "orchestrator:wake:example__alpha",
     ]
     payloads = [json.loads(message) for _, message in fake.published]
-    assert {payload["event_type"] for payload in payloads} == {"control"}
+    assert [payload["event_type"] for payload in payloads] == [
+        "pause",
+        "stop",
+        "resume",
+    ]
+
+
+def test_pause_endpoint_publishes_pause_wake_event(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/pause")
+
+    assert response.status_code == 200
+    assert len(fake.published) == 1
+    channel, message = fake.published[0]
+    assert channel == "orchestrator:wake:example__alpha"
+    payload = json.loads(message)
+    assert payload["event_type"] == "pause"
+    assert payload["repo"] == "example__alpha"
+
+
+def test_resume_endpoint_publishes_resume_wake_event(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        user_paused=True,
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/resume")
+
+    assert response.status_code == 200
+    assert len(fake.published) == 1
+    channel, message = fake.published[0]
+    assert channel == "orchestrator:wake:example__alpha"
+    payload = json.loads(message)
+    assert payload["event_type"] == "resume"
+    assert payload["repo"] == "example__alpha"
+
+
+def test_stop_endpoint_publishes_stop_wake_event(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/stop")
+
+    assert response.status_code == 200
+    assert len(fake.published) == 1
+    channel, message = fake.published[0]
+    assert channel == "orchestrator:wake:example__alpha"
+    payload = json.loads(message)
+    assert payload["event_type"] == "stop"
+    assert payload["repo"] == "example__alpha"
+
+
+def test_pause_endpoint_succeeds_when_publish_wake_fails(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Pause endpoint must persist the flag even if pub/sub fails."""
+
+    class _PublishBoomRedis(_FakeRedis):
+        async def publish(self, channel: str, message: str) -> int:
+            raise RuntimeError("publish boom")
+
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+    )
+    fake = _PublishBoomRedis({"pipeline:example__alpha": stored.model_dump_json()})
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
+
+    with TestClient(app) as client:
+        with caplog.at_level("WARNING", logger=web_app.logger.name):
+            response = client.post("/repos/example__alpha/pause")
+
+    assert response.status_code == 200
+    paused = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+    assert paused.user_paused is True
+    assert any(
+        "publish_wake failed for example__alpha" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_resume_endpoint_succeeds_when_publish_wake_fails(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Resume endpoint must clear the pause flag even if pub/sub fails."""
+
+    class _PublishBoomRedis(_FakeRedis):
+        async def publish(self, channel: str, message: str) -> int:
+            raise RuntimeError("publish boom")
+
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        user_paused=True,
+    )
+    fake = _PublishBoomRedis({"pipeline:example__alpha": stored.model_dump_json()})
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
+
+    with TestClient(app) as client:
+        with caplog.at_level("WARNING", logger=web_app.logger.name):
+            response = client.post("/repos/example__alpha/resume")
+
+    assert response.status_code == 200
+    resumed = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+    assert resumed.user_paused is False
+    assert any(
+        "publish_wake failed for example__alpha" in rec.getMessage()
+        for rec in caplog.records
+    )
 
 
 def test_stop_endpoint_succeeds_when_publish_wake_fails(
@@ -564,6 +707,47 @@ def test_stop_endpoint_succeeds_when_publish_wake_fails(
         "publish_wake failed for example__alpha" in rec.getMessage()
         for rec in caplog.records
     )
+
+
+def test_pause_endpoint_wake_message_resets_daemon_last_run(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: Pause click publishes a wake message that the daemon's
+    ``_apply_wake_message`` recognises and uses to reset its sleep timer.
+
+    This proves the channel published by the control endpoint is the same
+    channel the daemon subscribes to, so a daemon already in an extended
+    IDLE poll wakes within the next ``_wait_or_wake`` tick instead of
+    waiting up to ``idle_extended_poll_interval_sec`` (default 300s).
+    """
+    from src.daemon import main as daemon_main
+
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/pause")
+
+    assert response.status_code == 200
+    assert len(fake.published) == 1
+    channel, message = fake.published[0]
+    payload = json.loads(message)
+    assert payload["event_type"] == "pause"
+
+    last_run = {"alpha-key": 100.0, "beta-key": 200.0}
+    slug_to_key = {"example__alpha": "alpha-key", "example__beta": "beta-key"}
+    daemon_main._apply_wake_message(
+        {"channel": channel}, last_run, slug_to_key
+    )
+
+    assert last_run["alpha-key"] == 0.0
+    assert last_run["beta-key"] == 200.0
 
 
 def test_resume_endpoint_cancels_pending_pause_for_active_run(
