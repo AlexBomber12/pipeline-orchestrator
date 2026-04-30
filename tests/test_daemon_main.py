@@ -87,6 +87,9 @@ def _reset_fake_runner() -> None:
     _FakeRunner.instances = []
 
 
+_REAL_ASYNCIO_SLEEP = asyncio.sleep
+
+
 def _patch_main(
     monkeypatch: pytest.MonkeyPatch,
     config: AppConfig,
@@ -119,6 +122,12 @@ def _patch_main(
     async def fake_sleep(seconds: float) -> None:
         sleep_calls.append(seconds)
         clock[0] += seconds + 1
+        # The main loop schedules per-runner cycles as background tasks
+        # (PR-207). They only execute on the next event-loop turn, so the
+        # fake sleep must yield once so scheduled cycle tasks can run before
+        # we raise the stop sentinel — otherwise tests that count cycles
+        # would observe zero.
+        await _REAL_ASYNCIO_SLEEP(0)
         if len(sleep_calls) >= sleep_iterations:
             raise _StopLoop
 
@@ -262,6 +271,7 @@ def test_main_reload_detects_new_repository(
     async def fake_sleep(seconds: float) -> None:
         sleep_calls.append(seconds)
         clock[0] += seconds + 1
+        await _REAL_ASYNCIO_SLEEP(0)
         if len(sleep_calls) >= 3:
             raise _StopLoop
 
@@ -327,6 +337,7 @@ def test_main_reload_drops_removed_repository(
     async def fake_sleep(seconds: float) -> None:
         sleep_calls.append(seconds)
         clock2[0] += seconds + 1
+        await _REAL_ASYNCIO_SLEEP(0)
         if len(sleep_calls) >= 3:
             raise _StopLoop
 
@@ -401,6 +412,7 @@ def test_main_reload_recreates_shared_usage_providers(
     async def fake_sleep(seconds: float) -> None:
         sleep_calls.append(seconds)
         clock[0] += seconds + 1
+        await _REAL_ASYNCIO_SLEEP(0)
         if len(sleep_calls) >= 3:
             raise _StopLoop
 
@@ -460,6 +472,7 @@ def test_hot_reload_updates_repo_config_coder(
     async def fake_sleep(seconds: float) -> None:
         sleep_calls.append(seconds)
         clock[0] += seconds + 1
+        await _REAL_ASYNCIO_SLEEP(0)
         if len(sleep_calls) >= 3:
             raise _StopLoop
 
@@ -1193,6 +1206,7 @@ def test_per_repo_poll_interval(
     async def fake_sleep(seconds: float) -> None:
         sleep_calls.append(seconds)
         clock[0] += 15
+        await _REAL_ASYNCIO_SLEEP(0)
         if len(sleep_calls) >= 3:
             raise _StopLoop
 
@@ -1252,7 +1266,8 @@ def test_unpause_runs_immediately(
             runner.repo_config = RepoConfig(
                 url=repo.url, poll_interval_sec=100, active=True,
             )
-        elif sleep_count[0] >= 3:
+        await _REAL_ASYNCIO_SLEEP(0)
+        if sleep_count[0] >= 3:
             raise _StopLoop
 
     monkeypatch.setattr(main_module.asyncio, "sleep", fake_sleep)
@@ -1910,3 +1925,443 @@ async def test_wait_or_wake_resets_runner_idle_streak() -> None:
     assert healthy is True
     assert last_run["alpha-key"] == 0.0
     assert runner.idle_streak_resets == 1
+
+
+# ---------------------------------------------------------------------------
+# PR-207: parallel per-runner run_cycle scheduling
+# ---------------------------------------------------------------------------
+
+
+def test_main_schedules_run_cycles_in_parallel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long-running cycle on runner A must not delay runner B's cycle.
+
+    The previous serial loop awaited each runner in turn, so runner B was
+    starved of polling for the duration of A's CODING/FIX subprocess.
+    """
+    a_started = asyncio.Event()
+    b_started = asyncio.Event()
+    release_a = asyncio.Event()
+
+    class _ParallelRunner(_FakeRunner):
+        async def run_cycle(self) -> None:
+            self.cycles += 1
+            if self.name == "octo__alpha":
+                a_started.set()
+                await release_a.wait()
+            else:
+                b_started.set()
+
+    config = AppConfig(
+        repositories=[
+            _repo("https://github.com/octo/alpha.git"),
+            _repo("https://github.com/octo/beta.git"),
+        ],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+
+    _reset_fake_runner()
+    monkeypatch.setattr(main_module, "load_config", lambda: config)
+    monkeypatch.setattr(
+        main_module.aioredis,
+        "from_url",
+        lambda url, decode_responses: _FakeRedisClient(),
+    )
+    monkeypatch.setattr(main_module, "PipelineRunner", _ParallelRunner)
+    monkeypatch.setattr(main_module, "_setup_git_auth", lambda: None)
+    monkeypatch.setattr(
+        main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
+    )
+
+    clock = [0.0]
+    monkeypatch.setattr(main_module.time, "monotonic", lambda: clock[0])
+
+    sleep_calls = [0]
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls[0] += 1
+        clock[0] += seconds + 1
+        await _REAL_ASYNCIO_SLEEP(0)
+        if sleep_calls[0] == 1:
+            # First wait: both cycles have been scheduled. B finished
+            # almost immediately while A is still blocked on release_a —
+            # exactly the property this test asserts.
+            assert a_started.is_set(), "alpha cycle never started"
+            assert b_started.is_set(), (
+                "beta cycle was starved by alpha's blocking run_cycle"
+            )
+            release_a.set()
+        if sleep_calls[0] >= 2:
+            raise _StopLoop
+
+    monkeypatch.setattr(main_module.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    alpha = next(r for r in _FakeRunner.instances if r.name == "octo__alpha")
+    beta = next(r for r in _FakeRunner.instances if r.name == "octo__beta")
+    assert alpha.cycles >= 1
+    assert beta.cycles >= 1
+
+
+def test_main_does_not_double_schedule_running_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A still-running cycle must not be scheduled a second time.
+
+    Without per-runner deduplication, a runner whose CODING cycle outlives
+    one main-loop tick would have a fresh cycle stacked on top each tick,
+    multiplying coder subprocesses and corrupting per-runner state.
+    """
+    release = asyncio.Event()
+
+    class _BlockingRunner(_FakeRunner):
+        async def run_cycle(self) -> None:
+            self.cycles += 1
+            await release.wait()
+
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+
+    _reset_fake_runner()
+    monkeypatch.setattr(main_module, "load_config", lambda: config)
+    monkeypatch.setattr(
+        main_module.aioredis,
+        "from_url",
+        lambda url, decode_responses: _FakeRedisClient(),
+    )
+    monkeypatch.setattr(main_module, "PipelineRunner", _BlockingRunner)
+    monkeypatch.setattr(main_module, "_setup_git_auth", lambda: None)
+    monkeypatch.setattr(
+        main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
+    )
+
+    clock = [0.0]
+    monkeypatch.setattr(main_module.time, "monotonic", lambda: clock[0])
+
+    sleep_calls = [0]
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls[0] += 1
+        # Advance past the poll interval so the loop would re-schedule
+        # the runner if it weren't deduplicated against the in-flight task.
+        clock[0] += seconds + 100
+        await _REAL_ASYNCIO_SLEEP(0)
+        if sleep_calls[0] >= 4:
+            release.set()
+            raise _StopLoop
+
+    monkeypatch.setattr(main_module.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    runner = _FakeRunner.instances[0]
+    # Only one cycle was scheduled; subsequent ticks observed the
+    # in-flight task as still running and skipped scheduling.
+    assert runner.cycles == 1
+
+
+def test_main_continues_other_runners_when_one_cycle_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An exception inside one runner's task does not affect another's task.
+
+    Companion to ``test_main_continues_when_one_runner_raises``: with the
+    parallel scheduler, isolation is provided by the per-runner task
+    boundary, not by the previous ``try/except`` around an awaited call.
+    """
+
+    class _FailingFirstRunner(_FakeRunner):
+        async def run_cycle(self) -> None:
+            self.cycles += 1
+            if self.name == "octo__alpha":
+                raise RuntimeError("alpha boom")
+
+    config = AppConfig(
+        repositories=[
+            _repo("https://github.com/octo/alpha.git"),
+            _repo("https://github.com/octo/beta.git"),
+        ],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    _patch_main(monkeypatch, config, runner_cls=_FailingFirstRunner)
+
+    with caplog.at_level(logging.ERROR, logger=main_module.logger.name):
+        with pytest.raises(_StopLoop):
+            asyncio.run(main_module.main())
+
+    alpha = next(r for r in _FakeRunner.instances if r.name == "octo__alpha")
+    beta = next(r for r in _FakeRunner.instances if r.name == "octo__beta")
+    assert alpha.cycles == 1
+    assert beta.cycles == 1
+    errors = [rec.getMessage() for rec in caplog.records if rec.levelno == logging.ERROR]
+    assert any(
+        "run_cycle failed for octo__alpha" in msg for msg in errors
+    ), errors
+
+
+def test_drain_finished_cycles_logs_runner_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``_drain_finished_cycles`` collects exceptions from completed tasks."""
+
+    async def boom() -> None:
+        raise RuntimeError("kaboom")
+
+    async def runner_test() -> None:
+        task = asyncio.create_task(boom())
+        # Yield so the task can run and store its exception.
+        await asyncio.sleep(0)
+
+        runner = types.SimpleNamespace(name="octo__alpha")
+        in_flight: dict[str, asyncio.Task[None]] = {"key": task}
+        runners = {"key": runner}
+
+        with caplog.at_level(logging.ERROR, logger=main_module.logger.name):
+            main_module._drain_finished_cycles(in_flight, runners)
+
+        assert in_flight == {}
+        errors = [rec.getMessage() for rec in caplog.records if rec.levelno == logging.ERROR]
+        assert any(
+            "run_cycle failed for octo__alpha" in msg for msg in errors
+        ), errors
+
+    asyncio.run(runner_test())
+
+
+def test_drain_finished_cycles_silently_collects_cancelled_task() -> None:
+    """A cancelled task is intentional teardown, not a runner bug — no log."""
+
+    async def slow() -> None:
+        await asyncio.Event().wait()
+
+    async def scenario() -> None:
+        task = asyncio.create_task(slow())
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        runner = types.SimpleNamespace(name="octo__alpha")
+        in_flight: dict[str, asyncio.Task[None]] = {"key": task}
+        runners = {"key": runner}
+
+        # No logs — pure drain.
+        main_module._drain_finished_cycles(in_flight, runners)
+        assert in_flight == {}
+
+    asyncio.run(scenario())
+
+
+def test_drain_finished_cycles_keeps_running_task() -> None:
+    """In-flight tasks that have not finished must remain in the dict."""
+
+    pending = asyncio.Event()
+
+    async def slow() -> None:
+        await pending.wait()
+
+    async def scenario() -> None:
+        task = asyncio.create_task(slow())
+        # Give the task one turn to start. It will not finish.
+        await asyncio.sleep(0)
+
+        in_flight: dict[str, asyncio.Task[None]] = {"key": task}
+        runners: dict[str, Any] = {}
+
+        main_module._drain_finished_cycles(in_flight, runners)
+
+        assert "key" in in_flight, "running task must not be popped"
+        pending.set()
+        await task
+
+    asyncio.run(scenario())
+
+
+def test_cleanup_in_flight_for_removed_cancels_running_task() -> None:
+    """Runners removed by config reload must have their cycle task cancelled.
+
+    Otherwise a slow CODING/FIX task on a now-removed repo would keep
+    holding open a coder subprocess and the coder rate-limit slot.
+    """
+
+    cancelled_observed = asyncio.Event()
+
+    async def long_cycle() -> None:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled_observed.set()
+            raise
+
+    async def scenario() -> None:
+        task = asyncio.create_task(long_cycle())
+        # Let the task start so the cancellation actually goes through
+        # the awaited sleep rather than stopping at task scheduling.
+        await asyncio.sleep(0)
+
+        in_flight: dict[str, asyncio.Task[None]] = {"removed-key": task}
+        await main_module._cleanup_in_flight_for_removed(
+            in_flight, {"removed-key"}
+        )
+
+        assert "removed-key" not in in_flight
+        assert task.cancelled()
+        assert cancelled_observed.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_cleanup_in_flight_for_removed_drains_completed_task(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A removed runner whose cycle already finished with an exception must
+    still have that exception logged so the failure is not silently lost
+    when the runner disappears from the live set."""
+
+    async def boom() -> None:
+        raise RuntimeError("post-removal boom")
+
+    async def scenario() -> None:
+        task = asyncio.create_task(boom())
+        await asyncio.sleep(0)
+        assert task.done()
+
+        in_flight: dict[str, asyncio.Task[None]] = {"removed-key": task}
+        with caplog.at_level(logging.ERROR, logger=main_module.logger.name):
+            await main_module._cleanup_in_flight_for_removed(
+                in_flight, {"removed-key"}
+            )
+
+        assert in_flight == {}
+        errors = [rec.getMessage() for rec in caplog.records if rec.levelno == logging.ERROR]
+        assert any(
+            "run_cycle failed for removed-key (runner removed)" in msg
+            for msg in errors
+        ), errors
+
+    asyncio.run(scenario())
+
+
+def test_cleanup_in_flight_for_removed_silently_drops_already_cancelled() -> None:
+    """A task cancelled before reload reaches cleanup is silently dropped."""
+
+    async def slow() -> None:
+        await asyncio.Event().wait()
+
+    async def scenario() -> None:
+        task = asyncio.create_task(slow())
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert task.done()
+
+        in_flight: dict[str, asyncio.Task[None]] = {"removed-key": task}
+        await main_module._cleanup_in_flight_for_removed(
+            in_flight, {"removed-key"}
+        )
+
+        assert in_flight == {}
+
+    asyncio.run(scenario())
+
+
+def test_cleanup_in_flight_for_removed_ignores_unknown_keys() -> None:
+    """No-op when the removed key has no in-flight task."""
+
+    async def scenario() -> None:
+        in_flight: dict[str, asyncio.Task[None]] = {}
+        await main_module._cleanup_in_flight_for_removed(
+            in_flight, {"never-scheduled"}
+        )
+        assert in_flight == {}
+
+    asyncio.run(scenario())
+
+
+def test_main_cancels_in_flight_for_removed_runner_on_reload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Config reload that drops a runner cancels any cycle still running for it."""
+
+    cancelled_for: list[str] = []
+    block = asyncio.Event()  # never set; use Event.wait() rather than
+    # asyncio.sleep so the patched main_module.asyncio.sleep cannot turn
+    # this into a fast-return inside the runner.
+
+    class _SlowRunner(_FakeRunner):
+        async def run_cycle(self) -> None:
+            self.cycles += 1
+            try:
+                await block.wait()
+            except asyncio.CancelledError:
+                cancelled_for.append(self.name)
+                raise
+
+    first = AppConfig(
+        repositories=[
+            _repo("https://github.com/octo/alpha.git"),
+            _repo("https://github.com/octo/beta.git"),
+        ],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    second = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+
+    _reset_fake_runner()
+    load_calls = {"n": 0}
+
+    def fake_load_config() -> AppConfig:
+        load_calls["n"] += 1
+        return first if load_calls["n"] == 1 else second
+
+    monkeypatch.setattr(main_module, "load_config", fake_load_config)
+    monkeypatch.setattr(
+        main_module.aioredis,
+        "from_url",
+        lambda url, decode_responses: _FakeRedisClient(),
+    )
+    monkeypatch.setattr(main_module, "PipelineRunner", _SlowRunner)
+    monkeypatch.setattr(main_module, "_setup_git_auth", lambda: None)
+    monkeypatch.setattr(
+        main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
+    )
+    monkeypatch.setattr(main_module, "CONFIG_RELOAD_CYCLES", 1)
+
+    clock = [0.0]
+    monkeypatch.setattr(main_module.time, "monotonic", lambda: clock[0])
+
+    sleep_calls = [0]
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls[0] += 1
+        # Advance past the reload window so the next iteration triggers
+        # config reload and drops beta from the live set.
+        clock[0] += seconds + 5
+        await _REAL_ASYNCIO_SLEEP(0)
+        if sleep_calls[0] >= 2:
+            raise _StopLoop
+
+    monkeypatch.setattr(main_module.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    # Beta is cancelled by the reload path mid-loop. Alpha may also be
+    # cancelled at asyncio.run shutdown (pending tasks are torn down when
+    # main() ends), but the order shows beta went first — that is the
+    # property under test.
+    assert cancelled_for[:1] == ["octo__beta"], cancelled_for

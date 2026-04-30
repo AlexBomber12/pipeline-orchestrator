@@ -381,6 +381,67 @@ async def _close_pubsub(pubsub: Any) -> None:
         pass
 
 
+def _drain_finished_cycles(
+    in_flight: dict[str, asyncio.Task[None]],
+    runners: dict[str, PipelineRunner],
+) -> None:
+    """Pop completed cycle tasks from ``in_flight`` and log exceptions.
+
+    Cancellations are intentional (config reload removed the runner) and
+    are not logged; any other exception is reported with the runner name
+    so a crash inside a per-runner task is not silently swallowed.
+    """
+    for key in list(in_flight.keys()):
+        task = in_flight[key]
+        if not task.done():
+            continue
+        runner = runners.get(key)
+        runner_name = runner.name if runner is not None else key
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.error(
+                "run_cycle failed for %s", runner_name, exc_info=True
+            )
+        del in_flight[key]
+
+
+async def _cleanup_in_flight_for_removed(
+    in_flight: dict[str, asyncio.Task[None]],
+    removed_keys: set[str],
+) -> None:
+    """Cancel still-running cycles for removed runners and drain finished ones.
+
+    Called after ``_sync_runners`` drops a repo from the live set: a long
+    CODING/FIX cycle on the removed runner must not keep a stale task alive
+    on the loop. Cancellation propagates ``asyncio.CancelledError`` into the
+    coder subprocess wait, which existing handlers already catch.
+    """
+    for key in list(removed_keys):
+        task = in_flight.pop(key, None)
+        if task is None:
+            continue
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
+            continue
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.error(
+                "run_cycle failed for %s (runner removed)",
+                key,
+                exc_info=True,
+            )
+
+
 def _apply_wake_message(
     message: dict[str, Any],
     last_run: dict[str, float],
@@ -558,6 +619,7 @@ async def main() -> None:
     watcher_task.add_done_callback(_background_tasks.discard)
 
     last_run: dict[str, float] = {}
+    in_flight: dict[str, asyncio.Task[None]] = {}
     last_config_check = time.monotonic()
     pubsub: Any | None = None
     subscribed_slugs: tuple[str, ...] = ()
@@ -577,6 +639,7 @@ async def main() -> None:
                     )
                     config = new_config
                     claude_usage_provider, codex_usage_provider = _create_usage_providers(config)
+                    prev_keys = set(runners.keys())
                     _sync_runners(
                         runners,
                         config,
@@ -585,6 +648,11 @@ async def main() -> None:
                         codex_usage_provider,
                         registry,
                     )
+                    removed_keys = prev_keys - set(runners.keys())
+                    if removed_keys:
+                        await _cleanup_in_flight_for_removed(
+                            in_flight, removed_keys
+                        )
 
         for key, runner in list(runners.items()):
             if not runner.repo_config.active:
@@ -598,17 +666,23 @@ async def main() -> None:
                         exc_info=True,
                     )
                 continue
+            existing = in_flight.get(key)
+            if existing is not None and not existing.done():
+                # Previous cycle still running; do not pile up another one
+                # on top of it. last_run is left untouched so the new cycle
+                # will be scheduled as soon as the in-flight task finishes
+                # and the next interval is due.
+                continue
             now = time.monotonic()
             interval = _runner_poll_interval(runner)
             if key in last_run and now - last_run[key] < interval:
                 continue
+            # last_run is stamped at scheduling time, not completion time.
+            # Otherwise a 30-minute CODING cycle would re-schedule itself
+            # the moment it returns and the per-runner interval would be
+            # ignored on long jobs.
             last_run[key] = now
-            try:
-                await runner.run_cycle()
-            except Exception:
-                logger.error(
-                    "run_cycle failed for %s", runner.name, exc_info=True
-                )
+            in_flight[key] = asyncio.create_task(runner.run_cycle())
 
         # Clean up last_run entries for removed runners.
         for key in list(last_run.keys()):
@@ -639,9 +713,17 @@ async def main() -> None:
             else:
                 subscribed_slugs = desired_slugs
 
-        healthy = await _wait_or_wake(
-            pubsub, max(tick, 1), last_run, slug_to_key, runners
-        )
+        try:
+            healthy = await _wait_or_wake(
+                pubsub, max(tick, 1), last_run, slug_to_key, runners
+            )
+        finally:
+            # Wait_or_wake yields to the event loop, giving any newly
+            # spawned per-runner cycle tasks a chance to run. Drain whatever
+            # finished during the wait so a runner crash is logged in the
+            # same iteration it occurred — even if wait_or_wake propagated
+            # an exception (e.g. the test sentinel).
+            _drain_finished_cycles(in_flight, runners)
         if not healthy:
             await _close_pubsub(pubsub)
             pubsub = None
