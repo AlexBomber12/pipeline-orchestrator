@@ -20004,6 +20004,33 @@ def test_check_budget_slowdown_runs_one_in_n_cycles() -> None:
     assert len(slowdown_logs) == 1
 
 
+def test_check_budget_no_skip_when_extended_idle_active() -> None:
+    """Extended-idle cadence already absorbs the slowdown; do not skip cycles.
+
+    With both slowdowns active, real cycles must space at
+    ``max(extended, base * multiplier)`` — not their product. The
+    extended-idle interval already handles the spacing, so the
+    budget check proceeds every cycle in this branch.
+    """
+    runner = _make_runner(poll_interval_sec=60)
+    runner.app_config.daemon.github_api_pause_threshold_percent = 5
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+    runner.app_config.daemon.github_api_slowdown_multiplier = 5
+    runner.app_config.daemon.idle_extended_after_cycles = 3
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 300
+    _set_budget(runner, _budget(remaining=500, limit=5000))  # 10%
+
+    runner._idle_streak = 5  # past idle_extended_after_cycles
+
+    decisions = [
+        asyncio.run(runner._check_github_api_budget()) for _ in range(6)
+    ]
+
+    assert decisions == [True] * 6
+    assert runner._github_api_slowdown_cycle == 0
+    assert runner._github_api_slowdown_attempts == 6
+
+
 def test_check_budget_slowdown_resets_on_recovery() -> None:
     runner = _make_runner()
     runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
@@ -20493,12 +20520,16 @@ def test_effective_idle_poll_interval_uses_extended_at_threshold() -> None:
     assert runner.effective_idle_poll_interval == 300
 
 
-def test_effective_idle_poll_interval_ignores_rate_limit_slowdown() -> None:
-    """Rate-limit slowdown does not feed back into the IDLE interval.
+def test_effective_idle_poll_interval_takes_larger_of_two_slowdowns() -> None:
+    """Rate-limit slowdown is folded in as ``max(extended, base*multiplier)``.
 
-    ``_check_github_api_budget`` already throttles work to one in
-    ``github_api_slowdown_multiplier`` cycles. Folding the multiplier in
-    here too would stack to ``base * multiplier^2`` between real cycles.
+    Below the IDLE-streak threshold the slowdown does not affect the
+    interval — the budget-check skip logic still throttles work to one
+    in ``multiplier`` cycles. At/above the threshold the property
+    returns the larger of the extended interval and ``base*multiplier``
+    so the two slowdowns do not compound (the budget check then
+    proceeds every cycle on the extended cadence, see
+    ``test_check_budget_no_skip_when_extended_idle_active``).
     """
     runner = _make_runner(poll_interval_sec=60)
     runner.app_config.daemon.idle_extended_after_cycles = 3
@@ -20509,12 +20540,19 @@ def test_effective_idle_poll_interval_ignores_rate_limit_slowdown() -> None:
     runner._github_api_slowdown_attempts = 2
     assert runner.effective_idle_poll_interval == 60
 
+    # extended=200 < base*multiplier=300 → take the larger (300).
     runner._idle_streak = 3
     runner._github_api_slowdown_attempts = 2
-    assert runner.effective_idle_poll_interval == 200
+    assert runner.effective_idle_poll_interval == 300
 
+    # extended=400 > base*multiplier=300 → stay at extended.
     runner.app_config.daemon.idle_extended_poll_interval_sec = 400
     assert runner.effective_idle_poll_interval == 400
+
+    # No slowdown active: extended interval applies as-is.
+    runner._github_api_slowdown_attempts = 0
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 200
+    assert runner.effective_idle_poll_interval == 200
 
 
 def test_update_idle_streak_increments_on_idle_with_no_pr() -> None:

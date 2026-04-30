@@ -1007,28 +1007,40 @@ class PipelineRunner(
             f"slowing polling to {effective_interval}s"
         )
 
+    def _is_extended_idle_active(self) -> bool:
+        """Return whether the runner is on the slower extended-idle cadence."""
+        return (
+            self._idle_streak
+            >= self.app_config.daemon.idle_extended_after_cycles
+        )
+
     @property
     def effective_idle_poll_interval(self) -> int:
         """Return the IDLE poll interval after the adaptive slow-down.
 
         Returns the configured base unless ``_idle_streak`` has reached
         ``idle_extended_after_cycles``, in which case the longer
-        ``idle_extended_poll_interval_sec`` cadence applies. The
-        GitHub-API rate-limit slowdown is intentionally NOT folded in
-        here: ``_check_github_api_budget`` already throttles by skipping
-        ``github_api_slowdown_multiplier - 1`` of every multiplier
-        cycles, so multiplying the poll interval too would compound the
-        slowdown into ``base * multiplier^2`` between cycles that do
-        real work.
+        ``idle_extended_poll_interval_sec`` cadence applies. When the
+        rate-limit slowdown is also active, returns the larger of the
+        two slowdowns (``max(extended, base * multiplier)``) rather
+        than letting ``_check_github_api_budget``'s skip-every-Nth
+        logic stack on top — which would compound the two into
+        ``extended * multiplier`` between real cycles. The skip logic
+        is suppressed in that branch so spacing equals this interval.
         """
         base = self.repo_config.poll_interval_sec
-        threshold = self.app_config.daemon.idle_extended_after_cycles
-        if self._idle_streak >= threshold:
-            return max(
-                base,
-                self.app_config.daemon.idle_extended_poll_interval_sec,
+        if not self._is_extended_idle_active():
+            return base
+        target = max(
+            base,
+            self.app_config.daemon.idle_extended_poll_interval_sec,
+        )
+        if self._github_api_slowdown_attempts > 0:
+            multiplier = max(
+                1, self.app_config.daemon.github_api_slowdown_multiplier
             )
-        return base
+            target = max(target, base * multiplier)
+        return target
 
     def reset_idle_streak(self) -> None:
         """Reset the adaptive IDLE-polling streak (e.g. on wake)."""
@@ -1093,6 +1105,13 @@ class PipelineRunner(
             self._github_api_slowdown_policy.increment(self)
             if was_zero:
                 await self._github_api_slowdown_policy.maybe_escalate(self)
+            # When the runner is already polling on the extended-idle
+            # cadence, ``effective_idle_poll_interval`` has folded the
+            # slowdown into the sleep duration. Skipping cycles here
+            # would compound the two slowdowns; instead, let every
+            # cycle proceed and rely on the longer interval.
+            if self._is_extended_idle_active():
+                return True
             proceed = self._github_api_slowdown_cycle % multiplier == 0
             self._github_api_slowdown_cycle += 1
             return proceed
