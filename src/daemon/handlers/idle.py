@@ -390,6 +390,7 @@ class IdleMixin:
 
         upload_result = await self.process_pending_uploads()
         if upload_result is None:
+            self._idle_upload_deferred = True
             self.log_event("Pending upload failed; skipping task dispatch to retry next cycle")
             return
         if upload_result:

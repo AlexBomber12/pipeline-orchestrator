@@ -20599,3 +20599,81 @@ def test_run_cycle_grows_idle_streak_across_consecutive_idle_cycles(
 
     assert intervals == [60, 60, 300, 300]
     assert runner._idle_streak == 4
+
+
+def test_update_idle_streak_resets_when_pending_upload_deferred() -> None:
+    """A cycle that deferred a pending upload must not grow the streak."""
+    runner = _make_runner()
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_pr = None
+    runner._idle_streak = 2
+    runner._idle_upload_deferred = True
+
+    runner._update_idle_streak_after_cycle()
+
+    assert runner._idle_streak == 0
+    assert runner._idle_upload_deferred is False
+
+
+def test_update_idle_streak_clears_deferred_flag_after_consuming() -> None:
+    """The deferred flag is one-shot: cleared regardless of streak path."""
+    runner = _make_runner()
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_pr = None
+    runner._idle_upload_deferred = True
+    runner._update_idle_streak_after_cycle()
+    assert runner._idle_upload_deferred is False
+
+    runner._update_idle_streak_after_cycle()
+    assert runner._idle_streak == 1
+
+
+def test_handle_idle_marks_upload_deferred_when_processing_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``handle_idle`` flags the cycle so the streak skips this IDLE tick."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+
+    async def fake_uploads() -> None:
+        return None
+
+    runner.process_pending_uploads = fake_uploads  # type: ignore[method-assign]
+
+    asyncio.run(runner.handle_idle())
+
+    assert runner._idle_upload_deferred is True
+
+
+def test_run_cycle_pending_upload_retries_keep_polling_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pending-upload retries do not slow the runner into extended IDLE."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner(poll_interval_sec=60)
+    runner.app_config.daemon.idle_extended_after_cycles = 3
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 300
+    runner._recovered = True
+    runner._scaffolded = True
+
+    async def fake_handle_idle() -> None:
+        runner.state.state = PipelineState.IDLE
+        runner.state.current_pr = None
+        runner._idle_upload_deferred = True
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", _preflight_true_stub)
+
+    runner.state.state = PipelineState.IDLE
+    intervals: list[int] = []
+    for _ in range(5):
+        asyncio.run(runner.run_cycle())
+        intervals.append(runner.effective_idle_poll_interval)
+
+    assert intervals == [60, 60, 60, 60, 60]
+    assert runner._idle_streak == 0
