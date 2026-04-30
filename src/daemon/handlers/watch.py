@@ -137,9 +137,18 @@ class WatchMixin:
 
         # EYES is the only state where the bot may have errored mid-review;
         # gating avoids paginating issue comments on every WATCH poll.
+        # Both retrigger paths post ``@codex review`` with
+        # ``bypass_same_head_dedup=True`` and would otherwise emit two
+        # back-to-back trigger comments when both conditions are true in
+        # the same poll cycle (author-dedup does not deduplicate the
+        # second post when the daemon and PR author have different
+        # logins). Run bot-error first because it is the more specific
+        # signal; fall through to stale-review only when bot-error did
+        # not post.
         if review == ReviewStatus.EYES:
-            self._maybe_retrigger_on_codex_bot_error(found.number)
-            self._maybe_retrigger_stale_review(found.number)
+            posted = self._maybe_retrigger_on_codex_bot_error(found.number)
+            if not posted:
+                self._maybe_retrigger_stale_review(found.number)
 
         last_activity = found.last_activity or self.state.last_updated
         if last_activity.tzinfo is None:
@@ -209,7 +218,7 @@ class WatchMixin:
                 return FeedbackCheckResult.NEW
         return FeedbackCheckResult.NONE
 
-    def _maybe_retrigger_stale_review(self, pr_number: int) -> None:
+    def _maybe_retrigger_stale_review(self, pr_number: int) -> bool:
         """Re-trigger ``@codex review`` when a stale review blocks progress.
 
         EYES is the OBS-Z race-window state — Codex acknowledged the
@@ -219,28 +228,32 @@ class WatchMixin:
         (``stale_review_threshold_eyes_min``) than the legitimate-review
         case (``stale_review_threshold_min``) where the human reviewer
         may simply be slow.
+
+        Returns ``True`` when ``@codex review`` was posted on this call
+        so the caller can suppress redundant retriggers in the same
+        WATCH cycle.
         """
         current_pr = self.state.current_pr
         if current_pr is None:
-            return
+            return False
         if current_pr.review_status == ReviewStatus.CHANGES_REQUESTED:
             stale_minutes = self.app_config.daemon.stale_review_threshold_min
         elif current_pr.review_status == ReviewStatus.EYES:
             stale_minutes = self.app_config.daemon.stale_review_threshold_eyes_min
         else:
-            return
+            return False
 
         last_push_age_seconds = github_client.get_last_push_age_seconds(
             self.owner_repo,
             pr_number,
         )
         if last_push_age_seconds is None:
-            return
+            return False
 
         now = datetime.now(timezone.utc)
         stale_after = timedelta(minutes=stale_minutes)
         if last_push_age_seconds < stale_after.total_seconds():
-            return
+            return False
 
         last_retrigger_at = self.state.last_stale_retrigger_at
         if last_retrigger_at is not None:
@@ -249,7 +262,7 @@ class WatchMixin:
                     tzinfo=timezone.utc
                 )
             if now - last_retrigger_at < _STALE_RETRIGGER_DEBOUNCE:
-                return
+                return False
 
         self.log_event(
             f"Stale CHANGES_REQUESTED on PR #{pr_number}; re-triggering "
@@ -260,13 +273,18 @@ class WatchMixin:
             bypass_same_head_dedup=True,
         )
         self.state.last_stale_retrigger_at = now
+        return posted
 
-    def _maybe_retrigger_on_codex_bot_error(self, pr_number: int) -> None:
+    def _maybe_retrigger_on_codex_bot_error(self, pr_number: int) -> bool:
         """Re-trigger ``@codex review`` when chatgpt-codex-connector[bot]
         posted an error comment (e.g. "Something went wrong while reviewing")
         instead of a verdict. Only matches comments authored by the codex bot
         itself, and applies a 5-minute per-PR cooldown to avoid loops on a
         permanent Codex outage.
+
+        Returns ``True`` when ``@codex review`` was posted on this call
+        so the caller can suppress redundant retriggers in the same
+        WATCH cycle.
         """
         try:
             comments = github_client._gh_api_paginated(
@@ -279,7 +297,7 @@ class WatchMixin:
                 pr_number,
                 exc_info=True,
             )
-            return
+            return False
 
         latest_error_at: datetime | None = None
         for c in comments:
@@ -298,7 +316,7 @@ class WatchMixin:
                 latest_error_at = created
 
         if latest_error_at is None:
-            return
+            return False
 
         last_retrigger_at = self.state.last_codex_retrigger_at
         if last_retrigger_at is not None:
@@ -307,18 +325,19 @@ class WatchMixin:
                     tzinfo=timezone.utc
                 )
             if latest_error_at <= last_retrigger_at:
-                return
+                return False
             now = datetime.now(timezone.utc)
             if now - last_retrigger_at < _CODEX_BOT_ERROR_RETRIGGER_COOLDOWN:
-                return
+                return False
 
         self.log_event(
             f"Codex bot error comment on PR #{pr_number}; "
             "re-triggering @codex review."
         )
-        success, _posted, _retry_at = self._post_codex_review_result(
+        success, posted, _retry_at = self._post_codex_review_result(
             pr_number,
             bypass_same_head_dedup=True,
         )
         if success:
             self.state.last_codex_retrigger_at = datetime.now(timezone.utc)
+        return posted

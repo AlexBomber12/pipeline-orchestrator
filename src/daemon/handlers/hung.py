@@ -64,16 +64,17 @@ class HungMixin:
         pre-post probe of the PR body's reactions lets the daemon skip the
         duplicate when the auto-trigger already landed.
 
-        Gates the dedup on head freshness: an EYES reaction that predates
-        the current head commit is stale and does not count, because a
-        FIX push creates a new head that still needs its own review
-        trigger. Without this gate, any prior EYES reaction would
-        permanently suppress ``_post_codex_review`` and recovery would
-        depend on the 1-hour stale-retrigger debounce in ``watch.py``.
+        Anchors freshness on the branch's last push time, not the head
+        commit's committer date. Cherry-picked, amended, and rebased
+        commits routinely carry committer dates older than the push that
+        actually published them, so committer-date gating could classify
+        a stale EYES reaction as fresh on a brand-new push and silently
+        skip the trigger. The activity API's ``pushed_at`` reflects when
+        the branch was actually updated, which is what the gate needs.
 
         Fails open (returns ``False``) on any GitHub API error or when
-        the head commit time cannot be resolved, so a transient outage
-        cannot suppress a needed mention.
+        the push time cannot be resolved, so a transient outage cannot
+        suppress a needed mention.
         """
         try:
             codex_reactions = github_client._get_codex_issue_reactions(
@@ -88,19 +89,24 @@ class HungMixin:
         if not eyes_reactions:
             return False
         try:
-            head_commit_iso = github_client.get_pr_head_commit_iso(
+            last_push_time = github_client.get_pr_last_push_time(
                 self.owner_repo, pr_number,
             )
         except Exception:
             return False
-        head_commit_time = github_client._parse_iso(head_commit_iso)
-        if head_commit_time is None:
+        if last_push_time is None:
             return False
+        if last_push_time.tzinfo is None:
+            last_push_time = last_push_time.replace(tzinfo=timezone.utc)
         for reaction in eyes_reactions:
             reaction_time = github_client._parse_iso(
                 reaction.get("created_at")
             )
-            if reaction_time is not None and reaction_time >= head_commit_time:
+            if reaction_time is None:
+                continue
+            if reaction_time.tzinfo is None:
+                reaction_time = reaction_time.replace(tzinfo=timezone.utc)
+            if reaction_time >= last_push_time:
                 return True
         return False
 

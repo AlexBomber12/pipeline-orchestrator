@@ -16641,7 +16641,7 @@ def test_handle_fix_pauses_when_late_breach_rev_parse_fails(
 def _patch_eyes_reaction_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Stub the EYES-skip pre-push gate to fire (fresh EYES on head)."""
+    """Stub the EYES-skip pre-push gate to fire (fresh EYES after push)."""
     monkeypatch.setattr(
         runner_module.github_client,
         "_get_codex_issue_reactions",
@@ -16655,15 +16655,17 @@ def _patch_eyes_reaction_present(
     )
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_head_commit_iso",
-        lambda repo, number: "2026-04-30T12:00:00Z",
+        "get_pr_last_push_time",
+        lambda repo, number: runner_module.github_client._parse_iso(
+            "2026-04-30T12:00:00Z"
+        ),
     )
 
 
 def _patch_eyes_reaction_stale(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Stub a stale EYES reaction (predates head) — gate must NOT skip."""
+    """Stub a stale EYES reaction (predates push) — gate must NOT skip."""
     monkeypatch.setattr(
         runner_module.github_client,
         "_get_codex_issue_reactions",
@@ -16677,8 +16679,10 @@ def _patch_eyes_reaction_stale(
     )
     monkeypatch.setattr(
         runner_module.github_client,
-        "get_pr_head_commit_iso",
-        lambda repo, number: "2026-04-30T12:00:00Z",
+        "get_pr_last_push_time",
+        lambda repo, number: runner_module.github_client._parse_iso(
+            "2026-04-30T12:00:00Z"
+        ),
     )
 
 
@@ -21669,6 +21673,126 @@ def test_handle_watch_codex_bot_error_normalizes_naive_timestamps(
 
     assert posted == [42]
     assert runner.state.last_codex_retrigger_at == frozen_now
+
+
+def test_handle_watch_eyes_skips_stale_review_after_bot_error_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a Codex bot-error retrigger fires in the EYES branch, the stale-
+    review retrigger must not also fire in the same cycle. Both paths post
+    ``@codex review`` with ``bypass_same_head_dedup=True``; without
+    mutual exclusion the daemon would emit two trigger comments back-to-
+    back when both conditions are simultaneously true (e.g. an error
+    comment plus a push old enough to cross the EYES threshold).
+    """
+    now = datetime(2026, 4, 30, 12, 0, tzinfo=timezone.utc)
+    pr = _codex_bot_pr()
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [_codex_bot_error_comment()],
+    )
+    # Push age well past the EYES stale threshold so the stale path WOULD
+    # otherwise fire if it were called.
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, number: 10 * 60,
+    )
+
+    posts: list[tuple[int, bool]] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        posts.append((number, bypass_same_head_dedup))
+        return True, True, None
+
+    runner = _make_runner(review_timeout_min=120)
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = now - timedelta(minutes=10)
+    runner._last_push_at_pr_number = pr.number
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert posts == [(42, True)]
+    assert runner.state.last_codex_retrigger_at == now
+    assert runner.state.last_stale_retrigger_at is None
+
+
+def test_handle_watch_eyes_runs_stale_review_when_bot_error_does_not_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the Codex bot-error retrigger does not post (e.g. cooldown blocked
+    after a prior retrigger), the stale-review retrigger must still run as
+    a fallback so a stuck EYES review eventually recovers."""
+    now = datetime(2026, 4, 30, 12, 0, tzinfo=timezone.utc)
+    pr = _codex_bot_pr()
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    # An error comment older than ``last_codex_retrigger_at`` is treated
+    # as already handled, so bot-error returns without posting.
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [
+            _codex_bot_error_comment(created_at="2026-04-30T11:00:00Z"),
+        ],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, number: 6 * 60,
+    )
+
+    posts: list[tuple[int, bool]] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        posts.append((number, bypass_same_head_dedup))
+        return True, True, None
+
+    runner = _make_runner(review_timeout_min=120)
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.state.last_codex_retrigger_at = now - timedelta(minutes=30)
+    runner._last_push_at = now - timedelta(minutes=6)
+    runner._last_push_at_pr_number = pr.number
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert posts == [(42, True)]
+    assert runner.state.last_stale_retrigger_at == now
 
 
 def test_repo_state_resets_codex_retrigger_on_pr_transition() -> None:

@@ -977,14 +977,18 @@ def get_branch_last_push_time(
     return None
 
 
-def get_last_push_age_seconds(repo: str, pr_number: int) -> float | None:
-    """Return seconds since the last push to the PR branch.
+def get_pr_last_push_time(repo: str, pr_number: int) -> datetime | None:
+    """Return the timestamp of the most recent push to the PR's head ref.
 
-    Uses the GitHub repository activity API to find the most recent push
-    event on the PR's head ref, which reflects the actual push timestamp
-    (not the commit's committer date).
+    Uses the GitHub repository activity API, which records the actual
+    push event time. This is distinct from the head commit's committer
+    date: a cherry-picked, amended, or rebased commit can carry a
+    committer date that predates the push that put it on the branch.
+    Anywhere we want "did X happen after this branch's latest push?",
+    push time is the correct anchor.
 
-    Returns ``None`` on any API or parse failure.
+    Returns ``None`` on any API or parse failure (callers must fail
+    open).
     """
     try:
         branch_raw = run_gh([
@@ -1009,11 +1013,20 @@ def get_last_push_age_seconds(repo: str, pr_number: int) -> float | None:
         date_str = date_raw.strip() if isinstance(date_raw, str) else ""
         if not date_str:
             return None
-        push_dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-        age = (datetime.now(timezone.utc) - push_dt).total_seconds()
-        return max(0.0, age)
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+def get_last_push_age_seconds(repo: str, pr_number: int) -> float | None:
+    """Return seconds since the last push to the PR branch.
+
+    Returns ``None`` on any API or parse failure.
+    """
+    push_dt = get_pr_last_push_time(repo, pr_number)
+    if push_dt is None:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - push_dt).total_seconds())
 
 
 def clear_last_known_sha() -> None:
