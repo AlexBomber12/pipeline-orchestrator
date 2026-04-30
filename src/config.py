@@ -221,7 +221,7 @@ def load_config(path: str | None = None) -> AppConfig:
                 key,
             )
         raw = _deep_merge(raw, overlay)
-        applied = _applied_overlay_paths(overlay)
+        applied = _applied_overlay_paths(overlay, AppConfig)
         if applied:
             logger.info(
                 "Applied %s overlay fields: %s",
@@ -291,12 +291,22 @@ def _resolve_nested_model(annotation: Any) -> type[BaseModel] | None:
     """Return the BaseModel subclass embedded in ``annotation`` if any.
 
     Recognizes plain ``Model`` and ``Optional[Model]`` / ``Model | None``
-    forms. Container types like ``list[Model]`` are intentionally left
-    alone — overlay validation does not descend into list items.
+    forms. ``list[Model]`` is handled separately by ``_list_item_model``
+    so the dict-recursion path stays free of list semantics.
     """
     if isinstance(annotation, type) and issubclass(annotation, BaseModel):
         return annotation
     if typing.get_origin(annotation) is list:
+        return None
+    for arg in typing.get_args(annotation):
+        if isinstance(arg, type) and issubclass(arg, BaseModel):
+            return arg
+    return None
+
+
+def _list_item_model(annotation: Any) -> type[BaseModel] | None:
+    """Return the item BaseModel subclass for a ``list[Model]`` annotation."""
+    if typing.get_origin(annotation) is not list:
         return None
     for arg in typing.get_args(annotation):
         if isinstance(arg, type) and issubclass(arg, BaseModel):
@@ -309,7 +319,12 @@ def _collect_unknown_overlay_keys(
     model_cls: type[BaseModel],
     prefix: str = "",
 ) -> list[str]:
-    """Return dotted overlay paths that do not match ``model_cls`` schema."""
+    """Return dotted overlay paths that do not match ``model_cls`` schema.
+
+    Descends into nested mappings AND list-of-model fields so that typos
+    inside list items (e.g. ``repositories[0].made_up_field``) surface as
+    warnings instead of being silently dropped at validation time.
+    """
     unknown: list[str] = []
     if not isinstance(overlay, dict):
         return unknown
@@ -325,22 +340,48 @@ def _collect_unknown_overlay_keys(
                 unknown.extend(
                     _collect_unknown_overlay_keys(value, inner, path)
                 )
+        elif isinstance(value, list):
+            item_model = _list_item_model(field.annotation)
+            if item_model is None:
+                continue
+            for idx, item in enumerate(value):
+                if isinstance(item, dict):
+                    unknown.extend(
+                        _collect_unknown_overlay_keys(
+                            item, item_model, f"{path}[{idx}]"
+                        )
+                    )
     return unknown
 
 
 def _applied_overlay_paths(
-    overlay: dict[str, Any], prefix: str = ""
+    overlay: dict[str, Any],
+    model_cls: type[BaseModel],
+    prefix: str = "",
 ) -> list[str]:
-    """Flatten ``overlay`` to dotted paths for the info log."""
+    """Flatten ``overlay`` to dotted paths for the info log.
+
+    Skips keys that ``model_cls`` does not know about — those keys were
+    already warned as "unknown" and pydantic drops them at validation, so
+    logging them as "Applied" would mislead operators verifying that an
+    override actually took effect.
+    """
     paths: list[str] = []
     if not isinstance(overlay, dict):
         return paths
     for key, value in overlay.items():
-        new_path = f"{prefix}.{key}" if prefix else key
+        path = f"{prefix}.{key}" if prefix else key
+        field = model_cls.model_fields.get(key)
+        if field is None:
+            continue
         if isinstance(value, dict) and value:
-            paths.extend(_applied_overlay_paths(value, new_path))
+            inner = _resolve_nested_model(field.annotation)
+            if inner is not None:
+                paths.extend(_applied_overlay_paths(value, inner, path))
+            else:
+                paths.append(path)
         else:
-            paths.append(new_path)
+            paths.append(path)
     return paths
 
 

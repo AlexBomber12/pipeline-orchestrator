@@ -955,23 +955,68 @@ def test_load_config_overlay_unknown_field_warns_and_ignored(
     overlay = tmp_path / "config.production.yml"
     overlay.write_text(
         "daemon:\n"
+        "  poll_interval_sec: 90\n"
         "  future_only_field: 1\n"
         "totally_unknown_section:\n"
         "  whatever: true\n",
         encoding="utf-8",
     )
 
-    with caplog.at_level("WARNING", logger="src.config"):
+    with caplog.at_level("INFO", logger="src.config"):
         cfg = load_config(str(base))
 
-    # Base values unchanged — the unknown overlay keys are forward-compat
-    # noise and pydantic's default extra="ignore" drops them at validation.
-    assert cfg.daemon.poll_interval_sec == 45
+    # Known overlay keys still apply; pydantic's default extra="ignore"
+    # silently drops the unknown ones during validation.
+    assert cfg.daemon.poll_interval_sec == 90
     warnings = [
         rec.getMessage() for rec in caplog.records if rec.levelname == "WARNING"
     ]
     assert any("daemon.future_only_field" in m for m in warnings), warnings
     assert any("totally_unknown_section" in m for m in warnings), warnings
+
+    # The "Applied overlay fields" log must NOT advertise a key that was
+    # just warned as unknown — operators verifying a deploy rely on this
+    # line to see what actually took effect.
+    info_messages = [
+        rec.getMessage() for rec in caplog.records if rec.levelname == "INFO"
+    ]
+    applied_msg = next(
+        (m for m in info_messages if "overlay fields" in m), None
+    )
+    assert applied_msg is not None, info_messages
+    assert "daemon.poll_interval_sec" in applied_msg
+    assert "future_only_field" not in applied_msg
+    assert "totally_unknown_section" not in applied_msg
+
+
+def test_load_config_overlay_warns_unknown_field_inside_list_item(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    base = tmp_path / "config.yml"
+    base.write_text("repositories: []\n", encoding="utf-8")
+    overlay = tmp_path / "config.production.yml"
+    overlay.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/o/r.git\n"
+        "    made_up_field: true\n",
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING", logger="src.config"):
+        cfg = load_config(str(base))
+
+    # The unknown sub-key is dropped by pydantic, but the rest of the
+    # repository entry still validates and the overlay still replaces the
+    # base list — operators must not be misled into thinking the typo
+    # took effect.
+    assert len(cfg.repositories) == 1
+    assert cfg.repositories[0].url == "https://github.com/o/r.git"
+    warnings = [
+        rec.getMessage() for rec in caplog.records if rec.levelname == "WARNING"
+    ]
+    assert any(
+        "repositories[0].made_up_field" in m for m in warnings
+    ), warnings
 
 
 def test_load_config_overlay_must_be_sibling_of_base(tmp_path: Path) -> None:
@@ -1054,8 +1099,8 @@ def test_resolve_nested_model_handles_optional_and_list() -> None:
     assert _resolve_nested_model(coder_field.annotation) is None
 
     repos_field = AppConfig.model_fields["repositories"]
-    # list[RepoConfig] must NOT recurse into the model — overlay validation
-    # does not descend into list items.
+    # ``list[RepoConfig]`` is handled by ``_list_item_model`` instead, so
+    # ``_resolve_nested_model`` returns None for list annotations.
     assert _resolve_nested_model(repos_field.annotation) is None
 
     # Optional[BaseModel] / ``Model | None`` must unwrap to the model. None
@@ -1064,6 +1109,22 @@ def test_resolve_nested_model_handles_optional_and_list() -> None:
     assert (
         _resolve_nested_model(DaemonConfig | None) is DaemonConfig
     )
+
+
+def test_list_item_model_resolves_repositories() -> None:
+    from src.config import AppConfig, RepoConfig, _list_item_model
+
+    repos_field = AppConfig.model_fields["repositories"]
+    assert _list_item_model(repos_field.annotation) is RepoConfig
+
+    daemon_field = AppConfig.model_fields["daemon"]
+    # Non-list annotations have no list item model.
+    assert _list_item_model(daemon_field.annotation) is None
+
+    # ``list[scalar]`` annotations (e.g. ``RepoConfig.disabled_coders``)
+    # are lists, but their item type is not a BaseModel — the function
+    # must return None rather than guessing.
+    assert _list_item_model(list[str]) is None
 
 
 def test_collect_unknown_overlay_keys_walks_nested_models() -> None:
@@ -1083,29 +1144,90 @@ def test_collect_unknown_overlay_keys_walks_nested_models() -> None:
     assert "daemon.poll_interval_sec" not in paths
 
 
+def test_collect_unknown_overlay_keys_walks_list_items() -> None:
+    from src.config import AppConfig, _collect_unknown_overlay_keys
+
+    overlay = {
+        "repositories": [
+            {
+                "url": "https://github.com/o/r.git",
+                "made_up_field": 1,
+                # ``disabled_coders`` is ``list[str]`` — a list whose item
+                # type is not a BaseModel. The collector must skip the
+                # descent silently rather than treat scalar items as typos.
+                "disabled_coders": ["claude"],
+            },
+            {"url": "https://github.com/o/s.git", "branch": "main"},
+            "scalar-not-a-dict",
+        ],
+    }
+    paths = _collect_unknown_overlay_keys(overlay, AppConfig)
+
+    assert "repositories[0].made_up_field" in paths
+    # Items that are entirely valid (or non-dict scalars that pydantic
+    # will reject for its own reasons) must not produce phantom warnings.
+    assert all(not p.startswith("repositories[1]") for p in paths), paths
+    assert all(not p.startswith("repositories[2]") for p in paths), paths
+    # ``disabled_coders`` itself is a known field and its scalar items
+    # must not be flagged as unknown.
+    assert all(
+        "disabled_coders" not in p for p in paths
+    ), paths
+
+
 def test_collect_unknown_overlay_keys_handles_non_dict_input() -> None:
     from src.config import AppConfig, _collect_unknown_overlay_keys
 
     assert _collect_unknown_overlay_keys("not-a-dict", AppConfig) == []  # type: ignore[arg-type]
 
 
-def test_applied_overlay_paths_flattens_nested() -> None:
-    from src.config import _applied_overlay_paths
+def test_applied_overlay_paths_flattens_nested_known_keys() -> None:
+    from src.config import AppConfig, _applied_overlay_paths
 
     overlay = {
-        "daemon": {"a": 1, "b": {"c": 2}},
-        "x": 9,
-        "empty": {},
+        "daemon": {
+            "poll_interval_sec": 45,
+            "coder_priority": {"claude": 10, "codex": 20},
+        },
+        "web": {"port": 9100},
+        "repositories": [{"url": "https://github.com/o/r.git"}],
     }
-    paths = sorted(_applied_overlay_paths(overlay))
+    paths = sorted(_applied_overlay_paths(overlay, AppConfig))
 
-    assert paths == ["daemon.a", "daemon.b.c", "empty", "x"]
+    # ``coder_priority`` is ``dict[str, int]`` — not a nested BaseModel —
+    # so the function does not descend; it appears as the field name.
+    # ``repositories`` is a list field so the wholesale-replaced list
+    # surfaces as the field name itself, not per-item paths.
+    assert paths == [
+        "daemon.coder_priority",
+        "daemon.poll_interval_sec",
+        "repositories",
+        "web.port",
+    ]
+
+
+def test_applied_overlay_paths_skips_unknown_keys() -> None:
+    from src.config import AppConfig, _applied_overlay_paths
+
+    overlay = {
+        "daemon": {
+            "poll_interval_sec": 45,
+            "future_only_field": 1,
+        },
+        "totally_unknown_section": {"whatever": True},
+    }
+    paths = _applied_overlay_paths(overlay, AppConfig)
+
+    assert "daemon.poll_interval_sec" in paths
+    assert "daemon.future_only_field" not in paths
+    assert "totally_unknown_section" not in paths
+    assert all("totally_unknown_section" not in p for p in paths)
 
 
 def test_applied_overlay_paths_handles_non_dict_input() -> None:
-    from src.config import _applied_overlay_paths
+    from src.config import AppConfig, _applied_overlay_paths
 
-    assert _applied_overlay_paths("not-a-dict") == []  # type: ignore[arg-type]
+    assert _applied_overlay_paths("not-a-dict", AppConfig) == []  # type: ignore[arg-type]
 
 
 def test_load_config_overlay_top_level_list_raises(tmp_path: Path) -> None:
