@@ -162,6 +162,13 @@ class MergeMixin:
                         ),
                         operation_name=f"git push origin {pr_branch}",
                     )
+                    # Pre-merge sync just rewrote the PR's head SHA;
+                    # the cached ``repos/{repo}/pulls`` pages still hold
+                    # the prior ``updated_at`` and ``head.sha`` values,
+                    # so drop them now to keep WATCH polling honest.
+                    github_client._invalidate_etag_cache(
+                        f"repos/{self.owner_repo}/pulls"
+                    )
                     self.state.state = PipelineState.WATCH
                     self.log_event(
                         f"Pre-merge sync pushed new commits to PR "

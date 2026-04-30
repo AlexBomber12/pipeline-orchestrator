@@ -85,6 +85,34 @@ def _etag_cache_put(path: str, etag: str, payload: object) -> None:
         _etag_cache.popitem(last=False)
 
 
+def _invalidate_etag_cache(prefix: str) -> None:
+    """Drop ETag cache entries whose path begins with ``prefix``.
+
+    Called at known list-mutation points (PR create, merge, close) so the
+    next REST list fetch returns a fresh 200 instead of a cached 304 that
+    would mask the new state for one polling cycle. False invalidation
+    only costs one extra API call; false non-invalidation hides a real
+    state change, so the call sites are deliberately conservative — when
+    in doubt, invalidate.
+    """
+    stale = [key for key in _etag_cache if key.startswith(prefix)]
+    for key in stale:
+        _etag_cache.pop(key, None)
+
+
+# List endpoints whose pages are walked one-at-a-time so each page can
+# return 304 independently. Currently scoped to the top-level
+# ``repos/{owner}/{name}/pulls`` list (open and closed states) — the
+# dominant REST consumer when the GraphQL ``gh pr list`` rollup falls
+# back. Sub-resources like ``pulls/{n}/comments`` stay on the legacy
+# slurp path because they change too often for ETag caching to help.
+_ETAG_PAGINATED_PATH_RE = re.compile(
+    r"^repos/[^/]+/[^/]+/pulls(?:\?[^#]*)?$"
+)
+_ETAG_PAGINATED_DEFAULT_PER_PAGE = 100
+_ETAG_PAGINATED_MAX_PAGES = 100
+
+
 _HTTP_STATUS_RE = re.compile(r"^HTTP/\S+\s+(\d{3})", re.MULTILINE)
 
 
@@ -799,8 +827,15 @@ def get_latest_codex_feedback(repo: str, pr_number: int) -> str | None:
 
 
 def merge_pr(repo: str, pr_number: int) -> None:
-    """Merge a PR using ``gh pr merge --squash --delete-branch``."""
+    """Merge a PR using ``gh pr merge --squash --delete-branch``.
+
+    Invalidates the cached ``repos/{repo}/pulls`` ETag entries on success
+    so the next REST list fetch sees the merged PR drop out of
+    ``state=open`` instead of returning a stale 304-cached page that
+    still contains it.
+    """
     run_gh(["pr", "merge", str(pr_number), "--squash", "--delete-branch"], repo=repo)
+    _invalidate_etag_cache(f"repos/{repo}/pulls")
 
 
 def post_comment(repo: str, pr_number: int, body: str) -> None:
@@ -1109,17 +1144,27 @@ def get_recent_codex_review_request_time(
 def _gh_api_paginated(path: str) -> list[dict] | None:
     """Fetch every page of a GitHub REST endpoint that returns a JSON array.
 
-    Uses ``gh api --paginate --slurp``: ``--paginate`` walks all pages and
-    ``--slurp`` wraps them into a single outer JSON array (one entry per page).
-    Without ``--slurp`` ``gh`` writes one JSON document per page back-to-back,
-    which is not parseable as a single document. The pages are then flattened
-    into a single list of items. Returns ``None`` if the response is not a
-    list (which would indicate an unexpected ``gh`` output).
+    For list endpoints that benefit from ETag conditional caching (the
+    top-level ``repos/{owner}/{name}/pulls`` list) the call is routed to
+    ``_etag_get_paginated`` so each page is fetched individually with its
+    own ``If-None-Match`` and 304s do not consume rate-limit budget.
+    Other paths (sub-resource lists like ``pulls/{n}/comments`` or
+    ``issues/{n}/reactions``, where ETag re-validation would rarely hit)
+    keep the legacy ``gh api --paginate --slurp`` flow.
+
+    The slurp path uses ``--slurp`` because ``--paginate`` alone writes
+    one JSON document per page back-to-back, which is not parseable as a
+    single document. Pages are flattened into a single item list.
+    Returns ``None`` if the response is not a list (which would indicate
+    an unexpected ``gh`` output).
 
     Wraps the underlying ``run_gh`` call with ``retry_transient`` so
     transient network errors (connection reset, 502/503/504, timeout) are
     retried up to 3 times with exponential backoff before propagating.
     """
+    if _ETAG_PAGINATED_PATH_RE.match(path):
+        return _etag_get_paginated(path)
+
     raw = retry_transient(
         lambda: run_gh(["api", "--paginate", "--slurp", path]),
         operation_name=f"gh api {path}",
@@ -1133,6 +1178,62 @@ def _gh_api_paginated(path: str) -> list[dict] | None:
             items.extend(item for item in page if isinstance(item, dict))
         elif isinstance(page, dict):
             items.append(page)
+    return items
+
+
+def _etag_get_paginated(path: str) -> list[dict] | None:
+    """Walk a JSON-array REST list endpoint one page at a time, ETag-cached.
+
+    Each page is keyed in ``_etag_cache`` by its full URL including
+    ``page=N`` (and any pre-existing ``per_page=M``) so a 304 from any
+    individual page returns its cached payload — and crucially that 304
+    is free against the rate-limit budget. Pages with real changes
+    round-trip a fresh 200 and refresh the cache.
+
+    Stops early when a page returns fewer items than the per-page size
+    declared in the URL (the GitHub convention for "last page"); when the
+    URL does not declare ``per_page=`` the helper assumes the GitHub
+    default (30). A bounded ``_ETAG_PAGINATED_MAX_PAGES`` keeps the loop
+    finite if the upstream signals an oversized list.
+
+    Returns ``None`` only when the very first page cannot be fetched or
+    parsed; partial results from later pages are surfaced as-is so a
+    transient mid-walk error degrades gracefully rather than dropping the
+    whole list.
+
+    Wraps each per-page ``_etag_get`` in ``retry_transient`` to match the
+    transient-retry semantics callers had under the legacy slurp path.
+    """
+    sep = "&" if "?" in path else "?"
+    per_page_match = re.search(r"(?:^|[?&])per_page=(\d+)", path)
+    per_page = (
+        int(per_page_match.group(1))
+        if per_page_match
+        else _ETAG_PAGINATED_DEFAULT_PER_PAGE
+    )
+    items: list[dict] = []
+    for page_num in range(1, _ETAG_PAGINATED_MAX_PAGES + 1):
+        url = f"{path}{sep}page={page_num}"
+        try:
+            payload = retry_transient(
+                lambda u=url: _etag_get(u),
+                operation_name=f"gh api {url}",
+            )
+        except RuntimeError:
+            if page_num == 1:
+                raise
+            break
+        if payload is None:
+            if page_num == 1:
+                return None
+            break
+        if not isinstance(payload, list):
+            if page_num == 1:
+                return None
+            break
+        items.extend(item for item in payload if isinstance(item, dict))
+        if len(payload) < per_page:
+            break
     return items
 
 

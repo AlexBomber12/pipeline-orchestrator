@@ -269,6 +269,14 @@ class CodingMixin:
             self.log_event(f"[{coder_name}] CLI failed: {self.state.error_message}")
             return
 
+        # The coder just exited; if it ran ``gh pr create`` from its own
+        # subprocess the daemon's ETag cache for ``repos/{repo}/pulls``
+        # still reflects the pre-create state. Invalidate before polling
+        # so the first ``get_open_prs`` REST fallback returns a fresh 200
+        # instead of a 304-cached page that omits the new PR.
+        github_client._invalidate_etag_cache(
+            f"repos/{self.owner_repo}/pulls"
+        )
         candidate = None
         for attempt in range(3):
             if await pause_for_stop_if_requested():
@@ -514,6 +522,14 @@ class CodingMixin:
                     f"[{coder_name}] gh pr create reports PR already exists "
                     f"for {target_branch!r}; reusing existing PR"
                 )
+                # The daemon's last list view did not include this PR yet
+                # but the upstream "already exists" reply confirms it does;
+                # drop any cached pages so the post-create visibility loop
+                # fetches a fresh 200 instead of looping on a 304-cached
+                # page that still misses it.
+                github_client._invalidate_etag_cache(
+                    f"repos/{self.owner_repo}/pulls"
+                )
                 return True
             message = (
                 f"[{coder_name}] Daemon PR creation failed for "
@@ -524,4 +540,7 @@ class CodingMixin:
             await self._save_current_run_record("error")
             self.log_event(message)
             return False
+        github_client._invalidate_etag_cache(
+            f"repos/{self.owner_repo}/pulls"
+        )
         return True
