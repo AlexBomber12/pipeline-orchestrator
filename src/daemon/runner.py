@@ -282,11 +282,14 @@ class PipelineRunner(
         # cleared by either a Redis wake event or any state transition
         # out of the no-work IDLE shape.
         self._idle_streak = 0
-        # Set by ``handle_idle`` when ``process_pending_uploads`` defers
-        # work to the next cycle (returning ``None``). Suppresses the
-        # streak increment so an outstanding upload retry is not folded
-        # into the slower extended-idle cadence.
-        self._idle_upload_deferred = False
+        # Set by ``handle_idle`` when the cycle ended without a clean
+        # IDLE verdict — either ``process_pending_uploads`` deferred
+        # work to the next cycle (returning ``None``) or a GitHub read
+        # (``get_open_prs``) raised, leaving queue/PR status unknown.
+        # Suppresses the streak increment so a transient outage or an
+        # outstanding upload retry is not folded into the slower
+        # extended-idle cadence.
+        self._idle_dispatch_deferred = False
         self._github_api_pause_policy: BoundedRecoveryPolicy[
             "PipelineRunner"
         ] = BoundedRecoveryPolicy(
@@ -1050,18 +1053,21 @@ class PipelineRunner(
         """Bump or clear ``_idle_streak`` based on the post-cycle state.
 
         A cycle counts toward the streak only when the runner ends in
-        IDLE with no PR pinned (``current_pr is None``) AND no pending
-        upload deferred work to the next cycle. Any other outcome —
-        transition to a working state, attaching to an open PR for
-        manual work, or a pending upload that asked to retry — resets
-        the streak so the next cycle polls on the fast cadence again.
+        IDLE with no PR pinned (``current_pr is None``) AND the cycle
+        produced a clean idle verdict (``_idle_dispatch_deferred`` is
+        false). Any other outcome — transition to a working state,
+        attaching to an open PR for manual work, a pending upload
+        retry, or a GitHub read failure that left queue/PR status
+        unknown — resets the streak so the next cycle polls on the
+        fast cadence again and recovers quickly from transient
+        outages.
         """
-        upload_deferred = self._idle_upload_deferred
-        self._idle_upload_deferred = False
+        dispatch_deferred = self._idle_dispatch_deferred
+        self._idle_dispatch_deferred = False
         if (
             self.state.state == PipelineState.IDLE
             and self.state.current_pr is None
-            and not upload_deferred
+            and not dispatch_deferred
         ):
             if self._idle_streak < _IDLE_STREAK_CAP:
                 self._idle_streak += 1

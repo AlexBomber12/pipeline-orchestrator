@@ -390,7 +390,7 @@ class IdleMixin:
 
         upload_result = await self.process_pending_uploads()
         if upload_result is None:
-            self._idle_upload_deferred = True
+            self._idle_dispatch_deferred = True
             self.log_event("Pending upload failed; skipping task dispatch to retry next cycle")
             return
         if upload_result:
@@ -417,6 +417,7 @@ class IdleMixin:
             )
             self.state.current_pr = None
             self.state.current_task = None
+            self._idle_dispatch_deferred = True
             return
         open_pr_snapshot = tuple(sorted((pr.number, pr.branch) for pr in prs))
         previous_open_pr_snapshot = getattr(self, "_idle_open_pr_snapshot", None)
