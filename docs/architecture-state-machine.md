@@ -18,7 +18,7 @@ these values per repo at any given time; there are no compound states.
 | `FIX`       | Coder subprocess is running in `FIX FEEDBACK` mode against an existing PR branch.                      |
 | `MERGE`     | A PR is approved and CI is green; daemon is performing the merge.                                      |
 | `HUNG`      | Daemon detected a stuck WATCH cycle and is running the hung-recovery routine.                          |
-| `ERROR`     | A bounded recoverable error occurred. Daemon transitions back to `IDLE` on the next tick.              |
+| `ERROR`     | An error occurred during task processing. May persist across ticks; see [ERROR state details](#error-state-details). |
 | `PAUSED`    | Operator pressed Pause. No state advancement until Resume.                                             |
 
 Operators see the canonical state in the repo card badge; semantic detail
@@ -52,6 +52,33 @@ within `stale_review_threshold_min` of the last push, or `review_status` is
 `_maybe_retrigger_stale_review` re-posts `@codex review` on the PR. This is a
 silent, dedup-aware operation; the daemon stays in `WATCH` and the dashboard
 continues to show `WATCH`.
+
+## ERROR state details
+
+ERROR is entered when any handler sets `state.state = PipelineState.ERROR` and
+writes a context string to `state.error_message`. Unlike the transient states
+that `_run_cycle_body` resets on each tick (`PREFLIGHT`, `CODING`, `FIX`,
+`MERGE`), ERROR is *not* auto-cleared. Each tick dispatches `handle_error`
+(in `src/daemon/handlers/error.py`) when `daemon.error_handler_use_ai` is
+enabled, and the state changes only based on the diagnosis outcome:
+
+- **ERROR persists** when the context is classified as an infra/network
+  failure, when the category is rate-limit or timeout, when no eligible
+  diagnosis coder is available, when the per-context diagnosis budget
+  (3 attempts) is exhausted, when the auto-fix push cannot post
+  `@codex review`, when the diagnosis CLI exits non-zero, or when the
+  verdict is `ESCALATE`.
+- **Transition to `IDLE`** when the verdict is `FIX` (with the auto-fix
+  applied and pushed) or `SKIP` (the active task/PR is cleared).
+- **Transition to `PAUSED`** when the diagnosis CLI itself trips a
+  rate-limit pause. `error_message` is preserved so `handle_paused` returns
+  the runner to ERROR after the pause window.
+
+For incident triage: a repo that remains in ERROR across multiple cycles is
+expected behaviour rather than a stuck dispatcher, and the most recent
+`diagnose_error` event log line records why the state did not clear
+(`ESCALATE`, max attempts, infra skip, rate-limited diagnosis coder, etc.).
+The legacy `_TRANSIENT_STATES` reset path does not apply to ERROR.
 
 ## WATCH STALLED substate (historical)
 
