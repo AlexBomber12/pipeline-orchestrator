@@ -2006,13 +2006,22 @@ def test_get_pr_author_returns_login(monkeypatch: pytest.MonkeyPatch) -> None:
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         captured.append(cmd)
-        return _FakeCompletedProcess(stdout='"claude-cli-bot"')
+        body = '{"user": {"login": "claude-cli-bot"}}'
+        stdout = (
+            "HTTP/2.0 200 OK\r\n"
+            'ETag: W/"abc"\r\n'
+            "\r\n"
+            f"{body}"
+        )
+        return _FakeCompletedProcess(stdout=stdout)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    github_client.clear_etag_cache()
 
     assert get_pr_author("owner/name", 42) == "claude-cli-bot"
     assert captured, "gh must be invoked"
     assert any("repos/owner/name/pulls/42" in arg for arg in captured[0])
+    assert "--include" in captured[0]
 
 
 def test_get_pr_author_returns_empty_on_error(
@@ -2948,9 +2957,9 @@ def test_get_pr_head_commit_iso_returns_empty_when_head_sha_missing_type(
 def test_get_pr_head_commit_iso_returns_empty_when_commit_lookup_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake_run_gh(args: list[str], repo: str | None = None, timeout: int = 30) -> str:
-        if args[-1] == ".head.sha":
-            return "abc123"
+    def fake_run_gh(args: list[str], repo: str | None = None, timeout: int = 30) -> object:
+        if any("/pulls/" in a for a in args):
+            return {"head": {"sha": "abc123"}}
         raise RuntimeError("boom")
 
     monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
@@ -3392,18 +3401,23 @@ def test_map_rest_ci_status_stale_failure_in_history_does_not_override_combined_
 def test_fetch_ci_status_rest_combines_check_runs_and_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``_fetch_ci_status_rest`` flattens paginated check-runs and parses status."""
+    """``_fetch_ci_status_rest`` flattens check-runs and parses status."""
     calls: list[list[str]] = []
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         calls.append(list(args))
-        if "check-runs" in args[-1]:
+        if any("check-runs" in a for a in args):
             return [
-                {"total_count": 3, "check_runs": [{"id": 1, "conclusion": "success"}]},
                 {
-                    "total_count": 3,
+                    "total_count": 2,
                     "check_runs": [
+                        {"id": 1, "conclusion": "success"},
                         {"id": 2, "conclusion": "neutral"},
+                    ],
+                },
+                {
+                    "total_count": 1,
+                    "check_runs": [
                         {"id": 3, "status": "in_progress"},
                     ],
                 },
@@ -3417,6 +3431,8 @@ def test_fetch_ci_status_rest_combines_check_runs_and_status(
     assert [r["id"] for r in check_runs] == [1, 2, 3]
     assert status_payload == {"state": "pending", "statuses": [{"state": "pending"}]}
     assert any("--paginate" in c for c in calls)
+    assert any("per_page=100" in a for c in calls for a in c)
+    assert any("--include" in c for c in calls)
     assert fetch_ok is True
 
 
@@ -3431,7 +3447,7 @@ def test_fetch_ci_status_rest_degrades_on_check_runs_failure(
     """A check-runs API failure leaves an empty list but still fetches status."""
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
-        if "check-runs" in args[-1]:
+        if any("check-runs" in a for a in args):
             raise RuntimeError("HTTP 503")
         return {"state": "success", "statuses": [{"state": "success"}]}
 
@@ -3450,7 +3466,7 @@ def test_fetch_ci_status_rest_degrades_on_status_failure(
     """A combined-status API failure leaves an empty status payload."""
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
-        if "check-runs" in args[-1]:
+        if any("check-runs" in a for a in args):
             return [{"check_runs": [{"conclusion": "success"}]}]
         raise RuntimeError("HTTP 503")
 
@@ -3502,7 +3518,7 @@ def test_fetch_ci_status_rest_partial_failure_trusts_empty_survivor(
     """
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
-        if "check-runs" in args[-1]:
+        if any("check-runs" in a for a in args):
             raise RuntimeError("HTTP 403")
         return {"state": "pending", "statuses": []}
 
@@ -3521,7 +3537,7 @@ def test_fetch_ci_status_rest_partial_failure_status_side_with_empty_check_runs(
     """Mirror: ``status`` fails, ``check-runs`` returns empty — fetch still ok."""
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
-        if "check-runs" in args[-1]:
+        if any("check-runs" in a for a in args):
             return [{"check_runs": []}]
         raise RuntimeError("HTTP 403")
 
@@ -3540,7 +3556,7 @@ def test_fetch_ci_status_rest_parses_string_status_payload(
     """``run_gh`` may return raw JSON text; ``_fetch_ci_status_rest`` parses it."""
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
-        if "check-runs" in args[-1]:
+        if any("check-runs" in a for a in args):
             return [{"check_runs": []}]
         return '{"state": "success", "statuses": [{"state": "success"}]}'
 
@@ -3556,7 +3572,7 @@ def test_fetch_ci_status_rest_string_status_invalid_json_falls_back(
     """Malformed string status payload degrades to an empty dict."""
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
-        if "check-runs" in args[-1]:
+        if any("check-runs" in a for a in args):
             return [{"check_runs": []}]
         return "not-json"
 
@@ -3572,7 +3588,7 @@ def test_fetch_ci_status_rest_ignores_non_list_pages(
     """When ``gh api --slurp`` returns an unexpected shape, fall back to empty."""
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
-        if "check-runs" in args[-1]:
+        if any("check-runs" in a for a in args):
             return {"unexpected": True}
         return {"state": "pending", "statuses": []}
 
@@ -3588,7 +3604,7 @@ def test_fetch_ci_status_rest_skips_non_dict_pages(
     """Non-dict and non-list ``check_runs`` entries are tolerated."""
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
-        if "check-runs" in args[-1]:
+        if any("check-runs" in a for a in args):
             return [
                 "garbage",
                 {"check_runs": "also-garbage"},
@@ -3616,7 +3632,7 @@ def test_fetch_ci_status_rest_caches_per_repo_sha(
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         calls.append(list(args))
-        if "check-runs" in args[-1]:
+        if any("check-runs" in a for a in args):
             return [{"check_runs": [{"conclusion": "success"}]}]
         return {"state": "success", "statuses": [{"state": "success"}]}
 
@@ -3636,8 +3652,8 @@ def test_fetch_ci_status_rest_cache_misses_on_new_sha(
     """A different head SHA (e.g. after a push) must bypass the cache."""
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
-        if "check-runs" in args[-1]:
-            sha = args[-1].split("/")[-2]
+        if any("check-runs" in a for a in args):
+            sha = next(a for a in args if "check-runs" in a).split("/")[-2]
             return [{"check_runs": [{"conclusion": "success", "id": sha}]}]
         return {"state": "success", "statuses": [{"state": "success"}]}
 
@@ -3658,7 +3674,7 @@ def test_fetch_ci_status_rest_cache_expires_after_ttl(
     state = {"calls": 0}
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
-        if "check-runs" in args[-1]:
+        if any("check-runs" in a for a in args):
             state["calls"] += 1
             return [{"check_runs": [{"conclusion": f"call_{state['calls']}"}]}]
         return {"state": "pending", "statuses": []}
@@ -3688,7 +3704,7 @@ def test_clear_ci_status_cache_forces_refetch(
     state = {"calls": 0}
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
-        if "check-runs" in args[-1]:
+        if any("check-runs" in a for a in args):
             state["calls"] += 1
             return [{"check_runs": [{"conclusion": f"call_{state['calls']}"}]}]
         return {}
@@ -3715,7 +3731,7 @@ def test_fetch_ci_status_rest_evicts_expired_entries_for_old_shas(
     from src.github_client import _ci_status_cache
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
-        if "check-runs" in args[-1]:
+        if any("check-runs" in a for a in args):
             return [{"check_runs": [{"conclusion": "success"}]}]
         return {"state": "success", "statuses": [{"state": "success"}]}
 
@@ -3746,7 +3762,7 @@ def test_fetch_ci_status_rest_eviction_preserves_unexpired_entries(
     from src.github_client import _ci_status_cache
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
-        if "check-runs" in args[-1]:
+        if any("check-runs" in a for a in args):
             return [{"check_runs": [{"conclusion": "success"}]}]
         return {"state": "success", "statuses": [{"state": "success"}]}
 
@@ -4235,3 +4251,262 @@ def test_get_latest_codex_feedback_skips_empty_codex_body(
     monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
 
     assert github_client.get_latest_codex_feedback("owner/name", 42) is None
+
+
+# ---------------------------------------------------------------------------
+# _etag_get conditional-request helper tests (PR-191a)
+# ---------------------------------------------------------------------------
+
+
+def _build_include_response(
+    body: str,
+    *,
+    status: int = 200,
+    etag: str | None = 'W/"v1"',
+) -> str:
+    """Compose a ``gh api --include`` style response."""
+    reason = {200: "OK", 304: "Not Modified", 500: "Server Error"}.get(status, "OK")
+    head = f"HTTP/2.0 {status} {reason}\r\nDate: now\r\n"
+    if etag is not None:
+        head += f"ETag: {etag}\r\n"
+    return f"{head}\r\n{body}"
+
+
+@pytest.fixture(autouse=True)
+def _clear_etag_cache_between_tests() -> None:
+    github_client.clear_etag_cache()
+
+
+def test_etag_get_first_call_populates_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First call has no ``If-None-Match``, parses 200 body, caches the ETag."""
+    captured: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured.append(cmd)
+        return _FakeCompletedProcess(
+            stdout=_build_include_response('{"merged": true}', etag='W/"abc"')
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    payload = github_client._etag_get("repos/owner/name/pulls/42")
+
+    assert payload == {"merged": True}
+    assert "--include" in captured[0]
+    assert not any("If-None-Match" in arg for arg in captured[0])
+    assert github_client._etag_cache["repos/owner/name/pulls/42"] == (
+        'W/"abc"',
+        {"merged": True},
+    )
+
+
+def test_etag_get_second_call_sends_if_none_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cached ETag must be echoed back as ``If-None-Match`` on the next call."""
+    captured: list[list[str]] = []
+    responses = iter(
+        [
+            _build_include_response('{"merged": false}', etag='W/"v1"'),
+            _build_include_response("", status=304, etag='W/"v1"'),
+        ]
+    )
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured.append(cmd)
+        return _FakeCompletedProcess(stdout=next(responses))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    github_client._etag_get("repos/owner/name/pulls/7")
+    github_client._etag_get("repos/owner/name/pulls/7")
+
+    assert 'If-None-Match: W/"v1"' in captured[1]
+
+
+def test_etag_get_304_returns_cached_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 304 response must short-circuit to the cached payload."""
+    responses = iter(
+        [
+            _build_include_response('{"merged": true, "n": 1}', etag='W/"v1"'),
+            _build_include_response("", status=304, etag='W/"v1"'),
+        ]
+    )
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(stdout=next(responses))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    first = github_client._etag_get("repos/owner/name/pulls/9")
+    second = github_client._etag_get("repos/owner/name/pulls/9")
+
+    assert first == {"merged": True, "n": 1}
+    assert second == {"merged": True, "n": 1}
+
+
+def test_etag_get_200_with_new_etag_replaces_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh 200 response must overwrite the cached ETag and payload."""
+    responses = iter(
+        [
+            _build_include_response('{"v": 1}', etag='W/"v1"'),
+            _build_include_response('{"v": 2}', etag='W/"v2"'),
+        ]
+    )
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(stdout=next(responses))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    first = github_client._etag_get("repos/owner/name/commits/abc")
+    second = github_client._etag_get("repos/owner/name/commits/abc")
+
+    assert first == {"v": 1}
+    assert second == {"v": 2}
+    assert github_client._etag_cache["repos/owner/name/commits/abc"] == (
+        'W/"v2"',
+        {"v": 2},
+    )
+
+
+def test_etag_get_evicts_oldest_when_max_entries_exceeded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cache must drop the least-recently-used entry past ``_ETAG_CACHE_MAX_ENTRIES``."""
+    monkeypatch.setattr(github_client, "_ETAG_CACHE_MAX_ENTRIES", 3)
+    counter = {"i": 0}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        counter["i"] += 1
+        body = f'{{"i": {counter["i"]}}}'
+        return _FakeCompletedProcess(
+            stdout=_build_include_response(body, etag=f'W/"e{counter["i"]}"')
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    github_client._etag_get("repos/x/y/pulls/1")
+    github_client._etag_get("repos/x/y/pulls/2")
+    github_client._etag_get("repos/x/y/pulls/3")
+    github_client._etag_get("repos/x/y/pulls/4")  # forces eviction of /pulls/1
+
+    assert "repos/x/y/pulls/1" not in github_client._etag_cache
+    assert {
+        "repos/x/y/pulls/2",
+        "repos/x/y/pulls/3",
+        "repos/x/y/pulls/4",
+    } <= set(github_client._etag_cache.keys())
+
+
+def test_etag_get_returns_none_on_unparseable_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 200 with malformed JSON must not crash and must not poison the cache."""
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(
+            stdout=_build_include_response("{not-json", etag='W/"v1"')
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert github_client._etag_get("repos/owner/name/pulls/1") is None
+    assert "repos/owner/name/pulls/1" not in github_client._etag_cache
+
+
+def test_etag_get_returns_none_when_304_without_prior_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 304 with no cached payload (e.g. server-side hiccup) must yield None."""
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(
+            stdout=_build_include_response("", status=304, etag='W/"v1"')
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert github_client._etag_get("repos/owner/name/pulls/3") is None
+
+
+def test_etag_get_passthrough_for_pre_parsed_run_gh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``run_gh`` is stubbed to return a parsed object (no HTTP head),
+    ``_etag_get`` must surface it directly so call-site tests retain their
+    semantics without crafting raw ``--include`` strings."""
+    monkeypatch.setattr(
+        "src.github_client.run_gh",
+        lambda args: {"merged": True, "state": "closed"},
+    )
+
+    payload = github_client._etag_get("repos/owner/name/pulls/5")
+    assert payload == {"merged": True, "state": "closed"}
+    # Cache stays empty because the test bypassed the --include path.
+    assert "repos/owner/name/pulls/5" not in github_client._etag_cache
+
+
+def test_etag_get_returns_none_on_5xx(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 5xx response (rare; gh normally raises) yields None and leaves cache untouched."""
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(
+            stdout=_build_include_response("server error", status=500, etag=None)
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert github_client._etag_get("repos/owner/name/pulls/8") is None
+    assert "repos/owner/name/pulls/8" not in github_client._etag_cache
+
+
+def test_etag_get_empty_200_body_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 200 with no body (degenerate) yields None rather than crashing on JSON."""
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(
+            stdout=_build_include_response("", status=200, etag='W/"v1"')
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert github_client._etag_get("repos/owner/name/pulls/9") is None
+
+
+def test_get_pr_metadata_extracts_nested_user_and_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production payload: nested ``.user.login`` and ``.head.sha`` are extracted."""
+    pr_body = (
+        '{"user": {"login": "alice"}, "head": {"sha": "abc123"}}'
+    )
+    commit_body = '{"commit": {"committer": {"date": "2026-04-15T12:00:00Z"}}}'
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        path = next((a for a in cmd if a.startswith("repos/")), "")
+        if "/pulls/" in path:
+            return _FakeCompletedProcess(
+                stdout=_build_include_response(pr_body, etag='W/"p1"')
+            )
+        if "/commits/" in path:
+            return _FakeCompletedProcess(
+                stdout=_build_include_response(commit_body, etag='W/"c1"')
+            )
+        return _FakeCompletedProcess(stdout="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert get_pr_metadata("owner/name", 42) == {
+        "author": "alice",
+        "head_sha": "abc123",
+        "head_commit_date": "2026-04-15T12:00:00Z",
+    }
