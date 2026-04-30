@@ -2365,3 +2365,552 @@ def test_main_cancels_in_flight_for_removed_runner_on_reload(
     # main() ends), but the order shows beta went first — that is the
     # property under test.
     assert cancelled_for[:1] == ["octo__beta"], cancelled_for
+
+
+def test_cleanup_in_flight_for_removed_propagates_caller_cancellation() -> None:
+    """A SIGINT/SIGTERM cancellation of the daemon's main task while we
+    await the cancelled cycle must propagate, not be swallowed by the
+    blanket BaseException handler. Otherwise the daemon ignores the
+    first shutdown signal whenever it lands during a config-reload
+    cleanup."""
+
+    async def long_cycle() -> None:
+        await asyncio.Event().wait()
+
+    async def scenario() -> None:
+        cycle_task = asyncio.create_task(long_cycle())
+        await asyncio.sleep(0)
+
+        outer_started = asyncio.Event()
+
+        async def outer() -> None:
+            in_flight: dict[str, asyncio.Task[None]] = {"removed-key": cycle_task}
+            outer_started.set()
+            await main_module._cleanup_in_flight_for_removed(
+                in_flight, {"removed-key"}
+            )
+
+        outer_task = asyncio.create_task(outer())
+        await outer_started.wait()
+        # Yield once so the cleanup is parked in ``await task``.
+        await asyncio.sleep(0)
+        outer_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await outer_task
+
+    asyncio.run(scenario())
+
+
+def test_sync_runners_defers_swap_when_cycle_is_in_flight() -> None:
+    """While a cycle is mid-execution, in-place mutation of repo_config
+    or app_config could let the running cycle observe a mixed old/new
+    snapshot across awaits. ``_sync_runners`` must route the change
+    through ``stage_config_reload`` instead."""
+
+    class _StagingRunner(_FakeRunner):
+        def __init__(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            redis_client: Any,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+        ) -> None:
+            super().__init__(
+                repo_config,
+                app_config,
+                redis_client,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+            self.staged: tuple[Any, ...] | None = None
+
+        def stage_config_reload(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+        ) -> None:
+            self.staged = (
+                repo_config,
+                app_config,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+
+    daemon_config = DaemonConfig(poll_interval_sec=1)
+    original_repo = _repo(
+        "https://github.com/octo/alpha.git",
+        coder="claude",
+        auto_merge=True,
+    )
+    updated_repo = _repo(
+        "https://github.com/octo/alpha.git",
+        coder="claude",
+        auto_merge=False,
+    )
+    runner = _StagingRunner(
+        original_repo,
+        AppConfig(repositories=[original_repo], daemon=daemon_config),
+        _FakeRedisClient(),
+        "old-claude-provider",
+        "old-codex-provider",
+    )
+    runner.state.state = PipelineState.WATCH
+
+    async def scenario() -> None:
+        async def long_cycle() -> None:
+            await asyncio.Event().wait()
+
+        cycle = asyncio.create_task(long_cycle())
+        try:
+            await asyncio.sleep(0)
+            in_flight: dict[str, asyncio.Task[None]] = {
+                "https://github.com/octo/alpha": cycle,
+            }
+            config = AppConfig(
+                repositories=[updated_repo],
+                daemon=daemon_config,
+            )
+
+            main_module._sync_runners(
+                {"https://github.com/octo/alpha": runner},
+                config,
+                _FakeRedisClient(),
+                "claude-provider",
+                "codex-provider",
+                registry=None,  # type: ignore[arg-type]
+                in_flight=in_flight,
+            )
+
+            # The non-coder change would have applied in-place if the cycle
+            # were not running; with an in-flight task we must stage instead
+            # so the running cycle keeps reading the original snapshot.
+            assert runner.repo_config is original_repo
+            assert runner.repo_config.auto_merge is True
+            assert runner.staged is not None
+            staged_repo, staged_app, staged_claude, staged_codex = runner.staged
+            assert staged_repo is updated_repo
+            assert staged_app is config
+            assert staged_claude == "claude-provider"
+            assert staged_codex == "codex-provider"
+        finally:
+            cycle.cancel()
+            try:
+                await cycle
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(scenario())
+
+
+def test_sync_runners_applies_in_place_when_cycle_already_done() -> None:
+    """A finished task in ``in_flight`` (not yet drained) is not a reason
+    to defer — the cycle has already returned, so its ``repo_config``
+    reads are over and an immediate swap is safe."""
+
+    class _StagingRunner(_FakeRunner):
+        def __init__(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            redis_client: Any,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+        ) -> None:
+            super().__init__(
+                repo_config,
+                app_config,
+                redis_client,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+            self.staged: tuple[Any, ...] | None = None
+
+        def stage_config_reload(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+        ) -> None:
+            self.staged = (
+                repo_config,
+                app_config,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+
+        def clear_staged_config_reload(self) -> None:
+            self.staged = None
+
+    daemon_config = DaemonConfig(poll_interval_sec=1)
+    runner = _StagingRunner(
+        _repo("https://github.com/octo/alpha.git", coder="claude", auto_merge=True),
+        AppConfig(
+            repositories=[
+                _repo(
+                    "https://github.com/octo/alpha.git",
+                    coder="claude",
+                    auto_merge=True,
+                )
+            ],
+            daemon=daemon_config,
+        ),
+        _FakeRedisClient(),
+        "old-claude-provider",
+        "old-codex-provider",
+    )
+    runner.state.state = PipelineState.WATCH
+
+    async def scenario() -> None:
+        async def quick_cycle() -> None:
+            return None
+
+        finished = asyncio.create_task(quick_cycle())
+        await finished
+
+        in_flight: dict[str, asyncio.Task[None]] = {
+            "https://github.com/octo/alpha": finished,
+        }
+        config = AppConfig(
+            repositories=[
+                _repo(
+                    "https://github.com/octo/alpha.git",
+                    coder="claude",
+                    auto_merge=False,
+                )
+            ],
+            daemon=daemon_config,
+        )
+
+        main_module._sync_runners(
+            {"https://github.com/octo/alpha": runner},
+            config,
+            _FakeRedisClient(),
+            "claude-provider",
+            "codex-provider",
+            registry=None,  # type: ignore[arg-type]
+            in_flight=in_flight,
+        )
+
+        assert runner.staged is None
+        assert runner.repo_config.auto_merge is False
+        assert runner.app_config is config
+        assert runner.claude_usage_provider == "claude-provider"
+
+    asyncio.run(scenario())
+
+
+def test_drain_finished_cycle_applies_pending_in_flight_config() -> None:
+    """The post-cycle drain must apply any config that was staged while
+    the cycle was running so the next cycle starts with the new
+    snapshot — otherwise the cycle finishes, the next one is scheduled,
+    and the staged change waits another full cycle (or never applies if
+    the runner never reaches IDLE)."""
+
+    applied = {"called": 0}
+
+    class _Runner:
+        name = "octo__alpha"
+
+        def _apply_staged_config_reload(self) -> None:
+            applied["called"] += 1
+
+    async def scenario() -> None:
+        async def quick() -> None:
+            return None
+
+        task = asyncio.create_task(quick())
+        await task
+
+        in_flight: dict[str, asyncio.Task[None]] = {"key": task}
+        runners = {"key": _Runner()}
+
+        popped = main_module._drain_finished_cycle("key", in_flight, runners)
+
+        assert popped is True
+        assert in_flight == {}
+        assert applied["called"] == 1
+
+    asyncio.run(scenario())
+
+
+def test_drain_finished_cycle_skips_running_task() -> None:
+    """A still-running task is not popped and its staged config is not
+    yet applied — the running cycle is still using the old snapshot."""
+
+    applied = {"called": 0}
+
+    class _Runner:
+        name = "octo__alpha"
+
+        def _apply_staged_config_reload(self) -> None:
+            applied["called"] += 1
+
+    pending = asyncio.Event()
+
+    async def scenario() -> None:
+        async def slow() -> None:
+            await pending.wait()
+
+        task = asyncio.create_task(slow())
+        await asyncio.sleep(0)
+
+        in_flight: dict[str, asyncio.Task[None]] = {"key": task}
+        runners = {"key": _Runner()}
+
+        popped = main_module._drain_finished_cycle("key", in_flight, runners)
+
+        assert popped is False
+        assert "key" in in_flight
+        assert applied["called"] == 0
+
+        pending.set()
+        await task
+
+    asyncio.run(scenario())
+
+
+def test_main_defers_repo_config_swap_during_in_flight_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: a config reload that fires while a cycle is in flight
+    must not mutate ``runner.repo_config`` until the cycle finishes."""
+
+    cycle_started = asyncio.Event()
+    cycle_block = asyncio.Event()
+    observed_branches: list[str] = []
+
+    class _SlowRunner(_FakeRunner):
+        async def run_cycle(self) -> None:
+            self.cycles += 1
+            observed_branches.append(self.repo_config.branch)
+            cycle_started.set()
+            await cycle_block.wait()
+
+        def stage_config_reload(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+        ) -> None:
+            self._staged_branch = repo_config.branch
+            self._pending_repo_config = repo_config
+            self._pending_app_config = app_config
+            self._pending_usage_providers = (
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+
+        def _apply_staged_config_reload(self) -> None:
+            if getattr(self, "_pending_repo_config", None) is None:
+                return
+            self.repo_config = self._pending_repo_config
+            self.app_config = self._pending_app_config
+            self.claude_usage_provider, self.codex_usage_provider = (
+                self._pending_usage_providers
+            )
+            self._pending_repo_config = None
+            self._pending_app_config = None
+            self._pending_usage_providers = None
+
+        def clear_staged_config_reload(self) -> None:
+            self._pending_repo_config = None
+            self._pending_app_config = None
+            self._pending_usage_providers = None
+
+    first = AppConfig(
+        repositories=[
+            _repo("https://github.com/octo/alpha.git", branch="main"),
+        ],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    second = AppConfig(
+        repositories=[
+            _repo("https://github.com/octo/alpha.git", branch="release"),
+        ],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+
+    _reset_fake_runner()
+    load_calls = {"n": 0}
+
+    def fake_load_config() -> AppConfig:
+        load_calls["n"] += 1
+        return first if load_calls["n"] == 1 else second
+
+    monkeypatch.setattr(main_module, "load_config", fake_load_config)
+    monkeypatch.setattr(
+        main_module.aioredis,
+        "from_url",
+        lambda url, decode_responses: _FakeRedisClient(),
+    )
+    monkeypatch.setattr(main_module, "PipelineRunner", _SlowRunner)
+    monkeypatch.setattr(main_module, "_setup_git_auth", lambda: None)
+    monkeypatch.setattr(
+        main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
+    )
+    monkeypatch.setattr(main_module, "CONFIG_RELOAD_CYCLES", 1)
+
+    clock = [0.0]
+    monkeypatch.setattr(main_module.time, "monotonic", lambda: clock[0])
+
+    sleep_calls = [0]
+    runner_holder: dict[str, _SlowRunner] = {}
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls[0] += 1
+        clock[0] += seconds + 5
+        await _REAL_ASYNCIO_SLEEP(0)
+        if sleep_calls[0] == 1:
+            # Cycle 1 has been scheduled; wait for it to start so the
+            # next iteration's config reload races a real in-flight task.
+            await cycle_started.wait()
+            # Snapshot the runner before the reload races the cycle so
+            # we can assert post-cycle that the swap was deferred until
+            # after the cycle returned.
+            runner_holder["r"] = _FakeRunner.instances[0]  # type: ignore[assignment]
+        if sleep_calls[0] == 2:
+            # The reload should already have fired in this iteration.
+            # While the cycle is still blocked, the swap must NOT have
+            # taken effect.
+            assert runner_holder["r"].repo_config.branch == "main", (
+                "in-place swap leaked into a running cycle"
+            )
+            cycle_block.set()
+            await _REAL_ASYNCIO_SLEEP(0)
+        if sleep_calls[0] >= 3:
+            raise _StopLoop
+
+    monkeypatch.setattr(main_module.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    runner = runner_holder["r"]
+    # The running cycle observed only the original branch; the deferred
+    # swap landed once it returned and the next cycle picks up the new
+    # branch.
+    assert observed_branches[:1] == ["main"]
+    assert runner.repo_config.branch == "release"
+
+
+def test_apply_pending_in_flight_config_logs_apply_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A defensive guard: if the runner's apply hook raises (it should
+    not, since the implementation is plain attribute assignment), the
+    error is logged so a stuck pending swap is at least visible in the
+    daemon log."""
+
+    class _BadRunner:
+        name = "octo__alpha"
+
+        def _apply_staged_config_reload(self) -> None:
+            raise RuntimeError("apply failed")
+
+    runner = _BadRunner()
+    with caplog.at_level(logging.ERROR, logger=main_module.logger.name):
+        main_module._apply_pending_in_flight_config(runner)  # type: ignore[arg-type]
+
+    errors = [rec.getMessage() for rec in caplog.records if rec.levelno == logging.ERROR]
+    assert any(
+        "Failed to apply deferred config for octo__alpha" in msg for msg in errors
+    ), errors
+
+
+def test_apply_pending_in_flight_config_skips_runners_without_apply_method() -> None:
+    """Test stubs without ``_apply_staged_config_reload`` are a no-op so
+    the drain helper does not need a hasattr check on every iteration."""
+
+    class _MinimalRunner:
+        name = "octo__alpha"
+
+    main_module._apply_pending_in_flight_config(_MinimalRunner())  # type: ignore[arg-type]
+
+
+def test_cleanup_in_flight_for_removed_logs_non_cancellation_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If a runner cycle catches ``CancelledError`` and re-raises a
+    different exception (or raises one before the cancel completes),
+    the cleanup must log it rather than silently dropping the failure
+    when the runner is removed."""
+
+    async def cycle() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise RuntimeError("post-cancel boom")
+
+    async def scenario() -> None:
+        task = asyncio.create_task(cycle())
+        await asyncio.sleep(0)
+
+        in_flight: dict[str, asyncio.Task[None]] = {"removed-key": task}
+        with caplog.at_level(logging.ERROR, logger=main_module.logger.name):
+            await main_module._cleanup_in_flight_for_removed(
+                in_flight, {"removed-key"}
+            )
+
+        assert in_flight == {}
+        errors = [rec.getMessage() for rec in caplog.records if rec.levelno == logging.ERROR]
+        assert any(
+            "run_cycle failed for removed-key (runner removed)" in msg
+            for msg in errors
+        ), errors
+
+    asyncio.run(scenario())
+
+
+def test_main_drains_cycle_finished_during_scheduling_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When an active runner's cycle finishes while the scheduling loop
+    is awaiting an inactive peer's ``publish_state``, the in-line drain
+    at the scheduling step must clean up the completed task before
+    scheduling its replacement so the old task is not leaked into the
+    next iteration's drain (where its exception would no longer be
+    associated with a runner)."""
+
+    proceed = asyncio.Event()
+    inactive_publish_calls = {"n": 0}
+
+    class _Runner(_FakeRunner):
+        async def run_cycle(self) -> None:
+            self.cycles += 1
+            await proceed.wait()
+
+        async def publish_state(self) -> None:
+            if not self.repo_config.active:
+                inactive_publish_calls["n"] += 1
+                if inactive_publish_calls["n"] >= 2:
+                    proceed.set()
+                    # Yield twice so the active runner's blocked cycle
+                    # has a chance to wake and finish before we return
+                    # control to the scheduling step.
+                    await _REAL_ASYNCIO_SLEEP(0)
+                    await _REAL_ASYNCIO_SLEEP(0)
+
+    config = AppConfig(
+        repositories=[
+            _repo("https://github.com/octo/alpha.git", active=False),
+            _repo("https://github.com/octo/beta.git", active=True),
+        ],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    _patch_main(monkeypatch, config, runner_cls=_Runner, sleep_iterations=3)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    beta = next(r for r in _FakeRunner.instances if r.name == "octo__beta")
+    # Beta's first cycle finished mid-iteration during alpha's
+    # publish_state; the scheduling step's in-line drain popped it and
+    # scheduled the next cycle in the same pass, so we observe at
+    # least 2 cycles.
+    assert beta.cycles >= 2

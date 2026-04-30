@@ -280,13 +280,19 @@ def _sync_runners(
     claude_usage_provider: UsageProvider,
     codex_usage_provider: UsageProvider,
     registry: CoderRegistry,
+    in_flight: dict[str, asyncio.Task[None]] | None = None,
 ) -> None:
     """Reconcile ``runners`` with ``config.repositories`` in place.
 
     * New URLs get a freshly constructed :class:`PipelineRunner`.
     * Removed URLs are dropped from the dict.
-    * Surviving URLs have their ``repo_config`` and ``app_config``
-      swapped in place so settings changes take effect on the next cycle.
+    * Surviving URLs whose runner has no cycle in flight have their
+      ``repo_config`` and ``app_config`` swapped in place so settings
+      changes take effect on the next cycle.
+    * Surviving URLs whose runner is mid-cycle route the change through
+      ``stage_config_reload`` instead, so the running cycle cannot
+      observe a mixed old/new config across awaits. The staged config
+      is applied by ``_drain_finished_cycle`` once the cycle completes.
 
     Runners are keyed by normalized URL so that equivalent forms of the
     same GitHub URL (``.git`` suffix, trailing slash) do not create or
@@ -306,6 +312,11 @@ def _sync_runners(
     for key, repo in desired.items():
         if key in runners:
             runner = runners[key]
+            cycle_in_flight = (
+                in_flight is not None
+                and key in in_flight
+                and not in_flight[key].done()
+            )
             active_changed = runner.repo_config.active != repo.active
             defer_coder_only_reload = (
                 _runner_requires_idle_boundary(runner)
@@ -316,20 +327,13 @@ def _sync_runners(
                     key,
                 )
             )
-            if (
-                not runner.repo_config.active
-                or active_changed
-                or not defer_coder_only_reload
-            ):
-                runner.repo_config = repo
-                runner.app_config = config
-                runner.set_usage_providers(
-                    claude_usage_provider,
-                    codex_usage_provider,
-                )
-                if hasattr(runner, "clear_staged_config_reload"):
-                    runner.clear_staged_config_reload()
-            elif hasattr(runner, "stage_config_reload"):
+            needs_idle_boundary_defer = (
+                runner.repo_config.active
+                and not active_changed
+                and defer_coder_only_reload
+            )
+            must_defer = cycle_in_flight or needs_idle_boundary_defer
+            if must_defer and hasattr(runner, "stage_config_reload"):
                 runner.stage_config_reload(
                     repo,
                     config,
@@ -343,6 +347,8 @@ def _sync_runners(
                     claude_usage_provider,
                     codex_usage_provider,
                 )
+                if hasattr(runner, "clear_staged_config_reload"):
+                    runner.clear_staged_config_reload()
             continue
         runner = _build_runner(
             repo,
@@ -381,6 +387,57 @@ async def _close_pubsub(pubsub: Any) -> None:
         pass
 
 
+def _apply_pending_in_flight_config(runner: PipelineRunner) -> None:
+    """Apply any config staged while a cycle was in flight.
+
+    ``_sync_runners`` defers the in-place ``repo_config``/``app_config``
+    swap when a cycle is still running, routing the new config through
+    ``stage_config_reload`` so the running cycle cannot observe a mixed
+    old/new snapshot across awaits. The staged config is then applied
+    once the cycle finishes — either here, after ``_drain_finished_cycle``
+    pops the task, or at the next IDLE handler entry via
+    ``reload_repo_config_if_dirty``. The two paths are idempotent because
+    ``_apply_staged_config_reload`` clears the pending fields after the
+    swap.
+    """
+    apply = getattr(runner, "_apply_staged_config_reload", None)
+    if apply is None:
+        return
+    try:
+        apply()
+    except Exception:
+        logger.error(
+            "Failed to apply deferred config for %s",
+            getattr(runner, "name", "?"),
+            exc_info=True,
+        )
+
+
+def _drain_finished_cycle(
+    key: str,
+    in_flight: dict[str, asyncio.Task[None]],
+    runners: dict[str, PipelineRunner],
+) -> bool:
+    """Drain ``key``'s completed cycle if present. Return whether it was popped."""
+    task = in_flight.get(key)
+    if task is None or not task.done():
+        return False
+    runner = runners.get(key)
+    runner_name = runner.name if runner is not None else key
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.error(
+            "run_cycle failed for %s", runner_name, exc_info=True
+        )
+    del in_flight[key]
+    if runner is not None:
+        _apply_pending_in_flight_config(runner)
+    return True
+
+
 def _drain_finished_cycles(
     in_flight: dict[str, asyncio.Task[None]],
     runners: dict[str, PipelineRunner],
@@ -389,23 +446,12 @@ def _drain_finished_cycles(
 
     Cancellations are intentional (config reload removed the runner) and
     are not logged; any other exception is reported with the runner name
-    so a crash inside a per-runner task is not silently swallowed.
+    so a crash inside a per-runner task is not silently swallowed. Any
+    config that was staged while the cycle was running is applied here
+    so the next cycle starts with the new snapshot.
     """
     for key in list(in_flight.keys()):
-        task = in_flight[key]
-        if not task.done():
-            continue
-        runner = runners.get(key)
-        runner_name = runner.name if runner is not None else key
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.error(
-                "run_cycle failed for %s", runner_name, exc_info=True
-            )
-        del in_flight[key]
+        _drain_finished_cycle(key, in_flight, runners)
 
 
 async def _cleanup_in_flight_for_removed(
@@ -418,7 +464,15 @@ async def _cleanup_in_flight_for_removed(
     CODING/FIX cycle on the removed runner must not keep a stale task alive
     on the loop. Cancellation propagates ``asyncio.CancelledError`` into the
     coder subprocess wait, which existing handlers already catch.
+
+    Caller cancellation (SIGINT/SIGTERM landing on the daemon's main task
+    while we await the cancelled cycle) is re-raised. Catching it here
+    would swallow the shutdown signal and leave the daemon unresponsive
+    to the first ``Ctrl-C`` whenever it arrived during a config-reload
+    cleanup.
     """
+    cur = asyncio.current_task()
+    initial_cancelling = cur.cancelling() if cur is not None else 0
     for key in list(removed_keys):
         task = in_flight.pop(key, None)
         if task is None:
@@ -427,8 +481,18 @@ async def _cleanup_in_flight_for_removed(
             task.cancel()
             try:
                 await task
-            except BaseException:
-                pass
+            except asyncio.CancelledError:
+                if (
+                    cur is not None
+                    and cur.cancelling() > initial_cancelling
+                ):
+                    raise
+            except Exception:
+                logger.error(
+                    "run_cycle failed for %s (runner removed)",
+                    key,
+                    exc_info=True,
+                )
             continue
         try:
             task.result()
@@ -597,6 +661,7 @@ async def main() -> None:
         )
 
     runners: dict[str, PipelineRunner] = {}
+    in_flight: dict[str, asyncio.Task[None]] = {}
     _sync_runners(
         runners,
         config,
@@ -604,6 +669,7 @@ async def main() -> None:
         claude_usage_provider,
         codex_usage_provider,
         registry,
+        in_flight,
     )
 
     # Keep a strong reference: the event loop only holds weak references
@@ -619,7 +685,6 @@ async def main() -> None:
     watcher_task.add_done_callback(_background_tasks.discard)
 
     last_run: dict[str, float] = {}
-    in_flight: dict[str, asyncio.Task[None]] = {}
     last_config_check = time.monotonic()
     pubsub: Any | None = None
     subscribed_slugs: tuple[str, ...] = ()
@@ -647,6 +712,7 @@ async def main() -> None:
                         claude_usage_provider,
                         codex_usage_provider,
                         registry,
+                        in_flight,
                     )
                     removed_keys = prev_keys - set(runners.keys())
                     if removed_keys:
@@ -667,12 +733,19 @@ async def main() -> None:
                     )
                 continue
             existing = in_flight.get(key)
-            if existing is not None and not existing.done():
-                # Previous cycle still running; do not pile up another one
-                # on top of it. last_run is left untouched so the new cycle
-                # will be scheduled as soon as the in-flight task finishes
-                # and the next interval is due.
-                continue
+            if existing is not None:
+                if not existing.done():
+                    # Previous cycle still running; do not pile up another
+                    # one on top of it. last_run is left untouched so the
+                    # new cycle will be scheduled as soon as the in-flight
+                    # task finishes and the next interval is due.
+                    continue
+                # Drain a cycle that finished between iterations (e.g.
+                # during ``await runner.publish_state()`` for an inactive
+                # peer earlier in this loop) before scheduling the next
+                # one, so any config staged during the cycle is applied
+                # and the new cycle starts from the latest snapshot.
+                _drain_finished_cycle(key, in_flight, runners)
             now = time.monotonic()
             interval = _runner_poll_interval(runner)
             if key in last_run and now - last_run[key] < interval:
