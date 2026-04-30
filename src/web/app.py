@@ -47,6 +47,7 @@ from src.events import publish_repo_event, publish_wake
 from src.events.sse import RepoEventsUnavailableError, stream_repo_events
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState, TaskStatus
+from src.onboarding.reconciliation import reconcile_agents_md
 from src.queue_parser import (
     QueueValidationError,
     parse_queue,
@@ -59,6 +60,9 @@ DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 CONFIG_PATH = os.environ.get("PO_CONFIG_PATH", "config.yml")
 REPOS_DIR = "/data/repos"
 _TASK_PR_ID_PATTERN = re.compile(r"^PR-[A-Za-z0-9_.-]+$")
+_REPO_SLUG_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9_.-]*__[A-Za-z0-9][A-Za-z0-9_.-]*$"
+)
 logger = logging.getLogger(__name__)
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
@@ -2729,4 +2733,72 @@ async def upload_tasks(
         request,
         _build_upload_success_message(uploaded_filenames, repo_state.state),
         repo_name=name,
+    )
+
+
+def _resolve_onboarding_target(repo_name: str) -> Path | None:
+    """Return the AGENTS.md path for ``repo_name`` if it is safe to touch.
+
+    Returns ``None`` when ``repo_name`` fails the slug regex, is not
+    listed in ``config.yml``, or would resolve outside ``REPOS_DIR``.
+    The combination of regex, config-membership check, and
+    ``relative_to`` resolution is the path-traversal sandbox: any single
+    layer alone would be insufficient because a malformed config entry,
+    a permissive regex, or a symlink under ``REPOS_DIR`` could each
+    individually allow escape.
+    """
+    if not _REPO_SLUG_PATTERN.fullmatch(repo_name):
+        return None
+    cfg = load_config(CONFIG_PATH)
+    known_slugs = {repo_slug_from_url(repo.url) for repo in cfg.repositories}
+    if repo_name not in known_slugs:
+        return None
+    repos_root = Path(REPOS_DIR).resolve()
+    target = (Path(REPOS_DIR) / repo_name / "AGENTS.md").resolve()
+    try:
+        target.relative_to(repos_root)
+    except ValueError:
+        return None
+    return target
+
+
+@app.post("/onboarding/preview")
+async def onboarding_preview(repo_name: str = Form(...)) -> JSONResponse:
+    """Return what onboarding reconciliation would change in AGENTS.md.
+
+    Form field ``repo_name`` is the repo slug (``owner__repo``). The
+    endpoint never writes; the response payload contains the full
+    proposed file body and a unified diff so the operator can decide
+    whether to call :func:`onboarding_apply`.
+    """
+    target = _resolve_onboarding_target(repo_name)
+    if target is None:
+        return JSONResponse(
+            {"error": "Unknown or invalid repo_name"}, status_code=422
+        )
+    proposed, diff = reconcile_agents_md(target, dry_run=True)
+    return JSONResponse(
+        {
+            "applied": False,
+            "diff": diff,
+            "proposed_content": proposed,
+        }
+    )
+
+
+@app.post("/onboarding/apply")
+async def onboarding_apply(repo_name: str = Form(...)) -> JSONResponse:
+    """Write the reconciled AGENTS.md for ``repo_name`` to disk."""
+    target = _resolve_onboarding_target(repo_name)
+    if target is None:
+        return JSONResponse(
+            {"error": "Unknown or invalid repo_name"}, status_code=422
+        )
+    final, diff = reconcile_agents_md(target, dry_run=False)
+    return JSONResponse(
+        {
+            "applied": True,
+            "diff": diff,
+            "proposed_content": final,
+        }
     )
