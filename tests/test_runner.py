@@ -9194,6 +9194,75 @@ def test_handle_error_head_before_defaults_empty_when_rev_parse_fails(
     assert not any(cmd[:1] == ("clean",) for cmd in calls)
 
 
+def test_handle_error_increments_push_count_when_post_push_rev_parse_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Successful diagnose-error push must still bump push_count when
+    the post-push ``git rev-parse HEAD`` lookup fails. Regression: when
+    ``observed_head_shas`` is already populated from prior pushes,
+    swallowing the rev-parse failure used to leave the set unchanged
+    and recompute ``push_count`` from its size, silently dropping the
+    just-completed push.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    changed = repo / "fix.txt"
+    calls: list[tuple[str, ...]] = []
+    rev_parse_head_calls = {"n": 0}
+    review_requests: list[int] = []
+
+    async def fake_diag(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        changed.write_text("fixed\n")
+        return (0, "FIX\nrepair broken config", "")
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(args)
+        if args[:2] == ("status", "--porcelain"):
+            status = ""
+            if changed.exists():
+                status = " M fix.txt\n"
+            return _FakeCompletedProcess(stdout=status)
+        if args[:3] == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return _FakeCompletedProcess(
+                stdout="fix/diagnose-error-commits-fixes\n"
+            )
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_head_calls["n"] += 1
+            if rev_parse_head_calls["n"] == 1:
+                return _FakeCompletedProcess(stdout="abc123\n")
+            raise subprocess.CalledProcessError(
+                128, ["git", *args], stderr="fatal: rev-parse intermittent"
+            )
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake_diag)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(error_module, "retry_transient", lambda op, **_: op())
+    runner = _make_runner()
+    monkeypatch.setattr(
+        runner,
+        "_post_codex_review",
+        lambda pr_number: review_requests.append(pr_number) or True,
+    )
+    runner.repo_path = str(repo)
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+    runner.state.current_pr = PRInfo(
+        number=119,
+        branch="fix/diagnose-error-commits-fixes",
+        observed_head_shas={"earlier-sha"},
+        push_count=1,
+    )
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.observed_head_shas == {"earlier-sha"}
+    assert runner.state.current_pr.push_count == 2
+    assert review_requests == [119]
+
+
 def test_handle_error_uses_current_task_branch_when_no_current_pr_and_task_branch_differs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

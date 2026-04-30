@@ -134,7 +134,9 @@ class WatchMixin:
                 "no_push_fix_count": current_pr.no_push_fix_count,
                 "observed_head_shas": merged_shas,
                 "push_count": (
-                    len(merged_shas) if merged_shas else found.push_count
+                    max(len(merged_shas), current_pr.push_count, found.push_count)
+                    if merged_shas
+                    else max(current_pr.push_count, found.push_count)
                 ),
             }
         )

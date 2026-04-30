@@ -85,17 +85,17 @@ class PRInfo(BaseModel):
     def record_observed_head(self, sha: str) -> None:
         """Add ``sha`` to ``observed_head_shas`` and refresh ``push_count``.
 
-        Empty ``sha`` is ignored — only test shims surface that case, and
-        a real push always carries a SHA. The fallback +1 keeps legacy
-        coverage paths green when the set is empty (no SHA seen yet).
+        Empty ``sha`` means the post-push ``git rev-parse HEAD`` lookup
+        failed (timeout, ``OSError``, or non-zero exit). Fall back to
+        ``push_count += 1`` so an intermittent rev-parse failure during
+        a real auto-fix push is still counted — recomputing from the
+        unchanged set size would otherwise silently drop the push.
         """
         if sha:
             self.observed_head_shas.add(sha)
-        self.push_count = (
-            len(self.observed_head_shas)
-            if self.observed_head_shas
-            else self.push_count + 1
-        )
+            self.push_count = max(len(self.observed_head_shas), self.push_count)
+        else:
+            self.push_count += 1
 
 
 class EventEntry(TypedDict, total=False):

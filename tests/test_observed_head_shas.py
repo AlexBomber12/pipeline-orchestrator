@@ -52,6 +52,30 @@ def test_repeated_same_sha_does_not_inflate_count() -> None:
     assert pr.push_count == 1
 
 
+def test_empty_sha_after_known_push_still_increments_count() -> None:
+    """Rev-parse failure after a real push must not drop the increment.
+
+    Regression for the diagnose-error auto-fix path: after a successful
+    push, ``git rev-parse HEAD`` can intermittently fail (timeout,
+    ``OSError``, non-zero exit) and the daemon then calls
+    ``record_observed_head("")``. The set's cardinality is unchanged,
+    so the legacy ``push_count += 1`` must still fire.
+    """
+    pr = PRInfo(number=4, branch="pr-004")
+    pr.record_observed_head("first-sha")
+    assert pr.push_count == 1
+
+    pr.record_observed_head("")
+
+    assert pr.observed_head_shas == {"first-sha"}
+    assert pr.push_count == 2
+
+    pr.record_observed_head("")
+
+    assert pr.observed_head_shas == {"first-sha"}
+    assert pr.push_count == 3
+
+
 def test_cross_restart_persistence_preserves_observed_set() -> None:
     """RepoState round-trips through Redis as JSON; the SHA set must survive."""
     state = RepoState(
