@@ -19,6 +19,7 @@ def _runner(
     open_prs_after_create: list[PRInfo] | None = None,
     open_prs_initial: list[PRInfo] | None = None,
     raise_on_post_create_list: bool = False,
+    post_create_empty_attempts: int = 0,
 ):
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
@@ -32,6 +33,9 @@ def _runner(
             return open_prs_initial or []
         if raise_on_post_create_list:
             raise RuntimeError("list-post-create boom")
+        post_idx = pr_list_calls["n"] - 4
+        if post_idx < post_create_empty_attempts:
+            return []
         return open_prs_after_create or []
 
     monkeypatch.setattr(
@@ -191,6 +195,33 @@ def test_case_c_pr_not_found_after_create_marks_hung(
 
     assert runner.state.state == PipelineState.HUNG
     assert "Daemon-created PR not found" in (runner.state.error_message or "")
+
+
+def test_case_c_post_create_eventual_consistency_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The PR list endpoint is eventually consistent: a PR opened via
+    daemon-side ``gh pr create`` may be absent from the first list
+    response but present on a later retry. The diagnostic must not
+    park the task as HUNG when the PR is simply not yet visible."""
+    created = PRInfo(number=123, branch="pr-001")
+    runner = _runner(
+        monkeypatch,
+        open_prs_after_create=[created],
+        post_create_empty_attempts=2,
+    )
+    _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
+    monkeypatch.setattr(github_client, "run_gh", lambda *a, **kw: "")
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 123
+    assert any(
+        "Daemon-created PR not visible yet" in entry["event"]
+        for entry in runner.state.history
+    )
 
 
 def test_local_branch_exists_handles_subprocess_error(

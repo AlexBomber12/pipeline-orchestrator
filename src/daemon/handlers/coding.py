@@ -353,23 +353,37 @@ class CodingMixin:
         ):
             return
 
-        try:
-            prs = github_client.get_open_prs(
-                self.owner_repo,
-                allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+        # GitHub's PR list endpoints are eventually consistent, so a PR
+        # that gh pr create just opened may be temporarily absent. Retry
+        # the same bounded 3x/5s schedule used earlier in handle_coding
+        # before declaring the PR missing.
+        candidate = None
+        for attempt in range(3):
+            try:
+                prs = github_client.get_open_prs(
+                    self.owner_repo,
+                    allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+                )
+            except Exception as exc:
+                self.state.state = PipelineState.HUNG
+                self.state.error_message = (
+                    f"[{coder_name}] Daemon-created PR not visible: {exc}"
+                )
+                await self._save_current_run_record("error")
+                self.log_event(self.state.error_message)
+                return
+            candidate = next(
+                (pr for pr in prs if pr.branch == target_branch), None
             )
-        except Exception as exc:
-            self.state.state = PipelineState.HUNG
-            self.state.error_message = (
-                f"[{coder_name}] Daemon-created PR not visible: {exc}"
-            )
-            await self._save_current_run_record("error")
-            self.log_event(self.state.error_message)
-            return
+            if candidate is not None:
+                break
+            if attempt < 2:
+                self.log_event(
+                    f"[{coder_name}] Daemon-created PR not visible yet for "
+                    f"{target_branch!r}, retrying in 5s ({attempt + 1}/3)"
+                )
+                await asyncio.sleep(5)
 
-        candidate = next(
-            (pr for pr in prs if pr.branch == target_branch), None
-        )
         if candidate is None:
             message = (
                 f"[{coder_name}] Daemon-created PR not found for branch "
