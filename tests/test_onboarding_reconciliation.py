@@ -247,6 +247,48 @@ def test_preview_rejects_path_traversal_via_symlink_escape(
     assert not (target_outside / "AGENTS.md").exists()
 
 
+def test_preview_rejects_symlinked_agents_md(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An AGENTS.md symlinked to a file outside REPOS_DIR must be
+    rejected. Otherwise read_text/write_text would follow the symlink
+    and let preview surface, or apply overwrite, an external file."""
+    repo_dir = _stub_repo(tmp_path, monkeypatch)
+    outside = tmp_path / "outside.md"
+    outside.write_text("secret outside content\n")
+    (repo_dir / "AGENTS.md").symlink_to(outside)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/onboarding/preview", data={"repo_name": "example__alpha"}
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"error": "Unknown or invalid repo_name"}
+    assert outside.read_text() == "secret outside content\n"
+
+
+def test_apply_rejects_symlinked_agents_md(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Apply must refuse to write through a symlinked AGENTS.md so an
+    attacker cannot overwrite an external file by planting a symlink in
+    a clone."""
+    repo_dir = _stub_repo(tmp_path, monkeypatch)
+    outside = tmp_path / "outside.md"
+    outside.write_text("secret outside content\n")
+    (repo_dir / "AGENTS.md").symlink_to(outside)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/onboarding/apply", data={"repo_name": "example__alpha"}
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"error": "Unknown or invalid repo_name"}
+    assert outside.read_text() == "secret outside content\n"
+
+
 def test_apply_rejects_when_repo_directory_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

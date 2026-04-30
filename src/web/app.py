@@ -2768,6 +2768,13 @@ def _resolve_onboarding_target(repo_name: str) -> Path | None:
         return None
     if not repo_dir.is_dir() or not (repo_dir / ".git").exists():
         return None
+    # ``target.relative_to`` only validates the textual path; if AGENTS.md
+    # itself is a symlink, ``read_text``/``write_text`` would follow it and
+    # could read or overwrite a file outside REPOS_DIR. Reject symlinked
+    # AGENTS.md outright so reconciliation only ever touches a regular
+    # file under operator control.
+    if target.is_symlink():
+        return None
     return target
 
 
