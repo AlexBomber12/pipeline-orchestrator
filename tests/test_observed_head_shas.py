@@ -113,6 +113,71 @@ def test_upgrade_from_pre_pr195_state_counts_new_pushes() -> None:
     assert pr.push_count == 8
 
 
+def test_merge_observed_pushes_counts_new_sha_against_legacy_count() -> None:
+    """Pre-PR-195 ``self`` (legacy ``push_count``, empty SHA set) merging
+    a freshly polled PRInfo (single new SHA, ``push_count=1``) must bump
+    the counter — the previous ``max(len, push_count)`` formula froze at
+    the legacy value until the SHA set caught up.
+    """
+    persisted = PRInfo(
+        number=11,
+        branch="pr-011",
+        push_count=5,
+        observed_head_shas=set(),
+    )
+    polled = PRInfo(
+        number=11,
+        branch="pr-011",
+        push_count=1,
+        observed_head_shas={"freshly-polled-sha"},
+    )
+
+    merged_shas, push_count = persisted.merge_observed_pushes(polled)
+
+    assert merged_shas == {"freshly-polled-sha"}
+    assert push_count == 6
+
+
+def test_merge_observed_pushes_repeated_sha_does_not_inflate_count() -> None:
+    persisted = PRInfo(
+        number=12,
+        branch="pr-012",
+        push_count=3,
+        observed_head_shas={"sha-a", "sha-b", "sha-c"},
+    )
+    polled = PRInfo(
+        number=12,
+        branch="pr-012",
+        push_count=1,
+        observed_head_shas={"sha-a"},
+    )
+
+    merged_shas, push_count = persisted.merge_observed_pushes(polled)
+
+    assert merged_shas == {"sha-a", "sha-b", "sha-c"}
+    assert push_count == 3
+
+
+def test_merge_observed_pushes_with_no_new_observation_keeps_count() -> None:
+    persisted = PRInfo(
+        number=13,
+        branch="pr-013",
+        push_count=4,
+        observed_head_shas={"sha-a", "sha-b"},
+    )
+    polled = PRInfo(
+        number=13,
+        branch="pr-013",
+        push_count=0,
+        observed_head_shas=set(),
+    )
+
+    merged_shas, push_count = persisted.merge_observed_pushes(polled)
+
+    assert merged_shas == {"sha-a", "sha-b"}
+    assert push_count == 4
+
+
 def test_cross_restart_persistence_preserves_observed_set() -> None:
     """RepoState round-trips through Redis as JSON; the SHA set must survive."""
     state = RepoState(

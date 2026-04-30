@@ -107,6 +107,27 @@ class PRInfo(BaseModel):
         self.observed_head_shas.add(sha)
         self.push_count += 1
 
+    def merge_observed_pushes(
+        self, other: "PRInfo"
+    ) -> tuple[set[str], int]:
+        """Return ``(observed_head_shas, push_count)`` after merging ``other``.
+
+        ``self`` is the daemon's persisted PR state; ``other`` is a
+        fresh GitHub observation. The merged SHA set is the union;
+        ``push_count`` is ``self.push_count`` plus one for every
+        previously-unseen SHA observed in ``other``. The earlier
+        ``max(len(merged), self.push_count, other.push_count)`` formula
+        froze the counter on upgrade from pre-PR-195 state
+        (``push_count > 0`` with an empty ``observed_head_shas``):
+        a single newly observed SHA produced ``len(merged) == 1`` while
+        the legacy count won the ``max`` and dropped the push. Counting
+        newly observed SHAs against the legacy base keeps polling-only
+        push detection accurate after an upgrade.
+        """
+        new_shas = other.observed_head_shas - self.observed_head_shas
+        merged_shas = self.observed_head_shas | other.observed_head_shas
+        return merged_shas, self.push_count + len(new_shas)
+
 
 class EventEntry(TypedDict, total=False):
     time: str

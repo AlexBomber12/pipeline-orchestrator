@@ -6870,6 +6870,71 @@ def test_handle_watch_preserves_no_push_fix_count_for_same_pr(
     assert runner.state.current_pr.no_push_fix_count == 2
 
 
+def test_handle_watch_counts_new_head_sha_after_pre_pr195_upgrade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-PR-195 persisted ``current_pr`` (``push_count > 0`` with empty
+    ``observed_head_shas``) must register a freshly polled head SHA as a
+    new push. The earlier ``max(len(merged), push_count)`` formula left
+    the legacy counter winning until the SHA set caught up, dropping the
+    polled push.
+    """
+    polled = PRInfo(
+        number=15,
+        branch="pr-015",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=datetime.now(timezone.utc),
+        observed_head_shas={"polled-head-sha"},
+        push_count=1,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: [polled]
+    )
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=15,
+        branch="pr-015",
+        push_count=4,
+        observed_head_shas=set(),
+    )
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.observed_head_shas == {"polled-head-sha"}
+    assert runner.state.current_pr.push_count == 5
+
+
+def test_preserve_fix_iteration_count_counts_new_head_sha_after_upgrade() -> None:
+    """``_preserve_fix_iteration_count`` is the IDLE-side mirror of the
+    WATCH merge. A pre-PR-195 ``current_pr`` carrying a legacy
+    ``push_count`` with empty ``observed_head_shas`` must bump the
+    counter when IDLE rehydrates a freshly fetched PRInfo with a new
+    head SHA — same regression, different polling path.
+    """
+    runner = _make_runner()
+    runner.state.current_pr = PRInfo(
+        number=21,
+        branch="pr-021",
+        push_count=7,
+        observed_head_shas=set(),
+    )
+    polled = PRInfo(
+        number=21,
+        branch="pr-021",
+        push_count=1,
+        observed_head_shas={"new-polled-sha"},
+    )
+
+    rehydrated = runner._preserve_fix_iteration_count(polled)
+
+    assert rehydrated.observed_head_shas == {"new-polled-sha"}
+    assert rehydrated.push_count == 8
+
+
 def test_handle_watch_no_fix_when_ci_pending_and_changes_requested(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
