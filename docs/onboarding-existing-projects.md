@@ -106,6 +106,21 @@ that has not been cloned yet would leave a non-repo directory that the
 daemon later tries to `git fetch`, parking the repo in an error state
 until an operator removes the directory by hand.
 
+## Malformed managed markers
+
+If the target repo's existing `AGENTS.md` contains malformed managed
+markers — an unmatched `BEGIN`, a mismatched `END`, nested regions, or
+a duplicate section name — both endpoints return HTTP 422 with a JSON
+body of the form:
+
+```json
+{ "error": "Malformed managed markers in AGENTS.md: <reason>" }
+```
+
+The file is left untouched. Fix the markers in the target file by hand
+(typically by deleting the broken block — reconciliation will re-append
+the canonical region on the next run) and retry.
+
 ## Example walkthrough — `my-app`
 
 Suppose `my-org/my-app` already has an `AGENTS.md` like:

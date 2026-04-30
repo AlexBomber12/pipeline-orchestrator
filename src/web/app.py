@@ -47,6 +47,7 @@ from src.events import publish_repo_event, publish_wake
 from src.events.sse import RepoEventsUnavailableError, stream_repo_events
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState, TaskStatus
+from src.onboarding.markdown_sections import MarkerError
 from src.onboarding.reconciliation import reconcile_agents_md
 from src.queue_parser import (
     QueueValidationError,
@@ -2784,7 +2785,13 @@ async def onboarding_preview(repo_name: str = Form(...)) -> JSONResponse:
         return JSONResponse(
             {"error": "Unknown or invalid repo_name"}, status_code=422
         )
-    proposed, diff = reconcile_agents_md(target, dry_run=True)
+    try:
+        proposed, diff = reconcile_agents_md(target, dry_run=True)
+    except MarkerError as exc:
+        return JSONResponse(
+            {"error": f"Malformed managed markers in AGENTS.md: {exc}"},
+            status_code=422,
+        )
     return JSONResponse(
         {
             "applied": False,
@@ -2802,7 +2809,13 @@ async def onboarding_apply(repo_name: str = Form(...)) -> JSONResponse:
         return JSONResponse(
             {"error": "Unknown or invalid repo_name"}, status_code=422
         )
-    final, diff = reconcile_agents_md(target, dry_run=False)
+    try:
+        final, diff = reconcile_agents_md(target, dry_run=False)
+    except MarkerError as exc:
+        return JSONResponse(
+            {"error": f"Malformed managed markers in AGENTS.md: {exc}"},
+            status_code=422,
+        )
     return JSONResponse(
         {
             "applied": True,

@@ -283,3 +283,53 @@ def test_apply_rejects_when_repo_directory_is_not_a_git_checkout(
     assert response.status_code == 422
     assert response.json() == {"error": "Unknown or invalid repo_name"}
     assert not (repo_dir / "AGENTS.md").exists()
+
+
+_MALFORMED_AGENTS_MD = (
+    "# AGENTS\n\n"
+    "<!-- pipeline-orchestrator: managed BEGIN work_modes -->\n"
+    "stale body without an END marker\n"
+)
+
+
+def test_preview_returns_client_error_on_malformed_markers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A target AGENTS.md with an unmatched managed marker must yield a
+    structured 4xx response, not a 500. Operators rely on the JSON
+    contract to surface what to fix."""
+    repo_dir = _stub_repo(tmp_path, monkeypatch)
+    target = repo_dir / "AGENTS.md"
+    target.write_text(_MALFORMED_AGENTS_MD)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/onboarding/preview", data={"repo_name": "example__alpha"}
+        )
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert "Malformed managed markers" in payload["error"]
+    assert "work_modes" in payload["error"]
+    assert target.read_text() == _MALFORMED_AGENTS_MD
+
+
+def test_apply_returns_client_error_on_malformed_markers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Apply must also surface a 4xx (not crash) so operators can
+    reconcile a repo whose AGENTS.md already drifted into a malformed
+    marker state."""
+    repo_dir = _stub_repo(tmp_path, monkeypatch)
+    target = repo_dir / "AGENTS.md"
+    target.write_text(_MALFORMED_AGENTS_MD)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/onboarding/apply", data={"repo_name": "example__alpha"}
+        )
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert "Malformed managed markers" in payload["error"]
+    assert target.read_text() == _MALFORMED_AGENTS_MD
