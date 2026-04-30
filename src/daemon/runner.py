@@ -1049,23 +1049,27 @@ class PipelineRunner(
         """Reset the adaptive IDLE-polling streak (e.g. on wake)."""
         self._idle_streak = 0
 
-    def _update_idle_streak_after_cycle(self) -> None:
-        """Bump or clear ``_idle_streak`` based on the post-cycle state.
+    def _update_idle_streak_after_cycle(
+        self, pre_state: PipelineState | None = None
+    ) -> None:
+        """Bump or clear ``_idle_streak`` based on the cycle outcome.
 
-        A cycle counts toward the streak only when the runner ends in
-        IDLE with no PR pinned (``current_pr is None``) AND the cycle
-        produced a clean idle verdict (``_idle_dispatch_deferred`` is
-        false). Any other outcome — transition to a working state,
-        attaching to an open PR for manual work, a pending upload
-        retry, or a GitHub read failure that left queue/PR status
-        unknown — resets the streak so the next cycle polls on the
-        fast cadence again and recovers quickly from transient
-        outages.
+        A cycle counts toward the streak only when the runner both
+        STARTED and ENDED the cycle in IDLE with no PR pinned
+        (``current_pr is None``) AND the cycle produced a clean idle
+        verdict (``_idle_dispatch_deferred`` is false). Any other
+        outcome — a transition into IDLE from an active state
+        (WATCH/FIX/MERGE/CODING/etc.), attaching to an open PR for
+        manual work, a pending upload retry, or a GitHub read
+        failure that left queue/PR status unknown — resets the
+        streak so the next cycle polls on the fast cadence again
+        and recovers quickly from transient outages.
         """
         dispatch_deferred = self._idle_dispatch_deferred
         self._idle_dispatch_deferred = False
         if (
-            self.state.state == PipelineState.IDLE
+            pre_state == PipelineState.IDLE
+            and self.state.state == PipelineState.IDLE
             and self.state.current_pr is None
             and not dispatch_deferred
         ):
@@ -1244,6 +1248,7 @@ class PipelineRunner(
             await self.publish_state()
             return
 
+        pre_state = self.state.state
         if self.state.state in _TRANSIENT_STATES:
             self.log_event(
                 f"resetting stale transient state {self.state.state.value} -> IDLE"
@@ -1289,5 +1294,5 @@ class PipelineRunner(
             self._error_skip_count = 0
             self._error_skip_active = False
 
-        self._update_idle_streak_after_cycle()
+        self._update_idle_streak_after_cycle(pre_state)
         await self.publish_state()

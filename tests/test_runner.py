@@ -20562,7 +20562,7 @@ def test_update_idle_streak_increments_on_idle_with_no_pr() -> None:
     runner.state.current_pr = None
 
     for expected in range(1, 6):
-        runner._update_idle_streak_after_cycle()
+        runner._update_idle_streak_after_cycle(PipelineState.IDLE)
         assert runner._idle_streak == expected
 
 
@@ -20572,8 +20572,26 @@ def test_update_idle_streak_resets_when_state_leaves_idle() -> None:
     runner._idle_streak = 5
     runner.state.state = PipelineState.WATCH
 
-    runner._update_idle_streak_after_cycle()
+    runner._update_idle_streak_after_cycle(PipelineState.IDLE)
     assert runner._idle_streak == 0
+
+
+def test_update_idle_streak_resets_when_cycle_started_outside_idle() -> None:
+    """A cycle that began in an active state and ended in IDLE resets the streak."""
+    runner = _make_runner()
+    runner._idle_streak = 5
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_pr = None
+
+    for active in (
+        PipelineState.WATCH,
+        PipelineState.FIX,
+        PipelineState.MERGE,
+        PipelineState.CODING,
+    ):
+        runner._idle_streak = 5
+        runner._update_idle_streak_after_cycle(active)
+        assert runner._idle_streak == 0
 
 
 def test_update_idle_streak_resets_when_idle_attaches_open_pr() -> None:
@@ -20583,7 +20601,7 @@ def test_update_idle_streak_resets_when_idle_attaches_open_pr() -> None:
     runner.state.state = PipelineState.IDLE
     runner.state.current_pr = PRInfo(number=42, branch="pr-042")
 
-    runner._update_idle_streak_after_cycle()
+    runner._update_idle_streak_after_cycle(PipelineState.IDLE)
     assert runner._idle_streak == 0
 
 
@@ -20594,7 +20612,7 @@ def test_update_idle_streak_caps_at_sane_ceiling() -> None:
     runner.state.current_pr = None
 
     runner._idle_streak = runner_module._IDLE_STREAK_CAP
-    runner._update_idle_streak_after_cycle()
+    runner._update_idle_streak_after_cycle(PipelineState.IDLE)
     assert runner._idle_streak == runner_module._IDLE_STREAK_CAP
 
 
@@ -20639,6 +20657,37 @@ def test_run_cycle_grows_idle_streak_across_consecutive_idle_cycles(
     assert runner._idle_streak == 4
 
 
+def test_run_cycle_resets_idle_streak_on_transition_into_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A WATCH→IDLE cycle must reset the streak, not increment it."""
+    _patch_subprocess(monkeypatch)
+
+    runner = _make_runner(poll_interval_sec=60)
+    runner.app_config.daemon.idle_extended_after_cycles = 3
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 300
+    runner._recovered = True
+    runner._scaffolded = True
+    runner._idle_streak = 2
+
+    async def fake_handle_watch() -> None:
+        runner.state.state = PipelineState.IDLE
+        runner.state.current_pr = None
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "handle_watch", fake_handle_watch)
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", _preflight_true_stub)
+
+    runner.state.state = PipelineState.WATCH
+    asyncio.run(runner.run_cycle())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner._idle_streak == 0
+
+
 def test_update_idle_streak_resets_when_pending_upload_deferred() -> None:
     """A cycle that deferred a pending upload must not grow the streak."""
     runner = _make_runner()
@@ -20647,7 +20696,7 @@ def test_update_idle_streak_resets_when_pending_upload_deferred() -> None:
     runner._idle_streak = 2
     runner._idle_dispatch_deferred = True
 
-    runner._update_idle_streak_after_cycle()
+    runner._update_idle_streak_after_cycle(PipelineState.IDLE)
 
     assert runner._idle_streak == 0
     assert runner._idle_dispatch_deferred is False
@@ -20659,10 +20708,10 @@ def test_update_idle_streak_clears_deferred_flag_after_consuming() -> None:
     runner.state.state = PipelineState.IDLE
     runner.state.current_pr = None
     runner._idle_dispatch_deferred = True
-    runner._update_idle_streak_after_cycle()
+    runner._update_idle_streak_after_cycle(PipelineState.IDLE)
     assert runner._idle_dispatch_deferred is False
 
-    runner._update_idle_streak_after_cycle()
+    runner._update_idle_streak_after_cycle(PipelineState.IDLE)
     assert runner._idle_streak == 1
 
 
