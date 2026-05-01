@@ -97,9 +97,13 @@ class WatchMixin:
                 allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
             )
         except Exception as exc:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = f"get_open_prs failed: {exc}"
-            self.log_event(f"[WATCH] {exc}.")
+            await self._transition_to_error(
+                f"get_open_prs failed: {exc}",
+                save_run_record_as=None,
+                publish=False,
+                log_prefix="[WATCH]",
+                log_message=str(exc),
+            )
             return
 
         current_pr = self.state.current_pr

@@ -376,7 +376,7 @@ class IdleMixin:
         if self.state.user_paused:
             return
         if self.state.pending_queue_sync_branch is not None:
-            if not self._resolve_pending_queue_sync():
+            if not await self._resolve_pending_queue_sync():
                 return
 
         try:
