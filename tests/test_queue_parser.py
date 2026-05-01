@@ -220,14 +220,68 @@ def test_parse_task_header_rejects_invalid_type_value(tmp_path: Path) -> None:
         """# PR-084: Task file header parser
 
 Branch: pr-084-task-header-parser
-- Type: chore
+- Type: nonsense
 - Complexity: medium
 - Depends on: none
 """,
     )
 
-    with pytest.raises(QueueValidationError, match="invalid Type 'chore'"):
+    with pytest.raises(QueueValidationError, match="invalid Type 'nonsense'"):
         parse_task_header(task_path)
+
+
+@pytest.mark.parametrize(
+    "synonym,canonical",
+    [
+        ("bug", "bugfix"),
+        ("fix", "bugfix"),
+        ("chore", "refactor"),
+        ("feat", "feature"),
+        ("task", "feature"),
+    ],
+)
+def test_parse_task_header_normalizes_type_synonyms(
+    tmp_path: Path, synonym: str, canonical: str
+) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        f"""# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: {synonym}
+- Complexity: low
+- Depends on: none
+""",
+    )
+
+    header = parse_task_header(task_path)
+    assert header.task_type == canonical
+
+
+def test_parse_task_header_canonical_type_still_accepted(tmp_path: Path) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: bugfix
+- Complexity: low
+- Depends on: none
+""",
+    )
+
+    header = parse_task_header(task_path)
+    assert header.task_type == "bugfix"
+
+
+def test_type_synonyms_constant_contract() -> None:
+    """Synonym keys must not collide with canonical values, and every
+    target must be a canonical value. Locks the immutability contract
+    documented in docs/TASK_SCHEMA.md."""
+    from src.queue_parser import _TASK_TYPE_VALUES, TYPE_SYNONYMS
+
+    assert set(TYPE_SYNONYMS).isdisjoint(_TASK_TYPE_VALUES)
+    assert set(TYPE_SYNONYMS.values()).issubset(_TASK_TYPE_VALUES)
 
 
 def test_parse_task_header_allows_existing_repo_task_types(

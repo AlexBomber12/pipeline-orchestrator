@@ -789,15 +789,30 @@ def test_upload_surfaces_invalid_type_details(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file(), _task_file(task_type="chore")],
+            files=[_queue_file(), _task_file(task_type="nonsense")],
         )
 
     assert resp.status_code == 400
     assert "Task file validation failed:" in resp.text
     assert "PR-001.md: invalid Type" in resp.text
-    assert "chore" in resp.text
+    assert "nonsense" in resp.text
     assert "expected one of" in resp.text
     assert "Dismiss upload error" in resp.text
+
+
+def test_upload_accepts_type_synonyms(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_queue_file(), _task_file(task_type="bug")],
+        )
+
+    assert resp.status_code == 200
+    assert "Accepted 1 task file (PR-001)." in resp.text
 
 
 def test_upload_invalid_zip_returns_400_with_validator_error(
@@ -805,14 +820,162 @@ def test_upload_invalid_zip_returns_400_with_validator_error(
     repo_dir: Path,
     uploads_dir: Path,
 ) -> None:
-    invalid_task = _task_file(task_type="bug")[1][1]
+    invalid_task = _task_file(task_type="nonsense")[1][1]
     resp = _post_upload([_zip_file({"PR-001.md": invalid_task})])
 
     assert resp.status_code == 400
     assert "Task file validation failed:" in resp.text
     assert "PR-001.md: invalid Type" in resp.text
-    assert "bug" in resp.text
+    assert "nonsense" in resp.text
     assert "expected one of" in resp.text
+
+
+def test_upload_aggregates_errors_across_multiple_invalid_files(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    """Batch upload with three files (two invalid, one valid) returns a
+    single aggregated error report listing both invalid files."""
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[
+                _queue_file(),
+                _task_file(name="PR-001.md", pr_id="PR-001"),
+                _task_file(
+                    name="PR-002.md", pr_id="PR-002", task_type="nonsense"
+                ),
+                _task_file(
+                    name="PR-003.md", pr_id="PR-003", task_type="alsobad"
+                ),
+            ],
+        )
+
+    assert resp.status_code == 400
+    assert "Task file validation failed:" in resp.text
+    assert "PR-002.md: invalid Type" in resp.text
+    assert "PR-003.md: invalid Type" in resp.text
+
+
+def test_upload_aggregates_errors_when_all_files_invalid(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[
+                _queue_file(),
+                _task_file(
+                    name="PR-001.md", pr_id="PR-001", task_type="nope1"
+                ),
+                _task_file(
+                    name="PR-002.md", pr_id="PR-002", task_type="nope2"
+                ),
+            ],
+        )
+
+    assert resp.status_code == 400
+    assert "PR-001.md: invalid Type" in resp.text
+    assert "PR-002.md: invalid Type" in resp.text
+
+
+def test_upload_aggregated_depends_on_hint_appended_when_multi_file(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    """When two files both omit Depends on, aggregated error still
+    surfaces the friendly hint at the end of the report."""
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[
+                _queue_file(),
+                _task_file(name="PR-001.md", pr_id="PR-001", depends_on=None),
+                _task_file(name="PR-002.md", pr_id="PR-002", depends_on=None),
+            ],
+        )
+
+    assert resp.status_code == 400
+    assert "PR-001.md: missing Depends on" in resp.text
+    assert "PR-002.md: missing Depends on" in resp.text
+    assert "for tasks with no dependencies" in resp.text
+
+
+def test_upload_truncates_aggregated_errors_over_fifty(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    """When more than 50 task files are invalid the report is capped at
+    50 entries with a trailing summary line."""
+    files = [_queue_file()]
+    for i in range(1, 53):
+        files.append(
+            _task_file(
+                name=f"PR-{i:03d}.md", pr_id=f"PR-{i:03d}", task_type="nope"
+            )
+        )
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks", files=files
+        )
+
+    assert resp.status_code == 400
+    assert "and 2 more error(s) (truncated)" in resp.text
+
+
+def test_upload_depends_on_hint_appended_when_truncated_out(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    """A `missing Depends on` error beyond the 50-entry truncation
+    boundary still surfaces the friendly hint line."""
+    files = [_queue_file()]
+    for i in range(1, 51):
+        files.append(
+            _task_file(
+                name=f"PR-{i:03d}.md", pr_id=f"PR-{i:03d}", task_type="nope"
+            )
+        )
+    files.append(
+        _task_file(name="PR-099.md", pr_id="PR-099", depends_on=None)
+    )
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks", files=files
+        )
+
+    assert resp.status_code == 400
+    assert "and 1 more error(s) (truncated)" in resp.text
+    assert "PR-099.md: missing Depends on" not in resp.text
+    assert "for tasks with no dependencies" in resp.text
+
+
+def test_upload_succeeds_when_batch_is_all_valid(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[
+                _queue_file(),
+                _task_file(name="PR-001.md", pr_id="PR-001"),
+                _task_file(name="PR-002.md", pr_id="PR-002"),
+                _task_file(name="PR-003.md", pr_id="PR-003"),
+            ],
+        )
+
+    assert resp.status_code == 200
+    assert "Accepted 3 task files (PR-001 through PR-003)." in resp.text
 
 
 def test_base_html_htmx_whitelist_includes_400() -> None:

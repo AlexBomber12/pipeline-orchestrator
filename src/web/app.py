@@ -2604,6 +2604,7 @@ async def upload_tasks(
         if _re.fullmatch(_TASK_UPLOAD_PATTERN, fname):
             task_uploads[fname] = content
 
+    aggregated_issues: list[str] = []
     for fname, content in task_uploads.items():
         try:
             task_text = content.decode("utf-8")
@@ -2620,23 +2621,39 @@ async def upload_tasks(
             try:
                 parse_task_header(task_path)
             except QueueValidationError as exc:
-                issues = [
-                    issue.replace(str(task_path), fname) for issue in exc.issues
-                ]
-                if any("missing Depends on" in issue for issue in issues):
-                    return _render_upload_error(
-                        request,
-                        f"Task file validation failed: {fname}: missing Depends on field.\n"
-                        "Use 'Depends on: none' for tasks with no dependencies.",
-                        400,
-                        repo_name=name,
+                for issue in exc.issues:
+                    aggregated_issues.append(
+                        issue.replace(str(task_path), fname)
                     )
-                return _render_upload_error(
-                    request,
-                    "Task file validation failed:\n" + "\n".join(issues),
-                    400,
-                    repo_name=name,
-                )
+
+    if aggregated_issues:
+        # Cap at 50 entries so a misbehaving batch upload cannot fill the
+        # dashboard error toast with thousands of lines. The Depends-on
+        # hint is keyed off the full aggregated list, not the capped slice,
+        # so a relevant issue beyond the truncation boundary still surfaces
+        # the guidance line.
+        has_missing_depends_on = any(
+            "missing Depends on" in issue for issue in aggregated_issues
+        )
+        capped = aggregated_issues[:50]
+        truncated = len(aggregated_issues) - len(capped)
+        if (
+            len(aggregated_issues) == 1
+            and has_missing_depends_on
+        ):
+            return _render_upload_error(
+                request,
+                f"Task file validation failed: {capped[0]} field.\n"
+                "Use 'Depends on: none' for tasks with no dependencies.",
+                400,
+                repo_name=name,
+            )
+        body = "Task file validation failed:\n" + "\n".join(capped)
+        if truncated > 0:
+            body += f"\n... and {truncated} more error(s) (truncated)"
+        if has_missing_depends_on:
+            body += "\nUse 'Depends on: none' for tasks with no dependencies."
+        return _render_upload_error(request, body, 400, repo_name=name)
 
     # Stage files to /data/uploads/{repo}/ and enqueue for daemon processing.
     # Git write operations are handled by the daemon to preserve the
