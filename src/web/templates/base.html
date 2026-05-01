@@ -368,6 +368,61 @@
             opacity: 0.75;
             box-shadow: 0 0 0 0 transparent;
         }
+
+        /* Resource chip row: four compact indicators replacing the legacy
+           single GitHub API budget bar. Color zone reflects percent
+           remaining; `none` is a neutral grey for missing data. */
+        .resource-chip-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .resource-chip {
+            display: inline-flex;
+            align-items: baseline;
+            gap: 6px;
+            padding: 3px 10px;
+            border-radius: 999px;
+            font-family: 'JetBrains Mono', ui-monospace, monospace;
+            font-size: 11px;
+            line-height: 1.4;
+            border: 1px solid transparent;
+            white-space: nowrap;
+            cursor: default;
+        }
+
+        .resource-chip-label {
+            font-weight: 500;
+        }
+
+        .resource-chip-value {
+            font-weight: 600;
+        }
+
+        .resource-chip[data-zone="green"] {
+            background-color: color-mix(in srgb, var(--ok) 18%, transparent);
+            border-color: color-mix(in srgb, var(--ok) 35%, transparent);
+            color: var(--ok);
+        }
+
+        .resource-chip[data-zone="amber"] {
+            background-color: color-mix(in srgb, var(--warn) 18%, transparent);
+            border-color: color-mix(in srgb, var(--warn) 35%, transparent);
+            color: var(--warn);
+        }
+
+        .resource-chip[data-zone="red"] {
+            background-color: color-mix(in srgb, var(--fail) 18%, transparent);
+            border-color: color-mix(in srgb, var(--fail) 35%, transparent);
+            color: var(--fail);
+        }
+
+        .resource-chip[data-zone="none"] {
+            background-color: rgb(var(--neutral-rgb) / 0.12);
+            border-color: rgb(var(--neutral-rgb) / 0.3);
+            color: var(--text-3);
+        }
     </style>
 </head>
 <body class="bg-surface-1 text-gray-200 min-h-screen">

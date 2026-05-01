@@ -16,23 +16,30 @@
     'CHANGES_REQUESTED': '✏️',
 } %}
 
-{% if github_api_budget %}
-{% set budget_bucket = github_api_budget.bucket %}
-{% set budget_color = {'ok': 'bg-ok', 'low': 'bg-warn', 'critical': 'bg-fail'}.get(budget_bucket, 'bg-ok') %}
-{% set budget_text_color = {'ok': 'text-ok', 'low': 'text-warn', 'critical': 'text-fail'}.get(budget_bucket, 'text-ok') %}
-<div class="mb-3 rounded-lg border border-white/5 bg-surface-2 p-3 text-xs"
-     data-github-api-budget>
-    <div class="mb-1 flex items-center justify-between">
-        <span class="text-gray-400">GitHub API budget</span>
-        <span class="font-mono {{ budget_text_color }}">
-            {{ github_api_budget.remaining }} / {{ github_api_budget.limit }}
-            ({{ github_api_budget.percent }}%)
-        </span>
-    </div>
-    <div class="h-1 bg-surface-3 rounded-full overflow-hidden">
-        <div class="h-full {{ budget_color }} rounded-full"
-             style="width: {{ github_api_budget.percent }}%"></div>
-    </div>
+{% if resources %}
+{% set chip_specs = [
+    ('github_rest', 'GH REST', 'GitHub REST API'),
+    ('github_graphql', 'GraphQL', 'GitHub GraphQL API'),
+    ('claude_5h', 'Claude 5h', 'Claude 5-hour window'),
+    ('claude_weekly', 'Claude weekly', 'Claude weekly window'),
+] %}
+<div class="mb-3 resource-chip-row" data-resource-chips>
+    {% for key, label, full_name in chip_specs %}
+    {% set chip = resources[key] %}
+    {% set pct = chip.percent_remaining %}
+    {% if chip.reset_unix %}
+    {%- set tooltip -%}{{ full_name }}
+{{ chip.remaining }} / {{ chip.limit }} remaining
+Resets at {{ chip.reset_unix | format_reset }}{%- endset -%}
+    {% else %}
+    {%- set tooltip -%}{{ full_name }}
+{% if chip.remaining is not none %}{{ chip.remaining }} / {{ chip.limit }} remaining{% else %}No data{% endif %}{%- endset -%}
+    {% endif %}
+    <span class="resource-chip" data-zone="{{ chip.zone }}" data-resource="{{ key }}" title="{{ tooltip }}">
+        <span class="resource-chip-label">{{ label }}</span>
+        <span class="resource-chip-value">{% if pct is none %}—{% else %}{{ pct | round(0, 'floor') | int }}%{% endif %}</span>
+    </span>
+    {% endfor %}
 </div>
 {% endif %}
 

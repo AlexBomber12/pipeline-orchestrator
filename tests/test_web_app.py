@@ -23,13 +23,16 @@ from src.models import (
 from src.web import app as web_app
 from src.web.app import (
     _active_rate_limit_coder,
-    _build_github_api_budget_view,
     _build_recent_graphql_burns_view,
+    _build_resources_view,
+    _claude_usage_chip,
     _find_repo_config_by_name,
     _format_duration_ms,
+    _format_reset_unix,
     _get_repo_state_safe,
     _parse_iso8601,
     _recent_repo_metrics_payload,
+    _resource_zone,
     app,
     get_all_repo_states,
     get_repo_state,
@@ -2576,86 +2579,241 @@ def test_post_repo_detail_coder_returns_success_when_publish_event_fails(
     assert reloaded.repositories[0].coder == "codex"
 
 
-def _make_budget_redis(
-    remaining: int,
+def _make_bucket_redis(
+    *,
+    rest_remaining: int | None = None,
+    graphql_remaining: int | None = None,
     limit: int = 5000,
     reset_at: datetime | None = None,
 ) -> _FakeRedis:
     from src.daemon.github_rate_limit import (
-        BUDGET_REDIS_KEY,
+        BUDGET_GRAPHQL_REDIS_KEY,
+        BUDGET_REST_REDIS_KEY,
         RateLimitBudget,
     )
 
-    budget = RateLimitBudget(
-        installation_id=None,
-        remaining=remaining,
-        limit=limit,
-        reset_at=reset_at
-        or (datetime.now(timezone.utc) + timedelta(seconds=1800)),
+    reset = reset_at or (datetime.now(timezone.utc) + timedelta(seconds=1800))
+    store: dict[str, str] = {}
+    if rest_remaining is not None:
+        store[BUDGET_REST_REDIS_KEY] = RateLimitBudget(
+            installation_id=None,
+            remaining=rest_remaining,
+            limit=limit,
+            reset_at=reset,
+        ).to_redis_payload()
+    if graphql_remaining is not None:
+        store[BUDGET_GRAPHQL_REDIS_KEY] = RateLimitBudget(
+            installation_id=None,
+            remaining=graphql_remaining,
+            limit=limit,
+            reset_at=reset,
+        ).to_redis_payload()
+    return _FakeRedis(store)
+
+
+def _claude_state(
+    *,
+    name: str = "octo__demo",
+    coder: str | None = "claude",
+    session_percent: int | None = None,
+    session_resets_at: int | None = None,
+    weekly_percent: int | None = None,
+    weekly_resets_at: int | None = None,
+    last_updated: datetime | None = None,
+    active: bool = True,
+) -> RepoState:
+    return RepoState(
+        url=f"https://github.com/{name.replace('__', '/')}",
+        name=name,
+        coder=coder,
+        usage_session_percent=session_percent,
+        usage_session_resets_at=session_resets_at,
+        usage_weekly_percent=weekly_percent,
+        usage_weekly_resets_at=weekly_resets_at,
+        last_updated=last_updated or datetime.now(timezone.utc),
+        active=active,
     )
-    return _FakeRedis({BUDGET_REDIS_KEY: budget.to_redis_payload()})
 
 
-def test_build_github_api_budget_view_returns_none_without_observation() -> None:
-    config = load_config()
-    assert asyncio.run(_build_github_api_budget_view(_FakeRedis(), config)) is None
+def test_resource_zone_boundaries() -> None:
+    # Spec boundaries: 50% → green, 49% → amber, 20% → amber, 19% → red.
+    assert _resource_zone(100.0) == "green"
+    assert _resource_zone(50.0) == "green"
+    assert _resource_zone(49.9) == "amber"
+    assert _resource_zone(20.0) == "amber"
+    assert _resource_zone(19.9) == "red"
+    assert _resource_zone(0.0) == "red"
+    assert _resource_zone(None) == "none"
 
 
-def test_build_github_api_budget_view_buckets_ok() -> None:
-    config = load_config()
-    config.daemon.github_api_pause_threshold_percent = 5
-    config.daemon.github_api_slowdown_threshold_percent = 20
-    redis = _make_budget_redis(remaining=4500, limit=5000)  # 90%
-
-    view = asyncio.run(_build_github_api_budget_view(redis, config))
-
-    assert view is not None
-    assert view["bucket"] == "ok"
-    assert view["remaining"] == 4500
-    assert view["limit"] == 5000
+def test_format_reset_unix_renders_utc_clock() -> None:
+    assert _format_reset_unix(0) == "unknown"
+    assert _format_reset_unix(None) == "unknown"
+    # 2024-01-01 12:34:56 UTC.
+    assert _format_reset_unix(1704112496) == "12:34 UTC"
 
 
-def test_build_github_api_budget_view_buckets_low() -> None:
-    config = load_config()
-    config.daemon.github_api_pause_threshold_percent = 5
-    config.daemon.github_api_slowdown_threshold_percent = 20
-    redis = _make_budget_redis(remaining=500)  # 10%
+def test_build_resources_view_missing_data_renders_neutral() -> None:
+    """No GitHub or Claude data anywhere → all four chips render as none."""
+    view = asyncio.run(_build_resources_view(_FakeRedis(), []))
 
-    view = asyncio.run(_build_github_api_budget_view(redis, config))
-
-    assert view is not None
-    assert view["bucket"] == "low"
-
-
-def test_build_github_api_budget_view_buckets_critical() -> None:
-    config = load_config()
-    config.daemon.github_api_pause_threshold_percent = 5
-    config.daemon.github_api_slowdown_threshold_percent = 20
-    redis = _make_budget_redis(remaining=10)  # 0.2%
-
-    view = asyncio.run(_build_github_api_budget_view(redis, config))
-
-    assert view is not None
-    assert view["bucket"] == "critical"
+    assert set(view) == {"github_rest", "github_graphql", "claude_5h", "claude_weekly"}
+    for chip in view.values():
+        assert chip["remaining"] is None
+        assert chip["percent_remaining"] is None
+        assert chip["zone"] == "none"
 
 
-def test_build_github_api_budget_view_bucket_ok_when_reset_window_elapsed() -> None:
-    """Stale snapshots past their reset_at must not flag the dashboard.
+def test_build_resources_view_populates_github_buckets_independently() -> None:
+    """REST and GraphQL chips must come from their own keys, not the constrained min."""
+    redis = _make_bucket_redis(rest_remaining=4500, graphql_remaining=1000)
 
-    The daemon stops throttling once ``now >= reset_at``; the dashboard
-    coloring should track the same trigger so operators don't see warning
-    or critical state while the runner is operating normally.
+    view = asyncio.run(_build_resources_view(redis, []))
+
+    assert view["github_rest"]["remaining"] == 4500
+    assert view["github_rest"]["zone"] == "green"  # 90%
+    assert view["github_graphql"]["remaining"] == 1000
+    assert view["github_graphql"]["zone"] == "amber"  # 20%
+    # Claude chips are still neutral when no Claude state is provided.
+    assert view["claude_5h"]["zone"] == "none"
+    assert view["claude_weekly"]["zone"] == "none"
+
+
+def test_build_resources_view_red_zone_when_buckets_near_exhaustion() -> None:
+    redis = _make_bucket_redis(rest_remaining=10, graphql_remaining=900)
+
+    view = asyncio.run(_build_resources_view(redis, []))
+
+    # 0.2% remaining → red.
+    assert view["github_rest"]["zone"] == "red"
+    # 18% remaining → red.
+    assert view["github_graphql"]["zone"] == "red"
+
+
+def test_build_resources_view_neutralizes_expired_bucket_snapshot() -> None:
+    """Snapshots whose ``reset_at`` has passed must render neutral, not red.
+
+    GitHub rolls the bucket over at ``reset_at``; a stale low-remaining
+    snapshot from before the rollover would otherwise hold a critical
+    chip indefinitely even though the daemon already stopped throttling.
     """
-    config = load_config()
-    config.daemon.github_api_pause_threshold_percent = 5
-    config.daemon.github_api_slowdown_threshold_percent = 20
-    expired = datetime.now(timezone.utc) - timedelta(seconds=60)
-    redis = _make_budget_redis(remaining=10, reset_at=expired)  # 0.2%, but expired
+    expired_reset = datetime.now(timezone.utc) - timedelta(seconds=60)
+    redis = _make_bucket_redis(
+        rest_remaining=10, graphql_remaining=10, reset_at=expired_reset
+    )
 
-    view = asyncio.run(_build_github_api_budget_view(redis, config))
+    view = asyncio.run(_build_resources_view(redis, []))
 
-    assert view is not None
-    assert view["bucket"] == "ok"
+    for key in ("github_rest", "github_graphql"):
+        assert view[key]["zone"] == "none"
+        assert view[key]["percent_remaining"] is None
+        assert view[key]["remaining"] is None
+        assert view[key]["reset_unix"] is None
+
+
+def test_build_resources_view_picks_most_recent_claude_state() -> None:
+    """Aggregation walks repos and uses the freshest Claude snapshot."""
+    older = _claude_state(
+        name="octo__a",
+        session_percent=10,
+        weekly_percent=5,
+        last_updated=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    newer = _claude_state(
+        name="octo__b",
+        session_percent=70,
+        session_resets_at=1700000000,
+        weekly_percent=80,
+        weekly_resets_at=1700100000,
+        last_updated=datetime(2026, 5, 1, tzinfo=timezone.utc),
+    )
+    # A non-Claude state must be ignored even if it carries usage fields.
+    other = _claude_state(
+        name="octo__c",
+        coder="codex",
+        session_percent=99,
+        weekly_percent=99,
+        last_updated=datetime(2026, 6, 1, tzinfo=timezone.utc),
+    )
+
+    view = asyncio.run(_build_resources_view(_FakeRedis(), [older, newer, other]))
+
+    # 100 - 70 = 30% remaining → amber.
+    assert view["claude_5h"]["percent_remaining"] == 30.0
+    assert view["claude_5h"]["zone"] == "amber"
+    assert view["claude_5h"]["reset_unix"] == 1700000000
+    # 100 - 80 = 20% remaining → amber.
+    assert view["claude_weekly"]["percent_remaining"] == 20.0
+    assert view["claude_weekly"]["zone"] == "amber"
+
+
+def test_claude_usage_chip_returns_neutral_when_no_claude_state() -> None:
+    only_codex = _claude_state(coder="codex", session_percent=10, weekly_percent=10)
+    chip = _claude_usage_chip([only_codex], window="session")
+    assert chip["zone"] == "none"
+    assert chip["percent_remaining"] is None
+
+
+def test_claude_usage_chip_skips_states_without_window_data() -> None:
+    no_session = _claude_state(weekly_percent=20)
+    no_weekly = _claude_state(session_percent=20)
+    assert _claude_usage_chip([no_session], window="session")["zone"] == "none"
+    assert _claude_usage_chip([no_weekly], window="weekly")["zone"] == "none"
+
+
+def test_claude_usage_chip_excludes_inactive_repos() -> None:
+    """Disabled Claude repos must not win the freshness race.
+
+    Inactive runners stop refreshing usage fields but still bump
+    ``last_updated`` each publish, so without this gate a disabled repo's
+    stale snapshot would supplant the active account's current observation.
+    """
+    active = _claude_state(
+        name="octo__active",
+        session_percent=10,
+        session_resets_at=1700000000,
+        weekly_percent=15,
+        weekly_resets_at=1700100000,
+        last_updated=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        active=True,
+    )
+    inactive_newer = _claude_state(
+        name="octo__inactive",
+        session_percent=90,
+        session_resets_at=1700200000,
+        weekly_percent=95,
+        weekly_resets_at=1700300000,
+        last_updated=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        active=False,
+    )
+
+    session = _claude_usage_chip(
+        [active, inactive_newer], window="session"
+    )
+    weekly = _claude_usage_chip(
+        [active, inactive_newer], window="weekly"
+    )
+
+    # Active repo's snapshot wins despite being older.
+    assert session["percent_remaining"] == 90.0
+    assert session["reset_unix"] == 1700000000
+    assert weekly["percent_remaining"] == 85.0
+    assert weekly["reset_unix"] == 1700100000
+
+
+def test_claude_usage_chip_neutral_when_only_candidate_inactive() -> None:
+    """Only inactive Claude repos available → render neutral, not stale data."""
+    only_inactive = _claude_state(
+        session_percent=20,
+        weekly_percent=30,
+        active=False,
+    )
+    assert (
+        _claude_usage_chip([only_inactive], window="session")["zone"] == "none"
+    )
+    assert (
+        _claude_usage_chip([only_inactive], window="weekly")["zone"] == "none"
+    )
 
 
 def test_build_recent_graphql_burns_view_returns_none_without_data() -> None:
