@@ -15,6 +15,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from src import claude_cli, codex_cli, github_client
+from src.analytics import log_merged_pr
+from src.analytics.coder_version import detect_coder_extension_version
+from src.config import CoderType
 from src.daemon import git_ops
 from src.models import PipelineState
 from src.queue_parser import mark_task_done
@@ -226,11 +229,114 @@ class MergeMixin:
             diff_stats=merged_diff_stats,
             base_branch=base,
         )
+        merged_at = datetime.now(timezone.utc)
+        try:
+            log_merged_pr(self._build_outcome_record(merged_at))
+        except Exception as exc:
+            self.log_event(
+                f"[ANALYTICS] outcome log for PR #{number} failed: {exc}."
+            )
         self._current_run_record = None
         self.state.current_pr = None
         self.state.current_task = None
         self.state.state = PipelineState.IDLE
         self.log_event(f"[MERGE] Merged PR #{number} -> IDLE.")
+
+    def _build_outcome_record(self, merged_at: datetime) -> dict:
+        """Assemble the outcome dict for the just-merged PR.
+
+        Pulls fields from the finalized run record and runner state.
+        Fields the daemon does not yet track are written as ``None`` so
+        the schema row stays complete; future PRs can fill them in
+        without changing the file format.
+        """
+        record = self._current_run_record
+        pr = self.state.current_pr
+        task = self.state.current_task
+        coder_name, model = self._resolve_outcome_coder_and_model(record)
+
+        wall_clock_seconds: int | None = None
+        if record is not None and record.duration_ms is not None:
+            wall_clock_seconds = max(record.duration_ms // 1000, 0)
+
+        # ``fix_iteration_count`` counts FIX entries the daemon drove on
+        # this PR; each one is preceded by exactly one ``@codex review``
+        # trigger, plus the initial post-create review. Using the PR-side
+        # counter (rather than the run record) survives a coder restart
+        # where the run record was re-initialized mid-PR.
+        codex_review_iterations: int | None = None
+        if pr is not None:
+            codex_review_iterations = pr.fix_iteration_count + 1
+
+        pr_id_value = ""
+        if task is not None and task.pr_id:
+            pr_id_value = task.pr_id
+        elif pr is not None and pr.pr_id:
+            pr_id_value = pr.pr_id
+
+        return {
+            "pr_id": pr_id_value,
+            # ``log_merged_pr`` recomputes this from pr_id+repo_slug; the
+            # placeholder keeps the dict complete for the schema check.
+            "task_id_hash": "",
+            "repo_slug": self.name,
+            "merged_at": merged_at.isoformat(),
+            "coder": coder_name,
+            "coder_model_string": model,
+            "coder_extension_version": detect_coder_extension_version(coder_name),
+            "task_type": (record.task_type if record is not None else "") or "",
+            "task_complexity": (record.complexity if record is not None else "") or "",
+            "fix_iterations": (
+                record.fix_iterations if record is not None else 0
+            ),
+            "ci_runs_total": None,
+            "ci_runs_failed": None,
+            "wall_clock_seconds": wall_clock_seconds,
+            "files_changed": (
+                record.files_touched_count if record is not None else 0
+            ),
+            "lines_added": (
+                record.diff_lines_added if record is not None else 0
+            ),
+            "lines_removed": (
+                record.diff_lines_deleted if record is not None else 0
+            ),
+            "review_blocker_count": None,
+            "review_nit_count": None,
+            "codex_review_iterations": codex_review_iterations,
+            "tokens_estimate": None,
+            "outcome": "merged",
+        }
+
+    def _resolve_outcome_coder_and_model(self, record) -> tuple[str, str]:
+        """Return the (coder, model) pair that actually ran the PR.
+
+        ``_get_coder()`` may switch away from the configured default at
+        run time — task-level pinning, exploration, or rate-limit
+        fallback can all select a non-default coder — and the chosen
+        pair is captured in the run record's
+        ``profile_id`` (``"<coder>:<model>:container"``) when CODING
+        starts. Reading from there keeps merged outcome rows aligned
+        with the run that produced them so later model/version-level
+        analytics are not mislabeled. Fall back to the repo/daemon
+        default only when no run record exists (e.g. recovery paths
+        that build an outcome row without a CODING pass on this
+        process).
+        """
+        if record is not None and record.profile_id:
+            parts = record.profile_id.split(":")
+            if len(parts) >= 2 and parts[0] and parts[1]:
+                return parts[0], parts[1]
+        configured_coder = (
+            self.repo_config.coder or self.app_config.daemon.coder
+        )
+        coder_name = configured_coder.value
+        model = (
+            self.app_config.daemon.codex_model
+            if coder_name == CoderType.CODEX.value
+            else self.app_config.daemon.claude_model
+        )
+        return coder_name, model
 
     def _mark_queue_done(self) -> None:
         """Mark the merged task DONE in the local QUEUE.md only.

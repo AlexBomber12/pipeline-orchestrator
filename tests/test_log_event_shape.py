@@ -25,6 +25,7 @@ ALLOWED_CATEGORIES = (
     "INFRA",
     "RATE-LIMIT",
     "ESCALATE",
+    "ANALYTICS",
 )
 _PREFIX_RE = re.compile(
     r"^\[(?:" + "|".join(re.escape(c) for c in ALLOWED_CATEGORIES) + r")\] "
