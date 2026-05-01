@@ -77,7 +77,11 @@ from src.daemon.selector import (
 from src.events import publish_repo_event
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
-from src.queue_parser import QueueValidationError, parse_task_header
+from src.queue_parser import (
+    TYPE_SYNONYMS,
+    QueueValidationError,
+    parse_task_header,
+)
 from src.usage import UsageProvider
 from src.utils import repo_slug_from_url
 
@@ -571,7 +575,7 @@ class PipelineRunner(
             if lower.startswith("- type:"):
                 value = line.split(":", 1)[1].strip()
                 if value:
-                    task_type = value
+                    task_type = TYPE_SYNONYMS.get(value, value)
             elif lower.startswith("- complexity:"):
                 value = line.split(":", 1)[1].strip()
                 if value:

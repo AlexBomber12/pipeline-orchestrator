@@ -3082,6 +3082,54 @@ def test_handle_coding_creates_run_record(
     assert record.complexity == "low"
 
 
+def test_handle_coding_normalizes_task_type_synonym(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        _async_cli_result(0, "ok", ""),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [PRInfo(number=42, branch="pr-001")],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+
+    task_file = tmp_path / "tasks" / "PR-001.md"
+    task_file.parent.mkdir(parents=True)
+    task_file.write_text(
+        "# PR-001: Sample\n\n"
+        "Branch: pr-001\n"
+        "- Type: bug\n"
+        "- Complexity: low\n",
+        encoding="utf-8",
+    )
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    record = runner._current_run_record
+    assert record is not None
+    assert record.task_type == "bugfix"
+
+
 def test_handle_coding_saves_record_on_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
