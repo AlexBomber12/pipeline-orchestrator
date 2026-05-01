@@ -929,6 +929,35 @@ def test_upload_truncates_aggregated_errors_over_fifty(
     assert "and 2 more error(s) (truncated)" in resp.text
 
 
+def test_upload_depends_on_hint_appended_when_truncated_out(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    """A `missing Depends on` error beyond the 50-entry truncation
+    boundary still surfaces the friendly hint line."""
+    files = [_queue_file()]
+    for i in range(1, 51):
+        files.append(
+            _task_file(
+                name=f"PR-{i:03d}.md", pr_id=f"PR-{i:03d}", task_type="nope"
+            )
+        )
+    files.append(
+        _task_file(name="PR-099.md", pr_id="PR-099", depends_on=None)
+    )
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks", files=files
+        )
+
+    assert resp.status_code == 400
+    assert "and 1 more error(s) (truncated)" in resp.text
+    assert "PR-099.md: missing Depends on" not in resp.text
+    assert "for tasks with no dependencies" in resp.text
+
+
 def test_upload_succeeds_when_batch_is_all_valid(
     one_repo_config: Path,
     repo_dir: Path,

@@ -2628,12 +2628,18 @@ async def upload_tasks(
 
     if aggregated_issues:
         # Cap at 50 entries so a misbehaving batch upload cannot fill the
-        # dashboard error toast with thousands of lines.
+        # dashboard error toast with thousands of lines. The Depends-on
+        # hint is keyed off the full aggregated list, not the capped slice,
+        # so a relevant issue beyond the truncation boundary still surfaces
+        # the guidance line.
+        has_missing_depends_on = any(
+            "missing Depends on" in issue for issue in aggregated_issues
+        )
         capped = aggregated_issues[:50]
         truncated = len(aggregated_issues) - len(capped)
         if (
-            len(capped) == 1
-            and "missing Depends on" in capped[0]
+            len(aggregated_issues) == 1
+            and has_missing_depends_on
         ):
             return _render_upload_error(
                 request,
@@ -2645,7 +2651,7 @@ async def upload_tasks(
         body = "Task file validation failed:\n" + "\n".join(capped)
         if truncated > 0:
             body += f"\n... and {truncated} more error(s) (truncated)"
-        if any("missing Depends on" in issue for issue in capped):
+        if has_missing_depends_on:
             body += "\nUse 'Depends on: none' for tasks with no dependencies."
         return _render_upload_error(request, body, 400, repo_name=name)
 
