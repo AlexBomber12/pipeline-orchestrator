@@ -13,13 +13,20 @@ The 4 branch concepts each test tracks:
                            (``git rev-parse --abbrev-ref HEAD``)
 - ``pr_head_branch``     — ``PRInfo.branch`` (the PR head, if any)
 
-Each test asserts the resulting ``state``, ``error_message``, and log
-event text at the end of the cycle. Where the current handler does NOT
-include a branch value in the log (the OBS-AI architectural ambiguity
-this PR captures), the assertion is wrapped in ``pytest.mark.xfail``
-so the gap is recorded without blocking the PR; the future
-BranchContext PR will flip those xfails into XPASS as branch context is
-threaded through the affected log lines.
+For each affected scenario, the file pairs a ``test_<scenario>``
+function (which captures today's observable state, error_message, and
+log text) with a sibling ``test_<scenario>_branch_context_diagnostic``
+function decorated with ``@pytest.mark.xfail(strict=True)``. Each
+sibling re-runs the same scenario and asserts that all four branch
+identifiers appear in the divergence diagnostic.
+
+Today every sibling fails its assertion (XFAIL). When the future
+BranchContext PR threads branch context through the affected log lines,
+each assertion will pass and ``strict`` will convert the resulting XPASS
+into a hard failure — the explicit signal to drop the xfail marker.
+This is intentionally NOT a runtime ``pytest.xfail()`` call, because
+runtime ``xfail`` reports a normal ``PASS`` when the divergence is
+fixed and would let stale guardrails linger silently.
 """
 
 from __future__ import annotations
@@ -55,6 +62,13 @@ BASE_BRANCH = "main"
 TASK_BRANCH = "pr-foo"
 WRONG_BRANCH = "pr-foo-2"  # the OBS-AI scenario suffix
 FEATURE_BRANCH = "pr-bar"  # used by the dirty-tree test
+
+XFAIL_BRANCH_CONTEXT_REASON = (
+    "OBS-AI class gap, fixed in BranchContext PR. Once branch context is "
+    "threaded through the divergence diagnostic, this assertion will pass "
+    "and strict=True will convert the resulting XPASS into a hard failure, "
+    "signaling that this xfail marker should be removed."
+)
 
 
 def _runner_with_task(
@@ -143,8 +157,8 @@ def _log_text(runner: Any) -> str:
 def _diagnostic_for(runner: Any, marker: str) -> str:
     """Return the most recent runner log entry containing ``marker``.
 
-    The branch-context xfail helper checks only this specific entry as
-    the divergence/cancellation diagnostic, so unrelated retry log lines
+    The branch-context check looks at this specific entry as the
+    divergence/cancellation diagnostic, so unrelated retry log lines
     (e.g. ``"PR not found for 'pr-foo'"``) that happen to mention a
     branch in passing cannot accidentally satisfy the assertion and
     falsely flip the xfail to XPASS without the diagnostic itself
@@ -155,6 +169,112 @@ def _diagnostic_for(runner: Any, marker: str) -> str:
         if marker in event:
             return event
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Scenario builders — shared between current-behavior tests and their
+# strict-xfail siblings so the setup cannot drift between the two.
+# ---------------------------------------------------------------------------
+
+
+def _run_coder_no_target_scenario(monkeypatch: pytest.MonkeyPatch) -> Any:
+    runner = _runner_with_task(monkeypatch, task_branch=TASK_BRANCH)
+    _patch_branch_state(monkeypatch, local_branch=None, remote_branch=None)
+    asyncio.run(runner.handle_coding())
+    return runner
+
+
+def _run_coder_wrong_remote_scenario(monkeypatch: pytest.MonkeyPatch) -> Any:
+    runner = _runner_with_task(monkeypatch, task_branch=TASK_BRANCH)
+    _patch_branch_state(
+        monkeypatch, local_branch=None, remote_branch=WRONG_BRANCH
+    )
+    asyncio.run(runner.handle_coding())
+    return runner
+
+
+def _run_recovery_branch_mismatch_scenario(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Any, list[str]]:
+    doing = QueueTask(
+        pr_id="PR-FOO",
+        title="In flight",
+        status=TaskStatus.DOING,
+        branch=TASK_BRANCH,
+    )
+    open_pr = PRInfo(
+        number=99,
+        branch=WRONG_BRANCH,
+        title="Suffixed branch PR",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **_kw: [open_pr],
+    )
+
+    runner = h._make_runner()
+    runner.repo_config = runner.repo_config.model_copy(
+        update={"branch": BASE_BRANCH}
+    )
+    runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [doing]  # type: ignore[method-assign]
+    # Preserve must succeed (no local branch present) so the path
+    # progresses to the CANCELED transition rather than stranding in
+    # ERROR; that is the case being documented here.
+    runner._preserve_crashed_run_commits = lambda branch: True  # type: ignore[method-assign]
+
+    coding_calls: list[str] = []
+
+    async def fake_coding() -> None:  # pragma: no cover - must not fire
+        coding_calls.append("coding")
+
+    runner.handle_coding = fake_coding  # type: ignore[method-assign]
+
+    asyncio.run(runner.recover_state())
+    return runner, coding_calls
+
+
+def _run_dirty_tree_scenario(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Any, list[list[str]]]:
+    git_commands: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+        git_commands.append(cmd)
+        if cmd[:3] == ["git", "status", "--porcelain"]:
+            return h._FakeCompletedProcess(
+                args=cmd, stdout=" M src/foo.py\n", returncode=0
+            )
+        if cmd[:2] == ["git", "rev-parse"] and "--abbrev-ref" in cmd:
+            return h._FakeCompletedProcess(
+                args=cmd, stdout=f"{FEATURE_BRANCH}\n", returncode=0
+            )
+        return h._FakeCompletedProcess(args=cmd, stdout="", returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = h._make_runner()
+    runner.repo_config = runner.repo_config.model_copy(
+        update={"branch": BASE_BRANCH}
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-FOO",
+        title="Active task",
+        status=TaskStatus.DOING,
+        branch=TASK_BRANCH,
+    )
+
+    # Two dirty cycles -> ERROR; the third triggers auto-reset -> IDLE.
+    assert asyncio.run(runner.preflight()) is False
+    assert runner.state.state == PipelineState.ERROR
+    assert asyncio.run(runner.preflight()) is False
+    assert runner.state.state == PipelineState.ERROR
+    assert asyncio.run(runner.preflight()) is True
+
+    return runner, git_commands
 
 
 # ---------------------------------------------------------------------------
@@ -180,38 +300,33 @@ def test_coder_exit_zero_with_no_target_branch_marks_hung(
 
     The runner correctly transitions to HUNG via the case-A diagnostic
     in ``coding.py``, and ``error_message`` contains the canonical
-    "did nothing" wording. The OBS-AI gap captured here is that the
-    error_message and log line do NOT name the missing target branch,
-    so a future ``BranchContext`` PR can thread it through. Those
-    branch-context assertions are wrapped in ``xfail`` below.
+    "did nothing" wording. The OBS-AI gap captured by the strict-xfail
+    sibling below is that the error_message and log line do NOT name
+    the missing target branch, so a future ``BranchContext`` PR can
+    thread it through.
     """
-    base_branch = BASE_BRANCH
-    task_branch = TASK_BRANCH
-    runner = _runner_with_task(monkeypatch, task_branch=task_branch)
-    _patch_branch_state(
-        monkeypatch, local_branch=None, remote_branch=None
-    )
+    runner = _run_coder_no_target_scenario(monkeypatch)
 
-    asyncio.run(runner.handle_coding())
-
-    # Current behavior — passes today.
     assert runner.state.state == PipelineState.HUNG
     assert "did nothing" in (runner.state.error_message or "")
     log = _log_text(runner)
     assert "[ESCALATE]" in log
     assert "did nothing" in log
     # base_branch is the PR target; not part of this code path's log.
-    assert base_branch not in (runner.state.error_message or "")
+    assert BASE_BRANCH not in (runner.state.error_message or "")
 
-    # Branch-context gap (OBS-AI). Future BranchContext PR will include
-    # all 4 branch values explicitly in the diagnostic. The check is
-    # scoped to the [ESCALATE] line so retry logs that already mention
-    # ``pr-foo`` cannot mask the gap.
-    _assert_branch_context_in_diagnostic_xfail(
+
+@pytest.mark.xfail(strict=True, reason=XFAIL_BRANCH_CONTEXT_REASON)
+def test_coder_exit_zero_with_no_target_branch_branch_context_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Strict-xfail: BranchContext PR will name all 4 branches in [ESCALATE]."""
+    runner = _run_coder_no_target_scenario(monkeypatch)
+    _assert_branch_context_in_diagnostic(
         _diagnostic_for(runner, "[ESCALATE]"),
         runner.state.error_message or "",
-        base_branch=base_branch,
-        task_branch=task_branch,
+        base_branch=BASE_BRANCH,
+        task_branch=TASK_BRANCH,
         current_git_branch=None,
         pr_head_branch=None,
     )
@@ -245,19 +360,7 @@ def test_coder_pushed_wrong_branch_target_absent_marks_hung_silently(
                                           but invisible to this code path
                                           because no PR exists yet)
     """
-    base_branch = BASE_BRANCH
-    task_branch = TASK_BRANCH
-    wrong_branch = WRONG_BRANCH
-    # Coder pushed to ``pr-foo-2`` but did not push ``pr-foo``. The
-    # daemon's case-A/B probe only asks about ``pr-foo``, so it sees
-    # "no local, no remote" and routes to HUNG without knowing
-    # ``pr-foo-2`` exists at all.
-    runner = _runner_with_task(monkeypatch, task_branch=task_branch)
-    _patch_branch_state(
-        monkeypatch, local_branch=None, remote_branch=wrong_branch
-    )
-
-    asyncio.run(runner.handle_coding())
+    runner = _run_coder_wrong_remote_scenario(monkeypatch)
 
     # Current behavior — same outcome as test 1 because the daemon does
     # not see the wrong branch. This collapse is precisely the OBS-AI
@@ -267,19 +370,21 @@ def test_coder_pushed_wrong_branch_target_absent_marks_hung_silently(
     log = _log_text(runner)
     assert "[ESCALATE]" in log
 
-    # Branch-context gap. Future BranchContext PR is expected to detect
-    # ``pr-foo-2`` as the actual remote branch and surface it alongside
-    # the missing target, at which point ``wrong_branch`` will appear in
-    # the [ESCALATE] diagnostic and this xfail will flip to XPASS. The
-    # check is scoped to that line so retry logs already mentioning
-    # ``pr-foo`` cannot mask the gap.
-    _assert_branch_context_in_diagnostic_xfail(
+
+@pytest.mark.xfail(strict=True, reason=XFAIL_BRANCH_CONTEXT_REASON)
+def test_coder_pushed_wrong_branch_branch_context_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Strict-xfail: BranchContext PR will surface ``pr-foo-2`` alongside
+    the missing target in the [ESCALATE] diagnostic."""
+    runner = _run_coder_wrong_remote_scenario(monkeypatch)
+    _assert_branch_context_in_diagnostic(
         _diagnostic_for(runner, "[ESCALATE]"),
         runner.state.error_message or "",
-        base_branch=base_branch,
-        task_branch=task_branch,
+        base_branch=BASE_BRANCH,
+        task_branch=TASK_BRANCH,
         current_git_branch=None,
-        pr_head_branch=wrong_branch,
+        pr_head_branch=WRONG_BRANCH,
     )
 
 
@@ -375,52 +480,11 @@ def test_recover_state_with_branch_mismatch_marks_task_canceled_and_idles(
     Deterministic outcome: the queue entry's branch wins for the
     cancellation log message; the PR head branch is silently dropped.
     The current log line names the ``pr_id`` ("PR-FOO") but does NOT
-    name either branch — that branch-context gap is the xfail below.
+    name either branch — that branch-context gap is captured by the
+    strict-xfail sibling below.
     """
-    base_branch = BASE_BRANCH
-    task_branch = TASK_BRANCH
-    pr_head_branch = WRONG_BRANCH
+    runner, coding_calls = _run_recovery_branch_mismatch_scenario(monkeypatch)
 
-    doing = QueueTask(
-        pr_id="PR-FOO",
-        title="In flight",
-        status=TaskStatus.DOING,
-        branch=task_branch,
-    )
-    open_pr = PRInfo(
-        number=99,
-        branch=pr_head_branch,
-        title="Suffixed branch PR",
-        ci_status=CIStatus.PENDING,
-        review_status=ReviewStatus.PENDING,
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
-        lambda repo, **_kw: [open_pr],
-    )
-
-    runner = h._make_runner()
-    runner.repo_config = runner.repo_config.model_copy(
-        update={"branch": base_branch}
-    )
-    runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
-    runner._parse_base_queue = lambda **_: [doing]  # type: ignore[method-assign]
-    # Preserve must succeed (no local branch present) so the path
-    # progresses to the CANCELED transition rather than stranding in
-    # ERROR; that is the case being documented here.
-    runner._preserve_crashed_run_commits = lambda branch: True  # type: ignore[method-assign]
-
-    coding_calls: list[str] = []
-
-    async def fake_coding() -> None:  # pragma: no cover - must not fire
-        coding_calls.append("coding")
-
-    runner.handle_coding = fake_coding  # type: ignore[method-assign]
-
-    asyncio.run(runner.recover_state())
-
-    # Current behavior — passes today.
     assert coding_calls == []
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
@@ -431,17 +495,22 @@ def test_recover_state_with_branch_mismatch_marks_task_canceled_and_idles(
         "[INFRA] Task PR-FOO crashed, marking CANCELED. "
         "Manually re-upload to retry."
     ) in log
-    # The unrelated open PR's branch is intentionally ignored by the
-    # matcher; documenting it does not bleed into the cancellation log.
-    assert pr_head_branch not in log
 
-    _assert_branch_context_in_diagnostic_xfail(
+
+@pytest.mark.xfail(strict=True, reason=XFAIL_BRANCH_CONTEXT_REASON)
+def test_recover_state_with_branch_mismatch_branch_context_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Strict-xfail: BranchContext PR will name both branches in the
+    cancellation diagnostic."""
+    runner, _ = _run_recovery_branch_mismatch_scenario(monkeypatch)
+    _assert_branch_context_in_diagnostic(
         _diagnostic_for(runner, "marking CANCELED"),
         runner.state.error_message or "",
-        base_branch=base_branch,
-        task_branch=task_branch,
+        base_branch=BASE_BRANCH,
+        task_branch=TASK_BRANCH,
         current_git_branch=None,
-        pr_head_branch=pr_head_branch,
+        pr_head_branch=WRONG_BRANCH,
     )
 
 
@@ -474,88 +543,55 @@ def test_dirty_tree_on_feature_branch_resets_after_three_cycles(
     The reset itself is correct behavior — it preserves nothing about
     the ``pr-bar`` work, which is in line with the existing
     ``_preserve_crashed_run_commits`` contract that only fires from
-    ``recover_state``. The OBS-AI gap is purely observability: the
-    auto-recovery log line does not name the actual branch (``pr-bar``)
-    nor the expected branch (``pr-foo``), so an operator cannot tell
-    from the event log which feature branch was wiped.
+    ``recover_state``. The OBS-AI gap captured by the strict-xfail
+    sibling is purely observability: the auto-recovery log line does
+    not name the actual branch (``pr-bar``) nor the expected branch
+    (``pr-foo``), so an operator cannot tell from the event log which
+    feature branch was wiped.
     """
-    base_branch = BASE_BRANCH
-    task_branch = TASK_BRANCH
-    current_git_branch = FEATURE_BRANCH
+    runner, git_commands = _run_dirty_tree_scenario(monkeypatch)
 
-    git_commands: list[list[str]] = []
-
-    def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
-        git_commands.append(cmd)
-        if cmd[:3] == ["git", "status", "--porcelain"]:
-            return h._FakeCompletedProcess(
-                args=cmd, stdout=" M src/foo.py\n", returncode=0
-            )
-        if cmd[:2] == ["git", "rev-parse"] and "--abbrev-ref" in cmd:
-            return h._FakeCompletedProcess(
-                args=cmd, stdout=f"{current_git_branch}\n", returncode=0
-            )
-        return h._FakeCompletedProcess(args=cmd, stdout="", returncode=0)
-
-    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
-
-    runner = h._make_runner()
-    runner.repo_config = runner.repo_config.model_copy(
-        update={"branch": base_branch}
-    )
-    runner.state.current_task = QueueTask(
-        pr_id="PR-FOO",
-        title="Active task",
-        status=TaskStatus.DOING,
-        branch=task_branch,
-    )
-
-    # Two dirty cycles -> ERROR; the third triggers auto-reset -> IDLE.
-    assert asyncio.run(runner.preflight()) is False
-    assert runner.state.state == PipelineState.ERROR
-    assert asyncio.run(runner.preflight()) is False
-    assert runner.state.state == PipelineState.ERROR
-    assert asyncio.run(runner.preflight()) is True
-
-    # Current behavior — passes today.
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.error_message is None
     assert runner._consecutive_dirty_cycles == 0
     # The reset chain ran with the base branch name only.
     assert any(
-        cmd[:4] == ["git", "checkout", "--force", base_branch]
+        cmd[:4] == ["git", "checkout", "--force", BASE_BRANCH]
         for cmd in git_commands
     )
     assert any(
         cmd[:3] == ["git", "reset", "--hard"]
-        and cmd[-1] == f"origin/{base_branch}"
+        and cmd[-1] == f"origin/{BASE_BRANCH}"
         for cmd in git_commands
     )
     assert any(cmd[:3] == ["git", "clean", "-fd"] for cmd in git_commands)
     log = _log_text(runner)
     assert "Auto-recovered from dirty tree -> IDLE" in log
-    # Documenting the OBS-AI gap: the reset log line does not name the
-    # feature branch that was wiped, nor the task branch that should
-    # have been on HEAD.
-    assert current_git_branch not in log
-    assert task_branch not in log
 
-    _assert_branch_context_in_diagnostic_xfail(
+
+@pytest.mark.xfail(strict=True, reason=XFAIL_BRANCH_CONTEXT_REASON)
+def test_dirty_tree_on_feature_branch_branch_context_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Strict-xfail: BranchContext PR will name the wiped feature branch
+    and the expected task branch in the auto-recovery diagnostic."""
+    runner, _ = _run_dirty_tree_scenario(monkeypatch)
+    _assert_branch_context_in_diagnostic(
         _diagnostic_for(runner, "Auto-recovered from dirty tree"),
         runner.state.error_message or "",
-        base_branch=base_branch,
-        task_branch=task_branch,
-        current_git_branch=current_git_branch,
+        base_branch=BASE_BRANCH,
+        task_branch=TASK_BRANCH,
+        current_git_branch=FEATURE_BRANCH,
         pr_head_branch=None,
     )
 
 
 # ---------------------------------------------------------------------------
-# Branch-context xfail helper
+# Branch-context assertion helper
 # ---------------------------------------------------------------------------
 
 
-def _assert_branch_context_in_diagnostic_xfail(
+def _assert_branch_context_in_diagnostic(
     diagnostic: str,
     error_message: str,
     *,
@@ -571,16 +607,23 @@ def _assert_branch_context_in_diagnostic_xfail(
     Earlier informational log lines — e.g. ``"PR not found for 'pr-foo',
     retrying in 5s"`` — already mention branches in passing, so a
     whole-history check would let those satisfy the assertion even
-    though the final diagnostic still omits branch context. That would
-    flip these xfails to XPASS without the regression actually being
-    fixed.
+    though the final diagnostic still omits branch context.
 
     The future BranchContext PR will thread base / task / git / PR
     branch identifiers through each divergence diagnostic. Until then,
-    every present branch must appear at least once in this single
-    diagnostic, and every ``None`` slot must be named individually as
-    absent — the loop does not short-circuit, so one ``"absent"``
-    mention cannot cover multiple ``None`` fields.
+    this helper is the failing assertion that drives the surrounding
+    ``@pytest.mark.xfail(strict=True)``: every present branch must
+    appear at least once in this single diagnostic, and every ``None``
+    slot must be named individually as absent — the loop does not
+    short-circuit, so one ``"absent"`` mention cannot cover multiple
+    ``None`` fields.
+
+    When the diagnostic is fixed the assertion will pass, the test will
+    XPASS, and ``strict=True`` will surface that as a hard failure —
+    the explicit signal to drop the xfail marker. This is intentionally
+    NOT a runtime ``pytest.xfail()`` call: that variant reports a plain
+    ``PASS`` once the gap closes and would let stale guardrails linger
+    silently, defeating the regression value of this suite.
     """
     haystack = f"{diagnostic}\n{error_message}"
     missing: list[str] = []
@@ -612,8 +655,7 @@ def _assert_branch_context_in_diagnostic_xfail(
             )
             if not absent_marker.search(haystack):
                 missing.append(f"{label}=<absent> not explicitly logged")
-    if missing:
-        pytest.xfail(
-            "OBS-AI class gap, fixed in BranchContext PR: "
-            + ", ".join(missing)
-        )
+    assert not missing, (
+        "BranchContext diagnostic is missing required branch identifiers: "
+        + ", ".join(missing)
+    )
