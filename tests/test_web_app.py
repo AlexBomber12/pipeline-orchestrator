@@ -1805,6 +1805,31 @@ def test_repo_card_renders_pause_and_stop_controls_for_active_repo(
     assert 'h-8 w-8 md:h-7 md:w-7' in body
 
 
+def test_repo_card_upload_button_renders_as_flat_icon(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR-201: Upload tasks must render as a flat icon button matching
+    Pause/Stop, with a ``title`` tooltip preserving discoverability and
+    no bordered/text-label appearance."""
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo-list")
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'for="upload-example__alpha"' in body
+    assert 'aria-label="Upload tasks"' in body
+    assert 'title="Upload tasks"' in body
+    assert (
+        'class="relative inline-flex items-center justify-center h-8 w-8 '
+        "md:h-7 md:w-7 rounded-md text-gray-400 hover:text-white "
+        'hover:bg-white/5 transition-colors cursor-pointer'
+    ) in body
+    assert "border border-white/10 px-3 text-xs font-medium" not in body
+    assert ">\n                        Upload tasks\n                    </label>" not in body
+
+
 @pytest.mark.parametrize(
     ("state", "user_paused", "queue_done", "queue_total", "present", "absent"),
     [
