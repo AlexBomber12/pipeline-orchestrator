@@ -1171,6 +1171,272 @@ The findings determine which fix to apply.
 
 ## Architectural future work — multi-repo + per-repo config (added 2026-05-01)
 
+### Coder plugin extensibility — Add Coder from presets (added 2026-05-01 late evening)
+
+**Operator's idea:** extend the per-repo/per-app settings concept down to coder level — enable "Add Coder" UI that picks from preset list (Claude, Codex, Qwen, Aider, local LLMs via Ollama, etc.) and instantiates the chosen plugin. Also: enable multiple instances of same plugin with different auth (e.g. 2-3 Claude Max accounts running in parallel for 3x throughput).
+
+**Foundation already exists in code (verified 2026-05-01):**
+
+- `src/coder_registry.py::CoderPlugin` Protocol defines clean interface: `name`, `display_name`, `models`, `run_planned_pr`, `fix_review`, `check_auth`, `create_usage_provider`, `rate_limit_patterns`.
+- `CoderRegistry` provides registration/lookup pattern.
+- `src/coders/__init__.py::build_coder_registry()` factory registers `ClaudePlugin` and `CodexPlugin`.
+- Two plugins implement the Protocol cleanly.
+
+**Architecture is plugin-shaped.** Adding new coders is a much smaller effort than starting from scratch.
+
+**What blocks dynamic "Add Coder" today:**
+
+1. **Hardcoded `CoderType` enum** (`src/config.py:19`) — `CLAUDE` and `CODEX` are baked into config schema. Adding a third coder requires adding an enum value. Not plugin-extensible from config.
+2. **`if coder_name == "claude"` branches** (`src/daemon/handlers/coding.py:115` and similar) — Claude-specific logic for breach monitoring, session tracking, weekly threshold. Tight coupling.
+3. **`disabled_coders` config field** assumes enum-based disable list, not arbitrary plugin name disable.
+4. **Multi-account same-coder is structurally absent.** `ClaudePlugin` instantiated once, uses single global `CLAUDE_CONFIG_DIR`. No concept of "claude account 1" vs "claude account 2".
+
+**Two distinct visions emerge from this idea:**
+
+#### Vision A: Multi-vendor preset library (Qwen, Aider, Ollama, etc.)
+
+UI: "Add Coder" → dropdown with presets → register plugin in registry → operator can assign per-repo.
+
+Per-plugin implementation cost:
+- **Qwen-via-API:** low (similar pattern to Claude through Anthropic API; just different endpoint and auth).
+- **Aider:** medium (Python tool, well-documented programmatic API).
+- **Local LLM via Ollama:** medium (less standardized; need to handle model selection, context window management).
+- **Cursor/Continue:** high (IDE-bound, no clean CLI; probably not viable as headless coder).
+
+To enable Vision A:
+- Replace `CoderType` enum with dynamic plugin-name string in config.
+- Refactor `if coder_name == "claude"` branches into capability-based dispatch (e.g. `plugin.supports_breach_monitor()` → returns Optional callable; default None).
+- Move Claude-specific logic into `ClaudePlugin`.
+- Per new plugin: implement Protocol methods (planned_pr, fix_review, auth, rate limits, usage tracking).
+
+**Estimated:** ~3-4 PRs for the plugin-extensibility refactor (config, dispatch, capability flags). Then ~2-3 PRs per new vendor plugin added. Initial vendor (Qwen, since it has familiar API shape): 5-7 PRs total (refactor + Qwen plugin + tests). Subsequent vendors: 2-3 PRs each.
+
+**Strategic significance:** this is the **cross-vendor routing thesis** in concrete form. Not just a feature — a positioning anchor. Anthropic does intra-vendor routing (opusplan); only an independent orchestrator routes Claude → Codex → Qwen → local. Vision A is the technical substrate for that positioning.
+
+**Wave placement (added 2026-05-01):** Vision A is **post-Wave-7**. Plugin extensibility is a substantial architectural shift; should not be undertaken before:
+- Foundation Sprint complete (god-class decomposition makes plugin extraction cleaner)
+- OBS-AS through OBS-BB fixes shipped (stable production baseline)
+- Multi-testbed infrastructure exists (regression coverage for plugin-swap scenarios)
+
+**Critical sequencing — Plugin extensibility is a Thompson Sampling prerequisite (added 2026-05-01):**
+
+Thompson Sampling bandit selector (Sprint F3.2) needs **measurement substrate across multiple coder/model options** to be meaningful. Currently the system only has Claude and Codex, both pinned per-repo by config. Bandit selection between two fixed options is degenerate — there is no "routing decision space" for the bandit to optimize over.
+
+Plugin extensibility (Vision A) creates the routing decision space:
+- Adding Qwen as a third coder gives the bandit 3 arms to pull
+- Adding local LLMs (Ollama) creates a "low-cost arm" that the bandit can route low-complexity tasks to
+- Per-coder model selection (Claude opus vs sonnet, Codex gpt-4 vs gpt-5) creates intra-coder routing options
+
+Without Vision A, Thompson Sampling has no meaningful work to do. Sequencing is:
+
+1. Foundation Sprint complete
+2. Wave 1-7 (OBS fixes + multi-testbed)
+3. Vision A first vendor (Qwen, ~5-7 PRs)
+4. Vision A 2-3 more vendors (validates routing decision space, ~10 PRs)
+5. **Then** Thompson Sampling becomes useful (Sprint F3.2)
+6. Vision B-alt (multi-tenant) ships independently as team-deployment feature
+
+This means **Vision A precedes Thompson by ~2-3 weeks of daemon work**, not the other way around. Thompson without Vision A is selecting between two fixed coders — could ship but provides minimal product value until routing options expand.
+
+#### Vision A.1: CLI plugins vs API plugins — two distinct shapes (added 2026-05-01)
+
+**Architectural distinction:** Vision A new vendors split into two technical shapes that need different Protocol abstractions:
+
+**CLI plugins** (current pattern):
+- `ClaudePlugin` invokes `claude` binary subprocess
+- `CodexPlugin` invokes `codex` binary subprocess
+- Subscription-based auth (Pro/Max OAuth tokens stored by CLI in config dir)
+- Local subprocess with `repo_path` working directory access
+- Returns `tuple[int, str, str]` = `(exit_code, stdout, stderr)`
+- Rate limit = subscription quota (session/weekly window)
+
+**API plugins** (new shape needed):
+- Direct HTTP call to vendor API (Anthropic API key, OpenAI API key, Qwen API key, etc.)
+- Pay-per-token billing
+- No subprocess; no `repo_path` access — agent sees code through tools the daemon provides
+- HTTP response (possibly streaming); no exit_code, no stderr in subprocess sense
+- Rate limit = tokens-per-minute, requests-per-minute (vendor TOS, not subscription)
+
+**Current CoderPlugin Protocol shaped for CLI subprocess.** Adapting API plugins requires either:
+
+1. **Generalize Protocol shape:** replace `tuple[int, str, str]` with `CoderResult` dataclass that both shapes return. Daemon code stays uniform.
+2. **Add capability flag:** `plugin.auth_kind() -> Literal["cli_subscription", "api_key"]` for daemon to dispatch correct auth UI flow + cost model. CLI subscription = device-flow login. API key = paste credential into UI.
+3. **Per-plugin rate limit semantics:** CLI plugin reports session/weekly percent (already does); API plugin reports tokens-per-minute consumption. Different units — UsageProvider abstraction needs to handle both.
+
+**Decision (2026-05-01, confirmed):** **Option 3 chosen — generalize current Protocol via `CoderResult` dataclass + capability flag + per-plugin rate limit abstraction.** This is the cleanest path: single Protocol, single result shape, daemon code agnostic to whether plugin is CLI or API. Plugins differ only in implementation, not in interface.
+
+**Why this distinction matters strategically:**
+
+- **Pricing transparency.** Cost-per-merged-PR thesis works with both shapes, but units differ: CLI = "fraction of $200/mo Max subscription used" vs API = "exact $X.YZ in tokens." Dashboard must display each meaningfully.
+- **Scaling story.** CLI plugins hit subscription wall (Max = ~17 PRs/day per author). API plugins scale to vendor budget. Multi-tenant (Vision B-alt) of CLI plugins = N operators × subscription each. API plugins = N operators on shared budget. Different deployment patterns.
+- **Vendor coverage.** Some vendors only offer API (no CLI tool) — Qwen, Mistral, smaller vendors. Some offer both — OpenAI (Codex CLI + GPT API), Anthropic (Claude CLI + API). Without API plugins, half the routing landscape is invisible.
+
+**Estimated additional work over Vision A:** ~3-4 PRs for Protocol generalization + capability flag dispatch + first API plugin (Qwen via API). Subsequent API vendors: 2-3 PRs each.
+
+**Sequencing:**
+1. Vision A refactor (Protocol generalization, capability flags, dispatch) — ships before any new vendor
+2. First CLI plugin (if applicable) OR first API plugin (Qwen recommended — no CLI exists)
+3. Add Anthropic API plugin (parallel path to ClaudePlugin CLI; same vendor, two access modes)
+4. Add OpenAI API plugin
+5. More vendors as needed
+
+**Anthropic API plugin specifically valuable:** unlocks deployment scenarios where Claude Code CLI subscription is impractical (cloud VPS deployments — see Anthropic ToS clarification, "Running it on a VPS? Use an API key"). Pipeline-orchestrator running on home server can use CLI plugin; pipeline-orchestrator running on cloud must use API plugin. **Both must be supported for product to be deployable beyond home-lab use case.**
+
+#### SQLite addition for long-term metrics (added 2026-05-01)
+
+**Framing decision (2026-05-01, confirmed):** **SQLite is added alongside Redis, not migrated to.** Each tool used for its strengths. Redis remains for state machine + pub/sub (its core competencies); SQLite added for durable, queryable metrics persistence (its core competency). No replacement, no migration in the destructive sense — additive architecture with clear responsibility split.
+
+**Tool-to-purpose mapping (target architecture):**
+
+| Concern | Tool | Why |
+|---|---|---|
+| RepoState per-repo (volatile, every cycle) | **Redis** | Fast SET/GET semantics, in-memory speed for high-frequency writes |
+| SSE pub/sub event stream | **Redis** | Native pub/sub primitive; SQLite has no equivalent |
+| ETag cache, deadlines, locks | **Redis** | TTL semantics built-in; ephemeral by nature |
+| RunRecord metrics (durable, queryable) | **SQLite** | Long-term retention without TTL loss; SQL queries for aggregation; backup-friendly |
+| Profile data for Thompson posteriors | **SQLite** | Bandit needs stable history beyond 90-day Redis TTL |
+| Cost-per-merged-PR analytics | **SQLite** | SQL-shape queries for time-series, cross-repo aggregations |
+
+**Current state (verified 2026-05-01):** all persistent data lives in Redis. Three distinct usage patterns:
+
+1. **State persistence** — `RepoState` per-repo, history (24h TTL). Stored as `pipeline:{name}` keys. Volatile, updated every cycle. **Stays in Redis.**
+2. **Pub/sub** — SSE event channel (`src/events/sse.py`), progress updates published from daemon to web UI subscribers. Ephemeral messaging. **Stays in Redis.**
+3. **TTL-based cache** — `MetricsStore` records (90-day TTL), recent-200 indexes per (task_id, repo_name). **Migrates to SQLite (Scenario A below).**
+
+**Problem with metrics-in-Redis:**
+
+- 90-day TTL **caps Thompson Sampling posterior stability**. Bandit cannot maintain reliable distributions over coder/model performance once data ages out. For long-running deployment (6+ months), bandit forgets earlier learning.
+- **No query layer.** Cost-per-merged-PR aggregation, time-series cost trends, cross-repo profile comparisons all require either dumping Redis to a queryable store or in-memory aggregation in Python. Both expensive at scale.
+- **No backup outside Redis volume.** If Redis crashes without persistence config, all metrics history lost. AOF/RDB persistence helps but not as durable as proper DB.
+- **Analytics dashboard can't be built cleanly.** Surface like "show me cost-per-PR by complexity bucket over last quarter" requires SQL-shape data; Python-side aggregation across O(thousands) of records is slow.
+
+**Two scenarios for adding SQLite:**
+
+**Scenario A: SQLite for metrics only, Redis keeps state + pub/sub. (CONFIRMED 2026-05-01 — initial scope)**
+- Move `MetricsStore` from Redis to SQLite.
+- Schema: `RunRecord` table with all current fields + indexes on (task_id, repo_name), (started_at), (profile_id).
+- Long-term retention (no TTL); manual archive/prune policy if needed later.
+- Redis retains state machine, SSE pub/sub, ETag cache, deadlines.
+- Net: **add** SQLite as additional store; two storage systems coexist with clear responsibility split.
+- Estimated: ~3-4 PRs (schema + MetricsStore rewrite + migration script for existing Redis data + tests + backup/restore documentation).
+
+**Scenario B: Expand SQLite to cover history + audit data (potential later, "потом" per operator decision).**
+- Migrate `key_history` (24h Redis TTL) to SQLite for long-term audit trail.
+- Add session log archive in SQLite (currently logged to event stream only, lost after pub/sub channel drops).
+- Add operator action audit log (who clicked Stop, when, on which repo).
+- State machine **stays in Redis** — its volatility profile is wrong for SQLite.
+- Pub/sub **stays in Redis** — SQLite has no equivalent.
+- Net: SQLite footprint grows from "metrics only" to "metrics + audit + history" for richer operator visibility.
+- Estimated: ~4-5 PRs additional.
+
+**Scenario C (Drop Redis entirely): NOT pursued.** Confirmed 2026-05-01 — keep Redis, add SQLite alongside. "Всему свой инструмент."
+
+**Recommendation: Scenario A first, Scenario B later when audit/history needs surface.**
+
+Why A first:
+- **Most immediate value** — long-term metrics persistence enables Thompson Sampling correctly. Current 90-day TTL is a Thompson blocker for posterior stability.
+- **Smallest blast radius** — touch only MetricsStore + add new SQLite schema. State machine, pub/sub, ETag cache untouched.
+- **Validates SQLite operational pattern** (backup, schema migrations, query layer) before expanding scope.
+- **Analytics dashboard foundation** — once metrics in SQLite, proper queries enable cost-per-PR breakdown view in operator dashboard. Big product story unlock.
+
+Why B later (or only when needed):
+- Scenario B is purely additive value (better audit, longer history). No urgent blocker.
+- Defer until operational reasons (audit trail required, history queries needed for debug or product) justify the work.
+
+**Wave placement (confirmed 2026-05-01):** SQLite addition (Scenario A) is **before Thompson Sampling**, **after Vision A**:
+
+1. Foundation Sprint complete
+2. Wave 1-7 (OBS fixes + multi-testbed)
+3. Vision A — Plugin Protocol generalization (Option 3: `CoderResult` dataclass + capability flag + per-plugin rate limit abstraction)
+4. Vision A — first API plugin (Qwen — no CLI exists, validates API plugin path)
+5. Vision A — Anthropic API plugin (unlocks cloud VPS deployment)
+6. Vision A — additional vendors as needed (OpenAI API, Mistral, etc.)
+7. **SQLite addition Scenario A** (metrics-only) — unlocks long-term Thompson posteriors and analytics dashboard foundation
+8. Analytics dashboard cost-per-merged-PR breakdown view (surfaced from SQLite queries)
+9. Thompson Sampling (Sprint F3.2) — now has both routing decision space (Vision A) and durable measurement substrate (SQLite)
+10. Vision B-alt (multi-tenant, ToS-safe) ships independently as team-deployment feature
+11. SQLite Scenario B (audit/history expansion) — only when audit/history needs surface, not urgent
+
+**Estimated total addition to post-Foundation roadmap:**
+- Plugin Protocol generalization for CLI vs API: ~3-4 PRs, ~6-8h
+- First API plugin (Qwen): ~3 PRs, ~6h
+- Anthropic API plugin: ~2 PRs, ~4h (mostly reuses Qwen pattern)
+- SQLite migration Scenario A: ~3-4 PRs, ~6-8h
+- Analytics dashboard cost-per-PR view: ~3 PRs, ~5h
+
+Total addition: ~14-16 PRs, ~27-31 daemon-hours. Combined with prior post-Foundation work (Wave 1-7 = 18-22 PRs), total post-Foundation = ~32-38 PRs / ~64-68 daemon-hours / ~3-4 daemon-days at 17 PR/day, calendar 2-3 weeks with buffers.
+
+**Data substrate status (verified 2026-05-01 by checking src/metrics.py):**
+
+`MetricsStore` already accumulates `RunRecord` data per coder run:
+- Per-run: run_id, task_id, profile_id, task_type, complexity, started_at, ended_at, duration_ms
+- Coder behaviour: fix_iterations, tokens_in, tokens_out, exit_reason, operator_intervention
+- Code metrics: files_touched_count, languages_touched, diff_lines_added/deleted, test_file_ratio, had_merge_conflict
+- Stage tag: currently "coder", reserved for "planner"/"reviewer"/"qa" expansion
+
+Storage in Redis with 90-day TTL, recent-200 index per (task_id, repo_name).
+
+**Implications:**
+- ✅ Measurement substrate exists. Cost-per-merged-PR thesis has data foundation.
+- ✅ Bandit can read recent records and compute posteriors when Thompson ships.
+- ⚠️ 90-day TTL means long-term posterior stability is limited. Need archive layer if Thompson runs for 6+ months.
+- ⚠️ No cross-repo aggregation query layer. Thompson selector would need to roll its own aggregation, or that's a prerequisite PR.
+- ⚠️ No analytics surface in dashboard yet (data is there, but nothing renders it as cost-per-merged-PR breakdown for operator). Separate concern from Thompson itself, but blocks operator from understanding what bandit is doing. Probably needs its own Wave between Vision A and Thompson.
+
+#### Vision B: Multi-account same-coder (parallel Claude accounts) — **REJECTED 2026-05-01 after ToS verification**
+
+**Original idea:** instantiate multiple `ClaudePlugin` instances with different auth credentials (e.g. 3 Claude Max accounts running in parallel for 3x throughput).
+
+**ToS verification (2026-05-01, web search of Anthropic Consumer ToS, Feb 2026 doc updates, and community discussion):**
+
+This is **explicitly prohibited** under Anthropic Consumer Terms of Service:
+
+> "Using OAuth tokens obtained through Claude Free, Pro, or Max accounts in any other product, tool, or service — including the Agent SDK — is not permitted and constitutes a violation of the Consumer Terms of Service." (Anthropic Legal Compliance, Feb 2026)
+
+> "Anthropic's Terms of Service don't explicitly allow multiple users under one personal Claude Pro plan. If multiple people log in from different IP addresses or browsers, the system may detect unusual activity and temporarily restrict access. Account lockouts: Claude may automatically flag multiple logins or device fingerprints, resulting in forced verification or suspension."
+
+The Feb 2026 docs update also introduced the phrase **"ordinary, individual usage"** when describing what subscription usage limits assume — coordinating multiple personal accounts to bypass a single account's rate limits is the opposite of ordinary individual usage.
+
+**Verdict: Vision B is dead as a primary product feature.** Building it as documented "give one user 3x throughput via multi-account" would:
+1. Encourage product users to violate Anthropic ToS
+2. Risk account bans for those users
+3. Create reputational and legal risk for the orchestrator product
+4. Build product value prop on fragile gray-area workaround
+
+**Do not implement Vision B in this form.** Strike from roadmap.
+
+#### Vision B-alt: Multi-tenant deployment with separate operator accounts (added 2026-05-01)
+
+**Reframed concept (ToS-safe alternative to original Vision B):**
+
+Each operator using pipeline-orchestrator brings their own Claude account, used individually by them in compliance with Consumer ToS "ordinary individual usage." The daemon coordinates work across multiple operators (each isolated to their own workspace, repos, and credentials), but no single subscription is shared or split.
+
+**Architecturally same as Vision B:**
+- `ClaudePlugin` instance-scoped config dir per operator (`/data/auth/operator-1/claude`, `/data/auth/operator-2/claude`, ...)
+- Per-operator UsageProvider, rate limit tracking, breach monitoring
+- Per-operator repo access (operator 1 sees their repos, operator 2 sees their repos)
+
+**Different product framing:**
+- Not "give one user 3x throughput" (ToS-violating)
+- Instead "deploy pipeline-orchestrator as a small-team coordination tool where each member's account is used by them, daemon orchestrates handoffs and visibility"
+- Each operator's usage stays within their own subscription's "ordinary individual usage" envelope
+- Multi-tenant boundary is the operator (human user), not the workload
+
+**Use cases for this framing:**
+- 2-3 person dev team where each has Claude Max, daemon coordinates work across team
+- Family/personal where one person works on different projects under different accounts (unusual but legal)
+- Multi-operator alpha deployment for testing
+
+**Key constraint:** the daemon must NOT pool work across operators (e.g. operator 1 cannot trigger work that consumes operator 2's quota). Each operator's quota envelope is independent.
+
+**Product positioning for this:** small-team deployment of orchestrator with each member's individual Claude subscription. Defensible against ToS scrutiny.
+
+**Estimated:** ~5-7 PRs (multi-tenant data model + per-operator auth dirs + per-operator rate limits + workspace isolation + operator-aware UI + tests).
+
+**Wave placement: post-Vision-A.** Vision A (multi-vendor) is bigger product story, ships first. Vision B-alt is later-stage feature for team adoption, not solo developer.
+
+
+
 ### Multi-repo testing infrastructure (added 2026-05-01 evening, **scheduled post-OBS-fixes**)
 
 **Sequencing decision (2026-05-01):** Foundation Sprint finishes → OBS-AS/AU/AV/AW/AX/AY fixes ship → multi-testbed setup → multi-repo tests added. This ordering ensures:
@@ -1421,7 +1687,54 @@ The scaffold step becomes a **two-phase process**:
    - Coder produces: proposed `scripts/ci.sh` mirroring project's existing CI commands; proposed AGENTS.md additions (managed sections + note section if user already has AGENTS.md, or full template if greenfield); proposed `.gitignore` additions; nothing else by default.
    - Coder opens MICRO PR with the additions; operator reviews and merges.
 
-**Detection rules (initial set):**
+**Tiered approach — simple-to-complex (added 2026-05-01, confirmed):**
+
+Not every repo needs AI generation. The scaffolder classifies the target repo into one of three tiers and applies the cheapest path that produces correct output. AI cost (CLI invocation + subscription quota + ~30-60s latency) is paid only when actually needed.
+
+**Tier 0: truly empty repo** (`_head_is_unborn(repo_path)` returns True — already detected in code)
+- No commits exist on any branch.
+- Action: copy all template files (`AGENTS.md`, `CLAUDE.md`, `tasks/`, `scripts/`, `.gitignore` entries) directly. No detection needed; no AI invocation.
+- Path: matches **current scaffolder behaviour** for unborn HEAD case. Already correct.
+- Cost: instant, deterministic, no quota consumed.
+
+**Tier 1: greenfield-ish** (commits exist but no project markers)
+- Detection: count of project markers (`pyproject.toml`, `package.json`, `Cargo.toml`, `go.mod`, `.github/workflows/`, `src/`, `tests/`, `Makefile`, `AGENTS.md`, `CLAUDE.md`) is ≤ 1. Typically only README and/or LICENSE present.
+- Action: copy templates + add a deliberately minimal `scripts/ci.sh` (e.g. `echo "no CI configured yet"; exit 0`) with a comment block instructing operator to fill in real commands once project structure exists.
+- Path: deterministic copy with one extra step (placeholder `scripts/ci.sh`); no AI invocation.
+- Cost: instant, deterministic, no quota consumed.
+- Use case: operator creates a fresh repo with just `git init` and `README.md`, attaches to orchestrator from day one. Project grows under daemon coordination from scratch — daemon's first PRs naturally introduce structure that later upgrades the repo to Tier 2 territory.
+
+**Tier 2: established project** (real codebase with multiple project markers)
+- Detection: project marker count > 1. Real codebase exists with established CI, conventions, test markers, etc.
+- Action: detection phase (Python deterministic) extracts repo profile. Generation phase invokes coder CLI to produce AGENTS.md additions, `scripts/ci.sh` mirroring existing CI, `.gitignore` additions. MICRO PR opened for operator review.
+- Path: full AI-driven flow.
+- Cost: ~30-60s CLI latency, subscription quota or API tokens consumed, MICRO PR review effort by operator.
+- Use case: onboarding existing projects (megaraid, sms-gateway, any external repo with non-trivial existing structure).
+
+**Tier classification logic (deterministic, runs first):**
+
+```python
+def detect_scaffold_tier(repo_path: str) -> Literal["empty", "greenfield", "established"]:
+    if _head_is_unborn(repo_path):
+        return "empty"
+    markers = {
+        "pyproject.toml", "package.json", "Cargo.toml", "go.mod",
+        ".github/workflows", "src", "tests", "Makefile",
+    }
+    found = sum(1 for m in markers if (Path(repo_path) / m).exists())
+    if found <= 1:
+        return "greenfield"
+    return "established"
+```
+
+**Why tier'ing matters strategically:**
+
+- **Cost-conscious:** AI invocation costs daemon quota and adds latency. For Tier 0/1 cases the AI has nothing meaningful to detect — running it would waste quota for zero-information outcome.
+- **Onboarding flow advertises differently:** Tier 0 path is the "start a new project on orchestrator from scratch" workflow. Tier 2 path is the "bring an existing project under orchestrator management" workflow. Different operators have different mental models; UX should make both feel native.
+- **Failure surface differs:** AI generation has its own failure modes (CLI timeout, quota exhausted, coder hallucination). Tier 0/1 paths have **no** AI-specific failure modes. Most onboarding cases (especially future operator base) will probably bias toward Tier 0/1 — keeping those paths AI-free improves overall reliability.
+- **Demo-friendly:** "Watch me onboard a new project in 30 seconds" demo uses Tier 0 path. AI-driven Tier 2 demo takes minutes and may surface hiccups. Both are real, but Tier 0 is the dramatic visual.
+
+**Detection rules (Tier 2 only, when AI generation runs):**
 
 For Python projects (most common):
 
