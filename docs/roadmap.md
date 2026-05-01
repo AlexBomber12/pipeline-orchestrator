@@ -16,7 +16,7 @@
 - **Multi-repo isolation audit complete** (PR-193, `docs/multi-repo-audit-2026-04-29.md`). PR-207 parallelized main loop based on audit finding — sequential run_cycle was the remaining blocker.
 - **Foundation Sprint 36 PR specs generated** (2026-05-01). PR-208..PR-236 batch covering god-class decomposition, atomic primitive in idle.py, regression test suite, observed-bug fixes (OBS-AR event log spam). Tasks ready in `/mnt/user-data/outputs/foundation-tasks/`. Estimated 2-3 days at daemon's 15-20 PR/day throughput.
 - **Onboarding of megaraid-dashboard and sms-gateway-v2 in progress** (2026-05-01). Reconciled AGENTS.md files prepared; pre-onboarding manual scripts/ci.sh creation required to avoid scaffolder stub trap (scaffolder creates exit-0 stub if no ci.sh exists; no semantic conflict resolution yet — PR-FUTURE-3 territory).
-- **Architectural future work documented** for post-Foundation period: PR-FUTURE-1 (AGENTS template scope cleanup), PR-FUTURE-2 (per-repo config inheritance), PR-FUTURE-3 (onboarding wizard with semantic conflict resolution), PR-FUTURE-4 (scripts/ci.sh generator MICRO PR).
+- **Architectural future work documented** for post-Foundation period: PR-FUTURE-1 (AGENTS template scope cleanup), PR-FUTURE-2 (per-repo config inheritance), PR-FUTURE-3 (onboarding wizard with semantic conflict resolution), PR-FUTURE-4 (AI-driven scaffold replacing template-driven), PR-FUTURE-5 (read-only/observe mode for trial onboarding), PR-FUTURE-6 (UI-driven auth flow for GH/Claude/Codex), PR-FUTURE-7 (eliminate tasks/QUEUE.md entirely — in-memory queue model).
 
 ---
 
@@ -1031,7 +1031,7 @@ This section captures architectural changes that emerged from the megaraid-dashb
 
 ### Architectural problem recap
 
-When planning onboarding of two real external projects (megaraid-dashboard and sms-gateway-v2) on 2026-05-01, four architectural gaps surfaced:
+When planning onboarding of two real external projects (megaraid-dashboard and sms-gateway-v2) on 2026-05-01, six architectural gaps surfaced. A seventh internal-architecture gap was identified the same day during code-level audit of QUEUE.md mechanics:
 
 1. **AGENTS template scope leakage.** The orchestrator's `daemon_managed_content()` extracts daemon-managed sections live from pipeline-orchestrator's own AGENTS.md. That source contains pipeline-orchestrator-specific paths (`tests/e2e/`, `pipeline-orchestrator-testbed`, `src/task_status.py`, `docs/ci-setup.md`) inside the managed regions. When applied to a different repo, those self-references travel verbatim and are nonsense for that repo.
 
@@ -1040,6 +1040,12 @@ When planning onboarding of two real external projects (megaraid-dashboard and s
 3. **Onboarding is mechanical, not semantic.** `/onboarding/preview` and `/onboarding/apply` perform a structural merge: append marked sections at the end of AGENTS.md if not already present. They do not detect or resolve **semantic conflicts** — for example, a user's "Workflow Rules" section saying "branches use Conventional Commit prefixes" sits side-by-side with daemon-managed "Branch naming" saying "branches use pr-XXX-slug from task file". The coder reads both, sees the contradiction, and picks one — usually the more recent (daemon-managed), silently overriding the user's existing convention.
 
 4. **scripts/ci.sh scaffold is a silent stub.** When daemon scaffolds a new repo, `scripts/ci.sh` is created as a stub that always returns exit 0 (no actual checks). Daemon thinks CI passes, coder thinks local validation OK, but no real validation runs. PRs with broken code only fail at GitHub Actions CI, wasting FIX FEEDBACK cycles. Operator must manually create real `scripts/ci.sh` before onboarding to avoid this trap.
+
+5. **Scaffold strategy is template-driven, not repo-aware.** The fundamental problem behind #4: `scaffolder.py` copies fixed templates from `templates/` directory regardless of what the target repo already has. It doesn't read existing `pyproject.toml`, doesn't mirror existing `.github/workflows/ci.yml`, doesn't respect existing test markers or coverage thresholds. This works only for greenfield projects built from the orchestrator template. For onboarding existing work, scaffold must be **AI-driven**: detect repo state, generate additions that respect what's there, surface as MICRO PR for operator review. There is also no "observe mode" for trial inspection without committing to full daemon management.
+
+6. **Auth setup is shell-driven, not UI-driven.** The operator must shell into the daemon container (`docker compose run --rm daemon bash`) and run `gh auth login --device-flow`, `claude auth login`, `codex auth login` manually. Tokens persist in mounted volumes, so this is a one-time setup for the author — but it makes the first-time experience for any other user inaccessible. The dashboard already shows auth status (probes for all 3 CLIs exist) but provides no flow to initiate or refresh auth from the UI. PR-FUTURE-4 (AI scaffold) and PR-FUTURE-3 (wizard) both depend on Claude/Codex/GH CLIs being authenticated; without UI-driven auth, the wizard cannot complete its steps for a fresh deployment.
+
+7. **QUEUE.md remains as on-disk artifact with no clear value.** PR-181 untracked `tasks/QUEUE.md` from git but kept the file on disk because 4 production code paths still read it (web UI tasks panel, recovery handler, idle handler legacy fallback, merge handler "mark done"). Code-level audit on 2026-05-01 revealed: the often-cited "coder shim parses QUEUE.md" dependency is **test-only** (the production Claude/Codex CLIs do not read QUEUE.md). Web UI and recovery can equally well consume an in-memory queue snapshot. Keeping QUEUE.md on disk maintains a derived projection alongside the source-of-truth (`tasks/PR-*.md` files), creating two-source confusion, disk I/O on every IDLE cycle, and ~80 LOC of legacy migration branching for "pre-PR-181 repos that still track QUEUE.md upstream". The simplification here is subtractive: remove QUEUE.md entirely, read from PR-*.md headers directly, expose queue snapshot via API instead of file.
 
 ### PR-FUTURE-1: AGENTS template scope cleanup
 
@@ -1141,73 +1147,316 @@ Example conflict that mechanical diff misses: user's "Workflow Rules" section sa
 
 **Type:** feature. **Complexity:** high. **Estimated:** 4-6 days.
 
-### PR-FUTURE-4: scripts/ci.sh onboarding generator MICRO PR
+### PR-FUTURE-4: AI-driven onboarding scaffold (replaces template-driven scaffolder)
 
-**Problem:** when daemon scaffolds a new repo, `scripts/ci.sh` is created as a stub that always returns exit 0. This is a silent trap: daemon thinks CI passes, coder thinks local validation OK, but no actual checks run. PRs go through with broken code that only surfaces when GitHub Actions CI catches it later.
+**Problem:** current `scaffold_repo()` in `src/daemon/scaffolder.py` is **template-driven** — it copies fixed template files from `templates/` directory regardless of repo state. This works only when the repo is built FROM the orchestrator template (greenfield case) and **breaks** when onboarding existing repos:
 
-The current workaround (manual creation of `scripts/ci.sh` before onboarding) is operator-time-intensive and easy to forget.
+- Generates stub `scripts/ci.sh` that always returns exit 0, silently bypassing all real validation. Daemon thinks CI passes, coder thinks local validation OK — but PRs go through with broken code that only fails at GitHub Actions later, wasting FIX FEEDBACK cycles.
+- Ignores existing `pyproject.toml` configuration (ruff, mypy, pytest settings, coverage threshold, test markers).
+- Ignores existing `.github/workflows/ci.yml` which often already contains the canonical commands the project uses.
+- Imposes pipeline-orchestrator's own coverage gate (100%) on projects that legitimately have different appetites (e.g. megaraid-dashboard had no coverage threshold set; sms-gateway-v2 already used 100%).
+- Creates `tasks/QUEUE.md` and `scripts/make-review-artifacts.sh` even if project doesn't intend to use the orchestrator (prevents read-only inspection mode).
 
-**Scope:** add an onboarding wizard step that detects project stack and generates a proper `scripts/ci.sh` as a MICRO PR for operator review.
+The current workaround is operator-time-intensive: manually create real `scripts/ci.sh` before onboarding, manually edit AGENTS.md, manually decide gitignore additions. Easy to forget; not viable for non-author users.
 
-**Detection logic:**
+**Real example (2026-05-01 onboarding planning of megaraid + sms-gateway):** both projects already have full GitHub Actions CI with `ruff check`, `ruff format --check`, `mypy src`, `pytest`. They use `pyproject.toml` for tool config including pytest `addopts`. They differ in coverage threshold (megaraid: none; sms-gateway: `--cov-fail-under=100` in addopts). Template scaffolder's stub `scripts/ci.sh` would shadow all this — coder would think CI passes when running stub, while real GitHub Actions runs different (correct) commands.
 
-1. After clone, scan repo root for stack indicators:
-   - `pyproject.toml` or `setup.py` → Python project
-   - `package.json` → Node project
-   - `Cargo.toml` → Rust project
-   - `go.mod` → Go project
+**Scope:** replace template-driven scaffolder with AI-driven one that detects repo state and generates project-aware additions as a MICRO PR for operator review.
 
-2. Scan for existing CI tooling:
-   - `.pre-commit-config.yaml` → use pre-commit hooks
-   - `Makefile` with `test` or `ci` targets → use those
-   - `.github/workflows/ci.yml` → mirror what GitHub Actions runs locally
-   - `pyproject.toml` `[tool.pytest]`, `[tool.ruff]`, `[tool.mypy]` configs → use them
+**Architecture change:**
 
-3. Determine current coverage threshold (if Python):
-   - Run `pytest --cov=src --cov-report=term-missing` against existing tests
-   - Parse current coverage percentage
-   - Propose threshold = `floor(current_coverage / 5) * 5` as starting point (gives operator headroom to clean up before tightening)
+The scaffold step becomes a **two-phase process**:
 
-4. Generate `scripts/ci.sh` content matching detected stack:
+1. **Detection phase (Python code, deterministic):**
+   - Scan repo root for stack indicators: `pyproject.toml`, `package.json`, `Cargo.toml`, `go.mod`, `Gemfile`, `pom.xml`, etc.
+   - Scan for existing CI tooling: `.github/workflows/*.yml`, `.gitlab-ci.yml`, `Makefile` with test/ci targets, `.pre-commit-config.yaml`, `tox.ini`.
+   - Read pyproject.toml `[tool.*]` sections (ruff, mypy, pytest, coverage) to extract configured commands and thresholds.
+   - Read existing `scripts/ci.sh` (if exists, non-stub) — content hash check against template stub.
+   - Read existing `AGENTS.md` and `CLAUDE.md` (if exist).
+   - Output: structured "repo profile" object — language, package manager, CI tool, test framework, lint config, coverage threshold (if any), test markers, existing files, project intent (orchestrator-managed vs read-only inspection).
 
-   - Python: `ruff check src/ tests/`, `mypy --strict src/`, `pytest --cov=src --cov-fail-under=<threshold> -q`
-   - Node: `npm run lint`, `npm run typecheck`, `npm test -- --coverage --coverageThreshold='{"global":{"lines":<threshold>}}'`
-   - etc.
+2. **Generation phase (AI-driven, via Claude/Codex CLI):**
+   - Pass repo profile to coder CLI as a structured task.
+   - Coder produces: proposed `scripts/ci.sh` mirroring project's existing CI commands; proposed AGENTS.md additions (managed sections + note section if user already has AGENTS.md, or full template if greenfield); proposed `.gitignore` additions; nothing else by default.
+   - Coder opens MICRO PR with the additions; operator reviews and merges.
 
-5. Open MICRO PR via Claude/Codex CLI with the generated content + a description that includes detection reasoning and threshold proposal. Operator reviews and merges (or modifies).
+**Detection rules (initial set):**
 
-**UI integration:** part of onboarding wizard flow (see PR-FUTURE-3). After AGENTS.md reconciliation step, wizard surfaces "Project CI script" panel showing detected stack + proposed `scripts/ci.sh`. Operator confirms or edits, wizard creates MICRO PR.
+For Python projects (most common):
 
-**Idempotency:** if `scripts/ci.sh` already exists and is not the daemon stub (check by content hash against template), wizard skips this step entirely. Operator has a working CI script — don't replace it.
+- If `.github/workflows/ci.yml` exists with steps `ruff check`, `ruff format --check`, `mypy src`, `pytest`, generate `scripts/ci.sh` with **exact same commands** (no impositions).
+- If `pyproject.toml` `[tool.pytest.ini_options]` `addopts` contains `--cov-fail-under=N`, propagate that N to `scripts/ci.sh`. **Do not impose orchestrator's 100%.**
+- If `pyproject.toml` has no coverage threshold, propose 0 (no gate) — operator can tighten later via per-repo config (PR-FUTURE-2).
+- If project has test markers (pytest `markers = [...]`), respect them: only run unit-equivalent in `scripts/ci.sh` (e.g. `pytest -m "not integration and not e2e"` if those markers exist).
+- If `Makefile` has `make ci` or `make test` target, prefer wrapping that in `scripts/ci.sh` rather than reimplementing.
 
-**Out of scope:** detecting all possible stack variants (Java/Maven, Ruby/Bundler, etc). Initial set covers Python, Node, Rust, Go. Other stacks fall through to current behavior (manual creation).
+For Node, Rust, Go projects: mirror existing CI scripts when present.
+
+**Idempotency:**
+
+- If `scripts/ci.sh` already exists and content hash differs from template stub — **leave it alone**. Operator has a working CI script; don't replace.
+- If existing `AGENTS.md` already has managed marker regions — apply reconciliation (existing PR-192a/b/c flow), don't regenerate from scratch.
+
+**UI integration (part of PR-FUTURE-3 wizard):**
+
+After clone, before "active" toggle:
+
+1. Wizard runs detection phase, surfaces "Repo profile" panel: detected language/CI/coverage/test markers.
+2. Wizard runs generation phase via coder CLI in a separate working directory. Operator can monitor progress.
+3. Wizard surfaces proposed MICRO PR diff. Operator approves, modifies, or rejects.
+4. On approval, MICRO PR is opened on the target repo (not on pipeline-orchestrator). Operator merges via GitHub UI.
+5. Daemon picks up the merged scaffolding on next IDLE cycle and starts the repo as active.
+
+**Manual fallback path:**
+
+For operators who prefer manual control or for projects where AI generation goes wrong:
+
+- Wizard exposes "Manual scaffold" button at any point.
+- Generates a checklist file `docs/orchestrator-scaffold-todo.md` in the target repo with todo items: "Create scripts/ci.sh with these commands [generated from detection]", "Update .gitignore", "Add AGENTS.md note section here".
+- Operator does the changes manually in their IDE, commits, pushes; daemon picks up on next cycle.
+
+**Why this matters strategically:**
+
+The current template-driven scaffolder is a **product gap**, not a bug. It assumes greenfield projects built from the orchestrator template. Real users have existing projects with established CI. The AI-driven scaffold is what makes pipeline-orchestrator viable as a tool for **onboarding existing work**, not just managing greenfield work.
+
+**Out of scope (for first version):**
+
+- Detecting Java/Maven, Ruby/Bundler, .NET, Elixir/Mix, Haskell/Cabal stacks. Initial set: Python, Node, Rust, Go.
+- Multi-language monorepos (project with both Python and Node sub-packages).
+- Custom CI tools (Jenkins, CircleCI, BuildKite, Travis) — only GitHub Actions detection in v1.
+- Detecting and adapting to non-trivial Makefile target chains.
+
+**Type:** feature. **Complexity:** high. **Estimated:** 6-8 days. (Was 3-4 days; expanded scope reflects the architectural shift from template-copy to AI-detect-and-generate.)
+
+### PR-FUTURE-5: Read-only / observation-mode onboarding
+
+**Problem:** current scaffolder always assumes the operator wants to put the repo under daemon-driven PR creation. There is no "just observe this repo" mode where:
+
+- Daemon reads the repo's PR queue and CI status for monitoring/dashboard purposes.
+- Daemon does NOT add `tasks/`, `scripts/`, `artifacts/`, or `.gitignore` modifications.
+- Daemon does NOT create PRs in the repo.
+
+This is useful for:
+
+- Trial onboarding ("let me see what dashboard looks like with my repo on it before committing to use it").
+- Repos where the operator wants pipeline-orchestrator to surface metrics (cost-per-merged-PR, GraphQL burn) without touching workflow.
+- Testing isolation properties of multi-repo behavior without polluting target repos.
+
+**Scope:** add a per-repo `mode` field with values `managed` (current default — daemon scaffolds, creates PRs) and `observe` (daemon reads-only, no scaffold, no PR creation). UI Settings exposes this as "Repo mode" radio: Managed (full pipeline) vs Observe (metrics only).
+
+**Behavior changes when mode=observe:**
+
+- Skip scaffold step entirely on add-repo.
+- Skip AGENTS.md reconciliation.
+- Daemon main loop polls PR list for status (read-only) but never enters CODING/FIX/MERGE states.
+- Dashboard shows repo card with state="OBSERVING" (new state value), event log shows merge events from external PR creators (you, manual, other tools), GraphQL/cost metrics tracked.
+- Operator can switch mode managed↔observe via settings; switching to managed triggers scaffold + onboarding wizard.
+
+**UI/UX:**
+
+- Repo settings panel (from PR-FUTURE-2 per-repo config) gets "Mode" toggle at top.
+- "Observe" mode hides task-related UI for that repo (no upload tasks button, no QUEUE.md viewer).
+- Cost/burn metrics still surface for observe-mode repos.
+
+**Out of scope:** retroactive observe mode for repos that were originally scaffolded as managed (would require cleanup of tasks/QUEUE.md, scripts/, etc — leave for follow-up).
 
 **Type:** feature. **Complexity:** medium. **Estimated:** 3-4 days.
 
+### PR-FUTURE-7: Eliminate tasks/QUEUE.md entirely (in-memory queue model)
+
+**Problem:** `tasks/QUEUE.md` is a derived artifact regenerated each IDLE cycle from the structured `tasks/PR-*.md` headers, but it persists on disk and 4 production code paths still read it. After PR-181 untracked it from git, the file lost its source-of-truth role but kept its on-disk-interface role. This creates several latent issues:
+
+1. **Two-source confusion.** `tasks/PR-*.md` files are the authoritative source. `QUEUE.md` is derived from them. But the recovery handler reads QUEUE.md on startup before PR-*.md files are parsed, creating a window where the derived view is consulted ahead of the source.
+2. **Disk I/O on every IDLE cycle.** Every time daemon enters IDLE, it regenerates QUEUE.md content in-memory and writes it to disk for downstream consumers. That write costs filesystem ops, can fail (disk full, permissions, etc), and the failure handling (`_write_generated_queue_md` swallows exceptions) hides issues.
+3. **Legacy migration overhead.** `_origin_queue_md_tracked()` probes git on every recovery cycle to determine whether the repo is post-PR-181 or pre-PR-181. This branching keeps a code path alive for "legacy repos that still track QUEUE.md upstream" — paying complexity tax for a state that the orchestrator's own deployment has already moved past.
+4. **Onboarding friction for external repos.** Every newly onboarded repo must add `tasks/QUEUE.md` to `.gitignore` to prevent the daemon from accidentally committing it (the scaffolder's gitignore step does this, but only on repos that already have a `.gitignore`; some repos have non-standard layouts).
+5. **Race vulnerability.** Multi-process scenarios (recovery + IDLE running in close succession on daemon restart) read different snapshots of QUEUE.md, potentially making different selection decisions based on stale views.
+
+The original justification for keeping QUEUE.md after PR-181 has eroded:
+
+- **Coder shim dependency was misidentified.** The shim that parses QUEUE.md (`tests/e2e/lib/coder_shim.sh::parse_doing_task`) is a **test-only mock coder** used inside the e2e test stack, not the production Claude/Codex CLIs. Production coders read their task scope from the prompt, not from disk. Removing QUEUE.md does not affect production coders.
+- **Web UI tasks panel** reads QUEUE.md only because that was the convenient interface in PR-157 era. It can equally well be served by an in-memory snapshot exposed via an API endpoint backed by the same `_generate_queue_md` function called for read instead of write.
+- **Recovery handler** reads QUEUE.md from `origin/{branch}` via `git show` to reconstruct state on startup. Post-PR-181 repos gitignore QUEUE.md, so the file is absent from origin anyway — recovery already falls through to "treat as empty queue and defer to preflight + IDLE regeneration" path. The remaining `git show` probe path exists only for legacy pre-PR-181 repos.
+- **Idle handler legacy queue fallback** parses QUEUE.md to detect "visible legacy queue entries" — entries in QUEUE.md that the DAG-based selector did not produce. This catches accidental hand-edits to QUEUE.md and guards against ghosts surviving across daemon restarts. Without on-disk QUEUE.md, this concern disappears entirely (no surface to hand-edit).
+
+**Scope:** remove `tasks/QUEUE.md` from the orchestrator's runtime model. Keep `_generate_queue_md` as a pure function (returns the rendered string). Replace all read sites with consumers of an in-memory snapshot held on `RepoState` or computed on-demand from the structured PR-*.md headers.
+
+**Architecture:**
+
+1. **In-memory queue model on `RepoState`.** Add `RepoState.current_queue: list[QueueTask] | None` populated by IDLE handler at the end of each cycle. Web UI and recovery read from this state instead of from disk.
+
+2. **Recovery without QUEUE.md.** `recover_state` parses `tasks/PR-*.md` files directly via `parse_task_header` (already used by DAG selector). Reconstructs the same `list[QueueTask]` shape that QUEUE.md parsing currently produces. Drops the `_origin_queue_md_tracked()` probe and the `git show origin/{branch}:tasks/QUEUE.md` path.
+
+3. **Web UI via API endpoint.** Add `/api/repo/{name}/queue` returning JSON of `RepoState.current_queue`. HTMX tasks panel fragment fetches from this endpoint. Removes `parse_queue(queue_path)` calls in `app.py`.
+
+4. **Upload validation unchanged.** Operator uploads `PR-*.md` files via UI; uploads do NOT include QUEUE.md anymore (the upload validation block that handled QUEUE.md as a special filename gets simplified — only PR-*.md files are accepted).
+
+5. **Scaffolder simplification.** Remove `tasks/QUEUE.md` from `_GITIGNORE_ENTRIES` and from the scaffolder's "create from template" step. Onboarding repos no longer need `tasks/QUEUE.md` in their gitignore.
+
+6. **Test shim migration.** The e2e test shim's `parse_doing_task` function is rewritten to read `tasks/PR-*.md` files directly and find the one with `Status: DOING` in its frontmatter or header. This is a test-side change, not production.
+
+7. **Merge handler simplification.** `_mark_queue_done` (currently flips `DONE` row in QUEUE.md text) becomes `RepoState.current_queue` update directly. No file write.
+
+8. **Backward compatibility.** Repos that already have `tasks/QUEUE.md` checked into git (legacy pre-PR-181 repos) get a one-time daemon-side cleanup: on first IDLE cycle after this PR ships, daemon detects tracked QUEUE.md and opens an auto-MICRO-PR to remove it via `git rm` + commit. After merge, the file is gone from git and the local working-tree copy is deleted on next clone.
+
+**Why this is worth doing:**
+
+- Removes a layer of indirection that has no remaining purpose.
+- Simplifies onboarding (one less file to gitignore, one less concept to explain).
+- Eliminates "legacy repo" branching in recovery and idle handlers (~80 LOC of dead-end branches).
+- Removes a class of race conditions (concurrent reads of stale QUEUE.md snapshots).
+- Aligns the runtime model with the source-of-truth model: `tasks/PR-*.md` is the authoritative form, and the system reads that authority directly without an intermediate cached projection.
+
+**Why this might NOT be worth doing yet:**
+
+- The work touches recovery handler, idle handler, merge handler, web UI, scaffolder, and tests. Big surface area.
+- Recovery handler has subtle invariants (state reconstruction on daemon restart) that are currently tested via QUEUE.md content. Migrating tests to PR-*.md fixtures requires care.
+- The legacy migration MICRO PR (point 8) needs to handle edge cases: repos where operators have manually edited QUEUE.md, repos in mid-cycle when the migration runs, multi-repo scenarios where some are migrated and some aren't.
+
+**Out of scope:**
+
+- Renaming `_generate_queue_md` to something more honest like `render_queue_view`. Cosmetic; defer.
+- Replacing `QueueTask` dataclass with a richer model. Different concern; defer.
+- Cross-repo queue aggregation in dashboard ("show all DOING tasks across all repos"). Different feature; defer.
+
+**Type:** refactor. **Complexity:** high. **Estimated:** 5-7 days. (The actual code change is moderate; the bulk of the time is migrating tests from QUEUE.md fixtures to PR-*.md fixtures and validating recovery semantics across edge cases.)
+
+**Strategic placement:** this PR can ship anywhere after Foundation Sprint completes. It is independent of PR-FUTURE-1 through PR-FUTURE-6 (those concern external onboarding; this concerns internal queue model). Worth doing **before** PR-FUTURE-3 (onboarding wizard) because the wizard's per-repo health check and tasks panel become simpler when QUEUE.md is gone.
+
+
+
+**Problem:** current scaffolder always assumes the operator wants to put the repo under daemon-driven PR creation. There is no "just observe this repo" mode where:
+
+- Daemon reads the repo's PR queue and CI status for monitoring/dashboard purposes.
+- Daemon does NOT add `tasks/`, `scripts/`, `artifacts/`, or `.gitignore` modifications.
+- Daemon does NOT create PRs in the repo.
+
+This is useful for:
+
+- Trial onboarding ("let me see what dashboard looks like with my repo on it before committing to use it").
+- Repos where the operator wants pipeline-orchestrator to surface metrics (cost-per-merged-PR, GraphQL burn) without touching workflow.
+- Testing isolation properties of multi-repo behavior without polluting target repos.
+
+**Scope:** add a per-repo `mode` field with values `managed` (current default — daemon scaffolds, creates PRs) and `observe` (daemon reads-only, no scaffold, no PR creation). UI Settings exposes this as "Repo mode" radio: Managed (full pipeline) vs Observe (metrics only).
+
+**Behavior changes when mode=observe:**
+
+- Skip scaffold step entirely on add-repo.
+- Skip AGENTS.md reconciliation.
+- Daemon main loop polls PR list for status (read-only) but never enters CODING/FIX/MERGE states.
+- Dashboard shows repo card with state="OBSERVING" (new state value), event log shows merge events from external PR creators (you, manual, other tools), GraphQL/cost metrics tracked.
+- Operator can switch mode managed↔observe via settings; switching to managed triggers scaffold + onboarding wizard.
+
+**UI/UX:**
+
+- Repo settings panel (from PR-FUTURE-2 per-repo config) gets "Mode" toggle at top.
+- "Observe" mode hides task-related UI for that repo (no upload tasks button, no QUEUE.md viewer).
+- Cost/burn metrics still surface for observe-mode repos.
+
+**Out of scope:** retroactive observe mode for repos that were originally scaffolded as managed (would require cleanup of tasks/QUEUE.md, scripts/, etc — leave for follow-up).
+
+**Type:** feature. **Complexity:** medium. **Estimated:** 3-4 days.
+
+### PR-FUTURE-6: Auth flow for onboarding wizard
+
+**Problem:** current auth setup is a **manual one-time operator step** done outside the orchestrator UI. The operator runs `docker compose run --rm daemon bash` and inside the container runs `gh auth login --device-flow`, `claude auth login`, `codex auth login`. Auth credentials are stored in mounted volumes (`CLAUDE_CONFIG_DIR=/data/auth/claude`, `GH_CONFIG_DIR=/data/auth/gh`, `codex-auth:/data/auth/.codex`) which persist across container restarts.
+
+The UI (`src/web/app.py`) has auth status probes (`_check_claude_auth`, `_check_codex_auth`, `_check_gh_auth`) that report whether each CLI is authenticated, surfaced in dashboard. But there is **no flow** to perform initial auth or re-auth from the UI — the operator must shell into the container.
+
+This works for author's own use (do auth once, forget about it). It **does not work** for onboarding wizard concept where:
+
+1. New operator opens the dashboard for the first time, has not done CLI auth yet — wizard must guide them through GH/Claude/Codex auth before any onboarding step.
+2. Auth tokens expire (Claude OAuth 7-day refresh, GH device-flow tokens, Codex sessions) — wizard must surface re-auth flow when probes fail.
+3. Multiple operators on the same daemon (future product evolution) — each operator needs their own auth scope.
+
+The **AI-driven scaffold (PR-FUTURE-4) depends on this**: when wizard runs Claude/Codex CLI to generate scaffold MICRO PR, it needs valid Claude/Codex auth. When MICRO PR is opened on target repo, it needs valid GH auth with write access to that repo. Without auth flow, wizard cannot complete.
+
+**Scope:** add UI flow for initiating and re-authenticating each of the 3 auth providers without shell access.
+
+**Architecture:**
+
+Three auth providers, each with different flow:
+
+1. **GitHub CLI (`gh`):** device flow. UI surfaces "Connect GitHub" button. Backend runs `gh auth login --device-flow --web` via subprocess in daemon container, captures the device code from stderr, surfaces it in UI with "open https://github.com/login/device and enter `XXXX-XXXX`" instruction. UI polls `gh auth status` every 5s; on success, surfaces "GitHub connected as @username".
+
+2. **Claude CLI:** OAuth flow via `claude auth login`. Similar pattern — backend runs CLI, captures device code or auth URL, surfaces in UI. Polls `claude auth status`.
+
+3. **Codex CLI:** session-based via `codex auth login`. Same pattern.
+
+For each provider, also add **"Disconnect"** button (`gh auth logout`, `claude auth logout`, `codex auth logout`) and **"Re-auth"** combination button (logout + login).
+
+**Onboarding wizard integration:**
+
+Wizard step 0 (before any repo-add step) checks `_collect_auth_status()`:
+
+- All 3 green → proceed to repo-add.
+- Any provider not connected → surface "Connect <provider>" panel; block wizard until at least GH + 1 coder (Claude OR Codex) are connected.
+- Auth panel shows what each provider is needed for: "GitHub: clone repos, create PRs, post review comments. Claude: AI-driven scaffold, code generation. Codex: alternative coder, PR review."
+
+**Token expiry handling:**
+
+Daemon main loop already polls auth status. When a probe transitions from green to red (token expired), surface a banner in UI: "Claude auth expired. [Re-authenticate]". Daemon does **not** auto-re-auth (too risky, security-relevant). Operator clicks button to start re-auth flow.
+
+**Multi-account support (out of scope for v1):**
+
+Future iteration: per-repo override of which GH account / Claude account / Codex account to use. Useful when operator works on org repo (separate GH account from personal). For v1, single global auth shared across all managed repos.
+
+**Security considerations:**
+
+- All auth flows happen inside daemon container. Tokens never leave container.
+- UI surfaces device codes via SSE (or polled fetch), not via persistent storage. After auth completes, device code is forgotten.
+- Re-auth flows revoke old token before issuing new one (atomic replacement, no overlap).
+- Backend rate-limits auth flow attempts (1 per 30s per provider) to prevent UI spam if auth is broken.
+
+**Why this matters strategically:**
+
+The current "shell in and set up" model is fine for the author. For pipeline-orchestrator to be **viable as a tool for non-author users**, auth must be UI-driven. Otherwise the first-time experience is "clone the repo, copy docker-compose.yml, edit it, docker compose up, then `docker compose run --rm daemon bash`, then `gh auth login --device-flow`..." — which loses 80% of users.
+
+**Out of scope:** SAML/SSO providers, organization-level GitHub Apps with installation IDs (mentioned in OBS-AC Leverage 6 GitHub App migration — separate workstream). v1 covers: personal access tokens via device flow for `gh`, OAuth for `claude`, session for `codex`.
+
+**Type:** feature. **Complexity:** medium. **Estimated:** 4-5 days. (Security-sensitive surface area; needs careful UX around token visibility.)
+
 ### Sequencing
 
-The four PRs above are independent but build on each other naturally:
+The seven PRs above build on each other:
 
-1. **PR-FUTURE-1 first** (AGENTS template scope cleanup). Without clean orchestrator-level template, every other onboarding effort works around dirty template. Foundation for the others.
+1. **PR-FUTURE-6 first** (auth flow). Without UI-driven auth, the wizard cannot run AI scaffolding (PR-FUTURE-4) which needs Claude/Codex CLI authenticated. Foundational. Can ship independently of others — improves existing single-operator UX even before wizard exists.
 
-2. **PR-FUTURE-2 second** (per-repo config). Inheritance model unblocks coverage_gate_percent and other settings being expressible.
+2. **PR-FUTURE-1 second** (AGENTS template scope cleanup). Without clean orchestrator-level template, every other onboarding effort works around dirty template.
 
-3. **PR-FUTURE-3 third** (onboarding wizard). With clean template (PR-FUTURE-1) and per-repo overrides (PR-FUTURE-2), the wizard has more leverage points for conflict resolution.
+3. **PR-FUTURE-7 second-parallel** (eliminate QUEUE.md). Internal architecture cleanup, independent of onboarding work. Ships in parallel with PR-FUTURE-1; touches recovery/idle/merge handlers + web UI + scaffolder. Worth doing before PR-FUTURE-3 wizard so the wizard's per-repo health check and tasks panel become simpler.
 
-4. **PR-FUTURE-4 last** (scripts/ci.sh generator). Integrates into wizard from PR-FUTURE-3 as one additional step. Doing this before PR-FUTURE-3 means building a standalone flow that later gets folded in — wasted work.
+4. **PR-FUTURE-2 third** (per-repo config). Inheritance model unblocks coverage_gate_percent and other settings being expressible.
 
-Parallel work is possible but risks rework when the template scope changes.
+5. **PR-FUTURE-4 fourth** (AI-driven scaffold). Replaces template-driven scaffolder. Depends on PR-FUTURE-6 (auth) and PR-FUTURE-1 (clean template). Can ship before PR-FUTURE-3 wizard — operates as standalone CLI command initially, later integrated into wizard.
+
+6. **PR-FUTURE-3 fifth** (onboarding wizard UI). Integrates auth flow (PR-FUTURE-6), per-repo config (PR-FUTURE-2), AI scaffold (PR-FUTURE-4), and (if PR-FUTURE-7 shipped) the simpler queue model into a coherent UI flow with semantic conflict resolution.
+
+7. **PR-FUTURE-5 last** (observe mode). Adds per-repo `mode` field. Builds on PR-FUTURE-2 (per-repo config) and PR-FUTURE-4 (scaffold can be skipped for observe-mode repos).
+
+Critical path: **6 → 1 → 4**. PR-FUTURE-7 parallel to 1 (independent track, same time). Rest can parallelize after that. Total estimate ~5-6 weeks of solo daemon-driven work assuming no major architectural surprises.
 
 ### Foundation Sprint relationship
 
-None of the four PRs are in Foundation Sprint scope. Foundation Sprint cleans up internal architecture of pipeline-orchestrator (god classes, atomic primitives, regression tests). After Foundation, these four PRs become natural follow-up sprint(s) before declaring multi-repo onboarding production-ready for non-author users.
+None of the seven PRs are in Foundation Sprint scope. Foundation Sprint cleans up internal architecture of pipeline-orchestrator (god classes, atomic primitives, regression tests). After Foundation, these seven PRs become natural follow-up sprint(s) before declaring multi-repo onboarding production-ready for non-author users.
+
+Three key conceptual shifts deserve emphasis:
+
+**Scaffold should be AI-driven, not template-driven (PR-FUTURE-4).** Current `scaffolder.py` assumes greenfield projects built from the orchestrator template. Real users have existing projects with established CI, established AGENTS.md, established conventions. The AI-driven scaffold detects what exists and generates additions that respect what's there, surfaced as a MICRO PR for operator review. This is what makes pipeline-orchestrator viable as a tool for **onboarding existing work**, not just managing greenfield work.
+
+**Auth must be UI-driven, not shell-driven (PR-FUTURE-6).** Current "shell into container, run gh auth login" model is fine for the author. For pipeline-orchestrator to onboard non-author users, auth flow must happen in the dashboard. Without UI-driven auth, the wizard cannot run AI scaffolding which depends on Claude/Codex CLI being authenticated.
+
+**Source-of-truth should be authoritative without intermediate projection (PR-FUTURE-7).** `tasks/PR-*.md` files are the source of truth for the queue. `tasks/QUEUE.md` was a derived projection that mattered when QUEUE.md was git-tracked (PR-181 era and before). Post-PR-181, the projection persists on disk only because legacy code paths read from disk instead of from the in-memory snapshot the daemon already computes. Removing QUEUE.md eliminates the two-source confusion, simplifies onboarding (one less file), and removes ~80 LOC of legacy-repo migration branching.
 
 For author's own multi-repo use (megaraid-dashboard, sms-gateway-v2 onboarding), workarounds exist:
 
 - **AGENTS template scope leakage** is mitigated by adding a "Note about daemon-managed sections" section in user's AGENTS.md above the managed block, explicitly directing coder that orchestrator-specific paths in managed sections are illustrative, not applicable to this repo.
 - **Per-repo config gap** is mitigated by editing user's AGENTS.md to set the desired coverage gate explicitly in the user's `## Testing` section. Daemon-managed `## CI gates` is read alongside but user's section is project-specific source of truth.
 - **Onboarding wizard absence** is mitigated by manual conflict resolution: operator reads existing AGENTS.md, identifies conflicts with daemon-managed sections, edits user's content to defer-or-clarify before applying onboarding.
-- **Stub scripts/ci.sh** is mitigated by manual creation of a real `scripts/ci.sh` before adding the repo to daemon (scaffolder is idempotent and won't overwrite an existing file).
+- **Stub scripts/ci.sh** is mitigated by manual creation of a real `scripts/ci.sh` before adding the repo to daemon (scaffolder is idempotent and won't overwrite an existing file). For megaraid+sms-gateway, the manual `scripts/ci.sh` should mirror the project's own GitHub Actions CI commands exactly: `ruff check .`, `ruff format --check .`, `mypy src`, `pytest [project's own coverage flags]`.
+- **No observe mode** is mitigated by accepting full management on add-repo. For trial inspection, can use a fork instead of the real repo.
+- **Manual auth flow** is already done by the author; daemon's mounted volumes (`CLAUDE_CONFIG_DIR`, `GH_CONFIG_DIR`, `codex-auth` volume) keep tokens persistent. Author re-auths manually via `docker compose run` when tokens expire.
+- **QUEUE.md still on disk** is mitigated by adding `tasks/QUEUE.md` to onboarded repo's `.gitignore` so the file does not get accidentally committed. Daemon regenerates the file each IDLE cycle; gitignored entry prevents pollution. Workaround does not address the underlying complexity tax in the codebase, only the surface artifact in the onboarded repo.
 
 These workarounds are operator-time-intensive and do not scale to non-author users. Hence the future PRs.
 
