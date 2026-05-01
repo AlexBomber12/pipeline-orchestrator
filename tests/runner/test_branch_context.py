@@ -139,6 +139,23 @@ def _log_text(runner: Any) -> str:
     return "\n".join(entry["event"] for entry in runner.state.history)
 
 
+def _diagnostic_for(runner: Any, marker: str) -> str:
+    """Return the most recent runner log entry containing ``marker``.
+
+    The branch-context xfail helper checks only this specific entry as
+    the divergence/cancellation diagnostic, so unrelated retry log lines
+    (e.g. ``"PR not found for 'pr-foo'"``) that happen to mention a
+    branch in passing cannot accidentally satisfy the assertion and
+    falsely flip the xfail to XPASS without the diagnostic itself
+    actually being fixed.
+    """
+    for entry in reversed(runner.state.history):
+        event = entry.get("event", "")
+        if marker in event:
+            return event
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Test 1 — coder exits 0 on wrong local branch, target branch absent
 # ---------------------------------------------------------------------------
@@ -186,9 +203,11 @@ def test_coder_exit_zero_with_no_target_branch_marks_hung(
     assert base_branch not in (runner.state.error_message or "")
 
     # Branch-context gap (OBS-AI). Future BranchContext PR will include
-    # all 4 branch values explicitly in the diagnostic.
-    _assert_branch_context_in_log_xfail(
-        log,
+    # all 4 branch values explicitly in the diagnostic. The check is
+    # scoped to the [ESCALATE] line so retry logs that already mention
+    # ``pr-foo`` cannot mask the gap.
+    _assert_branch_context_in_diagnostic_xfail(
+        _diagnostic_for(runner, "[ESCALATE]"),
         runner.state.error_message or "",
         base_branch=base_branch,
         task_branch=task_branch,
@@ -253,9 +272,10 @@ def test_coder_pushed_wrong_branch_target_absent_marks_hung_silently(
 
     # Branch-context gap. Future BranchContext PR is expected to detect
     # ``pr-foo-2`` as the actual remote branch and surface it alongside
-    # the missing target.
-    _assert_branch_context_in_log_xfail(
-        log,
+    # the missing target. Scoped to the [ESCALATE] line so retry logs
+    # that already mention ``pr-foo`` cannot mask the gap.
+    _assert_branch_context_in_diagnostic_xfail(
+        _diagnostic_for(runner, "[ESCALATE]"),
         runner.state.error_message or "",
         base_branch=base_branch,
         task_branch=task_branch,
@@ -416,8 +436,8 @@ def test_recover_state_with_branch_mismatch_marks_task_canceled_and_idles(
     # matcher; documenting it does not bleed into the cancellation log.
     assert pr_head_branch not in log
 
-    _assert_branch_context_in_log_xfail(
-        log,
+    _assert_branch_context_in_diagnostic_xfail(
+        _diagnostic_for(runner, "marking CANCELED"),
         runner.state.error_message or "",
         base_branch=base_branch,
         task_branch=task_branch,
@@ -521,8 +541,8 @@ def test_dirty_tree_on_feature_branch_resets_after_three_cycles(
     assert current_git_branch not in log
     assert task_branch not in log
 
-    _assert_branch_context_in_log_xfail(
-        log,
+    _assert_branch_context_in_diagnostic_xfail(
+        _diagnostic_for(runner, "Auto-recovered from dirty tree"),
         runner.state.error_message or "",
         base_branch=base_branch,
         task_branch=task_branch,
@@ -536,8 +556,8 @@ def test_dirty_tree_on_feature_branch_resets_after_three_cycles(
 # ---------------------------------------------------------------------------
 
 
-def _assert_branch_context_in_log_xfail(
-    log: str,
+def _assert_branch_context_in_diagnostic_xfail(
+    diagnostic: str,
     error_message: str,
     *,
     base_branch: str,
@@ -545,19 +565,26 @@ def _assert_branch_context_in_log_xfail(
     current_git_branch: str | None,
     pr_head_branch: str | None,
 ) -> None:
-    """Assert all 4 branch values appear in the log, xfailing today.
+    """Assert all 4 branch values appear in the divergence diagnostic.
+
+    Scoped strictly to the divergence/cancellation log entry (plus the
+    surfaced ``error_message``) rather than the entire event history.
+    Earlier informational log lines — e.g. ``"PR not found for 'pr-foo',
+    retrying in 5s"`` — already mention branches in passing, so a
+    whole-history check would let those satisfy the assertion even
+    though the final diagnostic still omits branch context. That would
+    flip these xfails to XPASS without the regression actually being
+    fixed.
 
     The future BranchContext PR will thread base / task / git / PR
-    branch identifiers through every divergence diagnostic. Until that
-    lands, the diagnostics omit most of those values, so this helper
-    documents the desired post-refactor invariant via ``xfail``: each
-    present branch value should appear at least once in the runner's
-    event log or the surfaced ``error_message``. Absent values
-    (``None``) should be explicitly mentioned as missing — today's
-    diagnostics never do that, so the assertion fails strictly until
-    the BranchContext PR adds it.
+    branch identifiers through each divergence diagnostic. Until then,
+    every present branch must appear at least once in this single
+    diagnostic, and every ``None`` slot must be named individually as
+    absent — the loop does not short-circuit, so one ``"absent"``
+    mention cannot cover multiple ``None`` fields.
     """
-    haystack = f"{log}\n{error_message}"
+    haystack = f"{diagnostic}\n{error_message}"
+    haystack_lower = haystack.lower()
     missing: list[str] = []
     if base_branch and base_branch not in haystack:
         missing.append(f"base_branch={base_branch!r}")
@@ -567,17 +594,15 @@ def _assert_branch_context_in_log_xfail(
         missing.append(f"current_git_branch={current_git_branch!r}")
     if pr_head_branch and pr_head_branch not in haystack:
         missing.append(f"pr_head_branch={pr_head_branch!r}")
-    # Absent values today are silently absent rather than explicitly
-    # logged as such; future BranchContext PR makes them explicit.
     for label, value in (
         ("base_branch", base_branch),
         ("task_branch", task_branch),
         ("current_git_branch", current_git_branch),
         ("pr_head_branch", pr_head_branch),
     ):
-        if value is None and "absent" not in haystack.lower():
-            missing.append(f"{label}=<absent> not explicitly logged")
-            break
+        if value is None:
+            if label not in haystack_lower or "absent" not in haystack_lower:
+                missing.append(f"{label}=<absent> not explicitly logged")
     if missing:
         pytest.xfail(
             "OBS-AI class gap, fixed in BranchContext PR: "
