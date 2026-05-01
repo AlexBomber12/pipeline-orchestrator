@@ -40,6 +40,16 @@ _TASK_TYPE_VALUES = {
     "refactor",
     "ux",
 }
+# Accepted synonyms for the canonical Type values. Map entries are
+# immutable once shipped: keys must never be reused for a new canonical
+# value or historical task files would change meaning.
+TYPE_SYNONYMS: dict[str, str] = {
+    "bug": "bugfix",
+    "fix": "bugfix",
+    "chore": "refactor",
+    "feat": "feature",
+    "task": "feature",
+}
 _COMPLEXITY_VALUES = {"low", "medium", "high"}
 _CODER_VALUES = {"claude", "codex", "any"}
 
@@ -200,6 +210,8 @@ def parse_task_header(path: str | Path) -> TaskHeader:
     task_type = fields.get("type")
     if not task_type:
         issues.append(f"{task_path}: missing Type")
+    elif task_type in TYPE_SYNONYMS:
+        task_type = TYPE_SYNONYMS[task_type]
     elif task_type not in _TASK_TYPE_VALUES:
         issues.append(
             f"{task_path}: invalid Type {task_type!r}; expected one of "
