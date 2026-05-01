@@ -102,8 +102,8 @@ def _disable_github_rate_limit_fetch_by_default(
     """Tests that don't pin a budget shouldn't actually call the gh CLI."""
     monkeypatch.setattr(
         runner_module.github_client,
-        "fetch_rate_limit_budget",
-        lambda: None,
+        "fetch_rate_limit_buckets",
+        lambda: (None, None),
     )
 
 
@@ -20857,8 +20857,8 @@ def test_refresh_github_api_budget_fetches_and_persists(
     fetched = _budget(remaining=4321, limit=5000)
     monkeypatch.setattr(
         runner_module.github_client,
-        "fetch_rate_limit_budget",
-        lambda: fetched,
+        "fetch_rate_limit_buckets",
+        lambda: (fetched, None),
     )
 
     result = asyncio.run(runner._refresh_github_api_budget())
@@ -20867,6 +20867,43 @@ def test_refresh_github_api_budget_fetches_and_persists(
     assert runner._github_api_budget_cache is fetched
     from src.daemon.github_rate_limit import BUDGET_REDIS_KEY
 
+    assert BUDGET_REDIS_KEY in runner.redis.store
+
+
+def test_refresh_github_api_budget_persists_per_bucket_snapshots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REST and GraphQL buckets land in their own Redis keys for the dashboard."""
+    from src.daemon.github_rate_limit import (
+        BUDGET_GRAPHQL_REDIS_KEY,
+        BUDGET_REDIS_KEY,
+        BUDGET_REST_REDIS_KEY,
+        RateLimitBudget,
+    )
+
+    runner = _make_runner()
+    rest = _budget(remaining=4321, limit=5000)
+    graphql = _budget(remaining=120, limit=5000)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "fetch_rate_limit_buckets",
+        lambda: (rest, graphql),
+    )
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    # Constrained min surfaces as the cached/legacy budget, but each bucket
+    # is also persisted under its own key so the dashboard can render them
+    # individually rather than collapsing both into a single bar.
+    assert result is not None and result.remaining == graphql.remaining
+    stored_rest = RateLimitBudget.from_redis_payload(
+        runner.redis.store[BUDGET_REST_REDIS_KEY]
+    )
+    stored_graphql = RateLimitBudget.from_redis_payload(
+        runner.redis.store[BUDGET_GRAPHQL_REDIS_KEY]
+    )
+    assert stored_rest is not None and stored_rest.remaining == rest.remaining
+    assert stored_graphql is not None and stored_graphql.remaining == graphql.remaining
     assert BUDGET_REDIS_KEY in runner.redis.store
 
 
@@ -20882,10 +20919,10 @@ def test_refresh_github_api_budget_uses_cache_within_ttl(
 
     def _fetch() -> object:
         calls["count"] += 1
-        return _budget(remaining=1)
+        return _budget(remaining=1), None
 
     monkeypatch.setattr(
-        runner_module.github_client, "fetch_rate_limit_budget", _fetch
+        runner_module.github_client, "fetch_rate_limit_buckets", _fetch
     )
 
     result = asyncio.run(runner._refresh_github_api_budget())
@@ -20904,8 +20941,8 @@ def test_run_cycle_short_circuits_when_budget_critical(
 
     monkeypatch.setattr(
         runner_module.github_client,
-        "fetch_rate_limit_budget",
-        lambda: _budget(remaining=1, limit=5000),
+        "fetch_rate_limit_buckets",
+        lambda: (_budget(remaining=1, limit=5000), None),
     )
 
     asyncio.run(runner.run_cycle())
@@ -20941,10 +20978,10 @@ def test_refresh_github_api_budget_picks_up_sibling_update_within_ttl(
 
     def _fetch() -> object:
         fetch_calls["count"] += 1  # pragma: no cover - probe must not be invoked
-        return _budget(remaining=1)
+        return _budget(remaining=1), None
 
     monkeypatch.setattr(
-        runner_module.github_client, "fetch_rate_limit_budget", _fetch
+        runner_module.github_client, "fetch_rate_limit_buckets", _fetch
     )
 
     result = asyncio.run(runner._refresh_github_api_budget())
@@ -20967,8 +21004,8 @@ def test_refresh_github_api_budget_keeps_cache_when_fetch_fails(
     )
     monkeypatch.setattr(
         runner_module.github_client,
-        "fetch_rate_limit_budget",
-        lambda: None,
+        "fetch_rate_limit_buckets",
+        lambda: (None, None),
     )
 
     result = asyncio.run(runner._refresh_github_api_budget())
@@ -20990,8 +21027,8 @@ def test_refresh_github_api_budget_releases_lock_when_probe_returns_none(
     runner = _make_runner()
     monkeypatch.setattr(
         runner_module.github_client,
-        "fetch_rate_limit_budget",
-        lambda: None,
+        "fetch_rate_limit_buckets",
+        lambda: (None, None),
     )
 
     result = asyncio.run(runner._refresh_github_api_budget())
@@ -21020,10 +21057,10 @@ def test_refresh_github_api_budget_skips_fetch_when_lock_held(
 
     def _fetch() -> object:
         fetch_calls["count"] += 1
-        return _budget(remaining=1)
+        return _budget(remaining=1), None
 
     monkeypatch.setattr(
-        runner_module.github_client, "fetch_rate_limit_budget", _fetch
+        runner_module.github_client, "fetch_rate_limit_buckets", _fetch
     )
 
     result = asyncio.run(runner._refresh_github_api_budget())
@@ -21051,10 +21088,10 @@ def test_refresh_github_api_budget_lock_serializes_concurrent_runners(
 
     def _fetch() -> object:
         fetch_calls["count"] += 1
-        return fetched
+        return fetched, None
 
     monkeypatch.setattr(
-        runner_module.github_client, "fetch_rate_limit_budget", _fetch
+        runner_module.github_client, "fetch_rate_limit_buckets", _fetch
     )
 
     result_a = asyncio.run(runner_a._refresh_github_api_budget())
@@ -21079,8 +21116,8 @@ def test_refresh_github_api_budget_falls_back_to_local_cache_when_shared_empty(
 
     monkeypatch.setattr(
         runner_module.github_client,
-        "fetch_rate_limit_budget",
-        lambda: _budget(remaining=1),
+        "fetch_rate_limit_buckets",
+        lambda: (_budget(remaining=1), None),
     )
 
     result = asyncio.run(runner._refresh_github_api_budget())
@@ -21103,8 +21140,8 @@ def test_refresh_github_api_budget_keeps_ttl_unset_when_no_snapshot(
 
     monkeypatch.setattr(
         runner_module.github_client,
-        "fetch_rate_limit_budget",
-        lambda: None,  # pragma: no cover - lock held, fetch never invoked
+        "fetch_rate_limit_buckets",
+        lambda: (None, None),  # pragma: no cover - lock held, fetch never invoked
     )
 
     result = asyncio.run(runner._refresh_github_api_budget())

@@ -42,7 +42,12 @@ from src.config import (
     update_daemon_config,
     update_repository,
 )
-from src.daemon.github_rate_limit import read_budget, recent_cycle_burns
+from src.daemon.github_rate_limit import (
+    RateLimitBudget,
+    read_graphql_budget,
+    read_rest_budget,
+    recent_cycle_burns,
+)
 from src.events import publish_repo_event, publish_wake
 from src.events.sse import RepoEventsUnavailableError, stream_repo_events
 from src.metrics import MetricsStore, RunRecord
@@ -69,6 +74,23 @@ logger = logging.getLogger(__name__)
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 templates.env.globals["utcnow"] = lambda: datetime.now(timezone.utc)
+
+
+def _format_reset_unix(reset_unix: int | None) -> str:
+    """Render ``reset_unix`` as ``HH:MM UTC`` for resource-chip tooltips.
+
+    Returns ``"unknown"`` for ``None`` so the template still has a string
+    to interpolate; the chip template only renders the "Resets at" line
+    when ``reset_unix`` is truthy, so this branch is defensive.
+    """
+    if not reset_unix:
+        return "unknown"
+    return datetime.fromtimestamp(int(reset_unix), tz=timezone.utc).strftime(
+        "%H:%M UTC"
+    )
+
+
+templates.env.filters["format_reset"] = _format_reset_unix
 _HISTORY_LIMIT = 100
 _METRICS_PANEL_LIMIT = 20
 _METRICS_SCAN_LIMIT = 100
@@ -389,38 +411,106 @@ async def _build_recent_graphql_burns_view(
     }
 
 
-async def _build_github_api_budget_view(
-    redis_client: aioredis.Redis | None,
-    config: AppConfig,
-) -> dict[str, Any] | None:
-    """Return a render-ready budget snapshot for the dashboard.
+def _resource_zone(percent_remaining: float | None) -> str:
+    """Map ``percent_remaining`` to one of ``green|amber|red|none``.
 
-    Returns ``None`` when no observation has been persisted yet so the
-    template can hide the bar entirely. Color bucket maps to the same
-    daemon thresholds the poll loop uses, so the dashboard's red/amber
-    indicator matches the daemon's actual pause/slowdown trigger points.
+    Boundaries: ``>=50`` green, ``20<=pct<50`` amber, ``<20`` red. ``None``
+    (resource value unknown) collapses to ``none`` so the chip can render
+    a neutral placeholder rather than mis-coloring a missing reading.
     """
-    budget = await read_budget(redis_client)
+    if percent_remaining is None:
+        return "none"
+    if percent_remaining >= 50:
+        return "green"
+    if percent_remaining >= 20:
+        return "amber"
+    return "red"
+
+
+def _budget_chip(
+    budget: RateLimitBudget | None,
+) -> dict[str, Any]:
     if budget is None:
-        return None
+        return {
+            "remaining": None,
+            "limit": None,
+            "percent_remaining": None,
+            "reset_unix": None,
+            "zone": "none",
+        }
     pct = budget.remaining_percent
-    pause_pct = config.daemon.github_api_pause_threshold_percent
-    slowdown_pct = config.daemon.github_api_slowdown_threshold_percent
-    now = datetime.now(timezone.utc)
-    if now >= budget.reset_at:
-        bucket = "ok"
-    elif pct < pause_pct:
-        bucket = "critical"
-    elif pct < slowdown_pct:
-        bucket = "low"
-    else:
-        bucket = "ok"
     return {
         "remaining": budget.remaining,
         "limit": budget.limit,
-        "percent": round(pct, 1),
-        "reset_at": budget.reset_at,
-        "bucket": bucket,
+        "percent_remaining": round(pct, 1),
+        "reset_unix": int(budget.reset_at.timestamp()),
+        "zone": _resource_zone(pct),
+    }
+
+
+def _claude_usage_chip(
+    states: list[RepoState],
+    *,
+    window: Literal["session", "weekly"],
+) -> dict[str, Any]:
+    """Aggregate Claude usage across active Claude repos for the chip row.
+
+    All Claude repos share one OAuth account so any active Claude state's
+    snapshot is representative of the whole account. The most recently
+    updated one wins so the chip reflects the freshest observation.
+    """
+    candidate: RepoState | None = None
+    for state in states:
+        if (state.coder or "") != "claude":
+            continue
+        if window == "session" and state.usage_session_percent is None:
+            continue
+        if window == "weekly" and state.usage_weekly_percent is None:
+            continue
+        if candidate is None or state.last_updated > candidate.last_updated:
+            candidate = state
+    if candidate is None:
+        return {
+            "remaining": None,
+            "limit": None,
+            "percent_remaining": None,
+            "reset_unix": None,
+            "zone": "none",
+        }
+    if window == "session":
+        used = candidate.usage_session_percent or 0
+        reset_unix = candidate.usage_session_resets_at
+    else:
+        used = candidate.usage_weekly_percent or 0
+        reset_unix = candidate.usage_weekly_resets_at
+    pct_remaining = max(0.0, min(100.0, 100.0 - float(used)))
+    return {
+        "remaining": int(round(pct_remaining)),
+        "limit": 100,
+        "percent_remaining": round(pct_remaining, 1),
+        "reset_unix": reset_unix,
+        "zone": _resource_zone(pct_remaining),
+    }
+
+
+async def _build_resources_view(
+    redis_client: aioredis.Redis | None,
+    states: list[RepoState],
+) -> dict[str, dict[str, Any]]:
+    """Return the four-resource payload for the dashboard chip row.
+
+    Each entry exposes ``remaining``, ``limit``, ``percent_remaining``,
+    ``reset_unix`` and a precomputed ``zone`` (``green|amber|red|none``).
+    Missing data renders as ``percent_remaining: None`` plus ``zone: none``
+    rather than crashing the dashboard or hiding the chip.
+    """
+    rest = await read_rest_budget(redis_client)
+    graphql = await read_graphql_budget(redis_client)
+    return {
+        "github_rest": _budget_chip(rest),
+        "github_graphql": _budget_chip(graphql),
+        "claude_5h": _claude_usage_chip(states, window="session"),
+        "claude_weekly": _claude_usage_chip(states, window="weekly"),
     }
 
 
@@ -1028,9 +1118,7 @@ async def index(request: Request) -> HTMLResponse:
     stats = _compute_stats(states)
     alerts = _build_alerts(states)
     latest_alert = min(alerts, key=lambda a: a["duration_seconds"]) if alerts else None
-    github_api_budget = await _build_github_api_budget_view(
-        redis_client, load_config(CONFIG_PATH)
-    )
+    resources = await _build_resources_view(redis_client, states)
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -1040,7 +1128,7 @@ async def index(request: Request) -> HTMLResponse:
             "stats": stats,
             "latest_alert": latest_alert,
             "redis_warning": redis_warning,
-            "github_api_budget": github_api_budget,
+            "resources": resources,
         },
     )
 
@@ -1100,16 +1188,14 @@ async def partial_redis_banner(request: Request) -> HTMLResponse:
 async def partial_repo_list(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
     states, redis_warning = await get_all_repo_states(redis_client)
-    github_api_budget = await _build_github_api_budget_view(
-        redis_client, load_config(CONFIG_PATH)
-    )
+    resources = await _build_resources_view(redis_client, states)
     return templates.TemplateResponse(
         request,
         "components/repo_cards.html",
         {
             "repos": states,
             "redis_warning": redis_warning,
-            "github_api_budget": github_api_budget,
+            "resources": resources,
         },
     )
 

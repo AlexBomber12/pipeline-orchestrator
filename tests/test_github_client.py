@@ -4015,6 +4015,47 @@ def test_fetch_rate_limit_budget_returns_none_on_malformed_int(
     assert github_client.fetch_rate_limit_budget() is None
 
 
+def test_fetch_rate_limit_buckets_returns_each_bucket_separately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both buckets surface independently so the dashboard renders each chip."""
+    monkeypatch.setattr(
+        github_client,
+        "run_gh",
+        lambda args, **kw: {
+            "core": _bucket(remaining=4321),
+            "graphql": _bucket(remaining=120),
+        },
+    )
+    rest, graphql = github_client.fetch_rate_limit_buckets()
+    assert rest is not None and rest.remaining == 4321
+    assert graphql is not None and graphql.remaining == 120
+
+
+def test_fetch_rate_limit_buckets_returns_pair_of_none_on_gh_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise(args: list[str], **kw: Any) -> None:
+        raise RuntimeError("gh down")
+
+    monkeypatch.setattr(github_client, "run_gh", _raise)
+    assert github_client.fetch_rate_limit_buckets() == (None, None)
+
+
+def test_fetch_rate_limit_buckets_returns_pair_of_none_on_invalid_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(github_client, "run_gh", lambda args, **kw: "not-json")
+    assert github_client.fetch_rate_limit_buckets() == (None, None)
+
+
+def test_fetch_rate_limit_buckets_returns_pair_of_none_on_unexpected_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(github_client, "run_gh", lambda args, **kw: [1])
+    assert github_client.fetch_rate_limit_buckets() == (None, None)
+
+
 def test_get_latest_codex_feedback_collects_post_anchor_codex_comments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 #: a single budget per gh-CLI auth is the operational unit anyway.
 BUDGET_REDIS_KEY = "github_rate_limit_budget"
 
+#: Per-bucket Redis keys. The daemon throttles on the constrained min via
+#: ``BUDGET_REDIS_KEY``; the dashboard renders REST and GraphQL separately
+#: so an operator can see *which* surface is near exhaustion.
+BUDGET_REST_REDIS_KEY = "github_rate_limit_budget_rest"
+BUDGET_GRAPHQL_REDIS_KEY = "github_rate_limit_budget_graphql"
+
 #: Cross-runner refresh-lock key. Set with ``NX`` + ``EX`` so only one runner
 #: per TTL window probes ``gh api rate_limit``; the rest read the result via
 #: ``read_budget``. Without this, probe traffic scales linearly with repo
@@ -112,12 +118,11 @@ def _coerce_int(value: object, *, default: int) -> int:
         return default
 
 
-async def read_budget(redis_client: Any) -> RateLimitBudget | None:
-    """Return the most recent budget observation, or ``None`` if absent."""
+async def _read_budget_at(redis_client: Any, key: str) -> RateLimitBudget | None:
     if redis_client is None:
         return None
     try:
-        raw = await redis_client.get(BUDGET_REDIS_KEY)
+        raw = await redis_client.get(key)
     except Exception:
         return None
     if not raw:
@@ -125,14 +130,45 @@ async def read_budget(redis_client: Any) -> RateLimitBudget | None:
     return RateLimitBudget.from_redis_payload(raw)
 
 
-async def write_budget(redis_client: Any, budget: RateLimitBudget) -> None:
-    """Persist ``budget`` for dashboard and cross-runner readers."""
+async def _write_budget_at(
+    redis_client: Any, budget: RateLimitBudget, key: str
+) -> None:
     if redis_client is None:
         return
     try:
-        await redis_client.set(BUDGET_REDIS_KEY, budget.to_redis_payload())
+        await redis_client.set(key, budget.to_redis_payload())
     except Exception:
-        logger.warning("Failed to persist GitHub API budget", exc_info=True)
+        logger.warning("Failed to persist GitHub API budget at %s", key, exc_info=True)
+
+
+async def read_budget(redis_client: Any) -> RateLimitBudget | None:
+    """Return the most recent budget observation, or ``None`` if absent."""
+    return await _read_budget_at(redis_client, BUDGET_REDIS_KEY)
+
+
+async def write_budget(redis_client: Any, budget: RateLimitBudget) -> None:
+    """Persist ``budget`` for dashboard and cross-runner readers."""
+    await _write_budget_at(redis_client, budget, BUDGET_REDIS_KEY)
+
+
+async def read_rest_budget(redis_client: Any) -> RateLimitBudget | None:
+    """Return the most recent REST/core bucket snapshot, or ``None``."""
+    return await _read_budget_at(redis_client, BUDGET_REST_REDIS_KEY)
+
+
+async def write_rest_budget(redis_client: Any, budget: RateLimitBudget) -> None:
+    """Persist the REST/core bucket so the dashboard can render it alone."""
+    await _write_budget_at(redis_client, budget, BUDGET_REST_REDIS_KEY)
+
+
+async def read_graphql_budget(redis_client: Any) -> RateLimitBudget | None:
+    """Return the most recent GraphQL bucket snapshot, or ``None``."""
+    return await _read_budget_at(redis_client, BUDGET_GRAPHQL_REDIS_KEY)
+
+
+async def write_graphql_budget(redis_client: Any, budget: RateLimitBudget) -> None:
+    """Persist the GraphQL bucket so the dashboard can render it alone."""
+    await _write_budget_at(redis_client, budget, BUDGET_GRAPHQL_REDIS_KEY)
 
 
 async def try_claim_refresh_lock(redis_client: Any, ttl_seconds: int) -> bool:

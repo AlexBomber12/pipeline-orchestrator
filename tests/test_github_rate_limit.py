@@ -7,16 +7,22 @@ from datetime import datetime, timezone
 from typing import Any
 
 from src.daemon.github_rate_limit import (
+    BUDGET_GRAPHQL_REDIS_KEY,
     BUDGET_REDIS_KEY,
+    BUDGET_REST_REDIS_KEY,
     BURNS_REDIS_KEY_PREFIX,
     REFRESH_LOCK_REDIS_KEY,
     RateLimitBudget,
     read_budget,
+    read_graphql_budget,
+    read_rest_budget,
     recent_cycle_burns,
     record_cycle_burn,
     release_refresh_lock,
     try_claim_refresh_lock,
     write_budget,
+    write_graphql_budget,
+    write_rest_budget,
 )
 
 
@@ -327,3 +333,34 @@ def test_recent_cycle_burns_skips_malformed_entries() -> None:
     redis = _FakeRedis()
     redis.lists[f"{BURNS_REDIS_KEY_PREFIX}octo__demo"] = ["3", "not-a-number", "1"]
     assert asyncio.run(recent_cycle_burns(redis, "octo__demo")) == [3, 1]
+
+
+def test_per_bucket_helpers_roundtrip_under_distinct_keys() -> None:
+    """REST and GraphQL snapshots live under their own keys for the dashboard."""
+    redis = _FakeRedis()
+    rest_budget = _budget(remaining=4321)
+    graphql_budget = _budget(remaining=120)
+
+    asyncio.run(write_rest_budget(redis, rest_budget))
+    asyncio.run(write_graphql_budget(redis, graphql_budget))
+
+    assert BUDGET_REST_REDIS_KEY in redis.store
+    assert BUDGET_GRAPHQL_REDIS_KEY in redis.store
+    assert asyncio.run(read_rest_budget(redis)) == rest_budget
+    assert asyncio.run(read_graphql_budget(redis)) == graphql_budget
+
+
+def test_per_bucket_read_returns_none_when_redis_is_none() -> None:
+    """No-Redis deployments degrade gracefully rather than raising."""
+    assert asyncio.run(read_rest_budget(None)) is None
+    assert asyncio.run(read_graphql_budget(None)) is None
+
+
+def test_per_bucket_write_swallows_redis_failure() -> None:
+    """Best-effort persistence: a Redis hiccup must not crash the runner."""
+    redis = _FakeRedis()
+    redis.set_failure = True
+    asyncio.run(write_rest_budget(redis, _budget()))
+    asyncio.run(write_graphql_budget(redis, _budget()))
+    assert BUDGET_REST_REDIS_KEY not in redis.store
+    assert BUDGET_GRAPHQL_REDIS_KEY not in redis.store

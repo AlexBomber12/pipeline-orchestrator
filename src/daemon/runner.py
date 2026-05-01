@@ -50,6 +50,8 @@ from src.daemon.github_rate_limit import (
     release_refresh_lock,
     try_claim_refresh_lock,
     write_budget,
+    write_graphql_budget,
+    write_rest_budget,
 )
 from src.daemon.handlers.coding import CodingMixin
 from src.daemon.handlers.error import (  # noqa: F401 — re-exported for tests
@@ -1021,7 +1023,19 @@ class PipelineRunner(
         ):
             return self._github_api_budget_cache
         if await try_claim_refresh_lock(self.redis, ttl_seconds=60):
-            budget = await asyncio.to_thread(github_client.fetch_rate_limit_budget)
+            rest, graphql = await asyncio.to_thread(
+                github_client.fetch_rate_limit_buckets
+            )
+            if rest is not None:
+                await write_rest_budget(self.redis, rest)
+            if graphql is not None:
+                await write_graphql_budget(self.redis, graphql)
+            candidates = [b for b in (rest, graphql) if b is not None]
+            budget = (
+                min(candidates, key=lambda b: b.remaining_percent)
+                if candidates
+                else None
+            )
             if budget is not None:
                 self._github_api_budget_cache = budget
                 self._github_api_budget_last_fetched = now
