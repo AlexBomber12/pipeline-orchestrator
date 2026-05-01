@@ -88,7 +88,7 @@ class WatchMixin:
         """Poll PR status and decide whether to merge, fix, hang, or wait."""
         if self.state.current_pr is None:
             self.state.state = PipelineState.IDLE
-            self.log_event("WATCH without current_pr -> IDLE")
+            self.log_event("[WATCH] WATCH without current_pr -> IDLE.")
             return
 
         try:
@@ -99,7 +99,7 @@ class WatchMixin:
         except Exception as exc:
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"get_open_prs failed: {exc}"
-            self.log_event(str(exc))
+            self.log_event(f"[WATCH] {exc}.")
             return
 
         current_pr = self.state.current_pr
@@ -111,15 +111,19 @@ class WatchMixin:
             merged = github_client.is_pr_merged(self.owner_repo, current_number)
             if merged is True:
                 await self._save_current_run_record("success_merged")
-                self.log_event(f"PR #{current_number} merged externally -> IDLE")
+                self.log_event(
+                    f"[WATCH] PR #{current_number} merged externally -> IDLE."
+                )
             elif merged is False:
                 await self._save_current_run_record("closed_unmerged")
                 self.log_event(
-                    f"PR #{current_number} closed without merge -> IDLE"
+                    f"[WATCH] PR #{current_number} closed without merge "
+                    f"-> IDLE."
                 )
             else:
                 self.log_event(
-                    f"PR #{current_number} no longer open (state unknown) -> IDLE"
+                    f"[WATCH] PR #{current_number} no longer open (state "
+                    f"unknown) -> IDLE."
                 )
             self._current_run_record = None
             self.state.current_pr = None
@@ -157,17 +161,17 @@ class WatchMixin:
                 await self.handle_merge()
             else:
                 self.log_event(
-                    f"PR #{found.number} green but auto_merge disabled; "
-                    "awaiting manual merge"
+                    f"[WATCH] PR #{found.number} green but auto_merge "
+                    f"disabled; awaiting manual merge."
                 )
             return
         # Fork (cross-repo) PRs can't be fixed locally.
         if found.is_cross_repository:
             if ci == CIStatus.FAILURE or review == ReviewStatus.CHANGES_REQUESTED:
                 self.log_event(
-                    f"PR #{found.number} fork PR cannot be auto-fixed "
-                    f"(review={review.value}, ci={ci.value}); "
-                    "waiting for review timeout"
+                    f"[WATCH] PR #{found.number} fork PR cannot be "
+                    f"auto-fixed (review={review.value}, ci={ci.value}); "
+                    f"waiting for review timeout."
                 )
         elif ci == CIStatus.FAILURE:
             await self.handle_fix()
@@ -181,13 +185,14 @@ class WatchMixin:
                 return
             if result == FeedbackCheckResult.UNKNOWN:
                 self.log_event(
-                    f"PR #{found.number} CHANGES_REQUESTED but feedback check "
-                    "failed; staying in WATCH, will retry next cycle"
+                    f"[WATCH] PR #{found.number} CHANGES_REQUESTED but "
+                    f"feedback check failed; staying in WATCH, will retry "
+                    f"next cycle."
                 )
                 return
             self.log_event(
-                f"PR #{found.number} CHANGES_REQUESTED but no new "
-                "Codex feedback since last push; waiting for fresh review"
+                f"[WATCH] PR #{found.number} CHANGES_REQUESTED but no new "
+                f"Codex feedback since last push; waiting for fresh review."
             )
             self._maybe_retrigger_stale_review(found.number)
 
@@ -219,14 +224,14 @@ class WatchMixin:
         if elapsed_min >= timeout_min:
             self.state.state = PipelineState.HUNG
             self.log_event(
-                f"PR #{found.number} hung after {elapsed_min:.0f}m "
-                f"(review={review.value}, ci={ci.value})"
+                f"[WATCH] PR #{found.number} hung after {elapsed_min:.0f}m "
+                f"(review={review.value}, ci={ci.value})."
             )
         else:
             self.log_event(
-                f"PR #{found.number} waiting "
+                f"[WATCH] PR #{found.number} waiting "
                 f"(review={review.value}, ci={ci.value}, "
-                f"{elapsed_min:.0f}/{timeout_min}m)"
+                f"{elapsed_min:.0f}/{timeout_min}m)."
             )
 
     def _observe_watch_event_signature(self, found: object) -> None:
@@ -346,8 +351,8 @@ class WatchMixin:
                 return False
 
         self.log_event(
-            f"Stale CHANGES_REQUESTED on PR #{pr_number}; re-triggering "
-            "@codex review."
+            f"[WATCH] Stale CHANGES_REQUESTED on PR #{pr_number}; "
+            f"re-triggering @codex review."
         )
         success, posted, retry_at = self._post_codex_review_result(
             pr_number,
@@ -412,8 +417,8 @@ class WatchMixin:
                 return False
 
         self.log_event(
-            f"Codex bot error comment on PR #{pr_number}; "
-            "re-triggering @codex review."
+            f"[WATCH] Codex bot error comment on PR #{pr_number}; "
+            f"re-triggering @codex review."
         )
         success, posted, _retry_at = self._post_codex_review_result(
             pr_number,

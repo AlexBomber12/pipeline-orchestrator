@@ -541,7 +541,7 @@ def test_recover_doing_task_without_pr_marks_canceled_and_idles(
     assert runner.state.current_pr is None
     assert runner._crashed_task_pr_ids == {"PR-042"}
     assert any(
-        "Task PR-042 crashed, marking CANCELED. "
+        "[INFRA] Task PR-042 crashed, marking CANCELED. "
         "Manually re-upload to retry." == e["event"]
         for e in runner.state.history
     )
@@ -619,7 +619,8 @@ def test_recover_paused_doing_task_without_pr_defers_coding(
     assert runner.state.current_task.pr_id == "PR-042"
     assert runner.state.current_pr is None
     assert any(
-        "Recovered: DOING task PR-042, no PR but user_paused -> defer CODING until resume"
+        "[INFRA] Recovered: DOING task PR-042, no PR but user_paused "
+        "-> defer CODING until resume."
         == e["event"]
         for e in runner.state.history
     )
@@ -1143,7 +1144,7 @@ def test_recover_crashed_preflight_task_marks_canceled_and_idles(
     # against a quiesced repo.
     assert runner.state.error_message is None
     assert any(
-        "Task PR-042 crashed, marking CANCELED. "
+        "[INFRA] Task PR-042 crashed, marking CANCELED. "
         "Manually re-upload to retry." == e["event"]
         for e in runner.state.history
     )

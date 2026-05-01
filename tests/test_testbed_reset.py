@@ -571,7 +571,7 @@ def test_stop_daemon_waits_for_runner_pause_ack() -> None:
                 ).encode(),
                 (
                     f'[{{"name": "{slug}", "state": "WATCH", "user_paused": true, '
-                    '"history": [{"event": "Paused. Press Play to resume."}]}]'
+                    '"history": [{"event": "[INFRA] Paused. Press Play to resume."}]}]'
                 ).encode(),
             ]
         )

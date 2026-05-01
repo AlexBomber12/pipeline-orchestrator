@@ -161,7 +161,7 @@ def test_sigkill_during_coding_recovers_correctly(
 
         history = recovered.get("history") or []
         crash_event = (
-            f"Task {expected_pr_id} crashed, marking CANCELED. "
+            f"[INFRA] Task {expected_pr_id} crashed, marking CANCELED. "
             "Manually re-upload to retry."
         )
         assert any(

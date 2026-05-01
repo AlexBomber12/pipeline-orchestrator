@@ -78,7 +78,7 @@ class MergeMixin:
                                 "resolution"
                             )
                             await self._save_current_run_record("error")
-                            self.log_event(self.state.error_message)
+                            self.log_event(f"[MERGE] {self.state.error_message}.")
                             return
                         coder_name, _plugin = selected
                         if not await self._check_rate_limit(
@@ -91,7 +91,7 @@ class MergeMixin:
                             )
                             return
                         self.log_event(
-                            "Merge conflict with main, resolving..."
+                            "[MERGE] Merge conflict with main, resolving..."
                         )
                         if self._current_run_record is not None:
                             self._current_run_record.had_merge_conflict = True
@@ -127,8 +127,9 @@ class MergeMixin:
                                 self.state.error_message = None
                                 await self._save_current_run_record("rate_limit")
                                 self.log_event(
-                                    f"Rate limit pause active until "
-                                    f"{self.state.rate_limited_until.isoformat()}"
+                                    f"[RATE-LIMIT] Rate limit pause "
+                                    f"active until "
+                                    f"{self.state.rate_limited_until.isoformat()}."
                                 )
                                 return
                             self.state.state = PipelineState.ERROR
@@ -136,7 +137,7 @@ class MergeMixin:
                                 "Merge conflict resolution failed"
                             )
                             await self._save_current_run_record("error")
-                            self.log_event(self.state.error_message)
+                            self.log_event(f"[MERGE] {self.state.error_message}.")
                             return
                         sync_produced_commit = True
                     else:
@@ -146,7 +147,7 @@ class MergeMixin:
                             f"{merge_result.stderr.strip()}"
                         )
                         await self._save_current_run_record("error")
-                        self.log_event(self.state.error_message)
+                        self.log_event(f"[MERGE] {self.state.error_message}.")
                         return
                 else:
                     sync_produced_commit = (
@@ -171,9 +172,9 @@ class MergeMixin:
                     )
                     self.state.state = PipelineState.WATCH
                     self.log_event(
-                        f"Pre-merge sync pushed new commits to PR "
+                        f"[MERGE] Pre-merge sync pushed new commits to PR "
                         f"#{number}; returning to WATCH to re-verify "
-                        "gates"
+                        f"gates."
                     )
                     if not self._post_codex_review(number):
                         self.state.state = PipelineState.ERROR
@@ -189,11 +190,11 @@ class MergeMixin:
                 self.state.state = PipelineState.ERROR
                 self.state.error_message = f"Pre-merge sync failed: {exc}"
                 await self._save_current_run_record("error")
-                self.log_event(self.state.error_message)
+                self.log_event(f"[MERGE] {self.state.error_message}.")
                 return
 
         merged_diff_stats = self._compute_diff_stats(base)
-        self.log_event(f"Merging PR #{number}")
+        self.log_event(f"[MERGE] Merging PR #{number}.")
         try:
             github_client.run_gh(
                 ["pr", "ready", str(number)],
@@ -212,13 +213,13 @@ class MergeMixin:
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"merge_pr failed: {exc}"
             await self._save_current_run_record("error")
-            self.log_event(str(exc))
+            self.log_event(f"[MERGE] {exc}.")
             return
 
         try:
             self._mark_queue_done()
         except Exception as exc:
-            self.log_event(f"Warning: queue-sync step failed: {exc}")
+            self.log_event(f"[MERGE] Warning: queue-sync step failed: {exc}.")
 
         await self._save_current_run_record(
             "success_merged",
@@ -229,7 +230,7 @@ class MergeMixin:
         self.state.current_pr = None
         self.state.current_task = None
         self.state.state = PipelineState.IDLE
-        self.log_event(f"Merged PR #{number} -> IDLE")
+        self.log_event(f"[MERGE] Merged PR #{number} -> IDLE.")
 
     def _mark_queue_done(self) -> None:
         """Mark the merged task DONE in the local QUEUE.md only.
@@ -268,7 +269,8 @@ class MergeMixin:
             content = queue_path.read_text()
         except OSError as exc:
             self.log_event(
-                f"Warning: read QUEUE.md to mark {pr_id} DONE failed: {exc}"
+                f"[MERGE] Warning: read QUEUE.md to mark {pr_id} DONE "
+                f"failed: {exc}."
             )
             return
 
@@ -280,10 +282,11 @@ class MergeMixin:
             queue_path.write_text(updated)
         except OSError as exc:
             self.log_event(
-                f"Warning: write QUEUE.md to mark {pr_id} DONE failed: {exc}"
+                f"[MERGE] Warning: write QUEUE.md to mark {pr_id} DONE "
+                f"failed: {exc}."
             )
             return
-        self.log_event(f"Marked {pr_id} DONE in QUEUE.md")
+        self.log_event(f"[MERGE] Marked {pr_id} DONE in QUEUE.md.")
 
     def _resolve_pending_queue_sync(self) -> bool:
         """Poll the outstanding queue-sync PR and gate IDLE dispatch.
@@ -300,7 +303,9 @@ class MergeMixin:
                 repo=self.owner_repo,
             )
         except Exception as exc:
-            self.log_event(f"queue-sync PR {branch} view failed: {exc}")
+            self.log_event(
+                f"[MERGE] queue-sync PR {branch} view failed: {exc}."
+            )
             self._escalate_queue_sync_if_expired(branch)
             return False
 
@@ -313,7 +318,7 @@ class MergeMixin:
         if state == "MERGED" or merged_at:
             self.state.pending_queue_sync_branch = None
             self.state.pending_queue_sync_started_at = None
-            self.log_event(f"Queue-sync PR merged ({branch})")
+            self.log_event(f"[MERGE] Queue-sync PR merged ({branch}).")
             return True
 
         if state == "CLOSED":
@@ -323,7 +328,7 @@ class MergeMixin:
             self.state.error_message = (
                 f"queue-sync PR {branch} closed without merging"
             )
-            self.log_event(self.state.error_message)
+            self.log_event(f"[MERGE] {self.state.error_message}.")
             return False
 
         self._escalate_queue_sync_if_expired(branch)
@@ -343,4 +348,4 @@ class MergeMixin:
             f"queue-sync PR {branch} unresolved after "
             f"{int(elapsed)}s (max {_QUEUE_SYNC_MAX_WAIT_SEC}s)"
         )
-        self.log_event(self.state.error_message)
+        self.log_event(f"[MERGE] {self.state.error_message}.")

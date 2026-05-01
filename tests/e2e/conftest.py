@@ -43,7 +43,8 @@ def _stop_daemon_and_wait_paused(slug: str, timeout_sec: int = 30) -> None:
                     history = entry.get("history") or []
                     last_event = history[-1].get("event") if history and isinstance(history[-1], dict) else None
                     if last_state == "PAUSED" or (
-                        last_user_paused is True and last_event == "Paused. Press Play to resume."
+                        last_user_paused is True
+                        and last_event == "[INFRA] Paused. Press Play to resume."
                     ):
                         return
         time.sleep(0.5)

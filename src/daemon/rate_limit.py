@@ -72,8 +72,9 @@ class RateLimitMixin:
             ):
                 self._usage_degraded_logged = True
                 self.log_event(
-                    f"[{coder_name}] Usage API degraded (10 consecutive failures), "
-                    "falling back to reactive rate-limit detection"
+                    f"[RATE-LIMIT] [{coder_name}] Usage API degraded "
+                    f"(10 consecutive failures), falling back to "
+                    f"reactive rate-limit detection."
                 )
             return True
         self._usage_degraded_logged = False
@@ -98,9 +99,10 @@ class RateLimitMixin:
             self.state.error_message = None
         self.state.state = PipelineState.PAUSED
         self.log_event(
-            f"[{coder_name}] Proactive pause: {breached} usage at "
+            f"[RATE-LIMIT] [{coder_name}] Proactive pause: {breached} "
+            f"usage at "
             f"{snapshot.session_percent if breached == 'session' else snapshot.weekly_percent}%, "
-            f"resumes at {until.isoformat()}"
+            f"resumes at {until.isoformat()}."
         )
         return False
 
@@ -143,14 +145,19 @@ class RateLimitMixin:
                 effective_until = self._rate_limit_until_for(effective_coder)
                 self._claude_usage_provider.invalidate_cache()
                 self._codex_usage_provider.invalidate_cache()
-                self.log_event("Rate limit window expired, resuming")
+                self.log_event(
+                    "[RATE-LIMIT] Rate limit window expired, resuming."
+                )
                 if effective_until is not None:
                     self.state.rate_limited_until = effective_until
                     self.state.rate_limit_reactive_coder = effective_coder
                     if self.state.state != PipelineState.PAUSED:
                         self.state.state = PipelineState.PAUSED
                     remaining = (effective_until - now).total_seconds()
-                    self.log_event(f"Rate limited, resuming in {int(remaining)}s")
+                    self.log_event(
+                        f"[RATE-LIMIT] Rate limited, resuming in "
+                        f"{int(remaining)}s."
+                    )
                     return False
                 return await self._proactive_usage_check(proactive_coder=proactive_coder)
             # A pause from a *different* effective coder doesn't apply.
@@ -169,7 +176,10 @@ class RateLimitMixin:
                     if self.state.state != PipelineState.PAUSED:
                         self.state.state = PipelineState.PAUSED
                     remaining = (effective_until - now).total_seconds()
-                    self.log_event(f"Rate limited, resuming in {int(remaining)}s")
+                    self.log_event(
+                        f"[RATE-LIMIT] Rate limited, resuming in "
+                        f"{int(remaining)}s."
+                    )
                     return False
                 if self.state.state == PipelineState.PAUSED:
                     if (
@@ -189,16 +199,19 @@ class RateLimitMixin:
                 self._claude_usage_provider.invalidate_cache()
                 self._codex_usage_provider.invalidate_cache()
                 self.log_event(
-                    f"{effective_coder.capitalize()} active while "
-                    f"{pause_coder} remains rate-limited until "
-                    f"{pause_until.isoformat()}"
+                    f"[RATE-LIMIT] {effective_coder.capitalize()} active "
+                    f"while {pause_coder} remains rate-limited until "
+                    f"{pause_until.isoformat()}."
                 )
                 return await self._proactive_usage_check(proactive_coder=proactive_coder)
             if now < pause_until:
                 if self.state.state != PipelineState.PAUSED:
                     self.state.state = PipelineState.PAUSED
                 remaining = (pause_until - now).total_seconds()
-                self.log_event(f"Rate limited, resuming in {int(remaining)}s")
+                self.log_event(
+                    f"[RATE-LIMIT] Rate limited, resuming in "
+                    f"{int(remaining)}s."
+                )
                 return False
         if effective_until is not None:
             self.state.rate_limited_until = effective_until
@@ -206,7 +219,10 @@ class RateLimitMixin:
             if self.state.state != PipelineState.PAUSED:
                 self.state.state = PipelineState.PAUSED
             remaining = (effective_until - now).total_seconds()
-            self.log_event(f"Rate limited, resuming in {int(remaining)}s")
+            self.log_event(
+                f"[RATE-LIMIT] Rate limited, resuming in "
+                f"{int(remaining)}s."
+            )
             return False
         return await self._proactive_usage_check(proactive_coder=proactive_coder)
 
@@ -315,6 +331,6 @@ class RateLimitMixin:
             until = datetime.now(timezone.utc) + timedelta(minutes=pause_min)
             self._record_rate_limit(coder_name, until, reactive=True)
             self.log_event(
-                f"[{coder_name}] Rate limit detected ({limit_type}), "
-                f"pausing for {pause_min} min"
+                f"[RATE-LIMIT] [{coder_name}] Rate limit detected "
+                f"({limit_type}), pausing for {pause_min} min."
             )
