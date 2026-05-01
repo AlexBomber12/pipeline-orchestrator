@@ -12926,7 +12926,7 @@ def test_handle_error_skips_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     runner.state.error_message = "claude CLI timeout after 900s"
     asyncio.run(runner.handle_error())
     assert called == []
-    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.state == PipelineState.IDLE
 
 
 def test_handle_error_skips_rate_limit(
@@ -15298,7 +15298,7 @@ def test_handle_error_skips_diagnose_for_infra_error(
     asyncio.run(runner.handle_error())
 
     assert cli_calls == []
-    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.state == PipelineState.IDLE
     assert runner.state.error_message == msg
     assert runner._error_skip_context is None
     assert runner._error_skip_count == 0
@@ -15308,7 +15308,8 @@ def test_handle_error_skips_diagnose_for_infra_error(
     assert runner._error_diagnose_count == 1
     assert any(
         e["event"].startswith(
-            "[ERROR] Infra error detected, skipping AI diagnosis:"
+            "[ERROR] Infra error detected, skipping AI diagnosis "
+            "and transitioning to IDLE for retry:"
         )
         for e in runner.state.history
     )
@@ -15332,7 +15333,10 @@ def test_handle_error_infra_bypass_truncates_long_messages(
     asyncio.run(runner.handle_error())
 
     assert cli_calls == []
-    prefix = "[ERROR] Infra error detected, skipping AI diagnosis: "
+    prefix = (
+        "[ERROR] Infra error detected, skipping AI diagnosis "
+        "and transitioning to IDLE for retry: "
+    )
     log_entry = next(
         e["event"]
         for e in runner.state.history
@@ -15365,7 +15369,7 @@ def test_handle_error_infra_bypass_repeats_without_invoking_cli(
         asyncio.run(runner.handle_error())
 
     assert cli_calls == []
-    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.state == PipelineState.IDLE
 
 
 def test_handle_error_runs_diagnose_for_non_infra_error(
@@ -22739,3 +22743,87 @@ def test_verify_pushes_since_returns_false_when_remote_diverged(
     )
 
     assert result is False
+
+
+def test_handle_error_infra_bypass_resets_state_to_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Infra-error bypass must transition state to IDLE for the next cycle to
+    pick the failed task back up, while preserving error_message for the
+    operator dashboard until the next successful cycle clears it."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = (
+        "ensure_repo_cloned failed: git fetch origin main failed after 3 attempts"
+    )
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message == (
+        "ensure_repo_cloned failed: git fetch origin main failed after 3 attempts"
+    )
+
+
+def test_handle_error_rate_limit_bypass_resets_state_to_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rate-limit bypass must transition state to IDLE so the next cycle
+    retries the failing operation instead of trapping the daemon in ERROR."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "API rate limit exceeded"
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message == "API rate limit exceeded"
+
+
+def test_handle_error_timeout_bypass_resets_state_to_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeout bypass must transition state to IDLE so the next cycle
+    retries the failing operation instead of looping in ERROR forever."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "claude CLI timeout after 900s"
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message == "claude CLI timeout after 900s"
+
+
+def test_handle_error_recovers_within_two_cycles_after_tls_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard for the 2026-04-30 morning incident: a single TLS
+    handshake timeout produced 16 consecutive ``handle_error`` invocations
+    over 15 minutes because the bypass branches never reset state out of
+    ERROR. After the fix, the first cycle's bypass transitions to IDLE so
+    the second cycle dispatches to ``handle_idle`` (not ``handle_error``)
+    and is free to retry the failing call."""
+    _patch_subprocess(monkeypatch)
+    runner = _make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = (
+        "git fetch origin main failed after 3 attempts: "
+        "TLS handshake timeout reaching github.com"
+    )
+
+    # Cycle 1: ERROR -> handle_error bypass -> IDLE (state transition that
+    # the daemon's main dispatcher uses to route the next cycle).
+    asyncio.run(runner.handle_error())
+    assert runner.state.state == PipelineState.IDLE
+
+    # Cycle 2 simulation: a successful retry on the second attempt clears
+    # the error_message naturally. Before the fix, the daemon would still be
+    # in ERROR here and would re-enter handle_error for at least 14 more
+    # cycles before manual intervention; we assert directly that the state
+    # is IDLE so the dispatcher cannot loop in the ERROR branch.
+    runner.state.error_message = None
+    assert runner.state.state == PipelineState.IDLE

@@ -140,9 +140,11 @@ class ErrorMixin:
             self._error_skip_active = False
             truncated = context if len(context) <= 200 else context[:197] + "..."
             self.log_event(
-                f"[ERROR] Infra error detected, skipping AI diagnosis: "
-                f"{truncated}."
+                f"[ERROR] Infra error detected, skipping AI diagnosis and "
+                f"transitioning to IDLE for retry: {truncated}."
             )
+            self.state.state = PipelineState.IDLE
+            await self.publish_state()
             return
         category = _classify_error(context)
         if category == ErrorCategory.RATE_LIMIT:
@@ -150,17 +152,22 @@ class ErrorMixin:
             self._error_skip_count = 0
             self._error_skip_active = False
             self.log_event(
-                "[ERROR] Skipping AI diagnosis for rate-limit error."
+                "[ERROR] Skipping AI diagnosis for rate-limit error, "
+                "transitioning to IDLE for retry."
             )
+            self.state.state = PipelineState.IDLE
+            await self.publish_state()
             return
         if category == ErrorCategory.TIMEOUT:
             self._error_skip_context = None
             self._error_skip_count = 0
             self._error_skip_active = False
             self.log_event(
-                "[ERROR] Skipping AI diagnosis for timeout error; "
-                "will retry on next cycle."
+                "[ERROR] Skipping AI diagnosis for timeout error, "
+                "transitioning to IDLE for retry."
             )
+            self.state.state = PipelineState.IDLE
+            await self.publish_state()
             return
         selected = self._get_auxiliary_coder()
         if selected is None:
