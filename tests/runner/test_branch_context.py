@@ -265,15 +265,13 @@ def test_coder_pushed_wrong_branch_target_absent_marks_hung_silently(
     assert "did nothing" in (runner.state.error_message or "")
     log = _log_text(runner)
     assert "[ESCALATE]" in log
-    # The wrong branch (``pr-foo-2``) was never observed by the
-    # diagnostic — it is silently invisible at 2026-05-01.
-    assert wrong_branch not in log
-    assert wrong_branch not in (runner.state.error_message or "")
 
     # Branch-context gap. Future BranchContext PR is expected to detect
     # ``pr-foo-2`` as the actual remote branch and surface it alongside
-    # the missing target. Scoped to the [ESCALATE] line so retry logs
-    # that already mention ``pr-foo`` cannot mask the gap.
+    # the missing target, at which point ``wrong_branch`` will appear in
+    # the [ESCALATE] diagnostic and this xfail will flip to XPASS. The
+    # check is scoped to that line so retry logs already mentioning
+    # ``pr-foo`` cannot mask the gap.
     _assert_branch_context_in_diagnostic_xfail(
         _diagnostic_for(runner, "[ESCALATE]"),
         runner.state.error_message or "",
