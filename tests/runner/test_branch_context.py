@@ -609,11 +609,20 @@ def _assert_branch_context_in_diagnostic(
     whole-history check would let those satisfy the assertion even
     though the final diagnostic still omits branch context.
 
+    Both present and absent slots are matched as labeled tokens
+    (``<label>=<value>`` or ``<label>: <value>``), not bare substrings.
+    A raw substring check would treat ``pr_head_branch=pr-foo-2`` as
+    proof that ``task_branch=pr-foo`` was logged (because ``"pr-foo"``
+    is a prefix of ``"pr-foo-2"``), letting overlapping branch names
+    flip a strict xfail to XPASS without the diagnostic actually
+    naming the task branch. The labeled form plus a no-trailing-``[\\w-]``
+    lookahead pins each value to its own slot.
+
     The future BranchContext PR will thread base / task / git / PR
     branch identifiers through each divergence diagnostic. Until then,
     this helper is the failing assertion that drives the surrounding
-    ``@pytest.mark.xfail(strict=True)``: every present branch must
-    appear at least once in this single diagnostic, and every ``None``
+    ``@pytest.mark.xfail(strict=True)``: every present branch must be
+    labeled at least once in this single diagnostic, and every ``None``
     slot must be named individually as absent — the loop does not
     short-circuit, so one ``"absent"`` mention cannot cover multiple
     ``None`` fields.
@@ -627,14 +636,6 @@ def _assert_branch_context_in_diagnostic(
     """
     haystack = f"{diagnostic}\n{error_message}"
     missing: list[str] = []
-    if base_branch and base_branch not in haystack:
-        missing.append(f"base_branch={base_branch!r}")
-    if task_branch and task_branch not in haystack:
-        missing.append(f"task_branch={task_branch!r}")
-    if current_git_branch and current_git_branch not in haystack:
-        missing.append(f"current_git_branch={current_git_branch!r}")
-    if pr_head_branch and pr_head_branch not in haystack:
-        missing.append(f"pr_head_branch={pr_head_branch!r}")
     for label, value in (
         ("base_branch", base_branch),
         ("task_branch", task_branch),
@@ -655,6 +656,23 @@ def _assert_branch_context_in_diagnostic(
             )
             if not absent_marker.search(haystack):
                 missing.append(f"{label}=<absent> not explicitly logged")
+        else:
+            # Require a labeled token (``label=value`` / ``label: value``)
+            # rather than a raw substring. The negative lookahead for
+            # ``[\w-]`` ensures ``task_branch=pr-foo`` is not satisfied
+            # by ``pr_head_branch=pr-foo-2`` (prefix overlap), which
+            # would otherwise weaken the regression guard for the
+            # OBS-AI scenario where the wrong remote branch shares a
+            # prefix with the declared task branch. Optional opening
+            # quote/bracket characters tolerate common formatting
+            # variants like ``label="value"`` or ``label=<value>``.
+            present_marker = re.compile(
+                rf"\b{re.escape(label)}\b\s*[=:]\s*[<\"']?"
+                rf"{re.escape(value)}(?![\w-])",
+                re.IGNORECASE,
+            )
+            if not present_marker.search(haystack):
+                missing.append(f"{label}={value!r} not labeled")
     assert not missing, (
         "BranchContext diagnostic is missing required branch identifiers: "
         + ", ".join(missing)
