@@ -89,7 +89,7 @@ class CodingMixin:
             await self._save_current_run_record("rate_limit")
             return
 
-        self.log_event(f"[{coder_name}] Starting PLANNED PR")
+        self.log_event(f"[CODING] [{coder_name}] Starting PLANNED PR.")
 
         target_branch = (
             self.state.current_task.branch if self.state.current_task else None
@@ -100,7 +100,7 @@ class CodingMixin:
                 "Current task has no branch; cannot identify PR"
             )
             await self._save_current_run_record("error")
-            self.log_event(self.state.error_message)
+            self.log_event(f"[CODING] {self.state.error_message}.")
             return
 
         breach_dir, breach_run_id = self._breach_env()
@@ -142,7 +142,7 @@ class CodingMixin:
                 self.state.state = PipelineState.PAUSED
                 self.state.error_message = None
                 await self._save_current_run_record("error")
-                self.log_event("CODING aborted: user stop requested")
+                self.log_event("[CODING] CODING aborted: user stop requested.")
                 return
             if not breach_flag["breached"]:
                 raise
@@ -163,7 +163,8 @@ class CodingMixin:
                         if match:
                             self.state.current_pr = match
                             self.log_event(
-                                f"Recorded PR #{match.number} before breach-cancel pause"
+                                f"[CODING] Recorded PR #{match.number} "
+                                f"before breach-cancel pause."
                             )
                             break
                     except Exception:
@@ -174,8 +175,8 @@ class CodingMixin:
             self.state.error_message = None
             await self._save_current_run_record("rate_limit")
             self.log_event(
-                f"CODING aborted: in-flight rate limit breach, "
-                f"paused until {self.state.rate_limited_until}"
+                f"[CODING] CODING aborted: in-flight rate limit breach, "
+                f"paused until {self.state.rate_limited_until}."
             )
             return
         finally:
@@ -205,7 +206,8 @@ class CodingMixin:
                         if match:
                             self.state.current_pr = match
                             self.log_event(
-                                f"Recorded PR #{match.number} before late-breach pause"
+                                f"[CODING] Recorded PR #{match.number} "
+                                f"before late-breach pause."
                             )
                             break
                     except Exception:
@@ -216,8 +218,8 @@ class CodingMixin:
             self.state.error_message = None
             await self._save_current_run_record("rate_limit")
             self.log_event(
-                f"CODING paused: late in-flight rate limit breach, "
-                f"paused until {self.state.rate_limited_until}"
+                f"[CODING] CODING paused: late in-flight rate limit breach, "
+                f"paused until {self.state.rate_limited_until}."
             )
             return
 
@@ -230,7 +232,8 @@ class CodingMixin:
                     self._stop_requested = True
                     self.state.user_paused = True
                     self.log_event(
-                        "User stop requested after coder exit; honoring persisted stop"
+                        "[CODING] User stop requested after coder exit; "
+                        "honoring persisted stop."
                     )
             if not requested:
                 return False
@@ -239,7 +242,7 @@ class CodingMixin:
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
             await self._save_current_run_record("error")
-            self.log_event("CODING aborted: user stop requested")
+            self.log_event("[CODING] CODING aborted: user stop requested.")
             return True
 
         await self._save_cli_log(stdout, stderr, f"PLANNED PR output [{coder_name}]")
@@ -247,8 +250,8 @@ class CodingMixin:
             await self._refresh_user_paused_from_redis()
             if self.state.user_paused:
                 self.log_event(
-                    "User pause persisted during coder exit; finishing current run "
-                    "before honoring pause"
+                    "[CODING] User pause persisted during coder exit; "
+                    "finishing current run before honoring pause."
                 )
         if await pause_for_stop_if_requested():
             return
@@ -259,14 +262,17 @@ class CodingMixin:
                 self.state.error_message = None
                 await self._save_current_run_record("rate_limit")
                 self.log_event(
-                    f"Rate limit pause active until "
-                    f"{self.state.rate_limited_until.isoformat()}"
+                    f"[RATE-LIMIT] Rate limit pause active until "
+                    f"{self.state.rate_limited_until.isoformat()}."
                 )
                 return
             self.state.state = PipelineState.ERROR
             self.state.error_message = stderr.strip() or f"{coder_name} exit {code}"
             await self._save_current_run_record("error")
-            self.log_event(f"[{coder_name}] CLI failed: {self.state.error_message}")
+            self.log_event(
+                f"[CODING] [{coder_name}] CLI failed: "
+                f"{self.state.error_message}."
+            )
             return
 
         # The coder just exited; if it ran ``gh pr create`` from its own
@@ -290,7 +296,7 @@ class CodingMixin:
                 self.state.state = PipelineState.ERROR
                 self.state.error_message = f"get_open_prs failed: {exc}"
                 await self._save_current_run_record("error")
-                self.log_event(str(exc))
+                self.log_event(f"[CODING] {exc}.")
                 return
             candidate = next(
                 (pr for pr in prs if pr.branch == target_branch), None
@@ -299,8 +305,8 @@ class CodingMixin:
                 break
             if attempt < 2:
                 self.log_event(
-                    f"PR not found for {target_branch!r}, "
-                    f"retrying in 5s ({attempt + 1}/3)"
+                    f"[CODING] PR not found for {target_branch!r}, "
+                    f"retrying in 5s ({attempt + 1}/3)."
                 )
                 await asyncio.sleep(5)
 
@@ -316,11 +322,11 @@ class CodingMixin:
         self.state.state = PipelineState.WATCH
         self._rehydrate_last_push_at(candidate)
         await self._save_current_run_record("coding_complete")
-        self.log_event(f"Opened PR #{candidate.number} -> WATCH")
+        self.log_event(f"[CODING] Opened PR #{candidate.number} -> WATCH.")
         if self._should_skip_codex_review_post(candidate.number):
             self.log_event(
-                "Codex auto-trigger detected, skipping duplicate "
-                "@codex review post"
+                "[CODING] Codex auto-trigger detected, skipping duplicate "
+                "@codex review post."
             )
         else:
             self._post_codex_review(candidate.number)
@@ -372,12 +378,12 @@ class CodingMixin:
             self.state.state = PipelineState.HUNG
             self.state.error_message = message
             await self._save_current_run_record("error")
-            self.log_event(message)
+            self.log_event(f"[ESCALATE] {message}.")
             return
 
         self.log_event(
-            f"[{coder_name}] Coder exited 0 with branch but no PR — "
-            f"daemon creating PR"
+            f"[CODING] [{coder_name}] Coder exited 0 with branch but no "
+            f"PR — daemon creating PR."
         )
         if not await self._daemon_create_pr_for_branch(
             target_branch, coder_name
@@ -407,8 +413,9 @@ class CodingMixin:
             except Exception as exc:
                 last_list_exc = exc
                 self.log_event(
-                    f"[{coder_name}] Daemon-created PR list failed for "
-                    f"{target_branch!r}: {exc} ({attempt + 1}/3)"
+                    f"[CODING] [{coder_name}] Daemon-created PR list "
+                    f"failed for {target_branch!r}: {exc} "
+                    f"({attempt + 1}/3)."
                 )
                 if attempt < 2:
                     await asyncio.sleep(5)
@@ -421,8 +428,9 @@ class CodingMixin:
                 break
             if attempt < 2:
                 self.log_event(
-                    f"[{coder_name}] Daemon-created PR not visible yet for "
-                    f"{target_branch!r}, retrying in 5s ({attempt + 1}/3)"
+                    f"[CODING] [{coder_name}] Daemon-created PR not "
+                    f"visible yet for {target_branch!r}, retrying in 5s "
+                    f"({attempt + 1}/3)."
                 )
                 await asyncio.sleep(5)
 
@@ -447,7 +455,10 @@ class CodingMixin:
                 self.state.state = PipelineState.HUNG
             self.state.error_message = message
             await self._save_current_run_record("error")
-            self.log_event(message)
+            if self.state.state == PipelineState.HUNG:
+                self.log_event(f"[ESCALATE] {message}.")
+            else:
+                self.log_event(f"[CODING] {message}.")
             return
 
         self.state.current_pr = candidate
@@ -455,13 +466,13 @@ class CodingMixin:
         self._rehydrate_last_push_at(candidate)
         await self._save_current_run_record("coding_complete")
         self.log_event(
-            f"Daemon opened PR #{candidate.number} for {target_branch!r} "
-            f"-> WATCH"
+            f"[CODING] Daemon opened PR #{candidate.number} for "
+            f"{target_branch!r} -> WATCH."
         )
         if self._should_skip_codex_review_post(candidate.number):
             self.log_event(
-                "Codex auto-trigger detected, skipping duplicate "
-                "@codex review post"
+                "[CODING] Codex auto-trigger detected, skipping duplicate "
+                "@codex review post."
             )
         else:
             self._post_codex_review(candidate.number)
@@ -519,8 +530,9 @@ class CodingMixin:
         except (RuntimeError, subprocess.SubprocessError, OSError) as exc:
             if "already exists" in str(exc).lower():
                 self.log_event(
-                    f"[{coder_name}] gh pr create reports PR already exists "
-                    f"for {target_branch!r}; reusing existing PR"
+                    f"[CODING] [{coder_name}] gh pr create reports PR "
+                    f"already exists for {target_branch!r}; reusing "
+                    f"existing PR."
                 )
                 # The daemon's last list view did not include this PR yet
                 # but the upstream "already exists" reply confirms it does;
@@ -538,7 +550,7 @@ class CodingMixin:
             self.state.state = PipelineState.HUNG
             self.state.error_message = message
             await self._save_current_run_record("error")
-            self.log_event(message)
+            self.log_event(f"[ESCALATE] {message}.")
             return False
         github_client._invalidate_etag_cache(
             f"repos/{self.owner_repo}/pulls"

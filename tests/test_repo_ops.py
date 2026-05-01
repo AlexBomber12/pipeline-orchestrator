@@ -121,8 +121,8 @@ def test_ensure_repo_cloned_clones_scaffolds_and_backfills(
     assert removed == [clone_root]
     assert clone_calls == [["git", "clone", runner.repo_config.url, runner.repo_path]]
     assert runner._scaffolded is True
-    assert "scaffold_repo created: AGENTS.md" in runner.events
-    assert "backfilled CLAUDE.md for legacy repo" in runner.events
+    assert "[INFRA] scaffold_repo created: AGENTS.md." in runner.events
+    assert "[INFRA] backfilled CLAUDE.md for legacy repo." in runner.events
 
 
 @pytest.mark.parametrize(

@@ -327,7 +327,10 @@ def test_reload_repo_config_if_dirty_updates_coder_at_idle_boundary(
 
     assert runner.repo_config.coder == CoderType.CODEX
     assert "control:octo__demo:config_dirty" not in runner.redis.store
-    assert runner.state.history[-1]["event"] == "Reloaded repo config from config.yml"
+    assert (
+        runner.state.history[-1]["event"]
+        == "[INFRA] Reloaded repo config from config.yml."
+    )
 
 
 def test_stage_config_reload_tracks_idle_boundary_flag() -> None:
@@ -2716,7 +2719,8 @@ def test_handle_idle_rereads_pause_flag_before_coding_transition(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert any(
-        entry["event"] == "Pause requested while preparing PR-042; deferring CODING"
+        entry["event"]
+        == "[INFRA] Pause requested while preparing PR-042; deferring CODING."
         for entry in runner.state.history
     )
 
@@ -3963,7 +3967,8 @@ def test_handle_fix_escalates_at_iteration_cap_before_next_spawn(
     ]
     assert any(
         entry["event"]
-        == "FIX cap reached (15/15) on PR #77: escalated, moving to IDLE."
+        == "[ESCALATE] FIX cap reached (15/15) on PR #77: escalated, "
+        "moving to IDLE."
         for entry in runner.state.history
     )
 
@@ -4078,7 +4083,7 @@ def test_handle_fix_cap_skips_repeat_escalation_when_pr_already_escalated(
     assert runner.state.user_paused is True
     assert any(
         entry["event"]
-        == "FIX blocked for escalated PR #91, moving to IDLE."
+        == "[FIX] FIX blocked for escalated PR #91, moving to IDLE."
         for entry in runner.state.history
     )
 
@@ -4125,7 +4130,8 @@ def test_handle_fix_blocks_escalated_pr_even_when_counter_resets(
     assert gh_calls == []
     assert runner.state.state == PipelineState.IDLE
     assert any(
-        entry["event"] == "FIX blocked for escalated PR #92, moving to IDLE."
+        entry["event"]
+        == "[FIX] FIX blocked for escalated PR #92, moving to IDLE."
         for entry in runner.state.history
     )
 
@@ -4402,7 +4408,10 @@ def test_handle_fix_three_no_push_cycles_transition_to_hung(
     # path stays parked instead of bouncing back to WATCH.
     assert runner.state.current_pr.is_escalated is True
     assert posted[-1] == (runner.owner_repo, 217, expected_msg)
-    assert any(entry["event"] == expected_msg for entry in runner.state.history)
+    assert any(
+        entry["event"] == f"[ESCALATE] {expected_msg}"
+        for entry in runner.state.history
+    )
 
 
 def test_handle_fix_productive_push_resets_no_push_counter_before_threshold(
@@ -4791,7 +4800,8 @@ def test_handle_fix_coder_escalate_transitions_to_idle(
     ]
     assert any(
         entry["event"]
-        == "FIX coder ESCALATE on PR #300: rate limit exceeded. Moving to IDLE."
+        == "[ESCALATE] FIX coder ESCALATE on PR #300: rate limit "
+        "exceeded. Moving to IDLE."
         for entry in runner.state.history
     )
 
@@ -5020,7 +5030,7 @@ def test_handle_fix_coder_escalate_honors_deferred_stop_request(
     # ESCALATE bookkeeping (comment + label) still ran before PAUSED.
     assert posted and posted[0][1] == 308
     assert any(
-        entry["event"] == "FIX aborted: user stop requested"
+        entry["event"] == "[FIX] FIX aborted: user stop requested."
         for entry in runner.state.history
     )
 
@@ -6748,7 +6758,10 @@ def test_handle_watch_without_current_pr_returns_to_idle() -> None:
     asyncio.run(runner.handle_watch())
 
     assert runner.state.state == PipelineState.IDLE
-    assert runner.state.history[-1]["event"] == "WATCH without current_pr -> IDLE"
+    assert (
+        runner.state.history[-1]["event"]
+        == "[WATCH] WATCH without current_pr -> IDLE."
+    )
 
 
 def test_handle_watch_open_pr_lookup_failure_sets_error(
@@ -6771,7 +6784,7 @@ def test_handle_watch_open_pr_lookup_failure_sets_error(
 
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message == "get_open_prs failed: boom"
-    assert runner.state.history[-1]["event"] == "boom"
+    assert runner.state.history[-1]["event"] == "[WATCH] boom."
 
 
 def test_handle_watch_green_but_auto_merge_disabled_stays_watching(
@@ -7520,7 +7533,8 @@ def test_handle_hung_sets_error_when_fallback_post_fails(
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message == "post_comment failed: gh unavailable"
     assert any(
-        entry["event"] == "gh unavailable" for entry in runner.state.history
+        entry["event"] == "[ESCALATE] gh unavailable."
+        for entry in runner.state.history
     )
 
 
@@ -8014,7 +8028,7 @@ def test_resolve_pending_queue_sync_clears_state_when_pr_merged(
     assert runner._resolve_pending_queue_sync() is True
     assert runner.state.pending_queue_sync_branch is None
     assert runner.state.pending_queue_sync_started_at is None
-    assert events == ["Queue-sync PR merged (queue-done-pr-001)"]
+    assert events == ["[MERGE] Queue-sync PR merged (queue-done-pr-001)."]
 
 
 def test_resolve_pending_queue_sync_clears_state_when_pr_closed(
@@ -8039,7 +8053,7 @@ def test_resolve_pending_queue_sync_clears_state_when_pr_closed(
     assert runner.state.error_message == (
         "queue-sync PR queue-done-pr-001 closed without merging"
     )
-    assert events == [runner.state.error_message]
+    assert events == [f"[MERGE] {runner.state.error_message}."]
 
 
 def test_resolve_pending_queue_sync_handles_missing_pr(
@@ -8086,7 +8100,9 @@ def test_resolve_pending_queue_sync_logs_and_escalates_on_view_failure(
     )
 
     assert runner._resolve_pending_queue_sync() is False
-    assert events == ["queue-sync PR queue-done-pr-001 view failed: gh unavailable"]
+    assert events == [
+        "[MERGE] queue-sync PR queue-done-pr-001 view failed: gh unavailable."
+    ]
     assert escalations == ["queue-done-pr-001"]
 
 
@@ -8138,7 +8154,7 @@ def test_escalate_queue_sync_transitions_to_error_when_expired(
     assert f"(max {merge_module._QUEUE_SYNC_MAX_WAIT_SEC}s)" in (
         runner.state.error_message
     )
-    assert events == [runner.state.error_message]
+    assert events == [f"[MERGE] {runner.state.error_message}."]
 
 
 def test_handle_merge_failure_sets_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -9107,7 +9123,9 @@ def test_handle_error_logs_when_no_auxiliary_coder_is_eligible(
     assert not claude_calls
     assert not codex_calls
     assert any(
-        e["event"] == "No eligible coder available for error diagnosis; staying ERROR"
+        e["event"]
+        == "[ERROR] No eligible coder available for error diagnosis; "
+        "staying ERROR."
         for e in runner.state.history
     )
 
@@ -9213,7 +9231,8 @@ def test_handle_error_errors_when_review_trigger_fails_after_diagnose_push(
         "to avoid fix/push loop"
     )
     assert any(
-        e["event"] == runner.state.error_message for e in runner.state.history
+        e["event"] == f"[ERROR] {runner.state.error_message}."
+        for e in runner.state.history
     )
 
 
@@ -9233,7 +9252,9 @@ def test_handle_error_escalates_dirty_tree_without_active_pr_branch(
         "clean",
     ]
     assert any(
-        e["event"] == "diagnose_error: dirty tree without active PR/task branch"
+        e["event"]
+        == "[ERROR] diagnose_error: dirty tree without active "
+        "PR/task branch."
         for e in runner.state.history
     )
 
@@ -9446,8 +9467,8 @@ def test_handle_error_escalates_dirty_tree_when_branch_mismatches_pr(
     ]
     assert warnings == ["diagnose_error made uncommittable changes, reset"]
     assert any(
-        "diagnose_error: active branch mismatch ('main' != "
-        "'fix/diagnose-error-commits-fixes')"
+        "[ERROR] diagnose_error: active branch mismatch ('main' != "
+        "'fix/diagnose-error-commits-fixes')."
         == e["event"]
         for e in runner.state.history
     )
@@ -9530,7 +9551,8 @@ def test_handle_error_escalates_without_publishing_preexisting_dirty_tree(
     assert review_requests == []
     assert any(
         e["event"]
-        == "diagnose_error: pre-existing dirty tree blocks automatic cleanup/publish"
+        == "[ERROR] diagnose_error: pre-existing dirty tree blocks "
+        "automatic cleanup/publish."
         for e in runner.state.history
     )
 
@@ -12689,8 +12711,10 @@ def test_save_cli_log_truncates_and_warns_on_redis_error(
     asyncio.run(runner._save_cli_log("x" * (70 * 1024), "err text", "LABEL"))
 
     assert warnings == [f"Failed to save CLI log for {runner.name}"]
-    assert events and events[0].startswith("LABEL: [truncated]")
-    assert len(events[0]) <= 207
+    assert events and events[0].startswith("[INFRA] LABEL: [truncated]")
+    # `[INFRA] ` (8 chars) is added on top of the existing 207 bound, plus
+    # a trailing period.
+    assert len(events[0]) <= 207 + len("[INFRA] ") + 1
 
 
 def test_handle_watch_skips_fix_no_new_feedback(
@@ -13240,7 +13264,7 @@ def test_monitor_fix_idle_times_out_without_push_history(
     idle_flag, target = asyncio.run(run_monitor())
     assert idle_flag["timed_out"] is True
     assert target.cancelled() is True
-    assert events == ["FIX: idle timeout (5s since last push), killing"]
+    assert events == ["[FIX] idle timeout (5s since last push), killing."]
 
 
 def test_monitor_fix_idle_backdates_elapsed_time_from_head_age(
@@ -13366,7 +13390,7 @@ def test_monitor_fix_idle_resets_timer_on_detected_push(
 
     assert idle_flag["timed_out"] is False
     assert target_holder["task"].cancelled() is True
-    assert "FIX: [codex] pushed, resetting idle timer" in events
+    assert "[FIX] [codex] pushed, resetting idle timer." in events
 
 
 def test_monitor_fix_idle_logs_poll_failures_before_timing_out(
@@ -13425,8 +13449,8 @@ def test_monitor_fix_idle_logs_poll_failures_before_timing_out(
     assert idle_flag["timed_out"] is True
     assert target.cancelled() is True
     assert events == [
-        "FIX: GitHub API poll failed, preserving deadline",
-        "FIX: idle timeout (30s since last push), killing",
+        "[FIX] GitHub API poll failed, preserving deadline.",
+        "[FIX] idle timeout (30s since last push), killing.",
     ]
 
 
@@ -14248,7 +14272,8 @@ def test_handle_watch_retriggers_stale_changes_requested_review(
     assert runner.state.last_stale_retrigger_at is not None
     assert any(
         entry["event"]
-        == "Stale CHANGES_REQUESTED on PR #42; re-triggering @codex review."
+        == "[WATCH] Stale CHANGES_REQUESTED on PR #42; re-triggering "
+        "@codex review."
         for entry in runner.state.history
     )
 
@@ -15234,7 +15259,9 @@ def test_handle_error_skips_diagnose_for_infra_error(
     # be eligible for diagnosis.
     assert runner._error_diagnose_count == 1
     assert any(
-        e["event"].startswith("Infra error detected, skipping AI diagnosis:")
+        e["event"].startswith(
+            "[ERROR] Infra error detected, skipping AI diagnosis:"
+        )
         for e in runner.state.history
     )
 
@@ -15257,13 +15284,14 @@ def test_handle_error_infra_bypass_truncates_long_messages(
     asyncio.run(runner.handle_error())
 
     assert cli_calls == []
-    prefix = "Infra error detected, skipping AI diagnosis: "
+    prefix = "[ERROR] Infra error detected, skipping AI diagnosis: "
     log_entry = next(
         e["event"]
         for e in runner.state.history
         if e["event"].startswith(prefix)
     )
-    payload = log_entry[len(prefix):]
+    # Trim the trailing ".".
+    payload = log_entry[len(prefix):-1]
     assert len(payload) == 200
     assert payload.endswith("...")
 
@@ -15462,7 +15490,7 @@ def test_handle_error_skips_ai_diagnosis_when_claude_session_is_limited(
     assert runner.state.rate_limited_until is None
     assert runner._error_diagnose_count == 0
     assert any(
-        e["event"] == "Skipping AI diagnosis: Claude rate limited"
+        e["event"] == "[ERROR] Skipping AI diagnosis: Claude rate limited."
         for e in runner.state.history
     )
 
@@ -15501,7 +15529,7 @@ def test_handle_error_honors_claude_rate_limit_when_active_coder_is_claude(
     assert runner.state.rate_limited_until is None
     assert runner._error_diagnose_count == 0
     assert any(
-        e["event"] == "Skipping AI diagnosis: Claude rate limited"
+        e["event"] == "[ERROR] Skipping AI diagnosis: Claude rate limited."
         for e in runner.state.history
     )
 
@@ -15543,7 +15571,7 @@ def test_handle_error_skips_ai_diagnosis_when_claude_weekly_is_limited(
     assert runner.state.rate_limited_until is None
     assert runner._error_diagnose_count == 0
     assert any(
-        e["event"] == "Skipping AI diagnosis: Claude rate limited"
+        e["event"] == "[ERROR] Skipping AI diagnosis: Claude rate limited."
         for e in runner.state.history
     )
 
@@ -15574,7 +15602,7 @@ def test_handle_error_proceeds_when_usage_snapshot_fetch_raises(
     assert cli_calls == ["diagnose"]
     assert runner.state.state == PipelineState.ERROR
     assert not any(
-        e["event"] == "Skipping AI diagnosis: Claude rate limited"
+        e["event"] == "[ERROR] Skipping AI diagnosis: Claude rate limited."
         for e in runner.state.history
     )
 
@@ -15642,7 +15670,7 @@ def test_handle_error_logs_and_returns_when_diagnose_cli_fails(
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message == "Build failed: missing dependency X"
     assert any(
-        e["event"] == "diagnose_error CLI failed: boom"
+        e["event"] == "[ERROR] diagnose_error CLI failed: boom."
         for e in runner.state.history
     )
 
@@ -17861,7 +17889,7 @@ def test_run_cycle_runs_recovery_before_honoring_user_pause(
     assert publishes == ["published"]
     assert runner._recovered is True
     assert not any(
-        entry["event"] == "Paused. Press Play to resume."
+        entry["event"] == "[INFRA] Paused. Press Play to resume."
         for entry in runner.state.history
     )
 
@@ -17928,7 +17956,7 @@ def test_run_cycle_short_circuits_idle_when_user_paused(
     assert sum(
         1
         for entry in runner.state.history
-        if entry["event"] == "Paused. Press Play to resume."
+        if entry["event"] == "[INFRA] Paused. Press Play to resume."
     ) == 1
 
 
@@ -17971,7 +17999,7 @@ def test_run_cycle_short_circuits_paused_when_user_paused(
     assert sum(
         1
         for entry in runner.state.history
-        if entry["event"] == "Paused. Press Play to resume."
+        if entry["event"] == "[INFRA] Paused. Press Play to resume."
     ) == 1
 
 
@@ -18023,7 +18051,7 @@ def test_run_cycle_short_circuits_active_watch_and_merge_when_user_paused(
     assert sum(
         1
         for entry in runner.state.history
-        if entry["event"] == "Paused. Press Play to resume."
+        if entry["event"] == "[INFRA] Paused. Press Play to resume."
     ) == 1
 
 
@@ -18113,7 +18141,7 @@ def test_run_cycle_rereads_pause_flag_before_idle_dispatch(
     assert sum(
         1
         for entry in runner.state.history
-        if entry["event"] == "Paused. Press Play to resume."
+        if entry["event"] == "[INFRA] Paused. Press Play to resume."
     ) == 1
 
 
@@ -19014,7 +19042,10 @@ def test_handle_coding_errors_when_get_open_prs_raises(
 
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message == "get_open_prs failed: gh unavailable"
-    assert any("gh unavailable" == entry["event"] for entry in runner.state.history)
+    assert any(
+        entry["event"] == "[CODING] gh unavailable."
+        for entry in runner.state.history
+    )
 
 
 # -----------------------------------------------------------------------
@@ -19968,7 +19999,7 @@ def test_handle_paused_logs_user_pause_only_once() -> None:
     assert sum(
         1
         for entry in runner.state.history
-        if entry["event"] == "Paused. Press Play to resume."
+        if entry["event"] == "[INFRA] Paused. Press Play to resume."
     ) == 1
 
 
@@ -19998,7 +20029,7 @@ def test_handle_fix_head_unchanged_honors_stop_requested_after_exit(
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.error_message is None
     assert any(
-        entry["event"] == "FIX aborted: user stop requested"
+        entry["event"] == "[FIX] FIX aborted: user stop requested."
         for entry in runner.state.history
     )
 
@@ -20553,7 +20584,7 @@ def test_handle_coding_honors_stop_requested_after_pr_poll_exhaustion(
     assert runner.state.current_pr is None
     assert attempts["count"] == 3
     assert any(
-        entry["event"] == "CODING aborted: user stop requested"
+        entry["event"] == "[CODING] CODING aborted: user stop requested."
         for entry in runner.state.history
     )
 

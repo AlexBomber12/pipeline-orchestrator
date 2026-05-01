@@ -52,8 +52,8 @@ class BreachMixin:
                 pct_key = "session_pct" if breach_type == "session" else "weekly_pct"
                 pct_val = data.get(pct_key, "?")
                 self.log_event(
-                    f"In-flight breach: {breach_type} at {pct_val}%, "
-                    f"killing Claude CLI"
+                    f"[RATE-LIMIT] In-flight breach: {breach_type} at "
+                    f"{pct_val}%, killing Claude CLI."
                 )
                 breach_flag["breached"] = True
                 claude_task.cancel()
@@ -95,7 +95,8 @@ class BreachMixin:
         pct_key = "session_pct" if breach_type == "session" else "weekly_pct"
         pct_val = data.get(pct_key, "?")
         self.log_event(
-            f"Late in-flight breach detected: {breach_type} at {pct_val}%"
+            f"[RATE-LIMIT] Late in-flight breach detected: "
+            f"{breach_type} at {pct_val}%."
         )
         breach_flag["breached"] = True
 

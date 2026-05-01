@@ -56,8 +56,9 @@ class RecoveryMixin:
                 and not (Path(self.repo_path) / queued.task_file).is_file()
             ):
                 self.log_event(
-                    f"recover_state: ignoring ghost QUEUE.md entry "
-                    f"{queued.pr_id} (no {queued.task_file} on disk)"
+                    f"[INFRA] recover_state: ignoring ghost QUEUE.md "
+                    f"entry {queued.pr_id} (no {queued.task_file} on "
+                    f"disk)."
                 )
                 continue
             kept.append(queued)
@@ -146,8 +147,8 @@ class RecoveryMixin:
                 "retrying next cycle"
             )
             self.log_event(
-                "recover_state: tasks/QUEUE.md tracking probe failed; "
-                "retrying next cycle"
+                "[INFRA] recover_state: tasks/QUEUE.md tracking probe "
+                "failed; retrying next cycle."
             )
             return False
         try:
@@ -159,7 +160,9 @@ class RecoveryMixin:
             self.state.error_message = (
                 f"recover_state: queue validation failed: {exc}"
             )
-            self.log_event(f"recover_state: queue validation failed: {exc}")
+            self.log_event(
+                f"[INFRA] recover_state: queue validation failed: {exc}."
+            )
             return False
         if tasks is None:
             if queue_from_origin:
@@ -168,7 +171,8 @@ class RecoveryMixin:
                     "recover_state: read QUEUE.md from origin failed"
                 )
                 self.log_event(
-                    "recover_state: read QUEUE.md from origin failed"
+                    "[INFRA] recover_state: read QUEUE.md from origin "
+                    "failed."
                 )
                 return False
             # Post-PR-181 repos gitignore ``tasks/QUEUE.md`` and rely on
@@ -185,9 +189,9 @@ class RecoveryMixin:
             # preflight; once the tree self-heals, ``handle_idle``
             # rebuilds QUEUE.md and re-matches any open PR by branch.
             self.log_event(
-                "recover_state: tasks/QUEUE.md absent in working tree; "
-                "treating as empty queue and deferring to preflight + "
-                "IDLE regeneration"
+                "[INFRA] recover_state: tasks/QUEUE.md absent in working "
+                "tree; treating as empty queue and deferring to "
+                "preflight + IDLE regeneration."
             )
             tasks = []
 
@@ -199,7 +203,7 @@ class RecoveryMixin:
         except Exception as exc:
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"recover_state: get_open_prs failed: {exc}"
-            self.log_event(f"recover_state failed: {exc}")
+            self.log_event(f"[INFRA] recover_state failed: {exc}.")
             return False
         # Ghost filtering uses local task-file existence, which is only a
         # safe signal for post-PR-181 repos (QUEUE.md gitignored, parsed
@@ -242,7 +246,8 @@ class RecoveryMixin:
                 or datetime.now(timezone.utc)
             )
             self.log_event(
-                f"Recovered pending queue-sync branch: {pending_sync.branch}"
+                f"[INFRA] Recovered pending queue-sync branch: "
+                f"{pending_sync.branch}."
             )
 
         if doing is not None:
@@ -265,16 +270,16 @@ class RecoveryMixin:
                 self._watch_entered_at = datetime.now(timezone.utc)
                 self._rehydrate_last_push_at(matching)
                 self.log_event(
-                    f"Recovered: DOING task {doing.pr_id} "
-                    f"-> WATCH PR #{matching.number}"
+                    f"[INFRA] Recovered: DOING task {doing.pr_id} "
+                    f"-> WATCH PR #{matching.number}."
                 )
                 return True
 
             if self._is_doing_already_merged(doing):
                 self.log_event(
-                    f"recover_state: ignoring stale DOING entry "
+                    f"[INFRA] recover_state: ignoring stale DOING entry "
                     f"{doing.pr_id} (already merged on "
-                    f"origin/{self.repo_config.branch})"
+                    f"origin/{self.repo_config.branch})."
                 )
                 self.state.current_task = None
                 doing = None
@@ -290,13 +295,13 @@ class RecoveryMixin:
                         f"commits on {doing.branch!r}; refusing to defer "
                         "CODING while paused"
                     )
-                    self.log_event(self.state.error_message)
+                    self.log_event(f"[INFRA] {self.state.error_message}.")
                     return True
                 self.state.current_pr = None
                 self.state.state = PipelineState.IDLE
                 self.log_event(
-                    f"Recovered: DOING task {doing.pr_id}, no PR "
-                    "but user_paused -> defer CODING until resume"
+                    f"[INFRA] Recovered: DOING task {doing.pr_id}, no PR "
+                    f"but user_paused -> defer CODING until resume."
                 )
                 return True
 
@@ -316,7 +321,7 @@ class RecoveryMixin:
                     f"commits on {doing.branch!r}; refusing to mark "
                     "CANCELED"
                 )
-                self.log_event(self.state.error_message)
+                self.log_event(f"[INFRA] {self.state.error_message}.")
                 return True
             self._crashed_task_pr_ids.add(doing.pr_id)
             self.state.current_task = None
@@ -330,8 +335,8 @@ class RecoveryMixin:
             # repo.
             self.state.error_message = None
             self.log_event(
-                f"Task {doing.pr_id} crashed, marking CANCELED. "
-                "Manually re-upload to retry."
+                f"[INFRA] Task {doing.pr_id} crashed, marking CANCELED. "
+                f"Manually re-upload to retry."
             )
             return True
 
@@ -358,8 +363,8 @@ class RecoveryMixin:
             self._watch_entered_at = datetime.now(timezone.utc)
             self._rehydrate_last_push_at(matched_pr)
             self.log_event(
-                f"Recovered: {matched_task.status.value} task "
-                f"{matched_task.pr_id} -> WATCH PR #{matched_pr.number}"
+                f"[INFRA] Recovered: {matched_task.status.value} task "
+                f"{matched_task.pr_id} -> WATCH PR #{matched_pr.number}."
             )
             return True
 
@@ -371,11 +376,13 @@ class RecoveryMixin:
 
         if prs:
             self.log_event(
-                f"Recovered: {len(prs)} open PR(s) not matched to any "
-                "queued task -> IDLE"
+                f"[INFRA] Recovered: {len(prs)} open PR(s) not matched "
+                f"to any queued task -> IDLE."
             )
         else:
-            self.log_event("Recovered: no DOING tasks, no open PRs -> IDLE")
+            self.log_event(
+                "[INFRA] Recovered: no DOING tasks, no open PRs -> IDLE."
+            )
         return True
 
     def _preserve_crashed_run_commits(self, branch: str) -> bool:
@@ -396,8 +403,8 @@ class RecoveryMixin:
         """
         if branch == self.repo_config.branch:
             self.log_event(
-                f"Refusing to preserve crashed-run commits on base "
-                f"branch {branch!r}"
+                f"[INFRA] Refusing to preserve crashed-run commits on "
+                f"base branch {branch!r}."
             )
             return False
 
@@ -413,7 +420,7 @@ class RecoveryMixin:
             )
         except (subprocess.TimeoutExpired, OSError) as exc:
             self.log_event(
-                f"Could not probe local branch {branch}: {exc}"
+                f"[INFRA] Could not probe local branch {branch}: {exc}."
             )
             return False
         if probe.returncode != 0:
@@ -433,11 +440,14 @@ class RecoveryMixin:
             OSError,
         ) as exc:
             self.log_event(
-                f"Failed to preserve unpushed commits on {branch}: {exc}"
+                f"[INFRA] Failed to preserve unpushed commits on "
+                f"{branch}: {exc}."
             )
             return False
 
-        self.log_event(f"Preserved crashed-run commits on {branch}")
+        self.log_event(
+            f"[INFRA] Preserved crashed-run commits on {branch}."
+        )
         return True
 
     def _rehydrate_last_push_at(self, pr: PRInfo) -> None:

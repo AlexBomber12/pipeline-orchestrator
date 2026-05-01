@@ -139,14 +139,14 @@ class HungMixin:
                 )
         except Exception as exc:
             self.log_event(
-                "Warning: failed to load PR metadata for @codex review "
-                f"dedup on PR #{pr_number}: {exc}; posting without "
-                "PR-author dedup"
+                f"[INFRA] Warning: failed to load PR metadata for "
+                f"@codex review dedup on PR #{pr_number}: {exc}; "
+                f"posting without PR-author dedup."
             )
         if head_sha is None:
             self.log_event(
-                f"Warning: failed to resolve HEAD for PR #{pr_number}; "
-                "posting @codex review without dedup"
+                f"[INFRA] Warning: failed to resolve HEAD for PR "
+                f"#{pr_number}; posting @codex review without dedup."
             )
         elif (
             pr_author
@@ -161,8 +161,9 @@ class HungMixin:
             self._last_codex_review_pr = pr_number
             self._last_codex_review_head_sha = head_sha
             self.log_event(
-                f"Skipping duplicate @codex review for PR #{pr_number}; "
-                "PR author already requested review for this head"
+                f"[INFRA] Skipping duplicate @codex review for PR "
+                f"#{pr_number}; PR author already requested review for "
+                f"this head."
             )
             requested_at = _author_recent_review_requested_at(
                 self.owner_repo,
@@ -180,7 +181,8 @@ class HungMixin:
             and self._last_codex_review_head_sha == head_sha
         ):
             self.log_event(
-                f"Skipping duplicate @codex review for PR #{pr_number}"
+                f"[INFRA] Skipping duplicate @codex review for PR "
+                f"#{pr_number}."
             )
             return True, False, None
 
@@ -195,15 +197,17 @@ class HungMixin:
             github_client.post_comment(
                 self.owner_repo, pr_number, "@codex review"
             )
-            self.log_event(f"Posted @codex review on PR #{pr_number}")
+            self.log_event(
+                f"[INFRA] Posted @codex review on PR #{pr_number}."
+            )
             return True, True, None
         except Exception as exc:
             if cache_dedup_key:
                 self._last_codex_review_pr = None
                 self._last_codex_review_head_sha = None
             self.log_event(
-                f"Warning: failed to post @codex review on PR "
-                f"#{pr_number}: {exc}"
+                f"[INFRA] Warning: failed to post @codex review on PR "
+                f"#{pr_number}: {exc}."
             )
             return False, False, None
 
@@ -263,7 +267,8 @@ class HungMixin:
                 )
             except Exception as exc:
                 self.log_event(
-                    f"hung: failed to check PR state: {exc}; staying HUNG"
+                    f"[ESCALATE] hung: failed to check PR state: {exc}; "
+                    f"staying HUNG."
                 )
                 return
 
@@ -273,8 +278,8 @@ class HungMixin:
 
             if pr_state in ("MERGED", "CLOSED"):
                 self.log_event(
-                    f"PR #{current_pr.number} {pr_state} "
-                    "by operator -> IDLE"
+                    f"[ESCALATE] PR #{current_pr.number} {pr_state} by "
+                    f"operator -> IDLE."
                 )
                 self.state.current_pr = None
                 self.state.current_task = None
@@ -288,8 +293,9 @@ class HungMixin:
                 # bouncing through WATCH and re-entering the loop that
                 # triggered escalation in the first place.
                 self.log_event(
-                    f"PR #{current_pr.number} escalated; staying HUNG, "
-                    "skipping @codex review fallback. Manual review required."
+                    f"[ESCALATE] PR #{current_pr.number} escalated; "
+                    f"staying HUNG, skipping @codex review fallback. "
+                    f"Manual review required."
                 )
                 return
 
@@ -306,14 +312,15 @@ class HungMixin:
             except Exception as exc:
                 self.state.state = PipelineState.ERROR
                 self.state.error_message = f"post_comment failed: {exc}"
-                self.log_event(str(exc))
+                self.log_event(f"[ESCALATE] {exc}.")
                 return
             current_pr.last_activity = datetime.now(timezone.utc)
             self.state.state = PipelineState.WATCH
-            self.log_event("posted @codex review -> WATCH")
+            self.log_event("[ESCALATE] posted @codex review -> WATCH.")
             return
 
         self.log_event(
-            "hung fallback disabled; leaving runner in HUNG for operator action. "
-            "Resolve the PR manually or re-enable hung_fallback_codex_review."
+            "[ESCALATE] hung fallback disabled; leaving runner in HUNG "
+            "for operator action. Resolve the PR manually or re-enable "
+            "hung_fallback_codex_review."
         )

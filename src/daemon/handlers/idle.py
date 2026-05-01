@@ -105,10 +105,10 @@ class IdleMixin:
                 self, "_legacy_tracked_queue_md_logged", False,
             ):
                 self.log_event(
-                    "Skipping QUEUE.md regeneration: still tracked on "
-                    f"origin/{self.repo_config.branch}; "
-                    "untrack via 'git rm --cached tasks/QUEUE.md' to "
-                    "enable daemon-side regeneration"
+                    f"[INFRA] Skipping QUEUE.md regeneration: still "
+                    f"tracked on origin/{self.repo_config.branch}; "
+                    f"untrack via 'git rm --cached tasks/QUEUE.md' to "
+                    f"enable daemon-side regeneration."
                 )
                 self._legacy_tracked_queue_md_logged = True
             return True
@@ -388,13 +388,16 @@ class IdleMixin:
         ) as exc:
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"sync_to_main failed: {exc}"
-            self.log_event(f"sync_to_main failed: {exc}")
+            self.log_event(f"[INFRA] sync_to_main failed: {exc}.")
             return
 
         upload_result = await self.process_pending_uploads()
         if upload_result is None:
             self._idle_dispatch_deferred = True
-            self.log_event("Pending upload failed; skipping task dispatch to retry next cycle")
+            self.log_event(
+                "[INFRA] Pending upload failed; skipping task dispatch "
+                "to retry next cycle."
+            )
             return
         if upload_result:
             try:
@@ -406,7 +409,9 @@ class IdleMixin:
             ) as exc:
                 self.state.state = PipelineState.ERROR
                 self.state.error_message = f"sync_to_main after upload failed: {exc}"
-                self.log_event(f"sync_to_main after upload failed: {exc}")
+                self.log_event(
+                    f"[INFRA] sync_to_main after upload failed: {exc}."
+                )
                 return
 
         try:
@@ -416,7 +421,8 @@ class IdleMixin:
             )
         except Exception as exc:
             self.log_event(
-                f"IDLE: open PR check failed: {exc}; deferring task dispatch"
+                f"[INFRA] IDLE: open PR check failed: {exc}; deferring "
+                f"task dispatch."
             )
             self.state.current_pr = None
             self.state.current_task = None
@@ -436,8 +442,8 @@ class IdleMixin:
             )
         except Exception as exc:
             self.log_event(
-                f"IDLE: merged PR check failed: {exc}; "
-                "continuing with local merged-status heuristics"
+                f"[INFRA] IDLE: merged PR check failed: {exc}; "
+                f"continuing with local merged-status heuristics."
             )
             merged_prs = []
         else:
@@ -460,7 +466,7 @@ class IdleMixin:
         ) as exc:
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"Task selection failed: {exc}"
-            self.log_event(f"Task selection failed: {exc}")
+            self.log_event(f"[INFRA] Task selection failed: {exc}.")
             return
         finally:
             self._idle_open_prs = []
@@ -478,11 +484,11 @@ class IdleMixin:
             if dag_tasks is None:
                 self.state.state = PipelineState.ERROR
                 self.state.error_message = str(exc)
-                self.log_event(f"Queue validation failed: {exc}")
+                self.log_event(f"[INFRA] Queue validation failed: {exc}.")
                 return
             self.log_event(
-                "Queue validation failed after DAG selection; "
-                f"continuing with DAG task: {exc}"
+                f"[INFRA] Queue validation failed after DAG selection; "
+                f"continuing with DAG task: {exc}."
             )
             visible_legacy_queue_entries = self._queue_md_contains_visible_legacy_entries(
                 queue_path,
@@ -524,11 +530,13 @@ class IdleMixin:
                 if dag_tasks is None:
                     self.state.state = PipelineState.ERROR
                     self.state.error_message = f"Task status derivation failed: {exc}"
-                    self.log_event(f"Task status derivation failed: {exc}")
+                    self.log_event(
+                        f"[INFRA] Task status derivation failed: {exc}."
+                    )
                     return
                 self.log_event(
-                    "Task status derivation failed after DAG selection; "
-                    f"continuing with DAG tasks: {exc}"
+                    f"[INFRA] Task status derivation failed after DAG "
+                    f"selection; continuing with DAG tasks: {exc}."
                 )
                 tasks = []
                 queue_task = None
@@ -558,8 +566,9 @@ class IdleMixin:
                 for queued in tasks:
                     if queued.pr_id in ghost_legacy_pr_ids:
                         self.log_event(
-                            f"Ignoring ghost legacy QUEUE.md entry {queued.pr_id} "
-                            f"(no {queued.task_file} on disk)"
+                            f"[INFRA] Ignoring ghost legacy QUEUE.md "
+                            f"entry {queued.pr_id} (no "
+                            f"{queued.task_file} on disk)."
                         )
                 non_ghost_tasks = (
                     [t for t in tasks if t.pr_id not in ghost_legacy_pr_ids]
@@ -633,10 +642,10 @@ class IdleMixin:
                 message = f"QUEUE.md auto-generation failed: {exc}"
                 self.state.state = PipelineState.ERROR
                 self.state.error_message = message
-                self.log_event(message)
+                self.log_event(f"[INFRA] {message}.")
                 return
         if task is None:
-            self.log_event("No tasks available")
+            self.log_event("[INFRA] No tasks available.")
             if prs:
                 done_branches = {
                     t.branch for t in queue_tasks
@@ -648,7 +657,8 @@ class IdleMixin:
                 selected = match or prs[0]
                 self.state.current_pr = self._preserve_fix_iteration_count(selected)
                 self.log_event(
-                    f"IDLE: {len(prs)} open PR(s) detected (manual work)"
+                    f"[INFRA] IDLE: {len(prs)} open PR(s) detected "
+                    f"(manual work)."
                 )
             else:
                 self.state.current_pr = None
@@ -669,8 +679,9 @@ class IdleMixin:
                 self.state.state = PipelineState.WATCH
                 self._rehydrate_last_push_at(self.state.current_pr)
                 self.log_event(
-                    f"Task {task.pr_id} has existing open PR #{existing.number} "
-                    f"on {task_branch!r} -> WATCH (no duplicate CODING)"
+                    f"[INFRA] Task {task.pr_id} has existing open PR "
+                    f"#{existing.number} on {task_branch!r} -> WATCH "
+                    f"(no duplicate CODING)."
                 )
                 await self.publish_state()
                 return
@@ -679,7 +690,8 @@ class IdleMixin:
         if self.state.user_paused:
             self.state.current_task = None
             self.log_event(
-                f"Pause requested while preparing {task.pr_id}; deferring CODING"
+                f"[INFRA] Pause requested while preparing {task.pr_id}; "
+                f"deferring CODING."
             )
             return
 
@@ -692,12 +704,12 @@ class IdleMixin:
                 self.state.error_message = (
                     f"Task {task.pr_id} pinned to {pin} but coder unavailable"
                 )
-                self.log_event(self.state.error_message)
+                self.log_event(f"[INFRA] {self.state.error_message}.")
                 await self.publish_state()
                 return
 
         self.state.state = PipelineState.CODING
-        self.log_event(f"Picked task {task.pr_id}: {task.title}")
+        self.log_event(f"[INFRA] Picked task {task.pr_id}: {task.title}.")
         await self.publish_state()
         await self.handle_coding()
 
@@ -705,11 +717,13 @@ class IdleMixin:
         """Wait for rate limit window to expire, then resume previous flow."""
         if self.state.user_paused:
             if not getattr(self, "_user_pause_logged", False):
-                self.log_event("Paused. Press Play to resume.")
+                self.log_event("[INFRA] Paused. Press Play to resume.")
                 self._user_pause_logged = True
             return
         if self.state.rate_limited_until is None:
-            self.log_event("PAUSED without rate_limited_until -> IDLE")
+            self.log_event(
+                "[INFRA] PAUSED without rate_limited_until -> IDLE."
+            )
             self.state.state = PipelineState.IDLE
             return
         pause_coder = self.state.rate_limit_reactive_coder or "claude"
@@ -748,10 +762,16 @@ class IdleMixin:
                 )
                 if is_rate_limit_msg:
                     self.state.error_message = None
-                    self.log_event(f"{label}, cleared legacy rate-limit error")
+                    self.log_event(
+                        f"[RATE-LIMIT] {label}, cleared legacy "
+                        f"rate-limit error."
+                    )
                 else:
                     self.state.state = PipelineState.ERROR
-                    self.log_event(f"{label} -> ERROR (preserved context)")
+                    self.log_event(
+                        f"[RATE-LIMIT] {label} -> ERROR "
+                        f"(preserved context)."
+                    )
                     return
             if (
                 self.state.current_pr is not None
@@ -759,16 +779,18 @@ class IdleMixin:
                 and self.state.current_pr.branch == self.state.current_task.branch
             ):
                 self.state.state = PipelineState.WATCH
-                self.log_event(f"{label} -> WATCH")
+                self.log_event(f"[RATE-LIMIT] {label} -> WATCH.")
             else:
                 self.state.state = PipelineState.IDLE
-                self.log_event(f"{label} -> IDLE")
+                self.log_event(f"[RATE-LIMIT] {label} -> IDLE.")
             return
         if datetime.now(timezone.utc) < self.state.rate_limited_until:
             remaining = (
                 self.state.rate_limited_until - datetime.now(timezone.utc)
             ).total_seconds()
-            self.log_event(f"Paused, resuming in {int(remaining)}s")
+            self.log_event(
+                f"[RATE-LIMIT] Paused, resuming in {int(remaining)}s."
+            )
             return
         # Window expired: resume to appropriate state
         self.state.rate_limited_coders.discard(pause_coder)
@@ -784,12 +806,14 @@ class IdleMixin:
             if is_rate_limit_msg:
                 self.state.error_message = None
                 self.log_event(
-                    "Rate limit expired, cleared legacy rate-limit error"
+                    "[RATE-LIMIT] Rate limit expired, cleared legacy "
+                    "rate-limit error."
                 )
             else:
                 self.state.state = PipelineState.ERROR
                 self.log_event(
-                    "Rate limit expired, resuming -> ERROR (preserved context)"
+                    "[RATE-LIMIT] Rate limit expired, resuming -> ERROR "
+                    "(preserved context)."
                 )
                 return
         if (
@@ -798,7 +822,11 @@ class IdleMixin:
             and self.state.current_pr.branch == self.state.current_task.branch
         ):
             self.state.state = PipelineState.WATCH
-            self.log_event("Rate limit expired, resuming -> WATCH")
+            self.log_event(
+                "[RATE-LIMIT] Rate limit expired, resuming -> WATCH."
+            )
         else:
             self.state.state = PipelineState.IDLE
-            self.log_event("Rate limit expired, resuming -> IDLE")
+            self.log_event(
+                "[RATE-LIMIT] Rate limit expired, resuming -> IDLE."
+            )

@@ -449,7 +449,9 @@ class PipelineRunner(
                 )
                 self.clear_staged_config_reload()
                 await self.redis.delete(dirty_key)
-                self.log_event("Reloaded repo config from config.yml")
+                self.log_event(
+                    "[INFRA] Reloaded repo config from config.yml."
+                )
                 return
         await self.redis.delete(dirty_key)
         self._apply_staged_config_reload()
@@ -723,7 +725,8 @@ class PipelineRunner(
         except Exception as exc:
             self._current_run_record = None
             self.log_event(
-                f"restore_current_run_record failed for {task.pr_id}: {exc}"
+                f"[INFRA] restore_current_run_record failed for "
+                f"{task.pr_id}: {exc}."
             )
             return
         self._current_run_record = next(
@@ -828,7 +831,10 @@ class PipelineRunner(
             if await self._pop_stop_request():
                 self._stop_requested = True
                 self.state.user_paused = True
-                self.log_event("User stop requested; terminating current coder")
+                self.log_event(
+                    "[INFRA] User stop requested; terminating current "
+                    "coder."
+                )
                 await self._terminate_current_coder()
                 cli_task.cancel()
                 return
@@ -926,7 +932,7 @@ class PipelineRunner(
             logger.warning("Failed to save CLI log for %s", self.name)
         if combined.strip():
             first_lines = combined.strip()[:200]
-            self.log_event(f"{label}: {first_lines}")
+            self.log_event(f"[INFRA] {label}: {first_lines}.")
 
     def log_event(self, event: str) -> None:
         """Append an event to ``state.history`` (capped) and log it.
@@ -1037,8 +1043,9 @@ class PipelineRunner(
             int((budget.reset_at - datetime.now(timezone.utc)).total_seconds() // 60),
         )
         self.log_event(
-            f"GitHub API budget critical ({budget.remaining}/{budget.limit}), "
-            f"pausing until {reset_iso} ({remaining_min} min)"
+            f"[RATE-LIMIT] GitHub API budget critical "
+            f"({budget.remaining}/{budget.limit}), pausing until "
+            f"{reset_iso} ({remaining_min} min)."
         )
 
     def _enter_github_api_slowdown(self) -> None:
@@ -1049,8 +1056,9 @@ class PipelineRunner(
         multiplier = self.app_config.daemon.github_api_slowdown_multiplier
         effective_interval = self.repo_config.poll_interval_sec * multiplier
         self.log_event(
-            f"GitHub API budget low ({budget.remaining}/{budget.limit}), "
-            f"slowing polling to {effective_interval}s"
+            f"[RATE-LIMIT] GitHub API budget low "
+            f"({budget.remaining}/{budget.limit}), slowing polling to "
+            f"{effective_interval}s."
         )
 
     def _is_extended_idle_active(self) -> bool:
@@ -1241,7 +1249,7 @@ class PipelineRunner(
         except RuntimeError as exc:
             self.state.state = PipelineState.ERROR
             self.state.error_message = str(exc)
-            self.log_event(f"ensure_repo_cloned failed: {exc}")
+            self.log_event(f"[INFRA] ensure_repo_cloned failed: {exc}.")
             await self.publish_state()
             return
 
@@ -1294,7 +1302,7 @@ class PipelineRunner(
             )
         ):
             if not self._user_pause_logged:
-                self.log_event("Paused. Press Play to resume.")
+                self.log_event("[INFRA] Paused. Press Play to resume.")
                 self._user_pause_logged = True
             await self.publish_state()
             return
@@ -1306,7 +1314,8 @@ class PipelineRunner(
         pre_state = self.state.state
         if self.state.state in _TRANSIENT_STATES:
             self.log_event(
-                f"resetting stale transient state {self.state.state.value} -> IDLE"
+                f"[INFRA] resetting stale transient state "
+                f"{self.state.state.value} -> IDLE."
             )
             self.state.state = PipelineState.IDLE
 
@@ -1314,7 +1323,7 @@ class PipelineRunner(
             await self._refresh_user_paused_from_redis()
             if self.state.user_paused:
                 if not self._user_pause_logged:
-                    self.log_event("Paused. Press Play to resume.")
+                    self.log_event("[INFRA] Paused. Press Play to resume.")
                     self._user_pause_logged = True
                 await self.publish_state()
                 return
@@ -1336,7 +1345,10 @@ class PipelineRunner(
         elif current == PipelineState.ERROR:
             if self.state.rate_limited_until is not None:
                 self.state.state = PipelineState.PAUSED
-                self.log_event("Legacy ERROR + rate_limited_until -> PAUSED")
+                self.log_event(
+                    "[RATE-LIMIT] Legacy ERROR + rate_limited_until "
+                    "-> PAUSED."
+                )
             elif self.app_config.daemon.error_handler_use_ai:
                 await self.handle_error()
 

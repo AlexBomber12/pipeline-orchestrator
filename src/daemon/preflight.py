@@ -46,7 +46,7 @@ class PreflightMixin:
             # handler and leaves the runner state stale.
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"preflight failed: {exc}"
-            self.log_event(f"preflight failed: {exc}")
+            self.log_event(f"[INFRA] preflight failed: {exc}.")
             return False
 
         dirty = result.stdout.strip()
@@ -55,7 +55,8 @@ class PreflightMixin:
             count = policy.increment(self)
             if count >= _DIRTY_CYCLES_BEFORE_AUTO_RESET:
                 self.log_event(
-                    f"Dirty tree persisted {count} cycles, auto-resetting to recover"
+                    f"[INFRA] Dirty tree persisted {count} cycles, "
+                    f"auto-resetting to recover."
                 )
             if await policy.maybe_escalate(self):
                 if self.state.state in (PipelineState.IDLE, PipelineState.WATCH):
@@ -63,7 +64,7 @@ class PreflightMixin:
                     return True
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"working tree dirty: {dirty}"
-            self.log_event("preflight: dirty working tree")
+            self.log_event("[INFRA] preflight: dirty working tree.")
             return False
         policy.reset(self)
         return True
@@ -100,7 +101,7 @@ class PreflightMixin:
             subprocess.TimeoutExpired,
             OSError,
         ) as exc:
-            self.log_event(f"Auto-recovery failed: {exc}")
+            self.log_event(f"[INFRA] Auto-recovery failed: {exc}.")
             return
         if self.state.current_pr is not None:
             resumed = PipelineState.WATCH
@@ -108,4 +109,6 @@ class PreflightMixin:
             resumed = PipelineState.IDLE
         self.state.state = resumed
         self.state.error_message = None
-        self.log_event(f"Auto-recovered from dirty tree -> {resumed.value}")
+        self.log_event(
+            f"[INFRA] Auto-recovered from dirty tree -> {resumed.value}."
+        )

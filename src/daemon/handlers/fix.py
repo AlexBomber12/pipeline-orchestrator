@@ -133,17 +133,21 @@ class FixMixin(BreachMixin):
                     if latest_push_at is not None:
                         last_known_push = time.monotonic()
             except github_client.GitHubPollError:
-                self.log_event("FIX: GitHub API poll failed, preserving deadline")
+                self.log_event(
+                    "[FIX] GitHub API poll failed, preserving deadline."
+                )
                 latest_push_at = None
             if latest_push_at is not None and latest_push_at > last_known_push:
                 last_known_push = latest_push_at
                 self.log_event(
-                    f"FIX: [{self.state.coder or 'coder'}] pushed, resetting idle timer"
+                    f"[FIX] [{self.state.coder or 'coder'}] pushed, "
+                    f"resetting idle timer."
                 )
             elapsed = time.monotonic() - last_known_push
             if elapsed >= idle_limit:
                 self.log_event(
-                    f"FIX: idle timeout ({idle_limit}s since last push), killing"
+                    f"[FIX] idle timeout ({idle_limit}s since last push), "
+                    f"killing."
                 )
                 idle_flag["timed_out"] = True
                 target.cancel()
@@ -184,7 +188,9 @@ class FixMixin(BreachMixin):
                 repo=self.owner_repo,
             )
         except Exception as exc:
-            self.log_event(f"{label_create_log_prefix} label create skipped: {exc}")
+            self.log_event(
+                f"[FIX] {label_create_log_prefix} label create skipped: {exc}."
+            )
         try:
             github_client.run_gh(
                 ["pr", "edit", str(pr_number), "--add-label", "escalated"],
@@ -193,8 +199,8 @@ class FixMixin(BreachMixin):
             return True
         except Exception as exc:
             self.log_event(
-                f"Warning: failed to apply escalated label to PR "
-                f"#{pr_number}: {exc}"
+                f"[FIX] Warning: failed to apply escalated label to PR "
+                f"#{pr_number}: {exc}."
             )
             return False
 
@@ -228,15 +234,15 @@ class FixMixin(BreachMixin):
             github_client.post_comment(self.owner_repo, pr_number, message)
         except Exception as exc:
             self.log_event(
-                f"Warning: failed to post FIX deadlock comment on PR "
-                f"#{pr_number}: {exc}"
+                f"[FIX] Warning: failed to post FIX deadlock comment on PR "
+                f"#{pr_number}: {exc}."
             )
         self._ensure_escalated_label(pr_number, "FIX no-push")
         current_pr.is_escalated = True
         current_pr.no_push_fix_count = 0
         self.state.state = PipelineState.HUNG
         self.state.error_message = None
-        self.log_event(message)
+        self.log_event(f"[ESCALATE] {message}")
         await self.publish_state()
 
     async def _escalate_fix_coder_initiated(
@@ -268,8 +274,8 @@ class FixMixin(BreachMixin):
             github_client.post_comment(self.owner_repo, pr_number, message)
         except Exception as exc:
             self.log_event(
-                f"Warning: failed to post FIX coder ESCALATE comment on PR "
-                f"#{pr_number}: {exc}"
+                f"[FIX] Warning: failed to post FIX coder ESCALATE comment "
+                f"on PR #{pr_number}: {exc}."
             )
         label_applied = self._ensure_escalated_label(
             pr_number, "FIX coder ESCALATE"
@@ -282,14 +288,14 @@ class FixMixin(BreachMixin):
                 f"`escalated` label. Reason: {clean_reason}. Manual "
                 "review required."
             )
-            self.log_event(self.state.error_message)
+            self.log_event(f"[ESCALATE] {self.state.error_message}")
             await self.publish_state()
             return
         self.state.state = PipelineState.IDLE
         self.state.error_message = None
         self.log_event(
-            f"FIX coder ESCALATE on PR #{pr_number}: {clean_reason}. "
-            "Moving to IDLE."
+            f"[ESCALATE] FIX coder ESCALATE on PR #{pr_number}: "
+            f"{clean_reason}. Moving to IDLE."
         )
         await self.publish_state()
 
@@ -314,7 +320,7 @@ class FixMixin(BreachMixin):
         except Exception as exc:
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"post_comment failed: {exc}"
-            self.log_event(self.state.error_message)
+            self.log_event(f"[FIX] {self.state.error_message}.")
             return
         try:
             github_client.run_gh(
@@ -330,7 +336,7 @@ class FixMixin(BreachMixin):
                 repo=self.owner_repo,
             )
         except Exception as exc:
-            self.log_event(f"FIX cap label create skipped: {exc}")
+            self.log_event(f"[FIX] FIX cap label create skipped: {exc}.")
         try:
             github_client.run_gh(
                 ["pr", "edit", str(pr_number), "--add-label", "escalated"],
@@ -339,14 +345,14 @@ class FixMixin(BreachMixin):
         except Exception as exc:
             self.state.state = PipelineState.ERROR
             self.state.error_message = f"pr edit failed: {exc}"
-            self.log_event(self.state.error_message)
+            self.log_event(f"[FIX] {self.state.error_message}.")
             return
         current_pr.is_escalated = True
         self.state.error_message = None
         self.state.state = PipelineState.IDLE
         self.log_event(
-            f"FIX cap reached ({count}/{fix_iteration_cap}) on PR "
-            f"#{pr_number}: escalated, moving to IDLE."
+            f"[ESCALATE] FIX cap reached ({count}/{fix_iteration_cap}) on "
+            f"PR #{pr_number}: escalated, moving to IDLE."
         )
         await self.publish_state()
 
@@ -385,12 +391,13 @@ class FixMixin(BreachMixin):
                 )
             except Exception as exc:
                 self.log_event(
-                    f"FIX: GitHub poll for PR #{pr_number} failed: {exc}"
+                    f"[FIX] GitHub poll for PR #{pr_number} failed: {exc}."
                 )
                 continue
             if state_info is None:
                 self.log_event(
-                    f"FIX: GitHub poll for PR #{pr_number} returned no data"
+                    f"[FIX] GitHub poll for PR #{pr_number} returned no "
+                    f"data."
                 )
                 continue
             state = (state_info.get("state") or "").upper()
@@ -398,8 +405,8 @@ class FixMixin(BreachMixin):
                 continue
             terminal_flag["state"] = state
             self.log_event(
-                f"PR #{pr_number} reached terminal state {state} during "
-                "FIX, requesting coder termination."
+                f"[FIX] PR #{pr_number} reached terminal state {state} "
+                f"during FIX, requesting coder termination."
             )
             await self._terminate_current_coder()
             target.cancel()
@@ -443,7 +450,7 @@ class FixMixin(BreachMixin):
             subprocess.TimeoutExpired,
             OSError,
         ) as exc:
-            self.log_event(f"fetch {branch} failed {context}: {exc}")
+            self.log_event(f"[FIX] fetch {branch} failed {context}: {exc}.")
             return None
         try:
             remote_head = git_ops._git(
@@ -457,7 +464,7 @@ class FixMixin(BreachMixin):
             OSError,
         ) as exc:
             self.log_event(
-                f"rev-parse origin/{branch} failed {context}: {exc}"
+                f"[FIX] rev-parse origin/{branch} failed {context}: {exc}."
             )
             return None
         if (
@@ -479,7 +486,7 @@ class FixMixin(BreachMixin):
             )
         except (subprocess.TimeoutExpired, OSError) as exc:
             self.log_event(
-                f"merge-base ancestry check failed {context}: {exc}"
+                f"[FIX] merge-base ancestry check failed {context}: {exc}."
             )
             return None
         return is_ancestor.returncode == 0
@@ -535,8 +542,8 @@ class FixMixin(BreachMixin):
                 pr.no_push_fix_count = 0
                 pr.fix_iteration_count = 0
             self.log_event(
-                f"PR {pr_number_str} merged externally during FIX, "
-                "returning to IDLE."
+                f"[FIX] PR {pr_number_str} merged externally during FIX, "
+                f"returning to IDLE."
             )
             await self._save_current_run_record("success_merged")
             self._current_run_record = None
@@ -553,9 +560,10 @@ class FixMixin(BreachMixin):
                 # on PR #223: surface the failure but do not nullify the
                 # guard).
                 self.log_event(
-                    "Warning: _mark_queue_done failed during external-merge "
-                    f"cleanup: {exc}; pending_queue_sync_branch preserved "
-                    "so handle_idle resolves via _resolve_pending_queue_sync"
+                    "[FIX] Warning: _mark_queue_done failed during "
+                    f"external-merge cleanup: {exc}; "
+                    "pending_queue_sync_branch preserved so handle_idle "
+                    "resolves via _resolve_pending_queue_sync."
                 )
             self.state.current_pr = None
             self.state.current_task = None
@@ -565,8 +573,8 @@ class FixMixin(BreachMixin):
             return
         # CLOSED
         self.log_event(
-            f"PR {pr_number_str} closed externally during FIX, "
-            "transitioning to HUNG."
+            f"[FIX] PR {pr_number_str} closed externally during FIX, "
+            f"transitioning to HUNG."
         )
         # Finalize the run record before parking in HUNG. Otherwise the
         # next ``handle_hung`` tick will move the runner to IDLE and
@@ -622,7 +630,8 @@ class FixMixin(BreachMixin):
             and self.state.current_pr.is_cross_repository
         ):
             self.log_event(
-                f"Skipping FIX for cross-repo PR #{self.state.current_pr.number}"
+                f"[FIX] Skipping FIX for cross-repo PR "
+                f"#{self.state.current_pr.number}."
             )
             self.state.state = PipelineState.WATCH
             return
@@ -634,7 +643,8 @@ class FixMixin(BreachMixin):
             self.state.error_message = None
             self.state.state = PipelineState.IDLE
             self.log_event(
-                f"FIX blocked for escalated PR #{current_pr.number}, moving to IDLE."
+                f"[FIX] FIX blocked for escalated PR #{current_pr.number}, "
+                f"moving to IDLE."
             )
             await self.publish_state()
             return
@@ -656,7 +666,7 @@ class FixMixin(BreachMixin):
             current_pr
         ):
             return
-        self.log_event(f"[{coder_name}] entering FIX")
+        self.log_event(f"[FIX] [{coder_name}] entering FIX.")
         await self.publish_state()
         if self._current_run_record is not None:
             self._current_run_record.fix_iterations += 1
@@ -690,7 +700,7 @@ class FixMixin(BreachMixin):
                 self.state.error_message = (
                     f"git refresh {branch} failed: {stderr.strip() or exc}"
                 )
-                self.log_event(self.state.error_message)
+                self.log_event(f"[FIX] {self.state.error_message}.")
                 return
 
         head_before = ""  # PR-050: detect whether a commit actually happened
@@ -793,8 +803,8 @@ class FixMixin(BreachMixin):
                             self.state.current_pr.number
                         ):
                             self.log_event(
-                                "Codex auto-trigger detected, skipping "
-                                "duplicate @codex review post"
+                                "[FIX] Codex auto-trigger detected, "
+                                "skipping duplicate @codex review post."
                             )
                         elif not self._post_codex_review(
                             self.state.current_pr.number
@@ -806,13 +816,13 @@ class FixMixin(BreachMixin):
                                 "breach-cancel fix push; manual review "
                                 "trigger required"
                             )
-                            self.log_event(self.state.error_message)
+                            self.log_event(f"[FIX] {self.state.error_message}.")
                             return
                 self.state.state = PipelineState.PAUSED
                 self.state.error_message = None
                 self.log_event(
-                    f"FIX aborted: in-flight rate limit breach, "
-                    f"paused until {self.state.rate_limited_until}"
+                    f"[FIX] FIX aborted: in-flight rate limit breach, "
+                    f"paused until {self.state.rate_limited_until}."
                 )
                 return
             elif not idle_flag["timed_out"]:
@@ -856,8 +866,8 @@ class FixMixin(BreachMixin):
                         self.state.current_pr.number
                     ):
                         self.log_event(
-                            "Codex auto-trigger detected, skipping "
-                            "duplicate @codex review post"
+                            "[FIX] Codex auto-trigger detected, skipping "
+                            "duplicate @codex review post."
                         )
                     elif not self._post_codex_review(
                         self.state.current_pr.number
@@ -869,13 +879,13 @@ class FixMixin(BreachMixin):
                             "late-breach fix push; manual review "
                             "trigger required"
                         )
-                        self.log_event(self.state.error_message)
+                        self.log_event(f"[FIX] {self.state.error_message}.")
                         return
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
             self.log_event(
-                f"FIX paused: late in-flight rate limit breach, "
-                f"paused until {self.state.rate_limited_until}"
+                f"[FIX] FIX paused: late in-flight rate limit breach, "
+                f"paused until {self.state.rate_limited_until}."
             )
             return
 
@@ -895,8 +905,8 @@ class FixMixin(BreachMixin):
             self.state.user_paused = True
             stop_requested_after_exit = True
             self.log_event(
-                "User stop requested after FIX exit; deferring pause "
-                "until FIX bookkeeping completes"
+                "[FIX] User stop requested after FIX exit; deferring "
+                "pause until FIX bookkeeping completes."
             )
             return True
 
@@ -905,7 +915,7 @@ class FixMixin(BreachMixin):
                 return False
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
-            self.log_event("FIX aborted: user stop requested")
+            self.log_event("[FIX] FIX aborted: user stop requested.")
             return True
 
         def read_head_after_fix() -> str | None:
@@ -920,7 +930,7 @@ class FixMixin(BreachMixin):
             ) as exc:
                 self.state.state = PipelineState.ERROR
                 self.state.error_message = f"rev-parse after fix failed: {exc}"
-                self.log_event(self.state.error_message)
+                self.log_event(f"[FIX] {self.state.error_message}.")
                 return None
 
         def remote_branch_contains_head(branch: str, head_after: str) -> bool:
@@ -949,14 +959,14 @@ class FixMixin(BreachMixin):
             else:
                 iteration = 0
 
-            self.log_event(f"Fix pushed, iteration #{iteration}")
+            self.log_event(f"[FIX] Fix pushed, iteration #{iteration}.")
             if self.state.current_pr is not None:
                 if self._should_skip_codex_review_post(
                     self.state.current_pr.number
                 ):
                     self.log_event(
-                        "Codex auto-trigger detected, skipping "
-                        "duplicate @codex review post"
+                        "[FIX] Codex auto-trigger detected, skipping "
+                        "duplicate @codex review post."
                     )
                 elif not self._post_codex_review(
                     self.state.current_pr.number
@@ -982,7 +992,7 @@ class FixMixin(BreachMixin):
             self.state.error_message = (
                 f"FIX idle timeout: no push for {idle_limit}s"
             )
-            self.log_event(self.state.error_message)
+            self.log_event(f"[FIX] {self.state.error_message}.")
             await self._save_cli_log("", "", "FIX idle timeout")
             if await pause_for_stop_after_bookkeeping():
                 return
@@ -1027,8 +1037,9 @@ class FixMixin(BreachMixin):
                     return
             elif head_before and head_before != head_after:
                 self.log_event(
-                    "FIX stop-cancel left local HEAD outside the fetched remote branch; "
-                    "skipping push bookkeeping and @codex review"
+                    "[FIX] FIX stop-cancel left local HEAD outside the "
+                    "fetched remote branch; skipping push bookkeeping and "
+                    "@codex review."
                 )
             if await pause_for_stop_after_bookkeeping():
                 return
@@ -1047,15 +1058,18 @@ class FixMixin(BreachMixin):
                 self.state.state = PipelineState.PAUSED
                 self.state.error_message = None
                 self.log_event(
-                    f"Rate limit pause active until "
-                    f"{self.state.rate_limited_until.isoformat()}"
+                    f"[RATE-LIMIT] Rate limit pause active until "
+                    f"{self.state.rate_limited_until.isoformat()}."
                 )
                 return
             if await pause_for_stop_after_bookkeeping():
                 return
             self.state.state = PipelineState.ERROR
             self.state.error_message = stderr.strip() or f"{coder_name} exit {code}"
-            self.log_event(f"[{coder_name}] fix_review failed: {self.state.error_message}")
+            self.log_event(
+                f"[FIX] [{coder_name}] fix_review failed: "
+                f"{self.state.error_message}."
+            )
             return
 
         head_after = read_head_after_fix()
@@ -1084,21 +1098,21 @@ class FixMixin(BreachMixin):
                 remote_no_push = True
             elif verification is None and verify_branch:
                 self.log_event(
-                    "FIX push verification unavailable; "
-                    "proceeding optimistically"
+                    "[FIX] FIX push verification unavailable; "
+                    "proceeding optimistically."
                 )
 
         if local_no_push or remote_no_push:
             self._last_push_at = datetime.now(timezone.utc)
             if local_no_push:
                 self.log_event(
-                    "FIX FEEDBACK exited 0 but HEAD unchanged; "
-                    "no push, skipping @codex review"
+                    "[FIX] FIX FEEDBACK exited 0 but HEAD unchanged; "
+                    "no push, skipping @codex review."
                 )
             else:
                 self.log_event(
-                    "Coder exited cleanly but no push detected; "
-                    "treating as no-push, skipping @codex review"
+                    "[FIX] Coder exited cleanly but no push detected; "
+                    "treating as no-push, skipping @codex review."
                 )
             if self.state.current_pr is not None:
                 no_push_policy.increment(self.state.current_pr)
