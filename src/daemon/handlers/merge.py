@@ -253,15 +253,7 @@ class MergeMixin:
         record = self._current_run_record
         pr = self.state.current_pr
         task = self.state.current_task
-        configured_coder = (
-            self.repo_config.coder or self.app_config.daemon.coder
-        )
-        coder_name = configured_coder.value
-        model = (
-            self.app_config.daemon.codex_model
-            if coder_name == CoderType.CODEX.value
-            else self.app_config.daemon.claude_model
-        )
+        coder_name, model = self._resolve_outcome_coder_and_model(record)
 
         wall_clock_seconds: int | None = None
         if record is not None and record.duration_ms is not None:
@@ -315,6 +307,36 @@ class MergeMixin:
             "tokens_estimate": None,
             "outcome": "merged",
         }
+
+    def _resolve_outcome_coder_and_model(self, record) -> tuple[str, str]:
+        """Return the (coder, model) pair that actually ran the PR.
+
+        ``_get_coder()`` may switch away from the configured default at
+        run time — task-level pinning, exploration, or rate-limit
+        fallback can all select a non-default coder — and the chosen
+        pair is captured in the run record's
+        ``profile_id`` (``"<coder>:<model>:container"``) when CODING
+        starts. Reading from there keeps merged outcome rows aligned
+        with the run that produced them so later model/version-level
+        analytics are not mislabeled. Fall back to the repo/daemon
+        default only when no run record exists (e.g. recovery paths
+        that build an outcome row without a CODING pass on this
+        process).
+        """
+        if record is not None and record.profile_id:
+            parts = record.profile_id.split(":")
+            if len(parts) >= 2 and parts[0] and parts[1]:
+                return parts[0], parts[1]
+        configured_coder = (
+            self.repo_config.coder or self.app_config.daemon.coder
+        )
+        coder_name = configured_coder.value
+        model = (
+            self.app_config.daemon.codex_model
+            if coder_name == CoderType.CODEX.value
+            else self.app_config.daemon.claude_model
+        )
+        return coder_name, model
 
     def _mark_queue_done(self) -> None:
         """Mark the merged task DONE in the local QUEUE.md only.

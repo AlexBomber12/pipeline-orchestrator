@@ -337,3 +337,68 @@ def test_build_outcome_record_falls_back_to_pr_pr_id_when_task_missing(
 
     assert record["pr_id"] == "PR-204"
     assert record["codex_review_iterations"] == 2
+
+
+def test_build_outcome_record_uses_run_record_coder_over_config_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run-time coder selection (e.g. rate-limit fallback) must win over config.
+
+    The runner here is configured with ``coder=CoderType.CLAUDE``, but
+    the run record was started with codex/gpt-5-codex — simulating the
+    case where ``_get_coder()`` switched coders due to rate limits or
+    task pinning. The merged outcome row must report what actually
+    ran, not the configured default, otherwise downstream
+    model/version analytics get mislabeled.
+    """
+    monkeypatch.setattr(
+        "src.daemon.handlers.merge.detect_coder_extension_version",
+        lambda coder: None,
+    )
+
+    runner = _make_runner()
+    # Confirm the configured default is claude, so a config-driven
+    # build would mislabel this run.
+    assert runner.repo_config.coder == CoderType.CLAUDE
+
+    runner.state.current_pr = PRInfo(
+        number=11, branch="b", pr_id="PR-204", fix_iteration_count=0
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-204", title="t", status=TaskStatus.DOING, branch="b",
+    )
+    runner._start_current_run_record("codex", "gpt-5-codex-2026-05")
+
+    from datetime import datetime, timezone
+
+    record = runner._build_outcome_record(
+        datetime(2026, 4, 29, 14, 25, 23, tzinfo=timezone.utc)
+    )
+
+    assert record["coder"] == "codex"
+    assert record["coder_model_string"] == "gpt-5-codex-2026-05"
+
+
+def test_build_outcome_record_falls_back_to_config_when_run_record_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a run record, the row reverts to repo/daemon defaults."""
+    monkeypatch.setattr(
+        "src.daemon.handlers.merge.detect_coder_extension_version",
+        lambda coder: None,
+    )
+
+    runner = _make_runner()
+    runner.repo_config = runner.repo_config.model_copy(
+        update={"coder": CoderType.CODEX}
+    )
+    # Leave _current_run_record as None.
+
+    from datetime import datetime, timezone
+
+    record = runner._build_outcome_record(
+        datetime(2026, 4, 29, 14, 25, 23, tzinfo=timezone.utc)
+    )
+
+    assert record["coder"] == "codex"
+    assert record["coder_model_string"] == "gpt-5-codex"

@@ -300,6 +300,22 @@ def test_concurrent_appends_across_processes_use_flock(
     assert parsed_ids == {f"PR-{i:04d}" for i in range(8)}
 
 
+@pytest.fixture(autouse=True)
+def _no_binary_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default ``shutil.which`` to "binary missing" for npm-fallback tests.
+
+    The detector first looks up the coder binary on ``PATH`` and reads
+    ``<prefix>/lib/node_modules/<pkg>/package.json`` if found. Tests
+    that target the npm-list subprocess fallback want that lookup to
+    fail; tests that target the prefix-derived path re-patch
+    ``shutil.which`` themselves.
+    """
+    monkeypatch.setattr(
+        "src.analytics.coder_version.shutil.which",
+        lambda binary: None,
+    )
+
+
 def test_detect_coder_extension_version_returns_none_for_unknown_coder() -> None:
     assert detect_coder_extension_version("nobody") is None
     assert detect_coder_extension_version("") is None
@@ -341,6 +357,144 @@ def test_detect_coder_extension_version_handles_oserror(
         "src.analytics.coder_version.subprocess.run", fail
     )
     assert detect_coder_extension_version("claude") is None
+
+
+def test_detect_codex_version_from_custom_install_prefix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Mirrors the Dockerfile: codex installed under a non-default --prefix.
+
+    A plain ``npm list -g`` cannot see a package installed at a custom
+    prefix, so the detector must derive the prefix from the binary on
+    PATH and read ``<prefix>/lib/node_modules/<pkg>/package.json``
+    directly. ``subprocess.run`` is wired to ``raise`` to prove the
+    detector never reaches the npm fallback on this path.
+    """
+    prefix = tmp_path / ".npm-global"
+    bin_dir = prefix / "bin"
+    pkg_dir = prefix / "lib" / "node_modules" / "@openai" / "codex"
+    bin_dir.mkdir(parents=True)
+    pkg_dir.mkdir(parents=True)
+    (bin_dir / "codex").write_text("#!/bin/sh\n")
+    (pkg_dir / "package.json").write_text(
+        json.dumps({"name": "@openai/codex", "version": "0.125.0"})
+    )
+
+    monkeypatch.setattr(
+        "src.analytics.coder_version.shutil.which",
+        lambda binary: str(bin_dir / "codex") if binary == "codex" else None,
+    )
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError(
+            "npm list fallback must not run when prefix detection succeeds"
+        )
+
+    monkeypatch.setattr(
+        "src.analytics.coder_version.subprocess.run", fail
+    )
+
+    assert detect_coder_extension_version("codex") == "0.125.0"
+
+
+def test_detect_coder_extension_version_falls_back_to_npm_when_package_json_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Prefix is found but package.json is missing — fall back to npm list."""
+    prefix = tmp_path / "node-prefix"
+    bin_dir = prefix / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "codex").write_text("#!/bin/sh\n")
+
+    monkeypatch.setattr(
+        "src.analytics.coder_version.shutil.which",
+        lambda binary: str(bin_dir / "codex") if binary == "codex" else None,
+    )
+    monkeypatch.setattr(
+        "src.analytics.coder_version.subprocess.run",
+        lambda *a, **kw: _fake_completed(
+            json.dumps(
+                {"dependencies": {"@openai/codex": {"version": "0.99.9"}}}
+            )
+        ),
+    )
+
+    assert detect_coder_extension_version("codex") == "0.99.9"
+
+
+def test_resolve_install_prefix_returns_none_when_binary_missing() -> None:
+    from src.analytics.coder_version import _resolve_install_prefix
+
+    # The autouse ``_no_binary_on_path`` fixture already stubs ``which``
+    # to return None for every binary; this asserts the contract
+    # explicitly.
+    assert _resolve_install_prefix("codex") is None
+
+
+def test_resolve_install_prefix_returns_none_when_parent_is_not_bin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from src.analytics.coder_version import _resolve_install_prefix
+
+    odd_dir = tmp_path / "weird"
+    odd_dir.mkdir()
+    fake_bin = odd_dir / "codex"
+    fake_bin.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(
+        "src.analytics.coder_version.shutil.which",
+        lambda binary: str(fake_bin),
+    )
+    assert _resolve_install_prefix("codex") is None
+
+
+def test_resolve_install_prefix_returns_none_when_resolve_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.analytics.coder_version import _resolve_install_prefix
+
+    monkeypatch.setattr(
+        "src.analytics.coder_version.shutil.which",
+        lambda binary: "/some/path/codex",
+    )
+
+    def boom(self: Any) -> None:
+        raise OSError("symlink loop")
+
+    monkeypatch.setattr(Path, "resolve", boom)
+    assert _resolve_install_prefix("codex") is None
+
+
+def test_read_package_version_returns_none_for_invalid_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from src.analytics.coder_version import _read_package_version
+
+    pkg_dir = tmp_path / "lib" / "node_modules" / "@openai" / "codex"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "package.json").write_text("not json")
+    assert _read_package_version(str(tmp_path), "@openai/codex") is None
+
+
+def test_read_package_version_returns_none_when_payload_not_dict(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from src.analytics.coder_version import _read_package_version
+
+    pkg_dir = tmp_path / "lib" / "node_modules" / "@openai" / "codex"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "package.json").write_text("[]")
+    assert _read_package_version(str(tmp_path), "@openai/codex") is None
+
+
+def test_read_package_version_returns_none_when_version_not_string(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from src.analytics.coder_version import _read_package_version
+
+    pkg_dir = tmp_path / "lib" / "node_modules" / "@openai" / "codex"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "package.json").write_text(json.dumps({"version": 42}))
+    assert _read_package_version(str(tmp_path), "@openai/codex") is None
 
 
 def _fake_completed(stdout: str, returncode: int = 0) -> Any:
