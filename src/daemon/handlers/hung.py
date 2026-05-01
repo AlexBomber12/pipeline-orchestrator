@@ -281,8 +281,8 @@ class HungMixin:
                     f"[ESCALATE] PR #{current_pr.number} {pr_state} by "
                     f"operator -> IDLE."
                 )
-                self.state.current_pr = None
                 self.state.current_task = None
+                self._reset_runner_local_task_counters()
                 self.state.state = PipelineState.IDLE
                 return
 

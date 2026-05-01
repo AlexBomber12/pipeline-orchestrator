@@ -409,10 +409,8 @@ class ErrorMixin:
                 git_ops._git(self.repo_path, "clean", "-fd", check=False)
         if verdict == "SKIP":
             self.state.current_task = None
-            self.state.current_pr = None
-            self.state.error_message = None
+            self._reset_runner_local_task_counters()
             self.state.state = PipelineState.IDLE
-            self._error_diagnose_count = 0
             self.log_event("[ERROR] diagnose_error: SKIP -> IDLE.")
         elif verdict == "FIX":
             self.state.error_message = None

@@ -565,9 +565,8 @@ class FixMixin(BreachMixin):
                     "pending_queue_sync_branch preserved so handle_idle "
                     "resolves via _resolve_pending_queue_sync."
                 )
-            self.state.current_pr = None
             self.state.current_task = None
-            self.state.error_message = None
+            self._reset_runner_local_task_counters()
             self.state.state = PipelineState.IDLE
             await self.publish_state()
             return

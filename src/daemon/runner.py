@@ -393,6 +393,30 @@ class PipelineRunner(
             self._pending_requires_idle_boundary or requires_idle_boundary
         )
 
+    def _reset_runner_local_task_counters(self) -> None:
+        """Reset PipelineRunner-private counters tied to the active task.
+
+        Call this from every code path that clears
+        ``state.current_task``. The ``RepoState.__setattr__`` hook
+        already releases ``current_pr`` and ``error_message`` when the
+        triggering write is ``current_task = None``; this helper covers
+        the runner-instance fields that the persisted state does not
+        carry: the SKIP/diagnose retry counters and the IDLE soft-defer
+        flag. Keeping them on the runner avoids either bloating the
+        persisted RepoState blob or holding a runner reference inside
+        the Pydantic model.
+
+        After PR-218, no production code path may build a "task clear"
+        from ``state.current_task = None`` plus a hand-rolled set of
+        field resets. Use this helper next to the assignment so the
+        recovery.py:371-375 superset stays the universal contract.
+        """
+        self._error_skip_active = False
+        self._error_skip_count = 0
+        self._error_skip_context = None
+        self._error_diagnose_count = 0
+        self._idle_dispatch_deferred = False
+
     def _build_usage_providers_for_app_config(
         self,
         app_config: AppConfig,

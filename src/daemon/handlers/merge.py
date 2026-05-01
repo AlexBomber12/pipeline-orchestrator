@@ -237,8 +237,8 @@ class MergeMixin:
                 f"[ANALYTICS] outcome log for PR #{number} failed: {exc}."
             )
         self._current_run_record = None
-        self.state.current_pr = None
         self.state.current_task = None
+        self._reset_runner_local_task_counters()
         self.state.state = PipelineState.IDLE
         self.log_event(f"[MERGE] Merged PR #{number} -> IDLE.")
 

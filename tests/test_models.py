@@ -115,3 +115,67 @@ def test_repo_state_keeps_stale_retrigger_when_refreshing_same_pr() -> None:
 
 def test_repo_state_transition_helper_handles_non_prinfo_values() -> None:
     assert RepoState._is_new_pr_transition("old", "new") is True
+
+
+def test_repo_state_clearing_current_task_clears_current_pr() -> None:
+    state = RepoState(
+        url="https://github.com/example/repo.git",
+        name="repo",
+        current_task=QueueTask(
+            pr_id="PR-001", title="t", status=TaskStatus.DOING,
+        ),
+        current_pr=PRInfo(number=1, branch="pr-001"),
+    )
+
+    state.current_task = None
+
+    assert state.current_task is None
+    assert state.current_pr is None
+
+
+def test_repo_state_clearing_current_task_clears_error_message() -> None:
+    state = RepoState(
+        url="https://github.com/example/repo.git",
+        name="repo",
+        current_task=QueueTask(
+            pr_id="PR-001", title="t", status=TaskStatus.DOING,
+        ),
+        error_message="boom",
+    )
+
+    state.current_task = None
+
+    assert state.current_task is None
+    assert state.error_message is None
+
+
+def test_repo_state_assigning_current_task_does_not_clear_current_pr() -> None:
+    state = RepoState(
+        url="https://github.com/example/repo.git",
+        name="repo",
+        current_pr=PRInfo(number=1, branch="pr-001"),
+    )
+
+    state.current_task = QueueTask(
+        pr_id="PR-002", title="t", status=TaskStatus.DOING,
+    )
+
+    assert state.current_task is not None
+    assert state.current_pr is not None
+    assert state.current_pr.number == 1
+
+
+def test_repo_state_clearing_current_pr_does_not_clear_current_task() -> None:
+    task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
+    state = RepoState(
+        url="https://github.com/example/repo.git",
+        name="repo",
+        current_task=task,
+        current_pr=PRInfo(number=1, branch="pr-001"),
+        error_message="active failure",
+    )
+
+    state.current_pr = None
+
+    assert state.current_task == task
+    assert state.error_message == "active failure"
