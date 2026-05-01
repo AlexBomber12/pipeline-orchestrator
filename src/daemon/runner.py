@@ -797,6 +797,30 @@ class PipelineRunner(
             self._apply_diff_stats(record, stats, resolved_base_branch)
         await self._metrics_store.save(record)
 
+    async def _transition_to_error(
+        self,
+        message: str,
+        *,
+        save_run_record_as: str | None = "error",
+        publish: bool = True,
+        log_prefix: str = "[ERROR]",
+    ) -> None:
+        """Atomic transition to ERROR with consistent telemetry.
+
+        Sets state.state, error_message, logs an [ERROR]-prefixed event,
+        optionally saves a run record, and optionally publishes state. All
+        transitions to PipelineState.ERROR must use this primitive after
+        PR-219b ships; direct ``state.state = PipelineState.ERROR`` writes
+        are forbidden.
+        """
+        self.state.state = PipelineState.ERROR
+        self.state.error_message = message
+        self.log_event(f"{log_prefix} {message}.")
+        if save_run_record_as:
+            await self._save_current_run_record(save_run_record_as)
+        if publish:
+            await self.publish_state()
+
     def _track_current_coder_process(
         self, proc: asyncio.subprocess.Process
     ) -> None:

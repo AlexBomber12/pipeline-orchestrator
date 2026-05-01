@@ -359,15 +359,15 @@ class ErrorMixin:
                         self.state.current_pr.record_observed_head(head_after)
                         self.state.current_pr.last_activity = push_time
                         if not self._post_codex_review(self.state.current_pr.number):
-                            self.state.state = PipelineState.ERROR
-                            self.state.error_message = (
-                                f"Failed to post @codex review on PR "
-                                f"#{self.state.current_pr.number} after "
-                                "diagnose_error fix push; manual review "
-                                "trigger required to avoid fix/push loop"
-                            )
-                            self.log_event(
-                                f"[ERROR] {self.state.error_message}."
+                            await self._transition_to_error(
+                                (
+                                    f"Failed to post @codex review on PR "
+                                    f"#{self.state.current_pr.number} after "
+                                    "diagnose_error fix push; manual review "
+                                    "trigger required to avoid fix/push loop"
+                                ),
+                                save_run_record_as=None,
+                                publish=False,
                             )
                             return
                 except (

@@ -95,12 +95,11 @@ class CodingMixin:
             self.state.current_task.branch if self.state.current_task else None
         )
         if not target_branch:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = (
-                "Current task has no branch; cannot identify PR"
+            await self._transition_to_error(
+                "Current task has no branch; cannot identify PR",
+                publish=False,
+                log_prefix="[CODING]",
             )
-            await self._save_current_run_record("error")
-            self.log_event(f"[CODING] {self.state.error_message}.")
             return
 
         breach_dir, breach_run_id = self._breach_env()
@@ -266,12 +265,10 @@ class CodingMixin:
                     f"{self.state.rate_limited_until.isoformat()}."
                 )
                 return
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = stderr.strip() or f"{coder_name} exit {code}"
-            await self._save_current_run_record("error")
-            self.log_event(
-                f"[CODING] [{coder_name}] CLI failed: "
-                f"{self.state.error_message}."
+            await self._transition_to_error(
+                stderr.strip() or f"{coder_name} exit {code}",
+                publish=False,
+                log_prefix=f"[CODING] [{coder_name}] CLI failed:",
             )
             return
 
@@ -293,10 +290,11 @@ class CodingMixin:
                     allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
                 )
             except Exception as exc:
-                self.state.state = PipelineState.ERROR
-                self.state.error_message = f"get_open_prs failed: {exc}"
-                await self._save_current_run_record("error")
-                self.log_event(f"[CODING] {exc}.")
+                await self._transition_to_error(
+                    f"get_open_prs failed: {exc}",
+                    publish=False,
+                    log_prefix="[CODING]",
+                )
                 return
             candidate = next(
                 (pr for pr in prs if pr.branch == target_branch), None
@@ -442,23 +440,23 @@ class CodingMixin:
                 # cannot confirm its visibility. Degrade to ERROR (which
                 # the daemon retries) rather than HUNG (manual park) so a
                 # transient read outage does not strand the task.
-                message = (
-                    f"[{coder_name}] Daemon-created PR list failed after "
-                    f"3 attempts: {last_list_exc}"
+                await self._transition_to_error(
+                    (
+                        f"[{coder_name}] Daemon-created PR list failed after "
+                        f"3 attempts: {last_list_exc}"
+                    ),
+                    publish=False,
+                    log_prefix="[CODING]",
                 )
-                self.state.state = PipelineState.ERROR
             else:
                 message = (
                     f"[{coder_name}] Daemon-created PR not found for branch "
                     f"{target_branch!r}"
                 )
                 self.state.state = PipelineState.HUNG
-            self.state.error_message = message
-            await self._save_current_run_record("error")
-            if self.state.state == PipelineState.HUNG:
+                self.state.error_message = message
+                await self._save_current_run_record("error")
                 self.log_event(f"[ESCALATE] {message}.")
-            else:
-                self.log_event(f"[CODING] {message}.")
             return
 
         self.state.current_pr = candidate
