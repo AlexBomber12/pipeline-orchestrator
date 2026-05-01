@@ -25,6 +25,7 @@ threaded through the affected log lines.
 from __future__ import annotations
 
 import asyncio
+import re
 import subprocess
 from typing import Any
 
@@ -582,7 +583,6 @@ def _assert_branch_context_in_diagnostic_xfail(
     mention cannot cover multiple ``None`` fields.
     """
     haystack = f"{diagnostic}\n{error_message}"
-    haystack_lower = haystack.lower()
     missing: list[str] = []
     if base_branch and base_branch not in haystack:
         missing.append(f"base_branch={base_branch!r}")
@@ -599,7 +599,18 @@ def _assert_branch_context_in_diagnostic_xfail(
         ("pr_head_branch", pr_head_branch),
     ):
         if value is None:
-            if label not in haystack_lower or "absent" not in haystack_lower:
+            # Pair the label with "absent" via an explicit ``=`` or ``:``
+            # separator (allowing optional ``<>`` brackets). A bare
+            # global ``"absent"`` substring elsewhere in the haystack
+            # must NOT satisfy this slot, otherwise a future
+            # BranchContext implementation that names every label but
+            # marks only one as absent would falsely flip every xfail
+            # to XPASS and weaken the regression guard.
+            absent_marker = re.compile(
+                rf"\b{re.escape(label)}\b\s*[=:]\s*<?absent\b",
+                re.IGNORECASE,
+            )
+            if not absent_marker.search(haystack):
                 missing.append(f"{label}=<absent> not explicitly logged")
     if missing:
         pytest.xfail(
