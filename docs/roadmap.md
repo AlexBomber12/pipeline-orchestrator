@@ -83,6 +83,12 @@ PR-228/PR-232/PR-234/PR-236 all merged before 2026-04-29.
 - OBS-AD (PR-180 self-healing convergence): **DOCUMENTED** — observation captured, no fix needed.
 - OBS-AE (coder opens PR for wrong task): **MITIGATED** — PR-205 (control wake) and PR-206 (settings wake) reduce window. Defense-in-depth via PR-200 (task header validation).
 - OBS-AR (event log spam — 304 Not Modified loop): **OPEN** — bug in `_etag_get` returns None when status=304 AND cached=None, causing alternating "INFRA No tasks available" + "INFRA IDLE: merged PR check failed: gh: HTTP 304" every poll cycle. Reproduced by operator screenshot 76 events alternating these two types. Fix scoped as PR-236 in Foundation Sprint Batch E.
+- OBS-AS (UI inconsistencies during onboarding): **OPEN, polish-tier** — two issues observed 2026-05-01: (1) "initializing" state shows both pulsing dot AND solid badge, inconsistent with other active states; (2) upload-result toast notifications dismiss too quickly (~2-3s) before operator can read failure messages. Fix scoped as small Polish PR (~15 LOC, ux, low complexity). Not a blocker for active onboarding.
+- OBS-AT (successful multi-repo onboarding validation): **CLOSED, positive observation** — sequential onboarding of megaraid-dashboard + sms-gateway-v2 alongside existing pipeline-orchestrator validated 5 production surfaces in single session: AGENTS.md reconciliation, scaffolder idempotency, multi-repo coordination (PR-207), GraphQL diet headroom at 3 active repos, shared auth volumes. Foundation Sprint can now run safely on multi-repo daemon. Recorded for future reference.
+- OBS-AU (stuck Uploading spinner across all repos): **OPEN, medium severity (upgraded from low 2026-05-01 evening)** — race condition between HTMX auto-poll re-render and user upload interaction. Initially thought rare; observation in multi-repo (3 active repos) usage showed it triggers frequently with normal operator clicks. Browser warning: "Form submission canceled because the form is not connected." Self-resolves on next auto-poll but UI feels broken. **Priority raised to near-term polish PR** (~15 LOC JS to pause polling during upload interaction). Every operator with 2+ repos will encounter this without fix.
+- OBS-AV (partial task upload + missing vocabulary synonyms): **OPEN, medium severity** — observed 2026-05-01 evening. Operator uploaded task batch with `Complexity: small` (6 files) and `Type: infra` (1 file). Validation banner correctly flagged 6 errors, but **valid PR-001 file made it to disk and was picked by daemon** while dependent tasks (PR-002..PR-008) were rejected. Three sub-bugs: (1) missing TYPE_SYNONYMS entry for `infra` (likely should map to `config`); (2) COMPLEXITY_SYNONYMS doesn't exist at all (`small/medium/large` should map to `low/medium/high`); (3) upload validation is per-file, not all-or-nothing — partial acceptance breaks dependency chains and traps daemon on orphan tasks. Fix: add missing synonyms maps + atomic upload validation (all task files validate before any file commits to disk). ~3 PRs, ~5 daemon-hours.
+- OBS-AW (missing per-repo HUNG recovery control): **OPEN, medium severity** — observed 2026-05-01 evening. Repo stuck in HUNG state. Existing UI controls: Pause/Resume/Stop only manipulate `user_paused` flag, do not transition state machine out of HUNG. Resume on a HUNG repo is no-op. Operator forced to either: (a) restart entire daemon container (heavy hammer affecting all repos), (b) manually clear `tasks/PR-*.md` to force IDLE transition on next cycle, (c) wait for `handle_hung` to detect external PR merge/close. None of these surface in UI. Need explicit "Reset to IDLE" or "Recover from HUNG" button on repo card that: (1) clears local HUNG flag, (2) closes any orphan branch the coder may have created locally, (3) marks the trapped task as CANCELED in derived queue, (4) transitions state to IDLE. Fix: per-repo recovery control with confirmation dialog. ~2-3 PRs, ~4 daemon-hours. **High user-frustration impact even though not a daily occurrence — operator cannot recover from HUNG without shell access or destructive workarounds.**
+- OBS-AX (scaffolder must replace CLAUDE.md, not preserve it): **OPEN, high severity, immediate priority** — verified 2026-05-01 evening through hypothesis test on megaraid + sms-gateway. External repos with user-authored Claude-specific notes in CLAUDE.md (storcli/D-Bus hints, "prefer existing modules", etc.) cause coder to HUNG with "PLANNED PR alone isn't enough context" because CLAUDE.md becomes system prompt and competes with AGENTS.md redirect. Replacing CLAUDE.md with single line `Read and follow AGENTS.md in this repository.` immediately unblocks coder. **Current scaffolder leaves existing CLAUDE.md untouched** — should overwrite with minimal redirect instead, optionally migrating user-authored notes into a section in AGENTS.md user portion. Fix scoped as 1 PR, ~2 daemon-hours: update `scaffolder.py` to overwrite CLAUDE.md unconditionally with minimal content; document rationale in template. **Without this fix, every external repo with non-trivial CLAUDE.md will HUNG on first task pick.** Should ship before any non-author user attempts onboarding.
 
 ### Memory items still actionable
 
@@ -1025,6 +1031,87 @@ This is the same class of problem as Sprint F2.1 SoT (Source of Truth direct ins
 3. **Lost task file went undetected for hours.** Operator only noticed because they were debugging a different issue. Add proactive integrity check at upload time so this surfaces immediately, not via second-order observation.
 
 
+### OBS-AS: UI inconsistencies during onboarding (observed 2026-05-01)
+
+**Observed during sms-gateway-v2 onboarding test on dashboard:**
+
+1. **Repo card "initializing" state has both pulsing dot AND solid badge.** Two animated indicators side by side competing for attention. The dot pulses, the badge has a static color. Inconsistent visual language compared to other transient states (CODING, FIX, WATCH) which use a single pulsing badge.
+2. **Toast notifications dismiss too quickly.** After successful or failed upload, the confirmation/error note disappears before the operator can read it (~2-3 seconds vs the ~5-7 seconds typical for HTMX flash messages). On failure especially this is harmful — operator does not see what went wrong, has to retry to re-trigger the message.
+
+**Root cause hypothesis:**
+
+For (1): the "initializing" state likely was added later than the active states (CODING/FIX/WATCH) and inherited the dot indicator pattern from idle/paused states without removing it when the badge was added. Two design eras layered on top of each other.
+
+For (2): toast/note dismiss timing is probably hardcoded in the HTMX swap logic or in JS toast handler. Likely a single value used for all notifications regardless of severity. Should be configurable per-event-type or at minimum increased to 5-7 seconds for upload-result notifications.
+
+**Action items proposed (UI polish):**
+
+- **Polish PR (small):** Remove the pulsing dot from "initializing" state, keep only the pulsing badge. Match the visual language of other active states. ~5 LOC change in `src/web/templates/components/repo_cards.html` plus state_styles definition.
+- **Polish PR (small):** Increase toast dismiss timeout from current value to 7 seconds for upload-result notifications. Or surface a manual close button so operator can dismiss when they choose. ~10 LOC change in toast handler + CSS.
+
+Both can ship in a single Polish PR or split if scope grows. Type: ux. Complexity: low.
+
+**Strategic placement:** these are not blockers for the megaraid + sms-gateway onboarding test currently underway — operator can mentally filter the noise. Worth fixing before Foundation Sprint completes so the post-Foundation testing days have a cleaner UI to validate against.
+
+
+### OBS-AT: Successful multi-repo onboarding validation (observed 2026-05-01)
+
+**Positive observation, not a bug.** Recorded for future reference as a validation event spanning multiple production surfaces.
+
+**Setup:** operator added megaraid-dashboard and sms-gateway-v2 sequentially via UI after pre-onboarding MICRO PRs (manual `scripts/ci.sh` + `.gitignore` additions). Pipeline-orchestrator's own repo was already active. Total 3 managed repos in production simultaneously.
+
+**Outcome:** all 3 repos reached IDLE state without error. Daemon scaffolder ran on each external repo and committed only `scripts/make-review-artifacts.sh` (idempotent — operator's pre-existing `scripts/ci.sh` was not overwritten with stub). On-disk tasks/, artifacts/ directories created locally by scaffolder; gitignored entries (`tasks/QUEUE.md`, `artifacts/`) correctly excluded from commit. AGENTS.md reconciliation via `/onboarding/apply` appended daemon-managed sections without disturbing user content.
+
+**Production surfaces validated in single onboarding session:**
+
+1. **AGENTS.md reconciliation framework (PR-192a/b/c)** works on real external repos with pre-existing user-authored AGENTS.md content, not only on pipeline-orchestrator's self-AGENTS.md.
+2. **Scaffolder idempotency** works correctly — operator's MICRO-PR-shipped `scripts/ci.sh` was preserved (content hash differed from stub template, so daemon left it alone). `.gitignore` operator additions for `artifacts/` and `tasks/QUEUE.md` were preserved (already present, daemon's append step was no-op).
+3. **Multi-repo coordination (PR-207 parallel run_cycle)** validated in production — 3 active repos simultaneously in IDLE without one blocking another's poll cycle. Audit hypothesis (PR-193) confirmed: per-repo state isolation, slug computation, tasks/ paths, event log all properly scoped.
+4. **GraphQL diet (PR-180/PR-184/PR-191/PR-202)** holds at 3 active repos. No quota exhaust observable. The combination of REST check-runs + ETag conditional requests + adaptive WATCH polling + adaptive IDLE polling absorbs 3x repo load that would have blown a single-repo quota in 2026-04-28 timeframe.
+5. **Auth volume mounts** work across multiple repos with single shared credentials set (CLAUDE_CONFIG_DIR, GH_CONFIG_DIR, codex-auth volume). No per-repo auth duplication required.
+
+**Counter-intuitive learning for next operator/user:**
+
+Git does not track empty directories. After scaffolder runs, the on-disk repo at `/data/repos/<owner>__<name>/` has `tasks/`, `artifacts/`, `scripts/` directories — but only `scripts/make-review-artifacts.sh` becomes visible on GitHub (since it is the only new git-tracked file). The absence of `tasks/` in GitHub UI is correct behaviour, not a bug. Worth surfacing this in onboarding UI explicitly when wizard ships (PR-FUTURE-3) to prevent operator confusion.
+
+**Foundation Sprint readiness:** with 3 repos validated stable, Foundation Sprint (36 PR specs in `/mnt/user-data/outputs/foundation-tasks/`) can run safely on the now-multi-repo daemon. Foundation work will continue against pipeline-orchestrator while megaraid and sms-gateway sit idle waiting for their own task specs (separate session).
+
+
+### OBS-AU: Stuck "Uploading..." spinner across all repos (observed 2026-05-01)
+
+**Observed:** after partial-failed upload to megaraid (Bug 1 — 6 of 7 task files rejected for invalid Type/Complexity vocabulary), all 3 repo cards in dashboard showed "Uploading..." spinner indefinitely. Spinner did not clear on its own immediately. Eventually self-resolved after auto-refresh poll cycle re-rendered the cards.
+
+**Browser console showed only:** `Form submission canceled because the form is not connected. onchange @ (index):1`. No HTMX errors. No network errors. Single warning, single source.
+
+**Root cause:** race condition between dashboard auto-poll (HTMX re-renders repo cards every 2-3 seconds) and user upload interaction.
+
+Sequence:
+
+1. User clicks upload icon → file picker opens.
+2. File picker is modal but does not pause page rendering. Auto-poll fires during the open file-picker window.
+3. Poll response arrives, HTMX swaps repo cards fragment → form element under the upload icon **deleted from DOM**.
+4. User selects file → `change` event fires on file input. The form's `onchange` handler tries to submit, but the form is **disconnected** from DOM.
+5. Browser cancels submission silently with the console warning. HTMX's `htmx:beforeRequest` may have fired but `htmx:afterRequest` cannot fire on a disconnected form.
+6. `.htmx-indicator` CSS class added (or not removed) on the spinner span. Because the spinner span was rendered fresh by the poll re-render but inherited the `htmx-indicator` show state from a previous template render, **all 3 repo cards display spinner simultaneously**. Why all 3 and not just the one being uploaded to: likely a class-level CSS rule applying `opacity:1` to all `.htmx-indicator` spans rather than instance-level state.
+7. Self-recovery: next auto-poll re-renders cards from server, server sees no in-flight upload, returns clean fragment without indicator state.
+
+**Fix options:**
+
+1. **Decouple upload form from card fragment.** Move `<form>` element into a parent template that does not re-render on poll. Card body stays under poll, upload UI stays stable. Best long-term fix; requires template restructure.
+2. **Pause polling during user upload interaction.** JS event listener on upload icon click → temporarily disable HTMX poll triggers → resume after `change` event completes (success or cancel). Surgical fix, ~15 LOC JS.
+3. **Use morphdom swap** (`hx-swap="morph"` via the htmx-ext-morph extension). Swap with element identity preservation; form survives re-render even if content changes. Requires adding HTMX extension dependency.
+
+**Recommendation:** option 2 (pause polling during interaction) for a quick fix. Option 1 (decouple form) for the proper long-term solution; defer to PR-FUTURE-3 wizard work which will restructure card templates anyway.
+
+**Severity:** initially classified as rare (single ~200-500ms race window per upload click). **Upgraded 2026-05-01 evening based on multi-repo observation:** with 3 active repos, operator triggered the bug repeatedly within minutes through normal click interactions. Each additional repo multiplies the auto-poll cadence (every 2-3s × N cards), and operator's active UI work expands the total race window significantly. **Real classification: medium severity, frequent in multi-repo usage, every operator with 2+ repos will encounter it.**
+
+User-perspective framing: "web не справляется с мультирепо" — even though daemons run fine behind the stuck UI, the dashboard *appears* broken. UI experience IS the product surface.
+
+**Priority:** raised from "defer to PR-FUTURE-3 wizard" to **near-term polish PR.** Should ship within Foundation Sprint window or immediately after, before any fresh operator (non-author) tries multi-repo onboarding.
+
+**Type:** bugfix. **Complexity:** low. **Estimated:** 1 PR, ~2 daemon-hours. Recommended fix: option 2 (pause polling during user upload interaction, ~15 LOC JS).
+
+
 ## Architectural future work — multi-repo + per-repo config (added 2026-05-01)
 
 This section captures architectural changes that emerged from the megaraid-dashboard / sms-gateway-v2 onboarding planning. None of these are in Foundation Sprint scope (which is internal cleanup of pipeline-orchestrator itself), but all should be tackled before declaring multi-repo onboarding production-ready for non-author users.
@@ -1065,7 +1152,7 @@ Migration: pipeline-orchestrator's own AGENTS.md retains marked regions but they
 
 **Out of scope:** everything else — this PR is purely about scoping the template content correctly.
 
-**Type:** refactor. **Complexity:** medium. **Estimated:** 1-2 days.
+**Type:** refactor. **Complexity:** medium. **Estimated:** 1-3 PRs, ~3 daemon-hours. Replace hardcoded paths in 57-LOC `agents_md_template.py` with abstract phrasing.
 
 ### PR-FUTURE-2: Per-repo config file with inheritance
 
@@ -1107,7 +1194,7 @@ Option C — **Hybrid:** per-repo file in repo for repo-owner concerns (coverage
 
 **Out of scope:** rewriting all daemon settings as overridable per-repo. Initial set is targeted at the most-needed overrides.
 
-**Type:** feature. **Complexity:** high. **Estimated:** 5-7 days (Settings UI is substantial).
+**Type:** feature. **Complexity:** high. **Estimated:** 3-4 PRs, ~6-8 daemon-hours. Schema + load logic + UI drawer + tests.
 
 ### PR-FUTURE-3: Onboarding wizard with semantic conflict resolution
 
@@ -1145,7 +1232,7 @@ Example conflict that mechanical diff misses: user's "Workflow Rules" section sa
 
 **Out of scope:** automatic LLM-based merge without operator review. Human-in-the-loop is mandatory for first version.
 
-**Type:** feature. **Complexity:** high. **Estimated:** 4-6 days.
+**Type:** feature. **Complexity:** high. **Estimated:** 3-4 PRs, ~6-8 daemon-hours. Wizard state machine + conflict detection UX + integration.
 
 ### PR-FUTURE-4: AI-driven onboarding scaffold (replaces template-driven scaffolder)
 
@@ -1197,6 +1284,23 @@ For Node, Rust, Go projects: mirror existing CI scripts when present.
 - If `scripts/ci.sh` already exists and content hash differs from template stub — **leave it alone**. Operator has a working CI script; don't replace.
 - If existing `AGENTS.md` already has managed marker regions — apply reconciliation (existing PR-192a/b/c flow), don't regenerate from scratch.
 
+**Critical CLAUDE.md replacement rule (verified 2026-05-01):**
+
+The scaffolder **must overwrite `CLAUDE.md`** with the single line `Read and follow AGENTS.md in this repository.` This is non-negotiable, even if the repo has an existing CLAUDE.md with user-authored Claude-specific notes.
+
+**Why:** Claude CLI is invoked with `--append-system-prompt-file CLAUDE.md` and a literal user prompt of `"PLANNED PR"`. CLAUDE.md content becomes the system prompt. AGENTS.md is **not** automatically attached — coder must elect to read it. When CLAUDE.md contains user-authored notes (project conventions, style preferences, technology hints), those notes compete with the redirect-to-AGENTS instruction. Coder reads CLAUDE.md as authoritative system prompt, applies the user notes, but never resolves what `"PLANNED PR"` means as a command. Result: coder asks operator for clarification ("Could you clarify what you'd like me to do? PLANNED PR alone isn't enough context"), exits 0 without push, daemon classifies as HUNG.
+
+**Verification event (2026-05-01 evening):** both megaraid-dashboard and sms-gateway-v2 went HUNG with the clarification-question pattern after onboarding. Their original CLAUDE.md files contained 8-12 lines of user-authored Claude-specific notes (storcli flags, ModemManager D-Bus, "prefer existing modules", "long-term sustainable solutions"). Replacing CLAUDE.md with the single line `Read and follow AGENTS.md in this repository.` immediately unblocked the coder on next cycle — coder read AGENTS.md, found the daemon-managed `work_modes` section with PLANNED PR runbook definition, opened a real PR with code changes.
+
+**User-authored Claude-specific notes belong in AGENTS.md, not CLAUDE.md.** Scaffold should:
+
+1. Read existing `CLAUDE.md` content.
+2. If it contains user-authored notes (anything beyond a redirect line), extract those notes into a new "Claude-specific guidance" section in user's portion of AGENTS.md (above the daemon-managed marker regions).
+3. Replace `CLAUDE.md` with the single line `Read and follow AGENTS.md in this repository.`
+4. Surface this as part of the MICRO PR diff for operator review with explicit explanation of why CLAUDE.md must be minimal.
+
+**Pipeline-orchestrator's own CLAUDE.md** is already this single line — that is why coder works correctly on it. External repos onboarded via existing scaffolder kept their full CLAUDE.md and broke. This is a **product gap** not previously visible because pipeline-orchestrator was the only managed repo.
+
 **UI integration (part of PR-FUTURE-3 wizard):**
 
 After clone, before "active" toggle:
@@ -1226,7 +1330,7 @@ The current template-driven scaffolder is a **product gap**, not a bug. It assum
 - Custom CI tools (Jenkins, CircleCI, BuildKite, Travis) — only GitHub Actions detection in v1.
 - Detecting and adapting to non-trivial Makefile target chains.
 
-**Type:** feature. **Complexity:** high. **Estimated:** 6-8 days. (Was 3-4 days; expanded scope reflects the architectural shift from template-copy to AI-detect-and-generate.)
+**Type:** feature. **Complexity:** high. **Estimated:** 4-5 PRs, ~8-10 daemon-hours. Detection module + generation flow + integration + tests.
 
 ### PR-FUTURE-5: Read-only / observation-mode onboarding
 
@@ -1260,7 +1364,7 @@ This is useful for:
 
 **Out of scope:** retroactive observe mode for repos that were originally scaffolded as managed (would require cleanup of tasks/QUEUE.md, scripts/, etc — leave for follow-up).
 
-**Type:** feature. **Complexity:** medium. **Estimated:** 3-4 days.
+**Type:** feature. **Complexity:** medium. **Estimated:** 2-3 PRs, ~4 daemon-hours. Mode field + state value + UI hide tasks panel.
 
 ### PR-FUTURE-7: Eliminate tasks/QUEUE.md entirely (in-memory queue model)
 
@@ -1319,7 +1423,7 @@ The original justification for keeping QUEUE.md after PR-181 has eroded:
 - Replacing `QueueTask` dataclass with a richer model. Different concern; defer.
 - Cross-repo queue aggregation in dashboard ("show all DOING tasks across all repos"). Different feature; defer.
 
-**Type:** refactor. **Complexity:** high. **Estimated:** 5-7 days. (The actual code change is moderate; the bulk of the time is migrating tests from QUEUE.md fixtures to PR-*.md fixtures and validating recovery semantics across edge cases.)
+**Type:** refactor. **Complexity:** high. **Estimated:** 1-2 PRs, ~4 daemon-hours. 4 read-site refactor onto RepoState.current_queue snapshot + test shim migration. Optional 3rd PR for legacy auto-migration MICRO PR generator if needed.
 
 **Strategic placement:** this PR can ship anywhere after Foundation Sprint completes. It is independent of PR-FUTURE-1 through PR-FUTURE-6 (those concern external onboarding; this concerns internal queue model). Worth doing **before** PR-FUTURE-3 (onboarding wizard) because the wizard's per-repo health check and tasks panel become simpler when QUEUE.md is gone.
 
@@ -1355,7 +1459,7 @@ This is useful for:
 
 **Out of scope:** retroactive observe mode for repos that were originally scaffolded as managed (would require cleanup of tasks/QUEUE.md, scripts/, etc — leave for follow-up).
 
-**Type:** feature. **Complexity:** medium. **Estimated:** 3-4 days.
+**Type:** feature. **Complexity:** medium. **Estimated:** 2-3 PRs, ~4 daemon-hours. Mode field + state value + UI hide tasks panel.
 
 ### PR-FUTURE-6: Auth flow for onboarding wizard
 
@@ -1414,7 +1518,7 @@ The current "shell in and set up" model is fine for the author. For pipeline-orc
 
 **Out of scope:** SAML/SSO providers, organization-level GitHub Apps with installation IDs (mentioned in OBS-AC Leverage 6 GitHub App migration — separate workstream). v1 covers: personal access tokens via device flow for `gh`, OAuth for `claude`, session for `codex`.
 
-**Type:** feature. **Complexity:** medium. **Estimated:** 4-5 days. (Security-sensitive surface area; needs careful UX around token visibility.)
+**Type:** feature. **Complexity:** medium. **Estimated:** 3-4 PRs, ~6 daemon-hours. Per-provider device flow (single shared pattern) + UI polling + expiry banner. Security-sensitive but the device-flow pattern is well-trodden..
 
 ### Sequencing
 
@@ -1434,7 +1538,27 @@ The seven PRs above build on each other:
 
 7. **PR-FUTURE-5 last** (observe mode). Adds per-repo `mode` field. Builds on PR-FUTURE-2 (per-repo config) and PR-FUTURE-4 (scaffold can be skipped for observe-mode repos).
 
-Critical path: **6 → 1 → 4**. PR-FUTURE-7 parallel to 1 (independent track, same time). Rest can parallelize after that. Total estimate ~5-6 weeks of solo daemon-driven work assuming no major architectural surprises.
+Critical path: **6 → 1 → 4**. PR-FUTURE-7 parallel to 1 (independent track, same time). Rest can parallelize after that.
+
+**Realistic timing (corrected 2026-05-01 after second pass — first pass was inflated 5x):**
+
+The first pass at decomposition mistakenly counted each sub-task (data model, detection logic, tests, docs) as a separate PR. In reality the daemon ships **complete features in single PRs** (or modest 2-3 PR splits when scope is genuinely large). The existing onboarding framework (`reconciliation.py` + `agents_md_template.py` + `markdown_sections.py` = 247 LOC total) was built in 3 PRs (PR-192a/b/c), not 30. Same scaling applies here.
+
+Honest sizing per PR-FUTURE:
+
+- **PR-FUTURE-1 template cleanup:** 1-3 PRs. Replace hardcoded paths in 57-LOC `agents_md_template.py`. Optional split per-managed-section if review wants granularity. ~3 daemon-hours.
+- **PR-FUTURE-2 per-repo config:** 3-4 PRs. Schema + load + UI drawer + tests. ~6-8 daemon-hours.
+- **PR-FUTURE-3 wizard UI:** 3-4 PRs. Wizard state machine + conflict detection UX + integration. ~6-8 daemon-hours.
+- **PR-FUTURE-4 AI scaffold:** 4-5 PRs. Detection module + generation flow (call coder CLI) + integration + tests. The work is moderate; the existing scaffolder is 382 LOC and the new flow swaps detection/generation in. ~8-10 daemon-hours.
+- **PR-FUTURE-5 observe mode:** 2-3 PRs. Mode field + state value + UI hide. ~4 daemon-hours.
+- **PR-FUTURE-6 auth flow:** 3-4 PRs. Per-provider device flow (one shared pattern) + UI polling + expiry banner. ~6 daemon-hours.
+- **PR-FUTURE-7 QUEUE.md elimination:** 1-2 PRs. 4 read-site refactor onto `RepoState.current_queue` snapshot + test shim migration. ~4 daemon-hours.
+
+**Total daemon work: ~17-25 PRs, ~37-44 daemon-hours = 1.5-2 daemon-working-days at 17 PR/day throughput.**
+
+**Calendar: 1-2 weeks** with buffer for testing days between batches, strategic conversations, fixes on observed issues, plus operator's review and direction time. Calendar is dominated by buffer/review, not daemon coding.
+
+For comparison: Foundation Sprint is 36 PRs / ~50 daemon-hours / 2-3 daemon-days. The combined PR-FUTURE batch is **smaller than Foundation Sprint** because most of these PRs are focused refactors (rename, replace, remove) not new architectural builds. Foundation is heavier because it includes regression test suites and god-class decomposition of 800+ LOC files.
 
 ### Foundation Sprint relationship
 
