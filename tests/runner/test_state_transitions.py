@@ -35,6 +35,7 @@ Tests do not change production behavior; they only assert it.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -878,5 +879,40 @@ def test_recovery_transitions_error_on_get_open_prs_failure(
     )
     assert any(
         e["event"] == "[INFRA] recover_state failed: API down."
+        for e in runner.state.history
+    )
+
+
+def test_error_transitions_error_on_review_trigger_failure_after_fix_push(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``error.py:362`` — ``_post_codex_review`` fails after FIX push.
+
+    Sample ERROR transition for ``error.py`` (the ErrorMixin handler).
+    After ``diagnose_error`` returns FIX and the auto-fix commit is
+    pushed, the handler must trigger ``@codex review`` so the next
+    cycle does not silently sit in IDLE without re-review. When the
+    trigger post fails, the handler short-circuits to ERROR with the
+    fixed message ``"Failed to post @codex review on PR #<n> after
+    diagnose_error fix push; manual review trigger required to avoid
+    fix/push loop"`` and emits an ``[ERROR] <error_message>.`` log
+    event. ``publish_state`` is NOT called at this site (the handler
+    returns immediately), matching the contract for non-publishing
+    ERROR transitions in fix/watch/hung/recovery sampled above.
+    """
+    runner, _calls, _warnings, review_requests = h._run_dirty_diagnose(
+        monkeypatch, tmp_path, review_post_ok=False
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == (
+        "Failed to post @codex review on PR #119 after "
+        "diagnose_error fix push; manual review trigger required "
+        "to avoid fix/push loop"
+    )
+    assert review_requests == [119]
+    assert any(
+        e["event"] == f"[ERROR] {runner.state.error_message}."
         for e in runner.state.history
     )
