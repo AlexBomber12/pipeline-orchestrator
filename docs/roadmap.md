@@ -62,7 +62,7 @@ PR-187/188/189/190/191 — все 5 не начаты. Sprint целиком def
 
 ### Sprint F4.2 — Testing infra + cleanup (PARTIAL)
 - **DONE:** PR-193 upload locks (`_upload_locks` dict в `app.py`).
-- **NOT DONE:** PR-192 nightly e2e schedule, PR-194 STALLED documentation, PR-195 MERGE dead value cleanup (PR-195 → renumbered PR-198 in current backlog; verification 2026-04-30 rejected the cleanup, see Polish batch PR-198 below).
+- **NOT DONE:** PR-192 nightly e2e schedule, PR-194 STALLED documentation, PR-195 MERGE dead value cleanup.
 
 ### Sigkill multi-race fixes (2026-04-28 session)
 PR-228 (Coder ESCALATE), PR-232 (test fixture isolation /stop), PR-234 (REST quota), PR-236 (shim explicit lease + entrypoint mutex) все merged. Test_sigkill_recovery deterministically green в CI.
@@ -277,7 +277,7 @@ Numbering продолжает существующую sequence от PR-180 (п
 - **PR-195** push_count desync fix. UI metric совпадает с GitHub Commits tab — single source of truth.
 - **PR-196** AGENTS.md prohibit draft PRs (text update + PR-220 reconciliation example).
 - **PR-197** Document WATCH STALLED substate (Sprint F4.2 PR-194). Confirm intentional vs bug, document semantics в architecture docs.
-- **PR-198** PipelineState.MERGE dead value cleanup (Sprint F4.2 PR-195). **REJECTED — value is reachable.** Verification (2026-04-30): no production code path assigns `state.state = PipelineState.MERGE`, but comparison sites exist in `_TRANSIENT_STATES` (`src/daemon/runner.py:89`), the pause-substate set (`src/daemon/runner.py:1293`), `_DEFERRED_RUNNER_CONFIG_STATES` (`src/daemon/main.py:66`), two state sets in `src/web/app.py`, and four jinja templates. These defensive references guard `RepoState.model_validate_json` against stale Redis payloads written by older daemon binaries that may carry `state == "MERGE"`. Removing the enum value would break that backward-compatibility path. Architectural truth (MERGE has no live transition; merges happen inline inside `handle_watch`) is already documented in `docs/architecture-state-machine.md`.
+- **PR-198** PipelineState.MERGE dead value cleanup (Sprint F4.2 PR-195).
 - **PR-199** Event text clarity pass — audit log_event calls, normalize messages, remove ambiguity (Sprint F3.3 PR-184).
 
 **Exit criteria:** UI polished, documentation caught up, dead code removed.
@@ -951,6 +951,174 @@ This is the same class of problem as Sprint F2.1 SoT (Source of Truth direct ins
 1. **Coder freedom to interpret task selection is a critical bug surface.** Even though one bad outcome happened in 250+ PRs (low frequency), the consequence is significant — orphan PR, wasted Codex review cycle, operator confusion when investigating. Defense in depth needed: both task spec injection (PR-205 above) and post-upload verification (PR-206 above).
 2. **Symptom looked like daemon abandoned a task mid-flight, root cause was different.** Initial hypothesis was that daemon manually serialized only one PR at a time and lost track of the second. Reading logs carefully showed the actual sequence: coder created wrong PR, daemon recovered correctly, picked task again, second attempt succeeded. **Lesson: read the logs around the suspected event window before forming hypothesis from current state alone.**
 3. **Lost task file went undetected for hours.** Operator only noticed because they were debugging a different issue. Add proactive integrity check at upload time so this surfaces immediately, not via second-order observation.
+
+
+
+## Observations from 2026-04-30 (Sprint F endgame, evening + overnight session)
+
+This block captures everything observed during a single intense day of running production daemon through the tail of Sprint F (PR-180..PR-204), plus three follow-up task files generated mid-session (PR-205/206/207). Each observation is intended as durable memory: the day produced more findings than fit in any single planning pass, so the priority is preservation over polish. Cleanup audit triages.
+
+**Note on PR numbering for proposed fixes:** OBS-AE in the previous session originally proposed PR-205 (mandatory task_file injection) and PR-206 (upload integrity verification). Those numbers were repurposed on 2026-04-30 to ship pub/sub backbone (control commands, settings save). The fixes proposed in OBS-AE were not implemented and are not currently scheduled. They should be picked up under new numbers in cleanup audit, or merged into the broader OBS-AE/AI/AN family fix below.
+
+---
+
+### OBS-AF: PR-182 timeout/infra bypass leaves daemon trapped in ERROR state
+
+**Observed 2026-04-30 morning.** A single `gh pr list ... TLS handshake timeout` at 10:58:43 caused daemon to log "Skipping AI diagnosis for timeout error; will retry on next cycle" sixteen consecutive times over fifteen minutes with zero actual retries of the failing command. Independent verification (`curl https://api.github.com/zen` from inside the container) returned HTTP 200 in 108ms during this entire window, proving the underlying network was fine. Recovery required manual `docker compose restart daemon`.
+
+**Root cause:** PR-182 added bypass branches in `src/daemon/handlers/error.py::handle_error` for `_is_infra_error`, `RATE_LIMIT`, and `TIMEOUT` categories. Each branch correctly skips the AI diagnosis call (the goal of PR-182, avoiding wasted Claude session on transient blips), but returns from the handler without resetting `state.state` from `ERROR`. Compare to the non-bypass diagnose path on line 202 which does set `state.state = PipelineState.IDLE` before return. The transition to IDLE is what allows the next cycle to re-pick the task and re-run the failed command. The three bypass branches never set this transition, so they trap the daemon in ERROR indefinitely.
+
+The log message "will retry on next cycle" was honest about intent but dishonest about implementation — there was no retry, only repeat invocations of the same trapped handler.
+
+**Fix:** PR-207 task spec generated 2026-04-30 (priority 1, complexity low). Three single-line additions setting `state.state = PipelineState.IDLE` before each bypass return, plus log message updates from "will retry on next cycle" to "transitioning to IDLE for retry". Counter-based protection against very long outages (Variant B from planning) deferred to a future PR after Telegram alerting lands.
+
+**Related:** This bug existed silently in production from PR-182 merge until 2026-04-30 morning. It only manifested when GitHub's TLS handshake actually flaked. Combined with the lack of a CODING attempt cap and the daemon's consistent behavior under transient external errors, this means **a single GitHub network blip during business hours could cause the daemon to silently waste up to one polling-interval-bounded multiple of the outage duration** without recovering on its own. After PR-207 ships and is deployed, the recovery is automatic.
+
+---
+
+### OBS-AG: Escalate label correctly blocks FIX but does not exit task from rotation
+
+**Observed 2026-04-30 mid-morning, during PR-192b incident.** Daemon picked task PR-192b, coder opened PR #260, CI integration job failed with transient GitHub GraphQL HTTP 504, coder explicitly escalated the PR with `escalated` GitHub label. Daemon correctly logged `FIX blocked for escalated PR #260, moving to IDLE` and transitioned to IDLE.
+
+However, on the very next IDLE cycle (60 seconds later), DAG selector re-picked PR-192b because it was still the highest-priority task in the queue. Daemon entered WATCH again, saw the escalated label, returned to IDLE. This `WATCH ↔ IDLE` cycle on the same escalated task continued indefinitely, blocking all subsequent tasks (PR-184, PR-185, PR-187...) from being picked.
+
+**Root cause:** Escalate label handling is a per-cycle FIX-block, not a task-out-of-rotation marker. The DAG selector does not check escalate status when computing eligible tasks. Daemon does not write `status: blocked` or equivalent to the task frontmatter when an escalation is detected, so the task remains `in_progress` and at the front of the eligible queue.
+
+**Recovery:** Manual operator action required. Operator closed PR #260 (with `--delete-branch`), daemon on next cycle saw no open PR for PR-192b, re-entered CODING for the task, eventually shipped via PR #261 (with a separate side-issue documented as OBS-AI).
+
+**Fix needed:** Two layers. (1) When escalate label detected on FIX-blocked PR, daemon must write `status: blocked` (or new `status: escalated` if Linear-style vocabulary expands) to task frontmatter. (2) DAG selector must filter out tasks with `status: blocked|escalated` when computing eligible. Without both layers, the livelock returns. Belongs in cleanup audit alongside OBS-AE/AI/AN family.
+
+---
+
+### OBS-AH: Post-PR-create eventual consistency window exceeds retry budget
+
+**Observed 2026-04-30 mid-morning, downstream of OBS-AG recovery.** After operator closed PR #260 with `--delete-branch`, daemon picked PR-192b again, coder created a new PR. Coder reported success and identified the new PR URL in stdout. Daemon's verification step (`gh pr list --head <branch>`) ran 3 retries with 5s delay (15 seconds total), did not find the PR, classified as "coder succeeded but no PR found", returned to IDLE. On the next IDLE cycle daemon re-picked PR-192b and started a third coder attempt.
+
+The actual GitHub state at this moment: PR #261 was real and open. GitHub's eventual consistency between `gh pr create` and `gh pr list` was longer than 15 seconds in this instance. Daemon's retry budget was insufficient.
+
+**Note: this observation was initially misdiagnosed.** First hypothesis was the 15s window was the entire problem. Closer investigation (see OBS-AI below) showed that even with infinite retry, daemon would not have found the PR because it was looking on the wrong branch name. Eventual consistency was real but secondary; the branch divergence was the primary cause of the "no PR found" result. **Lesson: when daemon reports "no PR found", verify both timing (eventual consistency) and identity (correct branch name).**
+
+**Possible fix (low priority):** Increase retry budget to ~30-60 seconds with progressive backoff, AND combine with the branch-prefix matching from OBS-AI fix. Either alone is insufficient.
+
+---
+
+### OBS-AI: Branch name suffix collision after PR close+delete-branch
+
+**Observed 2026-04-30 mid-morning, root cause of false OBS-AH diagnosis.** Closing PR #260 with `--delete-branch` removed the remote branch `pr-192b-agents-md-marked-sections`, but the local clone in daemon's volume still had refs to that branch. When the coder ran `git checkout -b pr-192b-agents-md-marked-sections` on the next attempt, git detected a collision and created the branch with a `-2` suffix automatically, then pushed to that suffixed name. The actual PR #261 was on `pr-192b-agents-md-marked-sections-2`, not the original name.
+
+Daemon's task state still tracked the original branch name. Its `gh pr list --head pr-192b-agents-md-marked-sections` correctly returned empty because no PR existed on that branch. From daemon's perspective, the coder claimed to have created a PR but no PR existed.
+
+**Recovery:** HUNG fallback after 2 failed PR-create attempts correctly caught this scenario. Daemon transitioned to HUNG with `Task PR-192b blocked: coder failed to create PR 2 times in a row. Manual intervention required.` Operator manually verified PR #261 was real and clean, requested @codex review, merged. **Defense-in-depth via HUNG cap worked correctly.** The system did not silently produce duplicate PRs or thrash indefinitely.
+
+**Architectural fix candidate:** Two-pronged. (1) `--delete-branch` should also clean up local refs in daemon's clone, not just remote. (2) Fallback when `gh pr list --head <expected>` returns empty: try `gh pr list --search "head:pr-192b%"` (prefix match) and prompt operator if multiple suffixed branches exist. This fix is non-trivial because it touches branch naming semantics across operator-actions and coder-actions. Cleanup audit should treat OBS-AE, OBS-AG, OBS-AI, OBS-AN as a single family rooted in non-atomic task transitions.
+
+---
+
+### OBS-AJ: Coder emergent duplicate-PR-prevention behavior
+
+**Observed 2026-04-30 mid-morning, positive finding.** During the PR-192b livelock (caused by OBS-AI), on the second coder attempt after daemon re-picked the task, coder noticed that PR #261 already existed for the task and explicitly stopped without creating a duplicate:
+
+> PR-192b is the active task in `tasks/QUEUE.md` (Status: DOING), but PR #261 already exists and is essentially green. Stopping before creating a duplicate.
+
+This behavior was not explicitly programmed in AGENTS.md or in the task specs. Coder pattern-matched its way to the right decision from observable repository state. **This is emergent good behavior** — exactly the kind of judgment we want when the deterministic flow falters.
+
+**Implication:** Worth preserving and reinforcing. AGENTS.md could be updated to explicitly bless this pattern: "If you discover that an open PR already exists for the task you were given, do not create a duplicate. Stop and let daemon's HUNG fallback surface this to the operator." Currently it is implicit and could regress in future Claude versions.
+
+---
+
+### OBS-AK: Coder edits files but does not commit, dirty tree drift
+
+**Observed 2026-04-30 evening, during PR-199 FIX cycle.** During FIX iteration #2 of PR-199 (event text clarity refactor), coder reported in stdout that it had updated `tests/e2e/test_sigkill_recovery.py:164` to expect the new `[INFRA]` prefix introduced in `src/daemon/recovery.py:338`. Coder explicitly said "Ready to commit when y..." (text truncated) and stopped. The edit existed in working tree but was never committed.
+
+Daemon log entry: `FIX FEEDBACK exited 0 but HEAD unchanged; no push, skipping @codex review`. On the next preflight cycle the dirty working tree was detected and after 3 cycles the auto-recovery ran `git reset` and the edit was lost.
+
+The next coder attempt had to re-discover the same fix. Eventually (FIX iteration #4) coder did commit, push, CI went green. PR-199 merged.
+
+**Root cause hypothesis:** Coder's FIX prompt may not include explicit instruction to commit, leading coder to stop at "ready to commit" expecting a follow-up confirmation that never comes (it is a non-interactive subprocess). This is a coder-prompt-engineering issue, not a daemon code issue.
+
+**Fix candidate:** Update the FIX prompt template to include "After making edits, commit them with a descriptive message and push. Do not wait for confirmation. If commit fails, escalate." Verify with one PR worth of evidence that coder actually follows the new instruction.
+
+**Risk in current state:** Each FIX cycle that hits this pattern wastes ~3-5 minutes and one coder invocation. With 4 iterations on PR-199, this cost ~15 minutes of compute. Multiplied across PR-199-class refactor tasks, the wasted time becomes meaningful. Not a blocker, but a clear efficiency improvement.
+
+---
+
+### OBS-AL: Daemon reposts @codex review when CI fails
+
+**Observed 2026-04-30 evening, during PR-199 FIX cycle.** PR #273 reached the state `review=APPROVED, ci=FAILURE`. Daemon reposted `@codex review` on the PR, Codex responded again with approval (`Didn't find any major issues. Hooray!`). Daemon reposted again on a subsequent cycle. The PR accumulated several duplicate Codex review comments before CI was finally fixed by a coder commit.
+
+**Root cause:** Trigger condition for re-review appears to fire on any non-merged state, including `APPROVED + CI failure`. But Codex review cannot fix CI — CI is fixed by source code or test changes, which come from coder commits, not from re-reviewing. Reposting wastes Codex API calls, clutters the PR with duplicate reviews, and creates the false impression of progress where none exists.
+
+**Correct trigger:** Re-review should fire only on `(new commit pushed) AND (review_state in {CHANGES_REQUESTED, EYES with stale head})`, not on CI status. CI failure should trigger FIX (coder fix loop), not re-review.
+
+**Cosmetic but real impact.** Adds noise to PRs, wastes Codex quota. Not a correctness bug since the PR eventually merges. Suitable for cleanup audit polish batch.
+
+---
+
+### OBS-AM: Frontend HTMX polling pattern conflicts with continuous animations and SSE backbone
+
+**Observed 2026-04-30 overnight via DevTools network panel.** Dashboard frontend uses `hx-trigger="every Xs"` polling for state badge, event log, redis-banner, and repo partials. Each polled fragment swap re-mounts its DOM target, breaking continuous CSS animations. Visible artefacts: badge pulse animation stutters in a fixed phase, upload UI flickers on unrelated state changes. The pulse never completes a smooth fade because every 2-3 seconds the entire badge `<div>` is replaced and the animation restarts from frame zero.
+
+Network panel shows endpoints `/states`, `/repo/<slug>`, `/events`, `/partials/redis-banner` polled every 2-3 seconds. `/partials/redis-banner` returns `Content-Length: 0` when there is no banner to show, but HTMX still swaps the empty content into the target div, causing a re-render that interferes with neighboring animations.
+
+**Architectural conflict.** Server-side already has a Redis pub/sub backbone (PR-183 upload trigger, PR-205 control commands, PR-206 settings save once deployed). The frontend has no SSE consumer to receive these push events. So the same notion exists in two incompatible flavors: pub/sub on the server, polling on the client. Each layer pretends the other does not exist.
+
+**Fix candidate:** Frontend SSE consumer subscribes to `daemon_wake:{slug}` events and triggers swaps on real state change rather than every-N-seconds. Animations naturally persist between updates because targets are not blindly re-mounted. This completes the migration started in PR-183 — the back end pushes, the front end listens. Polish-level for cleanup audit, not blocker.
+
+---
+
+### OBS-AN: Two tasks simultaneously in_progress in frontmatter
+
+**Observed 2026-04-30 evening, on the dashboard tasks queue panel.** Two task files (PR-204 and PR-206) both showed status `in_progress` simultaneously. Single-runner repo, single daemon, but two tasks in flight per the persistent state.
+
+**Root cause sequence:** Daemon picked PR-204, set its frontmatter to `in_progress`, opened PR #277. Daemon hit a `gh pr list --head` empty-result moment (post-create eventual consistency, OBS-AH style), classified as "coder succeeded but no PR found", returned to IDLE. On the next IDLE cycle the DAG selector picked PR-206 (status `queued`, dependency met) without re-checking that PR-204 was still active and without resetting PR-204's status. Both tasks now show `in_progress`. Daemon proceeded with PR-206 only; PR-204 became abandoned in the persisted state.
+
+**Surface impact:** Obsidian Dataview dashboards show two `in_progress` for one daemon (visually wrong), Linear/GitHub Issues adapters in the future would sync both as in-flight (data corruption), recovery after daemon restart would not know which task to resume.
+
+**Family relationship to OBS-AE.** Both observations are different surfaces of the same underlying invariant violation: there is no atomic transaction "switch active task" that cleans up all surfaces — frontmatter status, current_task field, current_pr field, GitHub PR ownership — synchronously. Each surface is updated independently, surfaces diverge under error paths. OBS-AE manifests as orphan GitHub PR; OBS-AN manifests as multi-in_progress frontmatter; OBS-AI manifests as branch name divergence. Same root, different surfaces.
+
+**Fix:** Cleanup audit should treat OBS-AE, OBS-AG, OBS-AI, OBS-AN as one family. Fix is an "atomic task transition" primitive: when daemon decides to switch active task, it runs a single ordered transaction touching all surfaces (frontmatter, in-memory state, runtime tracking) under one lock. Either all surfaces transition together or none do. **PR-205 originally proposed in OBS-AE (mandatory task_file injection) was a partial fix at the input layer; it does not close OBS-AN at the output layer. The PR-205 number was repurposed 2026-04-30 to control pub/sub. The original family-level fix is not implemented and not scheduled.**
+
+---
+
+### OBS-AO: Coder capability uplift via Skills and MCP not tracked
+
+**Recorded 2026-04-30 overnight.** Claude Code and Codex CLI both support extension via Skills (Anthropic-side, project-aware capability bundles) and MCP servers (model-agnostic protocol-level tool integrations). The current orchestrator invokes both CLIs with default tool sets only. As the daemon encounters repeated classes of work — refactor sweeps, frontmatter surgery, test-assertion alignment, log_event normalization — these classes are good candidates for Skills/MCP-based uplift.
+
+**Specific candidates worth evaluating in cleanup audit or after:**
+
+- **Skill: frontmatter section marker editor.** Used in PR-192a/b style work (wrap daemon-managed sections in BEGIN/END markers, edit only inside markers). If this skill existed, PR-192b would have been faster and OBS-AI's branch divergence might not have occurred.
+- **Skill: log_event prefix normalizer.** Used in PR-199-style sweeps. PR-199 took 50 minutes of CODING + 4 FIX iterations. With a dedicated skill that systematically applies the `[CATEGORY]` rule across all `log_event(` calls, the same work could realistically take 10-15 minutes.
+- **MCP server for GitHub.** Replaces shell-out to `gh` CLI. Cleaner retry logic, structured error handling, no stdout parsing. Could reduce a class of bugs around the `gh` CLI behavior changes.
+- **MCP server for Redis.** Coder could directly publish/subscribe to channels rather than generating Python code that does so. Useful for the next generation of pub/sub features after PR-205/206/207.
+- **Project-specific skill for orchestrator itself.** Built-in knowledge of DAG semantics, frontmatter format, AGENTS.md sections framework. Read once at session start so coder doesn't re-discover them via context window each invocation.
+
+**Status:** Growth area, not a bug. No evaluation, no rollout plan exists. Cleanup audit should produce a concrete experiment plan: pick one skill or MCP, measure success rate / time / iterations on a comparable PR class with and without it, decide on broader rollout from data.
+
+---
+
+### OBS-AP: Graphify (placeholder, needs disambiguation)
+
+**Recorded 2026-04-30 overnight as a one-word note from operator.** Direction insufficiently specified to act on. Three plausible interpretations:
+
+A. **Project knowledge graph.** Structured representation of all PRs, their dependencies, observations, lessons learned. Currently distributed across roadmap.md, AGENTS.md, chat history. A graph would allow queries like "show all PRs that touched error.py", "show all observations linked to coder behavior", "trace decision lineage from Sprint F1 decision".
+
+B. **Visualize current pipeline state as graph.** DAG of tasks, runtime daemon state, open PRs, dependencies — all on one visual surface instead of linear event log. Would make "why is PR-204 not picked yet" answerable by looking at the eligible/blocked task graph.
+
+C. **Graph-based reasoning about codebase for cleanup audit.** Imports, call graphs, dead code detection via graph algorithms. Useful as input to cleanup audit's dead-code findings.
+
+**Action:** Operator to clarify in next planning session. Tentatively candidate for cleanup audit input (option C) or post-cleanup tooling (option A or B).
+
+---
+
+## Cross-cutting commentary on 2026-04-30 day
+
+This was an unusually productive day for observations. Twelve OBS entries (AF through AP) recorded against one daemon running one repo for one calendar day. The density is a property of (a) the operator actively watching, and (b) Sprint F bringing infrastructure changes (PR-180, PR-181, PR-182) into production where they immediately interacted with edge cases.
+
+**Pattern across the observations:** Several findings (OBS-AE family + OBS-AI + OBS-AN) point to the same architectural gap — non-atomic task transitions across multiple state surfaces. Fixing them as one project is more economical than as four separate PRs. The remaining observations (OBS-AF/AG/AH/AJ/AK/AL/AM/AO) are independent and can be picked up individually.
+
+**Three observations resulted in shipped task specs the same day:** PR-205 (control pub/sub, ships to address responsiveness), PR-206 (settings pub/sub), PR-207 (PR-182 retry gap fix, addresses OBS-AF). All three were uploaded to the daemon queue and merged into main during the same day-long session. Production deployment lag means OBS-AF will only stop manifesting in production after the next `git pull && docker compose up -d --build` on the home server.
+
+**Memory note for future sessions:** The OBS lettering convention has now reached AP, two letters from exhausting the alphabet. When AZ is reached, the convention will need to extend (BA? AAA?). Not urgent but worth deciding consciously before the boundary forces a decision under pressure.
 
 
 ## Deferred / Round 4
