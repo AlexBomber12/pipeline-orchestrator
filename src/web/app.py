@@ -458,10 +458,18 @@ def _claude_usage_chip(
     All Claude repos share one OAuth account so any active Claude state's
     snapshot is representative of the whole account. The most recently
     updated one wins so the chip reflects the freshest observation.
+
+    Inactive repos are excluded: their usage fields are not refreshed by the
+    runner once ``repo_config.active`` flips false, but ``last_updated`` is
+    still bumped each publish cycle. Without this gate, a disabled repo's
+    stale snapshot can win the timestamp race and the chip would render an
+    outdated percentage/reset for the live account.
     """
     candidate: RepoState | None = None
     for state in states:
         if (state.coder or "") != "claude":
+            continue
+        if not state.active:
             continue
         if window == "session" and state.usage_session_percent is None:
             continue

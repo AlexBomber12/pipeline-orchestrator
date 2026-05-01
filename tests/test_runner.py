@@ -20907,6 +20907,44 @@ def test_refresh_github_api_budget_persists_per_bucket_snapshots(
     assert BUDGET_REDIS_KEY in runner.redis.store
 
 
+def test_refresh_github_api_budget_clears_missing_bucket_snapshots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial probe (one bucket ``None``) drops the prior bucket snapshot.
+
+    Otherwise the dashboard keeps reading a stale per-bucket key and renders
+    the missing surface as healthy/warn/critical instead of the intended
+    neutral "no data" state during transient ``gh api rate_limit`` failures.
+    """
+    from src.daemon.github_rate_limit import (
+        BUDGET_GRAPHQL_REDIS_KEY,
+        BUDGET_REST_REDIS_KEY,
+    )
+
+    runner = _make_runner()
+    # Pre-populate both buckets to simulate a prior healthy snapshot.
+    runner.redis.store[BUDGET_REST_REDIS_KEY] = _budget(
+        remaining=4500
+    ).to_redis_payload()
+    runner.redis.store[BUDGET_GRAPHQL_REDIS_KEY] = _budget(
+        remaining=4500
+    ).to_redis_payload()
+
+    rest = _budget(remaining=4321, limit=5000)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "fetch_rate_limit_buckets",
+        lambda: (rest, None),
+    )
+
+    asyncio.run(runner._refresh_github_api_budget())
+
+    # REST snapshot is refreshed; GraphQL is dropped so the dashboard renders
+    # neutral instead of the stale value.
+    assert BUDGET_REST_REDIS_KEY in runner.redis.store
+    assert BUDGET_GRAPHQL_REDIS_KEY not in runner.redis.store
+
+
 def test_refresh_github_api_budget_uses_cache_within_ttl(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

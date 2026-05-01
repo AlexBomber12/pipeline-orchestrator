@@ -13,6 +13,8 @@ from src.daemon.github_rate_limit import (
     BURNS_REDIS_KEY_PREFIX,
     REFRESH_LOCK_REDIS_KEY,
     RateLimitBudget,
+    clear_graphql_budget,
+    clear_rest_budget,
     read_budget,
     read_graphql_budget,
     read_rest_budget,
@@ -364,3 +366,33 @@ def test_per_bucket_write_swallows_redis_failure() -> None:
     asyncio.run(write_graphql_budget(redis, _budget()))
     assert BUDGET_REST_REDIS_KEY not in redis.store
     assert BUDGET_GRAPHQL_REDIS_KEY not in redis.store
+
+
+def test_clear_per_bucket_helpers_drop_stored_snapshot() -> None:
+    """Probe failure for one bucket must replace the prior value with absence."""
+    redis = _FakeRedis()
+    asyncio.run(write_rest_budget(redis, _budget(remaining=4321)))
+    asyncio.run(write_graphql_budget(redis, _budget(remaining=120)))
+
+    asyncio.run(clear_rest_budget(redis))
+    asyncio.run(clear_graphql_budget(redis))
+
+    assert BUDGET_REST_REDIS_KEY not in redis.store
+    assert BUDGET_GRAPHQL_REDIS_KEY not in redis.store
+    assert asyncio.run(read_rest_budget(redis)) is None
+    assert asyncio.run(read_graphql_budget(redis)) is None
+
+
+def test_clear_per_bucket_helpers_no_op_when_redis_is_none() -> None:
+    asyncio.run(clear_rest_budget(None))
+    asyncio.run(clear_graphql_budget(None))
+
+
+def test_clear_per_bucket_helpers_swallow_redis_failure() -> None:
+    """A failed delete must not crash the runner; next probe will retry."""
+    redis = _FakeRedis()
+    asyncio.run(write_rest_budget(redis, _budget()))
+    asyncio.run(write_graphql_budget(redis, _budget()))
+    redis.delete_failure = True
+    asyncio.run(clear_rest_budget(redis))
+    asyncio.run(clear_graphql_budget(redis))

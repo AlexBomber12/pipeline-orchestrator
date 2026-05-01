@@ -141,6 +141,15 @@ async def _write_budget_at(
         logger.warning("Failed to persist GitHub API budget at %s", key, exc_info=True)
 
 
+async def _clear_budget_at(redis_client: Any, key: str) -> None:
+    if redis_client is None:
+        return
+    try:
+        await redis_client.delete(key)
+    except Exception:
+        logger.warning("Failed to clear GitHub API budget at %s", key, exc_info=True)
+
+
 async def read_budget(redis_client: Any) -> RateLimitBudget | None:
     """Return the most recent budget observation, or ``None`` if absent."""
     return await _read_budget_at(redis_client, BUDGET_REDIS_KEY)
@@ -161,6 +170,17 @@ async def write_rest_budget(redis_client: Any, budget: RateLimitBudget) -> None:
     await _write_budget_at(redis_client, budget, BUDGET_REST_REDIS_KEY)
 
 
+async def clear_rest_budget(redis_client: Any) -> None:
+    """Drop the REST/core bucket snapshot so the dashboard renders neutral.
+
+    Called when ``fetch_rate_limit_buckets`` returns ``None`` for the REST
+    bucket (transient ``gh api rate_limit`` failure or partial parse). Leaving
+    the prior value would render stale healthy/warn/critical zones in the chip
+    row instead of the intended "no data" state during the failure window.
+    """
+    await _clear_budget_at(redis_client, BUDGET_REST_REDIS_KEY)
+
+
 async def read_graphql_budget(redis_client: Any) -> RateLimitBudget | None:
     """Return the most recent GraphQL bucket snapshot, or ``None``."""
     return await _read_budget_at(redis_client, BUDGET_GRAPHQL_REDIS_KEY)
@@ -169,6 +189,16 @@ async def read_graphql_budget(redis_client: Any) -> RateLimitBudget | None:
 async def write_graphql_budget(redis_client: Any, budget: RateLimitBudget) -> None:
     """Persist the GraphQL bucket so the dashboard can render it alone."""
     await _write_budget_at(redis_client, budget, BUDGET_GRAPHQL_REDIS_KEY)
+
+
+async def clear_graphql_budget(redis_client: Any) -> None:
+    """Drop the GraphQL bucket snapshot so the dashboard renders neutral.
+
+    Symmetric with :func:`clear_rest_budget`: when the GraphQL bucket is
+    missing from the probe result, the previous Redis value must not survive
+    or the chip will misreport the GraphQL surface as healthy.
+    """
+    await _clear_budget_at(redis_client, BUDGET_GRAPHQL_REDIS_KEY)
 
 
 async def try_claim_refresh_lock(redis_client: Any, ttl_seconds: int) -> bool:

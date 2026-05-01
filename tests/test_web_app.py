@@ -2620,6 +2620,7 @@ def _claude_state(
     weekly_percent: int | None = None,
     weekly_resets_at: int | None = None,
     last_updated: datetime | None = None,
+    active: bool = True,
 ) -> RepoState:
     return RepoState(
         url=f"https://github.com/{name.replace('__', '/')}",
@@ -2630,6 +2631,7 @@ def _claude_state(
         usage_weekly_percent=weekly_percent,
         usage_weekly_resets_at=weekly_resets_at,
         last_updated=last_updated or datetime.now(timezone.utc),
+        active=active,
     )
 
 
@@ -2736,6 +2738,61 @@ def test_claude_usage_chip_skips_states_without_window_data() -> None:
     no_weekly = _claude_state(session_percent=20)
     assert _claude_usage_chip([no_session], window="session")["zone"] == "none"
     assert _claude_usage_chip([no_weekly], window="weekly")["zone"] == "none"
+
+
+def test_claude_usage_chip_excludes_inactive_repos() -> None:
+    """Disabled Claude repos must not win the freshness race.
+
+    Inactive runners stop refreshing usage fields but still bump
+    ``last_updated`` each publish, so without this gate a disabled repo's
+    stale snapshot would supplant the active account's current observation.
+    """
+    active = _claude_state(
+        name="octo__active",
+        session_percent=10,
+        session_resets_at=1700000000,
+        weekly_percent=15,
+        weekly_resets_at=1700100000,
+        last_updated=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        active=True,
+    )
+    inactive_newer = _claude_state(
+        name="octo__inactive",
+        session_percent=90,
+        session_resets_at=1700200000,
+        weekly_percent=95,
+        weekly_resets_at=1700300000,
+        last_updated=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        active=False,
+    )
+
+    session = _claude_usage_chip(
+        [active, inactive_newer], window="session"
+    )
+    weekly = _claude_usage_chip(
+        [active, inactive_newer], window="weekly"
+    )
+
+    # Active repo's snapshot wins despite being older.
+    assert session["percent_remaining"] == 90.0
+    assert session["reset_unix"] == 1700000000
+    assert weekly["percent_remaining"] == 85.0
+    assert weekly["reset_unix"] == 1700100000
+
+
+def test_claude_usage_chip_neutral_when_only_candidate_inactive() -> None:
+    """Only inactive Claude repos available → render neutral, not stale data."""
+    only_inactive = _claude_state(
+        session_percent=20,
+        weekly_percent=30,
+        active=False,
+    )
+    assert (
+        _claude_usage_chip([only_inactive], window="session")["zone"] == "none"
+    )
+    assert (
+        _claude_usage_chip([only_inactive], window="weekly")["zone"] == "none"
+    )
 
 
 def test_build_recent_graphql_burns_view_returns_none_without_data() -> None:

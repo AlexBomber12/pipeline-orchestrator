@@ -45,6 +45,8 @@ from src.daemon import (
 from src.daemon.git_ops import _repo_looks_scaffolded, repo_owner_from_url
 from src.daemon.github_rate_limit import (
     RateLimitBudget,
+    clear_graphql_budget,
+    clear_rest_budget,
     read_budget,
     record_cycle_burn,
     release_refresh_lock,
@@ -1028,8 +1030,12 @@ class PipelineRunner(
             )
             if rest is not None:
                 await write_rest_budget(self.redis, rest)
+            else:
+                await clear_rest_budget(self.redis)
             if graphql is not None:
                 await write_graphql_budget(self.redis, graphql)
+            else:
+                await clear_graphql_budget(self.redis)
             candidates = [b for b in (rest, graphql) if b is not None]
             budget = (
                 min(candidates, key=lambda b: b.remaining_percent)
