@@ -386,9 +386,12 @@ class IdleMixin:
             subprocess.TimeoutExpired,
             RuntimeError,
         ) as exc:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = f"sync_to_main failed: {exc}"
-            self.log_event(f"[INFRA] sync_to_main failed: {exc}.")
+            await self._transition_to_error(
+                f"sync_to_main failed: {exc}",
+                save_run_record_as=None,
+                publish=False,
+                log_prefix="[INFRA]",
+            )
             return
 
         upload_result = await self.process_pending_uploads()
@@ -407,10 +410,11 @@ class IdleMixin:
                 subprocess.TimeoutExpired,
                 RuntimeError,
             ) as exc:
-                self.state.state = PipelineState.ERROR
-                self.state.error_message = f"sync_to_main after upload failed: {exc}"
-                self.log_event(
-                    f"[INFRA] sync_to_main after upload failed: {exc}."
+                await self._transition_to_error(
+                    f"sync_to_main after upload failed: {exc}",
+                    save_run_record_as=None,
+                    publish=False,
+                    log_prefix="[INFRA]",
                 )
                 return
 
@@ -464,9 +468,12 @@ class IdleMixin:
             QueueValidationError,
             subprocess.TimeoutExpired,
         ) as exc:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = f"Task selection failed: {exc}"
-            self.log_event(f"[INFRA] Task selection failed: {exc}.")
+            await self._transition_to_error(
+                f"Task selection failed: {exc}",
+                save_run_record_as=None,
+                publish=False,
+                log_prefix="[INFRA]",
+            )
             return
         finally:
             self._idle_open_prs = []
@@ -482,9 +489,12 @@ class IdleMixin:
             tasks = parse_queue(queue_path, strict=strict)
         except QueueValidationError as exc:
             if dag_tasks is None:
-                self.state.state = PipelineState.ERROR
-                self.state.error_message = str(exc)
-                self.log_event(f"[INFRA] Queue validation failed: {exc}.")
+                await self._transition_to_error(
+                    str(exc),
+                    save_run_record_as=None,
+                    publish=False,
+                    log_prefix="[INFRA] Queue validation failed:",
+                )
                 return
             self.log_event(
                 f"[INFRA] Queue validation failed after DAG selection; "
@@ -528,10 +538,11 @@ class IdleMixin:
                 subprocess.TimeoutExpired,
             ) as exc:
                 if dag_tasks is None:
-                    self.state.state = PipelineState.ERROR
-                    self.state.error_message = f"Task status derivation failed: {exc}"
-                    self.log_event(
-                        f"[INFRA] Task status derivation failed: {exc}."
+                    await self._transition_to_error(
+                        f"Task status derivation failed: {exc}",
+                        save_run_record_as=None,
+                        publish=False,
+                        log_prefix="[INFRA]",
                     )
                     return
                 self.log_event(
@@ -639,10 +650,12 @@ class IdleMixin:
                     generated_statuses,
                 )
             except OSError as exc:
-                message = f"QUEUE.md auto-generation failed: {exc}"
-                self.state.state = PipelineState.ERROR
-                self.state.error_message = message
-                self.log_event(f"[INFRA] {message}.")
+                await self._transition_to_error(
+                    f"QUEUE.md auto-generation failed: {exc}",
+                    save_run_record_as=None,
+                    publish=False,
+                    log_prefix="[INFRA]",
+                )
                 return
         if task is None:
             self.log_event("[INFRA] No tasks available.")
@@ -768,10 +781,14 @@ class IdleMixin:
                         f"rate-limit error."
                     )
                 else:
-                    self.state.state = PipelineState.ERROR
-                    self.log_event(
-                        f"[RATE-LIMIT] {label} -> ERROR "
-                        f"(preserved context)."
+                    await self._transition_to_error(
+                        self.state.error_message,
+                        save_run_record_as=None,
+                        publish=False,
+                        log_prefix=(
+                            f"[RATE-LIMIT] {label} -> ERROR "
+                            f"(preserved context):"
+                        ),
                     )
                     return
             if (
@@ -811,10 +828,14 @@ class IdleMixin:
                     "rate-limit error."
                 )
             else:
-                self.state.state = PipelineState.ERROR
-                self.log_event(
-                    "[RATE-LIMIT] Rate limit expired, resuming -> ERROR "
-                    "(preserved context)."
+                await self._transition_to_error(
+                    self.state.error_message,
+                    save_run_record_as=None,
+                    publish=False,
+                    log_prefix=(
+                        "[RATE-LIMIT] Rate limit expired, resuming -> ERROR "
+                        "(preserved context):"
+                    ),
                 )
                 return
         if (

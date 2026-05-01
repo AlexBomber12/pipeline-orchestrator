@@ -19095,7 +19095,7 @@ def test_handle_coding_errors_when_get_open_prs_raises(
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message == "get_open_prs failed: gh unavailable"
     assert any(
-        entry["event"] == "[CODING] gh unavailable."
+        entry["event"] == "[CODING] get_open_prs failed: gh unavailable."
         for entry in runner.state.history
     )
 
