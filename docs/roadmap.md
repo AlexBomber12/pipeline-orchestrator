@@ -85,10 +85,14 @@ PR-228/PR-232/PR-234/PR-236 all merged before 2026-04-29.
 - OBS-AR (event log spam — 304 Not Modified loop): **OPEN** — bug in `_etag_get` returns None when status=304 AND cached=None, causing alternating "INFRA No tasks available" + "INFRA IDLE: merged PR check failed: gh: HTTP 304" every poll cycle. Reproduced by operator screenshot 76 events alternating these two types. Fix scoped as PR-236 in Foundation Sprint Batch E.
 - OBS-AS (UI inconsistencies during onboarding): **OPEN, polish-tier** — two issues observed 2026-05-01: (1) "initializing" state shows both pulsing dot AND solid badge, inconsistent with other active states; (2) upload-result toast notifications dismiss too quickly (~2-3s) before operator can read failure messages. Fix scoped as small Polish PR (~15 LOC, ux, low complexity). Not a blocker for active onboarding.
 - OBS-AT (successful multi-repo onboarding validation): **CLOSED, positive observation** — sequential onboarding of megaraid-dashboard + sms-gateway-v2 alongside existing pipeline-orchestrator validated 5 production surfaces in single session: AGENTS.md reconciliation, scaffolder idempotency, multi-repo coordination (PR-207), GraphQL diet headroom at 3 active repos, shared auth volumes. Foundation Sprint can now run safely on multi-repo daemon. Recorded for future reference.
-- OBS-AU (stuck Uploading spinner across all repos): **OPEN, medium severity (upgraded from low 2026-05-01 evening)** — race condition between HTMX auto-poll re-render and user upload interaction. Initially thought rare; observation in multi-repo (3 active repos) usage showed it triggers frequently with normal operator clicks. Browser warning: "Form submission canceled because the form is not connected." Self-resolves on next auto-poll but UI feels broken. **Priority raised to near-term polish PR** (~15 LOC JS to pause polling during upload interaction). Every operator with 2+ repos will encounter this without fix.
+- OBS-AU (Uploading spinner appears on all repo cards during single repo upload): **OPEN, medium severity** — observed 2026-05-01 evening across multiple sessions. Spinner does NOT appear during normal poll cycles (verified by operator: spinners disappear when no active upload). **Real pattern:** when operator uploads tasks to one repo, "Uploading..." spinner appears on ALL 3 repo cards simultaneously for the duration of the backend upload processing (validation, git stage, commit — several seconds). HTMX scoping leak: form's `hx-indicator="#upload-indicator-{name}"` should target only the matching card's spinner, but spinner shows on all cards. Sometimes spinner sticks past upload completion (browser warning "Form submission canceled because the form is not connected") — this is a secondary race-condition bug on top of the scoping leak. Two distinct problems in one observation: (a) scoping leak shows spinner on irrelevant cards during upload; (b) form-disconnect race occasionally leaves spinner stuck. **Diagnostic needed:** capture DevTools Network tab DURING an active upload (not after — spinners clear on complete). Look for: single vs multiple XHR requests, response timings, any `htmx:` events fired. **Priority:** near-term polish PR. ~15-25 LOC fix once root cause confirmed.
 - OBS-AV (partial task upload + missing vocabulary synonyms): **OPEN, medium severity** — observed 2026-05-01 evening. Operator uploaded task batch with `Complexity: small` (6 files) and `Type: infra` (1 file). Validation banner correctly flagged 6 errors, but **valid PR-001 file made it to disk and was picked by daemon** while dependent tasks (PR-002..PR-008) were rejected. Three sub-bugs: (1) missing TYPE_SYNONYMS entry for `infra` (likely should map to `config`); (2) COMPLEXITY_SYNONYMS doesn't exist at all (`small/medium/large` should map to `low/medium/high`); (3) upload validation is per-file, not all-or-nothing — partial acceptance breaks dependency chains and traps daemon on orphan tasks. Fix: add missing synonyms maps + atomic upload validation (all task files validate before any file commits to disk). ~3 PRs, ~5 daemon-hours.
 - OBS-AW (missing per-repo HUNG recovery control): **OPEN, medium severity** — observed 2026-05-01 evening. Repo stuck in HUNG state. Existing UI controls: Pause/Resume/Stop only manipulate `user_paused` flag, do not transition state machine out of HUNG. Resume on a HUNG repo is no-op. Operator forced to either: (a) restart entire daemon container (heavy hammer affecting all repos), (b) manually clear `tasks/PR-*.md` to force IDLE transition on next cycle, (c) wait for `handle_hung` to detect external PR merge/close. None of these surface in UI. Need explicit "Reset to IDLE" or "Recover from HUNG" button on repo card that: (1) clears local HUNG flag, (2) closes any orphan branch the coder may have created locally, (3) marks the trapped task as CANCELED in derived queue, (4) transitions state to IDLE. Fix: per-repo recovery control with confirmation dialog. ~2-3 PRs, ~4 daemon-hours. **High user-frustration impact even though not a daily occurrence — operator cannot recover from HUNG without shell access or destructive workarounds.**
 - OBS-AX (scaffolder must replace CLAUDE.md, not preserve it): **OPEN, high severity, immediate priority** — verified 2026-05-01 evening through hypothesis test on megaraid + sms-gateway. External repos with user-authored Claude-specific notes in CLAUDE.md (storcli/D-Bus hints, "prefer existing modules", etc.) cause coder to HUNG with "PLANNED PR alone isn't enough context" because CLAUDE.md becomes system prompt and competes with AGENTS.md redirect. Replacing CLAUDE.md with single line `Read and follow AGENTS.md in this repository.` immediately unblocks coder. **Current scaffolder leaves existing CLAUDE.md untouched** — should overwrite with minimal redirect instead, optionally migrating user-authored notes into a section in AGENTS.md user portion. Fix scoped as 1 PR, ~2 daemon-hours: update `scaffolder.py` to overwrite CLAUDE.md unconditionally with minimal content; document rationale in template. **Without this fix, every external repo with non-trivial CLAUDE.md will HUNG on first task pick.** Should ship before any non-author user attempts onboarding.
+- OBS-AY (UI freezes when navigating between repo views — setInterval leak + slow /api/states): **OPEN, HIGH severity, ROOT CAUSE CONFIRMED 2026-05-01** — initial hypothesis was SSE connection leak; verification via DevTools Network tab disproved that (SSE connections work fine, only 3 active). **Real root cause is two stacked bugs:** (A) `checkAlerts()` JS function in `base.html` runs `setInterval(checkAlerts, 10000)` on EVERY page; navigation does NOT cleanup the interval, so every page switch multiplies the polling rate of `/api/states`. After 5-6 navigations, fetch fires every ~2 seconds. (B) `/api/states` endpoint is slow — observed 14-25 second response times under load (Network tab confirmed). Browser HTTP/1.1 6-connection-per-domain limit gets saturated by stuck `/api/states` calls; new requests (including htmx polls and the next /api/states attempt) block waiting for a free slot, manifesting as full UI freeze. **Backend code-level finding (src/web/app.py:542 `get_all_repo_states`):** function does synchronous `load_config(config_path)` file I/O inside async function (blocks event loop), then `for repo in cfg.repositories: await _get_repo_state_safe(...)` — sequential awaits instead of `asyncio.gather()`. With multiple concurrent `/api/states` calls accumulating from leaked setInterval, sync file I/O on each + sequential per-repo Redis trips compound into multi-second waits per request. **Fix A (frontend, ~3 LOC):** add `window.addEventListener('beforeunload', () => clearInterval(intervalId))` to base.html. **Fix B (backend):** (i) cache config or load it async via `asyncio.to_thread`; (ii) parallelize per-repo Redis reads via `asyncio.gather`; (iii) short-TTL cache on /api/states response (5s acceptable for alert checks); (iv) expose only `has_alerts: bool` instead of full states JSON for the alert-check use case. Both fixes needed — Fix A stops the bleeding immediately, Fix B addresses the root performance issue. **Diagnostic evidence:** Network tab Image showing 3 sequential /api/states requests at 24.90s, 14.99s, 3.98s response times; pending fetch entries stacked behind them; /api/states triggered from `(index):1255` which is `checkAlerts`. ~2-3 PRs total, ~5 daemon-hours. **Impact: critical for multi-repo UX. Will get worse as repo count grows** — at 5 repos this could be 60s+ freeze, at 10 repos completely unusable. Without fix, every operator with 2+ repos navigating actively will experience UI freezes that scale super-linearly with repo count.
+- OBS-AZ (repo card header layout inconsistent — upload icon wraps to new row on long repo names): **OPEN, low-medium severity** — observed 2026-05-01 evening. Repo cards have a flex-wrap container holding state badge + Pause + Stop + Upload icon. For repos with long names like `AlexBomber12__pipeline-orchestrator` (truncated as `AlexBomber12__pipeline-orchestra…`), the long name+badge consume the row's width budget, forcing the upload icon to wrap onto a new line **below** the Pause/Stop pair. Repos with shorter names (`AlexBomber12__sms-gateway-v2`, `AlexBomber12__megaraid-dashboard`) fit all 4 elements inline. The behaviour is technically responsive (flex-wrap doing its job) but visually inconsistent across cards in the same dashboard view. Looks like a broken layout, not a deliberate stacking. Fix options: (a) put controls in a fixed-position right edge of card with overflow hidden, name+badge truncate harder; (b) drop name truncation point earlier so all variants fit one row; (c) use grid layout with explicit column widths; (d) hide upload icon behind a kebab menu when card width < threshold. Likely fix: option (a) — controls always at right edge regardless of name length, name truncates to fit. ~1 PR, ~2 daemon-hours. **Group with OBS-AS UI inconsistencies into single Polish PR for Wave 3.**
+- OBS-BA (Pause/Stop/Upload buttons positioned mid-card, not anchored to right edge): **OPEN, low severity** — observed 2026-05-01 evening, related to OBS-AZ same root cause (flex-wrap layout). Controls cluster appears in the middle horizontal space between repo name and card edge, rather than firmly anchored to right edge. Same fix as OBS-AZ option (a) addresses this: explicit right-edge positioning via `justify-end` on outer container with hard width allocation, or grid layout with right-aligned column. Combine with OBS-AZ into single Polish PR. **Same wave, same fix scope, no separate cost.**
+- OBS-BB (coder claims FIX done but does not push, triggering dirty-tree auto-reset cycle): **OPEN, RECURRING — severity upgraded to HIGH 2026-05-01 late evening** — observed twice on sms-gateway-v2 PR #10 within ~30 minutes. **Two independent occurrences on the same PR** confirm this is a recurring pattern, not a one-off coder-output anomaly. First occurrence: coder ran FIX FEEDBACK, output stdout claimed `"Fix is in place. Summary: deploy/docker-compose.yml: added a one-shot sms-gateway-state-init service..."`, **exited 0**, but daemon detected `HEAD unchanged; no push, skipping @codex review`. Working tree was left dirty. Preflight ran 3 cycles seeing dirty tree → auto-reset → discarded coder's work → recovered to WATCH. Second occurrence: same pattern repeated. Each cycle costs ~7-10 minutes wasted plus loses coder's intended fix; the PR keeps sitting in CHANGES_REQUESTED state with stale code. Same class of bug as OBS-AE (coder freedom to interpret task selection) — coder freedom to interpret completion is a critical bug surface. **Possible root causes:** (1) coder thought it was a MICRO PR scope (no commit/push expected); (2) coder hit a permission/git error during commit and silently degraded; (3) Claude CLI session ran out mid-stream and returned partial result; (4) Claude CLI's working-tree edits not in the form `git commit && git push` even though the prose declared completion. **Fix options:** (a) daemon enforces `git status --porcelain` empty + `git rev-parse HEAD` advanced before accepting "FIX done" signal; if mismatched, re-run FIX once before declaring no-op; (b) AGENTS.md hard rule: "FIX MUST end with a push or with explicit no-op declaration; dirty tree at FIX exit is a daemon-side fault"; (c) auto-commit + push of coder's working tree changes as a fallback when stdout indicates fix completed but no push happened. Recommended: combination of (a) + (b) — daemon detects mismatch and either retries or escalates; AGENTS.md documents the contract clearly. ~2 PRs, ~4 daemon-hours. **Severity upgraded from medium to HIGH due to recurrence.** **Wave 5 priority alongside OBS-AW recovery work.** Note: this happened on PR #10 specifically with `deploy/docker-compose.yml` edit; possibly related to the path being outside src/ or to coder's git config in that path.
 
 ### Memory items still actionable
 
@@ -1076,43 +1080,193 @@ Git does not track empty directories. After scaffolder runs, the on-disk repo at
 
 **Foundation Sprint readiness:** with 3 repos validated stable, Foundation Sprint (36 PR specs in `/mnt/user-data/outputs/foundation-tasks/`) can run safely on the now-multi-repo daemon. Foundation work will continue against pipeline-orchestrator while megaraid and sms-gateway sit idle waiting for their own task specs (separate session).
 
+### Reflection: bug discovery rate during first multi-repo session (2026-05-01 evening)
 
-### OBS-AU: Stuck "Uploading..." spinner across all repos (observed 2026-05-01)
+In a single 4-hour evening session of running the orchestrator with 3 active repos for the first time, **5 production bugs** surfaced (OBS-AS, AU, AV, AW, AX, AY). This is **expected and healthy**, not a sign of system instability. Until 2026-05-01, pipeline-orchestrator had been single-repo (its own self) for its entire ~250 PR development history. Many code paths and UX behaviours that were "fine for the author working alone on the orchestrator's own repo" only reveal their assumptions when exposed to:
 
-**Observed:** after partial-failed upload to megaraid (Bug 1 — 6 of 7 task files rejected for invalid Type/Complexity vocabulary), all 3 repo cards in dashboard showed "Uploading..." spinner indefinitely. Spinner did not clear on its own immediately. Eventually self-resolved after auto-refresh poll cycle re-rendered the cards.
+1. Repos with non-trivial pre-existing CLAUDE.md content (OBS-AX root cause)
+2. Multiple cards on the dashboard creating cumulative load (OBS-AY backend slowness)
+3. User actively interacting with multiple repos in quick succession (OBS-AU spinner scoping)
+4. Different task vocabulary conventions from different operators (OBS-AV synonym gap)
+5. Non-recoverable state in one of N repos requiring per-repo intervention (OBS-AW HUNG button)
 
-**Browser console showed only:** `Form submission canceled because the form is not connected. onchange @ (index):1`. No HTMX errors. No network errors. Single warning, single source.
+Late-evening additions surfaced in continued production observation: OBS-AZ + OBS-BA (button/header layout inconsistencies), and OBS-BB (coder claims FIX done but does not push, triggering dirty-tree auto-reset).
 
-**Root cause:** race condition between dashboard auto-poll (HTMX re-renders repo cards every 2-3 seconds) and user upload interaction.
+**Strategic implication:** these bugs are the *cost of multi-repo readiness*. Each one removes a barrier that would have surfaced as a confusing failure for the next operator (be it the author themselves, or alpha users). Discovering them now in the author's own validated environment is far cheaper than discovering them via alpha user feedback. Document them properly, sequence the fixes, and treat the discovery rate as a signal that the system is being exercised in genuinely new territory — not as a regression.
 
-Sequence:
+**Pattern recognition — coder-freedom-bug class:** OBS-AE (coder picks wrong task), OBS-AX (coder ignores AGENTS.md when CLAUDE.md is too rich), and OBS-BB (coder claims fix done without pushing) are all rooted in the same architectural gap: coder receives ambiguous-or-incomplete instruction, makes a partial-or-wrong choice, exits 0, and daemon accepts the success signal at face value without validating post-conditions. Sprint F2.1 SoT (Source of Truth direct instructions) — currently NOT STARTED — is the long-term architectural fix for this class. Daemon should validate post-conditions (HEAD advanced, working tree clean, tests pass, branch matches expected, PR opened against expected file) before accepting any "done" signal from coder. Per-bug fixes (OBS-AX, OBS-BB) are tactical patches; Sprint F2.1 is the systemic solution. Reference for sequencing: do Wave 1-7 first (immediate operator-visible problems), then plan Sprint F2.1 as the larger architectural follow-up.
 
-1. User clicks upload icon → file picker opens.
-2. File picker is modal but does not pause page rendering. Auto-poll fires during the open file-picker window.
-3. Poll response arrives, HTMX swaps repo cards fragment → form element under the upload icon **deleted from DOM**.
-4. User selects file → `change` event fires on file input. The form's `onchange` handler tries to submit, but the form is **disconnected** from DOM.
-5. Browser cancels submission silently with the console warning. HTMX's `htmx:beforeRequest` may have fired but `htmx:afterRequest` cannot fire on a disconnected form.
-6. `.htmx-indicator` CSS class added (or not removed) on the spinner span. Because the spinner span was rendered fresh by the poll re-render but inherited the `htmx-indicator` show state from a previous template render, **all 3 repo cards display spinner simultaneously**. Why all 3 and not just the one being uploaded to: likely a class-level CSS rule applying `opacity:1` to all `.htmx-indicator` spans rather than instance-level state.
-7. Self-recovery: next auto-poll re-renders cards from server, server sees no in-flight upload, returns clean fragment without indicator state.
+**Tactical decision applied to current sprint:** Foundation Sprint (PR-208..PR-236, currently in progress on pipeline-orchestrator) **continues uninterrupted**. New OBS items are recorded for post-Foundation handling. Exception: **OBS-AX (CLAUDE.md scaffolder fix)** is a deal-breaker for any future operator, and ships as priority-1 inject if non-author onboarding is on near-term horizon. Otherwise it queues after Foundation completes alongside the other OBS-AU/AV/AW/AY fixes.
 
-**Fix options:**
+### Closing reflection: разведка боем (reconnaissance by force) — 2026-05-01 retrospective
+
+**Operator's framing at end of session:** "Много чего нашли сегодня. Но нужно было сначала мультирепо тест, а потом в прод. Разведка боем." Translation: "Found lots today. But we should have done the multi-repo test first, then production. Reconnaissance by force."
+
+**This is correct retrospectively.** The session uncovered 11 OBS items (AR through BB) by running 3 repos in production for the first time. Several of these would have been caught much cheaper in a multi-repo test environment:
+
+- **OBS-AY** (`/api/states` slow at multi-repo scale): would surface immediately under `tests/e2e/multi/test_dashboard_scaling.py` with 5+ test repos.
+- **OBS-AU** (Uploading spinner scoping): would surface under `tests/e2e/multi/test_upload_visual_isolation.py` driving multiple concurrent uploads.
+- **OBS-AX** (scaffolder CLAUDE.md replacement): would surface in `tests/e2e/multi/test_onboarding_matrix.py` with varied pre-existing CLAUDE.md content fixtures.
+- **OBS-BB** (coder claims FIX done without push): would surface in any multi-PR FIX cycle test with post-condition validation assertions.
+
+**Why it happened anyway:** at the point of going multi-repo, the multi-testbed test infrastructure did not exist. Building it would have been 3-5 daemon-days of test-only work before getting to use the system on real external repos. The pull of "let me try megaraid + sms-gateway today" was stronger than the discipline of "let me build the test harness first." That impatience is normal for solo-developer product building, especially when production is itself the author's environment with low blast radius.
+
+**The cost of разведка боем was low this time:** all 11 bugs were observed in a 4-hour session, no data loss, no operator-blocking outage, daemons continued working through the bugs. Production validation event still succeeded (4 PRs done in the night across 3 repos). The bugs documented now make Wave 1-7 a clear post-Foundation roadmap. Multi-testbed (Wave 6-7) is itself one of those waves — the test-first investment happens, just after production told us what to test for.
+
+**The lesson for future major architectural shifts** (e.g. PR-FUTURE-7 QUEUE.md elimination, PR-FUTURE-3 onboarding wizard, intra-repo parallelism if revisited):
+
+1. Production is a valid validation venue **for the author**, accepting the 4-hour bug-discovery cost.
+2. Production is **not** a valid validation venue for non-author users — they will perceive the bugs as broken-product, not as "exciting findings."
+3. Before any non-author exposure (alpha users, public release), invest in regression test infrastructure for that surface area. Multi-testbed setup before alpha. Wizard test before public onboarding. Parallelism stress test before scaling claim.
+4. The pattern is: **author exposes new architecture in production → bugs surface → test infrastructure built to lock the fixes → external user exposure follows.** Skipping step 3 is what turns "разведка боем" into "alpha launch disaster."
+
+**Applied to current state:** post-Foundation Wave 1-5 fixes the bugs, Wave 6-7 builds the multi-testbed infrastructure. **Only after Wave 7 ships should the orchestrator be exposed to the first non-author alpha user.** This is the durable consequence of tonight's session.
+
+
+### OBS-AU: Uploading spinner appears on all repo cards during single repo upload (observed 2026-05-01)
+
+**Refined understanding (after multiple verification sessions):** spinner does NOT appear during normal HTMX poll cycles. Operator confirmed by direct observation that spinners are absent when no upload is in flight. The bug fires only during active upload processing.
+
+**Observed:** when operator uploads tasks to ONE repo (e.g. megaraid), the "Uploading..." spinner appears on **all 3 repo cards simultaneously** for the few seconds the backend takes to process the upload (validation + git stage + commit). After upload completes, spinners clear on all cards.
+
+**Two distinct problems stacked in one symptom:**
+
+A. **HTMX scoping leak (primary).** Form has `hx-indicator="#upload-indicator-{repo.name}"` which should scope the indicator to only the matching card. Yet spinner appears on all 3 cards. Either the selector resolution is broken, or HTMX adds `htmx-request` class to a parent element that all spinners look up to, or the CSS rule for `htmx-indicator` is too broad and matches all instances regardless of `hx-indicator` binding.
+
+B. **Form-disconnect race condition (secondary, less frequent).** Sometimes spinner sticks past upload completion. Browser console shows: `Form submission canceled because the form is not connected.` This happens when HTMX poll re-renders the cards while file picker is open — form element gets replaced mid-submission, browser cancels submission, HTMX never receives `afterRequest` event to clear `htmx-request` class. Self-resolves on next auto-poll cycle which re-renders without indicator state.
+
+**Browser console showed:** only the "Form submission canceled" warning during occasional sticks. No HTMX errors. No network errors.
+
+**Diagnostic still needed:**
+
+To distinguish whether problem A is "selector broken" vs "CSS rule too broad" vs "HTMX adds htmx-request to a shared ancestor":
+
+1. Open DevTools → Network tab → filter Fetch/XHR — BEFORE clicking upload.
+2. Click upload icon, select files.
+3. Capture Network tab during the upload (it lasts several seconds).
+4. Look for: how many XHR requests fire (one or many), what URLs (single repo or all), what timings.
+
+The findings determine which fix to apply.
+
+**Fix options (depending on which root cause):**
+
+1. **If selector resolution broken:** examine `hx-indicator` value at runtime via DevTools Elements inspector. Possibly Jinja escaping issue with `__` in repo names breaking selector.
+2. **If HTMX adds htmx-request to shared ancestor:** scope the upload form differently or add CSS rule to require `htmx-request` on the form itself, not on ancestors.
+3. **If CSS rule too broad:** add specificity: `.htmx-indicator[id^="upload-indicator-"]:not(.htmx-request *)` or similar.
+
+**For the secondary race condition (B):**
 
 1. **Decouple upload form from card fragment.** Move `<form>` element into a parent template that does not re-render on poll. Card body stays under poll, upload UI stays stable. Best long-term fix; requires template restructure.
 2. **Pause polling during user upload interaction.** JS event listener on upload icon click → temporarily disable HTMX poll triggers → resume after `change` event completes (success or cancel). Surgical fix, ~15 LOC JS.
 3. **Use morphdom swap** (`hx-swap="morph"` via the htmx-ext-morph extension). Swap with element identity preservation; form survives re-render even if content changes. Requires adding HTMX extension dependency.
 
-**Recommendation:** option 2 (pause polling during interaction) for a quick fix. Option 1 (decouple form) for the proper long-term solution; defer to PR-FUTURE-3 wizard work which will restructure card templates anyway.
+**Recommendation:** capture diagnostic first to confirm A's root cause before writing fix. Then ship combined fix for A+B as single polish PR.
 
-**Severity:** initially classified as rare (single ~200-500ms race window per upload click). **Upgraded 2026-05-01 evening based on multi-repo observation:** with 3 active repos, operator triggered the bug repeatedly within minutes through normal click interactions. Each additional repo multiplies the auto-poll cadence (every 2-3s × N cards), and operator's active UI work expands the total race window significantly. **Real classification: medium severity, frequent in multi-repo usage, every operator with 2+ repos will encounter it.**
+**Severity:** initially classified as rare. **Upgraded medium based on multi-repo observation:** with 3 active repos, the visual confusion happens on every upload. User-perspective framing: "web не справляется с мультирепо" — even though daemons run fine behind the spinner, the dashboard *appears* broken during normal upload operations.
 
-User-perspective framing: "web не справляется с мультирепо" — even though daemons run fine behind the stuck UI, the dashboard *appears* broken. UI experience IS the product surface.
+**Priority:** raised from "defer to PR-FUTURE-3 wizard" to **near-term polish PR.** Should ship within Foundation Sprint window or immediately after.
 
-**Priority:** raised from "defer to PR-FUTURE-3 wizard" to **near-term polish PR.** Should ship within Foundation Sprint window or immediately after, before any fresh operator (non-author) tries multi-repo onboarding.
-
-**Type:** bugfix. **Complexity:** low. **Estimated:** 1 PR, ~2 daemon-hours. Recommended fix: option 2 (pause polling during user upload interaction, ~15 LOC JS).
+**Type:** bugfix. **Complexity:** low-medium. **Estimated:** 1 PR after diagnostic captured, ~3 daemon-hours including investigation. Recommended fix for B: option 2 (pause polling during interaction, ~15 LOC JS). Fix for A depends on diagnostic.
 
 
 ## Architectural future work — multi-repo + per-repo config (added 2026-05-01)
+
+### Multi-repo testing infrastructure (added 2026-05-01 evening, **scheduled post-OBS-fixes**)
+
+**Sequencing decision (2026-05-01):** Foundation Sprint finishes → OBS-AS/AU/AV/AW/AX/AY fixes ship → multi-testbed setup → multi-repo tests added. This ordering ensures:
+
+1. Tests are written **after** the bugs they would have caught are fixed, so the test suite documents post-fix expected behaviour rather than inheriting pre-fix workarounds.
+2. Multi-testbed harness is built on top of stable scaffolder (OBS-AX fix in place — CLAUDE.md replacement) so every new testbed onboards correctly.
+3. Backend `/api/states` performance gate (`< 1 second for 10 repos`) only makes sense after OBS-AY backend fixes; otherwise tests would just confirm the known slowness.
+
+**Order of execution (post-Foundation):**
+
+```
+Wave 1 (critical):    OBS-AX scaffolder CLAUDE.md replace      (1 PR,  ~2h)
+Wave 2 (performance): OBS-AY setInterval cleanup + /api/states (2-3 PRs, ~5h)
+Wave 3 (UX polish):   OBS-AU spinner + OBS-AS initializing/toast + OBS-AZ + OBS-BA layout (3-4 PRs, ~5h)
+Wave 4 (vocabulary):  OBS-AV synonyms + atomic upload          (3 PRs,  ~5h)
+Wave 5 (recovery):    OBS-AW HUNG button + OBS-BB FIX-no-push  (3-4 PRs, ~6h)
+
+Then multi-testbed infrastructure:
+Wave 6 (test harness): provisioning + conftest + base patterns (2-3 PRs, ~5h)
+Wave 7 (tests):        one PR per multi-repo test scenario      (5+ PRs, ~10h)
+```
+
+**Total post-Foundation: ~17-21 PRs, ~35 daemon-hours, ~2 daemon-days** at 17 PR/day throughput.
+
+**Current testbed:** `tests/e2e/lib/coder_shim.sh` mocks Claude/Codex CLIs, drives a single testbed repo (`AlexBomber12/pipeline-orchestrator-testbed`) for e2e tests covering upload, merge, fix-escalate, redis recovery, sigkill recovery, stop/resume. All e2e tests are **single-repo**.
+
+**Gap revealed by 2026-05-01 multi-repo session:** the production validation event (3 active repos: pipeline-orchestrator + megaraid + sms-gateway) surfaced 5 OBS items that were never caught by the single-repo e2e suite (OBS-AS, AU, AV, AW, AX, AY). These are bugs the test suite had no way to detect because the conditions only manifest with N>1 repos.
+
+**Proposed: multi-testbed integration test infrastructure.**
+
+Provision N additional testbed repos (`pipeline-orchestrator-testbed-1`, `-2`, ..., `-10`) with same scaffolding pattern as existing testbed. Configure e2e harness to spin up subsets of these for tests requiring multiple managed repos simultaneously.
+
+Coverage targets a new test suite would address:
+
+1. **Multi-repo coordination:** N concurrent daemon `run_cycle`s on separate repos do not interfere with each other's state, queue selection, or git working trees. Already informally validated in production, but not in CI.
+2. **UI scaling:** dashboard with N repo cards renders correctly, polls at acceptable rates, does not freeze (OBS-AY regression test). Backend `/api/states` performance gate: must respond < 1 second for 10 repos.
+3. **Resource contention:** GraphQL quota across N repos stays within budget; auth volumes not corrupted by concurrent reads; Redis pubsub channels properly scoped per-repo.
+4. **Onboarding friction:** scaffolder runs idempotently on N freshly-cloned testbeds with diverse pre-existing CLAUDE.md/AGENTS.md content (matrix tests with various combinations).
+5. **Cross-repo independence:** failure (HUNG, ERROR) in repo K does not block repos 1..K-1 or K+1..N from progressing.
+
+How many testbed repos to provision: **start with 5, scale to 10 when 5 saturates**. Each additional testbed adds complexity to CI (clone time, GitHub API quota for setup/teardown). 10 is upper-bound for current architecture before per-test isolation costs become prohibitive.
+
+**Test categorization:**
+
+- `tests/e2e/multi/` — new directory for multi-repo tests
+- `tests/e2e/multi/test_concurrent_run_cycles.py` — verify N repos run independently
+- `tests/e2e/multi/test_dashboard_scaling.py` — UI performance with N cards (when OBS-AY ships)
+- `tests/e2e/multi/test_graphql_budget.py` — quota stays within limits at N=5, N=10
+- `tests/e2e/multi/test_one_repo_hung.py` — OBS-AW regression, HUNG in 1 of N repos doesn't block others
+- `tests/e2e/multi/test_onboarding_matrix.py` — scaffolder against varied CLAUDE.md/AGENTS.md states (OBS-AX regression)
+
+**Type:** test infrastructure. **Estimated:** 2-3 PRs to set up multi-testbed harness (provision script, conftest fixtures, base test patterns), then 1 PR per test case. ~4 PRs total = ~8 daemon-hours initially, growing linearly with each new test added.
+
+### Intra-repo task parallelism (added 2026-05-01 evening, **DEFERRED — backlog only**)
+
+**Decision (2026-05-01):** record as long-term architectural option, not actively planned. Multi-repo parallelism (PR-207, already shipped) gives 3x throughput when 3 repos active. Intra-repo parallelism's marginal benefit (~15-20% sprint speedup on truly independent tasks) does not justify ~8-12 PR refactor effort and state machine complexity at current product stage. Revisit when:
+
+- A specific repo with 50+ independent tasks needs to ship faster than multi-repo can deliver
+- Product reaches monorepo customers where multi-repo parallelism is structurally unavailable
+- Codex/Claude review throughput becomes the binding constraint (in which case intra-repo parallelism does not help anyway, would be wrong fix)
+
+**Current state:** daemon serializes work per-repo. State machine assumes single `current_pr` at a time. Parallelism is **across repos** (3 repos = 3x throughput) but **not within a repo**.
+
+**Question raised by operator:** could daemon work on multiple tasks in parallel within a single repo (e.g. PR-001 and PR-002 simultaneously)?
+
+**Architectural feasibility analysis:**
+
+Doable but expensive. Required changes:
+
+1. `RepoState.current_pr` becomes `current_prs: list[PRSummary]` keyed by branch.
+2. State machine forks per-task: each PR has independent state (CODING/WATCH/FIX/MERGE) progressing concurrently.
+3. Working tree isolation: separate clones per active task or careful branch checkout coordination — currently `repo_path` is a single working tree.
+4. Resource serialization: only one Claude CLI invocation at a time per machine (rate limits, CPU); intra-repo parallelism does NOT remove this constraint, just hides it as serialized within concurrent state machines.
+5. Recovery semantics: sigkill recovery becomes O(N_tasks) reconstruction instead of O(1); restart logic significantly more complex.
+6. Merge serialization: still need to serialize PR merges per-repo (merge conflicts, base branch updates).
+
+**Useful for which workloads:**
+
+- ✅ **Independent feature PRs in different subsystems** — backend PR-001 + frontend PR-002, no overlap. Theoretically 2x faster but only if both stages (planning, coding, review, fix, merge) actually parallelize.
+- ❌ **Dependent task chains** — PR-002 `Depends on: PR-001` forces sequential regardless. Most sprint plans have heavy dependency chains.
+- ❌ **Overlapping file scope** — PR-001 and PR-003 both touch `src/web/app.py` — merge conflicts at PR-002 merge time inevitable.
+- ⚠️ **Reviewer (Codex) bandwidth** — Codex reviews are also rate-limited; 2 PRs in flight = 2 review queue entries; not free.
+
+**Realistic speedup:** in a 36-PR Foundation Sprint where ~30% of tasks are truly independent, intra-repo parallelism with capacity 2 might yield ~15-20% sprint completion time reduction at significant complexity cost.
+
+**Multi-repo parallelism (already implemented, PR-207) gives 3x throughput** when 3 repos are active — same productivity gain as intra-repo parallelism level 3 within one repo, **without** the state machine complexity. Operator running 3 different projects simultaneously already gets the win.
+
+**Recommendation:** defer intra-repo parallelism until:
+
+- A specific repo with 50+ independent tasks needs to ship faster than multi-repo can deliver
+- All multi-repo bugs (OBS-AS, AU, AV, AW, AX, AY) are resolved and product is stable on 5+ repos
+- Codex review throughput becomes the binding constraint (would mean intra-repo parallelism doesn't help anyway)
+
+The "uber-test" the operator described — N parallel tasks per repo across multiple repos — is a **valuable test target for the multi-testbed infrastructure above** even if intra-repo parallelism is not implemented immediately. Test stresses the state machine assumptions and reveals whether the singular `current_pr` invariant holds under genuinely concurrent task selection attempts (race conditions in `_select_next_task` for example).
+
+**Type:** architecture refactor. **Estimated when prioritized:** ~8-12 PRs (RepoState refactor + state machine fork + working tree isolation + recovery refactor + tests + UI changes). Comparable to PR-FUTURE-7 (QUEUE.md elimination) in scope. Defer at least 2-3 months until product surfaces a real demand.
 
 This section captures architectural changes that emerged from the megaraid-dashboard / sms-gateway-v2 onboarding planning. None of these are in Foundation Sprint scope (which is internal cleanup of pipeline-orchestrator itself), but all should be tackled before declaring multi-repo onboarding production-ready for non-author users.
 
