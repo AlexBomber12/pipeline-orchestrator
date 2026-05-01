@@ -424,8 +424,8 @@ class IdleMixin:
                 f"[INFRA] IDLE: open PR check failed: {exc}; deferring "
                 f"task dispatch."
             )
-            self.state.current_pr = None
             self.state.current_task = None
+            self._reset_runner_local_task_counters()
             self._idle_dispatch_deferred = True
             return
         open_pr_snapshot = tuple(sorted((pr.number, pr.branch) for pr in prs))
@@ -689,6 +689,7 @@ class IdleMixin:
         await self._refresh_user_paused_from_redis()
         if self.state.user_paused:
             self.state.current_task = None
+            self._reset_runner_local_task_counters()
             self.log_event(
                 f"[INFRA] Pause requested while preparing {task.pr_id}; "
                 f"deferring CODING."

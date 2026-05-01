@@ -172,11 +172,35 @@ class RepoState(BaseModel):
     last_codex_retrigger_at: datetime | None = None
 
     def __setattr__(self, name: str, value: object) -> None:
+        """Couple related task/PR fields so a single write resets them together.
+
+        ``current_pr`` change resets the per-PR retrigger timestamps so
+        a new PR does not inherit "we already retriggered Codex" memory
+        from the previous one.
+
+        ``current_task = None`` is the canonical "drop the active work
+        handle" signal: it implies no live PR and no operator-relevant
+        error. Coupling those resets here lets every clear callsite
+        write the single triggering line.
+
+        Pydantic v2 ordering caveat: the side-effect writes
+        (``current_pr = None``, ``error_message = None``) run BEFORE the
+        triggering assignment goes through Pydantic's own validation.
+        Both fields are ``Optional`` and accept ``None`` today, so the
+        side-effect writes never fail validation. A future field
+        validator on ``current_task`` that rejects the new value would
+        leave the resets in place; contributors adding such a validator
+        must consciously decide whether the resets should run before or
+        after validation.
+        """
         if name == "current_pr":
             current_pr = getattr(self, "current_pr", None)
             if self._is_new_pr_transition(current_pr, value):
                 super().__setattr__("last_stale_retrigger_at", None)
                 super().__setattr__("last_codex_retrigger_at", None)
+        if name == "current_task" and value is None:
+            super().__setattr__("current_pr", None)
+            super().__setattr__("error_message", None)
         super().__setattr__(name, value)
 
     @staticmethod

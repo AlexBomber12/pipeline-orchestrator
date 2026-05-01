@@ -282,6 +282,7 @@ class RecoveryMixin:
                     f"origin/{self.repo_config.branch})."
                 )
                 self.state.current_task = None
+                self._reset_runner_local_task_counters()
                 doing = None
 
         if doing is not None:
@@ -325,15 +326,8 @@ class RecoveryMixin:
                 return True
             self._crashed_task_pr_ids.add(doing.pr_id)
             self.state.current_task = None
-            self.state.current_pr = None
+            self._reset_runner_local_task_counters()
             self.state.state = PipelineState.IDLE
-            # P2 review: a prior ERROR transition (e.g. preflight failure
-            # before the crash) leaves ``error_message`` populated. Now
-            # that recovery has converged on IDLE with the crashed task
-            # parked, clear that stale text so the dashboard does not
-            # surface a misleading failure banner against a quiesced
-            # repo.
-            self.state.error_message = None
             self.log_event(
                 f"[INFRA] Task {doing.pr_id} crashed, marking CANCELED. "
                 f"Manually re-upload to retry."
@@ -369,10 +363,8 @@ class RecoveryMixin:
             return True
 
         self.state.state = PipelineState.IDLE
-        self.state.error_message = None
         self.state.current_task = None
-        self.state.current_pr = None
-        self._error_diagnose_count = 0
+        self._reset_runner_local_task_counters()
 
         if prs:
             self.log_event(

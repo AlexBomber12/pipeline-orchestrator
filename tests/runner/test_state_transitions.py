@@ -237,11 +237,18 @@ def test_idle_clears_task_on_open_pr_check_failure(
 ) -> None:
     """``idle.py:428`` — ``get_open_prs`` raises during dispatch.
 
-    The site clears ``current_pr`` and ``current_task``, sets the
-    soft-defer flag ``_idle_dispatch_deferred`` so the next cycle
-    retries, and stays in IDLE without an ERROR transition (the
-    failure is treated as transient observability noise, not a fatal
-    handler error). ``error_message`` is intentionally NOT touched.
+    The site clears ``current_pr``, ``current_task`` and (post-PR-218)
+    ``error_message``, sets the soft-defer flag
+    ``_idle_dispatch_deferred`` so the next cycle retries, and stays in
+    IDLE without an ERROR transition (the failure is treated as
+    transient observability noise, not a fatal handler error).
+
+    PR-218 unified the task-clear contract: every callsite that drops
+    ``current_task`` now also releases ``current_pr`` and
+    ``error_message`` via ``RepoState.__setattr__``. The previous
+    "preserve error_message at this site" carve-out is gone, matching
+    the recovery.py:371-375 superset that the rest of the codebase
+    already followed.
     """
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
@@ -257,7 +264,7 @@ def test_idle_clears_task_on_open_pr_check_failure(
     runner.state.current_task = QueueTask(
         pr_id="PR-OLD", title="t", status=TaskStatus.TODO,
     )
-    runner.state.error_message = "preserved"
+    runner.state.error_message = "stale before clear"
     runner._idle_dispatch_deferred = False
 
     asyncio.run(runner.handle_idle())
@@ -266,7 +273,7 @@ def test_idle_clears_task_on_open_pr_check_failure(
     assert runner.state.current_pr is None
     assert runner.state.current_task is None
     assert runner._idle_dispatch_deferred is True
-    assert runner.state.error_message == "preserved"
+    assert runner.state.error_message is None
     assert any(
         "open PR check failed" in e["event"] for e in runner.state.history
     )
@@ -372,10 +379,13 @@ def test_hung_clears_task_on_resolved(
 ) -> None:
     """``hung.py:285`` — operator merged or closed the parked PR.
 
-    The site drops ``current_pr``, ``current_task``, and transitions to
-    IDLE. ``error_message`` is intentionally PRESERVED so the operator
-    can still see why the PR ended up in HUNG; only the active handles
-    are released so the next IDLE cycle picks fresh work.
+    The site drops ``current_pr``, ``current_task``, ``error_message``
+    and transitions to IDLE. PR-218 unified the task-clear contract:
+    once ``current_task`` flips to ``None`` the operator-relevant
+    ``error_message`` is released alongside the PR handle so the next
+    IDLE cycle starts from the canonical clean shape. Operators who
+    need to retain the parked-PR reason consult the event log; the live
+    ``error_message`` field is reserved for an active failure.
     """
     monkeypatch.setattr(
         hung_module.github_client,
@@ -396,8 +406,7 @@ def test_hung_clears_task_on_resolved(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is None
     assert runner.state.current_task is None
-    # error_message at this site is NOT cleared by the callsite itself.
-    assert runner.state.error_message == "operator review reason"
+    assert runner.state.error_message is None
     assert any(
         "PR #5 MERGED by operator -> IDLE" in e["event"]
         for e in runner.state.history
