@@ -1434,6 +1434,15 @@ async def post_repo_detail_coder(
     except Exception:
         logger.warning("Failed to publish coder update event", exc_info=True)
 
+    try:
+        await publish_wake(redis_client, name, "coder_swap")
+    except Exception:
+        logger.warning(
+            "publish_wake failed for %s; daemon will pick up coder_swap on next tick",
+            name,
+            exc_info=True,
+        )
+
     current_state = await get_repo_state(name, redis_client, config_path=CONFIG_PATH)
     applies_after_current_pr = (
         current_state.state in _DEFERRED_CODER_SWITCH_STATES
@@ -2313,6 +2322,15 @@ async def put_repo_detail_coder(
         return HTMLResponse(f"Failed to write config.yml: {exc}", status_code=503)
 
     redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is not None:
+        try:
+            await publish_wake(redis_client, name, "settings")
+        except Exception:
+            logger.warning(
+                "publish_wake failed for %s; daemon will pick up settings on next tick",
+                name,
+                exc_info=True,
+            )
     context = await _repo_template_context(name, redis_client)
     return templates.TemplateResponse(
         request,

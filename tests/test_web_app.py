@@ -2579,6 +2579,245 @@ def test_post_repo_detail_coder_returns_success_when_publish_event_fails(
     assert reloaded.repositories[0].coder == "codex"
 
 
+def test_post_repo_detail_coder_publishes_coder_swap_wake_event(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    idle = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        coder="claude",
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": idle.model_dump_json()})
+
+    async def _fake_publish_repo_event(*args: object, **kwargs: object) -> None:
+        return None
+
+    async def _fake_repo_template_context(
+        name: str,
+        redis_client: object | None,
+        *,
+        coder_update_message: str | None = None,
+        include_metrics: bool = False,
+    ) -> dict[str, object]:
+        return {"coder_update_message": coder_update_message or ""}
+
+    def _fake_template_response(
+        request: object,
+        template_name: str,
+        context: dict[str, object],
+    ) -> HTMLResponse:
+        return HTMLResponse(str(context["coder_update_message"]))
+
+    monkeypatch.setattr(web_app, "publish_repo_event", _fake_publish_repo_event)
+    monkeypatch.setattr(web_app, "_repo_template_context", _fake_repo_template_context)
+    monkeypatch.setattr(web_app.templates, "TemplateResponse", _fake_template_response)
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.post(
+            "/repos/example__alpha/coder",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 200
+    wake_events = [
+        (channel, message)
+        for channel, message in fake.published
+        if channel == "orchestrator:wake:example__alpha"
+    ]
+    assert len(wake_events) == 1
+    payload = json.loads(wake_events[0][1])
+    assert payload["event_type"] == "coder_swap"
+    assert payload["repo"] == "example__alpha"
+
+
+def test_post_repo_detail_coder_succeeds_when_publish_wake_fails(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Coder swap must persist even when the wake publish raises."""
+
+    class _PublishBoomRedis(_FakeRedis):
+        async def publish(self, channel: str, message: str) -> int:
+            raise RuntimeError("publish boom")
+
+    idle = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        coder="claude",
+    )
+    fake = _PublishBoomRedis({"pipeline:example__alpha": idle.model_dump_json()})
+
+    async def _fake_repo_template_context(
+        name: str,
+        redis_client: object | None,
+        *,
+        coder_update_message: str | None = None,
+        include_metrics: bool = False,
+    ) -> dict[str, object]:
+        return {"coder_update_message": coder_update_message or ""}
+
+    def _fake_template_response(
+        request: object,
+        template_name: str,
+        context: dict[str, object],
+    ) -> HTMLResponse:
+        return HTMLResponse(str(context["coder_update_message"]))
+
+    monkeypatch.setattr(web_app, "_repo_template_context", _fake_repo_template_context)
+    monkeypatch.setattr(web_app.templates, "TemplateResponse", _fake_template_response)
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        with caplog.at_level("WARNING", logger=web_app.logger.name):
+            response = client.post(
+                "/repos/example__alpha/coder",
+                data={"coder": "codex"},
+            )
+
+    assert response.status_code == 200
+    stored = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+    assert stored.coder == "codex"
+    reloaded = load_config(str(two_repo_config))
+    assert reloaded.repositories[0].coder == "codex"
+    assert any(
+        "publish_wake failed for example__alpha" in rec.getMessage()
+        and "coder_swap" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_put_repo_detail_coder_publishes_settings_wake_event(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeRedis()
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.put(
+            "/settings/repo/example__alpha",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 200
+    wake_events = [
+        (channel, message)
+        for channel, message in fake.published
+        if channel == "orchestrator:wake:example__alpha"
+    ]
+    assert len(wake_events) == 1
+    payload = json.loads(wake_events[0][1])
+    assert payload["event_type"] == "settings"
+    assert payload["repo"] == "example__alpha"
+
+
+def test_put_repo_detail_coder_succeeds_when_publish_wake_fails(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Per-repo settings save must persist even when the wake publish raises."""
+
+    class _PublishBoomRedis(_FakeRedis):
+        async def publish(self, channel: str, message: str) -> int:
+            raise RuntimeError("publish boom")
+
+    fake = _PublishBoomRedis()
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        with caplog.at_level("WARNING", logger=web_app.logger.name):
+            response = client.put(
+                "/settings/repo/example__alpha",
+                data={"coder": "codex"},
+            )
+
+    assert response.status_code == 200
+    reloaded = load_config(str(two_repo_config))
+    assert reloaded.repositories[0].coder is not None
+    assert reloaded.repositories[0].coder.value == "codex"
+    assert any(
+        "publish_wake failed for example__alpha" in rec.getMessage()
+        and "settings" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_coder_swap_wake_message_resets_daemon_last_run(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: coder swap publishes a wake message recognised by the
+    daemon, so a coder change during long IDLE polling is applied within the
+    next ``_wait_or_wake`` tick instead of waiting up to
+    ``idle_extended_poll_interval_sec`` (default 300s).
+    """
+    from src.daemon import main as daemon_main
+
+    idle = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        coder="claude",
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": idle.model_dump_json()})
+
+    async def _fake_publish_repo_event(*args: object, **kwargs: object) -> None:
+        return None
+
+    async def _fake_repo_template_context(
+        name: str,
+        redis_client: object | None,
+        *,
+        coder_update_message: str | None = None,
+        include_metrics: bool = False,
+    ) -> dict[str, object]:
+        return {"coder_update_message": coder_update_message or ""}
+
+    def _fake_template_response(
+        request: object,
+        template_name: str,
+        context: dict[str, object],
+    ) -> HTMLResponse:
+        return HTMLResponse(str(context["coder_update_message"]))
+
+    monkeypatch.setattr(web_app, "publish_repo_event", _fake_publish_repo_event)
+    monkeypatch.setattr(web_app, "_repo_template_context", _fake_repo_template_context)
+    monkeypatch.setattr(web_app.templates, "TemplateResponse", _fake_template_response)
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.post(
+            "/repos/example__alpha/coder",
+            data={"coder": "codex"},
+        )
+
+    assert response.status_code == 200
+    wake_events = [
+        (channel, message)
+        for channel, message in fake.published
+        if channel == "orchestrator:wake:example__alpha"
+    ]
+    assert len(wake_events) == 1
+    channel, message = wake_events[0]
+    payload = json.loads(message)
+    assert payload["event_type"] == "coder_swap"
+
+    last_run = {"alpha-key": 100.0, "beta-key": 200.0}
+    slug_to_key = {"example__alpha": "alpha-key", "example__beta": "beta-key"}
+    daemon_main._apply_wake_message(
+        {"channel": channel}, last_run, slug_to_key
+    )
+
+    assert last_run["alpha-key"] == 0.0
+    assert last_run["beta-key"] == 200.0
+
+
 def _make_bucket_redis(
     *,
     rest_remaining: int | None = None,
