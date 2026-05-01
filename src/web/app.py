@@ -429,8 +429,24 @@ def _resource_zone(percent_remaining: float | None) -> str:
 
 def _budget_chip(
     budget: RateLimitBudget | None,
+    *,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     if budget is None:
+        return {
+            "remaining": None,
+            "limit": None,
+            "percent_remaining": None,
+            "reset_unix": None,
+            "zone": "none",
+        }
+    # Snapshots whose ``reset_at`` has already passed describe a window
+    # GitHub has since rolled over. The remaining/limit pair is no longer
+    # informative — the daemon stops throttling once ``now >= reset_at`` —
+    # so render the chip as neutral until the next successful probe rather
+    # than letting a stale low-remaining reading hold a critical zone.
+    current = now if now is not None else datetime.now(timezone.utc)
+    if budget.reset_at <= current:
         return {
             "remaining": None,
             "limit": None,
@@ -514,9 +530,10 @@ async def _build_resources_view(
     """
     rest = await read_rest_budget(redis_client)
     graphql = await read_graphql_budget(redis_client)
+    now = datetime.now(timezone.utc)
     return {
-        "github_rest": _budget_chip(rest),
-        "github_graphql": _budget_chip(graphql),
+        "github_rest": _budget_chip(rest, now=now),
+        "github_graphql": _budget_chip(graphql, now=now),
         "claude_5h": _claude_usage_chip(states, window="session"),
         "claude_weekly": _claude_usage_chip(states, window="weekly"),
     }

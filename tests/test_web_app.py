@@ -2690,6 +2690,27 @@ def test_build_resources_view_red_zone_when_buckets_near_exhaustion() -> None:
     assert view["github_graphql"]["zone"] == "red"
 
 
+def test_build_resources_view_neutralizes_expired_bucket_snapshot() -> None:
+    """Snapshots whose ``reset_at`` has passed must render neutral, not red.
+
+    GitHub rolls the bucket over at ``reset_at``; a stale low-remaining
+    snapshot from before the rollover would otherwise hold a critical
+    chip indefinitely even though the daemon already stopped throttling.
+    """
+    expired_reset = datetime.now(timezone.utc) - timedelta(seconds=60)
+    redis = _make_bucket_redis(
+        rest_remaining=10, graphql_remaining=10, reset_at=expired_reset
+    )
+
+    view = asyncio.run(_build_resources_view(redis, []))
+
+    for key in ("github_rest", "github_graphql"):
+        assert view[key]["zone"] == "none"
+        assert view[key]["percent_remaining"] is None
+        assert view[key]["remaining"] is None
+        assert view[key]["reset_unix"] is None
+
+
 def test_build_resources_view_picks_most_recent_claude_state() -> None:
     """Aggregation walks repos and uses the freshest Claude snapshot."""
     older = _claude_state(
