@@ -41,9 +41,7 @@ def test_handle_idle_no_tasks_leaves_state_idle(
     calls = h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
-    monkeypatch.setattr(
-        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
-    )
+    monkeypatch.setattr("src.github.prs.get_merged_prs", lambda repo, branch, refresh=False: [])
 
     runner = h._make_runner()
     asyncio.run(runner.handle_idle())
@@ -58,12 +56,8 @@ def test_handle_idle_no_tasks_leaves_state_idle(
     # whatever branch/commit the repo was left on by a prior cycle.
     commands = [cmd[:4] for cmd in calls]
     fetch_idx = commands.index(["git", "fetch", "--prune", "origin"])
-    checkout_idx = next(
-        i for i, cmd in enumerate(commands) if cmd[:2] == ["git", "checkout"]
-    )
-    reset_idx = next(
-        i for i, cmd in enumerate(commands) if cmd[:2] == ["git", "reset"]
-    )
+    checkout_idx = next(i for i, cmd in enumerate(commands) if cmd[:2] == ["git", "checkout"])
+    reset_idx = next(i for i, cmd in enumerate(commands) if cmd[:2] == ["git", "reset"])
     assert fetch_idx < checkout_idx < reset_idx
     # No git pull anywhere: sync_to_main replaced it with reset --hard.
     assert not any(cmd[:2] == ["git", "pull"] for cmd in calls)
@@ -71,9 +65,7 @@ def test_handle_idle_no_tasks_leaves_state_idle(
     # files left by a crashed prior cycle would otherwise survive into
     # the next preflight as a dirty tree. ``git clean -fd`` after the
     # reset guarantees the working copy matches origin/{branch}.
-    clean_idx = next(
-        i for i, cmd in enumerate(commands) if cmd[:2] == ["git", "clean"]
-    )
+    clean_idx = next(i for i, cmd in enumerate(commands) if cmd[:2] == ["git", "clean"])
     assert reset_idx < clean_idx
     assert ["git", "clean", "-fd"] in calls
 
@@ -118,16 +110,12 @@ def test_handle_idle_picks_task_and_drives_coding(
         return [opened_pr]
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         _get_open_prs,
     )
+    monkeypatch.setattr("src.github.prs.get_merged_prs", lambda repo, branch, refresh=False: [])
     monkeypatch.setattr(
-        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
 
@@ -175,16 +163,12 @@ def test_handle_idle_sets_queue_counters_with_mixed_statuses(
         return [PRInfo(number=1, branch="pr-003")]
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         _get_open_prs,
     )
+    monkeypatch.setattr("src.github.prs.get_merged_prs", lambda repo, branch, refresh=False: [])
     monkeypatch.setattr(
-        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
 
@@ -224,13 +208,10 @@ def test_handle_idle_publishes_progress_update_only_for_new_counts(
         lambda tasks, repo_path, base_branch, open_pr_branches: tasks,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
-    )
+    monkeypatch.setattr("src.github.prs.get_merged_prs", lambda repo, branch, refresh=False: [])
     monkeypatch.setattr(runner_module, "publish_repo_event", _fake_publish_repo_event)
 
     runner = h._make_runner()
@@ -294,13 +275,11 @@ def test_handle_idle_uses_dag_when_headers_present(
     )
     monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: {"PR-001"})
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -337,9 +316,7 @@ def test_handle_idle_falls_back_to_queue_md(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text("No structured header here\n", encoding="utf-8")
-    (tasks_dir / "PR-099.md").write_text(
-        "Legacy fallback task body\n", encoding="utf-8"
-    )
+    (tasks_dir / "PR-099.md").write_text("Legacy fallback task body\n", encoding="utf-8")
 
     fallback_task = QueueTask(
         pr_id="PR-099",
@@ -361,13 +338,11 @@ def test_handle_idle_falls_back_to_queue_md(
     )
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: fallback_task)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -424,13 +399,11 @@ def test_handle_idle_dag_skips_files_without_headers(
     )
     monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -474,13 +447,11 @@ def test_handle_idle_dag_surfaces_malformed_task_headers(
     )
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -507,8 +478,7 @@ def test_handle_idle_dag_falls_back_for_legacy_task_files(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
-        "# PR-001: Legacy task\n\n"
-        "Branch: pr-001-legacy\n",
+        "# PR-001: Legacy task\n\nBranch: pr-001-legacy\n",
         encoding="utf-8",
     )
 
@@ -522,13 +492,11 @@ def test_handle_idle_dag_falls_back_for_legacy_task_files(
     parse_calls: list[str] = []
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
     monkeypatch.setattr(
@@ -574,8 +542,7 @@ def test_handle_idle_dag_falls_back_when_structured_task_depends_on_legacy_file(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
-        "# PR-001: Legacy task\n\n"
-        "Branch: pr-001-legacy\n",
+        "# PR-001: Legacy task\n\nBranch: pr-001-legacy\n",
         encoding="utf-8",
     )
     (tasks_dir / "PR-002.md").write_text(
@@ -598,13 +565,11 @@ def test_handle_idle_dag_falls_back_when_structured_task_depends_on_legacy_file(
 
     monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
     monkeypatch.setattr(
@@ -684,13 +649,11 @@ def test_handle_idle_dag_falls_back_when_structured_task_depends_on_missing_file
 
     monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
     monkeypatch.setattr(
@@ -754,13 +717,11 @@ def test_handle_idle_keeps_independent_dag_task_when_other_dependency_file_missi
 
     monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -814,13 +775,11 @@ def test_handle_idle_keeps_structured_task_when_legacy_dependency_is_already_don
 
     monkeypatch.setattr(idle_module, "get_merged_pr_ids", fake_get_merged_pr_ids)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -885,13 +844,11 @@ def test_handle_idle_prefers_legacy_queue_task_over_dag_task(
 
     monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -956,13 +913,11 @@ def test_handle_idle_ignores_ghost_legacy_queue_task_without_task_file(
 
     monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -980,8 +935,7 @@ def test_handle_idle_ignores_ghost_legacy_queue_task_without_task_file(
     assert runner.state.current_task is not None
     assert runner.state.current_task.pr_id == "PR-002"
     assert any(
-        "Ignoring ghost legacy QUEUE.md entry PR-001" in entry.get("event", "")
-        for entry in runner.state.history
+        "Ignoring ghost legacy QUEUE.md entry PR-001" in entry.get("event", "") for entry in runner.state.history
     )
     # The ghost entry must not block QUEUE.md regeneration: leaving the
     # stale ``PR-001: DOING`` block on disk would let the shim's
@@ -1026,20 +980,17 @@ def test_handle_idle_advances_to_real_legacy_after_skipping_ghost(
         encoding="utf-8",
     )
     (tasks_dir / "PR-002.md").write_text(
-        "# PR-002: Real legacy\n\n"
-        "Some legacy body without structured headers.\n",
+        "# PR-002: Real legacy\n\nSome legacy body without structured headers.\n",
         encoding="utf-8",
     )
 
     monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -1057,8 +1008,7 @@ def test_handle_idle_advances_to_real_legacy_after_skipping_ghost(
     assert runner.state.current_task is not None
     assert runner.state.current_task.pr_id == "PR-002"
     assert any(
-        "Ignoring ghost legacy QUEUE.md entry PR-001" in entry.get("event", "")
-        for entry in runner.state.history
+        "Ignoring ghost legacy QUEUE.md entry PR-001" in entry.get("event", "") for entry in runner.state.history
     )
 
 
@@ -1085,16 +1035,12 @@ def test_handle_idle_attaches_to_existing_pr_instead_of_coding(
         review_status=ReviewStatus.PENDING,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [existing_pr],
     )
+    monkeypatch.setattr("src.github.prs.get_merged_prs", lambda repo, branch, refresh=False: [])
     monkeypatch.setattr(
-        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, number: {"head_commit_date": "2026-04-14T12:00:00Z"},
     )
 
@@ -1139,18 +1085,15 @@ def test_handle_idle_proceeds_to_coding_when_no_matching_pr(
             return []
         return [PRInfo(number=17, branch="pr-042-sample")]
 
-    monkeypatch.setattr(runner_module.github_client, "get_open_prs", _get_open_prs)
-    monkeypatch.setattr(
-        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", _get_open_prs)
+    monkeypatch.setattr("src.github.prs.get_merged_prs", lambda repo, branch, refresh=False: [])
     monkeypatch.setattr(
         claude_cli,
         "run_planned_pr_async",
         h._async_cli_result(0, "ok", ""),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
 
@@ -1191,13 +1134,11 @@ def test_handle_idle_transitions_to_hung_when_pinned_coder_unavailable(
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: task)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -1214,9 +1155,7 @@ def test_handle_idle_transitions_to_hung_when_pinned_coder_unavailable(
         "claude": {"status": "ok"},
         "codex": {"status": "failed"},
     }
-    runner._auth_status_cache_expires_at = (
-        datetime.now(timezone.utc) + timedelta(minutes=5)
-    )
+    runner._auth_status_cache_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
     runner.state.current_pr = PRInfo(
         number=1234,
         branch="some-other-branch",
@@ -1225,9 +1164,7 @@ def test_handle_idle_transitions_to_hung_when_pinned_coder_unavailable(
     asyncio.run(runner.handle_idle())
 
     assert runner.state.state == PipelineState.HUNG
-    assert runner.state.error_message == (
-        "Task PR-200 pinned to codex but coder unavailable"
-    )
+    assert runner.state.error_message == ("Task PR-200 pinned to codex but coder unavailable")
     assert runner.state.current_pr is None
     assert not coding_called["v"]
 
@@ -1250,9 +1187,7 @@ def test_handle_idle_defers_on_gh_failure(
     def _exploding_get_open_prs(repo: str, **kw: Any) -> list[PRInfo]:
         raise RuntimeError("GitHub API unavailable")
 
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", _exploding_get_open_prs
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", _exploding_get_open_prs)
 
     coding_called = {"v": False}
 
@@ -1287,13 +1222,10 @@ def test_handle_idle_sets_error_when_task_status_derivation_times_out(
     )
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
-    )
+    monkeypatch.setattr("src.github.prs.get_merged_prs", lambda repo, branch, refresh=False: [])
 
     def _timed_out(*args: Any, **kwargs: Any) -> list[QueueTask]:
         raise subprocess.TimeoutExpired(cmd=["git", "branch", "--merged"], timeout=10)
@@ -1365,8 +1297,7 @@ def test_handle_idle_stops_when_pending_upload_processing_fails(
 
     assert runner.state.state == PipelineState.IDLE
     assert any(
-        "Pending upload failed; skipping task dispatch to retry next cycle" in e["event"]
-        for e in runner.state.history
+        "Pending upload failed; skipping task dispatch to retry next cycle" in e["event"] for e in runner.state.history
     )
 
 
@@ -1393,10 +1324,7 @@ def test_handle_idle_sets_error_when_sync_after_upload_fails(
     assert sync_calls["count"] == 2
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message == "sync_to_main after upload failed: resync broke"
-    assert any(
-        "sync_to_main after upload failed: resync broke" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("sync_to_main after upload failed: resync broke" in e["event"] for e in runner.state.history)
 
 
 def test_handle_idle_sets_error_when_queue_validation_fails_without_dag_tasks(
@@ -1405,30 +1333,23 @@ def test_handle_idle_sets_error_when_queue_validation_fails_without_dag_tasks(
     h._patch_subprocess(monkeypatch)
     runner = h._make_runner()
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
     monkeypatch.setattr(
         idle_module,
         "parse_queue",
-        lambda path, **kw: (_ for _ in ()).throw(
-            QueueValidationError(["tasks/QUEUE.md: malformed status"])
-        ),
+        lambda path, **kw: (_ for _ in ()).throw(QueueValidationError(["tasks/QUEUE.md: malformed status"])),
     )
 
     asyncio.run(runner.handle_idle())
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.error_message == (
-        "Queue validation failed:\n"
-        "  - tasks/QUEUE.md: malformed status"
-    )
+    assert runner.state.error_message == ("Queue validation failed:\n  - tasks/QUEUE.md: malformed status")
     assert any("Queue validation failed:" in e["event"] for e in runner.state.history)
     assert any("tasks/QUEUE.md: malformed status" in e["event"] for e in runner.state.history)
 
@@ -1454,18 +1375,15 @@ def test_handle_idle_preserves_fix_iteration_count_when_reattaching_same_pr(
         review_status=ReviewStatus.CHANGES_REQUESTED,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [reattached_pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, number: {"head_commit_date": "2026-04-21T00:48:54Z"},
     )
 
@@ -1506,12 +1424,8 @@ def test_handle_idle_no_tasks_but_open_pr_sets_current_pr(
         ci_status=CIStatus.SUCCESS,
         review_status=ReviewStatus.PENDING,
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [open_pr]
-    )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [open_pr])
+    monkeypatch.setattr("src.github.prs.get_merged_prs", lambda repo, branch, refresh=False: [])
 
     runner = h._make_runner()
     asyncio.run(runner.handle_idle())
@@ -1528,12 +1442,8 @@ def test_handle_idle_no_tasks_no_open_prs_clears_current_pr(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_merged_prs", lambda repo, branch, refresh=False: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
+    monkeypatch.setattr("src.github.prs.get_merged_prs", lambda repo, branch, refresh=False: [])
 
     runner = h._make_runner()
     # Set a stale current_pr to verify it gets cleared.
@@ -1551,13 +1461,11 @@ def test_handle_idle_new_open_pr_resets_fix_iteration_count(
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [PRInfo(number=42, branch="fresh-branch")],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -1583,9 +1491,7 @@ def test_handle_idle_no_tasks_does_not_change_state_from_idle(
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
 
     open_pr = PRInfo(number=7, branch="feature-x")
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [open_pr]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [open_pr])
 
     runner = h._make_runner()
     assert runner.state.state == PipelineState.IDLE
@@ -1602,8 +1508,7 @@ def test_handle_idle_open_pr_check_survives_github_failure(
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: (_ for _ in ()).throw(RuntimeError("API down")),
     )
 
@@ -1632,22 +1537,18 @@ def test_handle_idle_falls_back_when_merged_pr_check_fails(
     )
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: (_ for _ in ()).throw(RuntimeError("API down")),
     )
     derived_calls: list[list[PRInfo]] = []
     monkeypatch.setattr(
         idle_module,
         "derive_queue_task_statuses",
-        lambda tasks, repo_path, base_branch, prs, merged_prs=(): (
-            derived_calls.append(list(merged_prs)) or tasks
-        ),
+        lambda tasks, repo_path, base_branch, prs, merged_prs=(): (derived_calls.append(list(merged_prs)) or tasks),
     )
     coding_called = {"v": False}
 
@@ -1683,13 +1584,11 @@ def test_handle_idle_silences_merged_pr_http_304_failures(
     )
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: (_ for _ in ()).throw(
             RuntimeError("gh api repos/owner/name/pulls failed (exit 1): HTTP 304")
         ),
@@ -1707,13 +1606,8 @@ def test_handle_idle_silences_merged_pr_http_304_failures(
     runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
     asyncio.run(runner.handle_idle())
 
-    assert not any(
-        "merged PR check failed" in e["event"] for e in runner.state.history
-    )
-    assert not any(
-        "merged-PR detection degraded" in e["event"]
-        for e in runner.state.history
-    )
+    assert not any("merged PR check failed" in e["event"] for e in runner.state.history)
+    assert not any("merged-PR detection degraded" in e["event"] for e in runner.state.history)
     assert runner._idle_merged_pr_304_streak == 1
 
 
@@ -1732,13 +1626,11 @@ def test_handle_idle_warns_when_merged_pr_http_304_streak_persists(
     )
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: (_ for _ in ()).throw(
             RuntimeError("gh api repos/owner/name/pulls failed (exit 1): HTTP 304")
         ),
@@ -1754,21 +1646,12 @@ def test_handle_idle_warns_when_merged_pr_http_304_streak_persists(
 
     runner = h._make_runner()
     runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
-    runner._idle_merged_pr_304_streak = (
-        idle_module._IDLE_MERGED_PR_304_WARN_AT - 1
-    )
+    runner._idle_merged_pr_304_streak = idle_module._IDLE_MERGED_PR_304_WARN_AT - 1
     asyncio.run(runner.handle_idle())
 
-    assert any(
-        "merged-PR detection degraded" in e["event"]
-        for e in runner.state.history
-    )
-    assert not any(
-        "merged PR check failed" in e["event"] for e in runner.state.history
-    )
-    assert runner._idle_merged_pr_304_streak == (
-        idle_module._IDLE_MERGED_PR_304_WARN_AT
-    )
+    assert any("merged-PR detection degraded" in e["event"] for e in runner.state.history)
+    assert not any("merged PR check failed" in e["event"] for e in runner.state.history)
+    assert runner._idle_merged_pr_304_streak == (idle_module._IDLE_MERGED_PR_304_WARN_AT)
 
 
 def test_handle_idle_does_not_rewarn_before_full_cadence_after_threshold(
@@ -1786,13 +1669,11 @@ def test_handle_idle_does_not_rewarn_before_full_cadence_after_threshold(
     )
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: (_ for _ in ()).throw(
             RuntimeError("gh api repos/owner/name/pulls failed (exit 1): HTTP 304")
         ),
@@ -1810,18 +1691,11 @@ def test_handle_idle_does_not_rewarn_before_full_cadence_after_threshold(
     runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
     # Streak about to land on a multiple of WARN_EVERY (e.g. 50) but still
     # short of WARN_AT + WARN_EVERY (e.g. 60). Pre-fix this would re-warn.
-    runner._idle_merged_pr_304_streak = (
-        idle_module._IDLE_MERGED_PR_304_WARN_EVERY - 1
-    )
+    runner._idle_merged_pr_304_streak = idle_module._IDLE_MERGED_PR_304_WARN_EVERY - 1
     asyncio.run(runner.handle_idle())
 
-    assert runner._idle_merged_pr_304_streak == (
-        idle_module._IDLE_MERGED_PR_304_WARN_EVERY
-    )
-    assert not any(
-        "merged-PR detection degraded" in e["event"]
-        for e in runner.state.history
-    )
+    assert runner._idle_merged_pr_304_streak == (idle_module._IDLE_MERGED_PR_304_WARN_EVERY)
+    assert not any("merged-PR detection degraded" in e["event"] for e in runner.state.history)
 
 
 def test_handle_idle_rewarns_after_full_cadence_past_threshold(
@@ -1839,13 +1713,11 @@ def test_handle_idle_rewarns_after_full_cadence_past_threshold(
     )
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: (_ for _ in ()).throw(
             RuntimeError("gh api repos/owner/name/pulls failed (exit 1): HTTP 304")
         ),
@@ -1862,20 +1734,14 @@ def test_handle_idle_rewarns_after_full_cadence_past_threshold(
     runner = h._make_runner()
     runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
     runner._idle_merged_pr_304_streak = (
-        idle_module._IDLE_MERGED_PR_304_WARN_AT
-        + idle_module._IDLE_MERGED_PR_304_WARN_EVERY
-        - 1
+        idle_module._IDLE_MERGED_PR_304_WARN_AT + idle_module._IDLE_MERGED_PR_304_WARN_EVERY - 1
     )
     asyncio.run(runner.handle_idle())
 
     assert runner._idle_merged_pr_304_streak == (
-        idle_module._IDLE_MERGED_PR_304_WARN_AT
-        + idle_module._IDLE_MERGED_PR_304_WARN_EVERY
+        idle_module._IDLE_MERGED_PR_304_WARN_AT + idle_module._IDLE_MERGED_PR_304_WARN_EVERY
     )
-    assert any(
-        "merged-PR detection degraded" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("merged-PR detection degraded" in e["event"] for e in runner.state.history)
 
 
 def test_handle_idle_resets_merged_pr_http_304_streak_on_success(
@@ -1892,13 +1758,11 @@ def test_handle_idle_resets_merged_pr_http_304_streak_on_success(
     )
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
     monkeypatch.setattr(
@@ -1933,16 +1797,12 @@ def test_handle_idle_resets_merged_pr_http_304_streak_on_non_304_failure(
     )
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
-        lambda repo, branch, refresh=False: (_ for _ in ()).throw(
-            RuntimeError("API down")
-        ),
+        "src.github.prs.get_merged_prs",
+        lambda repo, branch, refresh=False: (_ for _ in ()).throw(RuntimeError("API down")),
     )
     monkeypatch.setattr(
         idle_module,
@@ -1959,9 +1819,7 @@ def test_handle_idle_resets_merged_pr_http_304_streak_on_non_304_failure(
     asyncio.run(runner.handle_idle())
 
     assert runner._idle_merged_pr_304_streak == 0
-    assert any(
-        "merged PR check failed" in e["event"] for e in runner.state.history
-    )
+    assert any("merged PR check failed" in e["event"] for e in runner.state.history)
 
 
 def test_handle_idle_resets_merged_pr_http_304_streak_when_check_skipped(
@@ -1976,8 +1834,7 @@ def test_handle_idle_resets_merged_pr_http_304_streak_when_check_skipped(
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: (_ for _ in ()).throw(RuntimeError("API down")),
     )
     merged_calls = {"n": 0}
@@ -1987,8 +1844,7 @@ def test_handle_idle_resets_merged_pr_http_304_streak_when_check_skipped(
         raise AssertionError("get_merged_prs must not run when get_open_prs failed")
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         fail_get_merged_prs,
     )
 
@@ -1998,10 +1854,7 @@ def test_handle_idle_resets_merged_pr_http_304_streak_when_check_skipped(
 
     assert merged_calls["n"] == 0
     assert runner._idle_merged_pr_304_streak == 0
-    assert not any(
-        "merged-PR detection degraded" in e["event"]
-        for e in runner.state.history
-    )
+    assert not any("merged-PR detection degraded" in e["event"] for e in runner.state.history)
 
 
 def test_handle_idle_resets_merged_pr_http_304_streak_on_pending_queue_sync(
@@ -2017,13 +1870,10 @@ def test_handle_idle_resets_merged_pr_http_304_streak_on_pending_queue_sync(
         return False
 
     def fail_get_merged_prs(repo, branch, refresh=False):
-        raise AssertionError(
-            "get_merged_prs must not run when pending queue sync is unresolved"
-        )
+        raise AssertionError("get_merged_prs must not run when pending queue sync is unresolved")
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         fail_get_merged_prs,
     )
 
@@ -2035,10 +1885,7 @@ def test_handle_idle_resets_merged_pr_http_304_streak_on_pending_queue_sync(
     asyncio.run(runner.handle_idle())
 
     assert runner._idle_merged_pr_304_streak == 0
-    assert not any(
-        "merged-PR detection degraded" in e["event"]
-        for e in runner.state.history
-    )
+    assert not any("merged-PR detection degraded" in e["event"] for e in runner.state.history)
 
 
 def test_handle_idle_uses_fallback_queue_counters_when_dag_picks_nothing(
@@ -2085,13 +1932,11 @@ def test_handle_idle_uses_fallback_queue_counters_when_dag_picks_nothing(
     )
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: fallback_task)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -2129,19 +1974,15 @@ def test_handle_idle_keeps_dag_task_when_queue_validation_fails(
         idle_module,
         "parse_queue",
         lambda path, **kw: (_ for _ in ()).throw(
-            idle_module.QueueValidationError(
-                ["Queue validation failed:\n- malformed queue"]
-            )
+            idle_module.QueueValidationError(["Queue validation failed:\n- malformed queue"])
         ),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -2161,10 +2002,7 @@ def test_handle_idle_keeps_dag_task_when_queue_validation_fails(
     assert runner.state.error_message is None
     assert runner.state.queue_done == 0
     assert runner.state.queue_total == 1
-    assert any(
-        "Queue validation failed after DAG selection" in entry["event"]
-        for entry in runner.state.history
-    )
+    assert any("Queue validation failed after DAG selection" in entry["event"] for entry in runner.state.history)
 
 
 def test_handle_idle_keeps_dag_state_when_queue_status_derivation_fails(
@@ -2199,19 +2037,15 @@ def test_handle_idle_keeps_dag_state_when_queue_status_derivation_fails(
         idle_module,
         "derive_queue_task_statuses",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            idle_module.QueueValidationError(
-                ["tasks/QUEUE.md: PR-123 does not match task file"]
-            )
+            idle_module.QueueValidationError(["tasks/QUEUE.md: PR-123 does not match task file"])
         ),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -2231,10 +2065,7 @@ def test_handle_idle_keeps_dag_state_when_queue_status_derivation_fails(
     assert runner.state.error_message is None
     assert runner.state.queue_done == 0
     assert runner.state.queue_total == 1
-    assert any(
-        "Task status derivation failed after DAG selection" in entry["event"]
-        for entry in runner.state.history
-    )
+    assert any("Task status derivation failed after DAG selection" in entry["event"] for entry in runner.state.history)
 
 
 def test_handle_idle_keeps_dag_metrics_when_derivation_fails_with_visible_legacy_rows(
@@ -2270,19 +2101,15 @@ def test_handle_idle_keeps_dag_metrics_when_derivation_fails_with_visible_legacy
         idle_module,
         "derive_queue_task_statuses",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            idle_module.QueueValidationError(
-                ["tasks/QUEUE.md: PR-123 does not match task file"]
-            )
+            idle_module.QueueValidationError(["tasks/QUEUE.md: PR-123 does not match task file"])
         ),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -2329,19 +2156,15 @@ def test_handle_idle_keeps_dag_state_when_queue_validation_fails_without_dag_pic
         idle_module,
         "parse_queue",
         lambda path, **kw: (_ for _ in ()).throw(
-            idle_module.QueueValidationError(
-                ["Queue validation failed:\n- malformed queue"]
-            )
+            idle_module.QueueValidationError(["Queue validation failed:\n- malformed queue"])
         ),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -2353,10 +2176,7 @@ def test_handle_idle_keeps_dag_state_when_queue_validation_fails_without_dag_pic
     assert runner.state.current_task is None
     assert runner.state.queue_done == 1
     assert runner.state.queue_total == 1
-    assert any(
-        "Queue validation failed after DAG selection" in entry["event"]
-        for entry in runner.state.history
-    )
+    assert any("Queue validation failed after DAG selection" in entry["event"] for entry in runner.state.history)
 
 
 def test_handle_idle_keeps_doing_dag_task_over_legacy_queue_fallback(
@@ -2392,13 +2212,11 @@ def test_handle_idle_keeps_doing_dag_task_over_legacy_queue_fallback(
     )
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: legacy_queue_task)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -2458,13 +2276,11 @@ def test_handle_idle_marks_freshly_picked_dag_task_as_doing_in_regenerated_queue
     )
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: dag_task)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -2550,13 +2366,11 @@ def test_handle_idle_skips_queue_regeneration_when_legacy_tasks_exist(
     )
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: legacy_queue_task)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -2587,9 +2401,7 @@ def test_handle_idle_skips_queue_regeneration_when_legacy_tasks_exist(
     # legitimately overwrite it.
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
-    (tasks_dir / "PR-001.md").write_text(
-        "# PR-001: Legacy queue task\n", encoding="utf-8"
-    )
+    (tasks_dir / "PR-001.md").write_text("# PR-001: Legacy queue task\n", encoding="utf-8")
     runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
     asyncio.run(runner.handle_idle())
 
@@ -2630,18 +2442,14 @@ def test_handle_idle_skips_queue_regeneration_when_legacy_check_fails_with_visib
     monkeypatch.setattr(
         idle_module,
         "parse_queue",
-        lambda path, **kw: (_ for _ in ()).throw(
-            idle_module.QueueValidationError(["Queue validation failed"])
-        ),
+        lambda path, **kw: (_ for _ in ()).throw(idle_module.QueueValidationError(["Queue validation failed"])),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -2711,18 +2519,14 @@ def test_handle_idle_skips_queue_regeneration_when_visible_legacy_row_is_malform
     monkeypatch.setattr(
         idle_module,
         "parse_queue",
-        lambda path, **kw: (_ for _ in ()).throw(
-            idle_module.QueueValidationError(["Queue validation failed"])
-        ),
+        lambda path, **kw: (_ for _ in ()).throw(idle_module.QueueValidationError(["Queue validation failed"])),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -2796,13 +2600,11 @@ def test_handle_idle_skips_queue_regeneration_when_successful_parse_still_has_vi
         lambda path, **kw: [dag_task],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
     monkeypatch.setattr(
@@ -2889,18 +2691,14 @@ def test_handle_idle_regenerates_queue_when_validation_fails_without_visible_leg
     monkeypatch.setattr(
         idle_module,
         "parse_queue",
-        lambda path, **kw: (_ for _ in ()).throw(
-            idle_module.QueueValidationError(["Queue validation failed"])
-        ),
+        lambda path, **kw: (_ for _ in ()).throw(idle_module.QueueValidationError(["Queue validation failed"])),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -2975,13 +2773,11 @@ def test_handle_idle_stops_when_queue_regeneration_fails(
     )
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -3049,13 +2845,11 @@ def test_handle_idle_does_not_promote_structured_queue_task_when_dag_blocks_it(
     )
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: queue_task)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -3083,8 +2877,7 @@ def test_handle_idle_uses_cached_merged_prs_for_status_derivation(
     )
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     refresh_calls: list[bool] = []
@@ -3098,8 +2891,7 @@ def test_handle_idle_uses_cached_merged_prs_for_status_derivation(
         return []
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         fake_get_merged_prs,
     )
     monkeypatch.setattr(
@@ -3141,8 +2933,7 @@ def test_handle_idle_marks_dispatch_deferred_on_open_prs_failure(
     """A ``get_open_prs`` exception leaves queue/PR status unknown: skip the streak."""
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: (_ for _ in ()).throw(RuntimeError("API down")),
     )
 
@@ -3164,8 +2955,7 @@ def test_idle_uses_cached_merged_prs(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
 
@@ -3176,8 +2966,7 @@ def test_idle_uses_cached_merged_prs(monkeypatch: pytest.MonkeyPatch) -> None:
         return []
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         fake_get_merged_prs,
     )
 
@@ -3204,8 +2993,7 @@ def test_idle_refreshes_merged_prs_when_open_pr_snapshot_changes(
         return open_pr_cycles.pop(0)
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         fake_get_open_prs,
     )
     refresh_calls: list[bool] = []
@@ -3220,8 +3008,7 @@ def test_idle_refreshes_merged_prs_when_open_pr_snapshot_changes(
         return []
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         fake_get_merged_prs,
     )
 
@@ -3254,11 +3041,7 @@ def test_select_next_task_from_dag_prefers_doing_task(
         encoding="utf-8",
     )
     (tasks_dir / "PR-002.md").write_text(
-        "# PR-002: Fresh task\n\n"
-        "Branch: pr-002-fresh\n"
-        "- Type: feature\n"
-        "- Complexity: low\n"
-        "- Depends on: none\n",
+        "# PR-002: Fresh task\n\nBranch: pr-002-fresh\n- Type: feature\n- Complexity: low\n- Depends on: none\n",
         encoding="utf-8",
     )
 
@@ -3267,9 +3050,7 @@ def test_select_next_task_from_dag_prefers_doing_task(
         idle_module,
         "derive_task_status",
         lambda header, merged_pr_ids, open_prs, merged_prs, **kwargs: (
-            TaskStatus.DOING
-            if header.pr_id == "PR-001"
-            else TaskStatus.TODO
+            TaskStatus.DOING if header.pr_id == "PR-001" else TaskStatus.TODO
         ),
     )
 
@@ -3507,11 +3288,7 @@ def test_select_next_task_from_dag_rejects_header_filename_mismatch(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
-        "# PR-999: Wrong task\n\n"
-        "Branch: pr-999-wrong-task\n"
-        "- Type: feature\n"
-        "- Complexity: low\n"
-        "- Depends on: none\n",
+        "# PR-999: Wrong task\n\nBranch: pr-999-wrong-task\n- Type: feature\n- Complexity: low\n- Depends on: none\n",
         encoding="utf-8",
     )
 
@@ -3567,9 +3344,11 @@ def test_init_migrates_legacy_clone_when_origin_matches(
     finally:
         with contextlib.suppress(FileNotFoundError):
             import shutil
+
             shutil.rmtree(new_path)
         with contextlib.suppress(FileNotFoundError):
             import shutil
+
             shutil.rmtree(old_path)
 
 
@@ -3600,9 +3379,11 @@ def test_init_skips_legacy_clone_migration_when_origin_mismatches(
     finally:
         with contextlib.suppress(FileNotFoundError):
             import shutil
+
             shutil.rmtree(new_path)
         with contextlib.suppress(FileNotFoundError):
             import shutil
+
             shutil.rmtree(old_path)
 
 
@@ -3633,9 +3414,11 @@ def test_init_skips_legacy_clone_migration_when_origin_probe_fails(
     finally:
         with contextlib.suppress(FileNotFoundError):
             import shutil
+
             shutil.rmtree(new_path)
         with contextlib.suppress(FileNotFoundError):
             import shutil
+
             shutil.rmtree(old_path)
 
 
@@ -3660,6 +3443,7 @@ def test_init_removes_non_git_directory_at_new_clone_path(
     finally:
         with contextlib.suppress(FileNotFoundError):
             import shutil
+
             shutil.rmtree(new_path)
 
 
@@ -3688,6 +3472,7 @@ def test_init_removes_stale_clone_when_origin_mismatches(
     finally:
         with contextlib.suppress(FileNotFoundError):
             import shutil
+
             shutil.rmtree(new_path)
 
 
@@ -3716,6 +3501,7 @@ def test_init_logs_when_new_clone_origin_probe_fails(
     finally:
         with contextlib.suppress(FileNotFoundError):
             import shutil
+
             shutil.rmtree(new_path)
 
 
@@ -3728,16 +3514,11 @@ def test_mark_queue_done_writes_updated_queue_to_disk(tmp_path: Path) -> None:
     queue_dir = tmp_path / "tasks"
     queue_dir.mkdir()
     queue_path = queue_dir / "QUEUE.md"
-    queue_path.write_text(
-        "## PR-001: first\n- Status: DOING\n\n"
-        "## PR-002: second\n- Status: TODO\n"
-    )
+    queue_path.write_text("## PR-001: first\n- Status: DOING\n\n## PR-002: second\n- Status: TODO\n")
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="first", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="first", status=TaskStatus.DOING)
 
     runner._mark_queue_done()
 
@@ -3749,9 +3530,7 @@ def test_mark_queue_done_writes_updated_queue_to_disk(tmp_path: Path) -> None:
     assert runner.state.pending_queue_sync_started_at is None
 
 
-def test_mark_queue_done_skips_when_origin_queue_md_tracked(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_mark_queue_done_skips_when_origin_queue_md_tracked(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Legacy repos that still track ``tasks/QUEUE.md`` on origin must
     not have the local file rewritten — an unstaged rewrite would
     dirty the working tree, push the next-cycle preflight to ERROR,
@@ -3760,17 +3539,12 @@ def test_mark_queue_done_skips_when_origin_queue_md_tracked(
     queue_dir = tmp_path / "tasks"
     queue_dir.mkdir()
     queue_path = queue_dir / "QUEUE.md"
-    original = (
-        "## PR-001: first\n- Status: DOING\n\n"
-        "## PR-002: second\n- Status: TODO\n"
-    )
+    original = "## PR-001: first\n- Status: DOING\n\n## PR-002: second\n- Status: TODO\n"
     queue_path.write_text(original)
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="first", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="first", status=TaskStatus.DOING)
     monkeypatch.setattr(
         runner_module.PipelineRunner,
         "_origin_queue_md_tracked",
@@ -3793,17 +3567,12 @@ def test_mark_queue_done_skips_when_tracking_probe_indeterminate(
     queue_dir = tmp_path / "tasks"
     queue_dir.mkdir()
     queue_path = queue_dir / "QUEUE.md"
-    original = (
-        "## PR-001: first\n- Status: DOING\n\n"
-        "## PR-002: second\n- Status: TODO\n"
-    )
+    original = "## PR-001: first\n- Status: DOING\n\n## PR-002: second\n- Status: TODO\n"
     queue_path.write_text(original)
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="first", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="first", status=TaskStatus.DOING)
     monkeypatch.setattr(
         runner_module.PipelineRunner,
         "_origin_queue_md_tracked",
@@ -3827,9 +3596,7 @@ def test_mark_queue_done_no_op_when_queue_missing(tmp_path: Path) -> None:
     """A missing local QUEUE.md is a no-op — nothing to update."""
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="first", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="first", status=TaskStatus.DOING)
 
     runner._mark_queue_done()
 
@@ -3848,18 +3615,14 @@ def test_mark_queue_done_no_op_when_pr_id_not_in_queue(tmp_path: Path) -> None:
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="first", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="first", status=TaskStatus.DOING)
 
     runner._mark_queue_done()
 
     assert queue_path.read_text() == original
 
 
-def test_mark_queue_done_logs_warning_on_read_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_mark_queue_done_logs_warning_on_read_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     queue_dir = tmp_path / "tasks"
     queue_dir.mkdir()
     queue_path = queue_dir / "QUEUE.md"
@@ -3872,9 +3635,7 @@ def test_mark_queue_done_logs_warning_on_read_failure(
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="first", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="first", status=TaskStatus.DOING)
     events: list[str] = []
     monkeypatch.setattr(runner, "log_event", events.append)
 
@@ -3883,9 +3644,7 @@ def test_mark_queue_done_logs_warning_on_read_failure(
     assert any("read QUEUE.md to mark PR-001 DONE failed" in e for e in events)
 
 
-def test_mark_queue_done_logs_warning_on_write_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_mark_queue_done_logs_warning_on_write_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     queue_dir = tmp_path / "tasks"
     queue_dir.mkdir()
     queue_path = queue_dir / "QUEUE.md"
@@ -3898,9 +3657,7 @@ def test_mark_queue_done_logs_warning_on_write_failure(
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="first", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="first", status=TaskStatus.DOING)
     events: list[str] = []
     monkeypatch.setattr(runner, "log_event", events.append)
 
@@ -3920,8 +3677,7 @@ def test_resolve_pending_queue_sync_continues_when_pr_open(
 ) -> None:
     escalations: list[str] = []
     monkeypatch.setattr(
-        runner_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda cmd, **kwargs: {"state": "open", "mergedAt": None},
     )
 
@@ -3947,8 +3703,7 @@ def test_resolve_pending_queue_sync_clears_state_when_pr_merged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        runner_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda cmd, **kwargs: {
             "state": "merged",
             "mergedAt": "2026-04-19T18:00:00Z",
@@ -3971,8 +3726,7 @@ def test_resolve_pending_queue_sync_clears_state_when_pr_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        runner_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda cmd, **kwargs: {"state": "closed", "mergedAt": None},
     )
 
@@ -3986,9 +3740,7 @@ def test_resolve_pending_queue_sync_clears_state_when_pr_closed(
     assert runner.state.pending_queue_sync_branch is None
     assert runner.state.pending_queue_sync_started_at is None
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.error_message == (
-        "queue-sync PR queue-done-pr-001 closed without merging"
-    )
+    assert runner.state.error_message == ("queue-sync PR queue-done-pr-001 closed without merging")
     assert events == [f"[MERGE] {runner.state.error_message}."]
 
 
@@ -3997,8 +3749,7 @@ def test_resolve_pending_queue_sync_handles_missing_pr(
 ) -> None:
     escalations: list[str] = []
     monkeypatch.setattr(
-        runner_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda cmd, **kwargs: None,
     )
 
@@ -4027,7 +3778,7 @@ def test_resolve_pending_queue_sync_logs_and_escalates_on_view_failure(
     def fail_run_gh(cmd: list[str], **kwargs: Any) -> None:
         raise RuntimeError("gh unavailable")
 
-    monkeypatch.setattr(runner_module.github_client, "run_gh", fail_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fail_run_gh)
 
     runner = h._make_runner()
     runner.state.pending_queue_sync_branch = "queue-done-pr-001"
@@ -4044,9 +3795,7 @@ def test_resolve_pending_queue_sync_logs_and_escalates_on_view_failure(
     )
 
     assert asyncio.run(runner._resolve_pending_queue_sync()) is False
-    assert events == [
-        "[MERGE] queue-sync PR queue-done-pr-001 view failed: gh unavailable."
-    ]
+    assert events == ["[MERGE] queue-sync PR queue-done-pr-001 view failed: gh unavailable."]
     assert escalations == ["queue-done-pr-001"]
 
 
@@ -4064,9 +3813,7 @@ def test_escalate_queue_sync_no_op_when_started_at_missing() -> None:
 def test_escalate_queue_sync_no_op_when_not_expired() -> None:
     runner = h._make_runner()
     runner.state.pending_queue_sync_branch = "queue-done-pr-001"
-    runner.state.pending_queue_sync_started_at = (
-        datetime.now(timezone.utc) - timedelta(minutes=5)
-    )
+    runner.state.pending_queue_sync_started_at = datetime.now(timezone.utc) - timedelta(minutes=5)
 
     asyncio.run(runner._escalate_queue_sync_if_expired("queue-done-pr-001"))
 
@@ -4100,9 +3847,7 @@ def test_ensure_repo_cloned_retries_scaffold_after_transient_failure(
             raise RuntimeError("simulated push timeout")
         return ["AGENTS.md", "tasks/QUEUE.md"]
 
-    monkeypatch.setattr(
-        runner_module.scaffolder, "scaffold_repo", fake_scaffold
-    )
+    monkeypatch.setattr(runner_module.scaffolder, "scaffold_repo", fake_scaffold)
 
     runner = h._make_runner()
     # Point repo_path at a non-existent directory so ensure_repo_cloned
@@ -4122,9 +3867,7 @@ def test_ensure_repo_cloned_retries_scaffold_after_transient_failure(
     asyncio.run(runner.ensure_repo_cloned())
     assert runner._scaffolded is True
     assert scaffold_calls == ["main", "main"]
-    assert any(
-        "scaffold_repo created" in e["event"] for e in runner.state.history
-    )
+    assert any("scaffold_repo created" in e["event"] for e in runner.state.history)
 
     # Cycle 3: scaffold_repo is NOT called again — _scaffolded gates
     # the entire retry loop.
@@ -4164,9 +3907,7 @@ def test_ensure_repo_cloned_tolerates_fetch_failure_before_first_scaffold(
         scaffold_calls.append(branch)
         return ["AGENTS.md"]
 
-    monkeypatch.setattr(
-        runner_module.scaffolder, "scaffold_repo", fake_scaffold
-    )
+    monkeypatch.setattr(runner_module.scaffolder, "scaffold_repo", fake_scaffold)
 
     runner = h._make_runner()
     runner.repo_path = str(existing)
@@ -4183,10 +3924,7 @@ def test_ensure_repo_cloned_tolerates_fetch_failure_before_first_scaffold(
     assert runner._scaffolded is True
     # The tolerated fetch failure leaves a breadcrumb in history so
     # the operator can see what happened.
-    assert any(
-        "will retry scaffold" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("will retry scaffold" in e["event"] for e in runner.state.history)
 
 
 def test_ensure_repo_cloned_raises_non_missing_ref_fetch_failure(
@@ -4208,10 +3946,7 @@ def test_ensure_repo_cloned_raises_non_missing_ref_fetch_failure(
             raise subprocess.CalledProcessError(
                 128,
                 cmd,
-                stderr=(
-                    "fatal: Authentication failed for "
-                    "'https://github.com/octo/demo.git'"
-                ),
+                stderr=("fatal: Authentication failed for 'https://github.com/octo/demo.git'"),
             )
         return h._FakeCompletedProcess(args=cmd, returncode=0)
 
@@ -4254,9 +3989,7 @@ def test_ensure_repo_cloned_skips_scaffold_when_repo_already_looks_scaffolded(
         # repo is fully in sync, so _base_branch_ahead_of_origin
         # returns False and no scaffold retry is triggered.
         if cmd[:2] == ["git", "rev-list"]:
-            return h._FakeCompletedProcess(
-                args=cmd, returncode=0, stdout="0\n"
-            )
+            return h._FakeCompletedProcess(args=cmd, returncode=0, stdout="0\n")
         return h._FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
@@ -4267,17 +4000,13 @@ def test_ensure_repo_cloned_skips_scaffold_when_repo_already_looks_scaffolded(
         scaffold_calls.append(branch)
         return []
 
-    monkeypatch.setattr(
-        runner_module.scaffolder, "scaffold_repo", fake_scaffold
-    )
+    monkeypatch.setattr(runner_module.scaffolder, "scaffold_repo", fake_scaffold)
 
     runner = h._make_runner()
     runner.repo_path = str(existing)
     # Re-seed the gate using the helper, mirroring what __init__ would
     # have done if ``/data/repos/demo`` were this test-local path.
-    runner._scaffolded = runner_module._repo_looks_scaffolded(
-        str(existing)
-    )
+    runner._scaffolded = runner_module._repo_looks_scaffolded(str(existing))
     assert runner._scaffolded is True
 
     asyncio.run(runner.ensure_repo_cloned())
@@ -4329,9 +4058,7 @@ def test_ensure_repo_cloned_defers_scaffold_when_working_tree_dirty(
         scaffold_calls.append(branch)
         return ["tasks/QUEUE.md"]
 
-    monkeypatch.setattr(
-        runner_module.scaffolder, "scaffold_repo", fake_scaffold
-    )
+    monkeypatch.setattr(runner_module.scaffolder, "scaffold_repo", fake_scaffold)
 
     runner = h._make_runner()
     runner.repo_path = str(existing)
@@ -4348,10 +4075,7 @@ def test_ensure_repo_cloned_defers_scaffold_when_working_tree_dirty(
     assert runner._scaffolded is False
     # A defer breadcrumb is logged so the operator can see why
     # scaffold_repo did not run.
-    assert any(
-        "scaffold_repo deferred" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("scaffold_repo deferred" in e["event"] for e in runner.state.history)
 
 
 def test_repo_looks_scaffolded_rejects_partial_provisioning(
@@ -4378,9 +4102,7 @@ def test_repo_looks_scaffolded_rejects_partial_provisioning(
     assert runner_module._repo_looks_scaffolded(str(base)) is False
 
     # Add the missing review-artifacts script — still missing .gitignore.
-    (base / "scripts" / "make-review-artifacts.sh").write_text(
-        "#!/usr/bin/env bash\n"
-    )
+    (base / "scripts" / "make-review-artifacts.sh").write_text("#!/usr/bin/env bash\n")
     assert runner_module._repo_looks_scaffolded(str(base)) is False
 
     # Add a .gitignore that does NOT mention artifacts/.
@@ -4388,9 +4110,7 @@ def test_repo_looks_scaffolded_rejects_partial_provisioning(
     assert runner_module._repo_looks_scaffolded(str(base)) is False
 
     # Finally append artifacts/ — now fully scaffolded.
-    (base / ".gitignore").write_text(
-        "node_modules/\n*.pyc\nartifacts/\n"
-    )
+    (base / ".gitignore").write_text("node_modules/\n*.pyc\nartifacts/\n")
     assert runner_module._repo_looks_scaffolded(str(base)) is True
 
 
@@ -4419,9 +4139,7 @@ def test_ensure_repo_cloned_resets_scaffolded_when_base_branch_ahead(
         if cmd[:2] == ["git", "rev-list"]:
             # Local base is 1 commit ahead of origin — the stranded
             # scaffolding commit.
-            return h._FakeCompletedProcess(
-                args=cmd, returncode=0, stdout="1\n"
-            )
+            return h._FakeCompletedProcess(args=cmd, returncode=0, stdout="1\n")
         return h._FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
@@ -4432,15 +4150,11 @@ def test_ensure_repo_cloned_resets_scaffolded_when_base_branch_ahead(
         scaffold_calls.append(branch)
         return []
 
-    monkeypatch.setattr(
-        runner_module.scaffolder, "scaffold_repo", fake_scaffold
-    )
+    monkeypatch.setattr(runner_module.scaffolder, "scaffold_repo", fake_scaffold)
 
     runner = h._make_runner()
     runner.repo_path = str(existing)
-    runner._scaffolded = runner_module._repo_looks_scaffolded(
-        str(existing)
-    )
+    runner._scaffolded = runner_module._repo_looks_scaffolded(str(existing))
     assert runner._scaffolded is True
 
     asyncio.run(runner.ensure_repo_cloned())
@@ -4450,10 +4164,7 @@ def test_ensure_repo_cloned_resets_scaffolded_when_base_branch_ahead(
     assert scaffold_calls == ["main"]
     assert runner._scaffolded is True  # set back to True after retry
     # A breadcrumb records why the retry happened.
-    assert any(
-        "ahead of origin" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("ahead of origin" in e["event"] for e in runner.state.history)
 
 
 def test_ensure_repo_cloned_resets_scaffolded_on_probe_timeout(
@@ -4487,15 +4198,11 @@ def test_ensure_repo_cloned_resets_scaffolded_on_probe_timeout(
         scaffold_calls.append(branch)
         return []
 
-    monkeypatch.setattr(
-        runner_module.scaffolder, "scaffold_repo", fake_scaffold
-    )
+    monkeypatch.setattr(runner_module.scaffolder, "scaffold_repo", fake_scaffold)
 
     runner = h._make_runner()
     runner.repo_path = str(existing)
-    runner._scaffolded = runner_module._repo_looks_scaffolded(
-        str(existing)
-    )
+    runner._scaffolded = runner_module._repo_looks_scaffolded(str(existing))
     assert runner._scaffolded is True
 
     # Must NOT raise TimeoutExpired out of ensure_repo_cloned.
@@ -4526,9 +4233,7 @@ def test_ensure_repo_cloned_preserves_scaffolded_when_base_branch_synced(
             return h._FakeCompletedProcess(args=cmd, returncode=0)
         if cmd[:2] == ["git", "rev-list"]:
             # 0 commits ahead — fully synced with origin.
-            return h._FakeCompletedProcess(
-                args=cmd, returncode=0, stdout="0\n"
-            )
+            return h._FakeCompletedProcess(args=cmd, returncode=0, stdout="0\n")
         return h._FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
@@ -4539,15 +4244,11 @@ def test_ensure_repo_cloned_preserves_scaffolded_when_base_branch_synced(
         scaffold_calls.append(branch)
         return []
 
-    monkeypatch.setattr(
-        runner_module.scaffolder, "scaffold_repo", fake_scaffold
-    )
+    monkeypatch.setattr(runner_module.scaffolder, "scaffold_repo", fake_scaffold)
 
     runner = h._make_runner()
     runner.repo_path = str(existing)
-    runner._scaffolded = runner_module._repo_looks_scaffolded(
-        str(existing)
-    )
+    runner._scaffolded = runner_module._repo_looks_scaffolded(str(existing))
     assert runner._scaffolded is True
 
     asyncio.run(runner.ensure_repo_cloned())
@@ -4593,18 +4294,14 @@ def test_ensure_repo_cloned_retries_scaffold_on_missing_ref_after_restart(
         scaffold_calls.append(branch)
         return []
 
-    monkeypatch.setattr(
-        runner_module.scaffolder, "scaffold_repo", fake_scaffold
-    )
+    monkeypatch.setattr(runner_module.scaffolder, "scaffold_repo", fake_scaffold)
 
     runner = h._make_runner()
     runner.repo_path = str(existing)
     # Simulate the post-__init__ state: fs check passed so
     # _scaffolded is seeded True, but fetch will report missing ref
     # and force the retry.
-    runner._scaffolded = runner_module._repo_looks_scaffolded(
-        str(existing)
-    )
+    runner._scaffolded = runner_module._repo_looks_scaffolded(str(existing))
     assert runner._scaffolded is True
 
     asyncio.run(runner.ensure_repo_cloned())
@@ -4718,9 +4415,7 @@ def test_write_generated_queue_md_writes_disk_only(tmp_path: Path) -> None:
     queue_dir = tmp_path / "tasks"
     queue_dir.mkdir()
     queue_path = queue_dir / "QUEUE.md"
-    queue_path.write_text(
-        "# Task Queue\n\n## PR-000: Existing\n", encoding="utf-8"
-    )
+    queue_path.write_text("# Task Queue\n\n## PR-000: Existing\n", encoding="utf-8")
     headers = [
         TaskHeader(
             pr_id="PR-001",
@@ -4857,12 +4552,9 @@ def test_write_generated_queue_md_skips_when_tracked_on_origin(
     # The tracked file on disk is left alone — no dirty modification.
     assert queue_path.read_text(encoding="utf-8") == legacy_text
     # Only the cat-file probe runs; no further git plumbing is invoked.
-    assert git_calls == [
-        ["git", "cat-file", "-e", "origin/main:tasks/QUEUE.md"]
-    ]
+    assert git_calls == [["git", "cat-file", "-e", "origin/main:tasks/QUEUE.md"]]
     assert any(
-        "Skipping QUEUE.md regeneration" in entry["event"]
-        and "tracked on origin/main" in entry["event"]
+        "Skipping QUEUE.md regeneration" in entry["event"] and "tracked on origin/main" in entry["event"]
         for entry in runner.state.history
     )
 
@@ -4924,10 +4616,7 @@ def test_write_generated_queue_md_skips_when_probe_indeterminate(
     assert queue_path.read_text(encoding="utf-8") == existing
     # The "tracked on origin" log line must NOT fire under indeterminate
     # probe results — that message tells operators to untrack the file.
-    assert not any(
-        "Skipping QUEUE.md regeneration" in entry["event"]
-        for entry in runner.state.history
-    )
+    assert not any("Skipping QUEUE.md regeneration" in entry["event"] for entry in runner.state.history)
 
 
 def test_select_next_task_from_dag_returns_none_when_tasks_dir_missing(
@@ -5068,8 +4757,7 @@ def test_select_next_task_from_dag_skips_merged_probe_without_structured_headers
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
-        "# Legacy task without structured metadata\n\n"
-        "Some older task body.\n",
+        "# Legacy task without structured metadata\n\nSome older task body.\n",
         encoding="utf-8",
     )
 
@@ -5228,10 +4916,7 @@ def test_run_cycle_handles_ensure_repo_cloned_runtime_error(
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message == "clone failed"
     assert publishes == ["published"]
-    assert any(
-        "ensure_repo_cloned failed: clone failed" in entry["event"]
-        for entry in runner.state.history
-    )
+    assert any("ensure_repo_cloned failed: clone failed" in entry["event"] for entry in runner.state.history)
 
 
 @pytest.mark.parametrize(
@@ -5315,9 +5000,7 @@ def test_run_cycle_skips_pending_uploads_when_git_probe_fails(
     monkeypatch.setattr(
         git_ops_module,
         "_git",
-        lambda repo_path, *args, **kwargs: (_ for _ in ()).throw(
-            RuntimeError("rev-parse failed")
-        ),
+        lambda repo_path, *args, **kwargs: (_ for _ in ()).throw(RuntimeError("rev-parse failed")),
     )
 
     asyncio.run(runner.run_cycle())

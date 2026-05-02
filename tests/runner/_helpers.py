@@ -22,6 +22,7 @@ from src.daemon import selector as selector_module
 from src.daemon.handlers import error as error_module
 from src.daemon.handlers import idle as idle_module
 from src.daemon.runner import PipelineRunner
+from src.github import gh_runner
 from src.models import (
     CIStatus,
     PipelineState,
@@ -36,15 +37,15 @@ _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG = idle_module.IdleMixin._select_next_task_fr
 def _async_cli_result(*result: object):
     async def _fn(*args: object, **kwargs: object) -> tuple:
         return result
+
     return _fn
 
 
-def _async_cli_result_with_side_effect(
-    collector: list, label: str, *result: object
-):
+def _async_cli_result_with_side_effect(collector: list, label: str, *result: object):
     async def _fn(*args: object, **kwargs: object) -> tuple:
         collector.append(label)
         return result
+
     return _fn
 
 
@@ -52,6 +53,7 @@ def _async_cli_capture_path(collector: list, *result: object):
     async def _fn(path: str, *args: object, **kwargs: object) -> tuple:
         collector.append(path)
         return result
+
     return _fn
 
 
@@ -131,13 +133,13 @@ class _FakeRedis:
         values = self.lists.get(key, [])
         if stop < 0:
             stop = len(values) + stop
-        return values[start:stop + 1]
+        return values[start : stop + 1]
 
     async def ltrim(self, key: str, start: int, stop: int) -> None:
         values = self.lists.get(key, [])
         if stop < 0:
             stop = len(values) + stop
-        self.lists[key] = values[start:stop + 1]
+        self.lists[key] = values[start : stop + 1]
 
     async def publish(self, key: str, value: str) -> int:
         return 1
@@ -254,9 +256,7 @@ def _make_runner(**repo_overrides: Any) -> PipelineRunner:
         "claude": {"status": "ok"},
         "codex": {"status": "ok"},
     }
-    runner._auth_status_cache_expires_at = (
-        datetime.now(timezone.utc) + timedelta(minutes=5)
-    )
+    runner._auth_status_cache_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
     return runner
 
 
@@ -275,40 +275,18 @@ def _patch_subprocess(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         calls.append(cmd)
         if cmd[:2] == ["git", "rev-list"]:
-            return _FakeCompletedProcess(
-                args=cmd, stdout="0\n", returncode=0
-            )
+            return _FakeCompletedProcess(args=cmd, stdout="0\n", returncode=0)
         if cmd[:3] == ["git", "cat-file", "-e"]:
             return _FakeCompletedProcess(args=cmd, returncode=1)
-        if (
-            cmd[:2] == ["git", "merge"]
-            and len(cmd) > 2
-            and cmd[2].startswith("origin/")
-        ):
-            return _FakeCompletedProcess(
-                args=cmd, stdout="Already up to date.\n", returncode=0
-            )
+        if cmd[:2] == ["git", "merge"] and len(cmd) > 2 and cmd[2].startswith("origin/"):
+            return _FakeCompletedProcess(args=cmd, stdout="Already up to date.\n", returncode=0)
         if cmd[:3] == ["git", "rev-parse", "HEAD"]:
             rev_parse_head_calls["n"] += 1
-            sha = (
-                "head-before-abc"
-                if rev_parse_head_calls["n"] == 1
-                else "head-after-def"
-            )
-            return _FakeCompletedProcess(
-                args=cmd, stdout=f"{sha}\n", returncode=0
-            )
-        if (
-            cmd[:2] == ["git", "rev-parse"]
-            and len(cmd) >= 3
-            and cmd[2].startswith("origin/")
-        ):
-            return _FakeCompletedProcess(
-                args=cmd, stdout="head-after-def\n", returncode=0
-            )
-        return _FakeCompletedProcess(
-            args=cmd, stdout=stdout, returncode=returncode
-        )
+            sha = "head-before-abc" if rev_parse_head_calls["n"] == 1 else "head-after-def"
+            return _FakeCompletedProcess(args=cmd, stdout=f"{sha}\n", returncode=0)
+        if cmd[:2] == ["git", "rev-parse"] and len(cmd) >= 3 and cmd[2].startswith("origin/"):
+            return _FakeCompletedProcess(args=cmd, stdout="head-after-def\n", returncode=0)
+        return _FakeCompletedProcess(args=cmd, stdout=stdout, returncode=returncode)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     return calls
@@ -322,12 +300,11 @@ async def _preflight_false_stub() -> bool:
     return False
 
 
-def _preflight_recording_stub(
-    sink: list[str], result: bool = True
-) -> Callable[[], Awaitable[bool]]:
+def _preflight_recording_stub(sink: list[str], result: bool = True) -> Callable[[], Awaitable[bool]]:
     async def _stub() -> bool:
         sink.append("preflight")
         return result
+
     return _stub
 
 
@@ -354,29 +331,21 @@ def _patch_no_push_fix(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         if cmd[:3] == ["git", "rev-parse", "HEAD"]:
-            return _FakeCompletedProcess(
-                args=cmd, stdout=f"{head_seq()}\n", returncode=0
-            )
+            return _FakeCompletedProcess(args=cmd, stdout=f"{head_seq()}\n", returncode=0)
         if cmd[:2] == ["git", "rev-parse"] and "--abbrev-ref" in cmd:
-            return _FakeCompletedProcess(
-                args=cmd, stdout="pr-218\n", returncode=0
-            )
+            return _FakeCompletedProcess(args=cmd, stdout="pr-218\n", returncode=0)
         if cmd[:2] == ["git", "rev-list"]:
             return _FakeCompletedProcess(args=cmd, stdout="0\n", returncode=0)
         return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(claude_cli, "fix_review_async", _async_cli_result(0, "", ""))
     monkeypatch.setattr(
-        claude_cli, "fix_review_async", _async_cli_result(0, "", "")
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: posted.append((repo, number, body)),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda *a, **kw: "",
     )
     return posted
@@ -396,9 +365,7 @@ def _patch_fix_with_stdout(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         if cmd[:2] == ["git", "rev-parse"] and "HEAD" in cmd:
-            return _FakeCompletedProcess(
-                args=cmd, stdout=f"{seq()}\n", returncode=0
-            )
+            return _FakeCompletedProcess(args=cmd, stdout=f"{seq()}\n", returncode=0)
         if cmd[:2] == ["git", "rev-list"]:
             return _FakeCompletedProcess(args=cmd, stdout="0\n", returncode=0)
         return _FakeCompletedProcess(args=cmd, stdout="", returncode=0)
@@ -409,13 +376,11 @@ def _patch_fix_with_stdout(
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: posted.append((repo, number, body)),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda cmd, **kwargs: gh_calls.append(cmd) or "",
     )
     return posted, gh_calls
@@ -472,9 +437,7 @@ def _run_dirty_diagnose(
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "boom"
     if with_pr:
-        runner.state.current_pr = PRInfo(
-            number=119, branch="fix/diagnose-error-commits-fixes"
-        )
+        runner.state.current_pr = PRInfo(number=119, branch="fix/diagnose-error-commits-fixes")
     asyncio.run(runner.handle_error())
     return runner, calls, warnings, review_requests
 
@@ -487,9 +450,7 @@ def _populate_fully_scaffolded_repo(repo: Any) -> None:
     (repo / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
     (repo / "scripts").mkdir()
     (repo / "scripts" / "ci.sh").write_text("#!/usr/bin/env bash\n")
-    (repo / "scripts" / "make-review-artifacts.sh").write_text(
-        "#!/usr/bin/env bash\n"
-    )
+    (repo / "scripts" / "make-review-artifacts.sh").write_text("#!/usr/bin/env bash\n")
     (repo / ".gitignore").write_text("artifacts/\n")
 
 
@@ -498,8 +459,7 @@ def _patch_eyes_reaction_present(
 ) -> None:
     """Stub the EYES-skip pre-push gate to fire (fresh EYES after push)."""
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_get_codex_issue_reactions",
+        "src.github.reactions._get_codex_issue_reactions",
         lambda repo, number: [
             {
                 "content": "eyes",
@@ -509,11 +469,8 @@ def _patch_eyes_reaction_present(
         ],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_last_push_time",
-        lambda repo, number: runner_module.github_client._parse_iso(
-            "2026-04-30T12:00:00Z"
-        ),
+        "src.github.prs.get_pr_last_push_time",
+        lambda repo, number: gh_runner._parse_iso("2026-04-30T12:00:00Z"),
     )
 
 
@@ -522,8 +479,7 @@ def _patch_eyes_reaction_stale(
 ) -> None:
     """Stub a stale EYES reaction (predates push) — gate must NOT skip."""
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_get_codex_issue_reactions",
+        "src.github.reactions._get_codex_issue_reactions",
         lambda repo, number: [
             {
                 "content": "eyes",
@@ -533,11 +489,8 @@ def _patch_eyes_reaction_stale(
         ],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_last_push_time",
-        lambda repo, number: runner_module.github_client._parse_iso(
-            "2026-04-30T12:00:00Z"
-        ),
+        "src.github.prs.get_pr_last_push_time",
+        lambda repo, number: gh_runner._parse_iso("2026-04-30T12:00:00Z"),
     )
 
 

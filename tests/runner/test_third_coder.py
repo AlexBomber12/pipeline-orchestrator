@@ -53,15 +53,11 @@ class FakeCoderPlugin:
         self.fix_review_calls: list[dict[str, Any]] = []
         self.diagnose_calls: list[tuple[str, str, str]] = []
 
-    async def run_planned_pr(
-        self, repo_path: str, **kwargs: Any
-    ) -> tuple[int, str, str]:
+    async def run_planned_pr(self, repo_path: str, **kwargs: Any) -> tuple[int, str, str]:
         self.run_planned_pr_calls.append({"repo_path": repo_path, **kwargs})
         return (0, "fake stdout", "")
 
-    async def fix_review(
-        self, repo_path: str, **kwargs: Any
-    ) -> tuple[int, str, str]:
+    async def fix_review(self, repo_path: str, **kwargs: Any) -> tuple[int, str, str]:
         self.fix_review_calls.append({"repo_path": repo_path, **kwargs})
         return (0, "fake stdout", "")
 
@@ -86,9 +82,7 @@ class FakeCoderPlugin:
     def default_weekly_pause_percent(self) -> int:
         return 100
 
-    async def diagnose_error(
-        self, repo_path: str, context: str, model: str
-    ) -> tuple[int, str, str]:
+    async def diagnose_error(self, repo_path: str, context: str, model: str) -> tuple[int, str, str]:
         self.diagnose_calls.append((repo_path, context, model))
         return (0, "FIX\nfake diagnose", "")
 
@@ -131,13 +125,11 @@ def test_handle_coding_dispatches_to_fake_plugin(
         review_status=ReviewStatus.PENDING,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [opened_pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
 
@@ -187,18 +179,15 @@ def test_handle_fix_dispatches_to_fake_plugin(
     h._patch_subprocess(monkeypatch)
     fake = FakeCoderPlugin()
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_branch_last_push_time",
+        "src.github.prs.get_branch_last_push_time",
         lambda repo, number: None,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_last_push_age_seconds",
+        "src.github.prs.get_last_push_age_seconds",
         lambda repo, number: None,
     )
 
@@ -272,13 +261,11 @@ def test_handle_coding_handler_keys_override_plugin_kwargs(
         review_status=ReviewStatus.PENDING,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [opened_pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
 
@@ -314,18 +301,15 @@ def test_handle_fix_handler_keys_override_plugin_kwargs(
     h._patch_subprocess(monkeypatch)
     fake = _OverridingPlugin()
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_branch_last_push_time",
+        "src.github.prs.get_branch_last_push_time",
         lambda repo, number: None,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_last_push_age_seconds",
+        "src.github.prs.get_last_push_age_seconds",
         lambda repo, number: None,
     )
 
@@ -538,25 +522,28 @@ def test_event_log_includes_coder_identity(
 
     monkeypatch.setattr(codex_cli, "run_planned_pr_async", fake_run_planned_pr)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
-        lambda *a, **kw: [PRInfo(
-            number=42,
-            url="https://github.com/octo/demo/pull/42",
-            branch="pr-001",
-            ci_status=CIStatus.PENDING,
-            review_status=ReviewStatus.PENDING,
-        )],
+        "src.github.prs.get_open_prs",
+        lambda *a, **kw: [
+            PRInfo(
+                number=42,
+                url="https://github.com/octo/demo/pull/42",
+                branch="pr-001",
+                ci_status=CIStatus.PENDING,
+                review_status=ReviewStatus.PENDING,
+            )
+        ],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda *a, **kw: True,
     )
 
     runner = h._make_runner(coder=CoderType.CODEX)
     runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001",
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
     )
     asyncio.run(runner.handle_coding())
 

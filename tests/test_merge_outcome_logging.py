@@ -20,9 +20,7 @@ class _FakeRedis:
         self.store: dict[str, str] = {}
         self.lists: dict[str, list[str]] = {}
 
-    async def set(
-        self, key: str, value: str, ex: int | None = None, nx: bool = False
-    ) -> bool:
+    async def set(self, key: str, value: str, ex: int | None = None, nx: bool = False) -> bool:
         if nx and key in self.store:
             return False
         self.store[key] = value
@@ -55,13 +53,13 @@ class _FakeRedis:
         values = self.lists.get(key, [])
         if stop < 0:
             stop = len(values) + stop
-        return values[start:stop + 1]
+        return values[start : stop + 1]
 
     async def ltrim(self, key: str, start: int, stop: int) -> None:
         values = self.lists.get(key, [])
         if stop < 0:
             stop = len(values) + stop
-        self.lists[key] = values[start:stop + 1]
+        self.lists[key] = values[start : stop + 1]
 
     async def publish(self, key: str, value: str) -> int:
         return 1
@@ -132,17 +130,12 @@ def test_handle_merge_appends_outcome_row(
     isolate_analytics_dir: Path,
 ) -> None:
     _patch_subprocess(monkeypatch)
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
     monkeypatch.setattr(
-        runner_module.github_client, "merge_pr", lambda repo, num: None
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda *a, **kw: {"state": "MERGED"},
     )
-    monkeypatch.setattr(
-        PipelineRunner, "_mark_queue_done", lambda self: None
-    )
+    monkeypatch.setattr(PipelineRunner, "_mark_queue_done", lambda self: None)
     # detect_coder_extension_version: avoid relying on host npm.
     monkeypatch.setattr(
         "src.daemon.handlers.merge.detect_coder_extension_version",
@@ -180,9 +173,7 @@ def test_handle_merge_appends_outcome_row(
 
     assert parsed["pr_id"] == "PR-204"
     assert parsed["repo_slug"] == runner.name
-    assert parsed["task_id_hash"] == compute_task_id_hash(
-        "PR-204", runner.name
-    )
+    assert parsed["task_id_hash"] == compute_task_id_hash("PR-204", runner.name)
     assert parsed["coder"] == "claude"
     assert parsed["coder_model_string"] == "claude-opus-4-7"
     assert parsed["coder_extension_version"] == "0.0.0-test"
@@ -210,30 +201,21 @@ def test_handle_merge_outcome_log_failure_does_not_block_merge(
     isolate_analytics_dir: Path,
 ) -> None:
     _patch_subprocess(monkeypatch)
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
     monkeypatch.setattr(
-        runner_module.github_client, "merge_pr", lambda repo, num: None
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda *a, **kw: {"state": "MERGED"},
     )
-    monkeypatch.setattr(
-        PipelineRunner, "_mark_queue_done", lambda self: None
-    )
+    monkeypatch.setattr(PipelineRunner, "_mark_queue_done", lambda self: None)
 
     def boom(_record: dict) -> None:
         raise RuntimeError("disk full")
 
-    monkeypatch.setattr(
-        "src.daemon.handlers.merge.log_merged_pr", boom
-    )
+    monkeypatch.setattr("src.daemon.handlers.merge.log_merged_pr", boom)
 
     runner = _make_runner()
     runner.state.state = PipelineState.MERGE
-    runner.state.current_pr = PRInfo(
-        number=99, branch="pr-204-y", pr_id="PR-204"
-    )
+    runner.state.current_pr = PRInfo(number=99, branch="pr-204-y", pr_id="PR-204")
     runner.state.current_task = QueueTask(
         pr_id="PR-204",
         title="t",
@@ -264,12 +246,8 @@ def test_build_outcome_record_handles_codex_coder(
     )
 
     runner = _make_runner()
-    runner.repo_config = runner.repo_config.model_copy(
-        update={"coder": CoderType.CODEX}
-    )
-    runner.state.current_pr = PRInfo(
-        number=1, branch="b", pr_id="PR-204", fix_iteration_count=0
-    )
+    runner.repo_config = runner.repo_config.model_copy(update={"coder": CoderType.CODEX})
+    runner.state.current_pr = PRInfo(number=1, branch="b", pr_id="PR-204", fix_iteration_count=0)
     runner.state.current_task = QueueTask(
         pr_id="PR-204",
         title="t",
@@ -280,9 +258,7 @@ def test_build_outcome_record_handles_codex_coder(
 
     from datetime import datetime, timezone
 
-    record = runner._build_outcome_record(
-        datetime(2026, 4, 29, 14, 25, 23, tzinfo=timezone.utc)
-    )
+    record = runner._build_outcome_record(datetime(2026, 4, 29, 14, 25, 23, tzinfo=timezone.utc))
 
     assert record["coder"] == "codex"
     assert record["coder_model_string"] == "gpt-5-codex"
@@ -304,9 +280,7 @@ def test_build_outcome_record_handles_no_run_record_or_pr(
 
     from datetime import datetime, timezone
 
-    record = runner._build_outcome_record(
-        datetime(2026, 4, 29, 14, 25, 23, tzinfo=timezone.utc)
-    )
+    record = runner._build_outcome_record(datetime(2026, 4, 29, 14, 25, 23, tzinfo=timezone.utc))
 
     assert record["pr_id"] == ""
     assert record["fix_iterations"] == 0
@@ -327,16 +301,12 @@ def test_build_outcome_record_falls_back_to_pr_pr_id_when_task_missing(
     )
 
     runner = _make_runner()
-    runner.state.current_pr = PRInfo(
-        number=7, branch="b", pr_id="PR-204", fix_iteration_count=1
-    )
+    runner.state.current_pr = PRInfo(number=7, branch="b", pr_id="PR-204", fix_iteration_count=1)
     # current_task intentionally left as None.
 
     from datetime import datetime, timezone
 
-    record = runner._build_outcome_record(
-        datetime(2026, 4, 29, 14, 25, 23, tzinfo=timezone.utc)
-    )
+    record = runner._build_outcome_record(datetime(2026, 4, 29, 14, 25, 23, tzinfo=timezone.utc))
 
     assert record["pr_id"] == "PR-204"
     assert record["codex_review_iterations"] == 2
@@ -364,19 +334,18 @@ def test_build_outcome_record_uses_run_record_coder_over_config_default(
     # build would mislabel this run.
     assert runner.repo_config.coder == CoderType.CLAUDE
 
-    runner.state.current_pr = PRInfo(
-        number=11, branch="b", pr_id="PR-204", fix_iteration_count=0
-    )
+    runner.state.current_pr = PRInfo(number=11, branch="b", pr_id="PR-204", fix_iteration_count=0)
     runner.state.current_task = QueueTask(
-        pr_id="PR-204", title="t", status=TaskStatus.DOING, branch="b",
+        pr_id="PR-204",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="b",
     )
     runner._start_current_run_record("codex", "gpt-5-codex-2026-05")
 
     from datetime import datetime, timezone
 
-    record = runner._build_outcome_record(
-        datetime(2026, 4, 29, 14, 25, 23, tzinfo=timezone.utc)
-    )
+    record = runner._build_outcome_record(datetime(2026, 4, 29, 14, 25, 23, tzinfo=timezone.utc))
 
     assert record["coder"] == "codex"
     assert record["coder_model_string"] == "gpt-5-codex-2026-05"
@@ -392,16 +361,12 @@ def test_build_outcome_record_falls_back_to_config_when_run_record_missing(
     )
 
     runner = _make_runner()
-    runner.repo_config = runner.repo_config.model_copy(
-        update={"coder": CoderType.CODEX}
-    )
+    runner.repo_config = runner.repo_config.model_copy(update={"coder": CoderType.CODEX})
     # Leave _current_run_record as None.
 
     from datetime import datetime, timezone
 
-    record = runner._build_outcome_record(
-        datetime(2026, 4, 29, 14, 25, 23, tzinfo=timezone.utc)
-    )
+    record = runner._build_outcome_record(datetime(2026, 4, 29, 14, 25, 23, tzinfo=timezone.utc))
 
     assert record["coder"] == "codex"
     assert record["coder_model_string"] == "gpt-5-codex"

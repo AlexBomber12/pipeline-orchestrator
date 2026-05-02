@@ -14,12 +14,15 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src import claude_cli, codex_cli, github_client
+from src import claude_cli, codex_cli
 from src.analytics import log_merged_pr
 from src.analytics.coder_version import detect_coder_extension_version
 from src.branch_context import BranchContext
 from src.config import CoderType
 from src.daemon import git_ops
+from src.github import cache as gh_cache
+from src.github import gh_runner
+from src.github import prs as gh_prs
 from src.models import PipelineState
 from src.queue_parser import mark_task_done
 from src.retry import retry_transient
@@ -177,7 +180,7 @@ class MergeMixin:
                     # the cached ``repos/{repo}/pulls`` pages still hold
                     # the prior ``updated_at`` and ``head.sha`` values,
                     # so drop them now to keep WATCH polling honest.
-                    github_client._invalidate_etag_cache(
+                    gh_cache._invalidate_etag_cache(
                         f"repos/{self.owner_repo}/pulls"
                     )
                     self.state.state = PipelineState.WATCH
@@ -211,7 +214,7 @@ class MergeMixin:
         merged_diff_stats = self._compute_diff_stats(base)
         self.log_event(f"[MERGE] Merging PR #{number}.")
         try:
-            github_client.run_gh(
+            gh_runner.run_gh(
                 ["pr", "ready", str(number)],
                 repo=self.owner_repo,
             )
@@ -223,7 +226,7 @@ class MergeMixin:
                 exc,
             )
         try:
-            github_client.merge_pr(self.owner_repo, number)
+            gh_prs.merge_pr(self.owner_repo, number)
         except Exception as exc:
             await self._transition_to_error(
                 f"merge_pr failed: {exc}",
@@ -418,7 +421,7 @@ class MergeMixin:
             return True
 
         try:
-            result = github_client.run_gh(
+            result = gh_runner.run_gh(
                 ["pr", "view", branch, "--json", "state,mergedAt"],
                 repo=self.owner_repo,
             )

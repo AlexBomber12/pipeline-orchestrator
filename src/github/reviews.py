@@ -2,30 +2,25 @@
 
 Owns the per-PR review status computation that powers the Codex Review
 gate (``ReviewStatus.APPROVED`` / ``EYES`` / ``CHANGES_REQUESTED`` /
-``PENDING``), plus the codex-bot identification helpers shared with the
-not-yet-moved reactions/comments code in ``src.github_client``. Cache and
-paginated GET primitives live in ``src.github_client`` until PR-226b;
-this module accesses them via ``from src import github_client``.
+``PENDING``). Codex-bot identification and reaction helpers live in
+:mod:`src.github.reactions`.
 """
 
 from __future__ import annotations
 
 import logging
-import re
 from datetime import datetime
 
+from src.github import cache
+from src.github import reactions as _reactions
 from src.github.gh_runner import (
     _extract_commit_date,
     _is_http_404_error,
     _parse_iso,
 )
 from src.models import ReviewStatus
-from src.retry import is_transient_error
 
 logger = logging.getLogger(__name__)
-
-CODEX_BOT_LOGIN_PATTERN = re.compile(r"codex", re.IGNORECASE)
-_CODEX_ONBOARDING_TEXT = "create a Codex account and connect to github"
 
 _review_status_cache: dict[str, "ReviewStatus"] = {}
 _review_status_cache_cycle: int | None = None
@@ -51,84 +46,10 @@ def _begin_review_cache_cycle() -> None:
     _review_status_cache_cycle += 1
 
 
-def _is_codex_user(user_dict: dict | None) -> bool:
-    """Return True if the GitHub user object represents a Codex bot."""
-    if not isinstance(user_dict, dict):
-        return False
-    login = user_dict.get("login", "") or ""
-    return bool(CODEX_BOT_LOGIN_PATTERN.search(login))
-
-
-def _is_codex_onboarding_comment(comment: dict) -> bool:
-    """Return True for Codex connector setup guidance, not review feedback."""
-    body = comment.get("body") or ""
-    return _CODEX_ONBOARDING_TEXT.lower() in body.lower()
-
-
-def _is_reaction_content(reaction: dict, content: str) -> bool:
-    """Return True when a reaction matches an exact content from Codex."""
-    if not isinstance(reaction, dict):
-        return False
-    if reaction.get("content") != content:
-        return False
-    return _is_codex_user(reaction.get("user"))
-
-
-def _is_plus_one(reaction: dict) -> bool:
-    """Return True if the reaction is exactly +1 from a Codex user."""
-    return _is_reaction_content(reaction, "+1")
-
-
-def _should_degrade_reactions_error(exc: RuntimeError) -> bool:
-    return _is_http_404_error(exc) or is_transient_error(exc)
-
-
-def _find_codex_plus_one_reaction(reactions: list[dict]) -> dict | None:
-    """Return the most recent +1 reaction from a Codex user, or None."""
-    best: dict | None = None
-    for r in reactions:
-        if not _is_plus_one(r):
-            continue
-        if best is None or (r.get("created_at") or "") > (best.get("created_at") or ""):
-            best = r
-    return best
-
-
-def _get_codex_issue_reactions(repo: str, pr_number: int) -> list[dict]:
-    """Fetch Codex reactions on a PR body."""
-    from src import github_client as _ghc
-
-    try:
-        reactions = _ghc._gh_api_paginated(
-            f"repos/{repo}/issues/{pr_number}/reactions"
-        )
-    except RuntimeError as exc:
-        if _is_http_404_error(exc):
-            return []
-        if not is_transient_error(exc):
-            raise
-        logger.warning(
-            "Reactions fetch degraded for PR %s in %s: %s",
-            pr_number,
-            repo,
-            exc,
-        )
-        return []
-    if not reactions:
-        return []
-    return [
-        r for r in reactions
-        if isinstance(r, dict)
-        and _is_codex_user(r.get("user"))
-    ]
-
-
 def _get_commit_time(repo: str, sha: str) -> datetime | None:
     """Return the committer date of a commit, or None on failure."""
-    from src import github_client as _ghc
-
     try:
-        payload = _ghc._etag_get(f"repos/{repo}/commits/{sha}")
+        payload = cache._etag_get(f"repos/{repo}/commits/{sha}")
     except RuntimeError:
         return None
     return _parse_iso(_extract_commit_date(payload))
@@ -169,16 +90,14 @@ def _compute_review_status(
     head_sha: str,
 ) -> ReviewStatus:
     """Core review status logic, separated for caching."""
-    from src import github_client as _ghc
-
     body_eyes = False
     body_approved = False
     head_commit_time: datetime | None = None
 
     try:
-        codex_reactions = _get_codex_issue_reactions(repo, pr_number)
+        codex_reactions = _reactions._get_codex_issue_reactions(repo, pr_number)
         if codex_reactions:
-            plus_one = _find_codex_plus_one_reaction(codex_reactions)
+            plus_one = _reactions._find_codex_plus_one_reaction(codex_reactions)
             if plus_one is not None:
                 if head_sha:
                     try:
@@ -216,7 +135,7 @@ def _compute_review_status(
                 else:
                     body_approved = True
             if not body_approved and any(
-                _is_reaction_content(reaction, "eyes")
+                _reactions._is_reaction_content(reaction, "eyes")
                 for reaction in codex_reactions
             ):
                 body_eyes = True
@@ -226,13 +145,13 @@ def _compute_review_status(
             raise
 
     try:
-        issue_comments = _ghc._gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
+        issue_comments = cache._gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
     except RuntimeError as exc:
         if not _is_http_404_error(exc):
             raise
         issue_comments = []
     try:
-        review_comments = _ghc._gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments") or []
+        review_comments = cache._gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments") or []
     except RuntimeError as exc:
         if not _is_http_404_error(exc):
             raise
@@ -253,21 +172,21 @@ def _compute_review_status(
         cid = anchor.get("id")
         if cid is not None:
             try:
-                reactions = _ghc._gh_api_paginated(
+                anchor_reactions = cache._gh_api_paginated(
                     f"repos/{repo}/issues/comments/{cid}/reactions"
                 )
-                if reactions:
-                    if any(_is_plus_one(reaction) for reaction in reactions):
+                if anchor_reactions:
+                    if any(_reactions._is_plus_one(reaction) for reaction in anchor_reactions):
                         anchor_approved = True
                     elif any(
-                        _is_reaction_content(reaction, "eyes")
-                        for reaction in reactions
+                        _reactions._is_reaction_content(reaction, "eyes")
+                        for reaction in anchor_reactions
                     ):
                         anchor_eyes = True
             except RuntimeError as exc:
                 if _is_http_404_error(exc):
                     pass
-                elif _should_degrade_reactions_error(exc):
+                elif _reactions._should_degrade_reactions_error(exc):
                     logger.warning(
                         "Anchor comment reactions fetch degraded for comment %s in %s: %s",
                         cid,
@@ -286,9 +205,9 @@ def _compute_review_status(
 
     anchor_ts = (anchor.get("created_at") or "") if anchor else ""
     for comment in issue_comments + review_comments:
-        if not _is_codex_user(comment.get("user")):
+        if not _reactions._is_codex_user(comment.get("user")):
             continue
-        if _is_codex_onboarding_comment(comment):
+        if _reactions._is_codex_onboarding_comment(comment):
             continue
         if anchor_ts and (comment.get("created_at") or "") <= anchor_ts:
             continue
@@ -301,10 +220,8 @@ def _get_codex_review_signals(
     repo: str, pr_number: int
 ) -> dict[str, str | datetime | None]:
     """Return the latest Codex review timestamp, sha, and state."""
-    from src import github_client as _ghc
-
     try:
-        reviews = _ghc._gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/reviews")
+        reviews = cache._gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/reviews")
     except RuntimeError as exc:
         if not _is_http_404_error(exc):
             raise
@@ -325,7 +242,7 @@ def _get_codex_review_signals(
     best_raw = ""
     best_state = ""
     for review in reviews:
-        if not _is_codex_user(review.get("user")):
+        if not _reactions._is_codex_user(review.get("user")):
             continue
         submitted_raw = review.get("submitted_at") or ""
         parsed = _parse_iso(submitted_raw)
@@ -347,9 +264,7 @@ def _get_latest_codex_review_info(
     repo: str, pr_number: int
 ) -> tuple[str, datetime | None]:
     """Return ``(commit_id, submitted_at)`` of the most recent Codex review."""
-    from src import github_client as _ghc
-
-    signals = _ghc._get_codex_review_signals(repo, pr_number)
+    signals = _get_codex_review_signals(repo, pr_number)
     latest_sha = signals["latest_sha"]
     latest_time = signals["latest_time"]
     return str(latest_sha or ""), latest_time if isinstance(latest_time, datetime) else None

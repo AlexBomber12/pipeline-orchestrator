@@ -9,11 +9,13 @@ import subprocess
 import time
 from datetime import datetime, timezone
 
-from src import github_client
 from src.branch_context import BranchContext
 from src.daemon import git_ops
 from src.daemon.handlers.breach import BreachMixin
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
+from src.github import comments as gh_comments
+from src.github import gh_runner
+from src.github import prs as gh_prs
 from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus
 from src.retry import retry_transient
 
@@ -53,7 +55,7 @@ def _fetch_failed_ci_logs(repo: str, branch: str) -> str | None:
     prompt simply omits the section instead of blocking on observability.
     """
     try:
-        runs = github_client.run_gh(
+        runs = gh_runner.run_gh(
             [
                 "run",
                 "list",
@@ -79,7 +81,7 @@ def _fetch_failed_ci_logs(repo: str, branch: str) -> str | None:
     if not run_id:
         return None
     try:
-        logs = github_client.run_gh(
+        logs = gh_runner.run_gh(
             ["run", "view", str(run_id), "--log-failed"],
             repo=repo,
             timeout=60,
@@ -107,17 +109,17 @@ class FixMixin(BreachMixin):
         primed = False
         try:
             await asyncio.to_thread(
-                github_client.get_branch_last_push_time,
+                gh_prs.get_branch_last_push_time,
                 self.owner_repo, pr_number,
             )
             primed = True
-        except github_client.GitHubPollError:
+        except gh_prs.GitHubPollError:
             pass
 
         poll_interval = min(60, idle_limit)
         now = time.monotonic()
         head_age = await asyncio.to_thread(
-            github_client.get_last_push_age_seconds,
+            gh_prs.get_last_push_age_seconds,
             self.owner_repo, pr_number,
         )
         if head_age is not None:
@@ -129,14 +131,14 @@ class FixMixin(BreachMixin):
             await asyncio.sleep(poll_interval)
             try:
                 latest_push_at = await asyncio.to_thread(
-                    github_client.get_branch_last_push_time,
+                    gh_prs.get_branch_last_push_time,
                     self.owner_repo, pr_number,
                 )
                 if not primed:
                     primed = True
                     if latest_push_at is not None:
                         last_known_push = time.monotonic()
-            except github_client.GitHubPollError:
+            except gh_prs.GitHubPollError:
                 self.log_event(
                     "[FIX] GitHub API poll failed, preserving deadline."
                 )
@@ -179,7 +181,7 @@ class FixMixin(BreachMixin):
         downgrade to a parking state that does not.
         """
         try:
-            github_client.run_gh(
+            gh_runner.run_gh(
                 [
                     "label",
                     "create",
@@ -196,7 +198,7 @@ class FixMixin(BreachMixin):
                 f"[FIX] {label_create_log_prefix} label create skipped: {exc}."
             )
         try:
-            github_client.run_gh(
+            gh_runner.run_gh(
                 ["pr", "edit", str(pr_number), "--add-label", "escalated"],
                 repo=self.owner_repo,
             )
@@ -225,7 +227,7 @@ class FixMixin(BreachMixin):
             "Manual review required."
         )
         try:
-            github_client.post_comment(self.owner_repo, pr_number, message)
+            gh_comments.post_comment(self.owner_repo, pr_number, message)
         except Exception as exc:
             self.log_event(
                 f"[FIX] Warning: failed to post FIX deadlock comment on PR "
@@ -258,7 +260,7 @@ class FixMixin(BreachMixin):
             "Manual review required."
         )
         try:
-            github_client.post_comment(self.owner_repo, pr_number, comment)
+            gh_comments.post_comment(self.owner_repo, pr_number, comment)
         except Exception as exc:
             self.log_event(
                 f"[FIX] Warning: failed to post FIX coder ESCALATE comment "
@@ -300,7 +302,7 @@ class FixMixin(BreachMixin):
             f"({count}/{fix_iteration_cap}). Escalating for manual review."
         )
         try:
-            github_client.post_comment(self.owner_repo, pr_number, comment)
+            gh_comments.post_comment(self.owner_repo, pr_number, comment)
         except Exception as exc:
             await self._transition_to_error(
                 f"post_comment failed: {exc}",
@@ -310,7 +312,7 @@ class FixMixin(BreachMixin):
             )
             return
         try:
-            github_client.run_gh(
+            gh_runner.run_gh(
                 [
                     "label",
                     "create",
@@ -325,7 +327,7 @@ class FixMixin(BreachMixin):
         except Exception as exc:
             self.log_event(f"[FIX] FIX cap label create skipped: {exc}.")
         try:
-            github_client.run_gh(
+            gh_runner.run_gh(
                 ["pr", "edit", str(pr_number), "--add-label", "escalated"],
                 repo=self.owner_repo,
             )
@@ -353,7 +355,7 @@ class FixMixin(BreachMixin):
     ) -> None:
         """Watch the PR for an external MERGED/CLOSED while FIX is in flight.
 
-        Polls ``github_client.pr_state`` every
+        Polls ``gh_prs.pr_state`` every
         ``app_config.daemon.fix_poll_interval_sec`` seconds. When a
         terminal state is observed, records it in ``terminal_flag``,
         terminates the active coder subprocess (SIGTERM with grace
@@ -376,7 +378,7 @@ class FixMixin(BreachMixin):
                 continue
             try:
                 state_info = await asyncio.to_thread(
-                    github_client.pr_state, self.owner_repo, pr_number
+                    gh_prs.pr_state, self.owner_repo, pr_number
                 )
             except Exception as exc:
                 self.log_event(
@@ -596,7 +598,7 @@ class FixMixin(BreachMixin):
                 )
         if current_pr.review_status == ReviewStatus.CHANGES_REQUESTED:
             feedback = await asyncio.to_thread(
-                github_client.get_latest_codex_feedback,
+                gh_comments.get_latest_codex_feedback,
                 self.owner_repo, current_pr.number,
             )
             if feedback:
