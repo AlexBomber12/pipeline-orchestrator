@@ -17,7 +17,7 @@
     <div id="event-list-wrapper-{{ repo.name }}"
          class="max-h-96 overflow-y-auto"
          hx-get="/partials/repo/{{ repo.name }}/events"
-         hx-trigger="repo:event_log_append from:body"
+         hx-trigger="repo:event_log_append from:body, repo:history_updated from:body"
          hx-swap="innerHTML"
          hx-on::before-swap="this._scrollPos = this.scrollTop"
          hx-on::after-swap="this.scrollTop = this._scrollPos">

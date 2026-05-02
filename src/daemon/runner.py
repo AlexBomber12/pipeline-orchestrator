@@ -1221,6 +1221,7 @@ class PipelineRunner(
             last_entry["count"] = int(last_entry.get("count", 1)) + 1
             last_entry["event"] = event
             last_entry["last_seen_at"] = now
+            self._pending_event_log_entries.append(dict(last_entry))
         else:
             entry = {
                 "time": now,

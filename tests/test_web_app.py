@@ -1191,6 +1191,14 @@ def test_repo_detail_route_renders_full_page(
     assert "Any (bandit picks per-PR)" in body
     assert "Recent PRs" not in body
     assert "Event log" in body
+    # Pause/resume/stop publish history_updated; the SSE consumer must
+    # relay it so the event log refreshes for IDLE repos that never see
+    # a daemon-side event_log_append.
+    assert "'history_updated'" in body
+    assert (
+        'hx-trigger="repo:event_log_append from:body, '
+        'repo:history_updated from:body"' in body
+    )
 
 
 def test_repo_summary_banner_keeps_fragment_wrapped(

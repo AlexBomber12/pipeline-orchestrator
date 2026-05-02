@@ -243,13 +243,18 @@ def test_publish_state_drains_pending_event_log_entries(
     assert runner._pending_event_log_entries == []
 
 
-def test_log_event_dedup_does_not_queue_event_log_append() -> None:
+def test_log_event_dedup_queues_updated_entry_for_event_log_append() -> None:
+    """Dedup must still publish an event_log_append so live counter
+    updates ("waiting 1/20m" -> "waiting 2/20m") reach subscribers."""
     runner = _make_runner()
     runner.log_event("waiting (1/20m)")
     runner.log_event("waiting (2/20m)")
 
-    queued_events = [entry["event"] for entry in runner._pending_event_log_entries]
-    assert queued_events == ["waiting (1/20m)"]
+    queued = [
+        (entry["event"], entry["count"])
+        for entry in runner._pending_event_log_entries
+    ]
+    assert queued == [("waiting (1/20m)", 1), ("waiting (2/20m)", 2)]
 
 
 def test_save_current_run_record_emits_pr_metrics_update(

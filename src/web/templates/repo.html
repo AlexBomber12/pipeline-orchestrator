@@ -53,7 +53,12 @@
         let delayMs = BASE_DELAY_MS;
         let timer = null;
         let source = null;
-        const RELAYED_EVENTS = ['state_change', 'event_log_append', 'pr_metrics_update'];
+        const RELAYED_EVENTS = [
+            'state_change',
+            'event_log_append',
+            'history_updated',
+            'pr_metrics_update',
+        ];
 
         function scheduleReconnect() {
             if (timer) {
