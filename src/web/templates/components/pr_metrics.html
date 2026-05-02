@@ -2,7 +2,7 @@
 <section id="repo-pr-metrics-{{ panel_repo_name }}"
          class="mt-6 rounded-lg border border-white/5 bg-surface-2 p-5"
          hx-get="/partials/repo/{{ panel_repo_name }}/metrics"
-         hx-trigger="every 60s"
+         hx-trigger="repo:pr_metrics_update from:body"
          hx-swap="outerHTML">
     <div class="mb-4 flex items-center justify-between gap-3">
         <div>

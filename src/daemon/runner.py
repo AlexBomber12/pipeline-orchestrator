@@ -266,6 +266,8 @@ class PipelineRunner(
         self._last_codex_review_head_sha: str | None = None
         self._queue_progress_dirty = False
         self._last_published_queue_progress: tuple[int, int] | None = None
+        self._last_published_state_value: str | None = None
+        self._pending_event_log_entries: list[dict[str, object]] = []
         self._usage_degraded_logged = False
         self._claude_usage_provider = claude_usage_provider
         self._codex_usage_provider = codex_usage_provider
@@ -727,6 +729,37 @@ class PipelineRunner(
         self._last_published_queue_progress = progress
         self._queue_progress_dirty = False
 
+    async def _publish_state_change_if_needed(self) -> None:
+        """Publish a state_change event when state.state transitions.
+
+        Drives SSE-driven dashboard refreshes; replaces the legacy 5s
+        repo-summary poll that caused the OBS-AM badge stutter.
+        """
+        current = self.state.state.value
+        if current == self._last_published_state_value:
+            return
+        await publish_repo_event(
+            self.name,
+            "state_change",
+            {"state": current},
+            redis_client=self.redis,
+        )
+        self._last_published_state_value = current
+
+    async def _publish_pending_event_log_entries(self) -> None:
+        """Drain queued log entries as event_log_append SSE events."""
+        if not self._pending_event_log_entries:
+            return
+        pending = self._pending_event_log_entries
+        self._pending_event_log_entries = []
+        for entry in pending:
+            await publish_repo_event(
+                self.name,
+                "event_log_append",
+                {"entry": entry},
+                redis_client=self.redis,
+            )
+
     def _compute_diff_stats(self, base_branch: str) -> dict[str, object]:
         """Compute file/language/line stats for the current branch vs base."""
         try:
@@ -851,6 +884,12 @@ class PipelineRunner(
                 stats = self._compute_diff_stats(resolved_base_branch)
             self._apply_diff_stats(record, stats, resolved_base_branch)
         await self._metrics_store.save(record)
+        await publish_repo_event(
+            self.name,
+            "pr_metrics_update",
+            {"task_id": record.task_id, "exit_reason": record.exit_reason},
+            redis_client=self.redis,
+        )
 
     # All ERROR transitions must use this primitive. Direct writes to
     # ``state.state = PipelineState.ERROR`` are forbidden after PR-219b.
@@ -1137,6 +1176,8 @@ class PipelineRunner(
             except Exception:
                 pass
         await self._publish_progress_updated_if_needed()
+        await self._publish_state_change_if_needed()
+        await self._publish_pending_event_log_entries()
 
     async def _save_cli_log(self, stdout: str, stderr: str, label: str) -> None:
         _MAX_CLI_LOG_BYTES = 64 * 1024  # 64 KB cap per entry
@@ -1189,6 +1230,7 @@ class PipelineRunner(
                 "last_seen_at": now,
             }
             self.state.history.append(entry)
+            self._pending_event_log_entries.append(dict(entry))
         if len(self.state.history) > _HISTORY_LIMIT:
             self.state.history = self.state.history[-_HISTORY_LIMIT:]
         logger.info("[%s] %s", self.name, event)

@@ -63,6 +63,9 @@ class _FakeRedis:
             stop = len(values) + stop
         self.lists[key] = values[start:stop + 1]
 
+    async def publish(self, key: str, value: str) -> int:
+        return 1
+
 
 class _FakeUsageProvider:
     consecutive_failures = 0

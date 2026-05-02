@@ -1183,7 +1183,7 @@ def test_repo_detail_route_renders_full_page(
     assert "alpha" in body
     assert "All repositories" in body
     assert 'hx-get="/partials/repo/example__alpha"' in body
-    assert 'hx-trigger="every 5s"' in body
+    assert 'hx-trigger="load, repo:state_change from:body"' in body
     assert "Current Task" in body
     assert "Current PR" in body
     assert 'hx-post="/repos/example__alpha/coder"' in body

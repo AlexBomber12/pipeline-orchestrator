@@ -231,7 +231,8 @@ def test_recover_state_publish_state_emits_progress_update(
     asyncio.run(runner.publish_state())
     asyncio.run(runner.publish_state())
 
-    assert published == [
+    progress_events = [event for event in published if event[1] == "progress_updated"]
+    assert progress_events == [
         (
             runner.name,
             "progress_updated",

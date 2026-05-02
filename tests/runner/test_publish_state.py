@@ -38,6 +38,7 @@ def test_publish_state_skips_progress_update_when_value_was_already_published(
 
     runner = _make_runner()
     runner._last_published_queue_progress = (1, 2)
+    runner._last_published_state_value = runner.state.state.value
     runner._set_queue_progress(1, 2)
 
     asyncio.run(runner.publish_state())
@@ -157,6 +158,178 @@ def test_publish_while_waiting_handles_publish_error(
         asyncio.run(runner._publish_while_waiting("heartbeat"))
 
     assert warnings == [f"[{runner.name}] heartbeat publish failed, will retry"]
+
+
+def test_publish_state_emits_state_change_on_first_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first publish_state call seeds _last_published_state_value and
+    emits an SSE state_change so reconnecting dashboards see the current
+    state without waiting for the next transition."""
+    published: list[tuple[str, str, dict[str, object], object | None]] = []
+
+    async def _fake_publish_repo_event(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, object],
+        redis_client: object | None = None,
+    ) -> None:
+        published.append((repo_name, event_type, payload, redis_client))
+
+    monkeypatch.setattr(runner_module, "publish_repo_event", _fake_publish_repo_event)
+
+    runner = _make_runner()
+    asyncio.run(runner.publish_state())
+
+    state_events = [event for event in published if event[1] == "state_change"]
+    assert state_events == [
+        (runner.name, "state_change", {"state": runner.state.state.value}, runner.redis)
+    ]
+    assert runner._last_published_state_value == runner.state.state.value
+
+
+def test_publish_state_emits_state_change_on_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    published: list[tuple[str, str, dict[str, object], object | None]] = []
+
+    async def _fake_publish_repo_event(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, object],
+        redis_client: object | None = None,
+    ) -> None:
+        published.append((repo_name, event_type, payload, redis_client))
+
+    monkeypatch.setattr(runner_module, "publish_repo_event", _fake_publish_repo_event)
+
+    runner = _make_runner()
+    asyncio.run(runner.publish_state())
+    runner.state.state = PipelineState.WATCH
+    asyncio.run(runner.publish_state())
+    asyncio.run(runner.publish_state())
+
+    state_events = [event for event in published if event[1] == "state_change"]
+    assert [event[2]["state"] for event in state_events] == ["IDLE", "WATCH"]
+
+
+def test_publish_state_drains_pending_event_log_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    published: list[tuple[str, str, dict[str, object], object | None]] = []
+
+    async def _fake_publish_repo_event(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, object],
+        redis_client: object | None = None,
+    ) -> None:
+        published.append((repo_name, event_type, payload, redis_client))
+
+    monkeypatch.setattr(runner_module, "publish_repo_event", _fake_publish_repo_event)
+
+    runner = _make_runner()
+    runner._last_published_state_value = runner.state.state.value
+    runner.log_event("first event")
+    runner.log_event("second event")
+
+    asyncio.run(runner.publish_state())
+
+    appended = [event for event in published if event[1] == "event_log_append"]
+    assert [event[2]["entry"]["event"] for event in appended] == [
+        "first event",
+        "second event",
+    ]
+    assert runner._pending_event_log_entries == []
+
+
+def test_log_event_dedup_does_not_queue_event_log_append() -> None:
+    runner = _make_runner()
+    runner.log_event("waiting (1/20m)")
+    runner.log_event("waiting (2/20m)")
+
+    queued_events = [entry["event"] for entry in runner._pending_event_log_entries]
+    assert queued_events == ["waiting (1/20m)"]
+
+
+def test_save_current_run_record_emits_pr_metrics_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finalizing a RunRecord publishes pr_metrics_update so the dashboard's
+    Recent PRs panel refreshes via SSE rather than the legacy 60s poll."""
+    from src.metrics import RunRecord
+
+    published: list[tuple[str, str, dict[str, object], object | None]] = []
+
+    async def _fake_publish_repo_event(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, object],
+        redis_client: object | None = None,
+    ) -> None:
+        published.append((repo_name, event_type, payload, redis_client))
+
+    async def _fake_save(record: object) -> None:
+        return None
+
+    monkeypatch.setattr(runner_module, "publish_repo_event", _fake_publish_repo_event)
+
+    runner = _make_runner()
+    runner._current_run_record = RunRecord(
+        run_id="run-1",
+        task_id="PR-300",
+        profile_id="claude:claude-opus-4-7:container",
+        task_type="feature",
+        complexity="low",
+        started_at=datetime.now(timezone.utc).isoformat(),
+        ended_at=None,
+        duration_ms=None,
+        fix_iterations=0,
+        tokens_in=0,
+        tokens_out=0,
+        exit_reason="",
+        operator_intervention=False,
+        repo_name=runner.name,
+        stage="coder",
+    )
+    monkeypatch.setattr(runner._metrics_store, "save", _fake_save)
+
+    asyncio.run(runner._save_current_run_record("coding_complete"))
+
+    metrics_events = [event for event in published if event[1] == "pr_metrics_update"]
+    assert metrics_events == [
+        (
+            runner.name,
+            "pr_metrics_update",
+            {"task_id": "PR-300", "exit_reason": "coding_complete"},
+            runner.redis,
+        )
+    ]
+
+
+def test_save_current_run_record_noop_when_no_active_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without an active RunRecord nothing publishes, matching the
+    early-return contract."""
+    published: list[tuple[str, str, dict[str, object], object | None]] = []
+
+    async def _fake_publish_repo_event(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, object],
+        redis_client: object | None = None,
+    ) -> None:
+        published.append((repo_name, event_type, payload, redis_client))
+
+    monkeypatch.setattr(runner_module, "publish_repo_event", _fake_publish_repo_event)
+
+    runner = _make_runner()
+    runner._current_run_record = None
+
+    asyncio.run(runner._save_current_run_record("error"))
+
+    assert published == []
 
 
 def test_repo_state_resets_codex_retrigger_on_pr_transition() -> None:
