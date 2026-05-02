@@ -377,6 +377,302 @@ class IdleMixin:
             branch=header.branch,
         )
 
+    def _check_legacy_queue_status(
+        self,
+        ghost_legacy_pr_ids: set[str] | None = None,
+        parse_error: str | None = None,
+    ) -> tuple[bool, str | None]:
+        """Return ``(has_visible_legacy_entries, parse_error_or_None)``.
+
+        Single source of truth for the legacy-queue gating decision.
+        Three scenarios:
+
+        - ``(True, None)``: visible legacy rows present (``## PR-*``
+          headers whose PR ID is not in ``self._idle_dag_tasks`` and
+          not in the optional ghost set).
+        - ``(False, error_text)``: caller flagged a ``parse_queue``
+          failure and no visible legacy entries are present
+          (``parse_error`` echoed back).
+        - ``(False, None)``: clean — no legacy rows, no parse failure.
+
+        Visible-legacy precedence: when both ``parse_error`` is set
+        and visible legacy is detected, returns ``(True, None)``. The
+        regex scan does not depend on parse success and is the
+        dominant gating signal for ``_write_generated_queue_md``.
+
+        The caller (``_select_next_task_or_attach``) supplies
+        ``parse_error`` from its own ``parse_queue`` exception so the
+        helper does not re-parse the queue file each call.
+        """
+        queue_path = str(Path(self.repo_path) / "tasks" / "QUEUE.md")
+        structured_pr_ids = {
+            queued.pr_id for queued in self._idle_dag_tasks or []
+        }
+        visible = self._queue_md_contains_visible_legacy_entries(
+            queue_path, structured_pr_ids, ghost_legacy_pr_ids,
+        )
+        if visible:
+            return True, None
+        return False, parse_error
+
+    async def _select_next_task_or_attach(
+        self,
+        prs,
+        merged_prs,
+    ) -> QueueTask | None:
+        """High-stakes IDLE decision: pick next task or reattach.
+
+        Returns the ``QueueTask`` to dispatch into CODING, or ``None``
+        when the handler must return without dispatching — either
+        nothing is actionable (logging "No tasks available", optionally
+        attaching ``current_pr`` to a manual-work open PR) or an
+        existing open PR matched the chosen task and the runner has
+        already transitioned to WATCH.
+
+        Encapsulates the dispatch decision tree previously inline in
+        ``handle_idle``: DAG selection, legacy queue parse + derive +
+        ghost detection + ``get_next_task``, DAG-vs-legacy combine,
+        DOING marking, queue progress, generated QUEUE.md write, and
+        existing-PR reattach.
+        """
+        queue_path = str(Path(self.repo_path) / "tasks" / "QUEUE.md")
+        strict = self.app_config.daemon.strict_queue_validation
+        dag_task = None
+        dag_tasks = None
+        self._idle_open_prs = prs
+        self._idle_merged_prs = merged_prs
+        try:
+            dag_task = await self._select_next_task_from_dag()
+            dag_tasks = self._idle_dag_tasks
+        except (
+            OSError,
+            RuntimeError,
+            QueueValidationError,
+            subprocess.TimeoutExpired,
+        ) as exc:
+            await self._transition_to_error(
+                f"Task selection failed: {exc}",
+                save_run_record_as=None,
+                publish=False,
+                log_prefix="[INFRA]",
+            )
+            return None
+        finally:
+            self._idle_open_prs = []
+            self._idle_merged_prs = []
+
+        tasks: list[QueueTask] = []
+        queue_task = None
+        structured_pr_ids = {queued.pr_id for queued in dag_tasks or []}
+        has_legacy_queue_tasks = False
+        legacy_queue_check_succeeded = False
+        try:
+            tasks = parse_queue(queue_path, strict=strict)
+        except QueueValidationError as exc:
+            if dag_tasks is None:
+                await self._transition_to_error(
+                    str(exc),
+                    save_run_record_as=None,
+                    publish=False,
+                    log_prefix="[INFRA] Queue validation failed:",
+                )
+                return None
+            self.log_event(
+                f"[INFRA] Queue validation failed after DAG selection; "
+                f"continuing with DAG task: {exc}."
+            )
+            visible, _ = self._check_legacy_queue_status(parse_error=str(exc))
+            legacy_queue_check_succeeded = not visible
+        else:
+            try:
+                derive_args = (
+                    tasks,
+                    self.repo_path,
+                    self.repo_config.branch,
+                    prs,
+                )
+                derive_sig_params = inspect.signature(
+                    derive_queue_task_statuses
+                ).parameters
+                derive_kwargs: dict[str, object] = {}
+                if "current_task_pr_id" in derive_sig_params:
+                    derive_kwargs["current_task_pr_id"] = (
+                        self.state.current_task.pr_id
+                        if self.state.current_task is not None
+                        else None
+                    )
+                if len(derive_sig_params) >= 5:
+                    tasks = derive_queue_task_statuses(
+                        *derive_args,
+                        merged_prs,
+                        **derive_kwargs,
+                    )
+                else:
+                    tasks = derive_queue_task_statuses(*derive_args)
+            except (
+                OSError,
+                RuntimeError,
+                QueueValidationError,
+                subprocess.TimeoutExpired,
+            ) as exc:
+                if dag_tasks is None:
+                    await self._transition_to_error(
+                        f"Task status derivation failed: {exc}",
+                        save_run_record_as=None,
+                        publish=False,
+                        log_prefix="[INFRA]",
+                    )
+                    return None
+                self.log_event(
+                    f"[INFRA] Task status derivation failed after DAG "
+                    f"selection; continuing with DAG tasks: {exc}."
+                )
+                tasks = []
+                queue_task = None
+                visible, _ = self._check_legacy_queue_status()
+                legacy_queue_check_succeeded = not visible
+            else:
+                # Ghost entries (whose declared task file is missing on disk)
+                # are not real legacy tasks: they're stale residue from a
+                # prior cycle that survived ``sync_to_main`` because QUEUE.md
+                # is gitignored (PR-181). Treating them as legacy would
+                # block ``_write_generated_queue_md`` from rewriting the
+                # file, leaving the shim's ``parse_doing_task`` stuck on a
+                # stale DOING entry and creating a PR for the wrong branch.
+                # Drop ghosts before ``get_next_task`` so the selector
+                # advances to a real legacy entry behind a stale DOING ghost
+                # instead of stalling IDLE on "no tasks available".
+                ghost_legacy_pr_ids = {
+                    queued.pr_id
+                    for queued in tasks
+                    if queued.pr_id not in structured_pr_ids
+                    and queued.task_file is not None
+                    and not (Path(self.repo_path) / queued.task_file).is_file()
+                }
+                for queued in tasks:
+                    if queued.pr_id in ghost_legacy_pr_ids:
+                        self.log_event(
+                            f"[INFRA] Ignoring ghost legacy QUEUE.md "
+                            f"entry {queued.pr_id} (no "
+                            f"{queued.task_file} on disk)."
+                        )
+                non_ghost_tasks = (
+                    [t for t in tasks if t.pr_id not in ghost_legacy_pr_ids]
+                    if ghost_legacy_pr_ids
+                    else tasks
+                )
+                queue_task = get_next_task(non_ghost_tasks)
+                visible, _ = self._check_legacy_queue_status(
+                    ghost_legacy_pr_ids,
+                )
+                has_legacy_queue_tasks = any(
+                    queued.pr_id not in structured_pr_ids
+                    for queued in non_ghost_tasks
+                ) or visible
+                legacy_queue_check_succeeded = not visible
+
+        task = dag_task
+        if queue_task is not None:
+            queue_task_is_legacy = queue_task.pr_id not in structured_pr_ids
+            if task is None and (dag_tasks is None or queue_task_is_legacy):
+                task = queue_task
+            elif (
+                task is not None
+                and task.status != TaskStatus.DOING
+                and queue_task_is_legacy
+            ):
+                task = queue_task
+
+        # The shim parses QUEUE.md to find its DOING task and exits 0 if it
+        # sees only TODO. Mark the dispatched structured task DOING in the
+        # statuses dict before _write_generated_queue_md runs.
+        statuses_for_dispatch = getattr(self, "_idle_dag_statuses", None)
+        if (
+            task is not None
+            and statuses_for_dispatch is not None
+            and statuses_for_dispatch.get(task.pr_id) == TaskStatus.TODO
+        ):
+            statuses_for_dispatch[task.pr_id] = TaskStatus.DOING
+            for i, queued in enumerate(dag_tasks or ()):
+                if queued.pr_id == task.pr_id:
+                    dag_tasks[i] = queued.model_copy(
+                        update={"status": TaskStatus.DOING}
+                    )
+                    break
+            task = task.model_copy(update={"status": TaskStatus.DOING})
+
+        if has_legacy_queue_tasks or dag_tasks is None:
+            queue_tasks = tasks
+        else:
+            queue_tasks = dag_tasks
+        self._set_queue_progress(
+            sum(1 for t in queue_tasks if t.status == TaskStatus.DONE),
+            len(queue_tasks),
+        )
+        generated_headers = getattr(self, "_idle_dag_headers", None)
+        generated_statuses = getattr(self, "_idle_dag_statuses", None)
+        if (
+            generated_headers
+            and generated_statuses
+            and legacy_queue_check_succeeded
+            and not has_legacy_queue_tasks
+        ):
+            try:
+                self._write_generated_queue_md(
+                    generated_headers,
+                    generated_statuses,
+                )
+            except OSError as exc:
+                await self._transition_to_error(
+                    f"QUEUE.md auto-generation failed: {exc}",
+                    save_run_record_as=None,
+                    publish=False,
+                    log_prefix="[INFRA]",
+                )
+                return None
+
+        if task is None:
+            self.log_event("[INFRA] No tasks available.")
+            if prs:
+                done_branches = {
+                    t.branch for t in queue_tasks
+                    if t.status == TaskStatus.DONE and t.branch
+                }
+                match = next(
+                    (pr for pr in prs if pr.branch in done_branches), None
+                )
+                selected = match or prs[0]
+                self.state.current_pr = self._preserve_fix_iteration_count(selected)
+                self.log_event(
+                    f"[INFRA] IDLE: {len(prs)} open PR(s) detected "
+                    f"(manual work)."
+                )
+            else:
+                self.state.current_pr = None
+            return None
+
+        self.state.current_task = task
+        task_branch = task.branch
+        if task_branch:
+            existing = find_matching_open_pr(
+                task.pr_id,
+                task_branch,
+                prs,
+            )
+            if existing is not None:
+                self.state.current_pr = self._preserve_fix_iteration_count(existing)
+                self.state.state = PipelineState.WATCH
+                self._rehydrate_last_push_at(self.state.current_pr)
+                self.log_event(
+                    f"[INFRA] Task {task.pr_id} has existing open PR "
+                    f"#{existing.number} on {task_branch!r} -> WATCH "
+                    f"(no duplicate CODING)."
+                )
+                await self.publish_state()
+                return None
+
+        return task
+
     async def handle_idle(self) -> None:
         """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
         self._error_diagnose_policy.reset(self)
@@ -501,251 +797,9 @@ class IdleMixin:
         else:
             self._idle_open_pr_snapshot = open_pr_snapshot
 
-        queue_path = str(Path(self.repo_path) / "tasks" / "QUEUE.md")
-        strict = self.app_config.daemon.strict_queue_validation
-        dag_task = None
-        dag_tasks = None
-        self._idle_open_prs = prs
-        self._idle_merged_prs = merged_prs
-        try:
-            dag_task = await self._select_next_task_from_dag()
-            dag_tasks = self._idle_dag_tasks
-        except (
-            OSError,
-            RuntimeError,
-            QueueValidationError,
-            subprocess.TimeoutExpired,
-        ) as exc:
-            await self._transition_to_error(
-                f"Task selection failed: {exc}",
-                save_run_record_as=None,
-                publish=False,
-                log_prefix="[INFRA]",
-            )
-            return
-        finally:
-            self._idle_open_prs = []
-            self._idle_merged_prs = []
-
-        tasks: list[QueueTask] = []
-        queue_task = None
-        structured_pr_ids = {queued.pr_id for queued in dag_tasks or []}
-        has_legacy_queue_tasks = False
-        legacy_queue_check_succeeded = False
-        visible_legacy_queue_entries = False
-        try:
-            tasks = parse_queue(queue_path, strict=strict)
-        except QueueValidationError as exc:
-            if dag_tasks is None:
-                await self._transition_to_error(
-                    str(exc),
-                    save_run_record_as=None,
-                    publish=False,
-                    log_prefix="[INFRA] Queue validation failed:",
-                )
-                return
-            self.log_event(
-                f"[INFRA] Queue validation failed after DAG selection; "
-                f"continuing with DAG task: {exc}."
-            )
-            visible_legacy_queue_entries = self._queue_md_contains_visible_legacy_entries(
-                queue_path,
-                structured_pr_ids,
-            )
-            legacy_queue_check_succeeded = not visible_legacy_queue_entries
-        else:
-            try:
-                derive_args = (
-                    tasks,
-                    self.repo_path,
-                    self.repo_config.branch,
-                    prs,
-                )
-                derive_sig_params = inspect.signature(
-                    derive_queue_task_statuses
-                ).parameters
-                derive_kwargs: dict[str, object] = {}
-                if "current_task_pr_id" in derive_sig_params:
-                    derive_kwargs["current_task_pr_id"] = (
-                        self.state.current_task.pr_id
-                        if self.state.current_task is not None
-                        else None
-                    )
-                if len(derive_sig_params) >= 5:
-                    tasks = derive_queue_task_statuses(
-                        *derive_args,
-                        merged_prs,
-                        **derive_kwargs,
-                    )
-                else:
-                    tasks = derive_queue_task_statuses(*derive_args)
-            except (
-                OSError,
-                RuntimeError,
-                QueueValidationError,
-                subprocess.TimeoutExpired,
-            ) as exc:
-                if dag_tasks is None:
-                    await self._transition_to_error(
-                        f"Task status derivation failed: {exc}",
-                        save_run_record_as=None,
-                        publish=False,
-                        log_prefix="[INFRA]",
-                    )
-                    return
-                self.log_event(
-                    f"[INFRA] Task status derivation failed after DAG "
-                    f"selection; continuing with DAG tasks: {exc}."
-                )
-                tasks = []
-                queue_task = None
-                visible_legacy_queue_entries = self._queue_md_contains_visible_legacy_entries(
-                    queue_path,
-                    structured_pr_ids,
-                )
-                legacy_queue_check_succeeded = not visible_legacy_queue_entries
-            else:
-                # Ghost entries (whose declared task file is missing on disk)
-                # are not real legacy tasks: they're stale residue from a
-                # prior cycle that survived ``sync_to_main`` because QUEUE.md
-                # is gitignored (PR-181). Treating them as legacy would
-                # block ``_write_generated_queue_md`` from rewriting the
-                # file, leaving the shim's ``parse_doing_task`` stuck on a
-                # stale DOING entry and creating a PR for the wrong branch.
-                # Drop ghosts before ``get_next_task`` so the selector
-                # advances to a real legacy entry behind a stale DOING ghost
-                # instead of stalling IDLE on "no tasks available".
-                ghost_legacy_pr_ids = {
-                    queued.pr_id
-                    for queued in tasks
-                    if queued.pr_id not in structured_pr_ids
-                    and queued.task_file is not None
-                    and not (Path(self.repo_path) / queued.task_file).is_file()
-                }
-                for queued in tasks:
-                    if queued.pr_id in ghost_legacy_pr_ids:
-                        self.log_event(
-                            f"[INFRA] Ignoring ghost legacy QUEUE.md "
-                            f"entry {queued.pr_id} (no "
-                            f"{queued.task_file} on disk)."
-                        )
-                non_ghost_tasks = (
-                    [t for t in tasks if t.pr_id not in ghost_legacy_pr_ids]
-                    if ghost_legacy_pr_ids
-                    else tasks
-                )
-                queue_task = get_next_task(non_ghost_tasks)
-                visible_legacy_queue_entries = self._queue_md_contains_visible_legacy_entries(
-                    queue_path,
-                    structured_pr_ids,
-                    ghost_legacy_pr_ids,
-                )
-                has_legacy_queue_tasks = any(
-                    queued.pr_id not in structured_pr_ids
-                    for queued in non_ghost_tasks
-                ) or visible_legacy_queue_entries
-                legacy_queue_check_succeeded = not visible_legacy_queue_entries
-
-        task = dag_task
-        if queue_task is not None:
-            queue_task_is_legacy = queue_task.pr_id not in structured_pr_ids
-            if task is None and (dag_tasks is None or queue_task_is_legacy):
-                task = queue_task
-            elif (
-                task is not None
-                and task.status != TaskStatus.DOING
-                and queue_task_is_legacy
-            ):
-                task = queue_task
-
-        # The shim parses QUEUE.md to find its DOING task and exits 0 if it
-        # sees only TODO. Mark the dispatched structured task DOING in the
-        # statuses dict before _write_generated_queue_md runs.
-        statuses_for_dispatch = getattr(self, "_idle_dag_statuses", None)
-        if (
-            task is not None
-            and statuses_for_dispatch is not None
-            and statuses_for_dispatch.get(task.pr_id) == TaskStatus.TODO
-        ):
-            statuses_for_dispatch[task.pr_id] = TaskStatus.DOING
-            for i, queued in enumerate(dag_tasks or ()):
-                if queued.pr_id == task.pr_id:
-                    dag_tasks[i] = queued.model_copy(
-                        update={"status": TaskStatus.DOING}
-                    )
-                    break
-            task = task.model_copy(update={"status": TaskStatus.DOING})
-
-        if has_legacy_queue_tasks or dag_tasks is None:
-            queue_tasks = tasks
-        else:
-            queue_tasks = dag_tasks
-        self._set_queue_progress(
-            sum(1 for t in queue_tasks if t.status == TaskStatus.DONE),
-            len(queue_tasks),
-        )
-        generated_headers = getattr(self, "_idle_dag_headers", None)
-        generated_statuses = getattr(self, "_idle_dag_statuses", None)
-        if (
-            generated_headers
-            and generated_statuses
-            and legacy_queue_check_succeeded
-            and not has_legacy_queue_tasks
-        ):
-            try:
-                self._write_generated_queue_md(
-                    generated_headers,
-                    generated_statuses,
-                )
-            except OSError as exc:
-                await self._transition_to_error(
-                    f"QUEUE.md auto-generation failed: {exc}",
-                    save_run_record_as=None,
-                    publish=False,
-                    log_prefix="[INFRA]",
-                )
-                return
+        task = await self._select_next_task_or_attach(prs, merged_prs)
         if task is None:
-            self.log_event("[INFRA] No tasks available.")
-            if prs:
-                done_branches = {
-                    t.branch for t in queue_tasks
-                    if t.status == TaskStatus.DONE and t.branch
-                }
-                match = next(
-                    (pr for pr in prs if pr.branch in done_branches), None
-                )
-                selected = match or prs[0]
-                self.state.current_pr = self._preserve_fix_iteration_count(selected)
-                self.log_event(
-                    f"[INFRA] IDLE: {len(prs)} open PR(s) detected "
-                    f"(manual work)."
-                )
-            else:
-                self.state.current_pr = None
             return
-
-        self.state.current_task = task
-        task_branch = task.branch
-
-        if task_branch:
-            existing = find_matching_open_pr(
-                task.pr_id,
-                task_branch,
-                prs,
-            )
-
-            if existing is not None:
-                self.state.current_pr = self._preserve_fix_iteration_count(existing)
-                self.state.state = PipelineState.WATCH
-                self._rehydrate_last_push_at(self.state.current_pr)
-                self.log_event(
-                    f"[INFRA] Task {task.pr_id} has existing open PR "
-                    f"#{existing.number} on {task_branch!r} -> WATCH "
-                    f"(no duplicate CODING)."
-                )
-                await self.publish_state()
-                return
 
         await self._refresh_user_paused_from_redis()
         if self.state.user_paused:
