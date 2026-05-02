@@ -13,6 +13,8 @@ import subprocess
 import uuid
 from typing import Callable
 
+from src.diagnosis import build_diagnosis_prompt
+
 logger = logging.getLogger(__name__)
 
 
@@ -115,30 +117,12 @@ def diagnose_error(
     The first line of stdout is expected to be exactly one of ``FIX``,
     ``SKIP``, or ``ESCALATE``; subsequent lines may contain a short plan.
     """
-    prompt = (
-        "You are the pipeline orchestrator. An infrastructure error occurred. "
-        f"Error context: {context} "
-        "Respond with exactly one word on the first line: FIX, SKIP, or ESCALATE. "
-        "If FIX, include a brief action plan on subsequent lines."
+    return run_claude(
+        build_diagnosis_prompt(repo_path, context),
+        repo_path,
+        timeout=120,
+        model=model,
     )
-    return run_claude(prompt, repo_path, timeout=120, model=model)
-
-
-def parse_diagnosis(stdout: str) -> str:
-    """Return ``FIX``, ``SKIP``, or ``ESCALATE`` from a ``diagnose_error`` stdout.
-
-    Anything that does not clearly start with one of those tokens is treated
-    as ``ESCALATE`` so ambiguous responses never silently trigger a fix.
-    """
-    tokens = stdout.split()
-    if not tokens:
-        return "ESCALATE"
-
-    first = tokens[0].upper()
-    for verdict in ("FIX", "SKIP", "ESCALATE"):
-        if first.startswith(verdict):
-            return verdict
-    return "ESCALATE"
 
 
 def _build_node_options() -> str:
@@ -286,12 +270,10 @@ async def fix_review_async(
 async def diagnose_error_async(
     repo_path: str, context: str, model: str | None = None
 ) -> tuple[int, str, str]:
-    prompt = (
-        "You are the pipeline orchestrator. An infrastructure error occurred. "
-        f"Error context: {context} "
-        "Respond with exactly one word on the first line: FIX, SKIP, or ESCALATE. "
-        "If FIX, include a brief action plan on subsequent lines."
-    )
     return await run_claude_async(
-        prompt, repo_path, timeout=120, model=model, system_prompt_file=None
+        build_diagnosis_prompt(repo_path, context),
+        repo_path,
+        timeout=120,
+        model=model,
+        system_prompt_file=None,
     )

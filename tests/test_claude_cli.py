@@ -13,7 +13,6 @@ from src.claude_cli import (
     diagnose_error_async,
     fix_review,
     fix_review_async,
-    parse_diagnosis,
     run_claude,
     run_claude_async,
     run_planned_pr,
@@ -288,26 +287,6 @@ def test_diagnose_error_builds_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "git push failed: 403" in prompt
     assert "FIX, SKIP, or ESCALATE" in prompt
     assert captured["kwargs"]["timeout"] == 120
-
-
-def test_parse_diagnosis_fix_with_plan() -> None:
-    assert parse_diagnosis("FIX\ndo something") == "FIX"
-
-
-def test_parse_diagnosis_skip() -> None:
-    assert parse_diagnosis("SKIP") == "SKIP"
-
-
-def test_parse_diagnosis_escalate_with_suffix() -> None:
-    assert parse_diagnosis("ESCALATE: too complex") == "ESCALATE"
-
-
-def test_parse_diagnosis_unknown_defaults_to_escalate() -> None:
-    assert parse_diagnosis("I don't know") == "ESCALATE"
-
-
-def test_parse_diagnosis_empty_defaults_to_escalate() -> None:
-    assert parse_diagnosis("") == "ESCALATE"
 
 
 def test_fix_review_accepts_timeout(monkeypatch: pytest.MonkeyPatch) -> None:

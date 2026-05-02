@@ -11,6 +11,8 @@ import asyncio
 import logging
 from typing import Callable
 
+from src.diagnosis import build_diagnosis_prompt
+
 logger = logging.getLogger(__name__)
 
 
@@ -130,10 +132,9 @@ async def fix_review_async(
 async def diagnose_error_async(
     repo_path: str, context: str, model: str | None = None
 ) -> tuple[int, str, str]:
-    prompt = (
-        "You are the pipeline orchestrator. An infrastructure error occurred. "
-        f"Error context: {context} "
-        "Respond with exactly one word on the first line: FIX, SKIP, or ESCALATE. "
-        "If FIX, include a brief action plan on subsequent lines."
+    return await run_codex_async(
+        build_diagnosis_prompt(repo_path, context),
+        repo_path,
+        timeout=120,
+        model=model,
     )
-    return await run_codex_async(prompt, repo_path, timeout=120, model=model)
