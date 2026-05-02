@@ -445,11 +445,18 @@ class IdleMixin:
                 refresh=refresh_merged_prs,
             )
         except Exception as exc:
-            self.log_event(
-                f"[INFRA] IDLE: merged PR check failed: {exc}; "
-                f"continuing with local merged-status heuristics."
-            )
-            merged_prs = []
+            if "HTTP 304" in str(exc):
+                # Upstream cache miss — _etag_get already retried without
+                # If-None-Match; this exception path is the legacy slurp
+                # fallback. Don't pollute the event log; fall through to
+                # local merged-status heuristics silently.
+                merged_prs = []
+            else:
+                self.log_event(
+                    f"[INFRA] IDLE: merged PR check failed: {exc}; "
+                    f"continuing with local merged-status heuristics."
+                )
+                merged_prs = []
         else:
             self._idle_open_pr_snapshot = open_pr_snapshot
 

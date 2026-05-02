@@ -10518,6 +10518,49 @@ def test_handle_idle_falls_back_when_merged_pr_check_fails(
     assert any("merged PR check failed" in e["event"] for e in runner.state.history)
 
 
+def test_handle_idle_silences_merged_pr_http_304_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-236: HTTP 304 surfacing through ``get_merged_prs`` must not log
+    ``[INFRA] IDLE: merged PR check failed`` (operator-visible spam)."""
+    _patch_subprocess(monkeypatch)
+    task = QueueTask(
+        pr_id="PR-123",
+        title="Keep dispatching",
+        branch="pr-123-keep-dispatching",
+        status=TaskStatus.TODO,
+    )
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: (_ for _ in ()).throw(
+            RuntimeError("gh api repos/owner/name/pulls failed (exit 1): HTTP 304")
+        ),
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda tasks, repo_path, base_branch, prs, merged_prs=(): tasks,
+    )
+
+    async def fake_handle_coding() -> None:
+        return None
+
+    runner = _make_runner()
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    asyncio.run(runner.handle_idle())
+
+    assert not any(
+        "merged PR check failed" in e["event"] for e in runner.state.history
+    )
+
+
 def test_handle_idle_uses_fallback_queue_counters_when_dag_picks_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

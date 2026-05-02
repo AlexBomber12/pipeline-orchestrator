@@ -174,7 +174,11 @@ def _etag_get(path: str) -> object:
     status, headers, body = _split_include_response(raw)
     if status == 304:
         if cached is None:
-            return None
+            # Server returned 304 but we have no cached body. This happens
+            # after daemon restart (in-memory cache empty) or LRU eviction
+            # while the GitHub edge cache still holds our prior ETag.
+            # Retry without If-None-Match to force a fresh 200 + body.
+            return _etag_get_no_cache(path)
         _etag_cache.move_to_end(path)
         return cached[1]
     if status is None or not (200 <= status < 300):
@@ -187,6 +191,27 @@ def _etag_get(path: str) -> object:
     except json.JSONDecodeError:
         return None
 
+    etag = headers.get("etag")
+    if etag:
+        _etag_cache_put(path, etag, payload)
+    return payload
+
+
+def _etag_get_no_cache(path: str) -> object:
+    """Fetch ``path`` without ``If-None-Match`` and re-populate the cache."""
+    raw = run_gh(["api", path, "--include"])
+    if not isinstance(raw, str) or not raw.lstrip().startswith("HTTP/"):
+        return raw
+    status, headers, body = _split_include_response(raw)
+    if status is None or not (200 <= status < 300):
+        return None
+    body = body.strip()
+    if not body:
+        return None
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return None
     etag = headers.get("etag")
     if etag:
         _etag_cache_put(path, etag, payload)
