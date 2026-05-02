@@ -788,7 +788,7 @@ def test_put_daemon_empty_numeric_inputs_are_no_ops(empty_config: Path) -> None:
     assert response.status_code == 200
     cfg = load_config(str(empty_config))
     assert cfg.daemon.poll_interval_sec == 60
-    assert cfg.daemon.review_timeout_min == 60
+    assert cfg.daemon.review_timeout_min == 20
     assert cfg.daemon.hung_fallback_codex_review is False
 
 
@@ -824,7 +824,7 @@ def test_put_daemon_non_positive_review_timeout_returns_422(
             assert "at least 1" in response.text
 
     cfg = load_config(str(empty_config))
-    assert cfg.daemon.review_timeout_min == 60
+    assert cfg.daemon.review_timeout_min == 20
 
 
 def test_put_daemon_invalid_int_returns_422_html(empty_config: Path) -> None:

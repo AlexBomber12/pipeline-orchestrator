@@ -5,22 +5,34 @@ repositories:
   poll_interval_sec: 60
 daemon:
   poll_interval_sec: 60
-  review_timeout_min: 60
+  # PR-231: Production-tuned (default was 60min). Operator observed reviews
+  # almost always arrive within 20min; longer timeout just delays HUNG escalation.
+  review_timeout_min: 20
   stale_review_threshold_eyes_min: 5
   auto_fallback: true
   hung_fallback_codex_review: true
   error_handler_use_ai: true
   claude_model: opus
   fix_idle_timeout_sec: 1800
+  # PR-231: Operator-confirmed production cap on FIX iterations.
+  fix_iteration_cap: 15
   fix_no_push_cap: 3
   fix_poll_interval_sec: 30
   coder_terminate_grace_sec: 5
-  planned_pr_timeout_sec: 900
+  # PR-231: Production-tuned (default was 900s/15min). Foundation Sprint tasks
+  # regularly need 20-40min for complex PLANNED PRs; 1 hour is the operator-
+  # validated upper bound that prevents premature subprocess kills.
+  planned_pr_timeout_sec: 3600
   coder_priority:
     codex: 81
     claude: 76
   exploration_epsilon: 0.15
   rate_limit_pause_percent: 90
+  # PR-231: Operator-confirmed production rate limit thresholds.
+  # 95% session pause keeps coder from hitting hard 5h cap.
+  # 100% weekly pause means run until Anthropic returns rate-limit response.
+  rate_limit_session_pause_percent: 95
+  rate_limit_weekly_pause_percent: 100
   github_api_pause_threshold_percent: 5
   github_api_slowdown_threshold_percent: 20
   github_api_slowdown_multiplier: 5
@@ -33,6 +45,11 @@ daemon:
   watch_slow_window_sec: 300
   watch_slow_poll_interval_sec: 300
   watch_fast_poll_interval_sec: 45
+  # PR-231: Anthropic OAuth beta header. Required for current API tier.
+  # NOTE: Anthropic periodically rotates beta headers. If auth breaks after
+  # an Anthropic announcement, re-verify this value matches the current
+  # supported beta cycle. Loss of correct value broke production on 2026-05-01.
+  usage_api_beta_header: "oauth-2025-04-20"
 web:
   host: 0.0.0.0
   port: 8000
