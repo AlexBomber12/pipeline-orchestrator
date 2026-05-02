@@ -54,6 +54,12 @@ def _page_rendered_at_iso() -> str:
     represents a fresh update — anchoring suppression to server time
     avoids both client-clock skew and the page-render→SSE-subscribe gap
     in which legitimate live events would otherwise be discarded.
+
+    Capture this cutoff BEFORE reading repo state so an event published
+    in the gap between snapshot read and cutoff generation cannot be
+    suppressed despite not being reflected in the rendered HTML; events
+    older than the cutoff are then guaranteed to predate the snapshot
+    read and thus already appear in the rendered HTML.
     """
     return (
         datetime.now(timezone.utc)
@@ -733,6 +739,7 @@ def _compute_stats(states: list[RepoState]) -> dict[str, Any]:
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
+    page_rendered_at = _page_rendered_at_iso()
     states, redis_warning = await _app.get_all_repo_states(
         redis_client, _app.CONFIG_PATH
     )
@@ -750,7 +757,7 @@ async def index(request: Request) -> HTMLResponse:
             "latest_alert": latest_alert,
             "redis_warning": redis_warning,
             "resources": resources,
-            "page_rendered_at": _page_rendered_at_iso(),
+            "page_rendered_at": page_rendered_at,
         },
     )
 
@@ -875,6 +882,7 @@ async def partial_alerts(request: Request) -> HTMLResponse:
 @router.get("/repo/{name}", response_class=HTMLResponse)
 async def repo_detail(request: Request, name: str) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
+    page_rendered_at = _page_rendered_at_iso()
     context = await _app._repo_template_context(
         name,
         redis_client,
@@ -887,7 +895,7 @@ async def repo_detail(request: Request, name: str) -> HTMLResponse:
             "title": name,
             **context,
             "events": list(context["repo"].history),
-            "page_rendered_at": _page_rendered_at_iso(),
+            "page_rendered_at": page_rendered_at,
         },
     )
 

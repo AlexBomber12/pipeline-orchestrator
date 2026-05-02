@@ -1079,6 +1079,50 @@ def test_index_bootstraps_progress_sse_manager(
     assert "replay_complete" not in body
 
 
+def test_index_captures_page_rendered_at_before_reading_state(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The replay-suppression cutoff must be sampled BEFORE the state
+    snapshot read. Otherwise an event published in the gap between the
+    snapshot read and cutoff sampling is not reflected in the rendered
+    HTML yet still gets classified as ``replayed`` (timestamp <
+    pageRenderedAt) and discarded — repo cards and stats would stay
+    stale until the 30s fallback poll or a later event arrived.
+    Capturing the cutoff first guarantees that any frame older than it
+    is part of the snapshot the page was rendered from.
+    """
+    from src.web.routes import dashboard as dashboard_routes
+
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    call_order: list[str] = []
+
+    real_iso = dashboard_routes._page_rendered_at_iso
+
+    def spy_iso() -> str:
+        call_order.append("page_rendered_at")
+        return real_iso()
+
+    real_get_states = web_app.get_all_repo_states
+
+    async def spy_get_states(*args: object, **kwargs: object):
+        call_order.append("get_all_repo_states")
+        return await real_get_states(*args, **kwargs)
+
+    monkeypatch.setattr(dashboard_routes, "_page_rendered_at_iso", spy_iso)
+    monkeypatch.setattr(web_app, "get_all_repo_states", spy_get_states)
+
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert "page_rendered_at" in call_order
+    assert "get_all_repo_states" in call_order
+    assert call_order.index("page_rendered_at") < call_order.index(
+        "get_all_repo_states"
+    )
+
+
 def test_partial_stats_renders_status_bar(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1259,6 +1303,47 @@ def test_repo_detail_route_renders_full_page(
     assert "REPLAY_SKEW_MS" not in body
     assert "liveSinceMs" not in body
     assert "replay_complete" not in body
+
+
+def test_repo_detail_captures_page_rendered_at_before_reading_state(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The repo-detail cutoff must be sampled BEFORE the per-repo state
+    read for the same reason as the dashboard route: an event published
+    in the gap between snapshot read and cutoff sampling would not be
+    in the rendered summary yet would be classified as replayed and
+    suppressed, leaving the summary stale until the 30s fallback poll.
+    """
+    from src.web.routes import dashboard as dashboard_routes
+
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    call_order: list[str] = []
+
+    real_iso = dashboard_routes._page_rendered_at_iso
+
+    def spy_iso() -> str:
+        call_order.append("page_rendered_at")
+        return real_iso()
+
+    real_ctx = dashboard_routes._repo_template_context
+
+    async def spy_ctx(*args: object, **kwargs: object):
+        call_order.append("repo_template_context")
+        return await real_ctx(*args, **kwargs)
+
+    monkeypatch.setattr(dashboard_routes, "_page_rendered_at_iso", spy_iso)
+    monkeypatch.setattr(dashboard_routes, "_repo_template_context", spy_ctx)
+
+    with TestClient(app) as client:
+        response = client.get("/repo/example__alpha")
+
+    assert response.status_code == 200
+    assert "page_rendered_at" in call_order
+    assert "repo_template_context" in call_order
+    assert call_order.index("page_rendered_at") < call_order.index(
+        "repo_template_context"
+    )
 
 
 def test_repo_summary_banner_keeps_fragment_wrapped(
