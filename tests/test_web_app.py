@@ -1044,6 +1044,17 @@ def test_index_bootstraps_progress_sse_manager(
     assert "window.repoProgressSSEManager" in body
     assert "new EventSource('/api/repos/' + encodeURIComponent(repoName) + '/events')" in body
     assert "const MAX_DELAY_MS = 10000;" in body
+    # The SSE consumer must relay history_updated so pause/resume/stop —
+    # which only mutate user_paused — refresh the repo-cards' play/pause
+    # controls. Without it the cards stay stale until state.state moves.
+    assert (
+        "['state_change', 'event_log_append', "
+        "'history_updated', 'pr_metrics_update']" in body
+    )
+    assert (
+        'hx-trigger="repo:state_change from:body, '
+        'repo:history_updated from:body"' in body
+    )
 
 
 def test_partial_stats_renders_status_bar(
@@ -1183,7 +1194,15 @@ def test_repo_detail_route_renders_full_page(
     assert "alpha" in body
     assert "All repositories" in body
     assert 'hx-get="/partials/repo/example__alpha"' in body
-    assert 'hx-trigger="load, repo:state_change from:body"' in body
+    # Pause/resume/stop publish history_updated; the summary fragment
+    # owns the play/pause/stop controls (their visibility depends on
+    # repo.user_paused), so it must refresh on history_updated too —
+    # otherwise an IDLE repo's controls stay stale until something else
+    # changes state.state.
+    assert (
+        'hx-trigger="load, repo:state_change from:body, '
+        'repo:history_updated from:body"' in body
+    )
     assert "Current Task" in body
     assert "Current PR" in body
     assert 'hx-post="/repos/example__alpha/coder"' in body

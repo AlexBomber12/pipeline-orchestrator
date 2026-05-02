@@ -10,12 +10,15 @@
     </a>
 </div>
 
-{# Summary refreshes on SSE state_change; the event log lives outside
-   this container so its DOM (and scroll position) is preserved when
-   the summary swaps. The badge now runs its pulse animation between
-   state transitions instead of restarting every 5s, fixing OBS-AM. #}
+{# Summary refreshes on SSE state_change AND history_updated; the latter
+   carries pause/resume/stop mutations of repo.user_paused (which the
+   play/pause/stop controls depend on) when state.state itself does not
+   transition. The event log lives outside this container so its DOM
+   (and scroll position) is preserved when the summary swaps. The badge
+   now runs its pulse animation between state transitions instead of
+   restarting every 5s, fixing OBS-AM. #}
 <div hx-get="/partials/repo/{{ repo.name }}"
-     hx-trigger="load, repo:state_change from:body"
+     hx-trigger="load, repo:state_change from:body, repo:history_updated from:body"
      hx-swap="innerHTML">
     {% include "components/repo_summary.html" %}
 </div>

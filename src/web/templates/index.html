@@ -3,8 +3,12 @@
 {% block title %}Dashboard - Pipeline Orchestrator{% endblock %}
 
 {% block content %}
+{# Cards refresh on state_change AND history_updated: pause/resume/stop
+   mutate repo.user_paused (which controls play/pause/stop visibility) and
+   emit history_updated, so without the second trigger the controls would
+   stay stale until an unrelated state transition fired. #}
 <div hx-get="/partials/repo-list"
-     hx-trigger="repo:state_change from:body"
+     hx-trigger="repo:state_change from:body, repo:history_updated from:body"
      hx-swap="innerHTML"
      id="repo-grid">
     {% include "components/repo_cards.html" %}
@@ -123,7 +127,7 @@
                 entry.delayMs = BASE_DELAY_MS;
             });
 
-            ['state_change', 'event_log_append', 'pr_metrics_update'].forEach(function (eventName) {
+            ['state_change', 'event_log_append', 'history_updated', 'pr_metrics_update'].forEach(function (eventName) {
                 source.addEventListener(eventName, function () {
                     if (window.htmx) {
                         window.htmx.trigger(document.body, 'repo:' + eventName);

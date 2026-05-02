@@ -243,6 +243,83 @@ def test_publish_state_drains_pending_event_log_entries(
     assert runner._pending_event_log_entries == []
 
 
+def test_publish_pending_event_log_entries_requeues_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient publish failure must keep the unsent entries (failed
+    plus not-yet-attempted) at the head of the queue so a later cycle
+    can retry — otherwise live event_log_append events are silently
+    dropped while history is already persisted in state.history."""
+    call_count = {"n": 0}
+    published: list[dict[str, object]] = []
+
+    async def _flaky_publish_repo_event(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, object],
+        redis_client: object | None = None,
+    ) -> None:
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("redis offline")
+        published.append(payload)
+
+    monkeypatch.setattr(runner_module, "publish_repo_event", _flaky_publish_repo_event)
+
+    runner = _make_runner()
+    runner._last_published_state_value = runner.state.state.value
+    runner.log_event("first event")
+    runner.log_event("second event")
+    runner.log_event("third event")
+
+    with pytest.raises(RuntimeError, match="redis offline"):
+        asyncio.run(runner.publish_state())
+
+    # First entry was published; second failed mid-flight and must be
+    # retained alongside the third (not-yet-attempted) entry.
+    assert [payload["entry"]["event"] for payload in published] == ["first event"]
+    assert [
+        entry["event"] for entry in runner._pending_event_log_entries
+    ] == ["second event", "third event"]
+
+
+def test_publish_pending_event_log_entries_retry_drains_remainder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a transient failure clears, the next publish_state must
+    drain the re-queued entries in original FIFO order."""
+    fail_next = {"flag": True}
+    published: list[str] = []
+
+    async def _publish_repo_event(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, object],
+        redis_client: object | None = None,
+    ) -> None:
+        if event_type != "event_log_append":
+            return
+        if fail_next["flag"]:
+            fail_next["flag"] = False
+            raise RuntimeError("redis offline")
+        published.append(payload["entry"]["event"])
+
+    monkeypatch.setattr(runner_module, "publish_repo_event", _publish_repo_event)
+
+    runner = _make_runner()
+    runner._last_published_state_value = runner.state.state.value
+    runner.log_event("first event")
+    runner.log_event("second event")
+
+    with pytest.raises(RuntimeError, match="redis offline"):
+        asyncio.run(runner.publish_state())
+
+    # Retry succeeds and drains both entries in FIFO order.
+    asyncio.run(runner.publish_state())
+    assert published == ["first event", "second event"]
+    assert runner._pending_event_log_entries == []
+
+
 def test_log_event_dedup_queues_updated_entry_for_event_log_append() -> None:
     """Dedup must still publish an event_log_append so live counter
     updates ("waiting 1/20m" -> "waiting 2/20m") reach subscribers."""

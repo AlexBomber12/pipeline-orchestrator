@@ -747,18 +747,32 @@ class PipelineRunner(
         self._last_published_state_value = current
 
     async def _publish_pending_event_log_entries(self) -> None:
-        """Drain queued log entries as event_log_append SSE events."""
+        """Drain queued log entries as event_log_append SSE events.
+
+        Each entry is removed only after the publish succeeds. If
+        ``publish_repo_event`` raises (transient Redis outage), the
+        failed entry and any not-yet-attempted ones are kept at the head
+        of the queue so a later cycle can retry — otherwise subscribers
+        would silently miss live updates while history was already
+        persisted in ``state.history``.
+        """
         if not self._pending_event_log_entries:
             return
         pending = self._pending_event_log_entries
         self._pending_event_log_entries = []
-        for entry in pending:
-            await publish_repo_event(
-                self.name,
-                "event_log_append",
-                {"entry": entry},
-                redis_client=self.redis,
-            )
+        for index, entry in enumerate(pending):
+            try:
+                await publish_repo_event(
+                    self.name,
+                    "event_log_append",
+                    {"entry": entry},
+                    redis_client=self.redis,
+                )
+            except Exception:
+                self._pending_event_log_entries = (
+                    list(pending[index:]) + self._pending_event_log_entries
+                )
+                raise
 
     def _compute_diff_stats(self, base_branch: str) -> dict[str, object]:
         """Compute file/language/line stats for the current branch vs base."""
