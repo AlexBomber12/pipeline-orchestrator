@@ -380,23 +380,24 @@ class IdleMixin:
     async def handle_idle(self) -> None:
         """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
         self._error_diagnose_policy.reset(self)
+        # The 304 streak counts only cycles that actually reached
+        # ``get_merged_prs`` and saw HTTP 304. Reset by default so any
+        # other outcome — success, non-304 failure, or an early return
+        # that skips the merged-PR fetch entirely (user_paused,
+        # pending_queue_sync still unresolved, ``sync_to_main`` or
+        # ``get_open_prs`` failed earlier this cycle) — breaks the
+        # streak. Reset first so every early-return path below shares
+        # the same semantics; the 304 branch later restores the prior
+        # count and increments it.
+        prev_merged_pr_304_streak = getattr(
+            self, "_idle_merged_pr_304_streak", 0,
+        )
+        self._idle_merged_pr_304_streak = 0
         if self.state.user_paused:
             return
         if self.state.pending_queue_sync_branch is not None:
             if not await self._resolve_pending_queue_sync():
                 return
-
-        # The 304 streak counts only cycles that actually reached
-        # ``get_merged_prs`` and saw HTTP 304. Reset by default so any
-        # other outcome — success, non-304 failure, or an early return
-        # that skips the merged-PR fetch entirely (e.g. ``sync_to_main``
-        # or ``get_open_prs`` failed earlier this cycle) — breaks the
-        # streak. The 304 branch below restores the prior count and
-        # increments it; any other path leaves the streak at zero.
-        prev_merged_pr_304_streak = getattr(
-            self, "_idle_merged_pr_304_streak", 0,
-        )
-        self._idle_merged_pr_304_streak = 0
 
         try:
             self.sync_to_main()

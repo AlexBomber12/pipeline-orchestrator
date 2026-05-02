@@ -10854,6 +10854,43 @@ def test_handle_idle_resets_merged_pr_http_304_streak_when_check_skipped(
     )
 
 
+def test_handle_idle_resets_merged_pr_http_304_streak_on_pending_queue_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-236 follow-up: a cycle that exits via the pending-queue-sync
+    early return must reset the 304 streak too, so non-consecutive 304s
+    don't accumulate across unrelated skipped cycles and trigger a
+    spurious degraded-detection warning later."""
+    _patch_subprocess(monkeypatch)
+
+    async def fake_resolve() -> bool:
+        return False
+
+    def fail_get_merged_prs(repo, branch, refresh=False):
+        raise AssertionError(
+            "get_merged_prs must not run when pending queue sync is unresolved"
+        )
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        fail_get_merged_prs,
+    )
+
+    runner = _make_runner()
+    runner.state.pending_queue_sync_branch = "queue-sync/pr-120"
+    runner._resolve_pending_queue_sync = fake_resolve  # type: ignore[method-assign]
+    runner._idle_merged_pr_304_streak = 9
+
+    asyncio.run(runner.handle_idle())
+
+    assert runner._idle_merged_pr_304_streak == 0
+    assert not any(
+        "merged-PR detection degraded" in e["event"]
+        for e in runner.state.history
+    )
+
+
 def test_handle_idle_uses_fallback_queue_counters_when_dag_picks_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
