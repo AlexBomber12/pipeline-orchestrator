@@ -21,7 +21,7 @@ from src.config import load_config
 from src.keyspace import control_stop, pipeline_state
 from src.models import PipelineState, RepoState, TaskStatus
 from src.web import app as _app
-from src.web.routes.dashboard import _effective_coder_name
+from src.web.services.coder import _effective_coder_name
 from src.web.services.repo_state import (
     _default_repo_state,
     _find_repo_config_by_name,

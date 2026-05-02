@@ -31,6 +31,7 @@ from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
 from src.utils import repo_slug_from_url
 from src.web import app as _app
+from src.web.services.coder import _effective_coder_name
 from src.web.services.repo_state import _find_repo_config_by_name
 
 router = APIRouter()
@@ -59,15 +60,6 @@ def _format_reset_unix(reset_unix: int | None) -> str:
     return datetime.fromtimestamp(int(reset_unix), tz=timezone.utc).strftime(
         "%H:%M UTC"
     )
-
-
-def _effective_coder_name(
-    repo_config: RepoConfig | None, config: AppConfig
-) -> str:
-    """Return the effective coder name for a repo."""
-    if repo_config is not None and repo_config.coder is not None:
-        return repo_config.coder.value
-    return config.daemon.coder.value
 
 
 def _daemon_default_coder_name(config: AppConfig) -> str:
