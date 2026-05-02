@@ -2884,7 +2884,7 @@ def test_handle_idle_waits_for_pending_queue_sync(
     _patch_subprocess(monkeypatch)
     sync_calls: list[str] = []
 
-    def fake_resolve() -> bool:
+    async def fake_resolve() -> bool:
         sync_calls.append("pending")
         return False
 
@@ -8028,7 +8028,7 @@ def test_mark_queue_done_logs_warning_on_write_failure(
 def test_resolve_pending_queue_sync_returns_true_without_branch() -> None:
     runner = _make_runner()
 
-    assert runner._resolve_pending_queue_sync() is True
+    assert asyncio.run(runner._resolve_pending_queue_sync()) is True
 
 
 def test_resolve_pending_queue_sync_continues_when_pr_open(
@@ -8044,13 +8044,17 @@ def test_resolve_pending_queue_sync_continues_when_pr_open(
     runner = _make_runner()
     runner.state.pending_queue_sync_branch = "queue-done-pr-001"
     runner.state.pending_queue_sync_started_at = datetime.now(timezone.utc)
+
+    async def fake_escalate(branch: str) -> None:
+        escalations.append(branch)
+
     monkeypatch.setattr(
         runner,
         "_escalate_queue_sync_if_expired",
-        lambda branch: escalations.append(branch),
+        fake_escalate,
     )
 
-    assert runner._resolve_pending_queue_sync() is False
+    assert asyncio.run(runner._resolve_pending_queue_sync()) is False
     assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
     assert escalations == ["queue-done-pr-001"]
 
@@ -8073,7 +8077,7 @@ def test_resolve_pending_queue_sync_clears_state_when_pr_merged(
     events: list[str] = []
     monkeypatch.setattr(runner, "log_event", events.append)
 
-    assert runner._resolve_pending_queue_sync() is True
+    assert asyncio.run(runner._resolve_pending_queue_sync()) is True
     assert runner.state.pending_queue_sync_branch is None
     assert runner.state.pending_queue_sync_started_at is None
     assert events == ["[MERGE] Queue-sync PR merged (queue-done-pr-001)."]
@@ -8094,7 +8098,7 @@ def test_resolve_pending_queue_sync_clears_state_when_pr_closed(
     events: list[str] = []
     monkeypatch.setattr(runner, "log_event", events.append)
 
-    assert runner._resolve_pending_queue_sync() is False
+    assert asyncio.run(runner._resolve_pending_queue_sync()) is False
     assert runner.state.pending_queue_sync_branch is None
     assert runner.state.pending_queue_sync_started_at is None
     assert runner.state.state == PipelineState.ERROR
@@ -8116,13 +8120,17 @@ def test_resolve_pending_queue_sync_handles_missing_pr(
 
     runner = _make_runner()
     runner.state.pending_queue_sync_branch = "queue-done-pr-001"
+
+    async def fake_escalate(branch: str) -> None:
+        escalations.append(branch)
+
     monkeypatch.setattr(
         runner,
         "_escalate_queue_sync_if_expired",
-        lambda branch: escalations.append(branch),
+        fake_escalate,
     )
 
-    assert runner._resolve_pending_queue_sync() is False
+    assert asyncio.run(runner._resolve_pending_queue_sync()) is False
     assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
     assert escalations == ["queue-done-pr-001"]
 
@@ -8141,13 +8149,17 @@ def test_resolve_pending_queue_sync_logs_and_escalates_on_view_failure(
     runner.state.pending_queue_sync_branch = "queue-done-pr-001"
     events: list[str] = []
     monkeypatch.setattr(runner, "log_event", events.append)
+
+    async def fake_escalate(branch: str) -> None:
+        escalations.append(branch)
+
     monkeypatch.setattr(
         runner,
         "_escalate_queue_sync_if_expired",
-        lambda branch: escalations.append(branch),
+        fake_escalate,
     )
 
-    assert runner._resolve_pending_queue_sync() is False
+    assert asyncio.run(runner._resolve_pending_queue_sync()) is False
     assert events == [
         "[MERGE] queue-sync PR queue-done-pr-001 view failed: gh unavailable."
     ]
@@ -8158,7 +8170,7 @@ def test_escalate_queue_sync_no_op_when_started_at_missing() -> None:
     runner = _make_runner()
     runner.state.pending_queue_sync_branch = "queue-done-pr-001"
 
-    runner._escalate_queue_sync_if_expired("queue-done-pr-001")
+    asyncio.run(runner._escalate_queue_sync_if_expired("queue-done-pr-001"))
 
     assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
     assert runner.state.pending_queue_sync_started_at is None
@@ -8172,7 +8184,7 @@ def test_escalate_queue_sync_no_op_when_not_expired() -> None:
         datetime.now(timezone.utc) - timedelta(minutes=5)
     )
 
-    runner._escalate_queue_sync_if_expired("queue-done-pr-001")
+    asyncio.run(runner._escalate_queue_sync_if_expired("queue-done-pr-001"))
 
     assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
     assert runner.state.pending_queue_sync_started_at is not None
@@ -8190,7 +8202,7 @@ def test_escalate_queue_sync_transitions_to_error_when_expired(
     events: list[str] = []
     monkeypatch.setattr(runner, "log_event", events.append)
 
-    runner._escalate_queue_sync_if_expired("queue-done-pr-001")
+    asyncio.run(runner._escalate_queue_sync_if_expired("queue-done-pr-001"))
 
     assert runner.state.pending_queue_sync_branch is None
     assert runner.state.pending_queue_sync_started_at is None

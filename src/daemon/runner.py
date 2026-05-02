@@ -797,6 +797,8 @@ class PipelineRunner(
             self._apply_diff_stats(record, stats, resolved_base_branch)
         await self._metrics_store.save(record)
 
+    # All ERROR transitions must use this primitive. Direct writes to
+    # ``state.state = PipelineState.ERROR`` are forbidden after PR-219b.
     async def _transition_to_error(
         self,
         message: str,
@@ -804,6 +806,7 @@ class PipelineRunner(
         save_run_record_as: str | None = "error",
         publish: bool = True,
         log_prefix: str = "[ERROR]",
+        log_message: str | None = None,
     ) -> None:
         """Atomic transition to ERROR with consistent telemetry.
 
@@ -812,10 +815,17 @@ class PipelineRunner(
         transitions to PipelineState.ERROR must use this primitive after
         PR-219b ships; direct ``state.state = PipelineState.ERROR`` writes
         are forbidden.
+
+        ``log_message`` overrides the body of the log line when callers
+        need the operator-visible log to differ from ``error_message``
+        (e.g. ``watch.py``'s ``[WATCH] {exc}.`` vs. its more verbose
+        ``error_message``). Defaults to ``message`` so the common case
+        keeps a one-line callsite.
         """
         self.state.state = PipelineState.ERROR
         self.state.error_message = message
-        self.log_event(f"{log_prefix} {message}.")
+        log_body = message if log_message is None else log_message
+        self.log_event(f"{log_prefix} {log_body}.")
         if save_run_record_as:
             await self._save_current_run_record(save_run_record_as)
         if publish:

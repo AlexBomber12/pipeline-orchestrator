@@ -75,13 +75,14 @@ class MergeMixin:
                                 "merge", "--abort",
                                 check=False,
                             )
-                            self.state.state = PipelineState.ERROR
-                            self.state.error_message = (
-                                "No eligible coder available for merge conflict "
-                                "resolution"
+                            await self._transition_to_error(
+                                (
+                                    "No eligible coder available for merge "
+                                    "conflict resolution"
+                                ),
+                                publish=False,
+                                log_prefix="[MERGE]",
                             )
-                            await self._save_current_run_record("error")
-                            self.log_event(f"[MERGE] {self.state.error_message}.")
                             return
                         coder_name, _plugin = selected
                         if not await self._check_rate_limit(
@@ -135,22 +136,22 @@ class MergeMixin:
                                     f"{self.state.rate_limited_until.isoformat()}."
                                 )
                                 return
-                            self.state.state = PipelineState.ERROR
-                            self.state.error_message = (
-                                "Merge conflict resolution failed"
+                            await self._transition_to_error(
+                                "Merge conflict resolution failed",
+                                publish=False,
+                                log_prefix="[MERGE]",
                             )
-                            await self._save_current_run_record("error")
-                            self.log_event(f"[MERGE] {self.state.error_message}.")
                             return
                         sync_produced_commit = True
                     else:
-                        self.state.state = PipelineState.ERROR
-                        self.state.error_message = (
-                            f"git merge origin/{base} failed: "
-                            f"{merge_result.stderr.strip()}"
+                        await self._transition_to_error(
+                            (
+                                f"git merge origin/{base} failed: "
+                                f"{merge_result.stderr.strip()}"
+                            ),
+                            publish=False,
+                            log_prefix="[MERGE]",
                         )
-                        await self._save_current_run_record("error")
-                        self.log_event(f"[MERGE] {self.state.error_message}.")
                         return
                 else:
                     sync_produced_commit = (
@@ -180,20 +181,25 @@ class MergeMixin:
                         f"gates."
                     )
                     if not self._post_codex_review(number):
-                        self.state.state = PipelineState.ERROR
-                        self.state.error_message = (
-                            f"Failed to post @codex review on PR "
-                            f"#{number} after pre-merge sync push; "
-                            "manual review trigger required to avoid "
-                            "merging on stale approval"
+                        await self._transition_to_error(
+                            (
+                                f"Failed to post @codex review on PR "
+                                f"#{number} after pre-merge sync push; "
+                                "manual review trigger required to avoid "
+                                "merging on stale approval"
+                            ),
+                            save_run_record_as=None,
+                            publish=False,
+                            log_prefix="[MERGE]",
                         )
                     return
             except (subprocess.CalledProcessError,
                     subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
-                self.state.state = PipelineState.ERROR
-                self.state.error_message = f"Pre-merge sync failed: {exc}"
-                await self._save_current_run_record("error")
-                self.log_event(f"[MERGE] {self.state.error_message}.")
+                await self._transition_to_error(
+                    f"Pre-merge sync failed: {exc}",
+                    publish=False,
+                    log_prefix="[MERGE]",
+                )
                 return
 
         merged_diff_stats = self._compute_diff_stats(base)
@@ -213,10 +219,12 @@ class MergeMixin:
         try:
             github_client.merge_pr(self.owner_repo, number)
         except Exception as exc:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = f"merge_pr failed: {exc}"
-            await self._save_current_run_record("error")
-            self.log_event(f"[MERGE] {exc}.")
+            await self._transition_to_error(
+                f"merge_pr failed: {exc}",
+                publish=False,
+                log_prefix="[MERGE]",
+                log_message=str(exc),
+            )
             return
 
         try:
@@ -394,7 +402,7 @@ class MergeMixin:
             return
         self.log_event(f"[MERGE] Marked {pr_id} DONE in QUEUE.md.")
 
-    def _resolve_pending_queue_sync(self) -> bool:
+    async def _resolve_pending_queue_sync(self) -> bool:
         """Poll the outstanding queue-sync PR and gate IDLE dispatch.
 
         Returns True when resolved, False when still pending.
@@ -412,7 +420,7 @@ class MergeMixin:
             self.log_event(
                 f"[MERGE] queue-sync PR {branch} view failed: {exc}."
             )
-            self._escalate_queue_sync_if_expired(branch)
+            await self._escalate_queue_sync_if_expired(branch)
             return False
 
         state = ""
@@ -430,17 +438,18 @@ class MergeMixin:
         if state == "CLOSED":
             self.state.pending_queue_sync_branch = None
             self.state.pending_queue_sync_started_at = None
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = (
-                f"queue-sync PR {branch} closed without merging"
+            await self._transition_to_error(
+                f"queue-sync PR {branch} closed without merging",
+                save_run_record_as=None,
+                publish=False,
+                log_prefix="[MERGE]",
             )
-            self.log_event(f"[MERGE] {self.state.error_message}.")
             return False
 
-        self._escalate_queue_sync_if_expired(branch)
+        await self._escalate_queue_sync_if_expired(branch)
         return False
 
-    def _escalate_queue_sync_if_expired(self, branch: str) -> None:
+    async def _escalate_queue_sync_if_expired(self, branch: str) -> None:
         started = self.state.pending_queue_sync_started_at
         if started is None:
             return
@@ -449,9 +458,12 @@ class MergeMixin:
             return
         self.state.pending_queue_sync_branch = None
         self.state.pending_queue_sync_started_at = None
-        self.state.state = PipelineState.ERROR
-        self.state.error_message = (
-            f"queue-sync PR {branch} unresolved after "
-            f"{int(elapsed)}s (max {_QUEUE_SYNC_MAX_WAIT_SEC}s)"
+        await self._transition_to_error(
+            (
+                f"queue-sync PR {branch} unresolved after "
+                f"{int(elapsed)}s (max {_QUEUE_SYNC_MAX_WAIT_SEC}s)"
+            ),
+            save_run_record_as=None,
+            publish=False,
+            log_prefix="[MERGE]",
         )
-        self.log_event(f"[MERGE] {self.state.error_message}.")

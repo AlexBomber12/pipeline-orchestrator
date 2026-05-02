@@ -141,14 +141,14 @@ class RecoveryMixin:
         # cycle re-probes once git is responsive.
         queue_from_origin = self._origin_queue_md_tracked()
         if queue_from_origin is None:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = (
-                "recover_state: tasks/QUEUE.md tracking probe failed; "
-                "retrying next cycle"
-            )
-            self.log_event(
-                "[INFRA] recover_state: tasks/QUEUE.md tracking probe "
-                "failed; retrying next cycle."
+            await self._transition_to_error(
+                (
+                    "recover_state: tasks/QUEUE.md tracking probe failed; "
+                    "retrying next cycle"
+                ),
+                save_run_record_as=None,
+                publish=False,
+                log_prefix="[INFRA]",
             )
             return False
         try:
@@ -156,23 +156,20 @@ class RecoveryMixin:
                 strict=strict, queue_from_origin=queue_from_origin,
             )
         except QueueValidationError as exc:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = (
-                f"recover_state: queue validation failed: {exc}"
-            )
-            self.log_event(
-                f"[INFRA] recover_state: queue validation failed: {exc}."
+            await self._transition_to_error(
+                f"recover_state: queue validation failed: {exc}",
+                save_run_record_as=None,
+                publish=False,
+                log_prefix="[INFRA]",
             )
             return False
         if tasks is None:
             if queue_from_origin:
-                self.state.state = PipelineState.ERROR
-                self.state.error_message = (
-                    "recover_state: read QUEUE.md from origin failed"
-                )
-                self.log_event(
-                    "[INFRA] recover_state: read QUEUE.md from origin "
-                    "failed."
+                await self._transition_to_error(
+                    "recover_state: read QUEUE.md from origin failed",
+                    save_run_record_as=None,
+                    publish=False,
+                    log_prefix="[INFRA]",
                 )
                 return False
             # Post-PR-181 repos gitignore ``tasks/QUEUE.md`` and rely on
@@ -201,9 +198,13 @@ class RecoveryMixin:
                 allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
             )
         except Exception as exc:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = f"recover_state: get_open_prs failed: {exc}"
-            self.log_event(f"[INFRA] recover_state failed: {exc}.")
+            await self._transition_to_error(
+                f"recover_state: get_open_prs failed: {exc}",
+                save_run_record_as=None,
+                publish=False,
+                log_prefix="[INFRA]",
+                log_message=f"recover_state failed: {exc}",
+            )
             return False
         # Ghost filtering uses local task-file existence, which is only a
         # safe signal for post-PR-181 repos (QUEUE.md gitignored, parsed
@@ -290,13 +291,16 @@ class RecoveryMixin:
                 if doing.branch and not self._preserve_crashed_run_commits(
                     doing.branch
                 ):
-                    self.state.state = PipelineState.ERROR
-                    self.state.error_message = (
-                        f"recover_state: could not preserve crashed-run "
-                        f"commits on {doing.branch!r}; refusing to defer "
-                        "CODING while paused"
+                    await self._transition_to_error(
+                        (
+                            f"recover_state: could not preserve crashed-run "
+                            f"commits on {doing.branch!r}; refusing to defer "
+                            "CODING while paused"
+                        ),
+                        save_run_record_as=None,
+                        publish=False,
+                        log_prefix="[INFRA]",
                     )
-                    self.log_event(f"[INFRA] {self.state.error_message}.")
                     return True
                 self.state.current_pr = None
                 self.state.state = PipelineState.IDLE
@@ -316,13 +320,16 @@ class RecoveryMixin:
             if doing.branch and not self._preserve_crashed_run_commits(
                 doing.branch
             ):
-                self.state.state = PipelineState.ERROR
-                self.state.error_message = (
-                    f"recover_state: could not preserve crashed-run "
-                    f"commits on {doing.branch!r}; refusing to mark "
-                    "CANCELED"
+                await self._transition_to_error(
+                    (
+                        f"recover_state: could not preserve crashed-run "
+                        f"commits on {doing.branch!r}; refusing to mark "
+                        "CANCELED"
+                    ),
+                    save_run_record_as=None,
+                    publish=False,
+                    log_prefix="[INFRA]",
                 )
-                self.log_event(f"[INFRA] {self.state.error_message}.")
                 return True
             self._crashed_task_pr_ids.add(doing.pr_id)
             self.state.current_task = None

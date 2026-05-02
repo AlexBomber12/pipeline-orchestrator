@@ -318,9 +318,12 @@ class FixMixin(BreachMixin):
         try:
             github_client.post_comment(self.owner_repo, pr_number, comment)
         except Exception as exc:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = f"post_comment failed: {exc}"
-            self.log_event(f"[FIX] {self.state.error_message}.")
+            await self._transition_to_error(
+                f"post_comment failed: {exc}",
+                save_run_record_as=None,
+                publish=False,
+                log_prefix="[FIX]",
+            )
             return
         try:
             github_client.run_gh(
@@ -343,9 +346,12 @@ class FixMixin(BreachMixin):
                 repo=self.owner_repo,
             )
         except Exception as exc:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = f"pr edit failed: {exc}"
-            self.log_event(f"[FIX] {self.state.error_message}.")
+            await self._transition_to_error(
+                f"pr edit failed: {exc}",
+                save_run_record_as=None,
+                publish=False,
+                log_prefix="[FIX]",
+            )
             return
         current_pr.is_escalated = True
         self.state.error_message = None
@@ -695,11 +701,12 @@ class FixMixin(BreachMixin):
                 RuntimeError,
             ) as exc:
                 stderr = getattr(exc, "stderr", "") or ""
-                self.state.state = PipelineState.ERROR
-                self.state.error_message = (
-                    f"git refresh {branch} failed: {stderr.strip() or exc}"
+                await self._transition_to_error(
+                    f"git refresh {branch} failed: {stderr.strip() or exc}",
+                    save_run_record_as=None,
+                    publish=False,
+                    log_prefix="[FIX]",
                 )
-                self.log_event(f"[FIX] {self.state.error_message}.")
                 return
 
         head_before = ""  # PR-050: detect whether a commit actually happened
@@ -808,14 +815,17 @@ class FixMixin(BreachMixin):
                         elif not self._post_codex_review(
                             self.state.current_pr.number
                         ):
-                            self.state.state = PipelineState.ERROR
-                            self.state.error_message = (
-                                f"Failed to post @codex review on PR "
-                                f"#{self.state.current_pr.number} after "
-                                "breach-cancel fix push; manual review "
-                                "trigger required"
+                            await self._transition_to_error(
+                                (
+                                    f"Failed to post @codex review on PR "
+                                    f"#{self.state.current_pr.number} after "
+                                    "breach-cancel fix push; manual review "
+                                    "trigger required"
+                                ),
+                                save_run_record_as=None,
+                                publish=False,
+                                log_prefix="[FIX]",
                             )
-                            self.log_event(f"[FIX] {self.state.error_message}.")
                             return
                 self.state.state = PipelineState.PAUSED
                 self.state.error_message = None
@@ -871,14 +881,17 @@ class FixMixin(BreachMixin):
                     elif not self._post_codex_review(
                         self.state.current_pr.number
                     ):
-                        self.state.state = PipelineState.ERROR
-                        self.state.error_message = (
-                            f"Failed to post @codex review on PR "
-                            f"#{self.state.current_pr.number} after "
-                            "late-breach fix push; manual review "
-                            "trigger required"
+                        await self._transition_to_error(
+                            (
+                                f"Failed to post @codex review on PR "
+                                f"#{self.state.current_pr.number} after "
+                                "late-breach fix push; manual review "
+                                "trigger required"
+                            ),
+                            save_run_record_as=None,
+                            publish=False,
+                            log_prefix="[FIX]",
                         )
-                        self.log_event(f"[FIX] {self.state.error_message}.")
                         return
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
@@ -917,7 +930,7 @@ class FixMixin(BreachMixin):
             self.log_event("[FIX] FIX aborted: user stop requested.")
             return True
 
-        def read_head_after_fix() -> str | None:
+        async def read_head_after_fix() -> str | None:
             try:
                 return git_ops._git(
                     self.repo_path, "rev-parse", "HEAD"
@@ -927,9 +940,12 @@ class FixMixin(BreachMixin):
                 subprocess.TimeoutExpired,
                 OSError,
             ) as exc:
-                self.state.state = PipelineState.ERROR
-                self.state.error_message = f"rev-parse after fix failed: {exc}"
-                self.log_event(f"[FIX] {self.state.error_message}.")
+                await self._transition_to_error(
+                    f"rev-parse after fix failed: {exc}",
+                    save_run_record_as=None,
+                    publish=False,
+                    log_prefix="[FIX]",
+                )
                 return None
 
         def remote_branch_contains_head(branch: str, head_after: str) -> bool:
@@ -943,7 +959,7 @@ class FixMixin(BreachMixin):
                 is True
             )
 
-        def record_fix_push(head_after: str, failure_detail: str) -> bool:
+        async def record_fix_push(head_after: str, failure_detail: str) -> bool:
             if head_before and head_before == head_after:
                 return True
 
@@ -970,10 +986,14 @@ class FixMixin(BreachMixin):
                 elif not self._post_codex_review(
                     self.state.current_pr.number
                 ):
-                    self.state.state = PipelineState.ERROR
-                    self.state.error_message = (
-                        f"Failed to post @codex review on PR "
-                        f"#{self.state.current_pr.number} {failure_detail}"
+                    await self._transition_to_error(
+                        (
+                            f"Failed to post @codex review on PR "
+                            f"#{self.state.current_pr.number} {failure_detail}"
+                        ),
+                        save_run_record_as=None,
+                        publish=False,
+                        log_prefix="[FIX]",
                     )
                     return False
             return True
@@ -987,11 +1007,12 @@ class FixMixin(BreachMixin):
             # (Codex P2 on PR #222).
             if self.state.current_pr is not None:
                 no_push_policy.reset(self.state.current_pr)
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = (
-                f"FIX idle timeout: no push for {idle_limit}s"
+            await self._transition_to_error(
+                f"FIX idle timeout: no push for {idle_limit}s",
+                save_run_record_as=None,
+                publish=False,
+                log_prefix="[FIX]",
             )
-            self.log_event(f"[FIX] {self.state.error_message}.")
             await self._save_cli_log("", "", "FIX idle timeout")
             if await pause_for_stop_after_bookkeeping():
                 return
@@ -1018,7 +1039,7 @@ class FixMixin(BreachMixin):
                 return
             return
         if stop_cancelled:
-            head_after = read_head_after_fix()
+            head_after = await read_head_after_fix()
             if head_after is None:
                 return
             # Stop-cancel breaks the consecutive no-push streak (Codex P2
@@ -1028,7 +1049,7 @@ class FixMixin(BreachMixin):
                 no_push_policy.reset(self.state.current_pr)
             branch = self.state.current_pr.branch if self.state.current_pr is not None else ""
             if branch and remote_branch_contains_head(branch, head_after):
-                if not record_fix_push(
+                if not await record_fix_push(
                     head_after,
                     "after stop-cancel fix push; manual review trigger "
                     "required to avoid fix/push loop",
@@ -1063,15 +1084,15 @@ class FixMixin(BreachMixin):
                 return
             if await pause_for_stop_after_bookkeeping():
                 return
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = stderr.strip() or f"{coder_name} exit {code}"
-            self.log_event(
-                f"[FIX] [{coder_name}] fix_review failed: "
-                f"{self.state.error_message}."
+            await self._transition_to_error(
+                stderr.strip() or f"{coder_name} exit {code}",
+                save_run_record_as=None,
+                publish=False,
+                log_prefix=f"[FIX] [{coder_name}] fix_review failed:",
             )
             return
 
-        head_after = read_head_after_fix()
+        head_after = await read_head_after_fix()
         if head_after is None:
             return
 
@@ -1125,7 +1146,7 @@ class FixMixin(BreachMixin):
             self.state.state = PipelineState.WATCH
             return
 
-        if not record_fix_push(
+        if not await record_fix_push(
             head_after,
             "after fix push; manual review trigger required "
             "to avoid fix/push loop",
