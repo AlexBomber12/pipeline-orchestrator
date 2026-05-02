@@ -2,7 +2,7 @@
 
 Живой документ. Обновляется после каждой merge'нутой волны и после каждой chat-session.
 
-Последнее обновление: 2026-05-02 (OBS-BE scope расширен: cause-of-CANCELED preservation для всех путей, не только ESCALATE. Storage `cancellation:{repo_name}:{task_id}`, TTL via `_TTL_SECONDS` из metrics.py, UI inline-expand. Cancellation policy section добавлена: behaviour matrix CRASH/ESCALATE/TIMEOUT/INFRA × Active/Off, layered SignalSource Protocol с heartbeat + manual override + active hours config, Human Availability indicator как non-negotiable UI requirement, dependency-aware blocked_set, dashboard sort by dependents_count, Variant A confirmed для transition. v1.1 refinements зафиксированы: 4-state visual scheme (Green/Yellow/Red-stripe/Cross мапятся на 2 behaviour bucket ESCALATE/SKIP), expected-wait-time differentiation между Red и Cross определяет dashboard sort и digest threshold, welcome-back digest modal для возврата после long-away periods (Mail/Slack-style summary). Vision C "Orchestrator Companion App" добавлен как design hook без реализации в v1. Wave 5 cumulative ~16h над OBS-AW + OBS-BB + OBS-BC; v1.1 refinements add ~3-5h когда дойдут).
+Последнее обновление: 2026-05-02 (OBS-BE scope расширен: cause-of-CANCELED preservation для всех путей, не только ESCALATE. Storage `cancellation:{repo_name}:{task_id}`, TTL via `_TTL_SECONDS` из metrics.py, UI inline-expand. Cancellation policy section добавлена: behaviour matrix CRASH/ESCALATE/TIMEOUT/INFRA × Active/Off, layered SignalSource Protocol с heartbeat + manual override + active hours config, Human Availability indicator как non-negotiable UI requirement, dependency-aware blocked_set, dashboard sort by dependents_count, Variant A confirmed для transition. v1.1 refinements: 4-state visual scheme, expected-wait-time differentiation Red vs Cross, welcome-back digest modal. Vision C "Orchestrator Companion App" desktop client как parallel product surface. Vision D "Conversational morning triage" через Telegram bot 4-stage gating (D.1 digest push opportunistic post-v1, D.2 interactive triage post-Vision-A, D.3 voice agent far horizon, D.4 telephony if Vision D becomes core). Wave 5 cumulative ~16h над OBS-AW + OBS-BB + OBS-BC).
 
 Предыдущие: 2026-05-01 (PR-180..PR-207 shipped, все 28 PR merged. Multi-repo isolation audit complete, parallel run_cycle in main loop deployed. Foundation Sprint 36 PR specs generated for PR-208..PR-236 batch, internal architecture cleanup. Architectural future work section added for post-Foundation: AGENTS template scope, per-repo config, onboarding wizard, CI script generator MICRO PR. Onboarding of megaraid-dashboard и sms-gateway-v2 actively in progress; reconciled AGENTS.md files prepared, scripts/ci.sh manual creation required pre-onboarding due to scaffolder stub trap), 2026-04-29 (full roadmap rewrite на основе Implementation Audit), 2026-04-28 (sigkill recovery test multi-race resolved via PR-228/PR-232/PR-234/PR-236; production daemon deployed on fresh main; GraphQL quota burn analyzed; onboarding test subjects identified), 2026-04-27 (OBS-AA test pollution v1 misdiagnosis + v2 docker-exec fix; OBS-Y premature merge; Multi-tier agent direction; OBS-Z Codex EYES race), 2026-04-26 (Sprint F1.0 + PR-156/157 + PR-158/159 merged; Variant D direction; Development model & Layer 2 substrate observations), 2026-04-24 (after code audit zip __27__).
 
@@ -618,6 +618,56 @@ Cross-platform desktop client surfacing daemon state and presence outside the br
 - Build only if and when self-hosted operator base demands cross-machine awareness (notebook closed, daemon on home server, status visible from phone or work machine).
 
 **Estimate:** approximately 2-3 weeks for initial desktop client; a separate subproject outside Foundation Sprint, Wave 1-7, and Vision A streams. Not a roadmap PR series. Revisit when Vision A ships and product is stable enough that auxiliary surfaces are worth the maintenance overhead.
+
+### Conversational morning triage (Vision D, added 2026-05-02)
+
+Endgame product surface where operator interacts with orchestrator through natural conversation, primarily over Telegram (text + voice messages), instead of (or alongside) browser dashboard. Concept emerged from operator framing 2026-05-02: wake up, open Telegram, see overnight summary already waiting, reply with voice or text to triage. No keyboard, no Safari tabs, no manual UI.
+
+**Why this matters strategically:**
+
+Vision D is the **logical consumer** of the substrate already designed in Cancellation policy + OBS-BE expanded. The same `/api/digest`, `/api/cancellation/{repo}/{task}`, `/api/presence/*` endpoints that power browser modal also power conversational surface. JSON identical, render different: dashboard renders modal, Telegram bot renders narrative messages, future voice agent renders TTS.
+
+Strategic moat reinforcement: a competing orchestrator now needs to reproduce not only routing intelligence and measurement data, but also a structured-digest substrate without which voice/conversational layer is impossible to build cleanly. Voice surface is downstream proof that internal API design is right.
+
+**Stage gating (each stage shippable independently, each adds value):**
+
+**Stage D.1 — Telegram digest bot (close horizon, ~1-2 weekends).** Simple push notification flow: when daemon detects operator long-away return condition (per Cancellation policy welcome-back digest trigger), bot pushes a text message via Telegram with the same content the modal would show. Operator reads, switches context. No interactivity beyond reading. Stack: existing `python-telegram-bot` library, daemon registers a webhook endpoint, bot polls `/api/digest` on schedule or on operator-presence-transition Redis pub/sub. Implementation cost ~6-8 hours.
+
+**Stage D.2 — Telegram interactive triage (medium horizon, ~1-2 weeks).** Bot accepts text and voice replies. Voice transcribed via Whisper (local on DGX Spark to keep self-hosted property, OR OpenAI Whisper API for managed deployment). Reply intent parsed into action options shown for each CANCELED/ESCALATED entry: "re-upload", "permanently cancel", "rewrite spec", "show me the cause", "defer to tomorrow". Bot translates operator intent into orchestrator API calls. Implements `TelegramSessionSource` per `SignalSource` Protocol so a recent voice/text exchange counts as active heartbeat (presence flips green automatically when operator engages with bot). Implementation cost ~3-5 days.
+
+**Stage D.3 — full voice agent with reasoning narrative (far horizon).** Bot/agent generates spoken digest narratives ("PR-220 cancelled three hours ago because... it blocks 5 dependent PRs... last similar issue resolved by re-upload with production config... want me to do that?"), accepts free-form voice instructions ("re-upload PR-220 and skip PR-225 for today"), parses ambiguity and asks clarifying questions ("you said skip PR-225, that has 3 dependents, are you sure?"). Voice tone conversational rather than corporate. Implementation requires LLM-based dialogue manager on top of orchestrator API, a more substantial subproject. ~3-4 weeks.
+
+**Stack rationale:**
+
+Telegram-first (over iOS Shortcuts, Twilio/IVR, custom WebRTC):
+- Operator already heavy Telegram user (sms-gateway-v2 system memory).
+- Cross-platform (phone, desktop, web) without per-platform build.
+- Voice messages built-in primitive, no STT pipeline before custom processing.
+- Free for personal scale; bot infrastructure is one process.
+- Self-hosted compatible; bot runs as a sidecar service in same docker-compose stack.
+
+iOS Shortcuts + Siri considered: native feel, but iOS-only and brittle to OS updates. Defer as alternative client when D.2 ships.
+
+Twilio/IVR considered: closest to literal "позвонил по виртуальному помощнику", but adds telephony cost and infrastructure complexity disproportionate to MVP. Defer as Stage D.4 if Vision D proves valuable enough.
+
+**Cross-references:**
+
+- `/api/digest` from Cancellation policy welcome-back digest subsection: same endpoint, two consumers.
+- `cancellation:{repo_name}:{task_id}` Redis storage from OBS-BE expanded: bot reads cause text directly.
+- `SignalSource` Protocol from Cancellation policy: TelegramSessionSource registered alongside HeartbeatSource and ManualOverrideSource.
+- Vision C "Orchestrator Companion App": parallel product surface, not competing. Desktop visual surface and conversational voice surface address different operator contexts (focused work vs morning triage from bed).
+
+**Defer rationale and ordering:**
+
+Vision D is **architecturally close** because substrate exists; **strategically defer** because Vision A multi-vendor routing must ship first to make the product itself worth a conversational interface. Order: Vision A → Vision C (companion app, optional) → Vision D.1 (Telegram digest, low cost trial) → Vision D.2 (interactive triage, validates conversational UX) → Vision D.3 (voice agent, only if D.2 traction justifies).
+
+Stage D.1 specifically is **eligible for opportunistic implementation** at any point after Cancellation policy v1 ships, because cost is low (~1-2 weekends) and value is immediate for operator's own workflow. Does not need to wait behind Vision A; can run in parallel as personal-use improvement.
+
+**Estimate summary:**
+- D.1: ~6-8 hours, opportunistic post-Cancellation-policy-v1.
+- D.2: ~3-5 days, after Vision A initial vendor plugin ships.
+- D.3: ~3-4 weeks, requires demand validation from D.2 usage.
+- D.4 (telephony): only if Vision D becomes core product surface, not before.
 
 ---
 
