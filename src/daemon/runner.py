@@ -266,7 +266,9 @@ class PipelineRunner(
         self._last_codex_review_head_sha: str | None = None
         self._queue_progress_dirty = False
         self._last_published_queue_progress: tuple[int, int] | None = None
-        self._last_published_state_signature: tuple[str, tuple] | None = None
+        self._last_published_state_signature: (
+            tuple[str, tuple, tuple] | None
+        ) = None
         self._pending_event_log_entries: list[dict[str, object]] = []
         self._usage_degraded_logged = False
         self._claude_usage_provider = claude_usage_provider
@@ -762,7 +764,12 @@ class PipelineRunner(
         changes — those mutate inside ``handle_watch`` while the runner
         stays in WATCH for many cycles, and without a publish here the
         summary card would stay stale until a state transition or an
-        unrelated history event arrived.
+        unrelated history event arrived. The signature also tracks the
+        coder usage fields (session/weekly percent, API degraded flag)
+        rendered in the summary's rate-limit badge — ``publish_state``
+        refreshes them every cycle, so without inclusion here the
+        badges would stay stale through long WATCH/IDLE stretches with
+        an unchanged PR signature until an unrelated transition fired.
 
         The published payload mirrors what ``_serialize_latest_state``
         writes to Redis: inactive repos surface as ``IDLE`` regardless
@@ -774,7 +781,16 @@ class PipelineRunner(
             current_state = self.state.state.value
         else:
             current_state = PipelineState.IDLE.value
-        signature = (current_state, self._summary_pr_signature())
+        usage_signature = (
+            self.state.usage_session_percent,
+            self.state.usage_weekly_percent,
+            self.state.usage_api_degraded,
+        )
+        signature = (
+            current_state,
+            self._summary_pr_signature(),
+            usage_signature,
+        )
         if signature == self._last_published_state_signature:
             return
         await publish_repo_event(

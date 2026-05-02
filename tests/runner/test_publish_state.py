@@ -38,7 +38,11 @@ def test_publish_state_skips_progress_update_when_value_was_already_published(
 
     runner = _make_runner()
     runner._last_published_queue_progress = (1, 2)
-    runner._last_published_state_signature = (runner.state.state.value, ())
+    runner._last_published_state_signature = (
+        runner.state.state.value,
+        (),
+        (None, None, False),
+    )
     runner._set_queue_progress(1, 2)
 
     asyncio.run(runner.publish_state())
@@ -188,6 +192,7 @@ def test_publish_state_emits_state_change_on_first_publish(
     assert runner._last_published_state_signature == (
         runner.state.state.value,
         (),
+        (None, None, False),
     )
 
 
@@ -276,6 +281,73 @@ def test_publish_state_emits_state_change_on_pr_field_change_in_watch(
     assert all(event[2] == {"state": "WATCH"} for event in state_events)
 
 
+def test_publish_state_emits_state_change_on_usage_field_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """publish_state refreshes usage_session_percent / usage_weekly_percent
+    / usage_api_degraded every cycle. The summary's rate-limit badge
+    renders all three, so an unchanged state.state plus unchanged PR
+    signature must NOT mask a usage refresh — otherwise the badge
+    can stay stale through a long WATCH/IDLE stretch until an unrelated
+    transition fires."""
+    from tests.runner._helpers import _FakeUsageProvider
+
+    class _UsageSnap:
+        def __init__(
+            self,
+            session_percent: int | None,
+            weekly_percent: int | None,
+        ) -> None:
+            self.session_percent = session_percent
+            self.session_resets_at = None
+            self.weekly_percent = weekly_percent
+            self.weekly_resets_at = None
+
+    published: list[tuple[str, str, dict[str, object], object | None]] = []
+
+    async def _fake_publish_repo_event(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, object],
+        redis_client: object | None = None,
+    ) -> None:
+        published.append((repo_name, event_type, payload, redis_client))
+
+    monkeypatch.setattr(runner_module, "publish_repo_event", _fake_publish_repo_event)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner._claude_usage_provider = _FakeUsageProvider(
+        snapshot=_UsageSnap(40, 25)
+    )
+    asyncio.run(runner.publish_state())
+
+    # Identical usage on the next cycle -> no extra publish.
+    asyncio.run(runner.publish_state())
+
+    # Session percent ticks up -> must publish so the badge refreshes.
+    runner._claude_usage_provider = _FakeUsageProvider(
+        snapshot=_UsageSnap(55, 25)
+    )
+    asyncio.run(runner.publish_state())
+
+    # Weekly percent changes -> must publish.
+    runner._claude_usage_provider = _FakeUsageProvider(
+        snapshot=_UsageSnap(55, 30)
+    )
+    asyncio.run(runner.publish_state())
+
+    # Usage API degrades -> must publish so the warning badge appears.
+    runner._claude_usage_provider = _FakeUsageProvider(
+        snapshot=_UsageSnap(55, 30), failures=10
+    )
+    asyncio.run(runner.publish_state())
+
+    state_events = [event for event in published if event[1] == "state_change"]
+    assert len(state_events) == 4
+    assert all(event[2] == {"state": "WATCH"} for event in state_events)
+
+
 def test_publish_state_change_for_inactive_repo_emits_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -307,6 +379,7 @@ def test_publish_state_change_for_inactive_repo_emits_idle(
     assert runner._last_published_state_signature == (
         PipelineState.IDLE.value,
         (),
+        (None, None, False),
     )
 
 
@@ -357,7 +430,11 @@ def test_publish_state_drains_pending_event_log_entries(
     monkeypatch.setattr(runner_module, "publish_repo_event", _fake_publish_repo_event)
 
     runner = _make_runner()
-    runner._last_published_state_signature = (runner.state.state.value, ())
+    runner._last_published_state_signature = (
+        runner.state.state.value,
+        (),
+        (None, None, False),
+    )
     runner.log_event("first event")
     runner.log_event("second event")
 
@@ -399,7 +476,11 @@ def test_publish_pending_event_log_entries_requeues_on_failure(
     monkeypatch.setattr(runner_module, "publish_repo_event", _flaky_publish_repo_event)
 
     runner = _make_runner()
-    runner._last_published_state_signature = (runner.state.state.value, ())
+    runner._last_published_state_signature = (
+        runner.state.state.value,
+        (),
+        (None, None, False),
+    )
     monkeypatch.setattr(
         runner_module.logger,
         "warning",
@@ -446,7 +527,11 @@ def test_publish_pending_event_log_entries_retry_drains_remainder(
     monkeypatch.setattr(runner_module, "publish_repo_event", _publish_repo_event)
 
     runner = _make_runner()
-    runner._last_published_state_signature = (runner.state.state.value, ())
+    runner._last_published_state_signature = (
+        runner.state.state.value,
+        (),
+        (None, None, False),
+    )
     runner.log_event("first event")
     runner.log_event("second event")
 
