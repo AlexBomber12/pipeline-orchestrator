@@ -41,15 +41,7 @@ from src.web.services.upload_validation import (
     sweep_abandoned_staging,
 )
 
-# ``router`` MUST be bound before ``src.web.app`` is imported. The app
-# module loads this one via ``from src.web.routes import uploads as
-# _uploads_routes`` and immediately calls ``app.include_router(
-# _uploads_routes.router)``; if uploads.py is the entry point of the
-# import, app.py runs while this module is still partial and would fail
-# without ``router`` already on the partial module.
 router = APIRouter()
-
-from src.web import app as _app  # noqa: E402 — must follow ``router = APIRouter()``
 
 _upload_locks: dict[str, asyncio.Lock] = {}
 
@@ -450,3 +442,12 @@ async def upload_tasks(
         _build_upload_success_message(uploaded_filenames, repo_state.state),
         repo_name=name,
     )
+
+
+# Imported at end-of-file so all ``@router`` decorators above have already
+# populated ``router.routes`` before ``app.py`` reaches
+# ``app.include_router(_uploads_routes.router)``. FastAPI snapshots
+# ``router.routes`` at include time, so an early import would let app.py
+# load this module while it is still partial (router empty) and silently
+# drop every endpoint declared below the import.
+from src.web import app as _app  # noqa: E402

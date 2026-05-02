@@ -21,15 +21,7 @@ from src.onboarding.markdown_sections import MarkerError
 from src.onboarding.reconciliation import reconcile_agents_md
 from src.utils import repo_slug_from_url
 
-# ``router`` MUST be bound before ``src.web.app`` is imported. The app
-# module loads this one via ``from src.web.routes import onboarding as
-# _onboarding_routes`` and immediately calls ``app.include_router(
-# _onboarding_routes.router)``; if onboarding.py is the entry point of
-# the import, app.py runs while this module is still partial and would
-# fail without ``router`` already on the partial module.
 router = APIRouter()
-
-from src.web import app as _app  # noqa: E402 — must follow ``router = APIRouter()``
 
 _REPO_SLUG_PATTERN = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9_.-]*__[A-Za-z0-9][A-Za-z0-9_.-]*$"
@@ -136,3 +128,12 @@ async def onboarding_apply(repo_name: str = Form(...)) -> JSONResponse:
             "proposed_content": final,
         }
     )
+
+
+# Imported at end-of-file so all ``@router`` decorators above have already
+# populated ``router.routes`` before ``app.py`` reaches
+# ``app.include_router(_onboarding_routes.router)``. FastAPI snapshots
+# ``router.routes`` at include time, so an early import would let app.py
+# load this module while it is still partial (router empty) and silently
+# drop every endpoint declared below the import.
+from src.web import app as _app  # noqa: E402

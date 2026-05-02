@@ -33,16 +33,7 @@ from src.utils import repo_slug_from_url
 from src.web.services.coder import _effective_coder_name
 from src.web.services.repo_state import _find_repo_config_by_name
 
-# ``router`` MUST be bound before ``src.web.app`` is imported. The app
-# module loads this one via ``from src.web.routes import dashboard as
-# _dashboard_routes`` and immediately calls ``app.include_router(
-# _dashboard_routes.router)``; if dashboard.py is the entry point of the
-# import (e.g. a test does ``import src.web.routes.dashboard``), app.py
-# runs while this module is still partial and would fail without ``router``
-# already on the partial module.
 router = APIRouter()
-
-from src.web import app as _app  # noqa: E402 — must follow ``router = APIRouter()``
 
 _HISTORY_LIMIT = 100
 _METRICS_PANEL_LIMIT = 20
@@ -982,3 +973,12 @@ async def repo_cli_log(request: Request, name: str) -> HTMLResponse:
         f'<pre class="bg-black text-green-400 font-mono text-xs p-4'
         f' overflow-auto max-h-96 rounded">{escaped}</pre>'
     )
+
+
+# Imported at end-of-file so all ``@router`` decorators above have already
+# populated ``router.routes`` before ``app.py`` reaches
+# ``app.include_router(_dashboard_routes.router)``. FastAPI snapshots
+# ``router.routes`` at include time, so an early import would let app.py
+# load this module while it is still partial (router empty) and silently
+# drop every endpoint declared below the import.
+from src.web import app as _app  # noqa: E402
