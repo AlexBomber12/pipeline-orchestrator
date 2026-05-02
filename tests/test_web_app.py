@@ -1280,11 +1280,14 @@ def test_repo_detail_route_renders_full_page(
     assert "Event log" in body
     # Pause/resume/stop publish history_updated; the SSE consumer must
     # relay it so the event log refreshes for IDLE repos that never see
-    # a daemon-side event_log_append.
+    # a daemon-side event_log_append. The `every 30s` fallback covers
+    # the case where the SSE channel itself is unavailable (Redis outage
+    # returns 503 from /api/repos/{name}/events, EventSource cannot
+    # connect, etc.) so the log still catches up to state.history.
     assert "'history_updated'" in body
     assert (
         'hx-trigger="repo:event_log_append from:body, '
-        'repo:history_updated from:body"' in body
+        'repo:history_updated from:body, every 30s"' in body
     )
     # stream_repo_events replays up to HISTORY_REPLAY_LIMIT entries on
     # each (re)connect. Without dedup + a server-provided render-time
