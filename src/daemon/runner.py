@@ -109,6 +109,11 @@ _HISTORY_LIMIT = 100
 _STOP_POLL_INTERVAL_SEC = 0.5
 _IDLE_STREAK_CAP = 100
 
+# Sentinel for ``_escalate_to_hung``'s ``error_message_override``: when
+# the caller passes the sentinel (the default), ``error_message`` is set
+# to ``message``. ``None`` and any string value override that default.
+_USE_MESSAGE_AS_ERROR: object = object()
+
 # A ``PR #<number>`` token is a semantic identifier (different PRs are
 # distinct events) and is preserved verbatim. The alternation tries the
 # ``PR #N`` form first so the full PR id is consumed before generic ``\d+``
@@ -880,6 +885,110 @@ class PipelineRunner(
             await self._save_current_run_record(save_run_record_as)
         if publish:
             await self.publish_state()
+
+    # All escalation transitions to HUNG must use this primitive after
+    # PR-220 ships. Direct writes to ``state.state = PipelineState.HUNG``
+    # are reserved for legitimate non-escalation HUNG transitions
+    # (e.g. operator-initiated stop, review timeout fall-through).
+    async def _escalate_to_hung(
+        self,
+        message: str,
+        *,
+        target_state: PipelineState = PipelineState.HUNG,
+        error_message_override: str | None | object = _USE_MESSAGE_AS_ERROR,
+        apply_escalated_label: bool = True,
+        label_create_log_prefix: str = "escalate",
+        post_comment_on_pr: str | None = None,
+        set_pr_escalated_flag: bool = True,
+        log_message: str | None = None,
+    ) -> bool:
+        """Escalate the active PR with consistent telemetry.
+
+        By default sets state=HUNG, applies the ``escalated`` label on
+        the current PR via ``_ensure_escalated_label`` (FixMixin),
+        marks ``PRInfo.is_escalated=True``, logs an ``[ESCALATE]``
+        event and publishes state.
+
+        Returns ``True`` when the ``escalated`` label was applied
+        successfully (or label-apply was skipped); ``False`` when
+        ``_ensure_escalated_label`` reported a soft-failure on the
+        ``pr edit --add-label`` step. Callers that route to a state
+        which depends on the GitHub label for durability inspect this
+        return to downgrade when the upstream apply failed.
+
+        Args:
+            message: Becomes ``error_message`` and the default log
+                payload. Callers that need a different log body pass
+                ``log_message``; callers that need to clear or replace
+                ``error_message`` pass ``error_message_override``.
+            target_state: Final state. Default ``HUNG``. ``IDLE`` is
+                used by ``_escalate_fix_iteration_cap`` and
+                ``_escalate_fix_coder_initiated`` on the success path
+                where the GitHub ``escalated`` label is the durable
+                parking signal. ``ERROR`` may also be passed when the
+                escalation should also act as a durable parking error.
+            error_message_override: Sentinel default uses ``message``.
+                Pass ``None`` to clear ``state.error_message`` (e.g.
+                ``_escalate_fix_no_push_deadlock`` clears it because
+                HUNG itself is the parking signal). Pass a string to
+                replace it (e.g. ``_escalate_fix_coder_initiated``
+                expands the failure context when label-apply fails).
+            apply_escalated_label: When True, calls
+                ``_ensure_escalated_label`` so the GitHub label is
+                created (idempotent) and applied to the PR. Default
+                True. Returns the apply outcome via the function's
+                return value.
+            label_create_log_prefix: Forwarded to
+                ``_ensure_escalated_label`` so existing label-create
+                soft-fail log prefixes (``"FIX no-push"``, ``"FIX
+                coder ESCALATE"``, ...) survive the migration.
+            post_comment_on_pr: When non-None, posts the supplied text
+                via ``github_client.post_comment``. Failure is logged
+                with a generic ``[INFRA] Warning:`` prefix; callers
+                that need a custom failure-log body (e.g. fix.py
+                wrappers asserted on by regression tests) post the
+                comment themselves before invoking the primitive.
+            set_pr_escalated_flag: When True, sets
+                ``self.state.current_pr.is_escalated = True``. Default
+                True. Set False at sites where the in-memory flag is
+                explicitly NOT meant to mark the PR as escalated
+                (e.g. ``watch.py``'s review-timeout HUNG fall-through,
+                where the PR is parked but recoverable).
+            log_message: Overrides the body after ``[ESCALATE] `` when
+                the operator-visible log differs from
+                ``error_message``. Defaults to ``message``.
+        """
+        pr = self.state.current_pr
+
+        if post_comment_on_pr is not None and pr is not None:
+            try:
+                github_client.post_comment(
+                    self.owner_repo, pr.number, post_comment_on_pr
+                )
+            except Exception as exc:
+                self.log_event(
+                    f"[INFRA] Warning: failed to post escalation comment "
+                    f"on PR #{pr.number}: {exc}."
+                )
+
+        label_applied = True
+        if apply_escalated_label and pr is not None:
+            label_applied = self._ensure_escalated_label(
+                pr.number, label_create_log_prefix
+            )
+
+        if set_pr_escalated_flag and pr is not None:
+            pr.is_escalated = True
+
+        self.state.state = target_state
+        if error_message_override is _USE_MESSAGE_AS_ERROR:
+            self.state.error_message = message
+        else:
+            self.state.error_message = error_message_override  # type: ignore[assignment]
+        log_body = log_message if log_message is not None else message
+        self.log_event(f"[ESCALATE] {log_body}")
+        await self.publish_state()
+        return label_applied
 
     def _track_current_coder_process(
         self, proc: asyncio.subprocess.Process

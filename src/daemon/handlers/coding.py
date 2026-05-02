@@ -370,10 +370,13 @@ class CodingMixin:
                     f"[{coder_name}] Coder exited 0 with local branch but "
                     f"no push — escalating"
                 )
-            self.state.state = PipelineState.HUNG
-            self.state.error_message = message
             await self._save_current_run_record("error")
-            self.log_event(f"[ESCALATE] {message}.")
+            await self._escalate_to_hung(
+                message,
+                apply_escalated_label=False,
+                set_pr_escalated_flag=False,
+                log_message=f"{message}.",
+            )
             return
 
         self.log_event(
@@ -450,10 +453,13 @@ class CodingMixin:
                     f"[{coder_name}] Daemon-created PR not found for branch "
                     f"{target_branch!r}"
                 )
-                self.state.state = PipelineState.HUNG
-                self.state.error_message = message
                 await self._save_current_run_record("error")
-                self.log_event(f"[ESCALATE] {message}.")
+                await self._escalate_to_hung(
+                    message,
+                    apply_escalated_label=False,
+                    set_pr_escalated_flag=False,
+                    log_message=f"{message}.",
+                )
             return
 
         self.state.current_pr = candidate
@@ -542,10 +548,13 @@ class CodingMixin:
                 f"[{coder_name}] Daemon PR creation failed for "
                 f"{target_branch!r}: {exc}"
             )
-            self.state.state = PipelineState.HUNG
-            self.state.error_message = message
             await self._save_current_run_record("error")
-            self.log_event(f"[ESCALATE] {message}.")
+            await self._escalate_to_hung(
+                message,
+                apply_escalated_label=False,
+                set_pr_escalated_flag=False,
+                log_message=f"{message}.",
+            )
             return False
         github_client._invalidate_etag_cache(
             f"repos/{self.owner_repo}/pulls"

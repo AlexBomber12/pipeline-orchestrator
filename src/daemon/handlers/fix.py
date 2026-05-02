@@ -207,21 +207,11 @@ class FixMixin(BreachMixin):
     async def _escalate_fix_no_push_deadlock(self, current_pr: PRInfo) -> None:
         """Park the PR in HUNG after consecutive no-push FIX cycles.
 
-        Logs the deadlock event with the counter value, posts an
-        explanatory comment on the PR, applies the ``escalated`` label so
-        ``get_open_prs`` rehydrates ``is_escalated`` after a daemon
-        restart (Codex P2 on PR #222), transitions to HUNG, and resets
-        the no-push counter so a future cycle out of HUNG starts fresh.
-        Comment- and label-post failures are logged but never block the
-        HUNG transition: HUNG is the safe parking state regardless, and
-        the in-memory ``is_escalated`` flag still holds for the current
-        run.
-
-        Marks ``current_pr.is_escalated`` so ``handle_hung`` keeps the
-        runner parked even when ``hung_fallback_codex_review`` is on.
-        Without this, the default fallback would post ``@codex review``
-        and bounce back to WATCH on the very next tick, immediately
-        re-entering the FIX loop the deadlock counter was meant to stop.
+        Thin wrapper over ``_escalate_to_hung``: posts a deadlock
+        comment with a fix.py-specific failure-log prefix, resets the
+        no-push counter, then delegates state transition / label apply
+        / is_escalated bookkeeping to the primitive. ``error_message``
+        is cleared because HUNG itself is the parking signal.
         """
         count = current_pr.no_push_fix_count
         pr_number = current_pr.number
@@ -237,41 +227,34 @@ class FixMixin(BreachMixin):
                 f"[FIX] Warning: failed to post FIX deadlock comment on PR "
                 f"#{pr_number}: {exc}."
             )
-        self._ensure_escalated_label(pr_number, "FIX no-push")
-        current_pr.is_escalated = True
         current_pr.no_push_fix_count = 0
-        self.state.state = PipelineState.HUNG
-        self.state.error_message = None
-        self.log_event(f"[ESCALATE] {message}")
-        await self.publish_state()
+        await self._escalate_to_hung(
+            message,
+            error_message_override=None,
+            label_create_log_prefix="FIX no-push",
+        )
 
     async def _escalate_fix_coder_initiated(
         self, current_pr: PRInfo, reason: str
     ) -> None:
         """Park the PR after the coder emits an ESCALATE marker.
 
-        Posts an explanatory PR comment (soft-fail), then ensures and
-        applies the ``escalated`` label. The label apply is the
-        durable parking signal: on the success path the runner moves
-        to ``IDLE`` — the coder explicitly self-reported, so the
-        ``handle_hung`` ``@codex review`` fallback is not appropriate,
-        and the next IDLE refresh rehydrates ``is_escalated=True``
-        from the label. On the failure path the runner moves to
-        ``HUNG`` instead: ``handle_hung``'s ``is_escalated`` guard
-        keeps the PR parked using the in-memory flag, while moving to
-        IDLE would silently drop the parking signal during a GitHub
-        outage because ``_preserve_fix_iteration_count`` rehydrates
-        ``is_escalated`` from the (missing) label on the next refresh
-        (Codex P1 on PR #228).
+        Posts a fix.py-specific failure-log comment and then routes
+        state via ``_escalate_to_hung``. On label-apply success the
+        runner parks in ``IDLE`` so the next refresh rehydrates
+        ``is_escalated`` from the GitHub label. On label-apply
+        failure ``HUNG`` is used so the in-memory flag stays the
+        load-bearing parking signal during a GitHub outage (Codex P1
+        on PR #228).
         """
         pr_number = current_pr.number
         clean_reason = reason.strip() or _ESCALATE_EMPTY_REASON
-        message = (
+        comment = (
             f"Coder explicitly escalated this PR. Reason: {clean_reason}. "
             "Manual review required."
         )
         try:
-            github_client.post_comment(self.owner_repo, pr_number, message)
+            github_client.post_comment(self.owner_repo, pr_number, comment)
         except Exception as exc:
             self.log_event(
                 f"[FIX] Warning: failed to post FIX coder ESCALATE comment "
@@ -280,33 +263,30 @@ class FixMixin(BreachMixin):
         label_applied = self._ensure_escalated_label(
             pr_number, "FIX coder ESCALATE"
         )
-        current_pr.is_escalated = True
-        if not label_applied:
-            self.state.state = PipelineState.HUNG
-            self.state.error_message = (
-                f"FIX coder ESCALATE on PR #{pr_number}: failed to apply "
-                f"`escalated` label. Reason: {clean_reason}. Manual "
-                "review required."
+        if label_applied:
+            await self._escalate_to_hung(
+                f"FIX coder ESCALATE on PR #{pr_number}: {clean_reason}. "
+                "Moving to IDLE.",
+                target_state=PipelineState.IDLE,
+                error_message_override=None,
+                apply_escalated_label=False,
             )
-            self.log_event(f"[ESCALATE] {self.state.error_message}")
-            await self.publish_state()
             return
-        self.state.state = PipelineState.IDLE
-        self.state.error_message = None
-        self.log_event(
-            f"[ESCALATE] FIX coder ESCALATE on PR #{pr_number}: "
-            f"{clean_reason}. Moving to IDLE."
+        await self._escalate_to_hung(
+            f"FIX coder ESCALATE on PR #{pr_number}: failed to apply "
+            f"`escalated` label. Reason: {clean_reason}. Manual "
+            "review required.",
+            apply_escalated_label=False,
         )
-        await self.publish_state()
 
     async def _escalate_fix_iteration_cap(self, current_pr: PRInfo) -> None:
         """Escalate the PR after the FIX iteration cap is reached.
 
-        Posts a @-mention comment, ensures the ``escalated`` label
-        exists, applies it to the PR, marks ``current_pr.is_escalated``
-        and transitions the runner to IDLE so subsequent cycles do
-        not redrive FIX. Sets ``state.ERROR`` if the GitHub mutation
-        fails — see callers for the surrounding control flow.
+        The comment-post and ``pr edit --add-label`` failure paths
+        route to ``ERROR`` (durable parking signal for daemon-driven
+        escalation, distinct from the coder-initiated ``HUNG``
+        fallback). The success path delegates to ``_escalate_to_hung``
+        for the IDLE transition + ``[ESCALATE]`` log + publish.
         """
         count = current_pr.fix_iteration_count
         fix_iteration_cap = self.app_config.daemon.fix_iteration_cap
@@ -353,14 +333,13 @@ class FixMixin(BreachMixin):
                 log_prefix="[FIX]",
             )
             return
-        current_pr.is_escalated = True
-        self.state.error_message = None
-        self.state.state = PipelineState.IDLE
-        self.log_event(
-            f"[ESCALATE] FIX cap reached ({count}/{fix_iteration_cap}) on "
-            f"PR #{pr_number}: escalated, moving to IDLE."
+        await self._escalate_to_hung(
+            f"FIX cap reached ({count}/{fix_iteration_cap}) on PR "
+            f"#{pr_number}: escalated, moving to IDLE.",
+            target_state=PipelineState.IDLE,
+            error_message_override=None,
+            apply_escalated_label=False,
         )
-        await self.publish_state()
 
     async def _poll_github_during_fix(
         self,
