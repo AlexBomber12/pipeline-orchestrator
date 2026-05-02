@@ -10,7 +10,7 @@ from src.daemon import git_ops
 from src.daemon.handlers import coding as coding_module
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 
-from tests import test_runner as h
+from tests.runner import _helpers as h
 
 
 def _runner(

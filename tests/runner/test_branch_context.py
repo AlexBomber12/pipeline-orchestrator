@@ -30,7 +30,6 @@ import subprocess
 from typing import Any
 
 import pytest
-from src import github_client
 from src.daemon import git_ops
 from src.daemon import recovery as recovery_module  # noqa: F401  (import sanity)
 from src.daemon import runner as runner_module
@@ -44,8 +43,7 @@ from src.models import (
 )
 from src.task_status import find_matching_open_pr
 
-from tests import test_runner as h
-
+from tests.runner import _helpers as h
 
 # ---------------------------------------------------------------------------
 # Shared helpers

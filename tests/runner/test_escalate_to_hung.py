@@ -24,7 +24,7 @@ from src.daemon import runner as runner_module
 from src.daemon.handlers import fix as fix_module
 from src.models import PipelineState, PRInfo
 
-from tests import test_runner as h
+from tests.runner import _helpers as h
 
 
 def _install_publish_state_spy(runner: Any) -> list[None]:

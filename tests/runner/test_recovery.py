@@ -59,7 +59,7 @@ from src.models import (
     TaskStatus,  # noqa: F811
 )
 
-from tests import test_runner as h
+from tests.runner import _helpers as h
 
 # ---------------------------------------------------------------------------
 # Test 1 — dirty-tree auto-reset composes with crashed-task marker
@@ -709,3 +709,110 @@ def test_recover_state_rehydrates_last_push_at(
     # PR-202: recovery anchors the slow-start window so the first
     # post-restart poll already uses the slow cadence.
     assert runner._watch_entered_at is not None
+
+
+# ---------------------------------------------------------------------------
+# PR-224b moved from tests/test_runner.py — recovery group
+# ---------------------------------------------------------------------------
+
+
+def test_run_cycle_resets_stale_transient_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch, stdout="")
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
+    )
+
+    runner = h._make_runner()
+    # _recovered=True skips recover_state so this test exercises the
+    # defensive transient-state reset, not the (separately tested)
+    # recovery path that would have caught a mid-coding crash first.
+    # _scaffolded=True skips the scaffold retry in ensure_repo_cloned
+    # so this test focuses on the transient-state reset rather than
+    # scaffolding behavior.
+    runner._recovered = True
+    runner._scaffolded = True
+    runner.state.state = PipelineState.CODING  # simulate crash mid-coding
+    asyncio.run(runner.run_cycle())
+
+    # The stale CODING state was reset and handle_idle ran to completion.
+    assert runner.state.state == PipelineState.IDLE
+    assert any("stale transient state" in e["event"] for e in runner.state.history)
+    assert isinstance(runner.redis, h._FakeRedis)
+    assert runner.redis.writes, "publish_state should have been called"
+
+
+def test_run_cycle_marks_recovery_complete_and_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publishes: list[str] = []
+    runner = h._make_runner()
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_recover_state() -> bool:
+        return True
+
+    async def fake_publish_state() -> None:
+        publishes.append("published")
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "recover_state", fake_recover_state)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+
+    asyncio.run(runner.run_cycle())
+
+    assert runner._recovered is True
+    assert publishes == ["published"]
+
+
+def test_run_cycle_runs_recovery_before_honoring_user_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publishes: list[str] = []
+    recovery_calls: list[str] = []
+    preflight_calls: list[str] = []
+    runner = h._make_runner()
+    runner.state.state = PipelineState.IDLE
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_refresh_user_paused_from_redis() -> None:
+        runner.state.user_paused = True
+
+    async def fake_recover_state() -> bool:
+        recovery_calls.append("recover")
+        return True
+
+    async def fake_publish_state() -> None:
+        publishes.append("published")
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(
+        runner,
+        "_refresh_user_paused_from_redis",
+        fake_refresh_user_paused_from_redis,
+    )
+    monkeypatch.setattr(runner, "recover_state", fake_recover_state)
+    monkeypatch.setattr(
+        runner,
+        "preflight",
+        h._preflight_recording_stub(preflight_calls),
+    )
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+
+    asyncio.run(runner.run_cycle())
+
+    assert recovery_calls == ["recover"]
+    assert preflight_calls == []
+    assert publishes == ["published"]
+    assert runner._recovered is True
+    assert not any(
+        entry["event"] == "[INFRA] Paused. Press Play to resume."
+        for entry in runner.state.history
+    )
