@@ -748,7 +748,7 @@ class FixMixin(BreachMixin):
             )
             if extra_context is not None:
                 fix_kwargs["extra_context"] = extra_context
-        if coder_name == "claude":
+        if plugin.supports_breach_lifecycle:
             fix_kwargs.update(
                 breach_dir=breach_dir,
                 breach_run_id=breach_run_id,
@@ -766,7 +766,7 @@ class FixMixin(BreachMixin):
             self._monitor_fix_idle(pr_number, idle_limit, claude_task, idle_flag)
         )
         breach_monitor: asyncio.Task[None] | None = None
-        if coder_name == "claude":
+        if plugin.supports_breach_lifecycle:
             breach_monitor = asyncio.create_task(
                 self._monitor_inflight_breach(
                     breach_dir, breach_run_id, claude_task, breach_flag,
@@ -849,7 +849,7 @@ class FixMixin(BreachMixin):
                     await external_state_monitor
             heartbeat.cancel()
             self._current_coder_process = None
-            if coder_name == "claude":
+            if plugin.supports_breach_lifecycle:
                 self._check_late_breach(breach_dir, breach_run_id, breach_flag)
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
         if external_state_flag["state"] is not None and not stop_cancelled:

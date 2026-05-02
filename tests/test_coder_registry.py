@@ -35,6 +35,10 @@ class DummyCoderPlugin:
     def rate_limit_patterns(self) -> list[re.Pattern[str]]:
         return [re.compile("limit")]
 
+    @property
+    def supports_breach_lifecycle(self) -> bool:
+        return True
+
     async def diagnose_error(
         self, repo_path: str, context: str, model: str
     ) -> tuple[int, str, str]:
@@ -83,6 +87,22 @@ def test_protocol_includes_diagnose_error() -> None:
     assert isinstance(plugin, CoderPlugin)
     assert isinstance(ClaudePlugin(), CoderPlugin)
     assert isinstance(CodexPlugin(), CoderPlugin)
+
+
+def test_protocol_includes_supports_breach_lifecycle() -> None:
+    """``CoderPlugin`` declares ``supports_breach_lifecycle`` so handlers
+    can gate breach monitoring without hardcoding coder names."""
+    assert "supports_breach_lifecycle" in dir(CoderPlugin)
+    assert isinstance(ClaudePlugin(), CoderPlugin)
+    assert isinstance(CodexPlugin(), CoderPlugin)
+
+
+def test_claude_plugin_supports_breach_lifecycle_true() -> None:
+    assert ClaudePlugin().supports_breach_lifecycle is True
+
+
+def test_codex_plugin_supports_breach_lifecycle_false() -> None:
+    assert CodexPlugin().supports_breach_lifecycle is False
 
 
 def test_claude_plugin_diagnose_error_delegates(
