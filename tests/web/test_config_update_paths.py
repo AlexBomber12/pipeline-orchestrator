@@ -1,25 +1,21 @@
-"""PR-211: Config update path consistency regression tests.
+"""PR-217: Config update path consistency regression tests.
 
-Documents current behavior at 2026-05-01 of the four web endpoints that
-mutate ``config.yml``. Each endpoint differs in two side effects:
-
-* whether it sets ``control:{repo}:config_dirty`` so the runner picks the
-  change up at its next IDLE boundary (instead of waiting for the
-  config-file watcher to poll);
-* whether it publishes a wake event on ``orchestrator:wake:{repo}`` so the
-  daemon's main loop short-circuits its sleep.
+Verifies the four web endpoints that mutate ``config.yml`` now share the
+same write+dirty+wake side-effect contract via ``apply_config_mutation``.
 
 | Endpoint                      | Writes config | Sets dirty | Publishes wake |
 |-------------------------------|---------------|------------|----------------|
 | POST /repos/{name}/coder      | yes           | yes        | yes            |
-| PUT  /settings/repos          | yes           | no         | no             |
-| PUT  /settings/repo/{name}    | yes           | no         | yes            |
-| PUT  /settings/daemon         | yes           | no         | no             |
+| PUT  /settings/repos          | yes           | yes        | yes            |
+| PUT  /settings/repo/{name}    | yes           | yes        | yes            |
+| PUT  /settings/daemon         | yes           | yes (all)  | yes (all)      |
 
-PR-217 will introduce a ``ConfigUpdateService`` that normalizes all four
-paths to write+dirty+wake. These tests must be updated when PR-217 lands.
-The tests assert *current* behavior, not desired behavior, so the refactor
-PR can show the diff explicitly rather than silently changing semantics.
+These tests previously documented the pre-PR-217 inconsistency (PR-211
+baseline). After PR-217 they verify the normalized behavior — every
+config-mutating endpoint sets ``control:{repo}:config_dirty`` and
+publishes a wake event for every affected repo. For ``PUT /settings/daemon``
+the affected set is every active repo because daemon-level fields feed
+into every runner.
 """
 
 from __future__ import annotations
@@ -136,6 +132,27 @@ def one_repo_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return cfg
 
 
+@pytest.fixture
+def two_repo_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/alpha.git\n"
+        "    branch: main\n"
+        "    auto_merge: true\n"
+        "    coder: claude\n"
+        "    review_timeout_min: 60\n"
+        "  - url: https://github.com/example/beta.git\n"
+        "    branch: main\n"
+        "    auto_merge: true\n"
+        "    coder: codex\n"
+        "    review_timeout_min: 60\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    return cfg
+
+
 def _stub_repo_template(monkeypatch: pytest.MonkeyPatch) -> None:
     """Bypass the per-repo summary template so the POST endpoint returns
     quickly and without depending on rendering machinery."""
@@ -166,13 +183,11 @@ def test_post_repo_coder_writes_config_sets_dirty_publishes_wake(
     one_repo_config: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Documents current behavior at 2026-05-01.
+    """Verifies PR-217 normalization.
 
-    POST /repos/{name}/coder is the single endpoint that does all three
-    side effects: writes config, sets ``control:{repo}:config_dirty``,
-    and publishes a ``coder_swap`` wake. PR-217 will normalize all four
-    config-mutating endpoints to this same write+dirty+wake pattern.
-    Update this test when PR-217 lands.
+    POST /repos/{name}/coder writes config, sets
+    ``control:{repo}:config_dirty``, and publishes a ``coder_swap`` wake.
+    Behavior is unchanged by PR-217 (this endpoint was the canonical one).
     """
     fake = _FakeRedis()
     _stub_repo_template(monkeypatch)
@@ -211,17 +226,15 @@ def test_post_repo_coder_writes_config_sets_dirty_publishes_wake(
     assert payload["repo"] == "example__alpha"
 
 
-def test_put_settings_repos_writes_config_no_dirty_no_wake(
+def test_put_settings_repos_writes_config_sets_dirty_publishes_wake(
     one_repo_config: Path,
 ) -> None:
-    """Documents current behavior at 2026-05-01.
+    """Verifies PR-217 normalization.
 
     PUT /settings/repos updates an existing repository (keyed by ``url``)
-    but does NOT set ``control:{repo}:config_dirty`` and does NOT publish
-    a wake event. The runner only learns about the change at the next
-    config_watcher tick (up to CONFIG_WATCH_INTERVAL_SEC seconds later).
-    PR-217 will normalize all four endpoints to write+dirty+wake. Update
-    this test when PR-217 lands.
+    and now sets ``control:{repo}:config_dirty`` and publishes a
+    ``settings`` wake. Pre-PR-217 it did neither, leaving the runner to
+    learn about the change via the next config_watcher tick.
     """
     fake = _FakeRedis()
 
@@ -239,31 +252,30 @@ def test_put_settings_repos_writes_config_no_dirty_no_wake(
     cfg = load_config(str(one_repo_config))
     assert cfg.repositories[0].branch == "develop"
 
-    # No dirty flag was set for any repo.
-    assert "control:example__alpha:config_dirty" not in fake.store
-    assert not any(
-        key.startswith("control:") and key.endswith(":config_dirty")
-        for key in fake.store
-    )
+    # Dirty flag set for the affected repo (and only that repo).
+    assert fake.store.get("control:example__alpha:config_dirty") == "1"
 
-    # No wake event was published on any orchestrator:wake:* channel.
-    assert not any(
-        channel.startswith("orchestrator:wake:")
-        for channel, _ in fake.published
-    )
+    # Wake event published with event_type "settings".
+    wake_events = [
+        (channel, message)
+        for channel, message in fake.published
+        if channel == "orchestrator:wake:example__alpha"
+    ]
+    assert len(wake_events) == 1
+    payload = json.loads(wake_events[0][1])
+    assert payload["event_type"] == "settings"
+    assert payload["repo"] == "example__alpha"
 
 
-def test_put_settings_repo_name_writes_config_no_dirty_publishes_wake(
+def test_put_settings_repo_name_writes_config_sets_dirty_publishes_wake(
     one_repo_config: Path,
 ) -> None:
-    """Documents current behavior at 2026-05-01.
+    """Verifies PR-217 normalization.
 
-    PUT /settings/repo/{name} writes config and publishes a ``settings``
-    wake event but does NOT set ``control:{repo}:config_dirty``. This is
-    a partial inconsistency: the wake nudges the daemon to run sooner,
-    yet the runner still has to detect the dirty state via the file
-    watcher. PR-217 will normalize all four endpoints to write+dirty+wake.
-    Update this test when PR-217 lands.
+    PUT /settings/repo/{name} writes config, sets
+    ``control:{repo}:config_dirty``, and publishes a ``settings`` wake.
+    Pre-PR-217 the dirty flag was missing — the wake nudged the daemon
+    but the runner still depended on the file watcher to notice.
     """
     fake = _FakeRedis()
 
@@ -281,8 +293,8 @@ def test_put_settings_repo_name_writes_config_no_dirty_publishes_wake(
     assert cfg.repositories[0].coder is not None
     assert cfg.repositories[0].coder.value == "codex"
 
-    # No dirty flag.
-    assert "control:example__alpha:config_dirty" not in fake.store
+    # Dirty flag set.
+    assert fake.store.get("control:example__alpha:config_dirty") == "1"
 
     # publish_wake was called with event_type "settings".
     wake_events = [
@@ -296,19 +308,16 @@ def test_put_settings_repo_name_writes_config_no_dirty_publishes_wake(
     assert payload["repo"] == "example__alpha"
 
 
-def test_put_settings_daemon_writes_config_no_dirty_no_wake(
-    one_repo_config: Path,
+def test_put_settings_daemon_writes_config_sets_dirty_publishes_wake_for_all_repos(
+    two_repo_config: Path,
 ) -> None:
-    """Documents current behavior at 2026-05-01.
+    """Verifies PR-217 normalization.
 
-    PUT /settings/daemon is the most inconsistent endpoint: it writes
-    config but neither sets ``control:{repo}:config_dirty`` nor publishes
-    any wake event, even though daemon-level changes (e.g.
-    ``exploration_epsilon``) affect every runner. The change only
-    propagates after a config_watcher tick (up to
-    CONFIG_WATCH_INTERVAL_SEC seconds later) plus the next IDLE
-    boundary. PR-217 will normalize all four endpoints to
-    write+dirty+wake. Update this test when PR-217 lands.
+    PUT /settings/daemon writes daemon-level config and now broadcasts
+    ``control:{repo}:config_dirty`` plus a ``settings`` wake to every
+    active repo. Pre-PR-217 this endpoint did neither, despite
+    daemon-level fields (``exploration_epsilon``, ``claude_model``)
+    affecting every runner.
     """
     fake = _FakeRedis()
 
@@ -322,34 +331,37 @@ def test_put_settings_daemon_writes_config_no_dirty_no_wake(
     assert response.status_code == 200
 
     # Writer was called.
-    cfg = load_config(str(one_repo_config))
+    cfg = load_config(str(two_repo_config))
     assert cfg.daemon.exploration_epsilon == pytest.approx(0.25)
 
-    # No dirty flag was set.
-    assert not any(
-        key.startswith("control:") and key.endswith(":config_dirty")
-        for key in fake.store
-    )
+    # Dirty flags set for every active repo.
+    assert fake.store.get("control:example__alpha:config_dirty") == "1"
+    assert fake.store.get("control:example__beta:config_dirty") == "1"
 
-    # No wake event was published.
-    assert not any(
-        channel.startswith("orchestrator:wake:")
-        for channel, _ in fake.published
-    )
+    # Wake events published on every active repo's wake channel.
+    wake_channels = {
+        channel for channel, _ in fake.published
+        if channel.startswith("orchestrator:wake:")
+    }
+    assert wake_channels == {
+        "orchestrator:wake:example__alpha",
+        "orchestrator:wake:example__beta",
+    }
+    for _, message in fake.published:
+        payload = json.loads(message)
+        assert payload["event_type"] == "settings"
 
 
-def test_config_watcher_catches_up_after_settings_daemon_put(
+def test_config_watcher_still_serves_as_fallback_after_settings_daemon_put(
     one_repo_config: Path,
 ) -> None:
-    """Documents current behavior at 2026-05-01.
+    """The config-file watcher remains the safety net for missed nudges.
 
-    The eventual-consistency window: PUT /settings/daemon does not set
-    the dirty flag itself, but the config-file watcher detects the
-    sha256 change on its next tick and sets the dirty flag for every
-    active runner. The window is bounded by ``CONFIG_WATCH_INTERVAL_SEC``
-    (5s in production). PR-217 will eliminate this window for the four
-    UI endpoints by setting the dirty flag synchronously. Update this
-    test when PR-217 lands.
+    PR-217 makes PUT /settings/daemon set the dirty flag synchronously
+    so operators no longer have to wait for the watcher in the happy
+    path. The watcher itself is unchanged: if Redis is briefly down at
+    write time, the next file-signature tick still surfaces the change
+    within ``CONFIG_WATCH_INTERVAL_SEC`` seconds.
     """
     fake = _FakeRedis()
 
@@ -368,7 +380,7 @@ def test_config_watcher_catches_up_after_settings_daemon_put(
         for _ in range(5):
             await asyncio.sleep(0.02)
 
-        # 2. PUT writes config but does not set the dirty flag itself.
+        # 2. PUT writes config; PR-217 also sets the dirty flag synchronously.
         with TestClient(app) as client:
             client.app.state.redis = fake
             response = client.put(
@@ -376,12 +388,14 @@ def test_config_watcher_catches_up_after_settings_daemon_put(
                 data={"exploration_epsilon": "0.4"},
             )
         assert response.status_code == 200
-        # Sanity check: at this point only the watcher's later tick will
-        # observe the change.
-        assert "control:example__alpha:config_dirty" not in fake.store
+        # The synchronous dirty flag is already in place; the watcher's
+        # later tick is no longer load-bearing for the happy path.
+        assert fake.store.get("control:example__alpha:config_dirty") == "1"
 
-        # 3. Wait for the watcher to detect the sha256 change and flag
-        # the active runner.
+        # 3. Confirm the watcher would still set the flag if it had been
+        # missing. Clear it and wait for the next tick to repopulate it
+        # via the file-signature path.
+        fake.store.pop("control:example__alpha:config_dirty", None)
         for _ in range(200):
             await asyncio.sleep(0.02)
             if "control:example__alpha:config_dirty" in fake.store:
@@ -395,30 +409,75 @@ def test_config_watcher_catches_up_after_settings_daemon_put(
 
     asyncio.run(driver())
     assert fake.store.get("control:example__alpha:config_dirty") == "1"
-    # Documented bound: a real watcher would take at most
-    # CONFIG_WATCH_INTERVAL_SEC seconds to catch up.
+    # Documented bound: the watcher catches up within
+    # CONFIG_WATCH_INTERVAL_SEC seconds.
     assert config_watcher.CONFIG_WATCH_INTERVAL_SEC == 5.0
+
+
+def test_post_repo_coder_logs_warning_when_state_refresh_raises(
+    one_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Exception inside the post-write state refresh is caught and logged.
+
+    PR-217 keeps the broad ``except Exception`` around the optional
+    ``RepoState.coder`` refresh so that a transient Redis read failure or
+    a corrupted state payload cannot turn into a 500 — the config write
+    has already succeeded and the runner will reconcile its own state on
+    the next IDLE boundary via the dirty flag.
+    """
+
+    class _GetBoomRedis(_FakeRedis):
+        async def get(self, key: str) -> str | None:
+            raise ConnectionError("redis get unavailable")
+
+    fake = _GetBoomRedis()
+    _stub_repo_template(monkeypatch)
+
+    async def _noop_publish(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(web_app, "publish_repo_event", _noop_publish)
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        with caplog.at_level("WARNING", logger=web_app.logger.name):
+            response = client.post(
+                "/repos/example__alpha/coder",
+                data={"coder": "codex"},
+            )
+
+    assert response.status_code == 200
+    # Dirty + wake nudge still happened via the helper before the refresh.
+    assert fake.store.get("control:example__alpha:config_dirty") == "1"
+    assert any(
+        "Failed to refresh repo state after coder update" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_put_settings_repo_name_succeeds_when_publish_wake_fails(
     one_repo_config: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Documents current behavior at 2026-05-01.
+    """Verifies PR-217 normalization.
 
     A Redis ``publish`` failure on the ``settings`` wake event must not
     fail the request: the config write is the source of truth and the
     config_watcher will eventually carry the change to the runner even
     without the wake nudge. The endpoint logs the failure at WARNING
-    level and returns 200. PR-217 will preserve this resilience while
-    also setting the dirty flag synchronously. Update this test when
-    PR-217 lands.
+    and returns 200. PR-217 routes the warning through
+    ``src.web.services.config_updates`` while preserving the same
+    user-visible resilience contract.
     """
     fake = _PublishBoomRedis()
 
     with TestClient(app) as client:
         client.app.state.redis = fake
-        with caplog.at_level("WARNING", logger=web_app.logger.name):
+        with caplog.at_level(
+            "WARNING", logger="src.web.services.config_updates"
+        ):
             response = client.put(
                 "/settings/repo/example__alpha",
                 data={"coder": "codex"},
@@ -431,6 +490,9 @@ def test_put_settings_repo_name_succeeds_when_publish_wake_fails(
     assert cfg.repositories[0].coder is not None
     assert cfg.repositories[0].coder.value == "codex"
 
+    # The dirty flag was still set synchronously even though publish failed.
+    assert fake.store.get("control:example__alpha:config_dirty") == "1"
+
     # publish_wake was attempted exactly once on the wake channel.
     wake_attempts = [
         channel
@@ -439,7 +501,7 @@ def test_put_settings_repo_name_succeeds_when_publish_wake_fails(
     ]
     assert len(wake_attempts) == 1
 
-    # The failure was logged at WARNING level on the web app logger.
+    # The failure was logged at WARNING level on the helper logger.
     assert any(
         "publish_wake failed for example__alpha" in record.getMessage()
         and "settings" in record.getMessage()
