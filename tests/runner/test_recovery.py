@@ -33,17 +33,33 @@ Tests do not change production behavior; they only assert it.
 from __future__ import annotations
 
 import asyncio
+
+# PR-224a: imports needed by tests moved from tests/test_runner.py
+import random  # noqa: F401
+import re  # noqa: F401
 import subprocess
+import time  # noqa: F401
+import types  # noqa: F401
+from pathlib import Path
 from typing import Any
 
 import pytest
 from src.daemon import runner as runner_module
-from src.daemon.handlers import fix as fix_module
-from src.daemon.handlers import hung as hung_module
-from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
+from src.daemon.handlers import coding as coding_module  # noqa: F401,F811
+from src.daemon.handlers import error as error_module  # noqa: F401,F811
+from src.daemon.handlers import fix as fix_module  # noqa: F811
+from src.daemon.handlers import hung as hung_module  # noqa: F811
+from src.daemon.handlers import idle as idle_module  # noqa: F811
+from src.daemon.handlers import merge as merge_module  # noqa: F401,F811
+from src.daemon.handlers import watch as watch_module  # noqa: F401,F811
+from src.models import (
+    PipelineState,  # noqa: F811
+    PRInfo,  # noqa: F811
+    QueueTask,  # noqa: F811
+    TaskStatus,  # noqa: F811
+)
 
 from tests import test_runner as h
-
 
 # ---------------------------------------------------------------------------
 # Test 1 — dirty-tree auto-reset composes with crashed-task marker
@@ -366,3 +382,330 @@ def test_iteration_cap_label_apply_failure_transitions_to_error(
         e["event"].startswith("[FIX] pr edit failed:")
         for e in runner.state.history
     )
+
+
+# ---------------------------------------------------------------------------
+# PR-224a moved from tests/test_runner.py
+# ---------------------------------------------------------------------------
+
+def test_select_next_task_from_dag_skips_crashed_task_marked_canceled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """PR-186: After recovery marks a task crashed, the next IDLE cycle's
+    selector must override its derived status to CANCELED so
+    get_eligible_tasks excludes it. Without the override the same crashed
+    task would be re-picked as TODO and dispatched into another doomed
+    CODING run on the very next cycle."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Crashed task\n\n"
+        "Branch: pr-001-crashed\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+    (tasks_dir / "PR-002.md").write_text(
+        "# PR-002: Healthy follow-up\n\n"
+        "Branch: pr-002-healthy\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+    runner._crashed_task_pr_ids.add("PR-001")
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-002"
+    assert task.status == TaskStatus.TODO
+    assert runner._idle_dag_statuses == {
+        "PR-001": TaskStatus.CANCELED,
+        "PR-002": TaskStatus.TODO,
+    }
+    queue_md = runner._generate_queue_md(
+        runner._idle_dag_headers,
+        runner._idle_dag_statuses,
+    )
+    assert "## PR-001" in queue_md
+    assert "- Status: CANCELED" in queue_md
+
+
+def test_select_next_task_from_dag_preserves_doing_for_crashed_task_with_visible_pr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Codex P1: a crashed task whose open PR becomes visible on a later
+    cycle (e.g. ``get_open_prs`` was stale during recovery) must not be
+    downgraded to CANCELED by the selector. Preserve the DOING ruling so
+    the runner can resume WATCH/merge for the real PR, and clear the
+    crashed flag so subsequent cycles treat the task as live again."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Crashed task with visible PR\n\n"
+        "Branch: pr-001-crashed\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = [
+        PRInfo(number=42, branch="pr-001-crashed", pr_id="PR-001")
+    ]
+    runner._idle_merged_prs = []
+    runner._crashed_task_pr_ids.add("PR-001")
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-001"
+    assert task.status == TaskStatus.DOING
+    assert runner._idle_dag_statuses == {"PR-001": TaskStatus.DOING}
+    assert "PR-001" not in runner._crashed_task_pr_ids
+
+
+def test_select_next_task_from_dag_clears_crashed_flag_when_done(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A crashed task that ends up DONE (e.g. a stale merge surfaced after
+    recovery) must clear the crashed flag so the task is not perpetually
+    marked CANCELED in regenerated QUEUE.md, and DONE remains terminal."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Crashed but merged\n\n"
+        "Branch: pr-001-merged\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        idle_module, "get_merged_pr_ids", lambda *args, **kwargs: {"PR-001"}
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+    runner._crashed_task_pr_ids.add("PR-001")
+
+    asyncio.run(runner._select_next_task_from_dag())
+
+    assert runner._idle_dag_statuses == {"PR-001": TaskStatus.DONE}
+    assert "PR-001" not in runner._crashed_task_pr_ids
+
+
+def test_dirty_tree_auto_recovery_after_3_cycles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After three consecutive dirty preflights the runner hard-resets
+    to ``origin/{branch}`` and returns to IDLE instead of staying stuck
+    in ERROR requiring manual intervention."""
+    commands: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
+        commands.append(cmd)
+        if cmd[:3] == ["git", "status", "--porcelain"]:
+            return h._FakeCompletedProcess(
+                args=cmd, stdout=" M src/foo.py\n", returncode=0
+            )
+        return h._FakeCompletedProcess(args=cmd, stdout="", returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    runner = h._make_runner()
+
+    assert asyncio.run(runner.preflight()) is False
+    assert runner._consecutive_dirty_cycles == 1
+    assert runner.state.state == PipelineState.ERROR
+
+    assert asyncio.run(runner.preflight()) is False
+    assert runner._consecutive_dirty_cycles == 2
+    assert runner.state.state == PipelineState.ERROR
+
+    assert asyncio.run(runner.preflight()) is True
+    assert runner._consecutive_dirty_cycles == 0
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None
+    assert any(
+        cmd[:2] == ["git", "reset"] and "--hard" in cmd
+        for cmd in commands
+    )
+    assert any(cmd[:3] == ["git", "clean", "-fd"] for cmd in commands)
+    assert any(
+        "Auto-recovered from dirty tree" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_dirty_tree_auto_recovery_preserves_watch_with_open_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When auto-recovery fires while a PR is being tracked, the runner
+    must resume WATCH, not IDLE. Dropping to IDLE lets the next cycle
+    re-pick the still-TODO task from origin/main's QUEUE.md and open a
+    duplicate PR — exactly the churn this safety net is meant to
+    avoid."""
+    def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
+        if cmd[:3] == ["git", "status", "--porcelain"]:
+            return h._FakeCompletedProcess(
+                args=cmd, stdout=" M src/foo.py\n", returncode=0
+            )
+        return h._FakeCompletedProcess(args=cmd, stdout="", returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=99, branch="pr-099-wip")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-099", title="wip", status=TaskStatus.DOING, branch="pr-099-wip"
+    )
+
+    asyncio.run(runner.preflight())
+    asyncio.run(runner.preflight())
+    assert asyncio.run(runner.preflight()) is True
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 99
+    assert runner.state.current_task is not None
+    assert any(
+        "auto-recovered from dirty tree -> watch" in e["event"].lower()
+        for e in runner.state.history
+    )
+
+
+def test_dirty_tree_counter_resets_on_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dirty-cycle counter must return to zero after any clean
+    preflight so a transient glitch does not push a later cycle over
+    the auto-reset threshold."""
+    h._patch_subprocess(monkeypatch, stdout=" M foo.py")
+    runner = h._make_runner()
+    assert asyncio.run(runner.preflight()) is False
+    assert runner._consecutive_dirty_cycles == 1
+
+    h._patch_subprocess(monkeypatch, stdout="")
+    assert asyncio.run(runner.preflight()) is True
+    assert runner._consecutive_dirty_cycles == 0
+
+
+def test_dirty_tree_auto_recovery_failure_stays_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the auto-reset git commands themselves fail, preflight must
+    leave the runner in ERROR so the operator still sees the issue
+    rather than silently declaring the tree clean."""
+    def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
+        if cmd[:3] == ["git", "status", "--porcelain"]:
+            return h._FakeCompletedProcess(
+                args=cmd, stdout=" M src/foo.py\n", returncode=0
+            )
+        if cmd[:2] == ["git", "reset"]:
+            raise subprocess.CalledProcessError(
+                1, cmd, stderr="reset refused"
+            )
+        return h._FakeCompletedProcess(args=cmd, stdout="", returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    runner = h._make_runner()
+
+    asyncio.run(runner.preflight())
+    asyncio.run(runner.preflight())
+    assert asyncio.run(runner.preflight()) is False
+    assert runner.state.state == PipelineState.ERROR
+    assert any(
+        "Auto-recovery failed" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_recover_state_rehydrates_last_push_at(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """recover_state must rehydrate _last_push_at when matching to an
+    in-flight DOING task's open PR so the first post-restart handle_watch
+    does not falsely fire handle_fix on pre-restart Codex feedback."""
+    parsed_tasks = [
+        QueueTask(
+            pr_id="PR-001",
+            title="t",
+            status=TaskStatus.DOING,
+            branch="pr-001",
+            task_file="tasks/PR-001.md",
+        )
+    ]
+    (tmp_path / "tasks").mkdir(parents=True)
+    (tmp_path / "tasks" / "PR-001.md").write_text("# PR-001\n")
+
+    head_iso = "2026-04-10T12:00:00Z"
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": head_iso},
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [PRInfo(number=7, branch="pr-001")],
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._parse_base_queue = lambda **_: parsed_tasks  # type: ignore[method-assign]
+    assert runner._last_push_at is None
+    assert runner._watch_entered_at is None
+    asyncio.run(runner.recover_state())
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._last_push_at is not None
+    assert runner._last_push_at.isoformat() == "2026-04-10T12:00:00+00:00"
+    # PR-202: recovery anchors the slow-start window so the first
+    # post-restart poll already uses the slow cadence.
+    assert runner._watch_entered_at is not None

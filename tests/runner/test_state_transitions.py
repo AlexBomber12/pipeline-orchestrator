@@ -35,22 +35,39 @@ Tests do not change production behavior; they only assert it.
 from __future__ import annotations
 
 import asyncio
+
+# PR-224a: imports needed by tests moved from tests/test_runner.py
+import random  # noqa: F401
+import re  # noqa: F401
+import time  # noqa: F401
+import types  # noqa: F401
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 from src import codex_cli
 from src.coders import claude as claude_plugin_module
+from src.config import AppConfig, CoderType, DaemonConfig
+from src.daemon import git_ops as git_ops_module
 from src.daemon import recovery as recovery_module  # noqa: F401  (sanity)
 from src.daemon import runner as runner_module
-from src.daemon.handlers import coding as coding_module  # noqa: F401
-from src.daemon.handlers import error as error_module  # noqa: F401
-from src.daemon.handlers import fix as fix_module
-from src.daemon.handlers import hung as hung_module
-from src.daemon.handlers import idle as idle_module
-from src.daemon.handlers import merge as merge_module  # noqa: F401
-from src.daemon.handlers import watch as watch_module  # noqa: F401
-from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
+from src.daemon.handlers import coding as coding_module  # noqa: F401  # noqa: F401,F811
+from src.daemon.handlers import error as error_module  # noqa: F401  # noqa: F401,F811
+from src.daemon.handlers import fix as fix_module  # noqa: F811
+from src.daemon.handlers import hung as hung_module  # noqa: F811
+from src.daemon.handlers import idle as idle_module  # noqa: F811
+from src.daemon.handlers import merge as merge_module  # noqa: F401  # noqa: F401,F811
+from src.daemon.handlers import watch as watch_module  # noqa: F401  # noqa: F401,F811
+from src.daemon.runner import PipelineRunner
+from src.models import (
+    CIStatus,
+    PipelineState,  # noqa: F811
+    PRInfo,  # noqa: F811
+    QueueTask,  # noqa: F811
+    ReviewStatus,
+    TaskStatus,  # noqa: F811
+)
 
 from tests import test_runner as h
 
@@ -924,4 +941,2078 @@ def test_error_transitions_error_on_review_trigger_failure_after_fix_push(
     assert any(
         e["event"] == f"[ERROR] {runner.state.error_message}."
         for e in runner.state.history
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR-224a moved from tests/test_runner.py
+# ---------------------------------------------------------------------------
+
+def test_handle_coding_no_pr_routes_to_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        h._async_cli_result(0, "ok", ""),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any):
+        return h._FakeCompletedProcess(args=list(args), returncode=1)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+
+    async def instant_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
+
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
+    )
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.HUNG
+    assert "did nothing" in (runner.state.error_message or "")
+
+
+def test_handle_coding_creates_run_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        h._async_cli_result(0, "ok", ""),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [PRInfo(number=42, branch="pr-001")],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+
+    task_file = tmp_path / "tasks" / "PR-001.md"
+    task_file.parent.mkdir(parents=True)
+    task_file.write_text(
+        "# PR-001: Sample\n\n"
+        "Branch: pr-001\n"
+        "- Type: feature\n"
+        "- Complexity: low\n",
+        encoding="utf-8",
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    record = runner._current_run_record
+    assert record is not None
+    assert record.task_id == "PR-001"
+    assert record.profile_id == "claude:opus:container"
+    assert record.task_type == "feature"
+    assert record.complexity == "low"
+
+
+def test_handle_coding_normalizes_task_type_synonym(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        h._async_cli_result(0, "ok", ""),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [PRInfo(number=42, branch="pr-001")],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+
+    task_file = tmp_path / "tasks" / "PR-001.md"
+    task_file.parent.mkdir(parents=True)
+    task_file.write_text(
+        "# PR-001: Sample\n\n"
+        "Branch: pr-001\n"
+        "- Type: bug\n"
+        "- Complexity: low\n",
+        encoding="utf-8",
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    record = runner._current_run_record
+    assert record is not None
+    assert record.task_type == "bugfix"
+
+
+def test_handle_coding_saves_record_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        h._async_cli_result(0, "ok", ""),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [PRInfo(number=42, branch="pr-001")],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+
+    assert len(recent) == 1
+    assert recent[0].run_id == runner._current_run_record.run_id
+    assert recent[0].exit_reason == "coding_complete"
+    assert recent[0].ended_at is not None
+    assert recent[0].duration_ms is not None
+
+
+def test_handle_coding_saves_record_on_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        h._async_cli_result(1, "", "build failed"),
+    )
+
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert len(recent) == 1
+    assert recent[0].exit_reason == "error"
+    assert recent[0].ended_at is not None
+    assert recent[0].duration_ms is not None
+
+
+def test_handle_coding_rejects_unmatched_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When no open PR matches current_task.branch, fail fast instead of
+    attaching to an unrelated newest open PR. The diagnostic handler then
+    routes the no-PR outcome to HUNG via case A/B/C."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        h._async_cli_result(0, "ok", ""),
+    )
+    unrelated = PRInfo(number=99, branch="other-branch")
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [unrelated],
+    )
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any):
+        return h._FakeCompletedProcess(args=list(args), returncode=1)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+
+    async def instant_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
+
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
+    )
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.current_pr is None
+    assert "did nothing" in (runner.state.error_message or "")
+
+
+def test_handle_coding_posts_codex_review_after_pr_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-019: ``handle_coding`` must explicitly post ``@codex review`` on the
+    newly-opened PR so Codex kicks off a review for every iteration instead
+    of relying on GitHub-side Automatic Reviews (which we want configured
+    for PR creation only, to avoid duplicate reviews)."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        h._async_cli_result(0, "ok", ""),
+    )
+    opened_pr = PRInfo(number=42, branch="pr-019")
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [opened_pr],
+    )
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-019", title="t", status=TaskStatus.DOING, branch="pr-019"
+    )
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 42
+    assert posted == [(runner.owner_repo, 42, "@codex review")]
+    assert any(
+        "Posted @codex review on PR #42" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_coding_survives_post_comment_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``post_comment`` failure after PR creation must be non-fatal:
+    the runner stays in ``WATCH`` and logs a warning. Codex may still
+    auto-trigger on push, and a transient ``gh`` hiccup must not flip an
+    otherwise healthy pipeline to ``ERROR``."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        h._async_cli_result(0, "ok", ""),
+    )
+    opened_pr = PRInfo(number=42, branch="pr-019")
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [opened_pr],
+    )
+
+    def boom(repo: str, number: int, body: str) -> None:
+        raise RuntimeError("gh transient failure")
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", boom)
+
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-019", title="t", status=TaskStatus.DOING, branch="pr-019"
+    )
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.error_message is None
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 42
+    assert any(
+        "Warning: failed to post @codex review" in e["event"]
+        and "gh transient failure" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_coding_stop_request_terminates_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    stop_called = {"terminate": 0, "kill": 0, "wait": 0}
+
+    class _FakeProc:
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self._done = asyncio.Event()
+
+        def terminate(self) -> None:
+            stop_called["terminate"] += 1
+            self.returncode = -15
+            self._done.set()
+
+        def kill(self) -> None:
+            stop_called["kill"] += 1
+            self.returncode = -9
+            self._done.set()
+
+        async def wait(self) -> int:
+            stop_called["wait"] += 1
+            await self._done.wait()
+            return self.returncode or 0
+
+    async def fake_run_planned_pr_async(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        proc = _FakeProc()
+        on_process_start = kwargs["on_process_start"]
+        assert callable(on_process_start)
+        on_process_start(proc)
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise
+        return (0, "ok", "")
+
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        fake_run_planned_pr_async,
+    )
+
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-127",
+        title="Pause controls",
+        status=TaskStatus.DOING,
+        branch="pr-127-control-endpoints-backend",
+    )
+    runner.redis.store[f"control:{runner.name}:stop"] = "1"
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.user_paused is True
+    assert runner.state.error_message is None
+    assert stop_called["terminate"] == 1
+    assert stop_called["kill"] == 0
+    assert stop_called["wait"] >= 1
+    assert any(
+        "user stop requested" in entry["event"].lower()
+        for entry in runner.state.history
+    )
+
+
+def test_handle_coding_honors_persisted_stop_after_fast_cli_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        h._async_cli_result(1, "", "coder failed fast"),
+    )
+
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-127",
+        title="Pause controls",
+        status=TaskStatus.DOING,
+        branch="pr-127-control-endpoints-backend",
+    )
+    runner.redis.store[f"control:{runner.name}:stop"] = "1"
+
+    async def stale_stop_monitor(
+        _cli_task: asyncio.Task[tuple[int, str, str]],
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_monitor_stop_request", stale_stop_monitor)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.user_paused is True
+    assert runner.state.error_message is None
+    assert f"control:{runner.name}:stop" not in runner.redis.store
+    assert any(
+        "after coder exit" in entry["event"].lower()
+        for entry in runner.state.history
+    )
+
+
+def test_handle_coding_honors_stop_requested_during_pr_retry_after_cli_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        h._async_cli_result(0, "ok", ""),
+    )
+
+    attempts = {"count": 0}
+
+    def fake_get_open_prs(repo: str, **kw: Any) -> list[PRInfo]:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            return []
+        return [PRInfo(number=127, branch="pr-127-control-endpoints-backend")]
+
+    async def stale_stop_monitor(
+        _cli_task: asyncio.Task[tuple[int, str, str]],
+    ) -> None:
+        return None
+
+    pop_calls = {"count": 0}
+
+    async def fake_pop_stop_request() -> bool:
+        pop_calls["count"] += 1
+        return pop_calls["count"] == 4
+
+    async def instant_sleep(_seconds: float) -> None:
+        return None
+
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-127",
+        title="Pause controls",
+        status=TaskStatus.DOING,
+        branch="pr-127-control-endpoints-backend",
+    )
+    monkeypatch.setattr(runner_module.github_client, "get_open_prs", fake_get_open_prs)
+    monkeypatch.setattr(runner, "_pop_stop_request", fake_pop_stop_request)
+    monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
+    monkeypatch.setattr(runner, "_monitor_stop_request", stale_stop_monitor)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.user_paused is True
+    assert runner.state.current_pr is None
+    assert attempts["count"] == 1
+    assert any(
+        "after coder exit" in entry["event"].lower()
+        for entry in runner.state.history
+    )
+
+
+def test_handle_coding_errors_when_task_has_no_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        h._async_cli_result(0, "ok", ""),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [PRInfo(number=1, branch="anything")],
+    )
+
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )  # no branch
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_pr is None
+    assert "no branch" in (runner.state.error_message or "").lower()
+    # Codex P1: the malformed-task error path must bail BEFORE
+    # ``_commit_and_push_dirty`` runs, otherwise a dirty tree could be
+    # committed + pushed to whatever branch HEAD happens to be on
+    # before the runner realises it cannot identify the target PR.
+    assert not any(cmd[:2] == ["git", "status"] for cmd in calls)
+    assert not any(cmd[:1] == ["scripts/ci.sh"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "add"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "commit"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
+
+
+def test_handle_coding_retries_pr_detection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub's open-PR list is eventually consistent: a PR opened by
+    Claude may not appear on the first poll. ``handle_coding`` must retry
+    up to 3 times before giving up."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        h._async_cli_result(0, "ok", ""),
+    )
+
+    opened_pr = PRInfo(number=42, branch="pr-001")
+    call_count = {"n": 0}
+
+    def flaky_get_open_prs(repo: str, **kw: Any) -> list[PRInfo]:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return []
+        return [opened_pr]
+
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", flaky_get_open_prs
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+
+    slept: list[float] = []
+
+    async def instant_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
+
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
+    )
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 42
+    assert call_count["n"] == 2
+    assert 5 in slept
+    assert any(
+        "PR not found for 'pr-001'" in e["event"] and "1/3" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_coding_runs_three_retries_before_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After 3 consecutive empty get_open_prs results the runner must
+    invoke ``_diagnose_exit_zero_no_pr`` rather than flipping straight
+    to ERROR. That diagnostic distinguishes A/B/C and routes to HUNG
+    when the coder did nothing observable upstream."""
+    h._patch_subprocess(monkeypatch)
+    call_count = {"n": 0}
+
+    def always_empty(repo: str, **kw: Any) -> list[PRInfo]:
+        call_count["n"] += 1
+        return []
+
+    monkeypatch.setattr(
+        runner_module.github_client, "get_open_prs", always_empty
+    )
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any):
+        return h._FakeCompletedProcess(args=list(args), returncode=1)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+
+    slept: list[float] = []
+
+    async def instant_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
+
+    class _CodexPlugin:
+        supports_breach_lifecycle = False
+
+        async def run_planned_pr(
+            self, path: str, **kwargs: object
+        ) -> tuple[int, str, str]:
+            return (0, "ok", "")
+
+        def build_run_kwargs(
+            self, *, daemon_config: Any, **_kw: object
+        ) -> dict[str, Any]:
+            return {"model": daemon_config.codex_model}
+
+    runner = h._make_runner()
+    runner._get_coder = lambda allow_exploration=False: (  # type: ignore[method-assign]
+        "codex",
+        _CodexPlugin(),
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
+    )
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.HUNG
+    assert "[codex]" in (runner.state.error_message or "")
+    assert call_count["n"] == 3
+    assert slept.count(5) == 2
+
+
+def test_handle_hung_posts_codex_review_and_returns_to_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    asyncio.run(runner.handle_hung())
+
+    assert posted == [(runner.owner_repo, 5, "@codex review")]
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.last_activity is not None
+
+
+def test_handle_hung_stays_hung_when_pr_is_escalated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Escalated PRs (e.g. parked here by the FIX no-push deadlock circuit
+    breaker) must stay HUNG even when ``hung_fallback_codex_review`` is on;
+    otherwise the fallback bounces back to WATCH and re-enters the loop
+    that triggered escalation in the first place."""
+    posted: list[tuple[str, int, str]] = []
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
+
+    runner = h._make_runner()
+    assert runner.app_config.daemon.hung_fallback_codex_review is True
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(
+        number=217, branch="pr-217", is_escalated=True
+    )
+    asyncio.run(runner.handle_hung())
+
+    assert posted == []
+    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.is_escalated is True
+    assert any(
+        "PR #217 escalated; staying HUNG" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_hung_escalated_pr_resolved_externally_transitions_to_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An escalated PR that the operator manually merges/closes must
+    transition out of HUNG. The early-return on ``is_escalated`` used to
+    short-circuit the PR state check and trap the runner forever (Codex
+    P1 on PR #222)."""
+    posted: list[tuple[str, int, str]] = []
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: {"state": "MERGED"},
+    )
+
+    runner = h._make_runner()
+    assert runner.app_config.daemon.hung_fallback_codex_review is True
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(
+        number=217, branch="pr-217", is_escalated=True
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-217", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_hung())
+
+    assert posted == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+    assert runner.state.current_task is None
+
+
+def test_handle_hung_sets_error_when_fallback_post_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(repo: str, number: int, body: str) -> None:
+        raise RuntimeError("gh unavailable")
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", boom)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    asyncio.run(runner.handle_hung())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "post_comment failed: gh unavailable"
+    assert any(
+        entry["event"] == "[ESCALATE] gh unavailable."
+        for entry in runner.state.history
+    )
+
+
+def test_handle_hung_preserves_context_when_fallback_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When hung_fallback_codex_review=False and PR is still open, runner
+    stays in HUNG with current_pr and current_task preserved."""
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
+    runner = PipelineRunner(
+        h._repo_cfg(),
+        AppConfig(
+            repositories=[],
+            daemon=DaemonConfig(hung_fallback_codex_review=False),
+        ),
+        h._FakeRedis(),
+        *h._usage_providers(),
+    )
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_hung())
+
+    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 5
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == "PR-001"
+
+
+def test_handle_hung_stays_hung_when_pr_state_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(*args: object, **kwargs: object) -> dict[str, str]:
+        raise RuntimeError("gh view failed")
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", boom)
+    runner = PipelineRunner(
+        h._repo_cfg(),
+        AppConfig(
+            repositories=[],
+            daemon=DaemonConfig(hung_fallback_codex_review=False),
+        ),
+        h._FakeRedis(),
+        *h._usage_providers(),
+    )
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_hung())
+
+    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.current_pr is not None
+    assert runner.state.current_task is not None
+    assert any(
+        "hung: failed to check PR state: gh view failed; staying HUNG"
+        in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+@pytest.mark.parametrize("pr_state", ["MERGED", "CLOSED"])
+def test_handle_hung_transitions_to_idle_when_pr_resolved(
+    monkeypatch: pytest.MonkeyPatch,
+    pr_state: str,
+) -> None:
+    """When hung_fallback_codex_review=False and the operator has closed or
+    merged the PR, the runner should transition back to IDLE."""
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "run_gh",
+        lambda *a, **kw: {"state": pr_state},
+    )
+    runner = PipelineRunner(
+        h._repo_cfg(),
+        AppConfig(
+            repositories=[],
+            daemon=DaemonConfig(hung_fallback_codex_review=False),
+        ),
+        h._FakeRedis(),
+        *h._usage_providers(),
+    )
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_hung())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+    assert runner.state.current_task is None
+
+
+def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.github_client, "merge_pr", lambda repo, num: None
+    )
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING,
+    )
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+    assert runner.state.current_task is None
+
+
+def test_handle_merge_without_current_pr_sets_idle() -> None:
+    runner = h._make_runner()
+    runner.state.state = PipelineState.MERGE
+
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+
+
+def test_handle_merge_queue_sync_failure_still_goes_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When _mark_queue_done raises, handle_merge catches the exception
+    and still transitions to IDLE. The pending_queue_sync_branch marker
+    (set eagerly inside _mark_queue_done) gates handle_idle from
+    re-dispatching the same task."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        runner_module.github_client, "merge_pr", lambda repo, num: None
+    )
+
+    def _failing_mark(self: Any) -> None:
+        self.state.pending_queue_sync_branch = "queue-done-pr-001"
+        raise RuntimeError("push rejected")
+
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", _failing_mark
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING,
+    )
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
+
+
+def test_escalate_queue_sync_transitions_to_error_when_expired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    runner.state.pending_queue_sync_branch = "queue-done-pr-001"
+    runner.state.pending_queue_sync_started_at = (
+        datetime.now(timezone.utc) - timedelta(hours=2)
+    )
+    events: list[str] = []
+    monkeypatch.setattr(runner, "log_event", events.append)
+
+    asyncio.run(runner._escalate_queue_sync_if_expired("queue-done-pr-001"))
+
+    assert runner.state.pending_queue_sync_branch is None
+    assert runner.state.pending_queue_sync_started_at is None
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message is not None
+    assert "queue-sync PR queue-done-pr-001 unresolved after " in (
+        runner.state.error_message
+    )
+    assert f"(max {merge_module._QUEUE_SYNC_MAX_WAIT_SEC}s)" in (
+        runner.state.error_message
+    )
+    assert events == [f"[MERGE] {runner.state.error_message}."]
+
+
+def test_handle_merge_failure_sets_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    h._patch_subprocess(monkeypatch)
+
+    def boom(repo: str, num: int) -> None:
+        raise RuntimeError("merge conflict")
+
+    monkeypatch.setattr(runner_module.github_client, "merge_pr", boom)
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "merge conflict" in (runner.state.error_message or "")
+
+
+def test_handle_merge_syncs_with_main(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Before calling merge_pr, handle_merge fetches and merges
+    origin/<base> into the PR branch. When the branch is already
+    up-to-date, the sync is a no-op and merge_pr runs immediately."""
+    git_calls: list[list[str]] = []
+
+    def fake_git(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
+        git_calls.append(cmd)
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return h._FakeCompletedProcess(
+                args=cmd, stdout="Already up to date.\n", returncode=0
+            )
+        return h._FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+
+    merge_pr_calls: list[tuple[str, int]] = []
+
+    def fake_merge_pr(repo: str, num: int) -> None:
+        merge_pr_calls.append((repo, num))
+
+    monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge_pr)
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert merge_pr_calls == [(runner.owner_repo, 5)]
+
+    merge_idx = next(
+        i for i, cmd in enumerate(git_calls)
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd
+    )
+    merge_pr_call_idx = len(git_calls)  # merge_pr ran after all git calls
+    assert merge_idx < merge_pr_call_idx
+    # No push because the merge was a no-op.
+    assert not any(
+        cmd[:2] == ["git", "push"] and "pr-001" in cmd for cmd in git_calls
+    )
+
+
+def test_handle_merge_marks_pr_ready_before_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+
+    call_order: list[str] = []
+
+    def fake_run_gh(cmd: list[str], **kwargs: Any) -> None:
+        assert cmd == ["pr", "ready", "5"]
+        call_order.append("ready")
+
+    def fake_merge_pr(repo: str, num: int) -> None:
+        assert (repo, num) == (runner.owner_repo, 5)
+        call_order.append("merge")
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge_pr)
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert call_order == ["ready", "merge"]
+
+
+def test_handle_merge_ignores_pr_ready_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+
+    call_order: list[str] = []
+
+    def fail_run_gh(cmd: list[str], **kwargs: Any) -> None:
+        assert cmd == ["pr", "ready", "5"]
+        call_order.append("ready")
+        raise RuntimeError("ready failed")
+
+    def fake_merge_pr(repo: str, num: int) -> None:
+        assert (repo, num) == (runner.owner_repo, 5)
+        call_order.append("merge")
+
+    monkeypatch.setattr(runner_module.github_client, "run_gh", fail_run_gh)
+    monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge_pr)
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert call_order == ["ready", "merge"]
+
+
+def test_handle_merge_captures_success_stats_before_queue_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_git(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return h._FakeCompletedProcess(
+                args=cmd, stdout="Already up to date.\n", returncode=0
+            )
+        return h._FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+    monkeypatch.setattr(
+        runner_module.github_client, "merge_pr", lambda repo, num: None
+    )
+
+    call_order: list[str] = []
+
+    def fake_compute(base_branch: str) -> dict[str, object]:
+        call_order.append(f"compute:{base_branch}")
+        return {
+            "files_touched_count": 7,
+            "languages_touched": ["python"],
+            "diff_lines_added": 11,
+            "diff_lines_deleted": 3,
+            "test_file_ratio": 0.286,
+        }
+
+    def fake_mark(self: runner_module.PipelineRunner) -> None:
+        call_order.append("queue")
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    runner._start_current_run_record("claude", "opus")
+    monkeypatch.setattr(runner, "_compute_diff_stats", fake_compute)
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", fake_mark
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+
+    assert call_order == ["compute:main", "queue"]
+    assert len(recent) == 1
+    assert recent[0].exit_reason == "success_merged"
+    assert recent[0].files_touched_count == 7
+    assert recent[0].languages_touched == ["python"]
+    assert recent[0].diff_lines_added == 11
+    assert recent[0].diff_lines_deleted == 3
+    assert recent[0].test_file_ratio == 0.286
+    assert recent[0].base_branch == "main"
+
+
+def test_handle_merge_returns_to_watch_after_sync_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the sync produces a new commit and push succeeds, the
+    merged commit invalidates previously observed gate state (branch
+    protection may require up-to-date checks or dismiss approvals on
+    new commits). Return to WATCH so the next cycle re-verifies gates
+    against the refreshed HEAD instead of calling merge_pr with stale
+    results."""
+    git_calls: list[list[str]] = []
+
+    def fake_git(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
+        git_calls.append(cmd)
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return h._FakeCompletedProcess(
+                args=cmd,
+                stdout="Merge made by the 'ort' strategy.\n",
+                returncode=0,
+            )
+        return h._FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+
+    merge_pr_calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "merge_pr",
+        lambda repo, num: merge_pr_calls.append((repo, num)),
+    )
+
+    post_calls: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, num, body: post_calls.append((repo, num, body)),
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_pr = pr
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is pr
+    assert not merge_pr_calls, (
+        "merge_pr must not run with stale gate results after sync push"
+    )
+    assert any(
+        cmd[:2] == ["git", "push"] and "pr-001" in cmd for cmd in git_calls
+    ), "sync must push the merged PR branch"
+    assert post_calls == [(runner.owner_repo, 5, "@codex review")], (
+        "must re-request Codex review on the refreshed HEAD"
+    )
+
+
+def test_handle_merge_errors_when_codex_post_fails_after_sync_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failing to post @codex review after a sync push must flip the
+    runner into ERROR: without a fresh review trigger on the new
+    HEAD, the prior anchor +1 keeps the PR APPROVED and a subsequent
+    handle_watch cycle would merge on stale approval."""
+    def fake_git(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return h._FakeCompletedProcess(
+                args=cmd,
+                stdout="Merge made by the 'ort' strategy.\n",
+                returncode=0,
+            )
+        return h._FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("gh api failure")
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", boom)
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "stale approval" in (runner.state.error_message or "")
+
+
+def test_handle_merge_resolves_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When git merge origin/<base> reports a conflict, handle_merge
+    asks Claude to resolve it. On success the merged HEAD is pushed
+    and the runner returns to WATCH so the next cycle re-verifies
+    gates — merge_pr is not called in the same cycle because the new
+    commit invalidates previously observed CI/review state."""
+    git_calls: list[list[str]] = []
+
+    def fake_git(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
+        git_calls.append(cmd)
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return h._FakeCompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout="CONFLICT (content): merge conflict in foo",
+            )
+        return h._FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+
+    claude_calls: list[tuple[str, str]] = []
+
+    async def fake_claude(
+        prompt: str,
+        cwd: str,
+        timeout: int | None = 600,
+        model: str | None = None,
+        **kwargs: Any,
+    ) -> tuple[int, str, str]:
+        claude_calls.append((prompt, cwd))
+        return (0, "", "")
+
+    monkeypatch.setattr(claude_cli, "run_claude_async", fake_claude)
+
+    merge_pr_calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "merge_pr",
+        lambda repo, num: merge_pr_calls.append((repo, num)),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, num, body: None,
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    runner._start_current_run_record("claude", "opus")
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert claude_calls, "Claude must be invoked on merge conflict"
+    assert not merge_pr_calls, (
+        "merge_pr must not run with stale gate results after sync push"
+    )
+    assert runner._current_run_record is not None
+    assert runner._current_run_record.had_merge_conflict is True
+    assert any(
+        cmd[:2] == ["git", "push"] and "pr-001" in cmd for cmd in git_calls
+    ), "conflict-resolved HEAD must be pushed to origin"
+
+
+def test_handle_merge_falls_back_to_codex_for_conflict_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_calls: list[tuple[str, ...]] = []
+
+    def fake_git(
+        repo_path: str,
+        *args: str,
+        **kwargs: Any,
+    ) -> h._FakeCompletedProcess:
+        git_calls.append(args)
+        if args[:2] == ("merge", "origin/main"):
+            return h._FakeCompletedProcess(
+                args=["git", *args],
+                returncode=1,
+                stdout="CONFLICT (content): merge conflict in foo",
+            )
+        return h._FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    proactive_coders: list[str | None] = []
+
+    async def fake_check_rate_limit(
+        self,
+        proactive_coder: str | None = None,
+    ) -> bool:
+        proactive_coders.append(proactive_coder)
+        return True
+
+    codex_calls: list[tuple[str, str]] = []
+
+    async def fake_codex(
+        prompt: str,
+        cwd: str,
+        timeout: int | None = 600,
+        model: str | None = None,
+        **kwargs: Any,
+    ) -> tuple[int, str, str]:
+        codex_calls.append((prompt, cwd))
+        return (0, "", "")
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_check_rate_limit", fake_check_rate_limit)
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_select_auxiliary_coder",
+        lambda self: ("codex", self._registry.get("codex")),
+    )
+    monkeypatch.setattr(codex_cli, "run_codex_async", fake_codex)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_claude_async",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Claude should not be used when Codex is selected")
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, num, body: None,
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert proactive_coders == ["codex"]
+    assert codex_calls, "Codex must be invoked on merge conflict fallback"
+    assert any(cmd[:2] == ("push", "origin") for cmd in git_calls)
+
+
+def test_handle_merge_sets_error_when_no_auxiliary_coder_is_eligible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_calls: list[tuple[str, ...]] = []
+    claude_calls: list[object] = []
+    codex_calls: list[object] = []
+
+    def fake_git(
+        repo_path: str,
+        *args: str,
+        **kwargs: Any,
+    ) -> h._FakeCompletedProcess:
+        git_calls.append(args)
+        if args[:2] == ("merge", "origin/main"):
+            return h._FakeCompletedProcess(
+                args=["git", *args],
+                returncode=1,
+                stdout="CONFLICT (content): merge conflict in foo",
+            )
+        return h._FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_select_auxiliary_coder",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        claude_cli,
+        "run_claude_async",
+        lambda *args, **kwargs: claude_calls.append(args),
+    )
+    monkeypatch.setattr(
+        codex_cli,
+        "run_codex_async",
+        lambda *args, **kwargs: codex_calls.append(args),
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._start_current_run_record("claude", "opus")
+
+    asyncio.run(runner.handle_merge())
+
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert (
+        runner.state.error_message
+        == "No eligible coder available for merge conflict resolution"
+    )
+    assert ("merge", "--abort") in git_calls
+    assert not claude_calls
+    assert not codex_calls
+    assert len(recent) == 1
+    assert recent[0].exit_reason == "error"
+
+
+def test_handle_merge_skips_sync_for_cross_repo_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fork-based PRs: the head branch is on the contributor's fork,
+    not origin. Any local push of the head branch would fail. Skip the
+    pre-merge sync entirely and defer to gh pr merge."""
+    git_calls: list[list[str]] = []
+
+    def fake_git(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
+        git_calls.append(cmd)
+        return h._FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+
+    merge_pr_calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "merge_pr",
+        lambda repo, num: merge_pr_calls.append((repo, num)),
+    )
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=5, branch="pr-001", is_cross_repository=True
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert merge_pr_calls == [(runner.owner_repo, 5)]
+    assert not any(
+        cmd[:2] == ["git", "push"] and "pr-001" in cmd for cmd in git_calls
+    ), "cross-repo PRs must not push the head branch to origin"
+    assert not any(
+        cmd[:2] == ["git", "merge"] and "origin/main" in cmd
+        for cmd in git_calls
+    ), "cross-repo PRs must not merge base locally"
+
+
+def test_handle_merge_refreshes_pr_head_before_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a daemon restart, the local PR branch may lag behind
+    origin (recover_state resumes WATCH with a stale checkout). The
+    sync must fetch origin/<pr_branch> and reset the local branch to
+    it, or the subsequent push will be rejected as non-fast-forward."""
+    git_calls: list[list[str]] = []
+
+    def fake_git(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
+        git_calls.append(cmd)
+        return h._FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+    monkeypatch.setattr(
+        runner_module.github_client, "merge_pr", lambda repo, num: None
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, num, body: None,
+    )
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_merge())
+
+    fetch_cmds = [
+        cmd for cmd in git_calls
+        if cmd[:4] == ["git", "fetch", "--prune", "origin"]
+    ]
+    assert fetch_cmds and any("pr-001" in cmd for cmd in fetch_cmds), (
+        "must fetch origin/<pr_branch> with --prune before local merge"
+    )
+    reset_cmds = [
+        cmd for cmd in git_calls
+        if cmd[:3] == ["git", "reset", "--hard"] and "origin/pr-001" in cmd
+    ]
+    assert reset_cmds, "must reset local PR branch to origin/<pr_branch>"
+
+    reset_idx = git_calls.index(reset_cmds[0])
+    merge_idx = next(
+        i for i, cmd in enumerate(git_calls)
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd
+    )
+    assert reset_idx < merge_idx, (
+        "reset to origin/<pr_branch> must happen before merging base"
+    )
+
+
+def test_handle_merge_sets_error_on_non_conflict_sync_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_git(
+        repo_path: str,
+        *args: str,
+        **kwargs: Any,
+    ) -> h._FakeCompletedProcess:
+        if args[:2] == ("merge", "origin/main"):
+            return h._FakeCompletedProcess(
+                args=["git", *args],
+                returncode=1,
+                stderr="fatal: unrelated histories",
+            )
+        return h._FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._start_current_run_record("claude", "opus")
+
+    asyncio.run(runner.handle_merge())
+
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "fatal: unrelated histories" in (runner.state.error_message or "")
+    assert len(recent) == 1
+    assert recent[0].exit_reason == "error"
+
+
+def test_handle_merge_aborts_on_unresolvable_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When Claude fails to resolve the conflict, handle_merge aborts
+    the merge, sets ERROR, and does not call github_client.merge_pr."""
+    git_calls: list[list[str]] = []
+
+    def fake_git(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
+        git_calls.append(cmd)
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return h._FakeCompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout="CONFLICT (content): merge conflict in foo",
+            )
+        return h._FakeCompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+
+    async def fake_claude_async(
+        prompt: str,
+        cwd: str,
+        timeout: int | None = 600,
+        model: str | None = None,
+        **kwargs: Any,
+    ) -> tuple[int, str, str]:
+        return (1, "", "claude failed")
+
+    monkeypatch.setattr(
+        claude_cli,
+        "run_claude_async",
+        fake_claude_async,
+    )
+
+    merge_pr_calls: list[tuple[str, int]] = []
+
+    def fake_merge_pr(repo: str, num: int) -> None:
+        merge_pr_calls.append((repo, num))
+
+    monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge_pr)
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "Merge conflict resolution failed" in (
+        runner.state.error_message or ""
+    )
+    assert not merge_pr_calls, "merge_pr must not be called on abort"
+    abort_cmds = [
+        cmd for cmd in git_calls
+        if cmd[:3] == ["git", "merge", "--abort"]
+    ]
+    assert abort_cmds, "git merge --abort must be invoked"
+
+
+def test_handle_merge_sets_error_when_pre_sync_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_retry_transient(op: Any, **kwargs: Any) -> h._FakeCompletedProcess:
+        return op()
+
+    def fake_git(
+        repo_path: str,
+        *args: str,
+        **kwargs: Any,
+    ) -> h._FakeCompletedProcess:
+        if args[:4] == ("fetch", "--prune", "origin", "main"):
+            raise OSError("network down")
+        return h._FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    monkeypatch.setattr(merge_module, "retry_transient", fake_retry_transient)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._start_current_run_record("claude", "opus")
+
+    asyncio.run(runner.handle_merge())
+
+    recent = asyncio.run(
+        runner._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "Pre-merge sync failed: network down"
+    assert len(recent) == 1
+    assert recent[0].exit_reason == "error"
+
+
+def test_handle_coding_saves_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """handle_coding must save CLI stdout to Redis via _save_cli_log."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        h._async_cli_result(0, "hello from claude", ""),
+    )
+    pr = PRInfo(number=42, branch="pr-001")
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
+    )
+    asyncio.run(runner.handle_coding())
+
+    redis_keys = [k for k, _v in runner.redis.writes]
+    assert any(k == f"cli_log:{runner.name}:latest" for k in redis_keys)
+    stored = runner.redis.store.get(f"cli_log:{runner.name}:latest")
+    assert "hello from claude" in (stored or "")
+    assert "=== STDOUT ===" in (stored or "")
+    assert "=== STDERR ===" in (stored or "")
+
+
+def test_handle_coding_uses_configured_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """planned_pr_timeout_sec from config must be forwarded to run_planned_pr."""
+    h._patch_subprocess(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    async def fake_planned(
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+    ) -> tuple[int, str, str]:
+        captured["timeout"] = timeout
+        return (0, "", "")
+
+    monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_planned)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [PRInfo(number=1, branch="pr-001")],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = PipelineRunner(
+        h._repo_cfg(),
+        AppConfig(
+            repositories=[],
+            daemon=DaemonConfig(
+                planned_pr_timeout_sec=1234,
+                auto_fallback=False,
+            ),
+        ),
+        h._FakeRedis(),
+        *h._usage_providers(),
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
+    )
+    asyncio.run(runner.handle_coding())
+    assert captured.get("timeout") == 1234
+
+
+def test_handle_external_terminal_pr_state_closed_transitions_to_hung(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Detected external close must transition runner to HUNG for manual
+    review AND finalize the active run record as ``closed_unmerged`` so
+    the next ``handle_hung`` -> IDLE tick does not strand the run with
+    a missing ``ended_at`` / ``exit_reason`` (Codex P2 follow-up on PR
+    #223)."""
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-055",
+        title="external close",
+        status=TaskStatus.DOING,
+        branch="pr-055",
+        task_file="tasks/PR-055.md",
+    )
+    runner.state.current_pr = PRInfo(number=55, branch="pr-055")
+    runner._start_current_run_record("claude", "opus")
+    monkeypatch.setattr(runner, "_compute_diff_stats", lambda base_branch: {})
+
+    saved: list[str] = []
+    original_save = runner._save_current_run_record
+
+    async def spy_save(exit_reason: str, **kwargs: object) -> None:
+        saved.append(exit_reason)
+        await original_save(exit_reason, **kwargs)
+
+    runner._save_current_run_record = spy_save  # type: ignore[assignment]
+
+    asyncio.run(runner._handle_external_terminal_pr_state("CLOSED"))
+
+    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.error_message is None
+    assert saved == ["closed_unmerged"]
+    assert runner._current_run_record is None
+    assert any(
+        "PR #55 closed externally during FIX, transitioning to HUNG."
+        in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_coding_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:
+    """handle_coding must call run_planned_pr_async, not the sync version."""
+    h._patch_subprocess(monkeypatch)
+    async_calls: list[str] = []
+    sync_calls: list[str] = []
+
+    async def fake_async(
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+    ) -> tuple[int, str, str]:
+        async_calls.append(path)
+        return (0, "ok", "")
+
+    def fake_sync(
+        path: str, model: str | None = None, timeout: int | None = None
+    ) -> tuple[int, str, str]:
+        sync_calls.append(path)
+        return (0, "ok", "")
+
+    monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_async)
+    monkeypatch.setattr(claude_cli, "run_planned_pr", fake_sync)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [PRInfo(number=1, branch="pr-001")],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
+    )
+    asyncio.run(runner.handle_coding())
+
+    assert async_calls, "run_planned_pr_async must be called"
+    assert not sync_calls, "sync run_planned_pr must NOT be called"
+
+
+def test_handle_coding_publishes_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """publish_state is called during Claude CLI run via heartbeat task."""
+    h._patch_subprocess(monkeypatch)
+    heartbeat_publishes: list[str] = []
+
+    original_publish = PipelineRunner.publish_state
+
+    async def counting_publish(self: Any) -> None:
+        await original_publish(self)
+
+    monkeypatch.setattr(PipelineRunner, "publish_state", counting_publish)
+
+    cli_done = None
+
+    async def slow_cli(
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+    ) -> tuple[int, str, str]:
+        nonlocal cli_done
+        cli_done = asyncio.get_event_loop().create_future()
+        await cli_done
+        return (0, "ok", "")
+
+    monkeypatch.setattr(claude_cli, "run_planned_pr_async", slow_cli)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [PRInfo(number=1, branch="pr-001")],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "post_comment", lambda *a, **kw: None
+    )
+
+    async def fast_heartbeat(self: Any, label: str) -> None:
+        while True:
+            await asyncio.sleep(0.01)
+            self.log_event(f"{label}...")
+            heartbeat_publishes.append(label)
+            await self.publish_state()
+
+    monkeypatch.setattr(
+        PipelineRunner, "_publish_while_waiting", fast_heartbeat
+    )
+
+    async def run() -> None:
+        runner = h._make_runner()
+        runner.state.current_task = QueueTask(
+            pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
+        )
+        task = asyncio.create_task(runner.handle_coding())
+        await asyncio.sleep(0.05)
+        cli_done.set_result(None)
+        await task
+
+    asyncio.run(run())
+
+    assert len(heartbeat_publishes) >= 2, (
+        f"Expected heartbeat to publish at least twice, got {len(heartbeat_publishes)}"
+    )
+
+
+def test_handle_coding_errors_when_get_open_prs_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub list failures after a successful CLI run surface as ERROR."""
+    from src import codex_cli
+
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        codex_cli, "run_planned_pr_async", h._async_cli_result(0, "ok", ""),
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda *args, **kwargs: h._raise_runtime_error("gh unavailable"),
+    )
+
+    runner = h._make_runner(coder=CoderType.CODEX)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001",
+    )
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "get_open_prs failed: gh unavailable"
+    assert any(
+        entry["event"] == "[CODING] get_open_prs failed: gh unavailable."
+        for entry in runner.state.history
+    )
+
+
+def test_handle_coding_uses_codex_cli_when_coder_is_codex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src import codex_cli
+
+    h._patch_subprocess(monkeypatch)
+    captured_module: list[str] = []
+
+    async def fake_run_planned_pr(path: str, **kwargs: object) -> tuple:
+        captured_module.append("codex")
+        return (0, "ok", "")
+
+    monkeypatch.setattr(codex_cli, "run_planned_pr_async", fake_run_planned_pr)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda *a, **kw: [PRInfo(
+            number=42,
+            url="https://github.com/octo/demo/pull/42",
+            branch="pr-001",
+            ci_status=CIStatus.PENDING,
+            review_status=ReviewStatus.PENDING,
+        )],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: True,
+    )
+
+    runner = h._make_runner(coder=CoderType.CODEX)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001",
+    )
+    asyncio.run(runner.handle_coding())
+
+    assert captured_module == ["codex"]
+    assert runner.state.state == PipelineState.WATCH
+
+
+def test_handle_coding_honors_stop_requested_after_pr_poll_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_planned_pr_async",
+        h._async_cli_result(0, "ok", ""),
+    )
+
+    async def stale_stop_monitor(
+        _cli_task: asyncio.Task[tuple[int, str, str]],
+    ) -> None:
+        return None
+
+    pop_calls = {"count": 0}
+    attempts = {"count": 0}
+
+    async def fake_pop_stop_request() -> bool:
+        pop_calls["count"] += 1
+        return pop_calls["count"] == 6
+
+    async def instant_sleep(_seconds: float) -> None:
+        return None
+
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-127",
+        title="Pause controls",
+        status=TaskStatus.DOING,
+        branch="pr-127-control-endpoints-backend",
+    )
+
+    def fake_get_open_prs(repo: str, **kw: Any) -> list[PRInfo]:
+        attempts["count"] += 1
+        return []
+
+    monkeypatch.setattr(runner_module.github_client, "get_open_prs", fake_get_open_prs)
+    monkeypatch.setattr(runner, "_pop_stop_request", fake_pop_stop_request)
+    monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
+    monkeypatch.setattr(runner, "_monitor_stop_request", stale_stop_monitor)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.error_message is None
+    assert runner.state.current_pr is None
+    assert attempts["count"] == 3
+    assert any(
+        entry["event"] == "[CODING] CODING aborted: user stop requested."
+        for entry in runner.state.history
     )
