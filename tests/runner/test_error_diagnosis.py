@@ -25,14 +25,33 @@ by stubbing the diagnosis async helpers and the usage-provider snapshot.
 from __future__ import annotations
 
 import asyncio
+
+# PR-224a: imports needed by tests moved from tests/test_runner.py
+import random  # noqa: F401
+import re  # noqa: F401
+import subprocess
+import time  # noqa: F401
+import types  # noqa: F401
+from pathlib import Path
 from typing import Any
 
 import pytest
 from src import codex_cli
 from src.coders import claude as claude_plugin_module
+from src.config import CoderType
+from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
-from src.daemon.handlers import idle as idle_module
-from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
+from src.daemon.handlers import coding as coding_module  # noqa: F401,F811
+from src.daemon.handlers import error as error_module  # noqa: F401,F811
+from src.daemon.handlers import idle as idle_module  # noqa: F811
+from src.daemon.handlers import merge as merge_module  # noqa: F401,F811
+from src.daemon.handlers import watch as watch_module  # noqa: F401,F811
+from src.models import (
+    PipelineState,  # noqa: F811
+    PRInfo,  # noqa: F811
+    QueueTask,  # noqa: F811
+    TaskStatus,  # noqa: F811
+)
 from src.usage import UsageSnapshot
 
 from tests import test_runner as h
@@ -536,3 +555,1148 @@ def test_handle_error_dispatches_to_third_coder_plugin_without_handler_edits(
     # FIX verdict transitions back to IDLE.
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.error_message is None
+
+
+# ---------------------------------------------------------------------------
+# PR-224a moved from tests/test_runner.py
+# ---------------------------------------------------------------------------
+
+def test_handle_error_skip_clears_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        h._async_cli_result(0, "SKIP", ""),
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None
+    assert runner.state.current_task is None
+
+
+def test_handle_error_falls_back_to_codex_for_diagnosis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_calls: list[tuple[str, str, str | None]] = []
+
+    async def fake_codex_diag(
+        repo_path: str,
+        context: str,
+        model: str | None = None,
+    ) -> tuple[int, str, str]:
+        codex_calls.append((repo_path, context, model))
+        return (0, "ESCALATE", "")
+
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_select_auxiliary_coder",
+        lambda self: ("codex", self._registry.get("codex")),
+    )
+    monkeypatch.setattr(codex_cli, "diagnose_error_async", fake_codex_diag)
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Claude should not be used when Codex is selected")
+        ),
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+
+    asyncio.run(runner.handle_error())
+
+    assert codex_calls == [(runner.repo_path, "boom", runner.app_config.daemon.codex_model)]
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "boom"
+
+
+def test_handle_error_logs_when_no_auxiliary_coder_is_eligible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_calls: list[object] = []
+    codex_calls: list[object] = []
+
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_select_auxiliary_coder",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        lambda *args, **kwargs: claude_calls.append(args),
+    )
+    monkeypatch.setattr(
+        codex_cli,
+        "diagnose_error_async",
+        lambda *args, **kwargs: codex_calls.append(args),
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "boom"
+    assert not claude_calls
+    assert not codex_calls
+    assert any(
+        e["event"]
+        == "[ERROR] No eligible coder available for error diagnosis; "
+        "staying ERROR."
+        for e in runner.state.history
+    )
+
+
+def test_handle_error_escalate_keeps_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        h._async_cli_result(0, "ESCALATE: human help", ""),
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "boom"
+
+
+def test_handle_error_commits_and_pushes_diagnose_fixes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, _, review_requests = h._run_dirty_diagnose(monkeypatch, tmp_path)
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.push_count == 1
+    assert runner.state.current_pr.observed_head_shas == {"abc123"}
+    assert runner.state.current_pr.last_activity is not None
+    assert runner._last_push_at is not None
+    assert runner._last_push_at_pr_number == 119
+    assert review_requests == [119]
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "status",
+        "rev-parse",
+        "rev-parse",
+        "add",
+        "commit",
+        "push",
+        "rev-parse",
+    ]
+    assert calls[-2] == (
+        "push",
+        "origin",
+        "HEAD:fix/diagnose-error-commits-fixes",
+    )
+
+
+def test_handle_error_resets_when_push_fails_and_escalates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, warnings, _ = h._run_dirty_diagnose(
+        monkeypatch, tmp_path, push_exc=RuntimeError("push failed")
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "status",
+        "rev-parse",
+        "rev-parse",
+        "add",
+        "commit",
+        "push",
+        "reset",
+        "clean",
+    ]
+    assert any(cmd[:3] == ("reset", "--hard", "abc123") for cmd in calls)
+    assert any(cmd[:2] == ("clean", "-fd") for cmd in calls)
+    assert warnings == ["diagnose_error made uncommittable changes, reset"]
+
+
+def test_handle_error_errors_when_review_trigger_fails_after_diagnose_push(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, _, review_requests = h._run_dirty_diagnose(
+        monkeypatch, tmp_path, review_post_ok=False
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.push_count == 1
+    assert runner.state.current_pr.observed_head_shas == {"abc123"}
+    assert runner._last_push_at is not None
+    assert runner._last_push_at_pr_number == 119
+    assert review_requests == [119]
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "status",
+        "rev-parse",
+        "rev-parse",
+        "add",
+        "commit",
+        "push",
+        "rev-parse",
+    ]
+    assert (
+        runner.state.error_message
+        == "Failed to post @codex review on PR #119 after "
+        "diagnose_error fix push; manual review trigger required "
+        "to avoid fix/push loop"
+    )
+    assert any(
+        e["event"] == f"[ERROR] {runner.state.error_message}."
+        for e in runner.state.history
+    )
+
+
+def test_handle_error_escalates_dirty_tree_without_active_pr_branch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, _warnings, _ = h._run_dirty_diagnose(
+        monkeypatch, tmp_path, with_pr=False
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "status",
+        "rev-parse",
+        "reset",
+        "clean",
+    ]
+    assert any(
+        e["event"]
+        == "[ERROR] diagnose_error: dirty tree without active "
+        "PR/task branch."
+        for e in runner.state.history
+    )
+
+
+def test_handle_error_head_before_defaults_empty_when_rev_parse_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    changed = repo / "fix.txt"
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_diag(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        changed.write_text("fixed\n")
+        return (0, "FIX\nrepair broken config", "")
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> h._FakeCompletedProcess:
+        calls.append(args)
+        if args[:2] == ("status", "--porcelain"):
+            status = ""
+            if changed.exists():
+                status = " M fix.txt\n"
+            return h._FakeCompletedProcess(stdout=status)
+        if args[:2] == ("rev-parse", "HEAD"):
+            raise subprocess.CalledProcessError(128, ["git", *args], "boom")
+        if args[:3] == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return h._FakeCompletedProcess(stdout="fix/diagnose-error-commits-fixes\n")
+        return h._FakeCompletedProcess()
+
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake_diag)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(error_module, "retry_transient", lambda op, **_: op())
+    runner = h._make_runner()
+    monkeypatch.setattr(runner, "_post_codex_review", lambda pr_number: True)
+    runner.repo_path = str(repo)
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+    runner.state.current_pr = PRInfo(
+        number=119, branch="fix/diagnose-error-commits-fixes"
+    )
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "status",
+        "rev-parse",
+        "rev-parse",
+        "add",
+        "commit",
+        "push",
+        "rev-parse",
+    ]
+    assert not any(cmd[:1] == ("reset",) for cmd in calls)
+    assert not any(cmd[:1] == ("clean",) for cmd in calls)
+
+
+def test_handle_error_post_push_rev_parse_failure_defers_count_to_polling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Empty-SHA after a diagnose-error push must not bump ``push_count``.
+
+    Regression: the previous fix bumped ``push_count`` directly inside
+    ``record_observed_head("")``. On the next WATCH/IDLE refresh the
+    polling merge would see the real head SHA as a new observation
+    and increment ``push_count`` a second time for the same real push.
+    The corrected behavior leaves ``push_count`` unchanged on the
+    empty-SHA path; the next poll cycle resolves the real SHA and
+    counts the push exactly once via ``merge_observed_pushes``.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    changed = repo / "fix.txt"
+    calls: list[tuple[str, ...]] = []
+    rev_parse_head_calls = {"n": 0}
+    review_requests: list[int] = []
+
+    async def fake_diag(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        changed.write_text("fixed\n")
+        return (0, "FIX\nrepair broken config", "")
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> h._FakeCompletedProcess:
+        calls.append(args)
+        if args[:2] == ("status", "--porcelain"):
+            status = ""
+            if changed.exists():
+                status = " M fix.txt\n"
+            return h._FakeCompletedProcess(stdout=status)
+        if args[:3] == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return h._FakeCompletedProcess(
+                stdout="fix/diagnose-error-commits-fixes\n"
+            )
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_head_calls["n"] += 1
+            if rev_parse_head_calls["n"] == 1:
+                return h._FakeCompletedProcess(stdout="abc123\n")
+            raise subprocess.CalledProcessError(
+                128, ["git", *args], stderr="fatal: rev-parse intermittent"
+            )
+        return h._FakeCompletedProcess()
+
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake_diag)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(error_module, "retry_transient", lambda op, **_: op())
+    runner = h._make_runner()
+    monkeypatch.setattr(
+        runner,
+        "_post_codex_review",
+        lambda pr_number: review_requests.append(pr_number) or True,
+    )
+    runner.repo_path = str(repo)
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+    runner.state.current_pr = PRInfo(
+        number=119,
+        branch="fix/diagnose-error-commits-fixes",
+        observed_head_shas={"earlier-sha"},
+        push_count=1,
+    )
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.observed_head_shas == {"earlier-sha"}
+    assert runner.state.current_pr.push_count == 1
+    assert review_requests == [119]
+
+    polled = PRInfo(
+        number=119,
+        branch="fix/diagnose-error-commits-fixes",
+        observed_head_shas={"post-rev-parse-failure-sha"},
+        push_count=1,
+    )
+    merged_shas, merged_push_count = runner.state.current_pr.merge_observed_pushes(
+        polled
+    )
+    assert merged_shas == {"earlier-sha", "post-rev-parse-failure-sha"}
+    assert merged_push_count == 2
+
+
+def test_handle_error_uses_current_task_branch_when_no_current_pr_and_task_branch_differs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    changed = repo / "fix.txt"
+    calls: list[tuple[str, ...]] = []
+    review_requests: list[int] = []
+
+    async def fake_diag(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        changed.write_text("fixed\n")
+        return (0, "FIX\nrepair broken config", "")
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> h._FakeCompletedProcess:
+        calls.append(args)
+        if args[:2] == ("status", "--porcelain"):
+            status = ""
+            if changed.exists():
+                status = " M fix.txt\n"
+            return h._FakeCompletedProcess(stdout=status)
+        if args[:3] == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return h._FakeCompletedProcess(stdout="feature-x\n")
+        if args[:2] == ("rev-parse", "HEAD"):
+            return h._FakeCompletedProcess(stdout="abc123\n")
+        return h._FakeCompletedProcess()
+
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake_diag)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(error_module, "retry_transient", lambda op, **_: op())
+    runner = h._make_runner()
+    monkeypatch.setattr(
+        runner,
+        "_post_codex_review",
+        lambda pr_number: review_requests.append(pr_number) or True,
+    )
+    runner.repo_path = str(repo)
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+    runner.state.current_task = QueueTask(
+        pr_id="PR-101",
+        title="t",
+        branch="feature-x",
+        status=TaskStatus.DOING,
+    )
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert review_requests == []
+    assert calls[-1] == ("push", "origin", "HEAD:feature-x")
+
+
+def test_handle_error_escalates_dirty_tree_when_branch_mismatches_pr(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, warnings, _ = h._run_dirty_diagnose(
+        monkeypatch, tmp_path, head_branch="main"
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "status",
+        "rev-parse",
+        "rev-parse",
+        "reset",
+        "clean",
+    ]
+    assert warnings == ["diagnose_error made uncommittable changes, reset"]
+    assert any(
+        "[ERROR] diagnose_error: active branch mismatch ('main' != "
+        "'fix/diagnose-error-commits-fixes')."
+        == e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_error_discards_dirty_tree_for_non_fix_verdict(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, warnings, _ = h._run_dirty_diagnose(
+        monkeypatch, tmp_path, diagnosis_stdout="ESCALATE\nhuman help"
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert [cmd[0] for cmd in calls] == [
+        "status",
+        "status",
+        "rev-parse",
+        "reset",
+        "clean",
+    ]
+    assert warnings == []
+
+
+def test_handle_error_non_fix_dirty_tree_skips_cleanup_when_head_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    changed = repo / "fix.txt"
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_diag(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        changed.write_text("dirty\n")
+        return (0, "SKIP\nskip this task", "")
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> h._FakeCompletedProcess:
+        calls.append(args)
+        if args[:2] == ("status", "--porcelain"):
+            status = ""
+            if changed.exists():
+                status = " M fix.txt\n"
+            return h._FakeCompletedProcess(stdout=status)
+        if args[:2] == ("rev-parse", "HEAD"):
+            raise subprocess.CalledProcessError(128, ["git", *args], "boom")
+        return h._FakeCompletedProcess()
+
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake_diag)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+    runner.state.current_task = QueueTask(
+        pr_id="PR-101", title="t", branch="feature-x", status=TaskStatus.DOING
+    )
+    runner.state.current_pr = PRInfo(number=119, branch="feature-x")
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.current_pr is None
+    assert [cmd[0] for cmd in calls] == ["status", "status", "rev-parse"]
+    assert not any(cmd[:1] == ("reset",) for cmd in calls)
+    assert not any(cmd[:1] == ("clean",) for cmd in calls)
+
+
+def test_handle_error_escalates_without_publishing_preexisting_dirty_tree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner, calls, warnings, review_requests = h._run_dirty_diagnose(
+        monkeypatch,
+        tmp_path,
+        preexisting_dirty=" M unrelated.txt\n",
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert [cmd[0] for cmd in calls] == ["status", "status"]
+    assert warnings == []
+    assert review_requests == []
+    assert any(
+        e["event"]
+        == "[ERROR] diagnose_error: pre-existing dirty tree blocks "
+        "automatic cleanup/publish."
+        for e in runner.state.history
+    )
+
+
+def test_handle_error_caps_at_3(monkeypatch: pytest.MonkeyPatch) -> None:
+    """handle_error must stop invoking diagnose_error after 3 attempts."""
+    calls: list[str] = []
+
+    async def fake_diag(path: str, ctx: str, model: str | None = None) -> tuple[int, str, str]:
+        calls.append(ctx)
+        return (0, "ESCALATE", "")
+
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake_diag)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "generic failure"
+    for _ in range(5):
+        asyncio.run(runner.handle_error())
+    assert len(calls) == 3
+    assert any(
+        "max attempts" in e["event"] for e in runner.state.history
+    )
+
+
+def test_handle_error_skips_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A timeout-marked error must skip the AI-diagnosis call entirely."""
+    called: list[bool] = []
+
+    async def fake_diag(*a: Any, **kw: Any) -> tuple[int, str, str]:
+        called.append(True)
+        return (0, "SKIP", "")
+
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake_diag)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "claude CLI timeout after 900s"
+    asyncio.run(runner.handle_error())
+    assert called == []
+    assert runner.state.state == PipelineState.IDLE
+
+
+def test_handle_error_skips_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rate-limit error must skip the AI-diagnosis call entirely."""
+    called: list[bool] = []
+
+    async def fake_diag(*a: Any, **kw: Any) -> tuple[int, str, str]:
+        called.append(True)
+        return (0, "SKIP", "")
+
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake_diag)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "API rate limit exceeded"
+    asyncio.run(runner.handle_error())
+    assert called == []
+
+
+def test_handle_error_skips_diagnose_for_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """handle_error skips diagnose_error when error contains 'rate limit'."""
+    h._patch_subprocess(monkeypatch)
+    cli_calls: list[str] = []
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        h._async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Claude rate limit exceeded"
+    runner._error_skip_context = "stale context"
+    runner._error_skip_count = 3
+    runner._error_skip_active = True
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+    assert runner._error_skip_context is None
+    assert runner._error_skip_count == 0
+    assert runner._error_skip_active is False
+
+
+def test_handle_error_skips_diagnose_for_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """handle_error skips diagnose_error when error contains 'timeout'."""
+    h._patch_subprocess(monkeypatch)
+    cli_calls: list[str] = []
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        h._async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Timeout waiting for response"
+    runner._error_skip_context = "stale context"
+    runner._error_skip_count = 2
+    runner._error_skip_active = True
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+    assert runner._error_skip_context is None
+    assert runner._error_skip_count == 0
+    assert runner._error_skip_active is False
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "ensure_repo_cloned failed: git fetch origin main failed after 3 attempts",
+        "git push origin HEAD:foo failed: Could not connect to github.com",
+        "Connection timed out reaching api.github.com",
+        "git fetch origin: network is unreachable",
+        "Failed to connect to github.com port 443",
+        "gh: failed to run git: dial tcp 140.82.112.4:443: i/o timeout",
+        "ensure_repo_cloned: dial tcp 1.2.3.4:22: connect: network is unreachable",
+        "git fetch origin main failed after 5 attempts",
+    ],
+)
+def test_handle_error_skips_diagnose_for_infra_error(
+    msg: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Infra/network failure messages must bypass the AI diagnose CLI."""
+    h._patch_subprocess(monkeypatch)
+    cli_calls: list[str] = []
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        h._async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    monkeypatch.setattr(
+        codex_cli,
+        "diagnose_error_async",
+        h._async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = msg
+    runner._error_skip_context = "stale context"
+    runner._error_skip_count = 2
+    runner._error_skip_active = True
+    runner._error_diagnose_count = 1
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message == msg
+    assert runner._error_skip_context is None
+    assert runner._error_skip_count == 0
+    assert runner._error_skip_active is False
+    # Counter is preserved (not poisoned): a later non-infra error must still
+    # be eligible for diagnosis.
+    assert runner._error_diagnose_count == 1
+    assert any(
+        e["event"].startswith(
+            "[ERROR] Infra error detected, skipping AI diagnosis "
+            "and transitioning to IDLE for retry:"
+        )
+        for e in runner.state.history
+    )
+
+
+def test_handle_error_infra_bypass_truncates_long_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Very long infra error messages are truncated to 200 chars in the log."""
+    h._patch_subprocess(monkeypatch)
+    cli_calls: list[str] = []
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        h._async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "git fetch origin main: " + ("x" * 500)
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+    prefix = (
+        "[ERROR] Infra error detected, skipping AI diagnosis "
+        "and transitioning to IDLE for retry: "
+    )
+    log_entry = next(
+        e["event"]
+        for e in runner.state.history
+        if e["event"].startswith(prefix)
+    )
+    # Trim the trailing ".".
+    payload = log_entry[len(prefix):-1]
+    assert len(payload) == 200
+    assert payload.endswith("...")
+
+
+def test_handle_error_infra_bypass_repeats_without_invoking_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated invocations with an infra error never invoke the diagnose CLI."""
+    h._patch_subprocess(monkeypatch)
+    cli_calls: list[str] = []
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        h._async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = (
+        "ensure_repo_cloned failed: git fetch origin main failed after 3 attempts"
+    )
+
+    for _ in range(5):
+        asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+    assert runner.state.state == PipelineState.IDLE
+
+
+def test_handle_error_runs_diagnose_for_non_infra_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-infra errors still go through the AI diagnose path."""
+    h._patch_subprocess(monkeypatch)
+    cli_calls: list[str] = []
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        h._async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "pytest: 3 tests failed in test_models.py"
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == ["diagnose"]
+    assert not any(
+        e["event"].startswith("Infra error detected") for e in runner.state.history
+    )
+
+
+def test_handle_error_infra_bypass_does_not_lock_out_subsequent_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Infra bypass must not poison the diagnose counter for later non-infra errors."""
+    h._patch_subprocess(monkeypatch)
+    cli_calls: list[str] = []
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        h._async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = (
+        "ensure_repo_cloned failed: git fetch origin main failed after 3 attempts"
+    )
+
+    asyncio.run(runner.handle_error())
+    assert cli_calls == []
+
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "working tree dirty: M src/foo.py"
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == ["diagnose"]
+
+
+def test_handle_error_preserves_error_message_on_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When diagnose_error_async is rate-limited, error_message is preserved."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        h._async_cli_result_with_side_effect([], "diagnose", 1, "", "Error: 429 Too Many Requests"),
+    )
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Build failed: missing dependency X"
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.error_message == "Build failed: missing dependency X"
+
+
+def test_handle_error_skips_ai_diagnosis_when_claude_session_is_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.usage import UsageSnapshot
+
+    cli_calls: list[str] = []
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        h._async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    runner = h._make_runner(coder=CoderType.CODEX)
+    runner.app_config.daemon.rate_limit_session_pause_percent = 80
+    runner._claude_usage_provider = h._FakeUsageProvider(
+        snapshot=UsageSnapshot(
+            session_percent=90,
+            session_resets_at=9999999999,
+            weekly_percent=10,
+            weekly_resets_at=9999999999,
+            fetched_at=time.time(),
+        )
+    )
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Build failed: missing dependency X"
+    runner._error_diagnose_count = 2
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None
+    assert runner.state.rate_limited_until is None
+    assert runner._error_diagnose_count == 0
+    assert any(
+        e["event"] == "[ERROR] Skipping AI diagnosis: Claude rate limited."
+        for e in runner.state.history
+    )
+
+
+def test_handle_error_honors_claude_rate_limit_when_active_coder_is_claude(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.usage import UsageSnapshot
+
+    cli_calls: list[str] = []
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        h._async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    runner = h._make_runner()
+    runner.app_config.daemon.rate_limit_session_pause_percent = 80
+    runner._claude_usage_provider = h._FakeUsageProvider(
+        snapshot=UsageSnapshot(
+            session_percent=90,
+            session_resets_at=int(time.time()) + 3600,
+            weekly_percent=10,
+            weekly_resets_at=int(time.time()) + 86400,
+            fetched_at=time.time(),
+        )
+    )
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Build failed: missing dependency X"
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None
+    assert runner.state.rate_limited_until is None
+    assert runner._error_diagnose_count == 0
+    assert any(
+        e["event"] == "[ERROR] Skipping AI diagnosis: Claude rate limited."
+        for e in runner.state.history
+    )
+
+
+def test_handle_error_skips_ai_diagnosis_when_claude_weekly_is_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.usage import UsageSnapshot
+
+    cli_calls: list[str] = []
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        h._async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    runner = h._make_runner(coder=CoderType.CODEX)
+    runner.app_config.daemon.rate_limit_session_pause_percent = 80
+    runner.app_config.daemon.rate_limit_weekly_pause_percent = 90
+    runner._claude_usage_provider = h._FakeUsageProvider(
+        snapshot=UsageSnapshot(
+            session_percent=20,
+            session_resets_at=int(time.time()) + 3600,
+            weekly_percent=95,
+            weekly_resets_at=int(time.time()) + 86400,
+            fetched_at=time.time(),
+        )
+    )
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Build failed: missing dependency X"
+    runner._error_diagnose_count = 2
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None
+    assert runner.state.rate_limited_until is None
+    assert runner._error_diagnose_count == 0
+    assert any(
+        e["event"] == "[ERROR] Skipping AI diagnosis: Claude rate limited."
+        for e in runner.state.history
+    )
+
+
+def test_handle_error_proceeds_when_usage_snapshot_fetch_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli_calls: list[str] = []
+    h._patch_subprocess(monkeypatch)
+
+    def raise_fetch() -> object:
+        raise RuntimeError("usage fetch failed")
+
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        h._async_cli_result_with_side_effect(
+            cli_calls, "diagnose", 0, "ESCALATE", ""
+        ),
+    )
+    runner = h._make_runner()
+    runner._claude_usage_provider.fetch = raise_fetch  # type: ignore[method-assign]
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Build failed: missing dependency X"
+
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == ["diagnose"]
+    assert runner.state.state == PipelineState.ERROR
+    assert not any(
+        e["event"] == "[ERROR] Skipping AI diagnosis: Claude rate limited."
+        for e in runner.state.history
+    )
+
+
+def test_handle_error_soft_skip_caps_repeated_codex_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.usage import UsageSnapshot
+
+    cli_calls: list[str] = []
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        h._async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+    runner = h._make_runner(coder=CoderType.CODEX)
+    runner.app_config.daemon.rate_limit_session_pause_percent = 80
+    runner._claude_usage_provider = h._FakeUsageProvider(
+        snapshot=UsageSnapshot(
+            session_percent=90,
+            session_resets_at=int(time.time()) + 3600,
+            weekly_percent=10,
+            weekly_resets_at=int(time.time()) + 86400,
+            fetched_at=time.time(),
+        )
+    )
+
+    for _ in range(3):
+        runner.state.state = PipelineState.ERROR
+        runner.state.error_message = "sync_to_main failed: auth denied"
+        asyncio.run(runner.handle_error())
+        assert runner.state.state == PipelineState.IDLE
+        assert runner.state.error_message is None
+
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "sync_to_main failed: auth denied"
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "sync_to_main failed: auth denied"
+    assert any(
+        "max soft-skip retries (3) reached" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_error_logs_and_returns_when_diagnose_cli_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        h._async_cli_result(1, "", "boom"),
+    )
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Build failed: missing dependency X"
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "Build failed: missing dependency X"
+    assert any(
+        e["event"] == "[ERROR] diagnose_error CLI failed: boom."
+        for e in runner.state.history
+    )
+
+
+def test_handle_error_timeout_has_distinct_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeout errors must produce a log mentioning 'timeout error', not 'rate-limit'."""
+    called: list[bool] = []
+
+    async def fake_diag(*a: Any, **kw: Any) -> tuple[int, str, str]:
+        called.append(True)
+        return (0, "SKIP", "")
+
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake_diag)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Timeout after 600s"
+    asyncio.run(runner.handle_error())
+
+    assert called == []
+    log_msgs = [e["event"] for e in runner.state.history]
+    assert any("timeout error" in m for m in log_msgs)
+    assert not any("rate-limit" in m for m in log_msgs)
+
+
+def test_handle_error_infra_bypass_resets_state_to_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Infra-error bypass must transition state to IDLE for the next cycle to
+    pick the failed task back up, while preserving error_message for the
+    operator dashboard until the next successful cycle clears it."""
+    h._patch_subprocess(monkeypatch)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = (
+        "ensure_repo_cloned failed: git fetch origin main failed after 3 attempts"
+    )
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message == (
+        "ensure_repo_cloned failed: git fetch origin main failed after 3 attempts"
+    )
+
+
+def test_handle_error_rate_limit_bypass_resets_state_to_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rate-limit bypass must transition state to IDLE so the next cycle
+    retries the failing operation instead of trapping the daemon in ERROR."""
+    h._patch_subprocess(monkeypatch)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "API rate limit exceeded"
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message == "API rate limit exceeded"
+
+
+def test_handle_error_timeout_bypass_resets_state_to_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeout bypass must transition state to IDLE so the next cycle
+    retries the failing operation instead of looping in ERROR forever."""
+    h._patch_subprocess(monkeypatch)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "claude CLI timeout after 900s"
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message == "claude CLI timeout after 900s"
+
+
+def test_handle_error_recovers_within_two_cycles_after_tls_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard for the 2026-04-30 morning incident: a single TLS
+    handshake timeout produced 16 consecutive ``handle_error`` invocations
+    over 15 minutes because the bypass branches never reset state out of
+    ERROR. After the fix, the first cycle's bypass transitions to IDLE so
+    the second cycle dispatches to ``handle_idle`` (not ``handle_error``)
+    and is free to retry the failing call."""
+    h._patch_subprocess(monkeypatch)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = (
+        "git fetch origin main failed after 3 attempts: "
+        "TLS handshake timeout reaching github.com"
+    )
+
+    # Cycle 1: ERROR -> handle_error bypass -> IDLE (state transition that
+    # the daemon's main dispatcher uses to route the next cycle).
+    asyncio.run(runner.handle_error())
+    assert runner.state.state == PipelineState.IDLE
+
+    # Cycle 2 simulation: a successful retry on the second attempt clears
+    # the error_message naturally. Before the fix, the daemon would still be
+    # in ERROR here and would re-enter handle_error for at least 14 more
+    # cycles before manual intervention; we assert directly that the state
+    # is IDLE so the dispatcher cannot loop in the ERROR branch.
+    runner.state.error_message = None
+    assert runner.state.state == PipelineState.IDLE
