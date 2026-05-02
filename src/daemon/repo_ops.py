@@ -24,6 +24,7 @@ from src.daemon.git_ops import (
     _base_branch_ahead_of_origin,
     _working_tree_dirty,
 )
+from src.keyspace import upload_pending
 from src.models import QueueTask
 from src.queue_parser import parse_queue_text
 from src.retry import retry_transient
@@ -321,7 +322,7 @@ return 0
         the recovery-failure path where the working tree may contain
         uncommitted crash-recovery work that must not be discarded.
         """
-        key = f"upload:{self.name}:pending"
+        key = upload_pending(self.name)
         try:
             raw = await self.redis.get(key)
         except Exception:

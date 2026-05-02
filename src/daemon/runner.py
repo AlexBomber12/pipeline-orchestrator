@@ -79,6 +79,14 @@ from src.daemon.selector import (
     select_coder,
 )
 from src.events import publish_repo_event
+from src.keyspace import (
+    cli_log_history,
+    cli_log_latest,
+    control_config_dirty,
+    control_stop,
+    pipeline_state,
+    upload_pending,
+)
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
 from src.queue_parser import (
@@ -494,7 +502,7 @@ class PipelineRunner(
 
     async def reload_repo_config_if_dirty(self) -> None:
         """Hot-reload repo config at the idle boundary when flagged by the web UI."""
-        dirty_key = f"control:{self.name}:config_dirty"
+        dirty_key = control_config_dirty(self.name)
         dirty_exists = False
         try:
             if hasattr(self.redis, "exists"):
@@ -882,7 +890,7 @@ class PipelineRunner(
     async def _refresh_user_paused_from_redis(self) -> None:
         """Merge the persisted ``user_paused`` flag into in-memory state."""
         try:
-            raw = await self.redis.get(f"pipeline:{self.name}")
+            raw = await self.redis.get(pipeline_state(self.name))
         except Exception:
             return
         if not raw:
@@ -895,7 +903,7 @@ class PipelineRunner(
 
     async def _pop_stop_request(self) -> bool:
         """Return True when a pending stop control signal exists."""
-        key = f"control:{self.name}:stop"
+        key = control_stop(self.name)
         try:
             raw = await self.redis.get(key)
         except Exception:
@@ -973,7 +981,7 @@ class PipelineRunner(
                 self.state.usage_weekly_resets_at = None
             self.state.usage_api_degraded = provider.consecutive_failures >= 10
         self.state.last_updated = datetime.now(timezone.utc)
-        state_key = f"pipeline:{self.name}"
+        state_key = pipeline_state(self.name)
 
         async def _serialize_latest_state() -> str:
             await self._refresh_user_paused_from_redis()
@@ -1003,7 +1011,7 @@ class PipelineRunner(
             await self.redis.set(state_key, payload)
         if self._old_basename != self.name:
             try:
-                old_key = f"pipeline:{self._old_basename}"
+                old_key = pipeline_state(self._old_basename)
                 old_data = await self.redis.get(old_key)
                 owns_old_key = False
                 if old_data:
@@ -1013,8 +1021,8 @@ class PipelineRunner(
                         await self.redis.delete(old_key)
                         owns_old_key = True
                 if owns_old_key:
-                    old_upload = f"upload:{self._old_basename}:pending"
-                    new_upload = f"upload:{self.name}:pending"
+                    old_upload = upload_pending(self._old_basename)
+                    new_upload = upload_pending(self.name)
                     if await self.redis.exists(old_upload):
                         await self.redis.renamenx(old_upload, new_upload)
             except Exception:
@@ -1024,8 +1032,8 @@ class PipelineRunner(
     async def _save_cli_log(self, stdout: str, stderr: str, label: str) -> None:
         _MAX_CLI_LOG_BYTES = 64 * 1024  # 64 KB cap per entry
         ts = datetime.now(timezone.utc).isoformat()
-        key_latest = f"cli_log:{self.name}:latest"
-        key_history = f"cli_log:{self.name}:{ts}"
+        key_latest = cli_log_latest(self.name)
+        key_history = cli_log_history(self.name, ts)
         marker = "[truncated]\n"
         combined = f"=== STDOUT ===\n{stdout}\n\n=== STDERR ===\n{stderr}"
         raw = combined.encode("utf-8", errors="replace")
@@ -1389,7 +1397,7 @@ class PipelineRunner(
             if not recovery_complete:
                 has_pending = False
                 try:
-                    raw = await self.redis.get(f"upload:{self.name}:pending")
+                    raw = await self.redis.get(upload_pending(self.name))
                     has_pending = bool(raw)
                 except Exception:
                     pass

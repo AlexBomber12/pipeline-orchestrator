@@ -9,6 +9,8 @@ from typing import Any, AsyncIterator
 
 from redis.exceptions import RedisError
 
+from src.keyspace import repo_events_channel, repo_events_history
+
 KEEPALIVE_INTERVAL_SECONDS = 15.0
 HISTORY_REPLAY_LIMIT = 20
 POLL_INTERVAL_SECONDS = 0.1
@@ -20,11 +22,11 @@ class RepoEventsUnavailableError(Exception):
 
 
 def _channel_name(repo_name: str) -> str:
-    return f"repo-events:{repo_name}"
+    return repo_events_channel(repo_name)
 
 
 def _history_name(repo_name: str) -> str:
-    return f"repo-events-history:{repo_name}"
+    return repo_events_history(repo_name)
 
 
 def format_sse_event(message: str) -> bytes:
