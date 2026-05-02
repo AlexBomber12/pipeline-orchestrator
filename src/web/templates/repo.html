@@ -53,6 +53,16 @@
         const repoName = {{ repo.name | tojson }};
         const BASE_DELAY_MS = 1000;
         const MAX_DELAY_MS = 10000;
+        // Replay window ignored on first connect: events whose server
+        // timestamp predates page load are already reflected in the
+        // server-rendered summary, so re-firing HTMX would only cause
+        // redundant /partials/repo/<name>* fetches and UI churn. The 2s
+        // margin absorbs minor client/server clock skew.
+        const REPLAY_SKEW_MS = 2000;
+        const SEEN_KEYS_LIMIT = 200;
+        const pageLoadedAt = Date.now();
+        const seenKeys = new Set();
+        const seenOrder = [];
         let delayMs = BASE_DELAY_MS;
         let timer = null;
         let source = null;
@@ -62,6 +72,30 @@
             'history_updated',
             'pr_metrics_update',
         ];
+
+        function rememberSeen(key) {
+            if (seenKeys.has(key)) {
+                return false;
+            }
+            seenKeys.add(key);
+            seenOrder.push(key);
+            if (seenOrder.length > SEEN_KEYS_LIMIT) {
+                const evicted = seenOrder.shift();
+                seenKeys.delete(evicted);
+            }
+            return true;
+        }
+
+        function isReplayedFrame(payload) {
+            if (!payload || typeof payload.timestamp !== 'string') {
+                return false;
+            }
+            const eventTime = Date.parse(payload.timestamp);
+            if (!Number.isFinite(eventTime)) {
+                return false;
+            }
+            return eventTime < pageLoadedAt - REPLAY_SKEW_MS;
+        }
 
         function scheduleReconnect() {
             if (timer) {
@@ -84,7 +118,26 @@
                 delayMs = BASE_DELAY_MS;
             };
             RELAYED_EVENTS.forEach(function (eventName) {
-                source.addEventListener(eventName, function () {
+                source.addEventListener(eventName, function (event) {
+                    let payload = null;
+                    try {
+                        payload = event && event.data ? JSON.parse(event.data) : null;
+                    } catch (_error) {
+                        payload = null;
+                    }
+                    if (payload && typeof payload.timestamp === 'string') {
+                        const key = eventName + '|' + payload.timestamp;
+                        // Dedup across reconnects: stream_repo_events
+                        // re-emits up to HISTORY_REPLAY_LIMIT entries on
+                        // each connect, and triggering HTMX for already-
+                        // seen ones would burst /partials/* fetches.
+                        if (!rememberSeen(key)) {
+                            return;
+                        }
+                        if (isReplayedFrame(payload)) {
+                            return;
+                        }
+                    }
                     if (window.htmx) {
                         window.htmx.trigger(document.body, 'repo:' + eventName);
                     }

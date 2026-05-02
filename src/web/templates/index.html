@@ -33,6 +33,14 @@
         const MAX_STREAMS = 8;
         const BASE_DELAY_MS = 1000;
         const MAX_DELAY_MS = 10000;
+        // Replay window ignored on first connect: events whose server
+        // timestamp predates page load are already reflected in the
+        // server-rendered HTML, so re-firing HTMX would only cause
+        // redundant /partials/* fetches and UI churn. The 2s margin
+        // absorbs minor client/server clock skew.
+        const REPLAY_SKEW_MS = 2000;
+        const SEEN_KEYS_LIMIT = 200;
+        const pageLoadedAt = Date.now();
         const connections = new Map();
 
         function getRenderedRepos() {
@@ -91,11 +99,45 @@
             entry.delayMs = Math.min(delay * 2, MAX_DELAY_MS);
         }
 
+        function rememberSeen(entry, key) {
+            if (entry.seenKeys.has(key)) {
+                return false;
+            }
+            entry.seenKeys.add(key);
+            entry.seenOrder.push(key);
+            if (entry.seenOrder.length > SEEN_KEYS_LIMIT) {
+                const evicted = entry.seenOrder.shift();
+                entry.seenKeys.delete(evicted);
+            }
+            return true;
+        }
+
+        function isReplayedFrame(payload) {
+            if (!payload || typeof payload.timestamp !== 'string') {
+                return false;
+            }
+            const eventTime = Date.parse(payload.timestamp);
+            if (!Number.isFinite(eventTime)) {
+                return false;
+            }
+            return eventTime < pageLoadedAt - REPLAY_SKEW_MS;
+        }
+
         function connect(repoName) {
             let entry = connections.get(repoName);
             if (!entry) {
-                entry = {source: null, timer: null, delayMs: BASE_DELAY_MS};
+                entry = {
+                    source: null,
+                    timer: null,
+                    delayMs: BASE_DELAY_MS,
+                    seenKeys: new Set(),
+                    seenOrder: [],
+                };
                 connections.set(repoName, entry);
+            }
+            if (!entry.seenKeys) {
+                entry.seenKeys = new Set();
+                entry.seenOrder = [];
             }
 
             if (entry.source) {
@@ -131,7 +173,26 @@
             });
 
             ['state_change', 'event_log_append', 'history_updated', 'pr_metrics_update'].forEach(function (eventName) {
-                source.addEventListener(eventName, function () {
+                source.addEventListener(eventName, function (event) {
+                    let payload = null;
+                    try {
+                        payload = event && event.data ? JSON.parse(event.data) : null;
+                    } catch (_error) {
+                        payload = null;
+                    }
+                    if (payload && typeof payload.timestamp === 'string') {
+                        const key = eventName + '|' + payload.timestamp;
+                        // Dedup across reconnects: stream_repo_events
+                        // re-emits up to HISTORY_REPLAY_LIMIT entries on
+                        // each connect, and triggering HTMX for already-
+                        // seen ones would burst /partials/* fetches.
+                        if (!rememberSeen(entry, key)) {
+                            return;
+                        }
+                        if (isReplayedFrame(payload)) {
+                            return;
+                        }
+                    }
                     if (window.htmx) {
                         window.htmx.trigger(document.body, 'repo:' + eventName);
                     }
@@ -159,6 +220,8 @@
                         source: null,
                         timer: null,
                         delayMs: BASE_DELAY_MS,
+                        seenKeys: new Set(),
+                        seenOrder: [],
                     });
                 }
                 const entry = connections.get(repoName);

@@ -793,7 +793,10 @@ class PipelineRunner(
         failed entry and any not-yet-attempted ones are kept at the head
         of the queue so a later cycle can retry — otherwise subscribers
         would silently miss live updates while history was already
-        persisted in ``state.history``.
+        persisted in ``state.history``. The exception is swallowed so a
+        pub/sub blip never aborts ``publish_state`` (state was already
+        persisted) and the runner cycle can keep progressing while the
+        queued entries wait for the next opportunity.
         """
         if not self._pending_event_log_entries:
             return
@@ -811,7 +814,11 @@ class PipelineRunner(
                 self._pending_event_log_entries = (
                     list(pending[index:]) + self._pending_event_log_entries
                 )
-                raise
+                logger.warning(
+                    "[%s] event_log_append publish failed; will retry later",
+                    self.name,
+                )
+                return
 
     def _compute_diff_stats(self, base_branch: str) -> dict[str, object]:
         """Compute file/language/line stats for the current branch vs base."""

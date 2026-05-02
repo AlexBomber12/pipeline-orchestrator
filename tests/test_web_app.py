@@ -1060,6 +1060,15 @@ def test_index_bootstraps_progress_sse_manager(
     assert (
         'hx-trigger="repo:state_change from:body, every 30s"' in body
     )
+    # stream_repo_events replays up to HISTORY_REPLAY_LIMIT entries on
+    # each (re)connect. Without dedup + page-load filtering, every
+    # replayed state_change/history_updated frame would refire the
+    # repo-list / stats fetches, causing a burst of redundant requests
+    # on page load and reconnect.
+    assert "rememberSeen" in body
+    assert "isReplayedFrame" in body
+    assert "const pageLoadedAt = Date.now();" in body
+    assert "REPLAY_SKEW_MS" in body
 
 
 def test_partial_stats_renders_status_bar(
@@ -1223,6 +1232,15 @@ def test_repo_detail_route_renders_full_page(
         'hx-trigger="repo:event_log_append from:body, '
         'repo:history_updated from:body"' in body
     )
+    # stream_repo_events replays up to HISTORY_REPLAY_LIMIT entries on
+    # each (re)connect. Without dedup + page-load filtering, every
+    # replayed state_change/history_updated frame would refire the
+    # repo-summary / event-log fetches, causing a burst of redundant
+    # requests on page load and reconnect.
+    assert "rememberSeen" in body
+    assert "isReplayedFrame" in body
+    assert "const pageLoadedAt = Date.now();" in body
+    assert "REPLAY_SKEW_MS" in body
 
 
 def test_repo_summary_banner_keeps_fragment_wrapped(

@@ -377,9 +377,13 @@ def test_publish_pending_event_log_entries_requeues_on_failure(
     """A transient publish failure must keep the unsent entries (failed
     plus not-yet-attempted) at the head of the queue so a later cycle
     can retry — otherwise live event_log_append events are silently
-    dropped while history is already persisted in state.history."""
+    dropped while history is already persisted in state.history. The
+    failure is logged and swallowed: state was already persisted before
+    we got here, and re-raising would abort the runner cycle on every
+    transient pub/sub blip."""
     call_count = {"n": 0}
     published: list[dict[str, object]] = []
+    warnings: list[str] = []
 
     async def _flaky_publish_repo_event(
         repo_name: str,
@@ -396,12 +400,16 @@ def test_publish_pending_event_log_entries_requeues_on_failure(
 
     runner = _make_runner()
     runner._last_published_state_signature = (runner.state.state.value, ())
+    monkeypatch.setattr(
+        runner_module.logger,
+        "warning",
+        lambda msg, *args: warnings.append(msg % args),
+    )
     runner.log_event("first event")
     runner.log_event("second event")
     runner.log_event("third event")
 
-    with pytest.raises(RuntimeError, match="redis offline"):
-        asyncio.run(runner.publish_state())
+    asyncio.run(runner.publish_state())
 
     # First entry was published; second failed mid-flight and must be
     # retained alongside the third (not-yet-attempted) entry.
@@ -409,6 +417,9 @@ def test_publish_pending_event_log_entries_requeues_on_failure(
     assert [
         entry["event"] for entry in runner._pending_event_log_entries
     ] == ["second event", "third event"]
+    assert any(
+        "event_log_append publish failed" in entry for entry in warnings
+    )
 
 
 def test_publish_pending_event_log_entries_retry_drains_remainder(
@@ -439,8 +450,13 @@ def test_publish_pending_event_log_entries_retry_drains_remainder(
     runner.log_event("first event")
     runner.log_event("second event")
 
-    with pytest.raises(RuntimeError, match="redis offline"):
-        asyncio.run(runner.publish_state())
+    # Failure is swallowed (state already persisted; abort would stall
+    # the runner). Entries stay queued for the next cycle.
+    asyncio.run(runner.publish_state())
+    assert published == []
+    assert [
+        entry["event"] for entry in runner._pending_event_log_entries
+    ] == ["first event", "second event"]
 
     # Retry succeeds and drains both entries in FIFO order.
     asyncio.run(runner.publish_state())
