@@ -4514,19 +4514,113 @@ def test_etag_get_returns_none_on_unparseable_body(
     assert "repos/owner/name/pulls/1" not in github_client._etag_cache
 
 
-def test_etag_get_returns_none_when_304_without_prior_cache(
+def test_etag_get_304_without_cache_retries_without_if_none_match(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A 304 with no cached payload (e.g. server-side hiccup) must yield None."""
+    """A 304 with no cached payload must retry without ``If-None-Match`` and parse the fresh body (PR-236)."""
+    captured: list[list[str]] = []
+    responses = iter(
+        [
+            _build_include_response("", status=304, etag='W/"v1"'),
+            _build_include_response('{"merged": true}', etag='W/"v2"'),
+        ]
+    )
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        return _FakeCompletedProcess(
-            stdout=_build_include_response("", status=304, etag='W/"v1"')
-        )
+        captured.append(cmd)
+        return _FakeCompletedProcess(stdout=next(responses))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    payload = github_client._etag_get("repos/owner/name/pulls/3")
+
+    assert payload == {"merged": True}
+    assert len(captured) == 2
+    assert not any("If-None-Match" in arg for arg in captured[1])
+    assert github_client._etag_cache["repos/owner/name/pulls/3"] == (
+        'W/"v2"',
+        {"merged": True},
+    )
+
+
+def test_etag_get_304_no_cache_retry_returns_none_on_non_2xx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the no-cache retry itself fails with non-2xx, ``_etag_get`` returns None (PR-236)."""
+    responses = iter(
+        [
+            _build_include_response("", status=304, etag='W/"v1"'),
+            _build_include_response("server error", status=500, etag=None),
+        ]
+    )
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(stdout=next(responses))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert github_client._etag_get("repos/owner/name/pulls/3") is None
+    assert "repos/owner/name/pulls/3" not in github_client._etag_cache
+
+
+def test_etag_get_304_no_cache_retry_returns_none_on_empty_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the retry returns 200 with empty body, ``_etag_get`` returns None (PR-236)."""
+    responses = iter(
+        [
+            _build_include_response("", status=304, etag='W/"v1"'),
+            _build_include_response("", status=200, etag='W/"v2"'),
+        ]
+    )
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(stdout=next(responses))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert github_client._etag_get("repos/owner/name/pulls/3") is None
+
+
+def test_etag_get_304_no_cache_retry_returns_none_on_unparseable_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the retry returns malformed JSON, ``_etag_get`` returns None (PR-236)."""
+    responses = iter(
+        [
+            _build_include_response("", status=304, etag='W/"v1"'),
+            _build_include_response("{not-json", etag='W/"v2"'),
+        ]
+    )
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(stdout=next(responses))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert github_client._etag_get("repos/owner/name/pulls/3") is None
+    assert "repos/owner/name/pulls/3" not in github_client._etag_cache
+
+
+def test_etag_get_304_no_cache_retry_passes_through_pre_parsed_run_gh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If a test stubs ``run_gh`` to return a parsed object, the retry surfaces it directly (PR-236)."""
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str]) -> object:
+        calls.append(args)
+        if len(calls) == 1:
+            return _build_include_response("", status=304, etag='W/"v1"')
+        return {"merged": True}
+
+    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+
+    payload = github_client._etag_get("repos/owner/name/pulls/4")
+
+    assert payload == {"merged": True}
+    assert len(calls) == 2
+    assert not any("If-None-Match" in arg for arg in calls[1])
 
 
 def test_etag_get_passthrough_for_pre_parsed_run_gh(

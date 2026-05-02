@@ -31,6 +31,13 @@ from src.task_status import (
     get_merged_pr_ids,
 )
 
+# Number of consecutive HTTP 304 cycles on get_merged_prs before the IDLE
+# handler emits a degraded-detection event, plus the cadence at which the
+# event is re-emitted while the failure persists. Sized to swallow brief
+# edge-cache stalemates while still surfacing genuine multi-minute outages.
+_IDLE_MERGED_PR_304_WARN_AT = 10
+_IDLE_MERGED_PR_304_WARN_EVERY = 50
+
 
 class IdleMixin:
     """Handle IDLE state: sync, pick next task, dispatch to CODING."""
@@ -373,6 +380,19 @@ class IdleMixin:
     async def handle_idle(self) -> None:
         """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
         self._error_diagnose_policy.reset(self)
+        # The 304 streak counts only cycles that actually reached
+        # ``get_merged_prs`` and saw HTTP 304. Reset by default so any
+        # other outcome — success, non-304 failure, or an early return
+        # that skips the merged-PR fetch entirely (user_paused,
+        # pending_queue_sync still unresolved, ``sync_to_main`` or
+        # ``get_open_prs`` failed earlier this cycle) — breaks the
+        # streak. Reset first so every early-return path below shares
+        # the same semantics; the 304 branch later restores the prior
+        # count and increments it.
+        prev_merged_pr_304_streak = getattr(
+            self, "_idle_merged_pr_304_streak", 0,
+        )
+        self._idle_merged_pr_304_streak = 0
         if self.state.user_paused:
             return
         if self.state.pending_queue_sync_branch is not None:
@@ -445,11 +465,39 @@ class IdleMixin:
                 refresh=refresh_merged_prs,
             )
         except Exception as exc:
-            self.log_event(
-                f"[INFRA] IDLE: merged PR check failed: {exc}; "
-                f"continuing with local merged-status heuristics."
-            )
-            merged_prs = []
+            if "HTTP 304" in str(exc):
+                # Upstream cache miss that slipped past _etag_get's retry.
+                # Transient 304s (a stale edge cache for one cycle) are
+                # noise; persistent ones mean merged-PR detection is stuck
+                # on local heuristics, which miss squash/custom-title
+                # merges. Suppress the first few, then surface a degraded
+                # signal once the streak shows the failure isn't blowing
+                # over.
+                streak = prev_merged_pr_304_streak + 1
+                self._idle_merged_pr_304_streak = streak
+                # Re-emit cadence is measured from the threshold crossing,
+                # not from streak=0. Otherwise the first repeat after the
+                # initial warning at WARN_AT lands at WARN_EVERY (e.g. 40
+                # cycles after WARN_AT=10 with WARN_EVERY=50), undercutting
+                # the configured spacing.
+                cycles_since_warn = streak - _IDLE_MERGED_PR_304_WARN_AT
+                if cycles_since_warn >= 0 and (
+                    cycles_since_warn % _IDLE_MERGED_PR_304_WARN_EVERY == 0
+                ):
+                    self.log_event(
+                        f"[INFRA] IDLE: merged PR check returned HTTP 304 "
+                        f"for {streak} consecutive cycles; merged-PR "
+                        f"detection degraded (squash/custom-title merges "
+                        f"may be missed) while falling back to local "
+                        f"heuristics."
+                    )
+                merged_prs = []
+            else:
+                self.log_event(
+                    f"[INFRA] IDLE: merged PR check failed: {exc}; "
+                    f"continuing with local merged-status heuristics."
+                )
+                merged_prs = []
         else:
             self._idle_open_pr_snapshot = open_pr_snapshot
 
