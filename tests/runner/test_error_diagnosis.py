@@ -367,3 +367,81 @@ def test_non_error_cycle_resets_error_skip_fields(
     assert runner._error_skip_context is None
     assert runner._error_skip_count == 0
     assert runner._error_skip_active is False
+
+
+# ---------------------------------------------------------------------------
+# PR-223 — BoundedRecoveryPolicy semantics for the error-skip / diagnose
+# counters. These tests bind the policy migration so the counter shape
+# stays interchangeable with the legacy fields the PR-210 baseline asserts.
+# ---------------------------------------------------------------------------
+
+
+def test_error_skip_policy_counter_tracks_legacy_field() -> None:
+    """The policy's counter accessor reads the same backing field
+    that PR-210 baseline tests assert on, so the two must always
+    agree."""
+    runner = h._make_runner()
+    runner._error_skip_count = 5
+    assert runner._error_skip_policy.counter_getter(runner) == 5
+    runner._error_skip_policy.counter_setter(runner, 7)
+    assert runner._error_skip_count == 7
+
+
+def test_error_skip_policy_increment_and_reset_round_trip() -> None:
+    """``policy.increment`` advances the legacy counter; ``policy.reset``
+    zeros it back to the post-init state."""
+    runner = h._make_runner()
+    assert runner._error_skip_count == 0
+    runner._error_skip_policy.increment(runner)
+    runner._error_skip_policy.increment(runner)
+    assert runner._error_skip_count == 2
+    runner._error_skip_policy.reset(runner)
+    assert runner._error_skip_count == 0
+
+
+def test_error_skip_policy_threshold_fires_after_count_exceeds_three() -> None:
+    """The threshold callback fires once the counter passes the legacy
+    ``count > 3`` gate. ``max_attempts=4`` translates the original
+    ``> 3`` semantic into the policy's ``counter >= max_attempts``
+    check, so increments 1-3 stay below threshold and increment 4
+    triggers the callback."""
+    runner = h._make_runner()
+    for _ in range(3):
+        runner._error_skip_policy.increment(runner)
+    fired_at_three = asyncio.run(
+        runner._error_skip_policy.maybe_escalate(runner)
+    )
+    assert fired_at_three is False
+
+    runner._error_skip_policy.increment(runner)
+    fired_at_four = asyncio.run(
+        runner._error_skip_policy.maybe_escalate(runner)
+    )
+    assert fired_at_four is True
+    assert any(
+        "max soft-skip retries (3) reached, staying ERROR" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_error_diagnose_policy_counter_tracks_legacy_field() -> None:
+    runner = h._make_runner()
+    runner._error_diagnose_count = 2
+    assert runner._error_diagnose_policy.counter_getter(runner) == 2
+    runner._error_diagnose_policy.reset(runner)
+    assert runner._error_diagnose_count == 0
+
+
+def test_error_diagnose_policy_threshold_fires_after_count_exceeds_three() -> None:
+    runner = h._make_runner()
+    for _ in range(3):
+        runner._error_diagnose_policy.increment(runner)
+    assert asyncio.run(runner._error_diagnose_policy.maybe_escalate(runner)) is False
+
+    runner._error_diagnose_policy.increment(runner)
+    assert asyncio.run(runner._error_diagnose_policy.maybe_escalate(runner)) is True
+    assert any(
+        "diagnose_error: max attempts (3) reached, staying ERROR"
+        in entry["event"]
+        for entry in runner.state.history
+    )
