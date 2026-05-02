@@ -10621,6 +10621,113 @@ def test_handle_idle_warns_when_merged_pr_http_304_streak_persists(
     )
 
 
+def test_handle_idle_does_not_rewarn_before_full_cadence_after_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-236 follow-up: the re-emit cadence is measured from the threshold
+    crossing, not from streak=0. With WARN_AT=10 and WARN_EVERY=50 the next
+    warning lands at streak=60, not streak=50."""
+    _patch_subprocess(monkeypatch)
+    task = QueueTask(
+        pr_id="PR-123",
+        title="Keep dispatching",
+        branch="pr-123-keep-dispatching",
+        status=TaskStatus.TODO,
+    )
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: (_ for _ in ()).throw(
+            RuntimeError("gh api repos/owner/name/pulls failed (exit 1): HTTP 304")
+        ),
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda tasks, repo_path, base_branch, prs, merged_prs=(): tasks,
+    )
+
+    async def fake_handle_coding() -> None:
+        return None
+
+    runner = _make_runner()
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    # Streak about to land on a multiple of WARN_EVERY (e.g. 50) but still
+    # short of WARN_AT + WARN_EVERY (e.g. 60). Pre-fix this would re-warn.
+    runner._idle_merged_pr_304_streak = (
+        idle_module._IDLE_MERGED_PR_304_WARN_EVERY - 1
+    )
+    asyncio.run(runner.handle_idle())
+
+    assert runner._idle_merged_pr_304_streak == (
+        idle_module._IDLE_MERGED_PR_304_WARN_EVERY
+    )
+    assert not any(
+        "merged-PR detection degraded" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_idle_rewarns_after_full_cadence_past_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-236 follow-up: once a full WARN_EVERY cycles have elapsed past the
+    initial WARN_AT crossing, the degraded-detection event must re-emit so
+    operators see the persistent outage at the configured spacing."""
+    _patch_subprocess(monkeypatch)
+    task = QueueTask(
+        pr_id="PR-123",
+        title="Keep dispatching",
+        branch="pr-123-keep-dispatching",
+        status=TaskStatus.TODO,
+    )
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: (_ for _ in ()).throw(
+            RuntimeError("gh api repos/owner/name/pulls failed (exit 1): HTTP 304")
+        ),
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda tasks, repo_path, base_branch, prs, merged_prs=(): tasks,
+    )
+
+    async def fake_handle_coding() -> None:
+        return None
+
+    runner = _make_runner()
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    runner._idle_merged_pr_304_streak = (
+        idle_module._IDLE_MERGED_PR_304_WARN_AT
+        + idle_module._IDLE_MERGED_PR_304_WARN_EVERY
+        - 1
+    )
+    asyncio.run(runner.handle_idle())
+
+    assert runner._idle_merged_pr_304_streak == (
+        idle_module._IDLE_MERGED_PR_304_WARN_AT
+        + idle_module._IDLE_MERGED_PR_304_WARN_EVERY
+    )
+    assert any(
+        "merged-PR detection degraded" in e["event"]
+        for e in runner.state.history
+    )
+
+
 def test_handle_idle_resets_merged_pr_http_304_streak_on_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

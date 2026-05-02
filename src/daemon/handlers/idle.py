@@ -474,9 +474,14 @@ class IdleMixin:
                 # over.
                 streak = prev_merged_pr_304_streak + 1
                 self._idle_merged_pr_304_streak = streak
-                if streak == _IDLE_MERGED_PR_304_WARN_AT or (
-                    streak > _IDLE_MERGED_PR_304_WARN_AT
-                    and streak % _IDLE_MERGED_PR_304_WARN_EVERY == 0
+                # Re-emit cadence is measured from the threshold crossing,
+                # not from streak=0. Otherwise the first repeat after the
+                # initial warning at WARN_AT lands at WARN_EVERY (e.g. 40
+                # cycles after WARN_AT=10 with WARN_EVERY=50), undercutting
+                # the configured spacing.
+                cycles_since_warn = streak - _IDLE_MERGED_PR_304_WARN_AT
+                if cycles_since_warn >= 0 and (
+                    cycles_since_warn % _IDLE_MERGED_PR_304_WARN_EVERY == 0
                 ):
                     self.log_event(
                         f"[INFRA] IDLE: merged PR check returned HTTP 304 "
