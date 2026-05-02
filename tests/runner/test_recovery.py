@@ -107,9 +107,10 @@ def test_dirty_tree_recovery_composes_with_crashed_task_marker(
     assert runner.state.current_task is None
     assert runner.state.current_pr is None
     assert any(
-        e["event"]
-        == "[INFRA] Task PR-100 crashed, marking CANCELED. "
-        "Manually re-upload to retry."
+        e["event"].startswith(
+            "[INFRA] Task PR-100 crashed, marking CANCELED. "
+            "Manually re-upload to retry."
+        )
         for e in runner.state.history
     )
 

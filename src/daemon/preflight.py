@@ -7,11 +7,15 @@ Mixin methods:
 
 from __future__ import annotations
 
+import logging
 import subprocess
 
+from src.branch_context import BranchContext
 from src.daemon import git_ops
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
 from src.models import PipelineState
+
+logger = logging.getLogger(__name__)
 
 # After this many consecutive cycles of a dirty working tree,
 # ``preflight`` hard-resets the repo to ``origin/{branch}`` and
@@ -83,6 +87,11 @@ class PreflightMixin:
         failure the state is left untouched so ``preflight`` falls
         through to the usual ERROR path.
         """
+        # Capture branch context before the reset wipes ``current_git_branch``
+        # so the diagnostic names which feature branch was actually
+        # checked out at the time of recovery rather than the post-reset
+        # base branch.
+        ctx = BranchContext.from_runner(self)
         branch = self.repo_config.branch
         try:
             # ``--force`` so a dirty PR-branch working tree cannot
@@ -110,5 +119,6 @@ class PreflightMixin:
         self.state.state = resumed
         self.state.error_message = None
         self.log_event(
-            f"[INFRA] Auto-recovered from dirty tree -> {resumed.value}."
+            f"[INFRA] Auto-recovered from dirty tree -> {resumed.value} "
+            f"({ctx.log_summary()})."
         )

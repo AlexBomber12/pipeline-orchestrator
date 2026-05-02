@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import subprocess
 import time
 from datetime import datetime, timezone
 
 from src import github_client
+from src.branch_context import BranchContext
 from src.daemon import git_ops
 from src.daemon.handlers.breach import BreachMixin
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
 from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus
 from src.retry import retry_transient
+
+logger = logging.getLogger(__name__)
 
 _FIX_CI_LOG_TRUNCATE_CHARS = 5000
 _ESCALATE_MARKER_PREFIX = "ESCALATE:"
@@ -604,6 +608,10 @@ class FixMixin(BreachMixin):
     async def handle_fix(self) -> None:
         """Run ``FIX FEEDBACK`` via the active coder CLI and return to WATCH."""
         self._stop_requested = False
+        logger.info(
+            "[BRANCH] handle_fix: %s",
+            BranchContext.from_runner(self).log_summary(),
+        )
         await self._refresh_auth_status_cache()
         coder_name, plugin = self._get_coder(allow_exploration=False)
         if not await self._check_rate_limit(proactive_coder=coder_name):

@@ -160,12 +160,19 @@ def test_sigkill_during_coding_recovers_correctly(
         )
 
         history = recovered.get("history") or []
-        crash_event = (
+        # PR-222 appended a ``BranchContext.log_summary()`` suffix to the
+        # cancellation event so an operator can name every branch surface
+        # from a single log entry; assert the prefix rather than exact
+        # equality so the diagnostic context can grow without breaking
+        # the recovery contract this e2e pins.
+        crash_event_prefix = (
             f"[INFRA] Task {expected_pr_id} crashed, marking CANCELED. "
             "Manually re-upload to retry."
         )
         assert any(
-            isinstance(entry, dict) and entry.get("event") == crash_event
+            isinstance(entry, dict)
+            and isinstance(entry.get("event"), str)
+            and entry["event"].startswith(crash_event_prefix)
             for entry in history
         ), (
             f"recovered IDLE without crash-mark log entry for {expected_pr_id!r}; "

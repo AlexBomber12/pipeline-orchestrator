@@ -11,6 +11,7 @@ import subprocess
 from typing import Awaitable, Callable
 
 from src import github_client
+from src.branch_context import BranchContext
 from src.daemon import git_ops
 from src.models import PipelineState
 
@@ -308,6 +309,15 @@ class CodingMixin:
         if await pause_for_stop_if_requested():
             return
         if candidate is None:
+            # The branch-mismatch check is layered into
+            # ``_diagnose_exit_zero_no_pr`` (only on the case-A/B path
+            # where no upstream branch exists) instead of firing here
+            # unconditionally: a recoverable case-C run that pushed
+            # ``task_branch`` but exited on a different local branch
+            # (e.g. switched back to ``main`` before exit) must still
+            # reach the daemon ``gh pr create`` recovery, since
+            # ``--head task_branch`` operates on the upstream ref
+            # regardless of the local checkout.
             await self._diagnose_exit_zero_no_pr(
                 target_branch, coder_name, pause_for_stop_if_requested
             )
@@ -360,15 +370,39 @@ class CodingMixin:
             return
 
         if not remote_exists:
+            ctx = BranchContext.from_runner(self)
+            if ctx.mismatch_reason is not None:
+                # Daemon recovery is unavailable (no upstream
+                # ``task_branch``) AND the runner ended on a different
+                # branch surface than the task declares — surface the
+                # divergence explicitly so an operator sees the named
+                # mismatch instead of the generic "did nothing" /
+                # "no push" verdict.
+                self.log_event(
+                    f"[BRANCH] mismatch detected: {ctx.mismatch_reason}; "
+                    f"{ctx.log_summary()}"
+                )
+                message = (
+                    f"[{coder_name}] Branch mismatch: "
+                    f"{ctx.mismatch_reason} ({ctx.log_summary()})"
+                )
+                await self._save_current_run_record("error")
+                await self._escalate_to_hung(
+                    message,
+                    apply_escalated_label=False,
+                    set_pr_escalated_flag=False,
+                    log_message=f"{message}.",
+                )
+                return
             if not local_exists:
                 message = (
                     f"[{coder_name}] Coder exited 0 but did nothing — "
-                    f"escalating"
+                    f"escalating ({ctx.log_summary()})"
                 )
             else:
                 message = (
                     f"[{coder_name}] Coder exited 0 with local branch but "
-                    f"no push — escalating"
+                    f"no push — escalating ({ctx.log_summary()})"
                 )
             await self._save_current_run_record("error")
             await self._escalate_to_hung(
