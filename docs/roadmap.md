@@ -1282,6 +1282,173 @@ This means **Vision A precedes Thompson by ~2-3 weeks of daemon work**, not the 
 
 **Anthropic API plugin specifically valuable:** unlocks deployment scenarios where Claude Code CLI subscription is impractical (cloud VPS deployments — see Anthropic ToS clarification, "Running it on a VPS? Use an API key"). Pipeline-orchestrator running on home server can use CLI plugin; pipeline-orchestrator running on cloud must use API plugin. **Both must be supported for product to be deployable beyond home-lab use case.**
 
+**Critical strategic implication — managed/hosted deployment requires API plugins exclusively (added 2026-05-01):**
+
+If pipeline-orchestrator ever becomes a hosted/managed product (SaaS where author or company runs the daemon, users connect to it), **CLI plugins become legally unavailable** under current Anthropic Consumer ToS. Two cited prohibitions:
+
+> "Running it on a VPS? Use an API key — subscription OAuth on servers is both impractical (tokens expire) and prohibited." (Anthropic Consumer ToS guidance, Feb 2026)
+
+> "Anthropic does not permit third-party developers to offer Claude.ai login or to route requests through Free, Pro, or Max plan credentials on behalf of their users." (Anthropic Legal Compliance docs)
+
+This means:
+
+| Deployment shape | CLI plugins | API plugins |
+|---|---|---|
+| Self-hosted on home server (current author case) | Allowed (ordinary individual usage) | Allowed |
+| Self-hosted on cloud VPS | **Prohibited** (subscription on server) | Required path |
+| Managed/hosted product (you run, users connect) | **Prohibited** (routing through user subscriptions on behalf) | Required path |
+| Multi-tenant on shared infrastructure | **Prohibited** even with separate operator accounts (still hosted by you) | Required path |
+
+**Product strategy fork (mid-term decision, not immediate):**
+
+This creates two distinct product directions with different unit economics:
+
+**Self-hosted product** (current direction):
+- Distribute pipeline-orchestrator as software (open-source, source-available, AGPL+commercial).
+- Operators run on their own hardware, use their CLI subscription.
+- Unit cost to operator ≈ 0 marginal (subscription is sunk cost they already pay for personal use).
+- Revenue model: commercial license, support contracts, hosted SaaS add-on (analytics, multi-tenant features, backup) — but core daemon remains self-hosted.
+
+**Managed product** (potential future direction):
+- Author/company runs daemon on cloud infrastructure.
+- Users authenticate via Anthropic API keys, OpenAI API keys (bring-your-own-key).
+- CLI plugins **completely disabled** in managed deployment configuration.
+- Unit economics: pass-through API costs + your orchestration margin per PR/repo/org.
+- **Cost-per-merged-PR thesis becomes cleaner business case** — operator sees real $X.YZ per PR (not "fraction of $200/mo subscription"); routing decisions tie directly to dollar-cost optimization, which is exactly what the bandit + analytics layer optimize for.
+
+**Why the fork is not immediate:**
+
+- Foundation Sprint and Wave 1-7 work the same for both directions.
+- Vision A (multi-vendor including Anthropic API plugin) is required for **either** direction — managed needs it for legal reason, self-hosted needs it for cloud VPS support and routing thesis.
+- Vision B-alt (multi-tenant) makes most sense in managed framing but is also useful for small-team self-hosted (each team member has own credentials).
+- The fork point is product positioning decision: when (if ever) the author wants to launch as a hosted SaaS. That decision currently sits beyond the present roadmap horizon.
+
+**What changes if managed becomes the path:**
+
+1. **Disable CLI plugins in managed deployment config.** Single feature flag (`config.daemon.allow_cli_plugins: bool`). Self-hosted defaults True; managed defaults False.
+2. **Onboarding flow guides API key paste** instead of CLI device-flow login. PR-FUTURE-6 auth UI must support both modes.
+3. **Pricing display in dashboard** shifts from "session 32%, weekly 4%" (subscription quota indicators) to actual dollar cost accumulation per repo / per PR / per org. Analytics dashboard already in roadmap (post-Vision A) supports this naturally.
+4. **Multi-account framing changes:** in managed, "each user has their own API key" is the natural model, no ToS gray area. Vision B-alt becomes the default tenancy pattern, not an edge case.
+
+**Action: do not architect for managed-only.** Architect for both paths; the fork point is a single configuration flag plus pricing display swap, not a deep refactor. Self-hosted remains primary near-term; managed becomes optional path that ships after Vision A is mature and product-market fit is validated on self-hosted.
+
+**Recorded as strategic note, not immediate roadmap item.** Revisit when considering hosted launch decision.
+
+#### Per-vendor ToS comparison (verified 2026-05-01)
+
+The "managed deployment requires API plugins" rule is **not Anthropic-specific** — same trajectory across vendors:
+
+| Vendor | CLI subscription | API key | Self-hosted weights | Notes |
+|---|---|---|---|---|
+| Anthropic Claude | OK personal home only; prohibited on VPS or hosted | OK any deployment | N/A (closed weights) | Explicit prohibition Feb 2026 docs update |
+| OpenAI Codex | OK personal interactive; gray area for automation | OK any deployment | N/A (closed weights) | Same trajectory as Anthropic; OpenAI silent where Anthropic was explicit, but community recognises automation = API key path |
+| Qwen (Alibaba) | Free OAuth tier discontinued Jan 2026 (1000/day → 100/day, then ended) | OK via Alibaba Cloud Coding Plan or third-party (OpenRouter, Fireworks) | OK Apache 2.0 license | Self-hosted weights = clean path; hosted requires paid API |
+| DeepSeek | Limited subscription tier | OK | OK on most models | Self-hosted clean; same dual-track |
+| Mistral | Limited subscription | OK via La Plateforme | OK for open models (Mistral 7B) | Premium models API-only paid |
+| Aider | N/A (it is a harness, not vendor) | Inherits backend's ToS | N/A (it is a harness) | Itself Apache 2.0; routes through your chosen vendor |
+| Ollama / llama.cpp | N/A | N/A | Fully OK, zero ToS friction | Self-hosted models via Ollama = no vendor terms apply |
+
+**Industry pattern across all vendors:** open weights for self-hosted; paid API for hosted; subscription tiers tightening rapidly (Anthropic Feb 2026, Qwen Jan 2026, OpenAI gradual). **API key path is the universal safe option for any deployment beyond the operator's own home machine.**
+
+**Implication for pipeline-orchestrator:**
+
+- CLI plugins (Claude CLI, Codex CLI, Qwen Code CLI when it existed for free) are **all on the same clock** — vendor ToS evolves toward restricting subscription use to personal interactive only.
+- API plugins are **uniformly safe** across all vendors. No vendor prohibits API key use for automation.
+- **Self-hosted-with-Ollama path** is the ONLY genuinely friction-free deployment — operator runs Qwen/DeepSeek/Mistral weights on their own hardware, no vendor relationship at all.
+
+**This shapes the product positioning differently than "Claude orchestrator":**
+
+- Pipeline-orchestrator is **vendor-agnostic by virtue of needing to be**. The product cannot rely on any single vendor's CLI being usable in non-personal contexts going forward.
+- The cross-vendor routing thesis (Vision A) is not just nice-to-have — it is **architecturally required** for any deployment outside the author's home server.
+- Self-hosted-with-local-Ollama becomes a credible deployment story for operators in regulated industries (finance, healthcare, government) who cannot send code to vendor APIs.
+
+#### Self-hosted product monetization analysis (added 2026-05-01)
+
+**Operator's question:** "Как продавать self-hosted? Брать плату данными о сделанных PR?"
+
+This is a serious strategic question with several viable answers and one natural-feeling but problematic answer. Worth thinking through systematically.
+
+**What is sold in self-hosted, structurally:**
+
+Pipeline-orchestrator as software has layered value:
+
+1. **Orchestration code** — the daemon, ~250 PRs of state machine, plugin architecture, FSM, recovery handlers. Open-source by default.
+2. **Operational knowledge** — accumulated patterns: scaffolder rules, AGENTS.md conventions, error classification, FIX cycles, session management. Embedded in code, transferred with installation.
+3. **Network-effect data** — across all installations, what coder/model/task combinations work best, cost-per-PR distributions by complexity bucket. Lives only at scale (50+ installations minimum for useful aggregates, 500+ for meaningful benchmarks).
+4. **Cost intelligence** — routing recommendations based on (3), competitive industry benchmarks. Sellable as data product to non-users (CTOs, VCs, vendors).
+
+In a managed (hosted) product, user pays for (1)+(2)+(3)+(4) bundled through subscription. In self-hosted, user gets (1)+(2) for free if open-source. Value capture for self-hosted MUST come from (3)+(4), or from bundling extra services.
+
+**Pricing model options:**
+
+**A. Open-source + commercial license** (GitLab CE/EE pattern)
+- AGPL or similar for community; paid commercial license for businesses that don't want AGPL viral clause.
+- Revenue from license fees.
+- Risk: AGPL can scare away companies that would otherwise contribute. Sets adversarial tone with users.
+
+**B. Open-core** (Sentry, Hashicorp pattern)
+- Free: core daemon, scaffolder, basic UI.
+- Paid: analytics dashboard, multi-tenant, advanced routing, audit logs, SSO, compliance.
+- Revenue: per-seat or per-org subscription.
+- Risk: users reimplement paid features in community fork.
+
+**C. Free + paid hosted SaaS addon** (Plausible, PostHog pattern)
+- Self-hosted always free and full-featured.
+- Optional paid hosted analytics that ingests opt-in telemetry, returns benchmark dashboards.
+- Optional paid hosted multi-tenant management plane for operators running orchestrator across organisations.
+- Revenue from SaaS subscription, not from software.
+- Risk: few operators opt into paid hosted addon.
+
+**D. Data-as-payment** (free unlimited + telemetry obligation)
+- Free unlimited use.
+- In exchange: anonymized PR metrics telemetry sent to author's servers.
+- Aggregate data trains routing intelligence; eventually sold as industry benchmark product.
+- Revenue from data product (sold to CTOs, VCs, vendors), not from operators directly.
+- Risk: privacy concerns, GDPR compliance burden, "free product that takes your data" has reputational baggage post-Facebook era. Technical operators (the initial target audience) will disable telemetry, fragmenting data quality.
+
+**Recommendation: Hybrid C + opt-in D, NOT pure D.**
+
+The natural temptation is "data-as-payment" because the data really is valuable and operators don't see a direct cost. But pure D model has structural problems:
+
+1. **GDPR exposure.** Accumulating data about developers' work product across the EU requires legal infrastructure (DPO, privacy policy, data protection agreements). For a solo developer launching a product, this is a heavy lift.
+2. **Trust signal negative.** "Free product that takes your data" has bad reputation specifically among the developer audience pipeline-orchestrator targets. Operators who care enough about cost-per-PR to use the product also care about data sovereignty.
+3. **Code/PR data is unusually sensitive.** Even "anonymized" PR metrics can leak proprietary patterns (release schedules, feature priorities, bug rates). Some operators legally cannot share even anonymized telemetry (regulated industries).
+4. **Slow monetization curve.** Data products take years to mature. Pipeline-orchestrator needs 50+ active operators before any aggregate is meaningful, 500+ before benchmarks are sellable. Meanwhile no revenue stream covers development cost.
+5. **Adversarial relationship with sophisticated users.** The most valuable users (large orgs, deep operators) will be the first to disable telemetry, fragmenting exactly the data you most need.
+
+**Hybrid that works (C + opt-in D):**
+
+1. **Self-hosted free, full-featured, no telemetry by default.** MIT or Apache 2.0 license. Operator runs on their infrastructure with zero data extraction.
+2. **Opt-in telemetry** — operator chooses to share anonymized PR metrics. In exchange:
+   - Access to **community benchmark dashboard** (compare your cost-per-PR vs industry median, by complexity bucket).
+   - Access to **community-trained routing recommendations** (which coder works best for which task type, learned from aggregate).
+3. **Paid SaaS analytics tier** for orgs wanting deep analytics on their own data:
+   - Multi-org dashboard (CTO sees all teams' cost-per-PR).
+   - Custom benchmarks compared to competitors via aggregate.
+   - Audit logs, compliance reports, SSO, role-based access.
+   - **This is the revenue stream.**
+4. **Mid-term: data product** sold to non-users (VCs, AI vendors, consulting firms) once aggregate is meaningful (500+ operators).
+
+**Why hybrid works:**
+
+- Operators bring data **in exchange for value** (community benchmarks, routing intelligence) — not as payment-for-software. Different framing matters culturally.
+- Orgs with serious analytics needs pay for SaaS tier, generating revenue without forcing payment from individual operators.
+- Telemetry is genuinely opt-in — preserves trust with sovereignty-conscious operators.
+- Two-tier value capture (community benchmarks + paid SaaS) is more resilient than single-revenue model.
+
+**Strategic note (not immediate decision):**
+
+Pricing model decision is **mid-term, 6-12 months out**. Current priorities (Foundation Sprint, Wave 1-7, Vision A, SQLite, Thompson) all happen before this decision needs to lock. Architecture should be **prepared** for opt-in telemetry but should **not bake it in by default**. Build the analytics surface in a way that works equally well for personal-use-only operators and for opt-in-telemetry operators.
+
+**Action items for product preparation (low cost now, preserves option):**
+
+1. **No telemetry by default.** Code base ships without any phone-home behaviour. Adding it later is a feature flag plus opt-in flow.
+2. **Analytics surfaces are local-only by default.** Cost-per-PR dashboard works on your own SQLite data. Opt-in flow could later sync subset to shared backend.
+3. **License decision deferred** but lean toward Apache 2.0 (no AGPL viral). Avoids commercial-license model adversarialism. Revenue comes from hosted SaaS tier when ready.
+4. **Pricing page work** is a separate Wave (post-Vision-A, post-SQLite, post-analytics dashboard). Not addressing pricing in current roadmap.
+
+**Recorded as strategic positioning note. Revisit when 30+ active operators exist (validation point for whether community matters as model) or when first paid SaaS feature request arrives organically.**
+
 #### SQLite addition for long-term metrics (added 2026-05-01)
 
 **Framing decision (2026-05-01, confirmed):** **SQLite is added alongside Redis, not migrated to.** Each tool used for its strengths. Redis remains for state machine + pub/sub (its core competencies); SQLite added for durable, queryable metrics persistence (its core competency). No replacement, no migration in the destructive sense — additive architecture with clear responsibility split.
