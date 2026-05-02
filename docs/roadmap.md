@@ -2,9 +2,26 @@
 
 Живой документ. Обновляется после каждой merge'нутой волны и после каждой chat-session.
 
-Последнее обновление: 2026-05-02 (OBS-BE scope расширен: cause-of-CANCELED preservation для всех путей, не только ESCALATE. Storage `cancellation:{repo_name}:{task_id}`, TTL via `_TTL_SECONDS` из metrics.py, UI inline-expand. Cancellation policy section добавлена: behaviour matrix CRASH/ESCALATE/TIMEOUT/INFRA × Active/Off, layered SignalSource Protocol с heartbeat + manual override + active hours config, Human Availability indicator как non-negotiable UI requirement, dependency-aware blocked_set, dashboard sort by dependents_count, Variant A confirmed для transition. v1.1 refinements: 4-state visual scheme, expected-wait-time differentiation Red vs Cross, welcome-back digest modal. Vision C "Orchestrator Companion App" desktop client как parallel product surface. Vision D "Conversational morning triage" через Telegram bot 4-stage gating (D.1 digest push opportunistic post-v1, D.2 interactive triage post-Vision-A, D.3 voice agent far horizon, D.4 telephony if Vision D becomes core). Wave 5 cumulative ~16h над OBS-AW + OBS-BB + OBS-BC).
+Последнее обновление: 2026-05-02 (major cleanup pass: deleted Active investigations + broken Work Modes blocks 528 lines, replaced with compact Lessons learned appendix; collapsed Implementation Audit summary to 5 lines; rewrote Risks section for current Sprint 13/14; rewrote Open questions reflecting today's strategic confirmations; demoted Multi-tier agent to Vision E; sprint nomenclature unified Sprint 12-17. Strategic confirmations today: License Apache 2.0 ASAP actionable (current LICENSE is MIT, not AGPL as memory implied), Vision A Sprint 17+, SQLite migration before Thompson, PR-FUTURE-7 eliminate QUEUE.md confirmed, PR-FUTURE-4 tier scaffolder after Sprint 13 OBS-AX, Telegram bot Vision D Sprint 17+. OBS-BI Path A locked. OBS-BG codex non-determinism explicitly NOT added (operator deliberate choice; defense-in-depth via existing pre-merge sync re-trigger). Sprint 14 expanded with OBS-BK + OBS-BL + OBS-BM totaling 9-11 PRs ~27h. Earlier session work: OBS-BE expanded scope, Cancellation policy v1, v1.1 refinements, Vision C companion app, Vision D conversational morning triage 4-stage gating, throughput baseline corrected to 25-30 PR/day. File reduced from 2790 to ~2200 lines).
 
 Предыдущие: 2026-05-01 (PR-180..PR-207 shipped, все 28 PR merged. Multi-repo isolation audit complete, parallel run_cycle in main loop deployed. Foundation Sprint 36 PR specs generated for PR-208..PR-236 batch, internal architecture cleanup. Architectural future work section added for post-Foundation: AGENTS template scope, per-repo config, onboarding wizard, CI script generator MICRO PR. Onboarding of megaraid-dashboard и sms-gateway-v2 actively in progress; reconciled AGENTS.md files prepared, scripts/ci.sh manual creation required pre-onboarding due to scaffolder stub trap), 2026-04-29 (full roadmap rewrite на основе Implementation Audit), 2026-04-28 (sigkill recovery test multi-race resolved via PR-228/PR-232/PR-234/PR-236; production daemon deployed on fresh main; GraphQL quota burn analyzed; onboarding test subjects identified), 2026-04-27 (OBS-AA test pollution v1 misdiagnosis + v2 docker-exec fix; OBS-Y premature merge; Multi-tier agent direction; OBS-Z Codex EYES race), 2026-04-26 (Sprint F1.0 + PR-156/157 + PR-158/159 merged; Variant D direction; Development model & Layer 2 substrate observations), 2026-04-24 (after code audit zip __27__).
+
+---
+
+## Sprint nomenclature (unified 2026-05-02)
+
+Continuous sprint numbering aligned with operator's mental model. Replaces ad-hoc "Wave X" / "Phase X" / "Round X" labels used earlier in this document. Earlier labels remain inline for cross-reference but new planning uses sprint numbers.
+
+| Sprint | Content | Status | Estimate |
+|---|---|---|---|
+| Sprint 12 | Foundation Sprint (PR-208..PR-236) | In progress | 36 PRs, ~25 daemon-hours, ~1 daemon-day at 25-30 PR/day |
+| Sprint 13 | OBS-AX scaffolder fix + OBS-AY UI freeze fix + License Apache 2.0 switch (was Wave 1 + Wave 2 + new license task added 2026-05-02) | Queued | 4-5 PRs, ~8 daemon-hours |
+| Sprint 14 | Recovery + Cancellation policy expanded (was Wave 5; reordered earlier than Wave 3-4 due to throughput cost demonstrated 2026-05-02; expanded with OBS-BK + OBS-BL + OBS-BM additions) | Queued | 9-11 PRs, ~27 daemon-hours |
+| Sprint 15 | UX polish + vocabulary + DONE-row metrics Path A (was Wave 3 + Wave 4, plus OBS-BH + OBS-BI Path A locked + OBS-BJ from 2026-05-02) | Queued | 7-9 PRs, ~17-19 daemon-hours |
+| Sprint 16 | Multi-testbed harness + multi-repo tests (was Wave 6 + Wave 7) | Queued | 7+ PRs, ~15 daemon-hours |
+| Sprint 17+ | Vision A multi-vendor routing first slice | Pending strategic decision | TBD |
+
+Earlier "Wave X" references inside OBS items remain for backward compatibility; mapping is `Wave 1+2 = Sprint 13`, `Wave 5 = Sprint 14`, `Wave 3+4 = Sprint 15`, `Wave 6+7 = Sprint 16`. New OBS items added 2026-05-02 use sprint terminology directly.
 
 ---
 
@@ -20,55 +37,9 @@
 
 ---
 
-## Implementation Audit summary (2026-04-29) — superseded by 2026-05-01 status
+## Implementation Audit summary (2026-04-29) — collapsed 2026-05-02
 
-Detailed PR-by-PR audit см. `docs/audit-2026-04-29.md`. Сводка по статусам legacy Sprint F1-F4 numbering следует, но **большинство пунктов теперь moot** — backlog был полностью переработан в 2026-04-29 Implementation Plan, и все 28 PRs из этого плана shipped 2026-04-29..2026-05-01. См. секцию "Implementation Plan (post-audit, 2026-04-29) — SHIPPED" ниже.
-
-### Sprint F1.0 — Playwright e2e infrastructure (DONE)
-PR-153, PR-154, PR-155 все merged. tests/e2e/ существует с 12 файлами, scripts/test-e2e.sh + docker-compose.test.yml на месте.
-
-### Sprint F1.1 — Coder pin (DONE)
-PR-156 (FINDING-2 fix) shipped. `task_coder_pin` routes pinned-but-unavailable to empty list → HUNG.
-
-### Sprint F1.2 — QUEUE.md presentation layer (DONE 2026-04-30)
-- `_generate_queue_md` в `idle.py` работает (in-memory generation done).
-- PR-181 shipped: QUEUE.md removed from git tracking. OBS-2 closed.
-- PR-182 shipped: diagnose_error bypass для infra errors. OBS-4 closed.
-
-### Sprint F1.3 — Reliability correctness (DONE 2026-04-30)
-- PR-160 (`BoundedRecoveryPolicy[T]`) shipped earlier.
-- PR-190 shipped: asymmetric push verification in fix.py normal path.
-
-### Sprint F1.4 — UX immediate batch (DONE)
-PR-161/162/163/164/165/166 + PR-176/177/178/179 nightly run — все shipped.
-
-### Sprint F2.1 — Sprint 10 SoT direct instructions (DEFERRED, low priority)
-PR-167/168/169 не начаты. AGENTS.md "Use the active entry" sections всё ещё актуальны and adequate.
-
-### Sprint F2.2 — PAUSED state model removal (DEFERRED indefinitely)
-PR-170/171/172/173 не начаты. PAUSED enum value still in code but works; `awaiting_start` flag refactor not shown to be necessary.
-
-### Sprint F3.1 — Settings comprehensive (DONE 2026-04-30 mostly)
-- PR-175 review_timeout_min UI shipped.
-- Per-repo coverage/branch settings still **gap** (now tracked as PR-FUTURE-2).
-
-### Sprint F3.2 — Selector + measurement (Thompson Sampling) (DEFERRED)
-Still epsilon-greedy default. Defer until measurement data justifies.
-
-### Sprint F3.3 — UI polish + tasks viewer (DONE)
-Pulse animation fix, task content viewer shipped. PR-184/PR-199 event clarity shipped, PR-183 Redis pub/sub shipped.
-
-### Sprint F4.1 — Failure modes comprehensive (DONE)
-- PR-186 (recovery skip retry), PR-187 (coder exit=0), PR-188 (Codex bot detect), PR-189 (OBS-Z fix) all shipped.
-
-### Sprint F4.2 — Testing infra + cleanup (PARTIAL → ongoing in Foundation Sprint)
-- PR-193 upload locks DONE earlier.
-- PR-197 STALLED documentation, PR-198 MERGE dead value cleanup shipped 2026-04-30.
-- Nightly e2e schedule still **deferred**.
-- Foundation Sprint (PR-208..PR-236) continues testing infra work with regression test guardrails.
-
-### Sigkill multi-race fixes (2026-04-28 session) — DONE
-PR-228/PR-232/PR-234/PR-236 all merged before 2026-04-29.
+Pre-2026-04-29 sprint legacy summary (Sprint F1.0..F4.2 detailed status) removed during 2026-05-02 cleanup. All items either shipped via 2026-04-29 Implementation Plan (PR-180..PR-207, see section below) or deferred indefinitely (PR-167..PR-173 SoT/PAUSED removal, Thompson Sampling). The Active OBS items subsection below is the only part still needed for current state tracking.
 
 ### Active OBS items
 
@@ -114,10 +85,49 @@ PR-228/PR-232/PR-234/PR-236 all merged before 2026-04-29.
   **Behaviour aspects** (when daemon goes ESCALATED vs CANCELED, operator availability signal, dependency-aware blocking, dashboard surfacing): covered separately in **Cancellation policy** section below. OBS-BE handles the storage/preservation problem; Cancellation policy handles the routing/policy problem. Both ship together in Wave 5.
 - OBS-BF (task generator produces internally-contradictory specs that violate established AGENTS.md rules): **OPEN, medium severity, root cause finding** — observed 2026-05-02 morning on PR-231 spec, surfaced by coder's ESCALATE reasoning. Task spec for PR-231 included a fallback instruction "Open a draft PR with TODO markers… wait for operator to fill in the values" but AGENTS.md and PR-196 establish hard rule "PRs must be created in ready state, not draft." Coder correctly flagged the contradiction. **Root cause:** task generator (whoever/whatever produced PR-231 spec — likely chat session like this one) did not have full context of AGENTS.md rules, so emitted instructions that conflict with established conventions. **This is a structural problem that grows with project age:** as the repo accumulates conventions, a generator without full rule context produces increasing rate of conflicting specs. Coder catches it via ESCALATE if smart enough; otherwise produces non-conforming PRs. **Fix approach:** (a) task generator must read AGENTS.md before producing spec; (b) automated linter on task files that checks for known anti-patterns ("open draft PR", "use --force", "skip CI", etc.); (c) longer-term, Sprint F2.1 SoT (Source of Truth direct instructions) where daemon validates task spec against AGENTS.md rules before accepting upload. ~2 PRs short-term (linter + generator-context-check), full Sprint F2.1 long-term. **Wave 4 vocabulary alongside OBS-AV** (both about task spec validation). Strategic: this is the **author's own task generation reliability problem**, distinct from coder reliability — surfaces only when sufficiently smart coder catches it via ESCALATE. With weaker coders, contradictory specs would silently produce non-conforming PRs (OBS-AX class).
 
+- OBS-BH (event log badge text duplicates badge label): **OPEN, low severity, observed 2026-05-02 by operator** - every event log line in the dashboard has the form `[BADGE_NAME] message text` (e.g. `[INFRA] Posted @codex review on PR #298`, `[FIX] [claude] entering FIX`, `[CODING] Opened PR #298 → WATCH`). The badge is also rendered as a coloured pill on the same row. The bracketed prefix in the text is therefore redundant and visually noisy. Fix: strip leading `[STATE_NAME]` token from the text rendering when the corresponding badge is present (template-side change, no event-log storage migration needed). Keep `[STATE_NAME]` in the underlying log payload for grep / debugging in raw mode, render-time stripping only. ~1 PR, ~1-2 daemon-hours. **Sprint 15 polish bucket.**
+
+- OBS-BI (per-PR metrics surface in DONE list rows): **OPEN, low-medium severity, observed 2026-05-02 by operator** - DONE list currently shows only PR ID + title + branch. Per-PR metrics are collected (RunRecord schema in `src/metrics.py` has `duration_ms`, `fix_iterations`, `tokens_in`, `tokens_out`, `task_type`, `complexity`, `exit_reason`, `files_touched_count`, `diff_lines_added/deleted`) and surfaced as a separate "Recent PRs" panel (`src/web/templates/components/pr_metrics.html`, endpoint `/partials/repo/{name}/metrics`, polls every 60s, last 20 records: Task / Coder / Model / Duration / FIX Iterations / Exit Reason). However, this panel is **not visible from the DONE list view** that the operator uses for historical browsing - it lives in a different repo-detail surface that does not naturally surface for completed PRs.
+
+  **Operator decision recorded 2026-05-02:** scope locked to **Path A** - surface what is already collected, no new fields, no dollar conversion, no cross-stage aggregation. Concretely: integrate columns from existing `pr_metrics.html` (Coder, Model, Duration, FIX Iterations, Exit Reason) inline into DONE list row rendering. Backend reuses existing `_recent_repo_metrics_payload` lookup, joining by `task_id` in DONE list serializer. Optionally deprecate or repurpose the standalone `pr_metrics.html` panel once DONE-row integration covers the use case (decision deferred - keep both panels initially as dual surface for transition period).
+
+  **Out of scope for this OBS:**
+  - Dollar-cost conversion of `tokens_in`/`tokens_out`. Separate decision; ties to plugin cost model architectural work in Vision A territory. Subscription users see token counts (marginal cost zero); API users see token counts (real billing). Both groups served by raw token display until cost model formalized.
+  - Cross-stage cost aggregation (planner/reviewer/qa stages). Currently only `coder` stage emits RunRecords (per `src/metrics.py:32` comment); aggregation premature.
+  - Subscription utilization fraction display. Vision A territory.
+
+  **Estimate:** ~1 PR, ~3 daemon-hours. **Sprint 15 polish bucket alongside OBS-BH and OBS-BJ.** Possibly bundle all three into single PR if scope stays compact.
+
+- OBS-BJ (DONE list reverse chronological sort, default newest first): **OPEN, low severity, observed 2026-05-02 by operator** - DONE list currently sorts oldest-first (PR-067, 068, 069, ...). At 175+ DONE PRs accumulated, finding recent merges requires scrolling to the bottom. Fix: reverse default sort to newest-first, optionally add a sort toggle in the panel header. Storage: in-memory list reversal at render time (no schema migration). Alternative: simple sortable column header for `merged_at` timestamp if present. ~1 PR, ~1-2 daemon-hours. **Sprint 15 polish bucket. Bundle with OBS-BH and OBS-BI in same sprint, possibly same PR if scope stays small.**
+
+- OBS-BK (WATCH→FIX trigger logic short-circuits when CI is PENDING): **OPEN, medium-high severity, observed 2026-05-02 morning on PR-227c** - confirmed by code inspection at `src/daemon/handlers/watch.py:180-189`. The elif chain evaluates `ci == FAILURE → handle_fix()` first, then `ci == PENDING → pass`, then `review == CHANGES_REQUESTED → handle_fix()`. Python short-circuits on first match: if CI is PENDING (CI hasn't completed yet, e.g. queue-stuck or slow-runner), the `pass` branch wins and the review-driven FIX trigger is never reached, even when codex has explicitly posted CHANGES_REQUESTED. Result: PR sits in WATCH waiting for CI to converge while codex feedback remains unaddressed. In production case 2026-05-02, combined with OBS-BL circuit-breaker absence, this caused a 4-hour WATCH↔HUNG loop on PR-227c.
+
+  **Fix:** swap the elif ordering so `review == CHANGES_REQUESTED → handle_fix()` runs **independent of CI state** (as long as new feedback is detected via existing `_has_new_codex_feedback_since_last_push()` check). CI PENDING should not block FIX-on-review - review feedback addressing is orthogonal to CI completion, and the next push from FIX will trigger a new CI run anyway.
+
+  **Care needed:** existing logic intentionally does not trigger FIX when CI is PENDING for a freshly-opened PR (CI hasn't even started). The fix must distinguish "fresh PR, CI not started" from "CHANGES_REQUESTED present on already-running CI". Existing `_has_new_codex_feedback_since_last_push()` already implements this distinction correctly (returns NEW only if codex has posted comments after last push); the bug is purely in elif ordering masking it. ~1 PR, ~3 daemon-hours including regression test. **Sprint 14.**
+
+- OBS-BL (WATCH↔HUNG escalation loop without circuit breaker): **OPEN, medium-high severity, observed 2026-05-02 morning on PR-227c** - when WATCH cycle hits 20-minute timeout and review is stale, daemon transitions to HUNG, posts `@codex review` re-trigger via ESCALATE path, transitions back to WATCH, resets the 20-minute timer. No circuit breaker on N-th attempt. Production observation 2026-05-02: PR-227c cycled through this loop 4+ times over 4 hours before operator manually intervened (cancelled blocking GHA run). Each cycle posts another `@codex review` mention (small Anthropic API cost per cycle, plus codex API/UI noise), and produces no progress because the underlying blocker (CI concurrency lock - see OBS-BM) was external and unaffected by re-triggers.
+
+  **Fix:** introduce circuit breaker on stale-review re-trigger attempts. After N consecutive HUNG→ESCALATE→WATCH→HUNG cycles for the same PR (suggested N=3, configurable), daemon transitions PR to ESCALATED state (per Cancellation policy) instead of looping. Circuit breaker resets when fresh push or fresh review activity observed. **Distinct from OBS-BB FIX-no-push deadlock** (which is about coder claiming fix without pushing); this is about stale-review WATCH retrigger loop. Same architectural pattern (bounded retry with operator escalation as exit), different trigger.
+
+  **Estimate:** ~1-2 PRs, ~3 daemon-hours. **Sprint 14, alongside OBS-BB.**
+
+- OBS-BM (long CI PENDING duration without classification - concurrency-lock-stuck vs slow-runner vs infra-down): **OPEN, medium severity, observed 2026-05-02 morning on PR-227c** - extension of OBS-BC scope. OBS-BC covers CI **failure** classification (infra-fail vs real-fail). OBS-BM covers CI **stuck-pending** classification: when CI has been PENDING for an extended duration (e.g. >15 minutes for repos where typical run completes in <5 min), daemon should distinguish:
+  1. **Concurrency-lock-stuck:** GitHub Actions workflow concurrency:group serializes integration job behind another run. If the blocking run is itself stuck (abandoned PR, infra issue), this PR will never converge. Detected by: GHA API query for `waiting_on` job, check if the blocking run is in-progress more than 2x typical duration.
+  2. **Slow-runner:** runner picked up the job but is processing slowly. Detected by: job is in_progress but no log activity for >5 min (heartbeat absent).
+  3. **Queued-no-runner:** GHA queue backlogged, no runner picked the job. Detected by: job is queued (not in_progress), waited > expected.
+  4. **Workflow file error:** workflow definition itself broken. Detected by: GHA returned error event on workflow start.
+
+  **Production case 2026-05-02:** PR-227c integration job stuck PENDING 4 hours due to concurrency-lock-stuck on prior main-branch push run that was itself hung (case 1). Daemon held in WATCH polling, never escalated, never alerted operator. Operator only noticed after 4 hours via dashboard observation.
+
+  **Fix:** expand WATCH cycle CI status check to include duration analysis. If `ci.status == PENDING AND duration > threshold`, daemon classifies stuck cause via GHA API queries, surfaces classified state in event log (`[WATCH] PR #N CI stuck PENDING (concurrency-locked on run #M, blocking run hung 3h+)`), and after operator-configured duration threshold transitions PR to ESCALATED with classification preserved per OBS-BE storage. Also: optional auto-recovery path for concurrency-locked case (`gh run cancel <blocking_run_id>` if blocking run idle > N hours, requires operator-permission flag).
+
+  **Estimate:** ~2-3 PRs, ~5 daemon-hours. **Sprint 14, alongside OBS-BC.** Strategic significance: completes the daemon's CI awareness model - failure classification (OBS-BC) plus stuck-pending classification (OBS-BM) gives daemon a robust view of CI health regardless of which bad-state CI is in.
+
 ### Memory items still actionable
 
-- push_count desync: **CLOSED** — PR-195 reconciled UI metric with GitHub Commits tab via observed_head_shas tracking.
-- AGENTS.md prohibit draft PRs: **CLOSED** — PR-196 updated AGENTS.md text + handler-side enforcement via `gh pr ready`.
+- push_count desync: **CLOSED** - PR-195 reconciled UI metric with GitHub Commits tab via observed_head_shas tracking.
+- AGENTS.md prohibit draft PRs: **CLOSED** - PR-196 updated AGENTS.md text + handler-side enforcement via `gh pr ready`.
 - All known memory items from 2026-04-28 session are now closed or deferred to long-term backlog.
 
 ### Production lessons (from 2026-04-28 session, recorded for future reference)
@@ -428,10 +438,6 @@ A real instance validated that bounded-everything design choices are paying off,
 
 ---
 
----
-
----
-
 ## Implementation Plan (post-audit, 2026-04-29) — SHIPPED 2026-04-29..2026-05-01
 
 **Status as of 2026-05-01:** all 28 numbered PRs (PR-180..PR-207, with subdivisions PR-191a/b and PR-192a/b/c yielding 31 task files) are merged in production. Below is the original plan annotated with as-shipped notes.
@@ -506,7 +512,7 @@ These weren't in original 2026-04-29 plan but emerged during execution:
 
 ---
 
-## Foundation Sprint (PR-208..PR-236, generated 2026-05-01)
+## Sprint 12 — Foundation Sprint (PR-208..PR-236, generated 2026-05-01)
 
 **Status:** task specs generated and validated. 36 task files in `/mnt/user-data/outputs/foundation-tasks/`. Not yet uploaded to daemon.
 
@@ -711,13 +717,11 @@ Given trunk-based reality + AI context limits, the following adjustments apply:
 
 ---
 
----
-
-## Multi-tier agent hierarchy (architectural direction, added 2026-04-26)
+### Multi-tier agent hierarchy (Vision E, added 2026-04-26, classified as Vision 2026-05-02)
 
 Direction crystallized in conversation 2026-04-26 evening. Aleksei's framing: "звать human раньше — а он должен звать другого агента, который имеет [memory access, full architecture nav, time/tokens for cross-file reasoning, escape capability]."
 
-This is a refinement of the **Tester role** Vision item (line 698) — broader and more specific. Not just review-time second opinion, but **always-available diagnostic agent** that coder can escalate to mid-cycle.
+This is a refinement of the **Tester role** Vision item — broader and more specific. Not just review-time second opinion, but **always-available diagnostic agent** that coder can escalate to mid-cycle.
 
 ### Three-tier model
 
@@ -859,565 +863,38 @@ This direction explicitly informed by **AI context limit observation** (line 745
 
 ---
 
-## Active investigations (added 2026-04-27)
-
-### OBS-Y: Daemon merges PR before formal APPROVED state
-
-**Observed:** PR #222 (PR-164 FIX no-push deadlock circuit breaker) merged automatically at 00:46:34 on 2026-04-27. Post-mortem analysis revealed:
-
-- Head commit `174ea408` pushed at 00:39:57
-- All 4 Codex formal reviews: `state=COMMENTED`, none `APPROVED`
-- +1 reaction on PR body: created at 00:50:20 — **4 minutes after** the merge
-- Production config `allow_merge_without_review` is unset (defaults to false)
-- Therefore daemon should NOT have merged
-
-**Two independent issues sandwiched together:**
-
-1. **Claude in FIX cycle hallucinated state.** Claude's STDOUT at 00:46:24:
-   > "Codex +1 at 2026-04-27T00:45:30Z (post round-3 push at ~00:42Z → non-stale)"
-   
-   No such +1 reaction existed at 00:45:30 (it was created at 00:50:20). Claude either fabricated the timestamp or misread an earlier signal. This is a **coder reasoning bug** — coder confidently asserted false fact about PR state.
-
-2. **Daemon also merged.** Even if coder's verdict is ignored, daemon's own `_compute_review_status` decided APPROVED was true. Without an actual +1 reaction or formal APPROVED review at that moment, the only mechanism would be:
-   - Stale cache from earlier cycle, OR
-   - Misinterpretation of body anchor parsing path (`src/github_client.py:503+`), OR
-   - Bug in threshold comparison (line 462-477)
-
-**Impact:** the PR happened to be a good merge (claude's fix was correct, Codex eventually +1'd). But the merge path was incorrect. If a real bad fix had slipped through this gap, prod main would be broken.
-
-**Action plan:**
-
-1. **Add debug logging to `_compute_review_status`** in `src/github_client.py`. Each branch (line 444-488) should log: `head_sha`, `latest_review_sha`, `latest_review_time`, `reaction_time`, `head_commit_time`, `threshold`, decision (`body_approved=True/False`). Plus log cache hits explicitly. MICRO PR (~30 LoC).
-
-2. **Add coder reasoning verification**. Coder's claims about PR state in STDOUT should be cross-checked by daemon before being acted on. If coder says "PR green" but daemon's own `_compute_review_status` returns NOT APPROVED — daemon should NOT trust coder's verdict.
-
-3. **Once 2-3 more observations of premature merge collected with debug logs** — root cause becomes diagnosable. Targeted fix follows.
-
-**Priority:** medium. Not blocking deployment, but represents trust-erosion risk in autonomous merging. Fix in batch after Stage 3 UX polish merges.
-
-**Backlog items:**
-
-- **PR-180 (next foundation batch):** Debug logging in `_compute_review_status`. MICRO PR.
-- **PR-181 (after observations):** Coder verdict verification — daemon does not trust coder's "PR is green" claim without independent confirmation.
-- **PR-182 (after debug logs collected):** Targeted fix once root cause identified.
-
-### Onboarding existing project (gap, added 2026-04-27)
-
-**Observed:** Pipeline-orchestrator currently assumes the managed repo is greenfield with full conventions in place: AGENTS.md, scripts/ci.sh, tasks/ directory, .gitignore for artifacts, GHA workflow with unit+integration jobs, Codex Connector enabled, optional branch protection. New project starting from zero — works fine.
-
-For an EXISTING project (e.g., LAN_Transcriber, AWA-App, or any of Aleksei's other repos), none of these conventions exist. Daemon clones the repo successfully but the first PLANNED PR breaks because:
-- AGENTS.md missing → coder doesn't know Work Modes / FIX FEEDBACK trigger
-- scripts/ci.sh missing → no local gate
-- tasks/ directory missing → coder doesn't know task file format
-- Existing CI workflow may conflict with pipeline conventions
-- Existing branch protection may require human reviewers (Codex can only Comment)
-- AGENTS.md / CLAUDE.md if already present → merge conflict with template
-- Non-Python stack → ci.sh template needs adaptation
-- Long history → coder context overflow risk
-
-**Chicken-and-egg:** the bootstrap convention itself requires conventions to follow. Solution direction: special bootstrap task whose body INCLUDES the AGENTS.md template inline, so coder can read it from the task body and then create the file in the repo.
-
-**Action plan (separate PR series, sized ~3-5 PRs):**
-
-1. **Onboarding runbook** (MICRO PR): `docs/onboarding-existing-project.md` — manual steps, edge cases, troubleshooting per common stack (Python, JS, Go, Rust).
-
-2. **Bootstrap task template** (config PR): `templates/PR-bootstrap.md.template` and supporting `templates/AGENTS.md.template` + `templates/ci.sh.template` (per-language variants). User copies and customizes for each new repo.
-
-3. **Stack detection helper** (medium feature): coder (or future Tier 2 architect) detects language/framework from repo files (pyproject.toml, package.json, go.mod, Cargo.toml) and adapts ci.sh template accordingly during bootstrap.
-
-4. **Bootstrap merge bypass** (small feature): config flag or per-repo setting `bootstrap_pr_count: 1` allows the first N PRs of a new repo to merge without full review/CI gate. Necessary because the gate itself doesn't exist yet on first PR.
-
-5. **Existing convention reconciliation** (medium feature): if repo already has AGENTS.md / CLAUDE.md / ci.sh, bootstrap PR merges with existing rather than overwrites. Risk-managed via 3-way diff and human review of the merge.
-
-6. **Onboarding wizard in UI** (large feature, optional): Settings page step-by-step "Add new repo" that walks user through clone, bootstrap task, first PR review, gate enable. Replaces manual runbook over time.
-
-**Testing path:** onboard one of Aleksei's existing public repos (LAN_Transcriber or AWA-App) as the first real-world test. Document what breaks, fix iteratively.
-
-**Priority:** high once Stage 1-3 stable. This unblocks "use orchestrator for multiple projects" — a strategic capability for sustained productivity. Currently the orchestrator only manages itself, which is impressive but limited.
-
-**Backlog items:**
-
-- **PR-183:** Onboarding runbook + templates (Python, JS, Go variants).
-- **PR-184:** Stack detection helper (pyproject.toml etc → adapt ci.sh).
-- **PR-185:** Bootstrap merge bypass config flag.
-- **PR-186:** Existing AGENTS.md/CLAUDE.md reconciliation — section markers approach (see detail below).
-- **PR-187+:** Onboarding wizard UI (later, optional).
-- **PR-220:** Implementation of the section-markers reconciliation logic in scaffolder.py (per spec below).
-
-#### Test subjects identified (added 2026-04-28)
-
-Two real existing projects in the AlexBomber12 account are valid candidates for testing the onboarding reconciliation logic (PR-220) before we touch any user-facing flow:
-
-**megaraid-dashboard** (`github.com/AlexBomber12/megaraid-dashboard`):
-- Python project, ~27 src files, ~27 test files, Alembic migrations present
-- AGENTS.md: 67 lines, sections: Mission, Workflow Rules, Code Style, Testing, Architecture Rules, Security Model, Hardware Target, Out Of Scope, Communication
-- CLAUDE.md present, README.md present, ci.yml in `.github/workflows/`
-- Status: incomplete project (per operator), good non-greenfield baseline
-
-**sms-gateway-v2** (`github.com/AlexBomber12/sms-gateway-v2`):
-- Python project, ~24 src files, ~51 test files (notably higher test coverage), Dockerfile + deploy/
-- AGENTS.md: 61 lines, sections: Mission, Workflow, Code Style, Testing, Architecture, Security, Hardware Target
-- CLAUDE.md present, README.md present, ci.yml in `.github/workflows/`
-- Status: incomplete project (per operator), good non-greenfield baseline
-
-**Reconciliation observations (preliminary):**
-
-Both projects use a section structure that **substantially differs** from pipeline-orchestrator's AGENTS.md (which has Work Modes, Daemon Mode, CI gates, Codex Review gate, ESCALATE protocol, etc.). Test subjects use a "guidelines for AI coder" structure (Mission/Workflow/Code Style/Testing/Architecture/Security/Hardware Target). Pipeline-orchestrator's AGENTS.md is "operating manual for the daemon."
-
-This is a real test of PR-220 reconciliation: the user's existing AGENTS.md is **not wrong** — it is a different document genre serving a different purpose. The orchestrator must either:
-
-1. **Append daemon-required sections** (Work Modes, CI gates, etc.) without disturbing the user's content. Section-marker reconciliation per the existing PR-220 spec. Project's AGENTS.md keeps its identity, daemon adds what it needs in marked regions.
-2. **Refuse to onboard** if reconciliation cannot be done safely — surface to user, let them decide whether to integrate.
-3. **Migrate user's content** into the daemon's section structure — risky, destructive, not recommended.
-
-**Recommendation:** option 1 (section-marker append). PR-220's reconciliation logic should treat the user's existing AGENTS.md as authoritative for its sections and add only the daemon's required sections in clearly-marked regions (e.g., `<!-- pipeline-orchestrator: managed -->` blocks).
-
-**Hardware Target section:** both subjects have a "Hardware Target" section that pipeline-orchestrator's AGENTS.md does not have. This is project-specific (megaraid is a hardware monitoring dashboard, sms-gateway runs on specific hardware). Onboarding logic must treat such project-specific sections as user-owned and never touch them.
-
-**Test plan (when ready):**
-
-1. Clone both subjects locally.
-2. Run pipeline-orchestrator onboarding on each, dry-run mode (do not write files yet).
-3. Inspect proposed reconciliation diff for each.
-4. Verify: user content preserved, daemon sections added in marked regions, no destructive overwrites.
-5. Apply reconciliation, run daemon against the onboarded project, verify CODING/WATCH/MERGE flow works without test-only assumptions leaking through.
-
-**Multi-repo aspect:** running daemon against both projects simultaneously will validate the multi-repo path that has so far been exercised only with a single repo (pipeline-orchestrator itself). Concrete things to verify:
-- Per-repo state isolation (one repo's CODING does not block another repo's WATCH polling)
-- GraphQL quota distribution across repos (related to OBS-AC diet — burn doubles with second active repo)
-- `tasks/` directory isolation per repo
-- Slug collision handling if two repos have similar names
-- UI dashboard handles 2+ repo cards correctly
-
-**Defer until:** PR-220 reconciliation logic exists and OBS-AC diet leverages 2-3 are shipped (otherwise multi-repo will hit GraphQL quota limit immediately).
-
-#### Reconciliation strategy for existing AGENTS.md / CLAUDE.md (clarified 2026-04-27)
-
-**Problem:** scaffolder.py:260 currently SKIPS copying template if `AGENTS.md` or `CLAUDE.md` already exists. This is correct defensive behavior — we never overwrite user content. But it creates a real gap: existing repo's AGENTS.md describes the user's project conventions (code style, testing rules, framework specifics) but does NOT describe orchestrator conventions (Work Modes, FIX FEEDBACK trigger, @codex review protocol, artifacts). Coder reads existing AGENTS.md, follows project conventions correctly, but does NOT execute orchestrator protocol. Daemon waits for actions coder doesn't perform → silent breakage.
-
-**Four directions evaluated:**
-
-**A. Section markers in AGENTS.md.** Orchestrator template wrapped in HTML comments:
-```
-<!-- BEGIN: orchestrator-managed (do not edit between these markers; auto-updated by pipeline-orchestrator) -->
-## Work Modes
-... orchestrator conventions here ...
-<!-- END: orchestrator-managed -->
-```
-On scaffold: append marked section to existing file (or replace between existing markers for future updates). User content outside markers untouched. The HTML-comment markers themselves are visible in the rendered markdown explaining provenance — user is NOT surprised.
-
-**B. Separate ORCHESTRATOR.md file.** Don't touch AGENTS.md at all. Coder gets two files in prompt context. Lower reliability — coder may ignore second file.
-
-**C. Inject conventions via task body.** Every task file includes inline conventions reminder. No repo modification. Verbose, expensive in tokens, fatigue.
-
-**D. Manual AI-assisted merge with user oversight.** Bootstrap PR proposes diff (append orchestrator section); requires human review and merge. No silent modification of user's repo.
-
-**Selected approach:** **D + A combined.**
-
-- **First-time bootstrap (D):** scaffolder detects existing AGENTS.md, generates bootstrap PR with proposed diff appending the marked orchestrator section. PR has `auto_merge: false` enforced — Aleksei reviews, accepts (or modifies), merges manually. This is a **deliberate decision moment** — onboarding orchestrator into an existing project deserves explicit human review of the convention merge.
-
-- **Visible markers (A):** the appended section uses HTML comments visible to user as commentary. Quote: `<!-- BEGIN: orchestrator-managed (do not edit between these markers; auto-updated by pipeline-orchestrator) -->`. User is not surprised when they next open AGENTS.md — they see what is managed and why.
-
-- **Future automatic updates (A):** subsequent pipeline-orchestrator version bumps that update the orchestrator-managed section can do so automatically by replacing content between markers. User content outside markers stays untouched.
-
-- **Conflict resolution rules:** if user removes the BEGIN/END markers (intentionally or accidentally), scaffolder treats the file as not-managed and creates a fresh bootstrap PR rather than silently appending again. If user moves markers, scaffolder respects the new boundaries (only updates content between markers). If markers are malformed (BEGIN without END or vice versa) — scaffolder logs warning and leaves file untouched, opens fresh bootstrap PR.
-
-**PR-186 revised spec:**
-
-`src/daemon/scaffolder.py`:
-- Detect existing AGENTS.md / CLAUDE.md.
-- If file does not exist → copy template as today (current behavior preserved).
-- If file exists with valid orchestrator markers → replace content between markers with current template's marked section (silent update path).
-- If file exists without markers → do NOT modify. Instead, set a flag in repo state indicating "bootstrap reconciliation PR pending". Daemon's IDLE handler picks this up next cycle and creates a bootstrap task file with the proposed merge as a normal PR (`auto_merge: false` flag in the task header).
-- Bootstrap reconciliation PR has type `config`, priority 1, depends_on: none, body = explanation + diff preview. Coder for bootstrap is `claude` (better at multi-file merge reasoning than codex).
-
-`templates/AGENTS.md`: rewrap orchestrator-specific sections in BEGIN/END markers. Non-orchestrator-specific content (if any) outside markers.
-
-`tests/test_scaffolder_reconciliation.py` (new):
-- Existing AGENTS.md without markers + scaffold → no file modification + bootstrap flag set.
-- Existing AGENTS.md with markers + scaffold + template change → content between markers updated.
-- Existing AGENTS.md with markers, user adds text outside markers → scaffold preserves user text.
-- Existing AGENTS.md with malformed markers (BEGIN, no END) → no modification + warning logged.
-- Existing AGENTS.md with markers removed by user → treated as not-managed (no silent re-append).
-
-`docs/onboarding-existing-project.md` (PR-183 dependency): documents the markers convention, what to expect on first bootstrap, how to remove orchestrator management cleanly if user later wants to (just delete the marked section + markers).
-
-**Renumber:** PR-186 in this spec is **distinct** from the older "PR-186 Task content viewer" (which was originally a different number; the current number for that is PR-198 → PR-186 in the renumber table at line 358). To avoid confusion, this onboarding reconciliation PR is **PR-220** in the new sequence. Updated backlog item list above.
-
-### OBS-Z: Codex EYES race window (observed 2026-04-27)
-
-**Observed:** PR #227 (PR-170 Remove STALLED indicator) sat in WATCH state for 21 minutes with `review=EYES, ci=SUCCESS`. Codex had emoji-react'd with eyes on PR body indicating "I'm reviewing" but never delivered actual review. HUNG handler triggered at 21-min timeout, posted `@codex review` fallback, Codex responded with +1 within 1 minute, PR merged normally.
-
-**Root cause:** dual-trigger race on the Codex Connector side.
-
-- Codex auto-triggers on PR creation and push (default Connector behavior, cannot be disabled)
-- Daemon ALSO posts `@codex review` after push (defensive — covers cases where Codex auto-trigger silently fails)
-- When both triggers fire within a small window, Codex sometimes posts EYES (acknowledgment) but the actual review work hangs internally — never produces +1 or CHANGES_REQUESTED
-- Only HUNG timeout (20 min default) recovers via re-trigger
-
-**Trade-off observed in dual-trigger design:**
-
-- DEFENSIVE side: Codex auto-trigger sometimes silently fails (their rate limit, transient error). Daemon's `@codex review` post is the only recovery path. Without it — silent permanent stuck.
-- COST side: when both triggers race, ~5-15% of PRs hit EYES-stuck state. 21+ minute recovery via HUNG.
-
-**Solution direction (PR-181 candidate, post-Stage-3 batch):**
-
-Combination of two approaches:
-
-1. **Pre-push state check (avoid creating race):** before daemon posts `@codex review`, check current PR state via `gh pr view --json reactions,reviews`. If Codex already reacted with EYES on PR body (auto-trigger fired first) → SKIP posting duplicate. Log: "Codex auto-trigger detected, skipping duplicate @codex review post."
-
-2. **Differentiated stale threshold (faster recovery from existing race):** new config field `stale_review_threshold_eyes_min: 5` (separate from general `stale_review_threshold_min: 10`). When review state is EYES and last activity older than 5 minutes — re-trigger as stale. EYES is recognized stuck pattern; treat with shorter timeout than CHANGES_REQUESTED (which represents legitimate active review work).
-
-3. **Analytics counter:** count "EYES race events recovered via pre-push check" vs "EYES race events recovered via 5-min stale retrigger" vs "EYES race events escalated to HUNG". Informs whether fix is effective; visible in dashboard or API endpoint.
-
-**Files to touch (PR-181 spec sketch):**
-
-- `src/daemon/handlers/coding.py` and `fix.py`: before `_post_codex_review` calls, add pre-push state check (~10 lines).
-- `src/daemon/handlers/watch.py`: add EYES branch to `_maybe_retrigger_stale_review` with shorter threshold (~15 lines).
-- `config.yml`, `config.test.yml`: add `stale_review_threshold_eyes_min` field (default 5).
-- `src/web/`: optional UI counter for EYES race telemetry (~30 lines).
-- Tests: 5-7 new unit tests covering pre-push skip, EYES retrigger, threshold comparison.
-
-**Total size:** small-medium, ~50-80 LoC product + tests.
-
-**Priority:** medium. Quality-of-life improvement, not blocker. Loses ~21 minutes per stuck PR; current cycle is ~5-10 PRs/day so estimated cost is ~1-2 hours/day of waste. Worth fixing in post-Stage-3 batch alongside PR-180 (debug logging) and PR-181 (this).
-
-**Relationship to PR-166 (coder ESCALATE protocol):** PR-166 handles coder-side stuck. This (PR-181) handles Codex-side stuck. Two different agents, both can stall; both deserve targeted recovery mechanisms.
-
-**Backlog item:**
-
-- **PR-181:** Codex EYES race resolution (pre-push state check + differentiated stale threshold + analytics counter).
-
-### OBS-AA: Test pollution via daemon Redis state survival (root cause located 2026-04-27, fix in flight)
-
-**Observed:** `tests/e2e/test_stop_and_resume.py::test_stop_during_coding_then_resume_picks_next_task` failing consistently in CI integration job after recent merges. Initial hypothesis (architectural defect in `_select_next_task` DOING path) was incorrect. Investigation via captured `stack-logs.txt` from a real failed CI run revealed the actual sequence:
-
-```
-08:48:39  POST /stop                                         ← test sends stop
-08:48:39  Picked task PR-1777279712: e2e-sigkill-recovery   ← previous test's task!
-08:48:42  Recovered: DOING task PR-1777279712, no PR -> 
-            re-running CODING                                ← daemon recovery
-08:49:28  Picked task PR-1777279712 (again)
-08:49:29  User stop requested; terminating current coder
-08:49:34  CODING aborted: user stop requested                ← stops the WRONG task
-08:49:35  PAUSED -> IDLE
-08:49:42  Picked task PR-1777279767: e2e-stop-resume-slow   ← test's task A picked AFTER stop
-```
-
-**Root cause:** the per-test `reset_testbed` fixture in `tests/e2e/conftest.py` only closes GitHub PRs, deletes branches, wipes `tasks/` directory. It does NOT clear the daemon's persistent Redis state (`pipeline:{slug}` containing `current_task`, `current_pr`; `control:{slug}:*` containing stop/pause/dirty flags). Previous test's `current_task = PR-X, status=DOING` survives into next test, daemon's recovery path picks it up at first poll cycle of next test, the stop/resume logic operates on the leftover task instead of the test's intended task.
-
-**This is INFRASTRUCTURE pollution, not an ARCHITECTURE defect.** Daemon's `_select_next_task`, `_user_stopped_task_pr_ids`, DOING/TODO derivation are all correct given the input state. The input state is wrong because the fixture didn't reset it.
-
-**Earlier misdiagnosis (recorded for posterity):** an initial investigation attempted to locate the bug in `_select_next_task` (DOING tasks bypass stopped set). Log evidence disproved this — the stopped task in the failing run was `PR-1777279712` (previous test's leftover), not the test's task A. The DOING path is technically correct in this scenario; daemon stopped what the state machine said was current. The real defect is upstream — the state machine was carrying a task from the previous test.
-
-**MICRO PR v1 attempt (failed 2026-04-27):** First fix attempt used `redis.Redis.from_url()` to clear keys directly from host pytest process. Codex implemented `_default_test_redis_url()` that ran `docker inspect` to get container IP and connect from host. This **failed** because `redis-test` container in `docker-compose.test.yml` has NO host port mapping (only internal network exposure on 6379/tcp). Host pytest tried to connect to `172.22.0.2:6379` (internal docker IP), hit `TimeoutError`. CI runs showed `Redis is unavailable: Error -3 connecting to redis-test:6379` even from inside daemon container during test execution — the failed connection attempts plus CI workflow's `docker compose down -v` cleanup explained the SIGTERM events seen in stack-logs.txt. Branch `micro-20260427-redis-testbed-reset` deleted before merge.
-
-**MICRO PR v2 (in flight 2026-04-27, expected to land):** Rewrites `clear_testbed_redis_state(slug: str) -> int` to use `subprocess.run` with `docker compose -f docker-compose.test.yml exec -T redis-test redis-cli ...` for both KEYS enumeration of `control:{slug}:*` pattern and DEL of all collected keys (plus `pipeline:{slug}` and `upload:{slug}:pending`). No host port mapping added. No python `redis` package dependency. Subprocess approach uses container network namespace that already works correctly (the same approach is already used by CI workflow line 91 to verify `which claude` inside daemon container). Validated locally: `docker compose exec -T redis-test redis-cli ping` returns PONG, SET/GET/DEL/KEYS all work via this path. Branch `micro-20260427-redis-testbed-reset-v2`.
-
-**Lesson recorded:** when a test failure pattern looks like a state-machine bug but the symptom is reproducible only after specific test ordering, suspect test fixture state pollution before suspecting architectural defects in the daemon. The capture-and-read-actual-logs approach was decisive here; without `stack-logs.txt` the architectural-fix hypothesis would have shipped and not solved the actual problem.
-
-**Second lesson:** when designing test infrastructure helpers that need to reach docker-internal services, prefer `docker compose exec -T <container> <cmd>` over python clients connecting to discovered container IPs. The subprocess approach uses the container's own network namespace and works identically from CI runner host and developer DESKTOP. The python-from-host approach requires host port mappings or `docker inspect` IP discovery, both of which add infrastructure complexity and fail in subtle ways.
-
----
-
-### OBS-AB: Sigkill recovery test multi-race root cause (resolved 2026-04-28)
-
-**Observed:** `tests/e2e/test_sigkill_recovery.py::test_sigkill_during_coding_recovers_correctly` had been intermittent across many sprints. Failure modes varied across runs: `(stale info)` push rejection, `Base branch was modified` mid-merge, timeout reaching `IDLE`, `claude] CLI failed`. The non-determinism made every diagnostic attempt feel like guesswork.
-
-**Root cause: three independent races layered on the same test.**
-
-1. **Shim push lease bug (deterministic when triggered).** `git checkout -B "${branch}" origin/main` in `tests/e2e/lib/coder_shim.sh::git_setup_branch` sets local upstream to `refs/heads/main`. A later `git push --force-with-lease` (no arg) reads upstream config to determine the lease check, comparing remote `pr-...` ref against local `main` HEAD — mismatch, reject. Triggered when daemon recovery's preserve-push had already created `refs/remotes/origin/<branch>` for the same branch.
-2. **Stale tracking ref on shim re-invocation (deterministic when triggered).** When shim is re-invoked for the same branch (recovery → CODING retry), local `refs/remotes/origin/<branch>` is stale because `git fetch origin` (without explicit refspec) does not reliably refresh non-default-fetched refs. Lease check uses stale local cache against actual remote tip. Reject.
-3. **Test fixture isolation race (intermittent).** Daemon mid-merge of one test's PR while next test's `reset_testbed` is concurrently wiping `main`. `gh pr merge` fails with "Base branch was modified". Cascades into all subsequent tests because daemon enters ERROR state.
-
-**Fixes shipped:**
-- PR-236 introduces `safe_push_branch` helper with explicit lease against fresh `refs/remotes/origin/<branch>` (force-fetched before lease computation). Resolves races 1 and 2.
-- PR-232 adds `/stop daemon → wait PAUSED → cleanup → resume` pattern in `reset_testbed_full`. Resolves race 3.
-- PR-236 also serializes shared `git config --global` setup in `scripts/entrypoint.sh` via `mkdir`-based mutex, eliminating a baseline `could not lock config file` race when daemon-test and web-test containers start concurrently sharing `HOME=/data/auth`.
-
-**Diagnostic approach that worked:** added `DBG_SHIM` and `DBG_RECOVERY` instrumentation to dump `git for-each-ref` snapshots, `ls-remote` ground truth, local tracking config, and the exact lease value passed to `--force-with-lease`. After 4 CI integration reruns the failure-mode distribution was clear: 2× race-1 deterministic + 1× race-3 + 1× lucky pass. Verification that the fix held: 4 sequential CI reruns on the same fixed commit, all green, before merge.
-
-**Lesson recorded:** when a flaky test's failure cause is contested across multiple debugging cycles, stop hypothesizing and add ref-state instrumentation to the suspect code paths. The trace will resolve the question deterministically. Coverage gates can be satisfied with `# pragma: no cover` on the debug exception handlers — debug instrumentation is non-production code by design. Cost of instrumentation: 2 commits + 5 lines. Time saved: hours.
-
-**Second lesson:** for race condition fixes, one green CI run is not validation. The test was passing on lucky timing some fraction of runs before the fix existed. Require N≥3 green reruns on the same commit before merge.
-
-**Third lesson:** flaky test investigations should run in **both** environments. CI runner timing differs from local Docker (CI runners are slower; sigkill landed before shim made any commit, race never triggered). Local alone may hide CI-only races; CI alone may hide local-only races. Once a hypothesis forms, validate in both contexts before declaring confidence.
-
-**Fourth lesson (operator side):** during high-stakes debugging sessions, single-step execution mode is required. Composite scripts that chain `&&` past stateful failure points (rebase, merge, deploy) caused real production damage in this session when a `git rebase` failed but the script continued through `docker compose down/up`, baking conflict markers into the running config. Each command's output must be reviewed before the next is issued.
-
-**Fifth lesson (production config gap):** during the 2026-04-28 deploy, `git reset --hard` on the production checkout reverted `config.yml` to upstream defaults that did not match the running daemon's actual configuration. The production `config.yml` had ~15 daemon overrides (review_timeout_min=20, planned_pr_timeout_sec=2400, rate_limit session/weekly split, statusline_hook, etc.) that **existed only as a local file on the production host**, never committed to the repo. Production behavior was therefore not reproducible from git alone. Action item: decide on a configuration discipline — either commit a `config.production.yml` referenced explicitly at deploy, or move all environment-specific values to environment variables, or add a deploy step that diffs the running config against expected production values.
-
-### OBS-AC: GraphQL quota burn — diet plan and GitHub App migration (added 2026-04-28)
-
-**Observed:** during the 2026-04-28 debug session, GraphQL quota (5000/hour on the personal token) exhausted twice within ~2 hours of intensive work. This blocked CI re-runs at peak debugging and forced ~13 minute wait windows for reset. The personal token is shared across daemon polling, Codex Connector reviewer activity, IDE GitHub Pull Requests extension passive polling, and CI re-run triggers from `gh` CLI.
-
-**Verified GraphQL consumers:**
-- **Daemon polling cycle:** `gh pr list --json statusCheckRollup` (heavy GraphQL, called per WATCH/MERGE poll). Approximate burn: 100-300 points per cycle depending on PR count and check rollup depth. At `poll_interval_sec: 60` and 1 active repo, this dominates daemon-side burn.
-- **Codex Connector reviewer:** posts P1/P2 review comments on every PR push. Each review post is GraphQL-heavy (PR context fetch, comment thread inspection, file diff via GraphQL).
-- **IDE GitHub Pull Requests extension (VS Code):** polls GraphQL for PR list refresh ~once per minute when window is open, regardless of user activity. **Identified as a major silent consumer; removed during 2026-04-28 session.**
-- **CI workflow `gh` usage:** workflow files use `gh api` and `gh pr list` for status checks and rollup queries. Each CI run costs additional GraphQL.
-- **Daemon `_get_codex_review_signals`:** GraphQL call per WATCH cycle to detect Codex review state transitions.
-
-**Suspected additional consumers (not yet verified, action items below):**
-- Browser tabs open on github.com PR pages (each PR view does background GraphQL refresh).
-- Other IDE extensions that integrate with GitHub (Octotree, Copilot PR features, GitHub Actions extension).
-- `gh cli` background credential refresh.
-- GitHub Desktop or any other local app polling.
-
-**Diet plan (GraphQL leverage list, ordered by ease × payoff):**
-
-1. **Leverage 0 (free, immediate):** raise `poll_interval_sec` from 60 → 180 in production for low-activity periods. Trade-off: 3× longer detection latency for state transitions. Acceptable since daemon is overnight worker, not interactive. Already deferred in earlier OBS-Y discussion; reaffirmed here.
-2. **Leverage 1.5 (PR-234, merged 2026-04-28):** drop `refresh=True` from IDLE merged_prs fetch. Cache absorbs cycles. ~10-15% GraphQL reduction during IDLE periods. Already shipped.
-3. **Leverage 2 (small, ~50 lines) — proposed PR-237:** replace `gh pr list --json statusCheckRollup` with REST `GET /repos/{owner}/{repo}/commits/{sha}/check-runs` + `GET /repos/{owner}/{repo}/commits/{sha}/status`. REST is core quota (5000/hr) which has been consistently underused (4900+ remaining at the time of GraphQL exhaustion). Eliminates the dominant GraphQL consumer in WATCH/MERGE polling paths.
-4. **Leverage 3 (medium, ~150 lines) — proposed PR-238:** add ETag conditional requests to all GitHub REST calls. `If-None-Match` returns 304 when nothing changed and **does not count against rate limit**. Most polling cycles return identical data; this is essentially free for the common case.
-5. **Leverage 4 (medium) — proposed PR-239:** adaptive polling per state. IDLE without PR → 300s. CODING/FIX → 60s. WATCH/MERGE → 30s. Cuts IDLE burn dramatically for the common case where daemon is between tasks.
-6. **Sprint-scale — proposed PR-240:** **migrate from personal access token to GitHub App authentication.** Each App installation gets its own 5000/hr quota independent of personal token. Solves the shared-quota problem at the root. Allows daemon, Codex Connector (already an App), and CI to operate on independent budgets.
-
-**GitHub App migration plan (architectural):**
-
-Three paths considered:
-
-**Path X — Centralized API server:** single Anthropic-hosted (or self-hosted) App receives all installations, daemon authenticates via this server. Rejected: GDPR concerns, infrastructure burden, single point of failure, does not match self-hosted posture.
-
-**Path Y — Manifest Flow (selected):** each user creates own App via predefined GitHub App manifest. Daemon ships with a manifest URL the user clicks to provision their own App. Each user's App gets its own 5000/hr quota. App's private key stored locally on user's server. This matches the project's self-hosted positioning and has zero centralized infrastructure. Proposed PR-241 covers manifest flow + onboarding doc + automated key handling. Defer until first external user.
-
-**Path Z — BYO PAT (current state):** user provides personal access token. Acceptable for solo use today; not scalable to third-party adoption.
-
-**Status (2026-04-28):**
-- New GitHub App `alexbomber-pipeline-orchestrator` created in account settings (App ID generated; private key not yet downloaded; permissions correct: Contents R+W, Issues R+W, Metadata R, Pull requests R+W; Repository scope "Only on this account" sufficient for personal use).
-- Existing App `pipeline-orchestrator-testbed-ci` (App ID 3502150) kept for CI testbed only.
-- Pending: generate private key, store at `/etc/pipeline-orchestrator/private-key.pem` (chmod 600) on AI-Server, install App on personal repos (knowledge-vault, LAN_Transcriber, AWA-App, pipeline-orchestrator), add `*.pem` to `.gitignore`.
-- Pending (sprint-scale): refactor daemon auth from `gh auth login` PAT path to App-installation-token path. Estimated 1-2 days work for daemon code; existing `gh` CLI calls work transparently with App tokens once env is configured.
-
-**Action items (Round 4 candidates):**
-
-- **PR-237 (proposed):** Leverage 2 — REST `check-runs`/`status` replacement for `statusCheckRollup`. Highest payoff for least code.
-- **PR-238 (proposed):** Leverage 3 — ETag conditional requests across `github_client.py`. Medium effort, high payoff.
-- **PR-239 (proposed):** Leverage 4 — adaptive polling per state. Configuration-only with state-aware multiplier in `runner.py` poll loop.
-- **PR-240 (proposed):** GitHub App auth refactor for daemon. Sprint-scale; do after the smaller leverages prove insufficient OR when third-party adoption becomes relevant.
-- **PR-241 (proposed):** Manifest flow for third-party adoption — predefined App manifest URL, onboarding doc, automated key handling. Defer until first external user.
-
-**Lesson recorded:** GraphQL quota is the binding constraint for an autonomous daemon that uses GitHub heavily, especially when the operator simultaneously runs IDE extensions and Codex Connector against the same token. Visibility into who-burns-what is essential; the IDE extension's contribution was invisible until removal made the difference observable. Recommend periodic `gh api rate_limit` checks during heavy debug sessions and instrumenting daemon to log GraphQL points consumed per cycle.
-
-**Lesson recorded (operator hygiene):** during long debug sessions, disable passive GitHub-polling extensions in the IDE (VS Code GitHub Pull Requests, GitHub Desktop, browser PR tabs left open). Each contributes silently and compounds at peak debugging when CI re-runs are most needed.
-
-
----
-
-### OBS-AD: PR-180 self-healing convergence pattern (recorded 2026-04-29, autonomous merge confirmed)
-
-**Observed:** PR-180 (REST replacement for `gh pr list --json statusCheckRollup`) was merged to main at 14:25 UTC after autonomous convergence. Timeline:
-
-- 10:31 — first CI run, integration job FAILED (timeout waiting for IDLE state, last seen WATCH).
-- 10:50, 11:07, 11:39, 11:58, 12:30, 12:52, 13:13 — seven additional FAILED runs, same symptom.
-- Between 13:13 and 14:09 daemon committed 4 fix commits via FIX iterations:
-  1. `5f1ced0` PR-180: trust combined commit-status state, ignore stale history
-  2. `22c82a1` PR-180: map fetch failure to PENDING, not FAILURE, to avoid FIX storm
-  3. `0b23c45` PR-180: treat partial REST fetch failures with empty signal as PENDING
-  4. `e6c42c4` PR-180: trust empty surviving signal on partial REST fetch failure
-- 14:09 — first GREEN CI run.
-- 14:17 — second GREEN CI run (daemon verification rerun before merge).
-- 14:25 — daemon auto-merged the PR.
-
-**Each fix commit addressed a real edge case** in the new REST mapping function — not a cosmetic patch. Specifically the four edge cases the PR-180 task spec mentioned generically as "edge cases (empty rollup, mixed statuses, в WATCH STALLED case)" but did NOT enumerate explicitly:
-
-1. **Stale check-run history interpretation:** REST `/check-runs` returns history including expired/stale runs. Naive mapping interpreted stale FAILURE entries as current state. Fix: trust the combined commit-status state, ignore historical entries when current status is available.
-2. **Partial REST fetch failure on FIX storm:** when one of two REST endpoints (check-runs or status) failed transiently, naive mapping returned FAILURE. This triggered FIX iterations which made more REST calls which had higher failure rate. Self-amplifying loop. Fix: map partial failure to PENDING, not FAILURE.
-3. **Empty signal on combined-fetch partial failure:** edge case where one endpoint returns empty (no checks) and the other fails. Naive mapping treated empty + failure as FAILURE. Fix: empty + failure = PENDING.
-4. **Trust empty surviving signal:** if check-runs returned empty AND status returned partial-failure, the surviving "no checks" signal should be trusted (likely a fresh PR with no CI yet) rather than escalated as failure.
-
-**Validates:**
-
-The autonomous loop converges on real bugs, not just cosmetic patches. Daemon used FIX iteration as designed: each cycle interpreted CI failure → asked Claude to fix → committed → waited for next CI signal. Convergence on a 4-step edge-case staircase is exactly the use case the system was built for.
-
-**Cost paid:**
-
-- ~3.9 hours wall-clock (10:31 → 14:25).
-- 8 integration job runs (each ~10 minutes) = ~80 minutes CI runner time.
-- 4 Claude FIX iterations on Claude Pro quota.
-- ~30 minutes operator time (interrupted twice to triage what was happening).
-
-**Lessons recorded:**
-
-1. **Initial assessment was wrong.** The operator and assistant initially read the 8 fails + 2 greens as "flaky test" pattern from OBS-AB sigkill multi-race, where lucky timing determined results. The truth was different — every fail was deterministic on the same root cause (REST mapping edge cases) and the greens came after real fixes. Confirming via `git log --since/--until` on the failure window resolved the question definitively. **Future debugging should always check git log on the affected branch before declaring "flaky" — fix commits in the failure window mean the failures were deterministic.**
-
-2. **Edge cases in task spec must be enumerated explicitly with test fixtures** if we want to short-circuit discovery cost. The PR-180 spec mentioned "edge cases (empty rollup, mixed statuses, в WATCH STALLED case)" generically but did not provide concrete fixtures. Daemon discovered them through trial, costing 4 FIX iterations. For future REST/API replacement PRs, the task spec should include explicit fixture data for each edge case identified during the original API analysis. This converts a 4-cycle discovery into a 1-cycle implementation.
-
-3. **Autonomous merge worked correctly.** Daemon waited for 2 consecutive green CI runs (14:09 + 14:17) before merging at 14:25. This matches the N≥2 verification policy the operator and assistant established after OBS-AB sigkill resolution. The merge gate is functioning as designed.
-
-4. **GraphQL/CI quota cost of FIX iterations is real.** Each FIX cycle re-runs the full CI integration job (10 minutes) and consumes Claude tokens. PR-180's own purpose (reduce GraphQL burn) was paid for during convergence. Net win still positive — PR-180 in steady state saves much more than it cost during convergence — but worth recording the meta-cost so we know the price of underspecified task files.
-
-5. **The "quick merge despite flaky CI" advice would have been wrong here.** Assistant initially recommended "merge anyway, it is flaky" based on incomplete evidence. If operator had merged at run #9 (14:09 green), the merge would have succeeded but bypassed the verification rerun — which would have been okay in this specific case but would be wrong policy. Operator did the right thing waiting for daemon's second green confirmation.
-
-**Action items:**
-
-- For PR-191a/PR-191b (ETag — also REST/API surface) and PR-202 (WATCH adaptive polling — depends on PR-180): ensure task specs include explicit edge case fixtures derived from PR-180 lessons (stale history, partial fetch failure, empty signal interpretation).
-- No production fix needed; PR-180 is merged in correct final form.
-
-
-### OBS-AE: Coder opens PR for wrong task (observed 2026-04-29 evening)
-
-**Observed:** daemon picked task PR-182 (diagnose_error infra bypass) at 18:42. Coder ran, but the resulting PR was opened as **PR-183 (Redis pub/sub upload trigger)** on branch `pr-183-redis-pubsub-upload-trigger` as GitHub PR #248. Daemon correctly classified this as failure (diagnose_error: FIX → IDLE twice) and re-picked PR-182 at 19:05, on the second attempt coder opened the correct PR #249 on `pr-182-diagnose-error-infra-bypass` branch.
-
-**Root cause hypothesis:** coder has freedom to interpret which task to work on rather than receiving the exact task file path as a non-negotiable instruction. Several possible failure modes:
-
-1. Coder reads `QUEUE.md` itself and picks the next task by its own logic, not respecting daemon's selection.
-2. Coder receives task file path but ignores it under certain conditions (multiple TODO entries near top of QUEUE confuse it).
-3. Coder pattern-matches task content and decides to do "what looks easier" first.
-
-This is the same class of problem as Sprint F2.1 SoT (Source of Truth direct instructions) which is currently NOT STARTED. The current path lets coder participate in task selection; the fix is to make daemon authoritative and coder mechanical.
-
-**Side effect:** PR #248 became an orphan — open on GitHub, but daemon does not track it in state, no task file points to it, no FIX iterations happen on it. Codex did one review on it (COMMENTED) and nothing else moves forward. Manual operator action required to close or reassign.
-
-**Related observation:** at the same time as this happened, `tasks/PR-183.md` is NOT present on production server (`cat: tasks/PR-183.md: No such file or directory`). The task file may have been lost during a previous upload (transient git error during zip extraction, partial commit). This means even when coder eventually picks PR-183 by its own logic, it does not have a task spec to work from. **Two failures stacked:** lost task file AND coder pick-without-instruction freedom.
-
-**Action items proposed:**
-
-- **PR-205 (proposed):** Mandatory task_file injection into coder prompt. Daemon constructs the coder invocation with explicit `--task-file=<path>` argument. AGENTS.md adds a hard rule: "Coder MUST work only on the task at the given path. If the path is missing or unreadable, ESCALATE — never pick another task." This is a Sprint F2.1 building block — minimal version that closes the immediate hole without requiring the full SoT refactor.
-- **PR-206 (proposed):** Upload integrity verification — after upload commit, daemon verifies all listed task files in QUEUE.md exist on disk. If any missing, log error and surface to operator before daemon picks any next task. Closes the lost-task-file failure mode.
-
-**Lessons recorded:**
-
-1. **Coder freedom to interpret task selection is a critical bug surface.** Even though one bad outcome happened in 250+ PRs (low frequency), the consequence is significant — orphan PR, wasted Codex review cycle, operator confusion when investigating. Defense in depth needed: both task spec injection (PR-205 above) and post-upload verification (PR-206 above).
-2. **Symptom looked like daemon abandoned a task mid-flight, root cause was different.** Initial hypothesis was that daemon manually serialized only one PR at a time and lost track of the second. Reading logs carefully showed the actual sequence: coder created wrong PR, daemon recovered correctly, picked task again, second attempt succeeded. **Lesson: read the logs around the suspected event window before forming hypothesis from current state alone.**
-3. **Lost task file went undetected for hours.** Operator only noticed because they were debugging a different issue. Add proactive integrity check at upload time so this surfaces immediately, not via second-order observation.
-
-
-### OBS-AS: UI inconsistencies during onboarding (observed 2026-05-01)
-
-**Observed during sms-gateway-v2 onboarding test on dashboard:**
-
-1. **Repo card "initializing" state has both pulsing dot AND solid badge.** Two animated indicators side by side competing for attention. The dot pulses, the badge has a static color. Inconsistent visual language compared to other transient states (CODING, FIX, WATCH) which use a single pulsing badge.
-2. **Toast notifications dismiss too quickly.** After successful or failed upload, the confirmation/error note disappears before the operator can read it (~2-3 seconds vs the ~5-7 seconds typical for HTMX flash messages). On failure especially this is harmful — operator does not see what went wrong, has to retry to re-trigger the message.
-
-**Root cause hypothesis:**
-
-For (1): the "initializing" state likely was added later than the active states (CODING/FIX/WATCH) and inherited the dot indicator pattern from idle/paused states without removing it when the badge was added. Two design eras layered on top of each other.
-
-For (2): toast/note dismiss timing is probably hardcoded in the HTMX swap logic or in JS toast handler. Likely a single value used for all notifications regardless of severity. Should be configurable per-event-type or at minimum increased to 5-7 seconds for upload-result notifications.
-
-**Action items proposed (UI polish):**
-
-- **Polish PR (small):** Remove the pulsing dot from "initializing" state, keep only the pulsing badge. Match the visual language of other active states. ~5 LOC change in `src/web/templates/components/repo_cards.html` plus state_styles definition.
-- **Polish PR (small):** Increase toast dismiss timeout from current value to 7 seconds for upload-result notifications. Or surface a manual close button so operator can dismiss when they choose. ~10 LOC change in toast handler + CSS.
-
-Both can ship in a single Polish PR or split if scope grows. Type: ux. Complexity: low.
-
-**Strategic placement:** these are not blockers for the megaraid + sms-gateway onboarding test currently underway — operator can mentally filter the noise. Worth fixing before Foundation Sprint completes so the post-Foundation testing days have a cleaner UI to validate against.
-
-
-### OBS-AT: Successful multi-repo onboarding validation (observed 2026-05-01)
-
-**Positive observation, not a bug.** Recorded for future reference as a validation event spanning multiple production surfaces.
-
-**Closing assessment 2026-05-02 (next morning):** all 3 repos completed their sprints successfully. Pipeline-orchestrator Foundation Sprint progressing, megaraid-dashboard and sms-gateway-v2 finished their planned work without operator intervention beyond initial onboarding. **Operator overall assessment of multi-repo experience: very positive.** This is a substantive product validation point — not "the author got it to work" but "3 different repos with different stacks, different conventions, different sizes, all completed real work autonomously."
-
-**Setup:** operator added megaraid-dashboard and sms-gateway-v2 sequentially via UI after pre-onboarding MICRO PRs (manual `scripts/ci.sh` + `.gitignore` additions). Pipeline-orchestrator's own repo was already active. Total 3 managed repos in production simultaneously.
-
-**Outcome:** all 3 repos reached IDLE state without error. Daemon scaffolder ran on each external repo and committed only `scripts/make-review-artifacts.sh` (idempotent — operator's pre-existing `scripts/ci.sh` was not overwritten with stub). On-disk tasks/, artifacts/ directories created locally by scaffolder; gitignored entries (`tasks/QUEUE.md`, `artifacts/`) correctly excluded from commit. AGENTS.md reconciliation via `/onboarding/apply` appended daemon-managed sections without disturbing user content.
-
-**Production surfaces validated in single onboarding session:**
-
-1. **AGENTS.md reconciliation framework (PR-192a/b/c)** works on real external repos with pre-existing user-authored AGENTS.md content, not only on pipeline-orchestrator's self-AGENTS.md.
-2. **Scaffolder idempotency** works correctly — operator's MICRO-PR-shipped `scripts/ci.sh` was preserved (content hash differed from stub template, so daemon left it alone). `.gitignore` operator additions for `artifacts/` and `tasks/QUEUE.md` were preserved (already present, daemon's append step was no-op).
-3. **Multi-repo coordination (PR-207 parallel run_cycle)** validated in production — 3 active repos simultaneously in IDLE without one blocking another's poll cycle. Audit hypothesis (PR-193) confirmed: per-repo state isolation, slug computation, tasks/ paths, event log all properly scoped.
-4. **GraphQL diet (PR-180/PR-184/PR-191/PR-202)** holds at 3 active repos. No quota exhaust observable. The combination of REST check-runs + ETag conditional requests + adaptive WATCH polling + adaptive IDLE polling absorbs 3x repo load that would have blown a single-repo quota in 2026-04-28 timeframe.
-5. **Auth volume mounts** work across multiple repos with single shared credentials set (CLAUDE_CONFIG_DIR, GH_CONFIG_DIR, codex-auth volume). No per-repo auth duplication required.
-
-**Counter-intuitive learning for next operator/user:**
-
-Git does not track empty directories. After scaffolder runs, the on-disk repo at `/data/repos/<owner>__<name>/` has `tasks/`, `artifacts/`, `scripts/` directories — but only `scripts/make-review-artifacts.sh` becomes visible on GitHub (since it is the only new git-tracked file). The absence of `tasks/` in GitHub UI is correct behaviour, not a bug. Worth surfacing this in onboarding UI explicitly when wizard ships (PR-FUTURE-3) to prevent operator confusion.
-
-**Foundation Sprint readiness:** with 3 repos validated stable, Foundation Sprint (36 PR specs in `/mnt/user-data/outputs/foundation-tasks/`) can run safely on the now-multi-repo daemon. Foundation work will continue against pipeline-orchestrator while megaraid and sms-gateway sit idle waiting for their own task specs (separate session).
-
-### Reflection: bug discovery rate during first multi-repo session (2026-05-01 evening)
-
-In a single 4-hour evening session of running the orchestrator with 3 active repos for the first time, **5 production bugs** surfaced (OBS-AS, AU, AV, AW, AX, AY). This is **expected and healthy**, not a sign of system instability. Until 2026-05-01, pipeline-orchestrator had been single-repo (its own self) for its entire ~250 PR development history. Many code paths and UX behaviours that were "fine for the author working alone on the orchestrator's own repo" only reveal their assumptions when exposed to:
-
-1. Repos with non-trivial pre-existing CLAUDE.md content (OBS-AX root cause)
-2. Multiple cards on the dashboard creating cumulative load (OBS-AY backend slowness)
-3. User actively interacting with multiple repos in quick succession (OBS-AU spinner scoping)
-4. Different task vocabulary conventions from different operators (OBS-AV synonym gap)
-5. Non-recoverable state in one of N repos requiring per-repo intervention (OBS-AW HUNG button)
-
-Late-evening additions surfaced in continued production observation: OBS-AZ + OBS-BA (button/header layout inconsistencies), and OBS-BB (coder claims FIX done but does not push, triggering dirty-tree auto-reset).
-
-**Strategic implication:** these bugs are the *cost of multi-repo readiness*. Each one removes a barrier that would have surfaced as a confusing failure for the next operator (be it the author themselves, or alpha users). Discovering them now in the author's own validated environment is far cheaper than discovering them via alpha user feedback. Document them properly, sequence the fixes, and treat the discovery rate as a signal that the system is being exercised in genuinely new territory — not as a regression.
-
-**Pattern recognition — coder-freedom-bug class:** OBS-AE (coder picks wrong task), OBS-AX (coder ignores AGENTS.md when CLAUDE.md is too rich), and OBS-BB (coder claims fix done without pushing) are all rooted in the same architectural gap: coder receives ambiguous-or-incomplete instruction, makes a partial-or-wrong choice, exits 0, and daemon accepts the success signal at face value without validating post-conditions. Sprint F2.1 SoT (Source of Truth direct instructions) — currently NOT STARTED — is the long-term architectural fix for this class. Daemon should validate post-conditions (HEAD advanced, working tree clean, tests pass, branch matches expected, PR opened against expected file) before accepting any "done" signal from coder. Per-bug fixes (OBS-AX, OBS-BB) are tactical patches; Sprint F2.1 is the systemic solution. Reference for sequencing: do Wave 1-7 first (immediate operator-visible problems), then plan Sprint F2.1 as the larger architectural follow-up.
-
-**Tactical decision applied to current sprint:** Foundation Sprint (PR-208..PR-236, currently in progress on pipeline-orchestrator) **continues uninterrupted**. New OBS items are recorded for post-Foundation handling. Exception: **OBS-AX (CLAUDE.md scaffolder fix)** is a deal-breaker for any future operator, and ships as priority-1 inject if non-author onboarding is on near-term horizon. Otherwise it queues after Foundation completes alongside the other OBS-AU/AV/AW/AY fixes.
-
-### Closing reflection: разведка боем (reconnaissance by force) — 2026-05-01 retrospective
-
-**Operator's framing at end of session:** "Много чего нашли сегодня. Но нужно было сначала мультирепо тест, а потом в прод. Разведка боем." Translation: "Found lots today. But we should have done the multi-repo test first, then production. Reconnaissance by force."
-
-**This is correct retrospectively.** The session uncovered 11 OBS items (AR through BB) by running 3 repos in production for the first time. Several of these would have been caught much cheaper in a multi-repo test environment:
-
-- **OBS-AY** (`/api/states` slow at multi-repo scale): would surface immediately under `tests/e2e/multi/test_dashboard_scaling.py` with 5+ test repos.
-- **OBS-AU** (Uploading spinner scoping): would surface under `tests/e2e/multi/test_upload_visual_isolation.py` driving multiple concurrent uploads.
-- **OBS-AX** (scaffolder CLAUDE.md replacement): would surface in `tests/e2e/multi/test_onboarding_matrix.py` with varied pre-existing CLAUDE.md content fixtures.
-- **OBS-BB** (coder claims FIX done without push): would surface in any multi-PR FIX cycle test with post-condition validation assertions.
-
-**Why it happened anyway:** at the point of going multi-repo, the multi-testbed test infrastructure did not exist. Building it would have been 3-5 daemon-days of test-only work before getting to use the system on real external repos. The pull of "let me try megaraid + sms-gateway today" was stronger than the discipline of "let me build the test harness first." That impatience is normal for solo-developer product building, especially when production is itself the author's environment with low blast radius.
-
-**The cost of разведка боем was low this time:** all 11 bugs were observed in a 4-hour session, no data loss, no operator-blocking outage, daemons continued working through the bugs. Production validation event still succeeded (4 PRs done in the night across 3 repos). The bugs documented now make Wave 1-7 a clear post-Foundation roadmap. Multi-testbed (Wave 6-7) is itself one of those waves — the test-first investment happens, just after production told us what to test for.
-
-**The lesson for future major architectural shifts** (e.g. PR-FUTURE-7 QUEUE.md elimination, PR-FUTURE-3 onboarding wizard, intra-repo parallelism if revisited):
-
-1. Production is a valid validation venue **for the author**, accepting the 4-hour bug-discovery cost.
-2. Production is **not** a valid validation venue for non-author users — they will perceive the bugs as broken-product, not as "exciting findings."
-3. Before any non-author exposure (alpha users, public release), invest in regression test infrastructure for that surface area. Multi-testbed setup before alpha. Wizard test before public onboarding. Parallelism stress test before scaling claim.
-4. The pattern is: **author exposes new architecture in production → bugs surface → test infrastructure built to lock the fixes → external user exposure follows.** Skipping step 3 is what turns "разведка боем" into "alpha launch disaster."
-
-**Applied to current state:** post-Foundation Wave 1-5 fixes the bugs, Wave 6-7 builds the multi-testbed infrastructure. **Only after Wave 7 ships should the orchestrator be exposed to the first non-author alpha user.** This is the durable consequence of tonight's session.
-
-
-### OBS-AU: Uploading spinner appears on all repo cards during single repo upload (observed 2026-05-01)
-
-**Refined understanding (after multiple verification sessions):** spinner does NOT appear during normal HTMX poll cycles. Operator confirmed by direct observation that spinners are absent when no upload is in flight. The bug fires only during active upload processing.
-
-**Observed:** when operator uploads tasks to ONE repo (e.g. megaraid), the "Uploading..." spinner appears on **all 3 repo cards simultaneously** for the few seconds the backend takes to process the upload (validation + git stage + commit). After upload completes, spinners clear on all cards.
-
-**Two distinct problems stacked in one symptom:**
-
-A. **HTMX scoping leak (primary).** Form has `hx-indicator="#upload-indicator-{repo.name}"` which should scope the indicator to only the matching card. Yet spinner appears on all 3 cards. Either the selector resolution is broken, or HTMX adds `htmx-request` class to a parent element that all spinners look up to, or the CSS rule for `htmx-indicator` is too broad and matches all instances regardless of `hx-indicator` binding.
-
-B. **Form-disconnect race condition (secondary, less frequent).** Sometimes spinner sticks past upload completion. Browser console shows: `Form submission canceled because the form is not connected.` This happens when HTMX poll re-renders the cards while file picker is open — form element gets replaced mid-submission, browser cancels submission, HTMX never receives `afterRequest` event to clear `htmx-request` class. Self-resolves on next auto-poll cycle which re-renders without indicator state.
-
-**Browser console showed:** only the "Form submission canceled" warning during occasional sticks. No HTMX errors. No network errors.
-
-**Diagnostic still needed:**
-
-To distinguish whether problem A is "selector broken" vs "CSS rule too broad" vs "HTMX adds htmx-request to a shared ancestor":
-
-1. Open DevTools → Network tab → filter Fetch/XHR — BEFORE clicking upload.
-2. Click upload icon, select files.
-3. Capture Network tab during the upload (it lasts several seconds).
-4. Look for: how many XHR requests fire (one or many), what URLs (single repo or all), what timings.
-
-The findings determine which fix to apply.
-
-**Fix options (depending on which root cause):**
-
-1. **If selector resolution broken:** examine `hx-indicator` value at runtime via DevTools Elements inspector. Possibly Jinja escaping issue with `__` in repo names breaking selector.
-2. **If HTMX adds htmx-request to shared ancestor:** scope the upload form differently or add CSS rule to require `htmx-request` on the form itself, not on ancestors.
-3. **If CSS rule too broad:** add specificity: `.htmx-indicator[id^="upload-indicator-"]:not(.htmx-request *)` or similar.
-
-**For the secondary race condition (B):**
-
-1. **Decouple upload form from card fragment.** Move `<form>` element into a parent template that does not re-render on poll. Card body stays under poll, upload UI stays stable. Best long-term fix; requires template restructure.
-2. **Pause polling during user upload interaction.** JS event listener on upload icon click → temporarily disable HTMX poll triggers → resume after `change` event completes (success or cancel). Surgical fix, ~15 LOC JS.
-3. **Use morphdom swap** (`hx-swap="morph"` via the htmx-ext-morph extension). Swap with element identity preservation; form survives re-render even if content changes. Requires adding HTMX extension dependency.
-
-**Recommendation:** capture diagnostic first to confirm A's root cause before writing fix. Then ship combined fix for A+B as single polish PR.
-
-**Severity:** initially classified as rare. **Upgraded medium based on multi-repo observation:** with 3 active repos, the visual confusion happens on every upload. User-perspective framing: "web не справляется с мультирепо" — even though daemons run fine behind the spinner, the dashboard *appears* broken during normal upload operations.
-
-**Priority:** raised from "defer to PR-FUTURE-3 wizard" to **near-term polish PR.** Should ship within Foundation Sprint window or immediately after.
-
-**Type:** bugfix. **Complexity:** low-medium. **Estimated:** 1 PR after diagnostic captured, ~3 daemon-hours including investigation. Recommended fix for B: option 2 (pause polling during interaction, ~15 LOC JS). Fix for A depends on diagnostic.
-
+## Lessons learned (compacted from forensics, 2026-05-02)
+
+Compact appendix preserving actionable lessons from extended forensics that previously lived in deleted Active investigations + Work Modes blocks. Detailed post-mortems removed during 2026-05-02 cleanup; brief one-line entries in Active OBS items above retain status.
+
+### Test infrastructure
+- **Test fixture state pollution before architectural defects.** When test failure pattern looks like a state-machine bug but the symptom is reproducible only after specific test ordering, suspect test fixture state pollution first. Capture-and-read-actual-logs approach (stack-logs.txt) was decisive in OBS-AA root cause; without it, the architectural-fix hypothesis would have shipped without solving the actual problem.
+- **Prefer `docker compose exec -T <container> <cmd>`** over python clients connecting to discovered container IPs. Subprocess approach uses container's own network namespace and works identically from CI runner host and developer desktop. Python-from-host requires port mappings or `docker inspect` IP discovery, both fail in subtle ways.
+
+### Diagnostics under stress
+- **Check git log before declaring flaky.** Fix commits in the failure window mean deterministic failures, not flakiness. PR-180 self-healing convergence was 4 deterministic edge cases discovered sequentially, mistaken for transient noise initially.
+- **Enumerate edge cases with fixtures in task spec.** Avoids multi-cycle discovery in production. Each FIX cycle on edge case = ~30 min daemon time + token cost.
+- **Read full stdout before diagnosing.** Avoid speculation without data ("мы гадаем вместо того чтобы читать").
+
+### Architecture and deploy discipline
+- **Solve systemically, not with quick patches.** MICRO PRs that bypass full analysis create new problems. The PR-181 v1 attempt (host pytest connecting to internal docker IP) failed because of insufficient infrastructure analysis; v2 (container exec) shipped after fundamental rethink.
+- **Deploy immediately after architectural merges, not batched.** PR-181 (QUEUE.md untrack) had a 1-hour livelock window because deploy was delayed; stale production + fresh main = interaction bugs.
+- **Read file before writing patch in long debug sessions.** Cached snapshot drifts from user actual state; always re-read user current file before generating patches.
+
+### Production lessons (from 2026-04-28 session)
+- **Production config gap:** ~15 daemon overrides existed only as local file on production host, never committed. `git reset --hard` reverted them to upstream defaults. Production behavior not reproducible from git alone. PR-194 shipped overlay approach as fix.
+- **Deploy checkout vs daemon `/data/repos/.../tasks/` distinction:** daemon works with own clone in docker volume; deploy-time `~/pipeline-orchestrator/tasks/` may contain different file set. Don't conflate when investigating queue discrepancies.
+- **N>=3 verification reruns rule** for race condition fixes: one green CI run is not validation. Test could pass on lucky timing pre-fix. Require 3+ green reruns on same commit before merge.
+- **Single-step on stateful operations:** rebase, merge, deploy not in `&&` chains. Each command output reviewed before next.
+
+### Multi-repo discovery pattern (2026-05-01 session)
+- Author production testing on 3 repos uncovered 11 OBS items in 4 hours. Cost of "разведка боем" was low: no data loss, daemon kept working through bugs.
+- Pattern: author production → bugs surface → tests built → external user exposure. Multi-testbed test infrastructure (Sprint 16) ships before any non-author alpha user is exposed.
+- Multi-repo coordination, GraphQL diet headroom, shared auth volumes all validated by this session.
+
+### Codex review behaviour (recorded for awareness)
+- Codex reviews are non-deterministic on identical code: EYES → CHANGES_REQUESTED → APPROVED → CHANGES_REQUESTED transitions happen without any push between them. Operator's deliberate choice (2026-05-02): keep this behaviour because intermediate codex comments often catch missed details. Pre-merge sync re-trigger in `merge.py:170-195` provides defense-in-depth against approval-on-stale-HEAD.
+- EYES race window: dual-trigger (codex auto-trigger + daemon `@codex review` post) sometimes causes EYES-stuck state. PR-189 shipped pre-push state check + EYES-specific stale threshold mitigations.
 
 ## Architectural future work — multi-repo + per-repo config (added 2026-05-01)
 
@@ -2004,21 +1481,54 @@ Each operator using pipeline-orchestrator brings their own Claude account, used 
 2. Multi-testbed harness is built on top of stable scaffolder (OBS-AX fix in place — CLAUDE.md replacement) so every new testbed onboards correctly.
 3. Backend `/api/states` performance gate (`< 1 second for 10 repos`) only makes sense after OBS-AY backend fixes; otherwise tests would just confirm the known slowness.
 
-**Order of execution (post-Foundation):**
+**Order of execution (post-Sprint 12 / post-Foundation):**
 
 ```
-Wave 1 (critical):    OBS-AX scaffolder CLAUDE.md replace      (1 PR,  ~2h)
-Wave 2 (performance): OBS-AY setInterval cleanup + /api/states (2-3 PRs, ~5h)
-Wave 3 (UX polish):   OBS-AU spinner + OBS-AS initializing/toast + OBS-AZ + OBS-BA layout (3-4 PRs, ~5h)
-Wave 4 (vocabulary):  OBS-AV synonyms + atomic upload          (3 PRs,  ~5h)
-Wave 5 (recovery):    OBS-AW HUNG button + OBS-BB FIX-no-push  (3-4 PRs, ~6h)
+Sprint 13 (external onboarding readiness + UI scaling + license switch):
+  - OBS-AX scaffolder CLAUDE.md replace      (1 PR,  ~2h)
+  - OBS-AY setInterval cleanup + /api/states (2-3 PRs, ~5h)
+  - License switch MIT to Apache 2.0         (1 PR,  ~1h)  NEW 2026-05-02
+  Total: 4-5 PRs, ~8 daemon-hours
+  License task is mechanical (replace LICENSE file content, add NOTICE,
+  update pyproject.toml license field). Operator confirmed ASAP 2026-05-02.
+  Independent of OBS-AX and OBS-AY; can ship in parallel within sprint.
 
-Then multi-testbed infrastructure:
-Wave 6 (test harness): provisioning + conftest + base patterns (2-3 PRs, ~5h)
-Wave 7 (tests):        one PR per multi-repo test scenario      (5+ PRs, ~10h)
+Sprint 14 (recovery + cancellation policy, REORDERED EARLIER 2026-05-02, EXPANDED with BK/BL/BM):
+  - OBS-AW HUNG button                       (~2h)
+  - OBS-BB FIX-no-push                       (~2h)
+  - OBS-BC CI infra-failure classification   (~5h)
+  - OBS-BE expanded cause preservation       (~7h)
+  - Cancellation policy v1                   (~9h)
+  - OBS-BK elif chain ordering fix           (~3h)  NEW 2026-05-02
+  - OBS-BL WATCH↔HUNG circuit breaker        (~3h)  NEW 2026-05-02
+  - OBS-BM CI stuck PENDING classification   (~5h)  NEW 2026-05-02
+  Total: 9-11 PRs, ~27 daemon-hours
+  Reordering rationale: 2026-05-02 production session demonstrated 4-hour
+  hang on PR-227c due to interaction of OBS-BK (elif blocks FIX trigger),
+  OBS-BL (no circuit breaker on retry loop), and OBS-BM (CI concurrency-lock
+  stuck not classified). All three combined with absent Cancellation policy
+  caused ~10 PR throughput loss. Sprint 14 now ships the full recovery suite
+  to prevent this class of incident across all four trigger paths.
+
+Sprint 15 (UX polish + vocabulary + DONE metrics):
+  - OBS-AU spinner + OBS-AS toast/initializing
+    + OBS-AZ + OBS-BA layout                 (3-4 PRs, ~5h)
+  - OBS-AV synonyms + atomic upload + OBS-BF (3 PRs,  ~5h)
+  - OBS-BD label create idempotency          (~1h)
+  - OBS-BH event log badge text dedup        (~1-2h)  NEW 2026-05-02
+  - OBS-BI per-PR metrics in DONE row (Path A locked) (~3h)  NEW 2026-05-02
+  - OBS-BJ DONE list newest-first sort       (~1-2h)  NEW 2026-05-02
+  Total: 7-9 PRs, ~17-19 daemon-hours
+
+Sprint 16 (multi-testbed test infrastructure):
+  - Provisioning + conftest + base patterns  (2-3 PRs, ~5h)
+  - One PR per multi-repo test scenario      (5+ PRs, ~10h)
+  Total: 7+ PRs, ~15 daemon-hours
+
+Sprint 17+ (Vision A multi-vendor first slice): TBD pending strategic decision.
 ```
 
-**Total post-Foundation: ~17-21 PRs, ~35 daemon-hours, ~2 daemon-days** at 17 PR/day throughput.
+**Total Sprint 13-16: ~23-27 PRs, ~51-56 daemon-hours, ~2-3 daemon-days** at 25-30 PR/day throughput. Calendar 1.5-2 weeks with sustainable pace.
 
 **Current testbed:** `tests/e2e/lib/coder_shim.sh` mocks Claude/Codex CLIs, drives a single testbed repo (`AlexBomber12/pipeline-orchestrator-testbed`) for e2e tests covering upload, merge, fix-escalate, redis recovery, sigkill recovery, stop/resume. All e2e tests are **single-repo**.
 
@@ -2639,22 +2149,28 @@ These workarounds are operator-time-intensive and do not scale to non-author use
 
 ---
 
-## Известные риски и осторожности
+## Известные риски и осторожности (current Sprint 13/14, refreshed 2026-05-02)
 
-### Sprint F2.2 (PAUSED state model refactor) — самый высокий риск
-4 sequential PR (PR-170/171/172/173). Migration script для existing Redis states требуется. Backward compatibility window для production restart. Не делать одновременно с другими Sprint. Минимум один 1-day отдельный sprint с only this work.
+### Sprint 13 - OBS-AY UI freeze fix (highest risk in batch)
+Two stacked bugs: setInterval leak in `base.html` (frontend) + slow `/api/states` endpoint with sync `load_config` and sequential per-repo Redis reads (backend). Fix B (backend) requires careful coordination: caching config asynchronously, parallelizing per-repo Redis reads via `asyncio.gather`, optionally short-TTL response cache. Risk: introducing concurrency bugs in `get_all_repo_states` while removing sync I/O. Mitigation: incremental PRs, Fix A first (frontend cleanup, ~3 LOC stops the bleeding), Fix B second with regression test against pre-fix scenario (5+ repos, 6+ navigations).
 
-### PR-180 (REST replacement) — средний риск
-`statusCheckRollup` GraphQL response shape отличается от REST `check-runs` + `status`. Mapping function требует тщательного тестирования edge cases (empty rollup, mixed statuses, в WATCH STALLED case). Нужны unit tests + integration test перебор.
+### Sprint 14 - Cancellation policy v1 (highest architectural surface)
+New `SignalSource` Protocol introduces extension point that future plugins (companion app, calendar, webhooks) will hook into. v1 design must not lock-in assumptions that prevent future sources. Risk: shipping v1 with implicit assumption that breaks at second SignalSource. Mitigation: design Protocol against the 3 known sources (manual override, heartbeat, active hours) plus 2 hypothetical (companion app, calendar) before locking signature.
 
-### PR-183/PR-184 (pub/sub + adaptive polling) — средний риск
-Race conditions: upload event arrives while daemon mid-cycle; multiple uploads quick succession (dedup); upload during rate limit pause; wake during stop cancellation (graceful). Тесты должны cover все четыре scenario.
+### Sprint 14 - OBS-BK elif chain ordering fix
+Reordering elif chain in `watch.py:180-189` so review-driven FIX runs independent of CI state. Risk: regress on freshly-opened-PR scenario (CI hasn't started AND review CHANGES_REQUESTED - should NOT trigger FIX, since review is on no-CI state). Existing `_has_new_codex_feedback_since_last_push()` handles this, but reordering without testing it explicitly may break. Mitigation: regression test for "fresh PR + CHANGES_REQUESTED + CI=PENDING" should NOT trigger FIX; "stale PR + CHANGES_REQUESTED + CI=PENDING + new feedback" SHOULD trigger FIX.
 
-### PR-192 (existing AGENTS.md reconciliation) — низкий риск
-Section-marker append pattern conservative. Возможен edge case: user manually deletes daemon-managed section, daemon re-adds на next cycle, looks like nagging. Mitigation: log warning, не silent re-add.
+### Sprint 14 - OBS-BL circuit breaker on WATCH↔HUNG loop
+N=3 default; but operator may want different cap per scenario. Risk: cap too low traps benign slow-codex cases; cap too high allows extended waste. Mitigation: configurable `escalation_loop_cap` field, sensible default (3), telemetry counter for "escalation circuit breaker tripped" events to validate threshold post-ship.
 
-### Multi-repo onboarding (overall)
-GraphQL quota distribution across repos критична. Без PR-180 + PR-191 second repo может exhaust budget within hours. Defer onboarding until critical batch shipped.
+### Sprint 14 - OBS-BM CI stuck-PENDING classification
+Classification heuristic depends on GHA API response shape; vendors change response format occasionally. Risk: classifier silently fails when GHA changes shape. Mitigation: defensive parsing with fallback to "unclassified PENDING" category; alert event when classifier hits unknown shape.
+
+### Sprint 14 - Multi-OBS coordination (9-11 PRs in one sprint)
+Sprint 14 is the largest sprint planned (27 daemon-hours, 9-11 PRs). Risk: dependency graph between OBS-AW, OBS-BB, OBS-BC, OBS-BE, OBS-BK, OBS-BL, OBS-BM, Cancellation policy creates serialization that throughput cannot collapse. Mitigation: batch parallelization plan in sprint spec generation; identify which OBS items can ship independently; ship OBS-BK + OBS-BL + OBS-BM (the recovery primitives) before Cancellation policy v1 (which consumes them as substrate).
+
+### Sprint 13 - License switch MIT to Apache 2.0
+Mechanical change. Risk: deps or contributors with explicit MIT-only constraints (none expected, all upstream deps likely Apache/MIT/BSD compatible). Mitigation: scan all upstream dependencies for license incompatibility (Apache 2.0 compatible with MIT/BSD/Apache, not GPL); coordinate before switch. ~1 PR, ~1h: replace LICENSE file content, update `pyproject.toml` license field, add NOTICE file (Apache 2.0 convention), update README badge if any. Daemon-eligible spec.
 
 ---
 
@@ -2663,20 +2179,11 @@ GraphQL quota distribution across repos критична. Без PR-180 + PR-191
 ### Как обновлять roadmap
 
 После каждой merged волны или significant chat-session:
-1. Update "Последнее обновление" header.
-2. Move just-shipped PRs из "Implementation Plan" в "Implementation Audit summary" с DONE status.
-3. Add new observations к "Active investigations" если есть.
-4. If sprint shifted in priority — move между "Critical / Important / Multi-repo / Polish / Deferred" batches.
-5. Don not introduce new PR numbering без проверки on conflicts с tasks/PR-XXX.md actual files.
-
-### Numbering discipline
-
-- **PR-001..PR-179:** completed work. Frozen numbering.
-- **PR-180..PR-199:** active backlog batches от 2026-04-29 audit (Critical / Important / Multi-repo / Polish).
-- **PR-200..PR-204:** task-validation synonyms + dashboard UI consistency + WATCH adaptive polling + compact resource limits row + outcome logging (added 2026-04-29 evening).
-- **PR-204+:** future work — sprint-scale items deferred (GitHub App migration, Thompson Sampling, PAUSED removal, manifest flow, resource limit history charts pending storage decision, JSONL → SQLite analytics migration when scale demands).
-
-Verify free numbers перед creating new task files: `ls tasks/PR-XXX.md` + `grep PR-XXX docs/roadmap.md`.
+1. Update "Последнее обновление" header with date + summary of changes.
+2. Move just-shipped PRs из active sprint sections в Active OBS items с CLOSED status.
+3. Add new OBS items observed during session.
+4. Refresh sprint estimates if scope changed.
+5. Verify task numbering is continuous (no reservation per established rule 2026-04-29).
 
 ### Daemon vs deploy-time tasks/
 
@@ -2684,22 +2191,34 @@ Daemon работает из `/data/repos/<slug>/tasks/` (docker volume). Deploy
 
 ---
 
-## Открытые вопросы ждущие решения
+## Открытые вопросы ждущие решения (refreshed 2026-05-02)
 
-### Next session priorities (after 2026-04-29 audit)
+### Strategic decisions confirmed today (2026-05-02)
 
-1. **Start Critical batch (PR-180..PR-185).** Я генерирую 6 task files в одном блоке когда скажешь.
-2. **OBS-16 ENV-TOKEN verification.** Manual run `docker compose up -d --force-recreate daemon`, check `GITHUB_TOKEN` visibility. Не PR, operational task.
-3. **OBS-Y status verification.** "Daemon merges PR before formal APPROVED state" — нужно current behavior проверить и закрыть либо как DONE либо как actionable PR.
+- **License Apache 2.0 - CONFIRMED, ASAP, scheduled Sprint 13.** Current LICENSE is MIT (not AGPL as memory implied). Action: replace with Apache 2.0 + NOTICE file. ~1 PR ~1h. Added to Sprint 13 batch alongside OBS-AX and OBS-AY (operator decision 2026-05-02).
+- **Vision A timing CONFIRMED:** Sprint 17+ after Sprint 16 multi-testbed. Plugin Protocol generalization is prerequisite for Thompson Sampling and managed product fork.
+- **SQLite Scenario A migration BEFORE Thompson Sampling.** Long-term posterior stability requires not 90-day TTL. Sprint slot: between Vision A first slice and Thompson Sampling work, likely Sprint 18-19 territory.
+- **PR-FUTURE-7 (eliminate QUEUE.md) CONFIRMED.** In-memory queue model. Sprint slot: post-Sprint 16, parallel-eligible with Vision A first slice if scope permits.
+- **PR-FUTURE-4 tier'ed scaffolder** AFTER Sprint 13 OBS-AX (CLAUDE.md replace fix). Likely Sprint 16-17 territory.
 
-### Still open architectural decisions
+### Strategic decisions deferred (Vision tier, not actioning soon)
 
-- **GitHub App migration timing.** Wait для GraphQL diet effectiveness data (after PR-180/PR-191) или start App migration параллельно? Risk: App migration sprint-scale, может block other work.
-- **Production config discipline.** PR-194 outline `config.production.yml` overlay, но возможны другие подходы (env vars only, secrets in vault). Decision needed before PR-194 task file generated.
-- **Multi-tier agent (Tier 2).** Roadmap section ниже describes architectural direction. Когда start? After all critical+important+multi-repo PRs ship? Or earlier as separate exploration sprint?
+- **Monetization model** (hybrid C + opt-in D). 6-12 months horizon. Recorded as Vision direction, no sprint commitment.
+- **Self-hosted vs Managed product fork.** Recorded as Vision direction tied to Vision A multi-vendor work; not actioning until plugin Protocol shipped.
+- **GitHub App migration timing.** Diet PRs reduced GraphQL burn substantially; even at 3 active repos operator observed below 80% utilization. App created (`alexbomber-pipeline-orchestrator`, scopes Contents/Issues/Metadata/PR R+W, "Only on this account") but private key still pending download. Activation deferred indefinitely; revisit only if quota exhaustion returns OR third-party adoption becomes relevant.
+- **Multi-tier agent (Tier 2 architect/diagnostic).** Recorded as Vision direction, not actioning soon (see Vision section).
+- **Tester role / Release Qualification Agent.** Vision item, not actioning.
+- **Telegram bot Vision D D.1 (digest push).** Operator confirmed Sprint 17+ slot, not opportunistic earlier.
 
-### Resolved decisions (2026-04-28..29)
+### New questions arising during cleanup (2026-05-02)
 
-- **Sigkill multi-race resolution path** -> 4 PRs merged (228, 232, 234, 236). Done.
-- **Roadmap rewrite** -> executed 2026-04-29 на основе audit. This document.
-- **PR numbering for new backlog** -> continues from PR-180 (next free после PR-179 DONE). Legacy roadmap reservations dropped — task files are source of truth, not roadmap-side numbering.
+- **Does Codex Connector's behaviour have observable patterns** beyond what OBS-Z (EYES race) and pre-merge sync re-trigger covered? Operator confirmed (2026-05-02) that codex non-determinism is acceptable as-is, no new fix work scheduled. Recorded for awareness only.
+- **Lessons learned appendix (line 872) - single source of truth or redundant with Active OBS items?** Currently both exist: brief one-liners in Active OBS items (line 90+) plus consolidated lessons in appendix. Decision deferred; revisit if appendix grows or contradicts Active OBS items.
+
+### Resolved decisions (closing entries from prior sessions)
+
+- **Sprint nomenclature:** unified 2026-05-02. Sprint 12 = Foundation, 13 = OBS-AX + OBS-AY, 14 = recovery + cancellation, 15 = polish + DONE metrics, 16 = multi-testbed, 17+ = Vision A.
+- **Sigkill multi-race resolution path** → 4 PRs merged 2026-04-28 via direct commits (legacy numbering, predates current task-file numbering). Closed.
+- **Roadmap rewrite** → executed 2026-04-29 + cleanup 2026-05-02. Latest version (this document).
+- **PR numbering rule** → continuous, no reservation. Established 2026-04-29.
+- **Throughput baseline** → 25-30 PR/day (corrected from earlier 15-20 estimate). Recorded 2026-05-02.
