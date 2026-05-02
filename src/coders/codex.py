@@ -164,6 +164,10 @@ class CodexPlugin:
     def rate_limit_patterns(self) -> list[re.Pattern[str]]:
         return [_CODEX_RETRY_PATTERN, _CODEX_USAGE_LIMIT_PATTERN]
 
+    @property
+    def supports_breach_lifecycle(self) -> bool:
+        return False
+
     async def diagnose_error(
         self,
         repo_path: str,

@@ -6739,6 +6739,8 @@ def test_handle_coding_runs_three_retries_before_diagnostic(
     monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
 
     class _CodexPlugin:
+        supports_breach_lifecycle = False
+
         async def run_planned_pr(
             self, path: str, **kwargs: object
         ) -> tuple[int, str, str]:

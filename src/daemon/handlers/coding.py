@@ -111,7 +111,7 @@ class CodingMixin:
             "timeout": self.app_config.daemon.planned_pr_timeout_sec,
             "on_process_start": self._track_current_coder_process,
         }
-        if coder_name == "claude":
+        if plugin.supports_breach_lifecycle:
             coder_kwargs.update(
                 breach_dir=breach_dir,
                 breach_run_id=breach_run_id,
@@ -125,7 +125,7 @@ class CodingMixin:
             )
         )
         breach_monitor: asyncio.Task[None] | None = None
-        if coder_name == "claude":
+        if plugin.supports_breach_lifecycle:
             breach_monitor = asyncio.create_task(
                 self._monitor_inflight_breach(
                     breach_dir, breach_run_id, cli_task, breach_flag,
@@ -184,7 +184,7 @@ class CodingMixin:
                 breach_monitor.cancel()
             heartbeat.cancel()
             self._current_coder_process = None
-            if coder_name == "claude":
+            if plugin.supports_breach_lifecycle:
                 self._check_late_breach(breach_dir, breach_run_id, breach_flag)
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
         if breach_flag["breached"]:

@@ -41,6 +41,17 @@ class CoderPlugin(Protocol):
 
     def rate_limit_patterns(self) -> list[re.Pattern[str]]: ...
 
+    @property
+    def supports_breach_lifecycle(self) -> bool:
+        """True if the plugin honors breach detection.
+
+        Anthropic CLI emits breach signals on stderr when usage hits
+        configured thresholds. Other coders may not have this concept
+        and return False here. Handlers check this property before
+        wiring breach monitors.
+        """
+        ...
+
     async def diagnose_error(
         self,
         repo_path: str,
