@@ -1272,8 +1272,14 @@ def test_committed_config_yml_uses_production_defaults() -> None:
     values. Loss of `usage_api_beta_header` on 2026-05-01 is the cautionary
     tale — divergence between upstream defaults and the operator's running
     daemon caused an outage on a routine deploy.
+
+    Reads the raw committed YAML and validates it against ``AppConfig``
+    directly. ``load_config`` would deep-merge a sibling
+    ``config.production.yml`` overlay and apply ``PO_*`` env overrides,
+    which makes the assertion non-hermetic on developer/ops machines.
     """
-    cfg = load_config("config.yml")
+    raw = config_module._load_config_raw("config.yml")
+    cfg = AppConfig.model_validate(raw)
 
     assert cfg.daemon.review_timeout_min == 20
     assert cfg.daemon.planned_pr_timeout_sec == 3600
