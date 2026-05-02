@@ -10,11 +10,22 @@
     </a>
 </div>
 
-{# Only the summary block is inside the 5s polling container. The event
-   log lives outside so HTMX cannot wipe it from the DOM when the
-   summary refreshes — it self-polls via /partials/repo/{name}/events
-   with the active filter carried in hx-vals. #}
-<div hx-get="/partials/repo/{{ repo.name }}" hx-trigger="every 5s" hx-swap="innerHTML">
+{# Summary refreshes on SSE state_change AND history_updated; the latter
+   carries pause/resume/stop mutations of repo.user_paused (which the
+   play/pause/stop controls depend on) when state.state itself does not
+   transition. The event log lives outside this container so its DOM
+   (and scroll position) is preserved when the summary swaps. The badge
+   now runs its pulse animation between state transitions instead of
+   restarting every 5s, fixing OBS-AM.
+
+   Keep `every 30s` alongside SSE: the "Rate limited — paused, Xm
+   remaining" line is derived from server `utcnow()` and ticks down
+   with wall-clock time even when no state/history event fires, so a
+   long PAUSED stretch would otherwise leave the countdown stale until
+   the next transition. #}
+<div hx-get="/partials/repo/{{ repo.name }}"
+     hx-trigger="load, repo:state_change from:body, repo:history_updated from:body, every 30s"
+     hx-swap="innerHTML">
     {% include "components/repo_summary.html" %}
 </div>
 
@@ -34,9 +45,148 @@
     <summary class="secondary-interactive text-sm text-gray-400 cursor-pointer">
         Coder log
     </summary>
+    {# Keep the periodic poll alongside SSE: state_change fires only on
+       transitions, but coder stdout grows continuously during long
+       CODING/WATCH stretches where state.state stays constant, so
+       without `every 30s` the panel can sit stale for many minutes
+       even while the log is actively appending. #}
     <div hx-get="/partials/repo/{{ repo.name }}/cli-log"
-         hx-trigger="revealed, every 30s"
+         hx-trigger="revealed, repo:state_change from:body, every 30s"
          hx-swap="innerHTML">
     </div>
 </details>
+
+<script>
+    (function () {
+        if (window.repoDetailSSEConnection) {
+            return;
+        }
+        const repoName = {{ repo.name | tojson }};
+        const BASE_DELAY_MS = 1000;
+        const MAX_DELAY_MS = 10000;
+        const SEEN_KEYS_LIMIT = 200;
+        // pageRenderedAtMs is the server-side instant this HTML was
+        // rendered (delivered via the page_rendered_at template var).
+        // Events with timestamps before it are already reflected in the
+        // server-rendered summary, so re-firing HTMX would only cause
+        // redundant /partials/repo/<name>* fetches. Events at or after
+        // it — even those still in the SSE replay batch, which covers
+        // the gap between page render and SSE subscription — represent
+        // fresh updates and must trigger HTMX. Keying suppression to a
+        // server-provided cutoff (not a client wall-clock) prevents
+        // skew from dropping legitimate live events.
+        const pageRenderedAt = {{ page_rendered_at | tojson }};
+        const pageRenderedAtMs = Date.parse(pageRenderedAt);
+        const seenKeys = new Set();
+        const seenOrder = [];
+        let delayMs = BASE_DELAY_MS;
+        let timer = null;
+        let source = null;
+        const RELAYED_EVENTS = [
+            'state_change',
+            'event_log_append',
+            'history_updated',
+            'pr_metrics_update',
+        ];
+
+        function rememberSeen(key) {
+            if (seenKeys.has(key)) {
+                return false;
+            }
+            seenKeys.add(key);
+            seenOrder.push(key);
+            if (seenOrder.length > SEEN_KEYS_LIMIT) {
+                const evicted = seenOrder.shift();
+                seenKeys.delete(evicted);
+            }
+            return true;
+        }
+
+        function isReplayedFrame(payload) {
+            // An event is "replayed" (already reflected in the rendered
+            // HTML) iff its server timestamp predates pageRenderedAtMs.
+            // Frames without a parseable timestamp default to fresh so
+            // the gap between page render and SSE subscription cannot
+            // silently drop legitimate live updates.
+            if (!Number.isFinite(pageRenderedAtMs)) {
+                return false;
+            }
+            if (!payload || typeof payload.timestamp !== 'string') {
+                return false;
+            }
+            const eventTime = Date.parse(payload.timestamp);
+            if (!Number.isFinite(eventTime)) {
+                return false;
+            }
+            return eventTime < pageRenderedAtMs;
+        }
+
+        function scheduleReconnect() {
+            if (timer) {
+                window.clearTimeout(timer);
+            }
+            const delay = Math.min(delayMs, MAX_DELAY_MS);
+            timer = window.setTimeout(function () {
+                timer = null;
+                connect();
+            }, delay);
+            delayMs = Math.min(delay * 2, MAX_DELAY_MS);
+        }
+
+        function connect() {
+            if (source) {
+                source.close();
+            }
+            // Capture the stream this closure owns so late callbacks
+            // (especially `onerror` from a previous EventSource that
+            // errored after `connect()` ran again) cannot close a
+            // newer connection. Without this guard a stale error
+            // would force an unnecessary reconnect and could drop or
+            // delay live SSE updates for this repo.
+            const stream = new EventSource('/api/repos/' + encodeURIComponent(repoName) + '/events');
+            source = stream;
+            stream.onopen = function () {
+                delayMs = BASE_DELAY_MS;
+            };
+            RELAYED_EVENTS.forEach(function (eventName) {
+                stream.addEventListener(eventName, function (event) {
+                    let payload = null;
+                    try {
+                        payload = event && event.data ? JSON.parse(event.data) : null;
+                    } catch (_error) {
+                        payload = null;
+                    }
+                    if (payload && typeof payload.timestamp === 'string') {
+                        const key = eventName + '|' + payload.timestamp;
+                        // Dedup across reconnects: stream_repo_events
+                        // re-emits up to HISTORY_REPLAY_LIMIT entries on
+                        // each connect, and triggering HTMX for already-
+                        // seen ones would burst /partials/* fetches.
+                        if (!rememberSeen(key)) {
+                            return;
+                        }
+                    }
+                    if (isReplayedFrame(payload)) {
+                        return;
+                    }
+                    if (window.htmx) {
+                        window.htmx.trigger(document.body, 'repo:' + eventName);
+                    }
+                    delayMs = BASE_DELAY_MS;
+                });
+            });
+            stream.onerror = function () {
+                if (source !== stream) {
+                    return;
+                }
+                stream.close();
+                source = null;
+                scheduleReconnect();
+            };
+        }
+
+        window.repoDetailSSEConnection = {connect: connect};
+        connect();
+    })();
+</script>
 {% endblock %}

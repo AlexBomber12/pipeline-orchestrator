@@ -241,7 +241,8 @@ def test_handle_idle_publishes_progress_update_only_for_new_counts(
     runner._set_queue_progress(1, 2)
     asyncio.run(runner.publish_state())
 
-    assert published == [
+    progress_events = [event for event in published if event[1] == "progress_updated"]
+    assert progress_events == [
         (
             runner.name,
             "progress_updated",

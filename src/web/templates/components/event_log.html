@@ -1,23 +1,29 @@
 {# Top-level event log rendered on the full repo detail page.
 
-   The wrapper div below is the swap target for the 5s poll of
+   The wrapper div below is the swap target for SSE-driven refreshes of
    /partials/repo/{name}/events. Its innerHTML is replaced with the
    rendered event_list.html fragment, so the wrapper itself (and its
-   scroll position) is preserved across ticks. #}
+   scroll position) is preserved across swaps.
+
+   `every 30s` runs alongside the SSE triggers as a fallback for the
+   case where /api/repos/{name}/events is unavailable (e.g., Redis
+   outage returns 503 from the SSE route) or the EventSource cannot
+   connect. Without it the log would stop updating indefinitely while
+   state.history continues to change. #}
 <section id="repo-event-log" class="rounded-lg border border-white/5 bg-surface-2 p-5">
     <div class="flex items-center gap-3 mb-3">
         <h3 class="text-sm font-semibold text-gray-300">Event log</h3>
         {# ID matches the hx-swap-oob="true" span emitted by
            event_list.html when served from /partials/repo/{name}/events
-           so the 5s poll refreshes the count alongside the list
-           instead of leaving the initial render's value stale. #}
+           so each refresh updates the count alongside the list instead
+           of leaving the initial render's value stale. #}
         <span id="event-log-count-{{ repo.name }}"
               class="font-mono text-xs text-gray-500">{{ events|length }} events</span>
     </div>
     <div id="event-list-wrapper-{{ repo.name }}"
          class="max-h-96 overflow-y-auto"
          hx-get="/partials/repo/{{ repo.name }}/events"
-         hx-trigger="every 5s"
+         hx-trigger="repo:event_log_append from:body, repo:history_updated from:body, every 30s"
          hx-swap="innerHTML"
          hx-on::before-swap="this._scrollPos = this.scrollTop"
          hx-on::after-swap="this.scrollTop = this._scrollPos">

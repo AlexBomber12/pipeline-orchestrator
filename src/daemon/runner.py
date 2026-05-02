@@ -266,6 +266,10 @@ class PipelineRunner(
         self._last_codex_review_head_sha: str | None = None
         self._queue_progress_dirty = False
         self._last_published_queue_progress: tuple[int, int] | None = None
+        self._last_published_state_signature: (
+            tuple[str, tuple, tuple] | None
+        ) = None
+        self._pending_event_log_entries: list[dict[str, object]] = []
         self._usage_degraded_logged = False
         self._claude_usage_provider = claude_usage_provider
         self._codex_usage_provider = codex_usage_provider
@@ -727,6 +731,126 @@ class PipelineRunner(
         self._last_published_queue_progress = progress
         self._queue_progress_dirty = False
 
+    def _summary_pr_signature(self) -> tuple:
+        """Return the visible PR fingerprint shown in the repo summary.
+
+        Captures the fields that ``handle_watch`` mutates while the
+        runner stays in WATCH for many cycles (CI conclusion, review
+        status, push and commit counters, plus the PR identity used in
+        the header). Without including these, the dashboard summary
+        would only refresh on ``state.state`` transitions and operator
+        history events — leaving CI/review status visibly stale until
+        an unrelated transition or a manual reload.
+        """
+        pr = self.state.current_pr
+        if pr is None:
+            return ()
+        return (
+            pr.number,
+            pr.branch,
+            pr.ci_status.value,
+            pr.review_status.value,
+            pr.push_count,
+            pr.commits_count,
+        )
+
+    async def _publish_state_change_if_needed(self) -> None:
+        """Publish a state_change event when the visible repo state changes.
+
+        Drives SSE-driven dashboard refreshes; replaces the legacy 5s
+        repo-summary poll that caused the OBS-AM badge stutter. Beyond
+        ``state.state`` itself this also fires when the visible PR
+        metadata (CI conclusion, review status, push/commit counters)
+        changes — those mutate inside ``handle_watch`` while the runner
+        stays in WATCH for many cycles, and without a publish here the
+        summary card would stay stale until a state transition or an
+        unrelated history event arrived. The signature also tracks the
+        coder usage fields (session/weekly percent, API degraded flag)
+        rendered in the summary's rate-limit badge — ``publish_state``
+        refreshes them every cycle, so without inclusion here the
+        badges would stay stale through long WATCH/IDLE stretches with
+        an unchanged PR signature until an unrelated transition fired.
+
+        The published payload mirrors what ``_serialize_latest_state``
+        writes to Redis: inactive repos surface as ``IDLE`` regardless
+        of ``self.state.state`` so SSE-only views (repo.html) reflect
+        the deactivation immediately instead of staying on the last
+        live state until a manual reload.
+        """
+        if self.repo_config.active:
+            current_state = self.state.state.value
+        else:
+            current_state = PipelineState.IDLE.value
+        usage_signature = (
+            self.state.usage_session_percent,
+            self.state.usage_weekly_percent,
+            self.state.usage_api_degraded,
+        )
+        signature = (
+            current_state,
+            self._summary_pr_signature(),
+            usage_signature,
+        )
+        if signature == self._last_published_state_signature:
+            return
+        # SSE notification is best-effort: a Redis pub/sub or list-op
+        # failure here must not abort ``publish_state``. The authoritative
+        # state was already persisted above, and re-raising would short-
+        # circuit ``_publish_pending_event_log_entries`` plus stall the
+        # runner cycle on every transient pub/sub blip. Leaving the
+        # signature unchanged on failure means the next cycle retries
+        # automatically while it still differs.
+        try:
+            await publish_repo_event(
+                self.name,
+                "state_change",
+                {"state": current_state},
+                redis_client=self.redis,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] state_change publish failed; will retry next cycle: %s",
+                self.name,
+                exc,
+            )
+            return
+        self._last_published_state_signature = signature
+
+    async def _publish_pending_event_log_entries(self) -> None:
+        """Drain queued log entries as event_log_append SSE events.
+
+        Each entry is removed only after the publish succeeds. If
+        ``publish_repo_event`` raises (transient Redis outage), the
+        failed entry and any not-yet-attempted ones are kept at the head
+        of the queue so a later cycle can retry — otherwise subscribers
+        would silently miss live updates while history was already
+        persisted in ``state.history``. The exception is swallowed so a
+        pub/sub blip never aborts ``publish_state`` (state was already
+        persisted) and the runner cycle can keep progressing while the
+        queued entries wait for the next opportunity.
+        """
+        if not self._pending_event_log_entries:
+            return
+        pending = self._pending_event_log_entries
+        self._pending_event_log_entries = []
+        for index, entry in enumerate(pending):
+            try:
+                await publish_repo_event(
+                    self.name,
+                    "event_log_append",
+                    {"entry": entry},
+                    redis_client=self.redis,
+                )
+            except Exception:
+                self._pending_event_log_entries = (
+                    list(pending[index:]) + self._pending_event_log_entries
+                )
+                logger.warning(
+                    "[%s] event_log_append publish failed; will retry later",
+                    self.name,
+                )
+                return
+
     def _compute_diff_stats(self, base_branch: str) -> dict[str, object]:
         """Compute file/language/line stats for the current branch vs base."""
         try:
@@ -851,6 +975,25 @@ class PipelineRunner(
                 stats = self._compute_diff_stats(resolved_base_branch)
             self._apply_diff_stats(record, stats, resolved_base_branch)
         await self._metrics_store.save(record)
+        # SSE notification is best-effort: a Redis pub/sub or list-op
+        # failure here must not abort the cycle, otherwise a transient
+        # outage would short-circuit downstream post-save logic in the
+        # caller (state transitions, review trigger, etc.) after the run
+        # record is already persisted.
+        try:
+            await publish_repo_event(
+                self.name,
+                "pr_metrics_update",
+                {"task_id": record.task_id, "exit_reason": record.exit_reason},
+                redis_client=self.redis,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] pr_metrics_update publish failed for %s: %s",
+                self.name,
+                record.task_id,
+                exc,
+            )
 
     # All ERROR transitions must use this primitive. Direct writes to
     # ``state.state = PipelineState.ERROR`` are forbidden after PR-219b.
@@ -1137,6 +1280,8 @@ class PipelineRunner(
             except Exception:
                 pass
         await self._publish_progress_updated_if_needed()
+        await self._publish_state_change_if_needed()
+        await self._publish_pending_event_log_entries()
 
     async def _save_cli_log(self, stdout: str, stderr: str, label: str) -> None:
         _MAX_CLI_LOG_BYTES = 64 * 1024  # 64 KB cap per entry
@@ -1180,6 +1325,7 @@ class PipelineRunner(
             last_entry["count"] = int(last_entry.get("count", 1)) + 1
             last_entry["event"] = event
             last_entry["last_seen_at"] = now
+            self._pending_event_log_entries.append(dict(last_entry))
         else:
             entry = {
                 "time": now,
@@ -1189,6 +1335,7 @@ class PipelineRunner(
                 "last_seen_at": now,
             }
             self.state.history.append(entry)
+            self._pending_event_log_entries.append(dict(entry))
         if len(self.state.history) > _HISTORY_LIMIT:
             self.state.history = self.state.history[-_HISTORY_LIMIT:]
         logger.info("[%s] %s", self.name, event)

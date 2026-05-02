@@ -3,10 +3,24 @@
 {% block title %}Dashboard - Pipeline Orchestrator{% endblock %}
 
 {% block content %}
-<div hx-get="/partials/repo-list" hx-trigger="every 10s" hx-swap="innerHTML" id="repo-grid">
+{# Cards refresh on state_change AND history_updated: pause/resume/stop
+   mutate repo.user_paused (which controls play/pause/stop visibility) and
+   emit history_updated, so without the second trigger the controls would
+   stay stale until an unrelated state transition fired. The `every 30s`
+   fallback covers repos beyond MAX_STREAMS (the SSE manager below only
+   subscribes to the first slice), and also catches the case where SSE
+   itself is unreachable. #}
+<div hx-get="/partials/repo-list"
+     hx-trigger="repo:state_change from:body, repo:history_updated from:body, every 30s"
+     hx-swap="innerHTML"
+     id="repo-grid">
     {% include "components/repo_cards.html" %}
 </div>
-<div hx-get="/partials/stats" hx-trigger="every 10s" hx-swap="innerHTML" id="status-bar" style="margin-top: 14px;">
+<div hx-get="/partials/stats"
+     hx-trigger="repo:state_change from:body, every 30s"
+     hx-swap="innerHTML"
+     id="status-bar"
+     style="margin-top: 14px;">
     {% include "components/status_bar.html" %}
 </div>
 <script>
@@ -19,6 +33,19 @@
         const MAX_STREAMS = 8;
         const BASE_DELAY_MS = 1000;
         const MAX_DELAY_MS = 10000;
+        // pageRenderedAtMs is the server-side instant this HTML was
+        // rendered (delivered via the page_rendered_at template var).
+        // Events with timestamps before it are already reflected in the
+        // server-rendered HTML, so re-firing HTMX would only cause
+        // redundant /partials/* fetches. Events at or after it — even
+        // those still in the SSE replay batch, which covers the gap
+        // between page render and SSE subscription — represent fresh
+        // updates and must trigger HTMX. Keying suppression to a
+        // server-provided cutoff (not a client wall-clock) prevents
+        // skew from dropping legitimate live events.
+        const SEEN_KEYS_LIMIT = 200;
+        const pageRenderedAt = {{ page_rendered_at | tojson }};
+        const pageRenderedAtMs = Date.parse(pageRenderedAt);
         const connections = new Map();
 
         function getRenderedRepos() {
@@ -77,11 +104,53 @@
             entry.delayMs = Math.min(delay * 2, MAX_DELAY_MS);
         }
 
+        function rememberSeen(entry, key) {
+            if (entry.seenKeys.has(key)) {
+                return false;
+            }
+            entry.seenKeys.add(key);
+            entry.seenOrder.push(key);
+            if (entry.seenOrder.length > SEEN_KEYS_LIMIT) {
+                const evicted = entry.seenOrder.shift();
+                entry.seenKeys.delete(evicted);
+            }
+            return true;
+        }
+
+        function isReplayedFrame(payload) {
+            // An event is "replayed" (already reflected in the rendered
+            // HTML) iff its server timestamp predates pageRenderedAtMs.
+            // Frames without a parseable timestamp default to fresh so
+            // the gap between page render and SSE subscription cannot
+            // silently drop legitimate live updates.
+            if (!Number.isFinite(pageRenderedAtMs)) {
+                return false;
+            }
+            if (!payload || typeof payload.timestamp !== 'string') {
+                return false;
+            }
+            const eventTime = Date.parse(payload.timestamp);
+            if (!Number.isFinite(eventTime)) {
+                return false;
+            }
+            return eventTime < pageRenderedAtMs;
+        }
+
         function connect(repoName) {
             let entry = connections.get(repoName);
             if (!entry) {
-                entry = {source: null, timer: null, delayMs: BASE_DELAY_MS};
+                entry = {
+                    source: null,
+                    timer: null,
+                    delayMs: BASE_DELAY_MS,
+                    seenKeys: new Set(),
+                    seenOrder: [],
+                };
                 connections.set(repoName, entry);
+            }
+            if (!entry.seenKeys) {
+                entry.seenKeys = new Set();
+                entry.seenOrder = [];
             }
 
             if (entry.source) {
@@ -116,6 +185,34 @@
                 entry.delayMs = BASE_DELAY_MS;
             });
 
+            ['state_change', 'event_log_append', 'history_updated', 'pr_metrics_update'].forEach(function (eventName) {
+                source.addEventListener(eventName, function (event) {
+                    let payload = null;
+                    try {
+                        payload = event && event.data ? JSON.parse(event.data) : null;
+                    } catch (_error) {
+                        payload = null;
+                    }
+                    if (payload && typeof payload.timestamp === 'string') {
+                        const key = eventName + '|' + payload.timestamp;
+                        // Dedup across reconnects: stream_repo_events
+                        // re-emits up to HISTORY_REPLAY_LIMIT entries on
+                        // each connect, and triggering HTMX for already-
+                        // seen ones would burst /partials/* fetches.
+                        if (!rememberSeen(entry, key)) {
+                            return;
+                        }
+                    }
+                    if (isReplayedFrame(payload)) {
+                        return;
+                    }
+                    if (window.htmx) {
+                        window.htmx.trigger(document.body, 'repo:' + eventName);
+                    }
+                    entry.delayMs = BASE_DELAY_MS;
+                });
+            });
+
             source.onerror = function () {
                 if (entry.source !== source) {
                     return;
@@ -136,6 +233,8 @@
                         source: null,
                         timer: null,
                         delayMs: BASE_DELAY_MS,
+                        seenKeys: new Set(),
+                        seenOrder: [],
                     });
                 }
                 const entry = connections.get(repoName);

@@ -1044,6 +1044,83 @@ def test_index_bootstraps_progress_sse_manager(
     assert "window.repoProgressSSEManager" in body
     assert "new EventSource('/api/repos/' + encodeURIComponent(repoName) + '/events')" in body
     assert "const MAX_DELAY_MS = 10000;" in body
+    # The SSE consumer must relay history_updated so pause/resume/stop —
+    # which only mutate user_paused — refresh the repo-cards' play/pause
+    # controls. Without it the cards stay stale until state.state moves.
+    assert (
+        "['state_change', 'event_log_append', "
+        "'history_updated', 'pr_metrics_update']" in body
+    )
+    # The `every 30s` fallback covers repos beyond MAX_STREAMS (the SSE
+    # manager only subscribes to the first slice) and any SSE outage.
+    assert (
+        'hx-trigger="repo:state_change from:body, '
+        'repo:history_updated from:body, every 30s"' in body
+    )
+    assert (
+        'hx-trigger="repo:state_change from:body, every 30s"' in body
+    )
+    # stream_repo_events replays up to HISTORY_REPLAY_LIMIT entries on
+    # each (re)connect. Without dedup + a server-provided render-time
+    # cutoff, every replayed state_change/history_updated frame would
+    # refire the repo-list / stats fetches, causing a burst of redundant
+    # requests on page load and reconnect. Replay suppression is keyed
+    # to ``page_rendered_at`` (the server-side instant the HTML was
+    # rendered) so client-clock skew cannot drop legitimate live events
+    # AND events delivered during the page-render→SSE-subscribe gap
+    # still trigger HTMX.
+    assert "rememberSeen" in body
+    assert "isReplayedFrame" in body
+    assert "pageRenderedAt" in body
+    assert "pageRenderedAtMs" in body
+    assert "pageLoadedAt" not in body
+    assert "REPLAY_SKEW_MS" not in body
+    assert "liveSinceMs" not in body
+    assert "replay_complete" not in body
+
+
+def test_index_captures_page_rendered_at_before_reading_state(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The replay-suppression cutoff must be sampled BEFORE the state
+    snapshot read. Otherwise an event published in the gap between the
+    snapshot read and cutoff sampling is not reflected in the rendered
+    HTML yet still gets classified as ``replayed`` (timestamp <
+    pageRenderedAt) and discarded — repo cards and stats would stay
+    stale until the 30s fallback poll or a later event arrived.
+    Capturing the cutoff first guarantees that any frame older than it
+    is part of the snapshot the page was rendered from.
+    """
+    from src.web.routes import dashboard as dashboard_routes
+
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    call_order: list[str] = []
+
+    real_iso = dashboard_routes._page_rendered_at_iso
+
+    def spy_iso() -> str:
+        call_order.append("page_rendered_at")
+        return real_iso()
+
+    real_get_states = web_app.get_all_repo_states
+
+    async def spy_get_states(*args: object, **kwargs: object):
+        call_order.append("get_all_repo_states")
+        return await real_get_states(*args, **kwargs)
+
+    monkeypatch.setattr(dashboard_routes, "_page_rendered_at_iso", spy_iso)
+    monkeypatch.setattr(web_app, "get_all_repo_states", spy_get_states)
+
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert "page_rendered_at" in call_order
+    assert "get_all_repo_states" in call_order
+    assert call_order.index("page_rendered_at") < call_order.index(
+        "get_all_repo_states"
+    )
 
 
 def test_partial_stats_renders_status_bar(
@@ -1183,7 +1260,17 @@ def test_repo_detail_route_renders_full_page(
     assert "alpha" in body
     assert "All repositories" in body
     assert 'hx-get="/partials/repo/example__alpha"' in body
-    assert 'hx-trigger="every 5s"' in body
+    # Pause/resume/stop publish history_updated; the summary fragment
+    # owns the play/pause/stop controls (their visibility depends on
+    # repo.user_paused), so it must refresh on history_updated too —
+    # otherwise an IDLE repo's controls stay stale until something else
+    # changes state.state. The `every 30s` fallback keeps the
+    # PAUSED rate-limit countdown (server `utcnow()`-derived) ticking
+    # during long pauses where no SSE event fires.
+    assert (
+        'hx-trigger="load, repo:state_change from:body, '
+        'repo:history_updated from:body, every 30s"' in body
+    )
     assert "Current Task" in body
     assert "Current PR" in body
     assert 'hx-post="/repos/example__alpha/coder"' in body
@@ -1191,6 +1278,75 @@ def test_repo_detail_route_renders_full_page(
     assert "Any (bandit picks per-PR)" in body
     assert "Recent PRs" not in body
     assert "Event log" in body
+    # Pause/resume/stop publish history_updated; the SSE consumer must
+    # relay it so the event log refreshes for IDLE repos that never see
+    # a daemon-side event_log_append. The `every 30s` fallback covers
+    # the case where the SSE channel itself is unavailable (Redis outage
+    # returns 503 from /api/repos/{name}/events, EventSource cannot
+    # connect, etc.) so the log still catches up to state.history.
+    assert "'history_updated'" in body
+    assert (
+        'hx-trigger="repo:event_log_append from:body, '
+        'repo:history_updated from:body, every 30s"' in body
+    )
+    # stream_repo_events replays up to HISTORY_REPLAY_LIMIT entries on
+    # each (re)connect. Without dedup + a server-provided render-time
+    # cutoff, every replayed state_change/history_updated frame would
+    # refire the repo-summary / event-log fetches, causing a burst of
+    # redundant requests on page load and reconnect. Replay suppression
+    # is keyed to ``page_rendered_at`` (the server-side instant the
+    # HTML was rendered) so client-clock skew cannot drop legitimate
+    # live events AND events delivered during the page-render→
+    # SSE-subscribe gap still trigger HTMX.
+    assert "rememberSeen" in body
+    assert "isReplayedFrame" in body
+    assert "pageRenderedAt" in body
+    assert "pageRenderedAtMs" in body
+    assert "pageLoadedAt" not in body
+    assert "REPLAY_SKEW_MS" not in body
+    assert "liveSinceMs" not in body
+    assert "replay_complete" not in body
+
+
+def test_repo_detail_captures_page_rendered_at_before_reading_state(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The repo-detail cutoff must be sampled BEFORE the per-repo state
+    read for the same reason as the dashboard route: an event published
+    in the gap between snapshot read and cutoff sampling would not be
+    in the rendered summary yet would be classified as replayed and
+    suppressed, leaving the summary stale until the 30s fallback poll.
+    """
+    from src.web.routes import dashboard as dashboard_routes
+
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    call_order: list[str] = []
+
+    real_iso = dashboard_routes._page_rendered_at_iso
+
+    def spy_iso() -> str:
+        call_order.append("page_rendered_at")
+        return real_iso()
+
+    real_ctx = dashboard_routes._repo_template_context
+
+    async def spy_ctx(*args: object, **kwargs: object):
+        call_order.append("repo_template_context")
+        return await real_ctx(*args, **kwargs)
+
+    monkeypatch.setattr(dashboard_routes, "_page_rendered_at_iso", spy_iso)
+    monkeypatch.setattr(dashboard_routes, "_repo_template_context", spy_ctx)
+
+    with TestClient(app) as client:
+        response = client.get("/repo/example__alpha")
+
+    assert response.status_code == 200
+    assert "page_rendered_at" in call_order
+    assert "repo_template_context" in call_order
+    assert call_order.index("page_rendered_at") < call_order.index(
+        "repo_template_context"
+    )
 
 
 def test_repo_summary_banner_keeps_fragment_wrapped(

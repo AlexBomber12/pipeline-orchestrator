@@ -516,11 +516,11 @@ def test_alert_repo_link_points_to_repo_detail(alerts_config: Path) -> None:
 
 
 def test_index_mounts_alerts_partial(alerts_config: Path) -> None:
-    """Dashboard index wires the status bar (with inline alerts) to the 10s HTMX poll."""
+    """Dashboard index wires the status bar (with inline alerts) to the SSE state_change trigger."""
     with TestClient(app) as client:
         response = client.get("/")
 
     assert response.status_code == 200
     body = response.text
     assert 'hx-get="/partials/stats"' in body
-    assert 'hx-trigger="every 10s"' in body
+    assert 'hx-trigger="repo:state_change from:body, every 30s"' in body

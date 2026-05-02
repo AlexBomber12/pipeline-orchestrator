@@ -639,7 +639,7 @@ def test_partial_daemon_returns_fragment(empty_config: Path) -> None:
     assert 'hx-swap-oob="innerHTML"' in body
 
 
-def test_partial_coders_returns_polling_fragment(empty_config: Path) -> None:
+def test_partial_coders_returns_static_fragment(empty_config: Path) -> None:
     with TestClient(app) as client:
         response = client.get("/partials/settings/coders")
 
@@ -647,9 +647,11 @@ def test_partial_coders_returns_polling_fragment(empty_config: Path) -> None:
     body = response.text
     assert "<!DOCTYPE" not in body
     assert 'id="settings-coders"' in body
-    assert 'hx-get="/partials/settings/coders"' in body
-    assert 'hx-trigger="every 30s"' in body
-    assert 'hx-swap="outerHTML"' in body
+    # PR-228: settings_coders no longer self-polls; the SSE migration
+    # replaces the 30s refresh and operators reload the page for fresh
+    # auth/usage snapshots.
+    assert 'hx-trigger="every' not in body
+    assert 'hx-get="/partials/settings/coders"' not in body
 
 
 def test_put_daemon_updates_numeric_fields(empty_config: Path) -> None:
@@ -1755,15 +1757,20 @@ def test_coders_table_shows_auth_status(
     assert "GitHub CLI" in body
 
 
-def test_coders_table_polls_for_auth_refresh(empty_config: Path) -> None:
+def test_coders_table_renders_without_polling_after_sse_migration(
+    empty_config: Path,
+) -> None:
+    """PR-228: the coders fragment no longer polls; SSE-driven dashboards
+    replace the legacy 30s refresh on the settings page."""
     with TestClient(app) as client:
         response = client.get("/settings")
 
     assert response.status_code == 200
     body = response.text
     assert 'id="settings-coders"' in body
-    assert 'hx-get="/partials/settings/coders"' in body
-    assert 'hx-trigger="every 30s"' in body
+    # The redis-banner in base.html is the only sanctioned `every` poll
+    # after PR-228; the coders fragment must no longer self-refresh.
+    assert 'hx-get="/partials/settings/coders"' not in body
 
 
 def test_coders_table_omits_unknown_selected_model(
