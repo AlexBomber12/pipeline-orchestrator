@@ -118,6 +118,14 @@ class ClaudePlugin:
     def supports_breach_lifecycle(self) -> bool:
         return True
 
+    @property
+    def default_session_pause_percent(self) -> int:
+        return 95
+
+    @property
+    def default_weekly_pause_percent(self) -> int:
+        return 80
+
     async def diagnose_error(
         self,
         repo_path: str,

@@ -168,6 +168,14 @@ class CodexPlugin:
     def supports_breach_lifecycle(self) -> bool:
         return False
 
+    @property
+    def default_session_pause_percent(self) -> int:
+        return 100
+
+    @property
+    def default_weekly_pause_percent(self) -> int:
+        return 100
+
     async def diagnose_error(
         self,
         repo_path: str,

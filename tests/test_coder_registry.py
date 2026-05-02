@@ -39,6 +39,14 @@ class DummyCoderPlugin:
     def supports_breach_lifecycle(self) -> bool:
         return True
 
+    @property
+    def default_session_pause_percent(self) -> int:
+        return 95
+
+    @property
+    def default_weekly_pause_percent(self) -> int:
+        return 80
+
     async def diagnose_error(
         self, repo_path: str, context: str, model: str
     ) -> tuple[int, str, str]:
@@ -103,6 +111,32 @@ def test_claude_plugin_supports_breach_lifecycle_true() -> None:
 
 def test_codex_plugin_supports_breach_lifecycle_false() -> None:
     assert CodexPlugin().supports_breach_lifecycle is False
+
+
+def test_protocol_includes_default_pause_percent_properties() -> None:
+    """``CoderPlugin`` declares ``default_session_pause_percent`` and
+    ``default_weekly_pause_percent`` so handlers can read per-plugin
+    rate-limit thresholds without hardcoding coder names."""
+    assert "default_session_pause_percent" in dir(CoderPlugin)
+    assert "default_weekly_pause_percent" in dir(CoderPlugin)
+    assert isinstance(ClaudePlugin(), CoderPlugin)
+    assert isinstance(CodexPlugin(), CoderPlugin)
+
+
+def test_claude_plugin_default_session_pause_percent() -> None:
+    assert ClaudePlugin().default_session_pause_percent == 95
+
+
+def test_claude_plugin_default_weekly_pause_percent() -> None:
+    assert ClaudePlugin().default_weekly_pause_percent == 80
+
+
+def test_codex_plugin_default_session_pause_percent() -> None:
+    assert CodexPlugin().default_session_pause_percent == 100
+
+
+def test_codex_plugin_default_weekly_pause_percent() -> None:
+    assert CodexPlugin().default_weekly_pause_percent == 100
 
 
 def test_claude_plugin_diagnose_error_delegates(
