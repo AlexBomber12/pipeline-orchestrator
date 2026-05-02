@@ -1225,7 +1225,108 @@ Thompson Sampling bandit selector (Sprint F3.2) needs **measurement substrate ac
 Plugin extensibility (Vision A) creates the routing decision space:
 - Adding Qwen as a third coder gives the bandit 3 arms to pull
 - Adding local LLMs (Ollama) creates a "low-cost arm" that the bandit can route low-complexity tasks to
-- Per-coder model selection (Claude opus vs sonnet, Codex gpt-4 vs gpt-5) creates intra-coder routing options
+- Per-coder model selection (Claude opus vs sonnet vs haiku, Codex gpt-5.4 vs 5.5 vs 5.3-spark) creates intra-coder routing options
+- **Intra-vendor model routing matters as much as cross-vendor routing** (added 2026-05-01) — see Vision A.2 below
+
+#### Vision A.2: Intra-vendor model routing (added 2026-05-01)
+
+**Operator observation:** routing decisions should distinguish not only "which provider" but also "which model within provider" based on task characteristics. Opus / Sonnet / Haiku for Claude; GPT-5.5 / GPT-5.4 / 5.3-Codex-Spark for Codex; qwen3-coder-plus / qwen3-thinking / qwen3-32b-dense for Qwen.
+
+**This is architecturally important and may have larger product impact than cross-vendor routing.**
+
+**Foundation in code already exists (verified 2026-05-01):**
+
+- `ClaudePlugin.models = ["opus", "sonnet"]` — list, not single. Protocol shape is already plural.
+- `CodexPlugin.models = ["", "gpt-5.4", "gpt-5.3-codex"]` — multiple models.
+- Config has `claude_model: str = "opus"` and `codex_model: str = ""` — per-repo static selection.
+
+**What's missing:**
+
+- Static per-repo model in config; no per-task dynamic selection.
+- Haiku model not yet in `ClaudePlugin.models`.
+- UsageProvider tracks plugin-level usage, not per-model sub-usage.
+- Bandit posterior space currently pluginscale (Codex Beta(81,19), Claude Beta(76,24)); not (plugin × model)-scale.
+
+**Why intra-vendor routing matters more than cross-vendor:**
+
+1. **No vendor switch friction.** Operator already pays Anthropic. Routing trivial bugs to Sonnet vs Opus is pure win — no political "you're recommending the competitor" friction. Cross-vendor routing has procurement/preference friction; intra-vendor doesn't.
+
+2. **Cost savings dramatic at model level.** Anthropic pricing illustrates:
+   - Opus: $15 / $75 per MTok input/output
+   - Sonnet: $3 / $15 per MTok
+   - Haiku: ~$1 / $5 per MTok (estimated based on prior tier ratios)
+   - Routing trivial bugfix from Opus to Haiku = **~15x cost reduction** with minimal quality loss for that task class.
+   
+3. **Closer fit to operator's good-enough thesis.** Industrial chiller analogy: choose C3 for office room, C4 for data center. Same brand, different sizing. Pipeline-orchestrator: choose Sonnet for standard feature PR, Opus for architectural refactor. Same provider, different model. This is the exact mental model the cost-per-merged-PR thesis trades on.
+
+4. **Easier adoption story.** "We picked Sonnet for this PR because complexity was low" is comprehensible. "We routed your PR to Qwen instead of Claude" requires more explanation and trust.
+
+**Routing intuition (not final, illustrative):**
+
+| Task pattern | Likely good model |
+|---|---|
+| Typo / lint / formatting | Haiku, gpt-5.3-spark, or local Ollama |
+| Test scaffolding (mechanical) | Sonnet, gpt-5.4, qwen3-coder-plus |
+| Standard feature PR (new endpoint, CRUD) | Sonnet, gpt-5.4 |
+| Bugfix requiring code understanding | Sonnet with thinking, gpt-5.4 |
+| Cross-cutting refactor | Opus, gpt-5.5 |
+| Architectural decision | Opus with thinking, gpt-5.5 + reasoning, qwen3-thinking |
+
+**Bandit sample size implication:**
+
+Current bandit has 2 arms (Claude, Codex), each with ~100 PRs of history → reasonably confident posteriors.
+
+With (plugin × model) decomposition:
+- ClaudePlugin × {opus, sonnet, haiku} = 3 arms
+- CodexPlugin × {gpt-5.4, gpt-5.5, 5.3-spark} = 3 arms
+- QwenPlugin × {coder-plus, thinking, 32b} = 3 arms
+
+Total ~9 arms minimum. To reach ~100 PRs per arm requires ~900 PRs total — 9x current data substrate. This is **acute sample-size problem** for bandit.
+
+**Workarounds:**
+
+1. **Hierarchical posteriors:** model the (plugin × model) effect as `vendor_baseline + model_offset`. Pool data across models within same vendor for vendor-level effect; smaller posteriors for model-specific deltas. Reduces effective sample size requirement substantially.
+2. **Task-stratified posteriors:** separate posteriors per (model, task_type, complexity_bucket). Many cells empty initially; bandit defaults to explore mode for empty cells.
+3. **Informative cold-start priors:** use vendor pricing tier as initial prior. Haiku starts at "fast and cheap" (high prior on success rate for trivial tasks, low prior for complex). Opus starts at "slow and expensive" (low prior on cost, high prior on quality). Bandit refines from there.
+4. **Defer Thompson until enough data:** don't start bandit until ~50 PRs per (plugin × model) combo exist. Until then use heuristic routing (e.g. complexity bucket → tier mapping).
+
+**Architectural changes needed (over Vision A baseline):**
+
+1. **Per-task model selection logic** — new component, lives in `_select_next_task` or bandit module. Reads task profile (complexity, type, files_touched), picks (plugin, model) tuple. ~3-4 PRs.
+2. **Cost model per (plugin, model)** — UsageProvider needs sub-tracking. Currently plugin-level; needs (plugin × model) granularity for cost-per-PR breakdown. ~2 PRs.
+3. **Bandit posterior space refactor** — when Thompson Sampling ships, posteriors must be (plugin × model)-keyed, not plugin-keyed. ~2 PRs (covered as part of Sprint F3.2 already).
+4. **Add haiku to `ClaudePlugin.models`** — small addition, ~1 PR.
+
+**Updated Vision A scope (combining A, A.1, A.2):**
+
+- Plugin Protocol generalization (Option 3) — 3-4 PRs
+- First API plugin (Qwen with multiple models) — 3 PRs
+- Anthropic API plugin (with haiku, sonnet, opus) — 2 PRs
+- Per-task model selection logic — 3-4 PRs
+- Cost model per (plugin, model) — 2 PRs
+- Add haiku to ClaudePlugin CLI — 1 PR
+
+**Total Vision A: ~14-16 PRs (was ~13-15 without A.2; A.2 adds ~5-6 PRs).**
+
+**Wave placement: A.2 ships alongside A and A.1, not deferred separately.** Per-task model selection requires the routing infrastructure that A and A.1 build; doing it as a separate later phase would create structural rework.
+
+**Strategic significance:** intra-vendor model routing converts the cost-per-merged-PR thesis from "interesting metric" to "actionable lever." Operator sees: "PR-208 cost $0.12 with Sonnet; equivalent PR-209 cost $1.84 with Opus. Was Opus needed for PR-209?" That comparison is the **product moment** — concrete dollar savings tied to a routing decision the orchestrator made on operator's behalf. Cross-vendor routing produces similar comparison ("Claude vs Qwen") but with vendor-switch friction; intra-vendor produces it without friction.
+
+**Implication for analytics dashboard (post-Vision-A wave):**
+
+The cost-per-merged-PR view should default to **(plugin, model) breakdown**, not plugin-only. Operator sees:
+
+```
+This week:
+  Claude Sonnet:    14 PRs, avg $0.18/PR, 71% of merges
+  Claude Opus:      4 PRs,  avg $1.62/PR, 21% of merges
+  Codex GPT-5.4:    2 PRs,  avg $0.40/PR, 8%  of merges
+
+Routing recommendation: 3 of 4 Opus PRs could have been Sonnet (low complexity).
+Estimated savings: $4.32 / week ($225 / year).
+```
+
+This is the actionable product surface. Without (plugin, model) granularity, this story doesn't exist.
 
 Without Vision A, Thompson Sampling has no meaningful work to do. Sequencing is:
 
@@ -1526,12 +1627,15 @@ Why B later (or only when needed):
 
 **Estimated total addition to post-Foundation roadmap:**
 - Plugin Protocol generalization for CLI vs API: ~3-4 PRs, ~6-8h
-- First API plugin (Qwen): ~3 PRs, ~6h
-- Anthropic API plugin: ~2 PRs, ~4h (mostly reuses Qwen pattern)
-- SQLite migration Scenario A: ~3-4 PRs, ~6-8h
-- Analytics dashboard cost-per-PR view: ~3 PRs, ~5h
+- First API plugin (Qwen with multiple models): ~3 PRs, ~6h
+- Anthropic API plugin (with haiku/sonnet/opus): ~2 PRs, ~4h
+- Per-task model selection logic (Vision A.2): ~3-4 PRs, ~6-8h
+- Cost model per (plugin, model) (Vision A.2): ~2 PRs, ~4h
+- Add haiku to ClaudePlugin CLI: ~1 PR, ~1h
+- SQLite addition Scenario A: ~3-4 PRs, ~6-8h
+- Analytics dashboard cost-per-PR view ((plugin, model) breakdown default): ~3 PRs, ~5h
 
-Total addition: ~14-16 PRs, ~27-31 daemon-hours. Combined with prior post-Foundation work (Wave 1-7 = 18-22 PRs), total post-Foundation = ~32-38 PRs / ~64-68 daemon-hours / ~3-4 daemon-days at 17 PR/day, calendar 2-3 weeks with buffers.
+Total addition: ~20-23 PRs, ~38-44 daemon-hours. Combined with prior post-Foundation work (Wave 1-7 = 18-22 PRs), total post-Foundation = ~38-45 PRs / ~75-86 daemon-hours / ~4-5 daemon-days at 17 PR/day, calendar 2-3 weeks with buffers.
 
 **Data substrate status (verified 2026-05-01 by checking src/metrics.py):**
 
