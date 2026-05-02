@@ -1061,14 +1061,19 @@ def test_index_bootstraps_progress_sse_manager(
         'hx-trigger="repo:state_change from:body, every 30s"' in body
     )
     # stream_repo_events replays up to HISTORY_REPLAY_LIMIT entries on
-    # each (re)connect. Without dedup + page-load filtering, every
-    # replayed state_change/history_updated frame would refire the
-    # repo-list / stats fetches, causing a burst of redundant requests
-    # on page load and reconnect.
+    # each (re)connect. Without dedup + the server-provided replay
+    # boundary, every replayed state_change/history_updated frame would
+    # refire the repo-list / stats fetches, causing a burst of redundant
+    # requests on page load and reconnect. Replay suppression is keyed
+    # to the server's subscribed_at (delivered via replay_complete) so
+    # client-clock skew can no longer drop legitimate live events.
     assert "rememberSeen" in body
     assert "isReplayedFrame" in body
-    assert "const pageLoadedAt = Date.now();" in body
-    assert "REPLAY_SKEW_MS" in body
+    assert "liveSinceMs" in body
+    assert "'replay_complete'" in body
+    assert "subscribed_at" in body
+    assert "pageLoadedAt" not in body
+    assert "REPLAY_SKEW_MS" not in body
 
 
 def test_partial_stats_renders_status_bar(
@@ -1233,14 +1238,20 @@ def test_repo_detail_route_renders_full_page(
         'repo:history_updated from:body"' in body
     )
     # stream_repo_events replays up to HISTORY_REPLAY_LIMIT entries on
-    # each (re)connect. Without dedup + page-load filtering, every
-    # replayed state_change/history_updated frame would refire the
-    # repo-summary / event-log fetches, causing a burst of redundant
-    # requests on page load and reconnect.
+    # each (re)connect. Without dedup + the server-provided replay
+    # boundary, every replayed state_change/history_updated frame would
+    # refire the repo-summary / event-log fetches, causing a burst of
+    # redundant requests on page load and reconnect. Replay suppression
+    # is keyed to the server's subscribed_at (delivered via
+    # replay_complete) so client-clock skew can no longer drop
+    # legitimate live events.
     assert "rememberSeen" in body
     assert "isReplayedFrame" in body
-    assert "const pageLoadedAt = Date.now();" in body
-    assert "REPLAY_SKEW_MS" in body
+    assert "liveSinceMs" in body
+    assert "'replay_complete'" in body
+    assert "subscribed_at" in body
+    assert "pageLoadedAt" not in body
+    assert "REPLAY_SKEW_MS" not in body
 
 
 def test_repo_summary_banner_keeps_fragment_wrapped(

@@ -33,14 +33,15 @@
         const MAX_STREAMS = 8;
         const BASE_DELAY_MS = 1000;
         const MAX_DELAY_MS = 10000;
-        // Replay window ignored on first connect: events whose server
-        // timestamp predates page load are already reflected in the
-        // server-rendered HTML, so re-firing HTMX would only cause
-        // redundant /partials/* fetches and UI churn. The 2s margin
-        // absorbs minor client/server clock skew.
-        const REPLAY_SKEW_MS = 2000;
+        // entry.liveSinceMs is the server-side instant the FIRST SSE
+        // subscription for this repo was established (parsed from the
+        // replay_complete boundary frame). Events with timestamps
+        // before it are already reflected in the server-rendered HTML,
+        // so re-firing HTMX would only cause redundant /partials/*
+        // fetches. Keying replay suppression to a server-provided
+        // ordering — not a client wall-clock — prevents skew from
+        // dropping legitimate live events.
         const SEEN_KEYS_LIMIT = 200;
-        const pageLoadedAt = Date.now();
         const connections = new Map();
 
         function getRenderedRepos() {
@@ -112,7 +113,14 @@
             return true;
         }
 
-        function isReplayedFrame(payload) {
+        function isReplayedFrame(entry, payload) {
+            // Until the boundary frame establishes entry.liveSinceMs,
+            // every incoming frame is part of the replay batch and must
+            // be suppressed. Once liveSinceMs is set, only events whose
+            // server timestamp predates it are replays.
+            if (entry.liveSinceMs === null || entry.liveSinceMs === undefined) {
+                return true;
+            }
             if (!payload || typeof payload.timestamp !== 'string') {
                 return false;
             }
@@ -120,7 +128,7 @@
             if (!Number.isFinite(eventTime)) {
                 return false;
             }
-            return eventTime < pageLoadedAt - REPLAY_SKEW_MS;
+            return eventTime < entry.liveSinceMs;
         }
 
         function connect(repoName) {
@@ -132,12 +140,16 @@
                     delayMs: BASE_DELAY_MS,
                     seenKeys: new Set(),
                     seenOrder: [],
+                    liveSinceMs: null,
                 };
                 connections.set(repoName, entry);
             }
             if (!entry.seenKeys) {
                 entry.seenKeys = new Set();
                 entry.seenOrder = [];
+            }
+            if (entry.liveSinceMs === undefined) {
+                entry.liveSinceMs = null;
             }
 
             if (entry.source) {
@@ -154,6 +166,30 @@
             source.onopen = function () {
                 entry.delayMs = BASE_DELAY_MS;
             };
+
+            source.addEventListener('replay_complete', function (event) {
+                // Only adopt the FIRST boundary's subscribed_at: events
+                // that arrive over a reconnect after a disconnection
+                // window have timestamps after that moment and must
+                // still fire HTMX. Pinning liveSinceMs to the original
+                // subscription preserves that surface area.
+                if (entry.liveSinceMs !== null) {
+                    return;
+                }
+                let payload = null;
+                try {
+                    payload = event && event.data ? JSON.parse(event.data) : null;
+                } catch (_error) {
+                    payload = null;
+                }
+                if (!payload || typeof payload.subscribed_at !== 'string') {
+                    return;
+                }
+                const parsed = Date.parse(payload.subscribed_at);
+                if (Number.isFinite(parsed)) {
+                    entry.liveSinceMs = parsed;
+                }
+            });
 
             source.addEventListener('progress_updated', function (event) {
                 let payload;
@@ -189,9 +225,9 @@
                         if (!rememberSeen(entry, key)) {
                             return;
                         }
-                        if (isReplayedFrame(payload)) {
-                            return;
-                        }
+                    }
+                    if (isReplayedFrame(entry, payload)) {
+                        return;
                     }
                     if (window.htmx) {
                         window.htmx.trigger(document.body, 'repo:' + eventName);
@@ -222,6 +258,7 @@
                         delayMs: BASE_DELAY_MS,
                         seenKeys: new Set(),
                         seenOrder: [],
+                        liveSinceMs: null,
                     });
                 }
                 const entry = connections.get(repoName);
