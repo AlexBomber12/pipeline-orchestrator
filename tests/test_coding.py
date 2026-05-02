@@ -191,6 +191,42 @@ def test_case_c_remote_branch_no_pr_daemon_creates_pr(
     )
 
 
+def test_case_c_branch_mismatch_does_not_block_daemon_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A coder that pushed ``task_branch`` (case C, recoverable) but
+    exited on a different local branch must still reach daemon ``gh
+    pr create`` recovery: ``--head task_branch`` operates on the
+    upstream ref regardless of the local checkout, so a divergence
+    between ``task_branch`` and ``current_git_branch`` here is not a
+    HUNG signal — escalating would skip the existing recovery path
+    and strand a recoverable run.
+    """
+    created = PRInfo(number=88, branch="pr-001")
+    runner = _runner(monkeypatch, open_prs_after_create=[created])
+    _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if cmd[:3] == ["git", "rev-parse", "--abbrev-ref"]:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="main\n", stderr=""
+            )
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout="", stderr=""
+        )
+
+    monkeypatch.setattr("src.branch_context.subprocess.run", fake_run)
+    monkeypatch.setattr(github_client, "run_gh", lambda *a, **kw: "")
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 88
+    log_entries = [entry["event"] for entry in runner.state.history]
+    assert not any("[BRANCH] mismatch detected" in e for e in log_entries)
+
+
 def test_case_c_create_pr_failure_marks_hung(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

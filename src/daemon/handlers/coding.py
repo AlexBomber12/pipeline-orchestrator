@@ -309,35 +309,15 @@ class CodingMixin:
         if await pause_for_stop_if_requested():
             return
         if candidate is None:
-            # Defer the branch-mismatch check until the PR lookup has
-            # completed: a successful coder run that exits on a
-            # different local branch (e.g. created and pushed
-            # ``task_branch``, opened the PR, then checked out
-            # ``main`` before exit) must still reach WATCH via the
-            # normal ``candidate is not None`` path. Only escalate on
-            # mismatch when no PR was found, so the divergence is
-            # surfaced as a [BRANCH] event instead of being silently
-            # collapsed into the case-A "did nothing" diagnostic.
-            # ``current_pr`` is still ``None`` here, so only
-            # ``task_branch`` ↔ ``current_git_branch`` divergence can
-            # fire.
-            ctx = BranchContext.from_runner(self)
-            if ctx.mismatch_reason is not None:
-                self.log_event(
-                    f"[BRANCH] mismatch detected: {ctx.mismatch_reason}; "
-                    f"{ctx.log_summary()}"
-                )
-                await self._save_current_run_record("error")
-                await self._escalate_to_hung(
-                    f"Branch mismatch: {ctx.mismatch_reason}",
-                    apply_escalated_label=False,
-                    set_pr_escalated_flag=False,
-                    log_message=(
-                        f"Branch mismatch: {ctx.mismatch_reason} "
-                        f"({ctx.log_summary()})"
-                    ),
-                )
-                return
+            # The branch-mismatch check is layered into
+            # ``_diagnose_exit_zero_no_pr`` (only on the case-A/B path
+            # where no upstream branch exists) instead of firing here
+            # unconditionally: a recoverable case-C run that pushed
+            # ``task_branch`` but exited on a different local branch
+            # (e.g. switched back to ``main`` before exit) must still
+            # reach the daemon ``gh pr create`` recovery, since
+            # ``--head task_branch`` operates on the upstream ref
+            # regardless of the local checkout.
             await self._diagnose_exit_zero_no_pr(
                 target_branch, coder_name, pause_for_stop_if_requested
             )
@@ -391,6 +371,29 @@ class CodingMixin:
 
         if not remote_exists:
             ctx = BranchContext.from_runner(self)
+            if ctx.mismatch_reason is not None:
+                # Daemon recovery is unavailable (no upstream
+                # ``task_branch``) AND the runner ended on a different
+                # branch surface than the task declares — surface the
+                # divergence explicitly so an operator sees the named
+                # mismatch instead of the generic "did nothing" /
+                # "no push" verdict.
+                self.log_event(
+                    f"[BRANCH] mismatch detected: {ctx.mismatch_reason}; "
+                    f"{ctx.log_summary()}"
+                )
+                message = (
+                    f"[{coder_name}] Branch mismatch: "
+                    f"{ctx.mismatch_reason} ({ctx.log_summary()})"
+                )
+                await self._save_current_run_record("error")
+                await self._escalate_to_hung(
+                    message,
+                    apply_escalated_label=False,
+                    set_pr_escalated_flag=False,
+                    log_message=f"{message}.",
+                )
+                return
             if not local_exists:
                 message = (
                     f"[{coder_name}] Coder exited 0 but did nothing — "
