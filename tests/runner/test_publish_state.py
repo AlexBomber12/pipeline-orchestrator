@@ -414,6 +414,53 @@ def test_publish_state_change_emits_idle_on_deactivation(
     ]
 
 
+def test_publish_state_change_swallows_publish_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A state_change SSE failure must not abort publish_state: the
+    authoritative state was already persisted to Redis above, so a
+    transient pub/sub blip should not turn a UI notification miss into
+    control-flow failure that stalls the runner cycle. The signature
+    stays unchanged so the next cycle retries automatically."""
+    warnings: list[str] = []
+    call_count = {"n": 0}
+
+    async def _failing_publish_repo_event(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, object],
+        redis_client: object | None = None,
+    ) -> None:
+        if event_type != "state_change":
+            return
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("redis pubsub down")
+
+    monkeypatch.setattr(runner_module, "publish_repo_event", _failing_publish_repo_event)
+
+    runner = _make_runner()
+    monkeypatch.setattr(
+        runner_module.logger,
+        "warning",
+        lambda msg, *args: warnings.append(msg % args),
+    )
+
+    asyncio.run(runner.publish_state())
+
+    assert any("state_change publish failed" in entry for entry in warnings)
+    assert runner._last_published_state_signature is None
+
+    asyncio.run(runner.publish_state())
+
+    assert call_count["n"] == 2
+    assert runner._last_published_state_signature == (
+        runner.state.state.value,
+        (),
+        (None, None, False),
+    )
+
+
 def test_publish_state_drains_pending_event_log_entries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

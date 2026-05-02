@@ -793,12 +793,27 @@ class PipelineRunner(
         )
         if signature == self._last_published_state_signature:
             return
-        await publish_repo_event(
-            self.name,
-            "state_change",
-            {"state": current_state},
-            redis_client=self.redis,
-        )
+        # SSE notification is best-effort: a Redis pub/sub or list-op
+        # failure here must not abort ``publish_state``. The authoritative
+        # state was already persisted above, and re-raising would short-
+        # circuit ``_publish_pending_event_log_entries`` plus stall the
+        # runner cycle on every transient pub/sub blip. Leaving the
+        # signature unchanged on failure means the next cycle retries
+        # automatically while it still differs.
+        try:
+            await publish_repo_event(
+                self.name,
+                "state_change",
+                {"state": current_state},
+                redis_client=self.redis,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] state_change publish failed; will retry next cycle: %s",
+                self.name,
+                exc,
+            )
+            return
         self._last_published_state_signature = signature
 
     async def _publish_pending_event_log_entries(self) -> None:
