@@ -10521,8 +10521,9 @@ def test_handle_idle_falls_back_when_merged_pr_check_fails(
 def test_handle_idle_silences_merged_pr_http_304_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """PR-236: HTTP 304 surfacing through ``get_merged_prs`` must not log
-    ``[INFRA] IDLE: merged PR check failed`` (operator-visible spam)."""
+    """PR-236: a single transient HTTP 304 surfacing through
+    ``get_merged_prs`` must not log ``[INFRA] IDLE: merged PR check failed``
+    (operator-visible spam) nor the persistent-degradation event."""
     _patch_subprocess(monkeypatch)
     task = QueueTask(
         pr_id="PR-123",
@@ -10557,6 +10558,151 @@ def test_handle_idle_silences_merged_pr_http_304_failures(
     asyncio.run(runner.handle_idle())
 
     assert not any(
+        "merged PR check failed" in e["event"] for e in runner.state.history
+    )
+    assert not any(
+        "merged-PR detection degraded" in e["event"]
+        for e in runner.state.history
+    )
+    assert runner._idle_merged_pr_304_streak == 1
+
+
+def test_handle_idle_warns_when_merged_pr_http_304_streak_persists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-236 follow-up: once the HTTP 304 streak crosses the warn threshold,
+    a degraded-detection INFRA event must surface so a stuck merged-PR
+    visibility outage is operator-visible."""
+    _patch_subprocess(monkeypatch)
+    task = QueueTask(
+        pr_id="PR-123",
+        title="Keep dispatching",
+        branch="pr-123-keep-dispatching",
+        status=TaskStatus.TODO,
+    )
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: (_ for _ in ()).throw(
+            RuntimeError("gh api repos/owner/name/pulls failed (exit 1): HTTP 304")
+        ),
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda tasks, repo_path, base_branch, prs, merged_prs=(): tasks,
+    )
+
+    async def fake_handle_coding() -> None:
+        return None
+
+    runner = _make_runner()
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    runner._idle_merged_pr_304_streak = (
+        idle_module._IDLE_MERGED_PR_304_WARN_AT - 1
+    )
+    asyncio.run(runner.handle_idle())
+
+    assert any(
+        "merged-PR detection degraded" in e["event"]
+        for e in runner.state.history
+    )
+    assert not any(
+        "merged PR check failed" in e["event"] for e in runner.state.history
+    )
+    assert runner._idle_merged_pr_304_streak == (
+        idle_module._IDLE_MERGED_PR_304_WARN_AT
+    )
+
+
+def test_handle_idle_resets_merged_pr_http_304_streak_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-236 follow-up: a successful merged-PR fetch resets the 304 streak,
+    so a recovered upstream cache stops the degraded-detection alarm."""
+    _patch_subprocess(monkeypatch)
+    task = QueueTask(
+        pr_id="PR-123",
+        title="Keep dispatching",
+        branch="pr-123-keep-dispatching",
+        status=TaskStatus.TODO,
+    )
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda tasks, repo_path, base_branch, prs, merged_prs=(): tasks,
+    )
+
+    async def fake_handle_coding() -> None:
+        return None
+
+    runner = _make_runner()
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    runner._idle_merged_pr_304_streak = 42
+    asyncio.run(runner.handle_idle())
+
+    assert runner._idle_merged_pr_304_streak == 0
+
+
+def test_handle_idle_resets_merged_pr_http_304_streak_on_non_304_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-236 follow-up: a non-304 merged-PR failure resets the 304 streak
+    and continues to log the regular ``merged PR check failed`` INFRA event,
+    so distinct failure modes don't accumulate into a misleading streak."""
+    _patch_subprocess(monkeypatch)
+    task = QueueTask(
+        pr_id="PR-123",
+        title="Keep dispatching",
+        branch="pr-123-keep-dispatching",
+        status=TaskStatus.TODO,
+    )
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        lambda repo, branch, refresh=False: (_ for _ in ()).throw(
+            RuntimeError("API down")
+        ),
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda tasks, repo_path, base_branch, prs, merged_prs=(): tasks,
+    )
+
+    async def fake_handle_coding() -> None:
+        return None
+
+    runner = _make_runner()
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    runner._idle_merged_pr_304_streak = 7
+    asyncio.run(runner.handle_idle())
+
+    assert runner._idle_merged_pr_304_streak == 0
+    assert any(
         "merged PR check failed" in e["event"] for e in runner.state.history
     )
 
