@@ -39,8 +39,13 @@
     <summary class="secondary-interactive text-sm text-gray-400 cursor-pointer">
         Coder log
     </summary>
+    {# Keep the periodic poll alongside SSE: state_change fires only on
+       transitions, but coder stdout grows continuously during long
+       CODING/WATCH stretches where state.state stays constant, so
+       without `every 30s` the panel can sit stale for many minutes
+       even while the log is actively appending. #}
     <div hx-get="/partials/repo/{{ repo.name }}/cli-log"
-         hx-trigger="revealed, repo:state_change from:body"
+         hx-trigger="revealed, repo:state_change from:body, every 30s"
          hx-swap="innerHTML">
     </div>
 </details>
