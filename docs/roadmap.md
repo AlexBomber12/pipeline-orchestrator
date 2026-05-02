@@ -1471,6 +1471,44 @@ This is a serious strategic question with several viable answers and one natural
 
 **What is sold in self-hosted, structurally:**
 
+**Critical correction (added 2026-05-01 late, after operator pointed out):** earlier analysis assumed "self-hosted operator = personal subscription, marginal cost ~0." This frame is **wrong for the org-deployment case** which is likely the actual paying customer. Three deployment shapes coexist:
+
+| Deployment | Auth | Cost visibility | Routing decision pressure |
+|---|---|---|---|
+| Self-hosted personal CLI | Personal subscription (sunk cost) | Quota % only | Personal preference |
+| Self-hosted with org API key | Org's API key (real $) | Real $ per PR | Org cost-conscious |
+| Managed/hosted (BYOK) | Org's API key (real $) | Real $ per PR | Org cost-conscious |
+
+The **org-with-API-key** case is structurally identical to managed deployment from cost-visibility and routing-decision perspective: real dollars per PR, CFO scrutiny, pressure to reduce bill. **And this case is probably where the paying customer actually lives.** Solo developer with personal subscription is hobby/early-adopter; **org with team budget is real revenue.**
+
+**Implications of org case being primary paying customer:**
+
+1. **Cost-per-merged-PR thesis is STRONGER in org case, not weaker.** In personal-subscription case, cost-per-PR is an abstract metric ("32% of session quota used"). In org-API-key case, it is invoice-level concrete savings ("PR-208 cost $0.42, equivalent PR-209 cost $3.18 — could PR-209 have used Sonnet?"). The thesis trades on dollar visibility, which only appears with API key auth.
+
+2. **Intra-vendor model routing (Vision A.2) is critical from day 1, not nice-to-have.** Org's API bill exposes them directly to 15x cost gap (Opus $15/$75 vs Haiku ~$1/$5). CFO sees monthly bill jump from $5k to $8k and asks "why?" Pipeline-orchestrator with model routing = direct answer. Without model routing, the orchestrator adds spend visibility but no spend control. Visibility without control is half the product.
+
+3. **Paid SaaS tier customer profile sharpens.** Earlier I described "operator who wants benchmarks." Real paid customer is **org spending $5k+/month on AI coding APIs** that wants to:
+   - See cost-per-PR breakdown by team, repo, complexity bucket
+   - Receive routing recommendations to reduce their bill (Thompson Sampling output)
+   - Track productivity vs cost ratio across team
+   - Audit who triggered which expensive PR
+   
+   ROI math becomes clean: org spending $60k/year on API, 20% routing savings = $12k/year, SaaS subscription priced $1-3k/year justifies easily. **Direct dollar ROI story, not abstract value.**
+
+4. **Vision B-alt re-positions to enterprise governance.** Multi-tenant deployment is not "personal multi-account workaround" but **API budget governance layer for orgs**:
+   - Org has team of 10 developers
+   - Each developer has subscription OR org has shared API key budget
+   - Pipeline-orchestrator manages auth for team, per-developer or per-team budget tracking
+   - Audit logs (who triggered which PR, at what cost, against which API key)
+   - SSO integration with org identity provider
+   - Role-based access (junior dev cannot trigger Opus PRs above $X/day budget)
+   
+   This is real enterprise feature set, not personal-use feature.
+
+5. **License decision implications.** Apache 2.0 (no AGPL viral) is **even more correct** under org-customer framing. Orgs cannot legally use AGPL software for internal proprietary work without releasing their modifications. AGPL would block org adoption entirely. Apache 2.0 keeps the door open while paid SaaS tier captures the revenue.
+
+**Layered value structurally (revised):**
+
 Pipeline-orchestrator as software has layered value:
 
 1. **Orchestration code** — the daemon, ~250 PRs of state machine, plugin architecture, FSM, recovery handlers. Open-source by default.
