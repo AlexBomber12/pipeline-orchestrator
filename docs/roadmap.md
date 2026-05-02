@@ -15,7 +15,7 @@ Continuous sprint numbering aligned with operator's mental model. Replaces ad-ho
 | Sprint | Content | Status | Estimate |
 |---|---|---|---|
 | Sprint 12 | Foundation Sprint (PR-208..PR-236) | In progress | 36 PRs, ~25 daemon-hours, ~1 daemon-day at 25-30 PR/day |
-| Sprint 13 | OBS-AX scaffolder fix + OBS-AY UI freeze fix (was Wave 1 + Wave 2) | Queued | 3-4 PRs, ~7 daemon-hours |
+| Sprint 13 | OBS-AX scaffolder fix + OBS-AY UI freeze fix + License Apache 2.0 switch (was Wave 1 + Wave 2 + new license task added 2026-05-02) | Queued | 4-5 PRs, ~8 daemon-hours |
 | Sprint 14 | Recovery + Cancellation policy expanded (was Wave 5; reordered earlier than Wave 3-4 due to throughput cost demonstrated 2026-05-02; expanded with OBS-BK + OBS-BL + OBS-BM additions) | Queued | 9-11 PRs, ~27 daemon-hours |
 | Sprint 15 | UX polish + vocabulary + DONE-row metrics Path A (was Wave 3 + Wave 4, plus OBS-BH + OBS-BI Path A locked + OBS-BJ from 2026-05-02) | Queued | 7-9 PRs, ~17-19 daemon-hours |
 | Sprint 16 | Multi-testbed harness + multi-repo tests (was Wave 6 + Wave 7) | Queued | 7+ PRs, ~15 daemon-hours |
@@ -1484,9 +1484,14 @@ Each operator using pipeline-orchestrator brings their own Claude account, used 
 **Order of execution (post-Sprint 12 / post-Foundation):**
 
 ```
-Sprint 13 (external onboarding readiness + UI scaling):
+Sprint 13 (external onboarding readiness + UI scaling + license switch):
   - OBS-AX scaffolder CLAUDE.md replace      (1 PR,  ~2h)
   - OBS-AY setInterval cleanup + /api/states (2-3 PRs, ~5h)
+  - License switch MIT to Apache 2.0         (1 PR,  ~1h)  NEW 2026-05-02
+  Total: 4-5 PRs, ~8 daemon-hours
+  License task is mechanical (replace LICENSE file content, add NOTICE,
+  update pyproject.toml license field). Operator confirmed ASAP 2026-05-02.
+  Independent of OBS-AX and OBS-AY; can ship in parallel within sprint.
 
 Sprint 14 (recovery + cancellation policy, REORDERED EARLIER 2026-05-02, EXPANDED with BK/BL/BM):
   - OBS-AW HUNG button                       (~2h)
@@ -1523,7 +1528,7 @@ Sprint 16 (multi-testbed test infrastructure):
 Sprint 17+ (Vision A multi-vendor first slice): TBD pending strategic decision.
 ```
 
-**Total Sprint 13-16: ~22-26 PRs, ~50-55 daemon-hours, ~2-3 daemon-days** at 25-30 PR/day throughput. Calendar 1.5-2 weeks with sustainable pace.
+**Total Sprint 13-16: ~23-27 PRs, ~51-56 daemon-hours, ~2-3 daemon-days** at 25-30 PR/day throughput. Calendar 1.5-2 weeks with sustainable pace.
 
 **Current testbed:** `tests/e2e/lib/coder_shim.sh` mocks Claude/Codex CLIs, drives a single testbed repo (`AlexBomber12/pipeline-orchestrator-testbed`) for e2e tests covering upload, merge, fix-escalate, redis recovery, sigkill recovery, stop/resume. All e2e tests are **single-repo**.
 
@@ -2164,8 +2169,8 @@ Classification heuristic depends on GHA API response shape; vendors change respo
 ### Sprint 14 - Multi-OBS coordination (9-11 PRs in one sprint)
 Sprint 14 is the largest sprint planned (27 daemon-hours, 9-11 PRs). Risk: dependency graph between OBS-AW, OBS-BB, OBS-BC, OBS-BE, OBS-BK, OBS-BL, OBS-BM, Cancellation policy creates serialization that throughput cannot collapse. Mitigation: batch parallelization plan in sprint spec generation; identify which OBS items can ship independently; ship OBS-BK + OBS-BL + OBS-BM (the recovery primitives) before Cancellation policy v1 (which consumes them as substrate).
 
-### License switch MIT → Apache 2.0 (operator decision 2026-05-02)
-Current `LICENSE` file is MIT (verified 2026-05-02). Operator confirmed switch to Apache 2.0 ASAP. Risk: deps or contributors with explicit MIT-only constraints. Mitigation: scan all upstream dependencies for license incompatibility (Apache 2.0 compatible with MIT/BSD/Apache, not GPL); coordinate before switch. ~1 PR, ~1h: replace LICENSE file, update `pyproject.toml` license field, add NOTICE file (Apache 2.0 convention), update README badge if any.
+### Sprint 13 - License switch MIT to Apache 2.0
+Mechanical change. Risk: deps or contributors with explicit MIT-only constraints (none expected, all upstream deps likely Apache/MIT/BSD compatible). Mitigation: scan all upstream dependencies for license incompatibility (Apache 2.0 compatible with MIT/BSD/Apache, not GPL); coordinate before switch. ~1 PR, ~1h: replace LICENSE file content, update `pyproject.toml` license field, add NOTICE file (Apache 2.0 convention), update README badge if any. Daemon-eligible spec.
 
 ---
 
@@ -2190,7 +2195,7 @@ Daemon работает из `/data/repos/<slug>/tasks/` (docker volume). Deploy
 
 ### Strategic decisions confirmed today (2026-05-02)
 
-- **License Apache 2.0 - CONFIRMED, ASAP.** Current LICENSE is MIT (not AGPL as memory implied). Action: replace with Apache 2.0 + NOTICE file. ~1 PR ~1h. Schedule alongside Sprint 13 (low complexity, can ship as standalone immediate task without waiting for sprint cycle).
+- **License Apache 2.0 - CONFIRMED, ASAP, scheduled Sprint 13.** Current LICENSE is MIT (not AGPL as memory implied). Action: replace with Apache 2.0 + NOTICE file. ~1 PR ~1h. Added to Sprint 13 batch alongside OBS-AX and OBS-AY (operator decision 2026-05-02).
 - **Vision A timing CONFIRMED:** Sprint 17+ after Sprint 16 multi-testbed. Plugin Protocol generalization is prerequisite for Thompson Sampling and managed product fork.
 - **SQLite Scenario A migration BEFORE Thompson Sampling.** Long-term posterior stability requires not 90-day TTL. Sprint slot: between Vision A first slice and Thompson Sampling work, likely Sprint 18-19 territory.
 - **PR-FUTURE-7 (eliminate QUEUE.md) CONFIRMED.** In-memory queue model. Sprint slot: post-Sprint 16, parallel-eligible with Vision A first slice if scope permits.
