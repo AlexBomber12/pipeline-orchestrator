@@ -30,11 +30,19 @@ from src.keyspace import cli_log_latest
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
 from src.utils import repo_slug_from_url
-from src.web import app as _app
 from src.web.services.coder import _effective_coder_name
 from src.web.services.repo_state import _find_repo_config_by_name
 
+# ``router`` MUST be bound before ``src.web.app`` is imported. The app
+# module loads this one via ``from src.web.routes import dashboard as
+# _dashboard_routes`` and immediately calls ``app.include_router(
+# _dashboard_routes.router)``; if dashboard.py is the entry point of the
+# import (e.g. a test does ``import src.web.routes.dashboard``), app.py
+# runs while this module is still partial and would fail without ``router``
+# already on the partial module.
 router = APIRouter()
+
+from src.web import app as _app  # noqa: E402 — must follow ``router = APIRouter()``
 
 _HISTORY_LIMIT = 100
 _METRICS_PANEL_LIMIT = 20
@@ -46,20 +54,6 @@ _ACTIVE_RUN_STATES = {
     PipelineState.FIX,
     PipelineState.MERGE,
 }
-
-
-def _format_reset_unix(reset_unix: int | None) -> str:
-    """Render ``reset_unix`` as ``HH:MM UTC`` for resource-chip tooltips.
-
-    Returns ``"unknown"`` for ``None`` so the template still has a string
-    to interpolate; the chip template only renders the "Resets at" line
-    when ``reset_unix`` is truthy, so this branch is defensive.
-    """
-    if not reset_unix:
-        return "unknown"
-    return datetime.fromtimestamp(int(reset_unix), tz=timezone.utc).strftime(
-        "%H:%M UTC"
-    )
 
 
 def _daemon_default_coder_name(config: AppConfig) -> str:

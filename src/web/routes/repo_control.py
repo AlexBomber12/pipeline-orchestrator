@@ -20,14 +20,21 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from src.config import load_config
 from src.keyspace import control_stop, pipeline_state
 from src.models import PipelineState, RepoState, TaskStatus
-from src.web import app as _app
 from src.web.services.coder import _effective_coder_name
 from src.web.services.repo_state import (
     _default_repo_state,
     _find_repo_config_by_name,
 )
 
+# ``router`` MUST be bound before ``src.web.app`` is imported. The app
+# module loads this one via ``from src.web.routes import repo_control as
+# _repo_control_routes`` and immediately calls ``app.include_router(
+# _repo_control_routes.router)``; if repo_control.py is the entry point of
+# the import, app.py runs while this module is still partial and would
+# fail without ``router`` already on the partial module.
 router = APIRouter()
+
+from src.web import app as _app  # noqa: E402 — must follow ``router = APIRouter()``
 
 _HISTORY_LIMIT = 100
 _TASK_PR_ID_PATTERN = re.compile(r"^PR-[A-Za-z0-9_.-]+$")

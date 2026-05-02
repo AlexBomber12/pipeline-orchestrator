@@ -80,53 +80,40 @@ templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 templates.env.globals["utcnow"] = lambda: datetime.now(timezone.utc)
 
 
+def _format_reset_unix(reset_unix: int | None) -> str:
+    """Render ``reset_unix`` as ``HH:MM UTC`` for resource-chip tooltips.
+
+    Returns ``"unknown"`` for ``None`` so the template still has a string
+    to interpolate; the chip template only renders the "Resets at" line
+    when ``reset_unix`` is truthy, so this branch is defensive.
+
+    Defined here rather than in ``src.web.routes.dashboard`` because the
+    Jinja filter has to be registered at module load time and the dashboard
+    module is partial at that point whenever the route module is the entry
+    point of the import (it imports this module via ``from src.web import
+    app as _app``).
+    """
+    if not reset_unix:
+        return "unknown"
+    return datetime.fromtimestamp(int(reset_unix), tz=timezone.utc).strftime(
+        "%H:%M UTC"
+    )
+
+
+templates.env.filters["format_reset"] = _format_reset_unix
+
 # Routers and shared helpers are imported AFTER the module-level constants
 # (CONFIG_PATH, REPOS_DIR, templates, etc.) are bound, because the route
 # modules reference this module via ``from src.web import app as _app`` and
 # expect those attributes to exist when route handlers fire at request time.
+#
+# Only module-level imports (``import ... as ...``) are used for the route
+# modules — any ``from src.web.routes.<name> import <symbol>`` would access
+# attributes on a partially initialized module whenever the route module is
+# the entry point of the import (see PEP 562 ``__getattr__`` below for the
+# backward-compatible re-exports tests rely on).
 from src.web.routes import dashboard as _dashboard_routes  # noqa: E402
 from src.web.routes import repo_control as _repo_control_routes  # noqa: E402
-from src.web.routes.dashboard import (  # noqa: E402,F401
-    _active_rate_limit_coder,
-    _alert_reference_time,
-    _budget_chip,
-    _build_activity_feed,
-    _build_alerts,
-    _build_recent_graphql_burns_view,
-    _build_resources_view,
-    _claude_usage_chip,
-    _coder_rate_limit_supported,
-    _compute_stats,
-    _daemon_default_coder_name,
-    _effective_coder_name,
-    _exit_reason_classes,
-    _exit_reason_label,
-    _format_alert_duration,
-    _format_duration_ms,
-    _format_history_time,
-    _format_reset_unix,
-    _most_recent_transition_into,
-    _parse_history_time,
-    _parse_iso8601,
-    _profile_parts,
-    _recent_repo_metrics_payload,
-    _repo_badge_abbrev,
-    _repo_badge_style,
-    _repo_coder_form_value,
-    _repo_template_context,
-    _resource_zone,
-    _serialize_run_record,
-)
-from src.web.routes.repo_control import (  # noqa: E402,F401
-    _append_history_entry,
-    _apply_repo_control_update,
-    _coder_display_name,
-    _publish_history_entry_event,
-    _RepoStateMutationError,
-    _resolve_repo_task_path,
-    _resume_event_message,
-    _update_repo_pause_state,
-)
 from src.web.services.repo_state import (  # noqa: E402,F401
     _default_repo_state,
     _find_repo_config_by_name,
@@ -135,7 +122,68 @@ from src.web.services.repo_state import (  # noqa: E402,F401
     get_repo_state,
 )
 
-templates.env.filters["format_reset"] = _format_reset_unix
+_DASHBOARD_REEXPORTS = frozenset(
+    {
+        "_active_rate_limit_coder",
+        "_alert_reference_time",
+        "_budget_chip",
+        "_build_activity_feed",
+        "_build_alerts",
+        "_build_recent_graphql_burns_view",
+        "_build_resources_view",
+        "_claude_usage_chip",
+        "_coder_rate_limit_supported",
+        "_compute_stats",
+        "_daemon_default_coder_name",
+        "_effective_coder_name",
+        "_exit_reason_classes",
+        "_exit_reason_label",
+        "_format_alert_duration",
+        "_format_duration_ms",
+        "_format_history_time",
+        "_most_recent_transition_into",
+        "_parse_history_time",
+        "_parse_iso8601",
+        "_profile_parts",
+        "_recent_repo_metrics_payload",
+        "_repo_badge_abbrev",
+        "_repo_badge_style",
+        "_repo_coder_form_value",
+        "_repo_template_context",
+        "_resource_zone",
+        "_serialize_run_record",
+    }
+)
+
+_REPO_CONTROL_REEXPORTS = frozenset(
+    {
+        "_append_history_entry",
+        "_apply_repo_control_update",
+        "_coder_display_name",
+        "_publish_history_entry_event",
+        "_RepoStateMutationError",
+        "_resolve_repo_task_path",
+        "_resume_event_message",
+        "_update_repo_pause_state",
+    }
+)
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily resolve names re-exported from route submodules.
+
+    Eagerly importing them with ``from src.web.routes.<name> import ...``
+    would create a circular import: each route module imports back into
+    this one via ``from src.web import app as _app``, so attribute access
+    on a partial module raises ``ImportError`` whenever the route module
+    is the entry point of the import. Resolving lazily defers the lookup
+    until both modules have finished initializing.
+    """
+    if name in _DASHBOARD_REEXPORTS:
+        return getattr(_dashboard_routes, name)
+    if name in _REPO_CONTROL_REEXPORTS:
+        return getattr(_repo_control_routes, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _build_coder_rows(
@@ -850,7 +898,9 @@ async def put_repo_detail_coder(
             affected_repo_names=[name],
             event_type="settings",
         )
-    context = await _repo_template_context(name, redis_client)
+    context = await _dashboard_routes._repo_template_context(
+        name, redis_client
+    )
     return templates.TemplateResponse(
         request,
         "components/repo_summary.html",
