@@ -47,8 +47,8 @@ cleanup only:
 
 `CODING`, `FIX`, and `MERGE` are not dispatched by the run_cycle state-machine entry point. They are invoked inline from inside other handlers:
 
-- `CODING` is invoked from `handle_idle` when a new task is selected. It runs to completion within the same cycle and then transitions to `WATCH` (PR created) or `IDLE` (no PR yet).
-- `FIX` is invoked from `handle_watch` when CHANGES_REQUESTED or CI failure is detected. It runs to completion and transitions back to `WATCH`.
+- `CODING` is invoked from `handle_idle` when a new task is selected. The happy-path exit is `WATCH` (PR created); off-path exits are `HUNG` (subprocess timeout / no-push circuit breaker) and `PAUSED` (coder rate-limit). `CODING` does not assign `IDLE` directly.
+- `FIX` is invoked from `handle_watch` when CHANGES_REQUESTED or CI failure is detected. The happy-path exit is `WATCH` (commits pushed); other exits are `IDLE` (nothing to fix or task cleared), `HUNG` (subprocess timeout / circuit breaker), and `PAUSED` (coder rate-limit). A nested cycle can also re-enter `FIX`.
 - `MERGE` is documented as a legacy enum value with no live transition path. Merges happen inline inside `handle_watch::handle_merge`.
 
 This means the run_cycle dispatch table in `runner.py:1361-1377` lists 5 states (IDLE, WATCH, HUNG, PAUSED, ERROR), but the operator-visible state machine has 8 substates because dashboards reflect CODING and FIX during their inline execution.
