@@ -111,9 +111,9 @@ class CodingMixin:
             breach_run_id=breach_run_id,
         )
         coder_kwargs: dict[str, object] = {
+            **plugin_run_kwargs,
             "timeout": self.app_config.daemon.planned_pr_timeout_sec,
             "on_process_start": self._track_current_coder_process,
-            **plugin_run_kwargs,
         }
         cli_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
             plugin.run_planned_pr(

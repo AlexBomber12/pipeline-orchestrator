@@ -222,3 +222,121 @@ def test_handle_fix_dispatches_to_fake_plugin(
     # head_after via the _patch_subprocess defaults), so the runner
     # transitions to WATCH after recording the push.
     assert runner.state.state == PipelineState.WATCH
+
+
+class _OverridingPlugin(FakeCoderPlugin):
+    """Plugin whose ``build_run_kwargs`` returns handler-owned keys.
+
+    Used to verify that handler keys remain authoritative when a plugin
+    accidentally (or maliciously) emits ``timeout`` / ``on_process_start``.
+    """
+
+    SENTINEL_TIMEOUT = 1
+    SENTINEL_HOOK = staticmethod(lambda proc: None)
+
+    def build_run_kwargs(
+        self,
+        *,
+        daemon_config: DaemonConfig,
+        breach_dir: str | None = None,
+        breach_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "model": "fake-1",
+            "timeout": self.SENTINEL_TIMEOUT,
+            "on_process_start": self.SENTINEL_HOOK,
+        }
+
+
+def test_handle_coding_handler_keys_override_plugin_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plugin-supplied ``timeout`` / ``on_process_start`` must not win.
+
+    Daemon-owned safety knobs (CODING timeout, process tracking hook)
+    have to remain authoritative even when ``build_run_kwargs`` returns
+    them — otherwise stop/kill behavior breaks.
+    """
+    h._patch_subprocess(monkeypatch)
+    fake = _OverridingPlugin()
+    opened_pr = PRInfo(
+        number=42,
+        branch="pr-001",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [opened_pr],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+
+    runner = h._make_runner()
+    runner._registry.register(fake)  # type: ignore[arg-type]
+    runner._get_coder = (  # type: ignore[method-assign]
+        lambda allow_exploration=False: ("fake", fake)
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    call = fake.run_planned_pr_calls[0]
+    assert call["timeout"] == runner.app_config.daemon.planned_pr_timeout_sec
+    assert call["timeout"] != _OverridingPlugin.SENTINEL_TIMEOUT
+    assert call["on_process_start"] == runner._track_current_coder_process
+    assert call["on_process_start"] is not _OverridingPlugin.SENTINEL_HOOK
+
+
+def test_handle_fix_handler_keys_override_plugin_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plugin-supplied ``on_process_start`` must not win in FIX.
+
+    FIX's process-tracking hook drives stop/idle/external-state control;
+    a plugin that emits the same key cannot be allowed to overwrite it.
+    """
+    h._patch_subprocess(monkeypatch)
+    fake = _OverridingPlugin()
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_branch_last_push_time",
+        lambda repo, number: None,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, number: None,
+    )
+
+    runner = h._make_runner()
+    runner._registry.register(fake)  # type: ignore[arg-type]
+    runner._get_coder = (  # type: ignore[method-assign]
+        lambda allow_exploration=False: ("fake", fake)
+    )
+    runner.state.current_pr = PRInfo(
+        number=99,
+        branch="pr-001",
+        ci_status=CIStatus.FAILURE,
+        review_status=ReviewStatus.PENDING,
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    call = fake.fix_review_calls[0]
+    assert call["on_process_start"] == runner._track_current_coder_process
+    assert call["on_process_start"] is not _OverridingPlugin.SENTINEL_HOOK

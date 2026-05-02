@@ -739,8 +739,8 @@ class FixMixin(BreachMixin):
 
         heartbeat = asyncio.create_task(self._publish_while_waiting("FIX"))
         fix_kwargs: dict[str, object] = {
-            "on_process_start": self._track_current_coder_process,
             **plugin_run_kwargs,
+            "on_process_start": self._track_current_coder_process,
         }
         if self.state.current_pr is not None:
             extra_context = await self._build_fix_feedback_context(
