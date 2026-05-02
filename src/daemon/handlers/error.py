@@ -189,10 +189,8 @@ class ErrorMixin:
         except Exception:
             snapshot = None
         if snapshot and (
-            snapshot.session_percent
-            >= self.app_config.daemon.rate_limit_session_pause_percent
-            or snapshot.weekly_percent
-            >= self.app_config.daemon.rate_limit_weekly_pause_percent
+            snapshot.session_percent >= plugin.default_session_pause_percent
+            or snapshot.weekly_percent >= plugin.default_weekly_pause_percent
         ):
             if context != self._error_skip_context:
                 self._error_skip_policy.reset(self)

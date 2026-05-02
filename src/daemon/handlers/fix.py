@@ -752,8 +752,8 @@ class FixMixin(BreachMixin):
             fix_kwargs.update(
                 breach_dir=breach_dir,
                 breach_run_id=breach_run_id,
-                session_threshold=self.app_config.daemon.rate_limit_session_pause_percent,
-                weekly_threshold=self.app_config.daemon.rate_limit_weekly_pause_percent,
+                session_threshold=plugin.default_session_pause_percent,
+                weekly_threshold=plugin.default_weekly_pause_percent,
             )
         claude_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
             plugin.fix_review(

@@ -15907,7 +15907,9 @@ def test_handle_error_skips_ai_diagnosis_when_claude_session_is_limited(
         _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
     )
     runner = _make_runner(coder=CoderType.CODEX)
-    runner.app_config.daemon.rate_limit_session_pause_percent = 80
+    monkeypatch.setattr(
+        claude_plugin_module.ClaudePlugin, "default_session_pause_percent", 80
+    )
     runner._claude_usage_provider = _FakeUsageProvider(
         snapshot=UsageSnapshot(
             session_percent=90,
@@ -15947,7 +15949,9 @@ def test_handle_error_honors_claude_rate_limit_when_active_coder_is_claude(
         _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
     )
     runner = _make_runner()
-    runner.app_config.daemon.rate_limit_session_pause_percent = 80
+    monkeypatch.setattr(
+        claude_plugin_module.ClaudePlugin, "default_session_pause_percent", 80
+    )
     runner._claude_usage_provider = _FakeUsageProvider(
         snapshot=UsageSnapshot(
             session_percent=90,
@@ -16060,7 +16064,9 @@ def test_handle_error_soft_skip_caps_repeated_codex_retries(
         _async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
     )
     runner = _make_runner(coder=CoderType.CODEX)
-    runner.app_config.daemon.rate_limit_session_pause_percent = 80
+    monkeypatch.setattr(
+        claude_plugin_module.ClaudePlugin, "default_session_pause_percent", 80
+    )
     runner._claude_usage_provider = _FakeUsageProvider(
         snapshot=UsageSnapshot(
             session_percent=90,
@@ -16130,7 +16136,9 @@ def test_run_cycle_clears_soft_skip_budget_after_successful_non_error_cycle(
 
     runner = _make_runner(coder=CoderType.CODEX)
     runner._recovered = True
-    runner.app_config.daemon.rate_limit_session_pause_percent = 80
+    monkeypatch.setattr(
+        claude_plugin_module.ClaudePlugin, "default_session_pause_percent", 80
+    )
     runner._claude_usage_provider = _FakeUsageProvider(
         snapshot=UsageSnapshot(
             session_percent=90,

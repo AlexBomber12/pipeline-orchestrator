@@ -52,6 +52,16 @@ class CoderPlugin(Protocol):
         """
         ...
 
+    @property
+    def default_session_pause_percent(self) -> int:
+        """Session-tier rate-limit pause threshold for this plugin."""
+        ...
+
+    @property
+    def default_weekly_pause_percent(self) -> int:
+        """Weekly-tier rate-limit pause threshold for this plugin."""
+        ...
+
     async def diagnose_error(
         self,
         repo_path: str,
