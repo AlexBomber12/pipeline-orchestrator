@@ -46,24 +46,6 @@ def format_sse_comment(comment: str) -> bytes:
     return f":{comment}\n\n".encode("utf-8")
 
 
-def _isoformat_z(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def format_sse_replay_complete(subscribed_at: datetime) -> bytes:
-    """Serialize the boundary frame that ends history replay.
-
-    Emitted once per SSE connection between the replayed history batch and
-    the live pubsub forwarding loop. The client uses ``subscribed_at`` —
-    the server-side moment the pubsub subscription was established — as
-    the cutoff between events already reflected in the rendered page and
-    events that should fire live HTMX triggers, replacing a brittle
-    client-wall-clock comparison that broke under skew.
-    """
-    payload = json.dumps({"subscribed_at": _isoformat_z(subscribed_at)})
-    return f"event: replay_complete\ndata: {payload}\n\n".encode("utf-8")
-
-
 def _message_timestamp(message: str) -> datetime | None:
     """Return the event timestamp for well-formed repo event payloads."""
     try:
@@ -182,10 +164,6 @@ async def stream_repo_events(
                 if await _is_disconnected(request):
                     return
                 yield format_sse_event(message)
-
-            if await _is_disconnected(request):
-                return
-            yield format_sse_replay_complete(subscribed_at)
 
             last_keepalive = asyncio.get_running_loop().time()
 

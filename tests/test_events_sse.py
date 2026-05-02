@@ -17,22 +17,10 @@ from src.events.sse import (
     _message_timestamp,
     format_sse_comment,
     format_sse_event,
-    format_sse_replay_complete,
     stream_repo_events,
 )
 from src.web import app as web_app
 from src.web.app import app
-
-
-def _assert_replay_boundary(frame: bytes) -> None:
-    """Assert ``frame`` is the SSE boundary marker emitted between replay
-    history and live forwarding."""
-    assert frame.startswith(b"event: replay_complete\ndata: ")
-    assert frame.endswith(b"\n\n")
-    data_line = frame.decode("utf-8").splitlines()[1]
-    payload = json.loads(data_line[len("data: ") :])
-    assert isinstance(payload, dict)
-    assert isinstance(payload.get("subscribed_at"), str)
 
 
 class _FakePubSub:
@@ -130,16 +118,6 @@ def test_format_sse_helpers() -> None:
     assert format_sse_comment("keepalive") == b":keepalive\n\n"
 
 
-def test_format_sse_replay_complete_emits_subscribed_at_iso_z() -> None:
-    subscribed_at = datetime(2026, 4, 20, 15, 0, 0, tzinfo=timezone.utc)
-    frame = format_sse_replay_complete(subscribed_at)
-
-    assert frame == (
-        b'event: replay_complete\n'
-        b'data: {"subscribed_at": "2026-04-20T15:00:00Z"}\n\n'
-    )
-
-
 def test_message_timestamp_rejects_malformed_payloads() -> None:
     assert _message_timestamp('"not-an-object"') is None
     assert _message_timestamp('{"type":"progress_updated"}') is None
@@ -219,7 +197,6 @@ async def test_stream_repo_events_replays_history_then_forwards_live_messages() 
 
     assert await anext(stream) == format_sse_event(first)
     assert await anext(stream) == format_sse_event(second)
-    _assert_replay_boundary(await anext(stream))
 
     next_message = asyncio.create_task(anext(stream))
     pubsub = await _wait_for_pubsub(redis)
@@ -250,8 +227,6 @@ async def test_stream_repo_events_emits_keepalive_after_ignored_message() -> Non
         poll_interval=0.01,
     )
     stream = await stream
-
-    _assert_replay_boundary(await anext(stream))
 
     next_message = asyncio.create_task(anext(stream))
     pubsub = await _wait_for_pubsub(redis)
@@ -285,7 +260,6 @@ async def test_stream_repo_events_sanitizes_invalid_history_and_live_messages() 
     )
 
     assert await anext(stream) == b":invalid event payload\n\n"
-    _assert_replay_boundary(await anext(stream))
 
     next_message = asyncio.create_task(anext(stream))
     pubsub = await _wait_for_pubsub(redis)
@@ -335,7 +309,6 @@ async def test_stream_repo_events_returns_keepalive_without_extra_idle_sleep() -
     )
     stream = await stream
 
-    _assert_replay_boundary(await anext(stream))
     assert await anext(stream) == b":keepalive\n\n"
 
     request.disconnected = True
@@ -369,7 +342,6 @@ async def test_stream_repo_events_forwards_buffered_live_message_after_history_r
     await pubsub.messages.put({"data": buffered_message.encode("utf-8")})
 
     assert await anext(stream) == format_sse_event(buffered_message)
-    _assert_replay_boundary(await anext(stream))
     assert await anext(stream) == b":keepalive\n\n"
 
     request.disconnected = True
@@ -410,7 +382,6 @@ async def test_stream_repo_events_subscribes_before_history_without_replaying_du
 
     assert await anext(stream) == format_sse_event(old_message)
     assert await anext(stream) == format_sse_event(raced_message)
-    _assert_replay_boundary(await anext(stream))
     assert await anext(stream) == b":keepalive\n\n"
 
     request.disconnected = True
@@ -469,7 +440,6 @@ async def test_stream_repo_events_orders_buffered_and_history_messages_by_timest
     assert await anext(stream) == format_sse_event(buffered_older)
     assert await anext(stream) == format_sse_event(newer_history)
     assert await anext(stream) == format_sse_event(newest_history)
-    _assert_replay_boundary(await anext(stream))
     assert await anext(stream) == b":keepalive\n\n"
 
     request.disconnected = True
@@ -527,7 +497,6 @@ async def test_stream_repo_events_orders_mixed_naive_and_aware_replay_timestamps
     assert await anext(stream) == format_sse_event(naive_history)
     assert await anext(stream) == format_sse_event(buffered_aware)
     assert await anext(stream) == format_sse_event(aware_history)
-    _assert_replay_boundary(await anext(stream))
     assert await anext(stream) == b":keepalive\n\n"
 
     request.disconnected = True
@@ -795,7 +764,6 @@ async def test_stream_repo_events_stops_cleanly_when_live_reads_fail() -> None:
 
     pubsub.get_message = _failing_get_message  # type: ignore[method-assign]
 
-    _assert_replay_boundary(await anext(stream))
     try:
         await anext(stream)
     except StopAsyncIteration:

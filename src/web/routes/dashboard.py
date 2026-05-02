@@ -47,6 +47,21 @@ _ACTIVE_RUN_STATES = {
 }
 
 
+def _page_rendered_at_iso() -> str:
+    """Server-side ISO-Z timestamp embedded in pages with a live SSE
+    consumer. Clients compare event timestamps to this cutoff to decide
+    whether a frame is already reflected in the rendered HTML or
+    represents a fresh update — anchoring suppression to server time
+    avoids both client-clock skew and the page-render→SSE-subscribe gap
+    in which legitimate live events would otherwise be discarded.
+    """
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
 def _daemon_default_coder_name(config: AppConfig) -> str:
     """Return the daemon-level default coder name."""
     return config.daemon.coder.value
@@ -735,6 +750,7 @@ async def index(request: Request) -> HTMLResponse:
             "latest_alert": latest_alert,
             "redis_warning": redis_warning,
             "resources": resources,
+            "page_rendered_at": _page_rendered_at_iso(),
         },
     )
 
@@ -871,6 +887,7 @@ async def repo_detail(request: Request, name: str) -> HTMLResponse:
             "title": name,
             **context,
             "events": list(context["repo"].history),
+            "page_rendered_at": _page_rendered_at_iso(),
         },
     )
 
