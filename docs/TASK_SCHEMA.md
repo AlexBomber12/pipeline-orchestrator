@@ -1,5 +1,7 @@
 # Task file schema (`tasks/PR-*.md`)
 
+**Note (2026-05-01):** This document describes the current production task header format. A future Phase 1 schema migration is planned that will introduce YAML frontmatter and Linear-style status vocabulary (queued, in_progress, in_review, merged, blocked, canceled). Until that migration ships, the header format below is the canonical schema.
+
 Every PR has a corresponding task file under `tasks/`. The header at the
 top of the file is parsed by `src/queue_parser.py:parse_task_header` and
 must contain the following fields:

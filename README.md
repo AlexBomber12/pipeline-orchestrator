@@ -1,7 +1,6 @@
 # Pipeline Orchestrator
 
-Autonomous AI development pipeline that drives a Claude Code agent through a queue
-of pre-planned PRs against one or more GitHub repositories.
+Pipeline orchestrator daemon that drives Claude Code or Codex CLI agents through PLANNED PR and FIX FEEDBACK workflows.
 
 ## Architecture
 
@@ -38,7 +37,10 @@ On first run, log in to the tools that the daemon shells out to:
 ```sh
 docker compose exec daemon gh auth login
 docker compose exec daemon claude login
+docker compose exec daemon codex login
 ```
+
+Authenticate either Claude Code (`claude login`) or Codex CLI (`codex login`) depending on which coder a repo is configured to use; both can be authenticated to support fallback. The daemon's auth probe is implemented in `src/coders/codex.py::check_auth` and runs `codex login status` to verify the Codex session.
 
 The dashboard is then available at http://localhost:8000.
 

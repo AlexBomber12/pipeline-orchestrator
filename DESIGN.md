@@ -37,7 +37,7 @@ Current implementation is narrower. Only the Coder role has concrete in-process 
 9. CLI retry policy belongs in shared transient handling, not at individual call sites. When new transient failure patterns are discovered they should be added to the shared retry mechanism rather than patched into one-off command wrappers. Introduced in PR-054.
 10. Task files are the source of truth for planned work. `tasks/QUEUE.md` exists for visibility and orchestration, but after PR-088 its canonical content is generated from structured task headers rather than maintained as an independent planning artifact. Introduced in PR-084 through PR-088.
 11. Auto-queue selection must respect explicit dependency ordering plus task priority. Eligible work is computed from structured headers, and ordering is priority first, then PR number. Introduced in PR-086 and PR-087.
-12. The dashboard is read-only and must not become an agent surface. It renders state from Redis and configuration, and should not make AI calls or own orchestration decisions. This is a repo-level product invariant reflected in the current FastAPI app and deployment model.
+12. The web service is an operator control plane. It may mutate config, pause/stop/resume repos, write coder/repo settings, stage trusted task uploads, and apply onboarding scaffolds. It must not make AI/coder calls or own orchestration policy. AI orchestration runs exclusively in the daemon process.
 
 ## 5. Self-healing invariants
 
@@ -141,7 +141,7 @@ The state model supports both legacy whole-daemon limits and coder-specific limi
 
 The dashboard is a FastAPI app with Jinja2 templates and HTMX polling. It is operationally important but intentionally narrow:
 
-- it is read-only with respect to pipeline execution;
+- it does not run AI/coder subprocesses or own orchestration policy;
 - it renders repo snapshots from Redis, falling back to synthetic `PREFLIGHT` or `IDLE` states when Redis is unavailable;
 - it exposes configuration editing and task upload flows, but it does not act as an AI runtime.
 

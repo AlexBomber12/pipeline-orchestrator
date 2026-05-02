@@ -175,7 +175,7 @@ These are non-negotiable contracts:
   - Auth tokens: `/data/auth/claude/`, `/data/auth/gh/`
   - Secrets: `/data/secrets/`
 - Docker Compose defines 3 services: `web` (FastAPI dashboard), `daemon` (pipeline state machine), `redis` (state bridge).
-- Dashboard is read-only, zero AI, zero tokens.
+- Web service is an operator control plane (mutates config, pauses repos, accepts uploads). It must not run AI/coder subprocesses or own orchestration policy.
 - Daemon is stateless: recovers from `tasks/QUEUE.md` + GitHub introspection on restart. Redis remains the state bridge between `web` and `daemon` during normal operation.
 - Config lives in `config.yml` at project root.
 
@@ -209,11 +209,7 @@ Artifacts are generated for Codex review but excluded from commits by .gitignore
 
 <!-- pipeline-orchestrator: managed BEGIN branch_naming -->
 ## Branch naming
-- PLANNED: use `Branch:` from the active `tasks/PR-*.md` as the source of truth.
-- If `Branch:` is missing, use `pr-<sanitized-pr-id>`:
-  - lowercase
-  - replace `.` with `-`
-  - allow only `[a-z0-9-]`
+- PLANNED: use `Branch:` from the active `tasks/PR-*.md` as the source of truth. Branch is required by the parser; tasks without Branch are rejected. There is no fallback.
 - MICRO: `micro-YYYYMMDD-<short-slug>`
 <!-- pipeline-orchestrator: managed END branch_naming -->
 
