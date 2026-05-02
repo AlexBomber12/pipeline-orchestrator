@@ -2,9 +2,9 @@
 
 Живой документ. Обновляется после каждой merge'нутой волны и после каждой chat-session.
 
-Последнее обновление: 2026-05-01 (PR-180..PR-207 shipped — все 28 PR merged. Multi-repo isolation audit complete, parallel run_cycle in main loop deployed. Foundation Sprint 36 PR specs generated for PR-208..PR-236 batch — internal architecture cleanup. Architectural future work section added for post-Foundation: AGENTS template scope, per-repo config, onboarding wizard, CI script generator MICRO PR. Onboarding of megaraid-dashboard и sms-gateway-v2 actively in progress; reconciled AGENTS.md files prepared, scripts/ci.sh manual creation required pre-onboarding due to scaffolder stub trap).
+Последнее обновление: 2026-05-02 (OBS-BE scope расширен: cause-of-CANCELED preservation для всех путей, не только ESCALATE. Storage `cancellation:{repo_name}:{task_id}`, TTL via `_TTL_SECONDS` из metrics.py, UI inline-expand. Cancellation policy section добавлена: behaviour matrix CRASH/ESCALATE/TIMEOUT/INFRA × Active/Off, layered SignalSource Protocol с heartbeat + manual override + active hours config, Human Availability indicator как non-negotiable UI requirement, dependency-aware blocked_set, dashboard sort by dependents_count, Variant A confirmed для transition. v1.1 refinements: 4-state visual scheme, expected-wait-time differentiation Red vs Cross, welcome-back digest modal. Vision C "Orchestrator Companion App" desktop client как parallel product surface. Vision D "Conversational morning triage" через Telegram bot 4-stage gating (D.1 digest push opportunistic post-v1, D.2 interactive triage post-Vision-A, D.3 voice agent far horizon, D.4 telephony if Vision D becomes core). Wave 5 cumulative ~16h над OBS-AW + OBS-BB + OBS-BC).
 
-Предыдущие: 2026-04-29 (full roadmap rewrite на основе Implementation Audit), 2026-04-28 (sigkill recovery test multi-race resolved via PR-228/PR-232/PR-234/PR-236; production daemon deployed on fresh main; GraphQL quota burn analyzed; onboarding test subjects identified), 2026-04-27 (OBS-AA test pollution v1 misdiagnosis + v2 docker-exec fix; OBS-Y premature merge; Multi-tier agent direction; OBS-Z Codex EYES race), 2026-04-26 (Sprint F1.0 + PR-156/157 + PR-158/159 merged; Variant D direction; Development model & Layer 2 substrate observations), 2026-04-24 (after code audit zip __27__).
+Предыдущие: 2026-05-01 (PR-180..PR-207 shipped, все 28 PR merged. Multi-repo isolation audit complete, parallel run_cycle in main loop deployed. Foundation Sprint 36 PR specs generated for PR-208..PR-236 batch, internal architecture cleanup. Architectural future work section added for post-Foundation: AGENTS template scope, per-repo config, onboarding wizard, CI script generator MICRO PR. Onboarding of megaraid-dashboard и sms-gateway-v2 actively in progress; reconciled AGENTS.md files prepared, scripts/ci.sh manual creation required pre-onboarding due to scaffolder stub trap), 2026-04-29 (full roadmap rewrite на основе Implementation Audit), 2026-04-28 (sigkill recovery test multi-race resolved via PR-228/PR-232/PR-234/PR-236; production daemon deployed on fresh main; GraphQL quota burn analyzed; onboarding test subjects identified), 2026-04-27 (OBS-AA test pollution v1 misdiagnosis + v2 docker-exec fix; OBS-Y premature merge; Multi-tier agent direction; OBS-Z Codex EYES race), 2026-04-26 (Sprint F1.0 + PR-156/157 + PR-158/159 merged; Variant D direction; Development model & Layer 2 substrate observations), 2026-04-24 (after code audit zip __27__).
 
 ---
 
@@ -95,6 +95,23 @@ PR-228/PR-232/PR-234/PR-236 all merged before 2026-04-29.
 - OBS-BC (daemon escalates on infra-failure CI runs without classifying failure type): **OPEN, medium severity** — observed 2026-05-02 morning on pipeline-orchestrator PR-219b. CI failed because GitHub Actions runner could not resolve `azure.archive.ubuntu.com` to fetch apt packages for Playwright chromium font dependencies. This is an **infra-failure** (external network glitch on Microsoft Azure mirror or GitHub runner side), **not a code-failure** in the PR. Coder correctly diagnosed root cause in FIX FEEDBACK output: "Confirmed — the failure is in `playwright install --with-deps chromium` because the GitHub runner could not resolve azure.archive.ubuntu.com to fetch apt packages." Despite this, daemon escalated PR for manual review instead of retrying CI. **Same class of bug as OBS-BB and OBS-AX:** daemon accepts signal at face value without post-condition validation. Here it sees "CI failed" and escalates, without distinguishing flaky-infra-failure from real-code-failure. **This is the auto-classification failure category from strategy-conversation-summary.md (раздел 6, "Failures — flaky vs real regression vs env vs coder logic"), not yet implemented in code.** Fix approach: daemon classifies CI failure by parsing CI log; if classification is infra-related (network resolution, apt fetch, transient timeout), retry CI run before escalating; only escalate on classified real-failures (test assertion, lint error, type error, coder logic regression). Bandit could optionally learn classification from labeled history, but heuristic rules cover the common cases. ~2-3 PRs, ~5 daemon-hours. **Wave 5 alongside OBS-AW + OBS-BB recovery work.** Strategic significance: this is the missing piece that distinguishes "noise" from "signal" in churn metric — without it, infra-flakes inflate FIX iterations and pollute cost-per-merged-PR data, making bandit posteriors less reliable.
 - OBS-BD (gh label create fails when label already exists, daemon does not handle gracefully): **OPEN, low severity** — observed 2026-05-02 morning. Daemon attempted `gh label create escalated --color B60205 --description "Daemon escalated, manual review required"` during PR-219b escalation. Failed exit 1 with `label with name "escalated" already exists; use --force to update its color and description`. Daemon logged "skipped" and continued (functional behavior preserved — escalation worked sans label), but this is brittle. **Fix options:** (a) check `gh label list` before create, only create if absent; (b) catch "already exists" error specifically and treat as success; (c) use `gh label create --force` always, idempotent. Likely fix: option (b) — exception catch on the specific stderr pattern. ~1 PR, ~1h. **Wave 3 polish, low priority — does not block work.**
 - OBS-BE (daemon classifies coder ESCALATE output as CRASH, marks task CANCELED): **OPEN, medium-high severity** — observed 2026-05-02 morning on pipeline-orchestrator PR-231. Coder (Claude) made a **correct, deliberate escalation**: read task spec, identified that production-critical config values (incl. `usage_api_beta_header` which could break Anthropic auth) were not provided in any source (task file, config.production.yml, /data/secrets/, git history, prompt), noted internal contradiction in spec (fallback says "open draft PR" but AGENTS.md PR-196 forbids draft PRs), and exited with structured `ESCALATE:` message in stdout summarizing the reasoning. **This is exactly the escalation behavior we want.** However, daemon treated this as CRASH: event log entry "Task PR-231 crashed, marking CANCELED. Manually re-upload to retry." The escalation reasoning was **lost** — operator sees no indication of what coder needed, has to read raw stdout in some other surface to understand. **Two distinct fixes needed:** (1) Daemon parses coder stdout for `ESCALATE:` prefix and treats it as deliberate signal, transitions task to ESCALATED state (new state) or BLOCKED with reasoning preserved in event log; (2) UI surfaces escalation reasoning prominently in task card so operator can act on it without digging into raw logs. **Same class of bug as OBS-BC and OBS-BB:** daemon accepts signal at face value without parsing intent. Here the signal IS intent (deliberate, structured ESCALATE), but daemon's classifier doesn't recognize it as distinct from crash. ~2-3 PRs, ~5 daemon-hours. **Wave 5 alongside OBS-AW + OBS-BB + OBS-BC recovery work.** Strategic significance: ESCALATE is the **correct alternative** to coder freedom-bug (OBS-AE, OBS-AX, OBS-BB) — instead of guessing and pushing wrong code, coder explicitly hands control back to operator. This pattern should be **rewarded by daemon**, not classified as failure.
+
+  **Scope expanded 2026-05-02 (after operator session on CRASH preservation):** the underlying issue is generalization of finding 1 above. Daemon must preserve cause-of-CANCELED for **every** path into CANCELED, not only structured ESCALATE. The current generic event log line "Crashed during a prior run; re-upload the task file to retry" loses information regardless of which path was taken. Four source categories with distinct payloads:
+
+  1. **CRASH** (uncaught exception or non-zero exit without ESCALATE marker): payload is `exit_code` plus last N lines of stderr/stdout (suggested N=20).
+  2. **ESCALATE** (deliberate ESCALATE marker on last non-empty stdout line): payload is the one-line reason text.
+  3. **TIMEOUT** (per-cycle, per-PR, per-FIX, planned-PR overall budget): payload is which limit hit, duration elapsed, active phase at timeout (CODING / FIX / WATCH).
+  4. **INFRA** (subsystem fault before coder even ran, or during recovery): payload is subsystem identifier (gh, network, redis, github_app_token) plus error class.
+
+  **Storage model:** Redis key `cancellation:{repo_name}:{task_id}` containing `{category, reason_text, timestamp, pr_number_if_open, event_log_range_start_id, event_log_range_end_id}`. Naming aligns with existing per-repo scope-noun keys (`pipeline:{repo_name}`, `control:{repo_name}:*`, `upload:{repo_name}:pending`) per `docs/multi-repo-audit-2026-04-29.md`. NOT in task file: task files are TODO/DONE markers per Variant D direction, runtime state lives in Redis. **TTL = `_TTL_SECONDS` from `src/metrics.py:9`** (currently 90 days), reusing the existing long-term-metrics horizon constant rather than introducing a new magic number. If forensics window proves insufficient or excessive in practice, both metrics records and cancellation records adjust together via the single constant.
+
+  **UI surface:** click on the CANCELED badge expands an inline panel below the badge with category icon, reason text, timestamp, optional PR link, and a button "Open in event log" that scrolls or filters the live event log to the captured range. **NOT a tooltip:** by analogy with the toast-dismiss problem documented in OBS-AS (auto-dismiss too fast for operator to read), tooltip pattern would inherit the same invisibility on mouseout. Inline expand keeps content visible until operator clicks elsewhere.
+
+  **Operator preference recorded:** CANCELED is an acceptable terminal state when cause survives, allowing later forensics. The bug is loss of cause, not the CANCELED outcome itself. Re-upload of the same task file remains the recovery flow; this fix only adds a "what happened" surface around it.
+
+  **Revised estimate:** 3-4 PRs (one extra PR added for the multi-source category model and detection paths across the four entry points, plus the inline-expand UI), ~7 daemon-hours total. **Wave 5 sequencing unchanged.**
+
+  **Behaviour aspects** (when daemon goes ESCALATED vs CANCELED, operator availability signal, dependency-aware blocking, dashboard surfacing): covered separately in **Cancellation policy** section below. OBS-BE handles the storage/preservation problem; Cancellation policy handles the routing/policy problem. Both ship together in Wave 5.
 - OBS-BF (task generator produces internally-contradictory specs that violate established AGENTS.md rules): **OPEN, medium severity, root cause finding** — observed 2026-05-02 morning on PR-231 spec, surfaced by coder's ESCALATE reasoning. Task spec for PR-231 included a fallback instruction "Open a draft PR with TODO markers… wait for operator to fill in the values" but AGENTS.md and PR-196 establish hard rule "PRs must be created in ready state, not draft." Coder correctly flagged the contradiction. **Root cause:** task generator (whoever/whatever produced PR-231 spec — likely chat session like this one) did not have full context of AGENTS.md rules, so emitted instructions that conflict with established conventions. **This is a structural problem that grows with project age:** as the repo accumulates conventions, a generator without full rule context produces increasing rate of conflicting specs. Coder catches it via ESCALATE if smart enough; otherwise produces non-conforming PRs. **Fix approach:** (a) task generator must read AGENTS.md before producing spec; (b) automated linter on task files that checks for known anti-patterns ("open draft PR", "use --force", "skip CI", etc.); (c) longer-term, Sprint F2.1 SoT (Source of Truth direct instructions) where daemon validates task spec against AGENTS.md rules before accepting upload. ~2 PRs short-term (linter + generator-context-check), full Sprint F2.1 long-term. **Wave 4 vocabulary alongside OBS-AV** (both about task spec validation). Strategic: this is the **author's own task generation reliability problem**, distinct from coder reliability — surfaces only when sufficiently smart coder catches it via ESCALATE. With weaker coders, contradictory specs would silently produce non-conforming PRs (OBS-AX class).
 
 ### Memory items still actionable
@@ -109,6 +126,165 @@ PR-228/PR-232/PR-234/PR-236 all merged before 2026-04-29.
 - **N>=3 verification reruns rule:** для race condition fixes один зелёный CI run не валидация. Тест мог проходить на lucky timing до фикса. Require 3+ green reruns на same commit перед merge.
 - **Single-step on stateful operations:** rebase, merge, deploy не должны быть в `&&` chains. Each command output must be reviewed перед next.
 - **Read file before writing patch:** during long debug sessions, мой cached snapshot drift'ит от user actual state. Always re-read user current file перед generation patches.
+
+---
+
+## Cancellation policy (Wave 5 architectural decision, 2026-05-02)
+
+OBS-BE expanded scope captures cause-of-CANCELED preservation (the storage and surfacing question). This section captures the orthogonal behaviour question: when daemon hits ESCALATE/CRASH/TIMEOUT/INFRA, should it halt the queue (state=ESCALATED) or record the cause and continue with next pickable task (state=CANCELED). Decision depends on operator availability and queue dependency structure. Operator preference established 2026-05-02: CANCELED with cause preserved is acceptable terminal state, not failure mode.
+
+### Behaviour matrix
+
+Trigger × operator availability → daemon action.
+
+| Trigger | Operator: Active | Operator: Off |
+|---|---|---|
+| ESCALATE marker (deliberate) | state=ESCALATED, halt task | state=CANCELED with cause, continue with next pickable |
+| CRASH (uncaught exception, non-zero exit) | state=ESCALATED, halt task | state=CANCELED, continue |
+| TIMEOUT (per-cycle, per-PR, per-FIX, planned-PR budget) | state=ESCALATED | state=CANCELED, continue |
+| INFRA (gh/network/redis/auth subsystem fault) | retry-aware per OBS-BC future fix; on final failure ESCALATED | retry-aware; on final failure CANCELED, continue |
+
+Justification for off-hours CANCELED + continue across all four categories: in worst case (queue is fully blocked because failed task has many dependents) daemon goes IDLE same as ESCALATED would; in best case (independent branches in queue) daemon makes progress instead of stalling the entire night. CANCELED-with-continue is strictly no worse than ESCALATED-and-halt in any scenario, given cause is preserved per OBS-BE expanded.
+
+### Operator availability signal
+
+**Layered design:**
+
+Layer 1 (always present): manual override. 3-state switch in dashboard top bar: `active` / `auto` / `off`. Click flips immediately. Persisted in Redis under `presence:override:global` (single global presence per orchestrator instance, not per-repo).
+
+Layer 2 (when override=auto): pluggable `SignalSource` Protocol. v1 ships with two implementations:
+- `HeartbeatSource`: introspection of UI requests. Daemon already routes XHR/SSE through `web/app.py`. If any operator-facing request received within last `presence_heartbeat_window_min` (default 30 min), considered active.
+- `ActiveHoursSource`: optional config field `daemon.operator_active_hours: "HH:MM-HH:MM Timezone"` (e.g. `"09:00-22:00 Europe/Rome"`). If unset, source returns "no opinion". If set, returns active when current time within window.
+
+**Composition rule:** if override = `active` or `off`, that wins (heartbeat and active hours ignored). If override = `auto`, OR-merge: active if ANY source says active. Conservative default; false positive on active is safer than false negative.
+
+**Failure-safe fallback:** if Redis unavailable to read override or heartbeat history, default to `active`. Pre-policy behaviour. Safer to halt on unknown than to silently CANCEL.
+
+Layer 3 (vision, NOT v1): additional `SignalSource` implementations such as `CompanionAppSource` (Vision C, see below), `CalendarSource` (Google/Outlook OAuth busy/free), `WebhookPresenceSource` (generic external automation input). Protocol designed to allow these; no implementations in v1. Reference for design hook stability.
+
+### Human Availability indicator (non-negotiable UI requirement)
+
+Status visibility is the operator preference that drives this entire section. Must be visually prominent at all times.
+
+**Placement:** persistent chip in dashboard top bar, visible across all views and all repo cards.
+
+**Visual states:**
+- Green chip "Active": override=active OR (override=auto AND any signal source says active).
+- Red chip "Off": override=off OR (override=auto AND all signal sources say off).
+- Yellow optional intermediate "Idle (auto)" if want to distinguish "auto-mode currently sleeping" from "explicit off". v1 may collapse Yellow into Red for simplicity; revisit if operator wants distinction.
+
+**Interaction:**
+- Click on chip: inline 3-state override switch opens (Active / Auto / Off). Click selection, switch persists.
+- Hover or expand: reasoning text. Examples: "Active because heartbeat at 14:23 from /api/states", "Off because no UI activity since 02:18 AND outside active_hours 09:00-22:00 Europe/Rome", "Active because manual override".
+
+**Invariant:** what operator sees on the chip is what daemon used for the most recent ESCALATED/CANCELED decision. No surface drift between displayed state and behaviour state. If this invariant is hard to maintain due to async update lag, daemon decisions log the chip state at decision time so post-hoc forensics can reconcile.
+
+**Refinement idea (recorded 2026-05-02, not v1 commitment):** operator proposed a richer 4-state visual scheme that maps onto the same 2-bucket behaviour:
+
+| Visual | Meaning | Source signal | Daemon behaviour |
+|---|---|---|---|
+| Green | Recently active | heartbeat within window OR override=active | ESCALATE on trigger |
+| Yellow | In active hours but not currently interacting | active_hours window matches AND heartbeat stale | ESCALATE on trigger |
+| Red with white stripe | Do-not-disturb (manual) | override=off (deliberate flip, e.g. focus mode) | SKIP on trigger |
+| Cross / X | Outside active hours, no manual override | active_hours window does not match AND heartbeat stale AND override=auto | SKIP on trigger |
+
+Green and Yellow oscillate based on heartbeat; transitions are smooth and frequent during the day. Red and Cross are stable until operator intervention or schedule boundary. The behavioural distinction is binary (ESCALATE vs SKIP), but the visual gives operator informative context about WHY daemon is in current mode without clicking through. Switching between manual states (Red) and automatic states (Cross/Green/Yellow) happens by clicking the chip; switching between Green and Yellow happens automatically as heartbeat ages.
+
+**Why recorded as refinement:** v1 design with 3 visual states (Green/Yellow-intermediate/Red) is mechanically simpler and ships first. Operator's 4-state scheme adds the Red-vs-Cross distinction (manual-do-not-disturb vs auto-off-hours) which improves operator awareness but is incremental UX polish rather than core behaviour change. Promote to v1 if implementation cost stays similar; otherwise ship as v1.1 refinement after baseline ships.
+
+**Secondary insight from 4-state distinction (added 2026-05-02):** Red and Cross differ not only visually but in expected wait time before operator returns. Red is a deliberate flip (focus mode, meeting, brief pause); operator likely returns within 30 to 90 minutes. Cross is schedule-driven off-hours (night, weekend); operator returns at the next active_hours boundary, likely 6 to 12 hours later. CANCELED accumulation differs by an order of magnitude between the two. Implication for v1.1 dashboard surfacing: secondary sort criterion can use the off-state-source to differentiate "short pause backlog" (small, urgent triage) from "overnight backlog" (large, needs grouped review panel rather than raw list). Operator returning from Red sees one or two CANCELED cards inline; operator returning from Cross sees a digest summary first, raw list on demand.
+
+### Dependency-aware blocked_set computation
+
+When daemon decides CANCELED + continue:
+
+1. Failed task = T.
+2. `blocked_set = {T} ∪ {tasks where Depends on transitively reaches T}` computed from current queue task headers.
+3. `pickable_set = current_queue \ blocked_set`.
+4. If `pickable_set` empty: daemon enters IDLE until either operator triages (override→active reveals dashboard with CANCELED + dependents) OR queue gains new tasks via upload. Same outcome as ESCALATED in this scenario; no regression.
+5. If `pickable_set` non-empty: daemon proceeds with next entry per existing selector logic. Independent branches keep moving.
+
+Note: dependency graph already exists for queue ordering (Depends on field is parsed in idle.py for selector). This computation reuses the same parse, no new data model required.
+
+### Dashboard surfacing on operator return
+
+When operator wakes (or override flips active) and reviews dashboard:
+
+Sort order for tasks needing triage (CANCELED + ESCALATED filtered view):
+1. ESCALATED (any) at top: "immediate, halt'd queue".
+2. CANCELED descending by `dependents_count`: most-blocking first ("5 PRs blocked").
+3. CANCELED ascending by timestamp within same dependents_count (older first).
+
+Each CANCELED card shows: category icon (CRASH/ESCALATE/TIMEOUT/INFRA per OBS-BE), reason text (preserved per OBS-BE storage), `dependents_count` badge if non-zero, "Open in event log" button to jump to captured range.
+
+### Welcome-back digest (v1.1 refinement, recorded 2026-05-02)
+
+Beyond the sorted triage list, operator returning after extended absence benefits from a **summary of what happened while away**, similar to "summary while you were away" patterns in mail and chat apps. Raw event log scrolling for hours of activity is a poor catch-up surface.
+
+**Trigger logic:**
+- Compute `away_duration = now - last_operator_active_timestamp`.
+- If `away_duration > 60 min` AND digest contains at least one notable event: surface digest modal on first dashboard load after operator return.
+- Otherwise (short pause, no notable events): no modal, dashboard renders normally.
+
+**Digest content sections:**
+
+1. **Completed while away:** count of merged PRs, top 3 by recency or by significance (linked PR numbers), aggregate cost-per-PR if metrics available.
+2. **Awaiting your review:** CANCELED entries (sorted per main triage rules), ESCALATED PRs (always top priority).
+3. **Currently in flight:** which repos are CODING/WATCH/FIX right now, last state transition timestamp.
+4. **Notable events:** rate limit hits, INFRA failures (with retry outcomes), ESCALATED transitions, repos that went HUNG and recovered.
+
+**Format:** HTMX modal with two actions: "Dismiss" (close modal, dashboard normal view), "Open triage view" (close modal, navigate to CANCELED+ESCALATED filtered view per Dashboard surfacing rules above).
+
+**Storage model:** digest computes on demand from existing data sources at modal-open time. No persistent digest storage needed:
+- Completed PRs: query `metrics:run:*` records where merge timestamp falls in away window.
+- CANCELED list: scan `cancellation:{repo_name}:*` keys per OBS-BE.
+- ESCALATED tasks: enumerate state machine for ESCALATED state.
+- In-flight: current `pipeline:{repo_name}` Redis state per repo.
+- Notable events: scan event log for last away_duration window, filter to flagged event categories.
+
+**Differentiation by off-state source (per 4-state refinement secondary insight above):** if return is from Red (short pause), digest threshold raises to e.g. 90 min so brief Red flips do not trigger modal. If return is from Cross (overnight off-hours window), digest triggers eagerly because operator typically wants full catch-up.
+
+**Estimate:** 1 PR additional to Cancellation policy v1.1, ~3 daemon-hours. Endpoint `/api/digest?since=<timestamp>` plus modal template plus trigger JS on dashboard load. Bundle with the 4-state visual refinement when v1.1 ships.
+
+### Transition behaviour at availability boundary
+
+**Variant A confirmed (operator decision 2026-05-02):**
+
+When daemon transitions auto-mode from off to active (heartbeat detected, or active_hours window opens, or override flipped):
+- No automatic state mutations on existing CANCELED tasks.
+- Operator sees Human Availability chip flip green; dashboard sort surfaces high-priority CANCELED entries; operator triages manually.
+
+Rationale: minimize automation across time boundaries. Mutating state from time alone breaks event log determinism (event without causing trigger from operator or coder action). Visible UX (chip flip + dependents_count sort) achieves same triage outcome cleaner.
+
+Variant B (auto-promote CANCELED → ESCALATED on active transition) deferred indefinitely. Implementation hook can be added later if Variant A proves insufficient in practice. Cost of revisiting later is small because the storage model already preserves cause; promotion is just a state transition over existing data.
+
+### Out of scope for v1
+
+- Push notifications (Telegram, email, OS native). Notification layer is separate concern, not part of orchestrator core. Companion app (Vision C) is the natural place for OS native notifications.
+- External signal source plugins beyond Protocol design. Teams presence, calendar busy/free, companion app pings: each is a separate v2+ deliverable.
+- Per-repo presence overrides ("repo X always halts on ESCALATE regardless of operator status"). Single global presence, single global behaviour. Per-repo override added only if specific scenario demands it.
+- Auto-retry CANCELED on timer. Re-upload remains operator-initiated; otherwise infinite loops on permanently-broken specs.
+- Predictive presence (calendar busy = scheduled meeting, daemon paused early). Heartbeat already covers this scenario implicitly (operator in meeting → not interacting with dashboard → eventually off).
+
+### Estimate
+
+3 PRs over Wave 5, on top of OBS-BE expanded (3-4 PRs ~7h):
+
+1. `SignalSource` Protocol + ManualOverrideSource + HeartbeatSource + ActiveHoursSource + composition + Redis presence keys + failure-safe fallback. ~4 daemon-hours.
+2. Human Availability indicator UI (chip placement + 3-state override switch + reasoning expand). ~2 daemon-hours.
+3. Dependency-aware blocked_set + dashboard sort by dependents_count + CANCELED inline-expand integration with OBS-BE cause display. ~3 daemon-hours.
+
+Total Cancellation policy v1: ~9 daemon-hours over 3 PRs.
+Combined with OBS-BE expanded: ~16 daemon-hours over 6-7 PRs.
+Wave 5 cumulative including existing OBS-AW + OBS-BB + OBS-BC: approximately 1.5-2 daemon-days when run alone.
+
+### Cross-references
+
+- **OBS-BE expanded:** storage model and detection paths for cause preservation. This section references the four categories (CRASH/ESCALATE/TIMEOUT/INFRA) defined there.
+- **OBS-AW:** per-repo HUNG recovery button. Adjacent UX work for stuck states; Cancellation policy assumes HUNG recovery is independent.
+- **OBS-BB:** FIX no-push deadlock recovery. Adjacent stuck-state work.
+- **OBS-BC:** CI infra-failure classification. Determines retry vs ESCALATED vs CANCELED for INFRA trigger category.
+- **Vision C (Orchestrator Companion App):** future `SignalSource` implementation candidate. Design hook in this section's Layer 3 keeps companion-app integration mechanically simple when product surface expands.
 
 ---
 
@@ -423,6 +599,75 @@ Human-in-the-loop release gate, не pipeline stage. Это **пятый actor**
 **Может выделиться в отдельный продукт.** Обоснование: Tester не требует самого pipeline-orchestrator'а для работы — он может работать с любым готовым кодом. Это standalone "Release Qualification Agent" / "Pre-Release AI QA". Separate positioning, separate pricing, separate moat.
 
 Пока — Vision. Без PR'ов, без Round'а, без конкретики. Returnить когда Round 3 + Round 4 закрыты и baseline стабилен.
+
+### Orchestrator Companion App (Vision C, added 2026-05-02)
+
+Cross-platform desktop client surfacing daemon state and presence outside the browser dashboard. Concept emerged from Cancellation policy discussion (2026-05-02) where operator noted that explicit availability signal supplied by operator is more robust than introspection-based heartbeat. Companion app would supply that explicit signal natively.
+
+**Form factor (initial sketch, not committed):**
+- Desktop client. Tauri preferred over Electron for binary size and Rust footprint. Cross-platform Linux/macOS/Windows.
+- Single primary window: Active/Off presence toggle (large, prominent), top 3 actionable items (CANCELED with high `dependents_count`, ESCALATED PRs, recent INFRA failures), live count of in-flight repos.
+- Pings daemon `/api/presence/heartbeat` every 60s when window focused; stops on minimize/quit. Implements `CompanionAppSource` per `SignalSource` Protocol from Cancellation policy section.
+- Optional native OS notifications on ESCALATED transition (opt-in per platform).
+
+**Mobile companion (iOS/Android):** later phase. Requires push notification backend (FCM/APNS) which is non-trivial for self-hosted deployments. Defer until desktop client validates the workflow.
+
+**Why deferred and why design hook only in v1:**
+- Wave 5 Cancellation policy ships `SignalSource` Protocol that already accommodates plugging in companion-app source. Mechanical integration cost when companion app is built later: write one Source class and register it.
+- Companion app itself is product-surface expansion, not orchestrator core. Deserves attention only when heartbeat + manual override v1 surfaces real gaps in operator workflow.
+- Build only if and when self-hosted operator base demands cross-machine awareness (notebook closed, daemon on home server, status visible from phone or work machine).
+
+**Estimate:** approximately 2-3 weeks for initial desktop client; a separate subproject outside Foundation Sprint, Wave 1-7, and Vision A streams. Not a roadmap PR series. Revisit when Vision A ships and product is stable enough that auxiliary surfaces are worth the maintenance overhead.
+
+### Conversational morning triage (Vision D, added 2026-05-02)
+
+Endgame product surface where operator interacts with orchestrator through natural conversation, primarily over Telegram (text + voice messages), instead of (or alongside) browser dashboard. Concept emerged from operator framing 2026-05-02: wake up, open Telegram, see overnight summary already waiting, reply with voice or text to triage. No keyboard, no Safari tabs, no manual UI.
+
+**Why this matters strategically:**
+
+Vision D is the **logical consumer** of the substrate already designed in Cancellation policy + OBS-BE expanded. The same `/api/digest`, `/api/cancellation/{repo}/{task}`, `/api/presence/*` endpoints that power browser modal also power conversational surface. JSON identical, render different: dashboard renders modal, Telegram bot renders narrative messages, future voice agent renders TTS.
+
+Strategic moat reinforcement: a competing orchestrator now needs to reproduce not only routing intelligence and measurement data, but also a structured-digest substrate without which voice/conversational layer is impossible to build cleanly. Voice surface is downstream proof that internal API design is right.
+
+**Stage gating (each stage shippable independently, each adds value):**
+
+**Stage D.1 — Telegram digest bot (close horizon, ~1-2 weekends).** Simple push notification flow: when daemon detects operator long-away return condition (per Cancellation policy welcome-back digest trigger), bot pushes a text message via Telegram with the same content the modal would show. Operator reads, switches context. No interactivity beyond reading. Stack: existing `python-telegram-bot` library, daemon registers a webhook endpoint, bot polls `/api/digest` on schedule or on operator-presence-transition Redis pub/sub. Implementation cost ~6-8 hours.
+
+**Stage D.2 — Telegram interactive triage (medium horizon, ~1-2 weeks).** Bot accepts text and voice replies. Voice transcribed via Whisper (local on DGX Spark to keep self-hosted property, OR OpenAI Whisper API for managed deployment). Reply intent parsed into action options shown for each CANCELED/ESCALATED entry: "re-upload", "permanently cancel", "rewrite spec", "show me the cause", "defer to tomorrow". Bot translates operator intent into orchestrator API calls. Implements `TelegramSessionSource` per `SignalSource` Protocol so a recent voice/text exchange counts as active heartbeat (presence flips green automatically when operator engages with bot). Implementation cost ~3-5 days.
+
+**Stage D.3 — full voice agent with reasoning narrative (far horizon).** Bot/agent generates spoken digest narratives ("PR-220 cancelled three hours ago because... it blocks 5 dependent PRs... last similar issue resolved by re-upload with production config... want me to do that?"), accepts free-form voice instructions ("re-upload PR-220 and skip PR-225 for today"), parses ambiguity and asks clarifying questions ("you said skip PR-225, that has 3 dependents, are you sure?"). Voice tone conversational rather than corporate. Implementation requires LLM-based dialogue manager on top of orchestrator API, a more substantial subproject. ~3-4 weeks.
+
+**Stack rationale:**
+
+Telegram-first (over iOS Shortcuts, Twilio/IVR, custom WebRTC):
+- Operator already heavy Telegram user (sms-gateway-v2 system memory).
+- Cross-platform (phone, desktop, web) without per-platform build.
+- Voice messages built-in primitive, no STT pipeline before custom processing.
+- Free for personal scale; bot infrastructure is one process.
+- Self-hosted compatible; bot runs as a sidecar service in same docker-compose stack.
+
+iOS Shortcuts + Siri considered: native feel, but iOS-only and brittle to OS updates. Defer as alternative client when D.2 ships.
+
+Twilio/IVR considered: closest to literal "позвонил по виртуальному помощнику", but adds telephony cost and infrastructure complexity disproportionate to MVP. Defer as Stage D.4 if Vision D proves valuable enough.
+
+**Cross-references:**
+
+- `/api/digest` from Cancellation policy welcome-back digest subsection: same endpoint, two consumers.
+- `cancellation:{repo_name}:{task_id}` Redis storage from OBS-BE expanded: bot reads cause text directly.
+- `SignalSource` Protocol from Cancellation policy: TelegramSessionSource registered alongside HeartbeatSource and ManualOverrideSource.
+- Vision C "Orchestrator Companion App": parallel product surface, not competing. Desktop visual surface and conversational voice surface address different operator contexts (focused work vs morning triage from bed).
+
+**Defer rationale and ordering:**
+
+Vision D is **architecturally close** because substrate exists; **strategically defer** because Vision A multi-vendor routing must ship first to make the product itself worth a conversational interface. Order: Vision A → Vision C (companion app, optional) → Vision D.1 (Telegram digest, low cost trial) → Vision D.2 (interactive triage, validates conversational UX) → Vision D.3 (voice agent, only if D.2 traction justifies).
+
+Stage D.1 specifically is **eligible for opportunistic implementation** at any point after Cancellation policy v1 ships, because cost is low (~1-2 weekends) and value is immediate for operator's own workflow. Does not need to wait behind Vision A; can run in parallel as personal-use improvement.
+
+**Estimate summary:**
+- D.1: ~6-8 hours, opportunistic post-Cancellation-policy-v1.
+- D.2: ~3-5 days, after Vision A initial vendor plugin ships.
+- D.3: ~3-4 weeks, requires demand validation from D.2 usage.
+- D.4 (telephony): only if Vision D becomes core product surface, not before.
 
 ---
 
