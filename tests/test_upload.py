@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import re
@@ -1516,3 +1517,15 @@ def test_sweep_handles_missing_root_files_and_stat_errors(
 
     monkeypatch.setattr(Path, "stat", _broken_stat)
     assert sweep_abandoned_staging(str(uploads), set(), max_age_hours=24) == 0
+
+
+def test_upload_route_helpers_resolve_via_module_getattr() -> None:
+    """Upload route helpers stay importable as ``web_app.X`` after PR-225b.
+
+    The helpers now live in ``src.web.routes.uploads`` and are re-exported
+    via :func:`src.web.app.__getattr__`; touching one of them keeps that
+    proxy branch exercised.
+    """
+    lock = web_app._get_upload_lock("coverage_repo")
+    assert isinstance(lock, asyncio.Lock)
+    assert callable(web_app._render_upload_error)

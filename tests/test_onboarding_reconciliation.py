@@ -414,3 +414,18 @@ def test_apply_returns_client_error_on_malformed_markers(
     payload = response.json()
     assert "Malformed managed markers" in payload["error"]
     assert target.read_text() == _MALFORMED_AGENTS_MD
+
+
+def test_onboarding_helpers_resolve_via_module_getattr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Onboarding helpers stay importable as ``web_app.X`` after PR-225b.
+
+    The helpers now live in ``src.web.routes.onboarding`` and are
+    re-exported via :func:`src.web.app.__getattr__`; touching one of
+    them keeps that proxy branch exercised.
+    """
+    repo_dir = _stub_repo(tmp_path, monkeypatch)
+    target = web_app._resolve_onboarding_target("example__alpha")
+    assert target == repo_dir / "AGENTS.md"
+    assert web_app._REPO_SLUG_PATTERN.fullmatch("example__alpha") is not None
