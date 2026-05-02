@@ -52,7 +52,6 @@ from src.events import publish_repo_event, publish_wake
 from src.events.sse import RepoEventsUnavailableError, stream_repo_events
 from src.keyspace import (
     cli_log_latest,
-    control_config_dirty,
     control_stop,
     pipeline_state,
     upload_pending,
@@ -68,6 +67,7 @@ from src.queue_parser import (
     parse_task_header,
 )
 from src.utils import repo_slug_from_url
+from src.web.services.config_updates import apply_config_mutation
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 CONFIG_PATH = os.environ.get("PO_CONFIG_PATH", "config.yml")
@@ -1398,10 +1398,14 @@ async def post_repo_detail_coder(
     except OSError as exc:
         return HTMLResponse(f"Failed to write config.yml: {exc}", status_code=503)
 
-    dirty_key = control_config_dirty(name)
+    await apply_config_mutation(
+        redis_client=redis_client,
+        affected_repo_names=[name],
+        event_type="coder_swap",
+    )
+
     state_key = pipeline_state(name)
     try:
-        await redis_client.set(dirty_key, "1")
         raw_state = await redis_client.get(state_key)
         if raw_state:
             state = RepoState.model_validate_json(raw_state)
@@ -1440,15 +1444,6 @@ async def post_repo_detail_coder(
         )
     except Exception:
         logger.warning("Failed to publish coder update event", exc_info=True)
-
-    try:
-        await publish_wake(redis_client, name, "coder_swap")
-    except Exception:
-        logger.warning(
-            "publish_wake failed for %s; daemon will pick up coder_swap on next tick",
-            name,
-            exc_info=True,
-        )
 
     current_state = await get_repo_state(name, redis_client, config_path=CONFIG_PATH)
     applies_after_current_pr = (
@@ -1982,6 +1977,18 @@ async def put_settings_daemon(
         return await _render_settings_daemon_error(
             request, f"Failed to write config.yml: {exc}", 503
         )
+
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is not None:
+        refreshed_cfg = load_config(CONFIG_PATH)
+        repo_names = [
+            repo_slug_from_url(repo.url) for repo in refreshed_cfg.repositories
+        ]
+        await apply_config_mutation(
+            redis_client=redis_client,
+            affected_repo_names=repo_names,
+            event_type="settings",
+        )
     return await _render_settings_daemon_response(request)
 
 
@@ -2297,6 +2304,14 @@ async def put_settings_repo(
         return _render_settings_error(request, message, status)
     except OSError as exc:
         return _render_config_write_error(request, exc)
+
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is not None:
+        await apply_config_mutation(
+            redis_client=redis_client,
+            affected_repo_names=[repo_slug_from_url(url)],
+            event_type="settings",
+        )
     return _render_settings_repo_list(request)
 
 
@@ -2330,14 +2345,11 @@ async def put_repo_detail_coder(
 
     redis_client = getattr(request.app.state, "redis", None)
     if redis_client is not None:
-        try:
-            await publish_wake(redis_client, name, "settings")
-        except Exception:
-            logger.warning(
-                "publish_wake failed for %s; daemon will pick up settings on next tick",
-                name,
-                exc_info=True,
-            )
+        await apply_config_mutation(
+            redis_client=redis_client,
+            affected_repo_names=[name],
+            event_type="settings",
+        )
     context = await _repo_template_context(name, redis_client)
     return templates.TemplateResponse(
         request,
