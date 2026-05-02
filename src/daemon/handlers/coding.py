@@ -270,31 +270,6 @@ class CodingMixin:
             )
             return
 
-        # Inspect branch surfaces before the PR lookup so an explicit
-        # divergence (``task_branch`` vs the actual checked-out branch
-        # or vs an existing PR head) is surfaced as a [BRANCH] event +
-        # explicit HUNG escalation, not silently degraded into the
-        # generic "PR not found for target branch" path. ``current_pr``
-        # is still ``None`` here, so only ``task_branch`` ↔
-        # ``current_git_branch`` divergence can fire.
-        ctx = BranchContext.from_runner(self)
-        if ctx.mismatch_reason is not None:
-            self.log_event(
-                f"[BRANCH] mismatch detected: {ctx.mismatch_reason}; "
-                f"{ctx.log_summary()}"
-            )
-            await self._save_current_run_record("error")
-            await self._escalate_to_hung(
-                f"Branch mismatch: {ctx.mismatch_reason}",
-                apply_escalated_label=False,
-                set_pr_escalated_flag=False,
-                log_message=(
-                    f"Branch mismatch: {ctx.mismatch_reason} "
-                    f"({ctx.log_summary()})"
-                ),
-            )
-            return
-
         # The coder just exited; if it ran ``gh pr create`` from its own
         # subprocess the daemon's ETag cache for ``repos/{repo}/pulls``
         # still reflects the pre-create state. Invalidate before polling
@@ -334,6 +309,35 @@ class CodingMixin:
         if await pause_for_stop_if_requested():
             return
         if candidate is None:
+            # Defer the branch-mismatch check until the PR lookup has
+            # completed: a successful coder run that exits on a
+            # different local branch (e.g. created and pushed
+            # ``task_branch``, opened the PR, then checked out
+            # ``main`` before exit) must still reach WATCH via the
+            # normal ``candidate is not None`` path. Only escalate on
+            # mismatch when no PR was found, so the divergence is
+            # surfaced as a [BRANCH] event instead of being silently
+            # collapsed into the case-A "did nothing" diagnostic.
+            # ``current_pr`` is still ``None`` here, so only
+            # ``task_branch`` ↔ ``current_git_branch`` divergence can
+            # fire.
+            ctx = BranchContext.from_runner(self)
+            if ctx.mismatch_reason is not None:
+                self.log_event(
+                    f"[BRANCH] mismatch detected: {ctx.mismatch_reason}; "
+                    f"{ctx.log_summary()}"
+                )
+                await self._save_current_run_record("error")
+                await self._escalate_to_hung(
+                    f"Branch mismatch: {ctx.mismatch_reason}",
+                    apply_escalated_label=False,
+                    set_pr_escalated_flag=False,
+                    log_message=(
+                        f"Branch mismatch: {ctx.mismatch_reason} "
+                        f"({ctx.log_summary()})"
+                    ),
+                )
+                return
             await self._diagnose_exit_zero_no_pr(
                 target_branch, coder_name, pause_for_stop_if_requested
             )
