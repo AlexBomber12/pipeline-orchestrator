@@ -20,8 +20,6 @@ import asyncio
 from typing import Any
 
 import pytest
-from src.daemon import runner as runner_module
-from src.daemon.handlers import fix as fix_module
 from src.models import PipelineState, PRInfo
 
 from tests.runner import _helpers as h
@@ -46,7 +44,7 @@ def _patch_label_calls(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
         gh_calls.append(cmd)
         return ""
 
-    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     return gh_calls
 
 
@@ -57,8 +55,7 @@ def test_default_args_park_in_hung_apply_label_no_comment(
     gh_calls = _patch_label_calls(monkeypatch)
     posted: list[tuple[str, int, str]] = []
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: posted.append((repo, number, body)),
     )
 
@@ -74,9 +71,7 @@ def test_default_args_park_in_hung_apply_label_no_comment(
     assert pr.is_escalated is True
     assert posted == []
     assert ["pr", "edit", "500", "--add-label", "escalated"] in gh_calls
-    assert any(
-        e["event"] == "[ESCALATE] park me" for e in runner.state.history
-    )
+    assert any(e["event"] == "[ESCALATE] park me" for e in runner.state.history)
     assert publish_calls == [None]
 
 
@@ -119,9 +114,7 @@ def test_apply_escalated_label_calls_pr_edit(
         )
     )
 
-    assert any(
-        cmd[:3] == ["label", "create", "escalated"] for cmd in gh_calls
-    )
+    assert any(cmd[:3] == ["label", "create", "escalated"] for cmd in gh_calls)
     assert ["pr", "edit", "502", "--add-label", "escalated"] in gh_calls
 
 
@@ -135,7 +128,7 @@ def test_label_apply_failure_still_sets_in_memory_flag(
             raise RuntimeError("gh down")
         return ""
 
-    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     runner = h._make_runner()
     pr = PRInfo(number=503, branch="pr-503")
@@ -147,22 +140,17 @@ def test_label_apply_failure_still_sets_in_memory_flag(
     assert label_applied is False
     assert pr.is_escalated is True
     assert runner.state.state == PipelineState.HUNG
-    assert any(
-        "failed to apply escalated label to PR #503: gh down"
-        in e["event"]
-        for e in runner.state.history
-    )
+    assert any("failed to apply escalated label to PR #503: gh down" in e["event"] for e in runner.state.history)
 
 
 def test_post_comment_on_pr_calls_post_comment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``post_comment_on_pr`` forwards the body to ``github_client.post_comment``."""
+    """``post_comment_on_pr`` forwards the body to ``comments.post_comment``."""
     _patch_label_calls(monkeypatch)
     posted: list[tuple[str, int, str]] = []
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: posted.append((repo, number, body)),
     )
 
@@ -190,7 +178,7 @@ def test_post_comment_failure_logged_not_raised(
     def boom(repo: str, number: int, body: str) -> None:
         raise RuntimeError("gh down")
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", boom)
+    monkeypatch.setattr("src.github.comments.post_comment", boom)
 
     runner = h._make_runner()
     pr = PRInfo(number=505, branch="pr-505")
@@ -205,11 +193,7 @@ def test_post_comment_failure_logged_not_raised(
     )
 
     assert runner.state.state == PipelineState.HUNG
-    assert any(
-        "failed to post escalation comment on PR #505: gh down"
-        in e["event"]
-        for e in runner.state.history
-    )
+    assert any("failed to post escalation comment on PR #505: gh down" in e["event"] for e in runner.state.history)
 
 
 def test_publish_state_called_at_end(
@@ -251,9 +235,7 @@ def test_error_message_override_clears_error_message(
     )
 
     assert runner.state.error_message is None
-    assert any(
-        e["event"] == "[ESCALATE] park me" for e in runner.state.history
-    )
+    assert any(e["event"] == "[ESCALATE] park me" for e in runner.state.history)
 
 
 def test_log_message_overrides_log_body(
@@ -274,9 +256,7 @@ def test_log_message_overrides_log_body(
     )
 
     assert runner.state.error_message == "stored"
-    assert any(
-        e["event"] == "[ESCALATE] logged." for e in runner.state.history
-    )
+    assert any(e["event"] == "[ESCALATE] logged." for e in runner.state.history)
 
 
 def test_set_pr_escalated_flag_false_skips_flag(
@@ -308,8 +288,7 @@ def test_no_current_pr_skips_label_and_comment(
     _patch_label_calls(monkeypatch)
     posted: list[Any] = []
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda *a, **kw: posted.append(a),
     )
 

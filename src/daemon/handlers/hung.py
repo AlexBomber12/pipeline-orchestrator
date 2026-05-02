@@ -10,8 +10,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from src import github_client
 from src.daemon import git_ops
+from src.github import comments as gh_comments
+from src.github import gh_runner, reactions
+from src.github import prs as gh_prs
 from src.models import PipelineState
 
 
@@ -23,7 +25,7 @@ def _author_already_requested_review(
 ) -> bool:
     """Treat author-trigger dedup as best-effort and fail open."""
     try:
-        return github_client.has_recent_codex_review_request(
+        return gh_comments.has_recent_codex_review_request(
             owner_repo,
             pr_number,
             pr_author=pr_author,
@@ -41,7 +43,7 @@ def _author_recent_review_requested_at(
 ) -> datetime | None:
     """Best-effort timestamp for a recent PR-author trigger on this head."""
     try:
-        return github_client.get_recent_codex_review_request_time(
+        return gh_comments.get_recent_codex_review_request_time(
             owner_repo,
             pr_number,
             pr_author=pr_author,
@@ -77,19 +79,19 @@ class HungMixin:
         suppress a needed mention.
         """
         try:
-            codex_reactions = github_client._get_codex_issue_reactions(
+            codex_reactions = reactions._get_codex_issue_reactions(
                 self.owner_repo, pr_number,
             )
         except Exception:
             return False
         eyes_reactions = [
             reaction for reaction in codex_reactions
-            if github_client._is_reaction_content(reaction, "eyes")
+            if reactions._is_reaction_content(reaction, "eyes")
         ]
         if not eyes_reactions:
             return False
         try:
-            last_push_time = github_client.get_pr_last_push_time(
+            last_push_time = gh_prs.get_pr_last_push_time(
                 self.owner_repo, pr_number,
             )
         except Exception:
@@ -99,7 +101,7 @@ class HungMixin:
         if last_push_time.tzinfo is None:
             last_push_time = last_push_time.replace(tzinfo=timezone.utc)
         for reaction in eyes_reactions:
-            reaction_time = github_client._parse_iso(
+            reaction_time = gh_runner._parse_iso(
                 reaction.get("created_at")
             )
             if reaction_time is None:
@@ -129,7 +131,7 @@ class HungMixin:
         except Exception:
             head_sha = None
         try:
-            metadata = github_client.get_pr_metadata(
+            metadata = gh_prs.get_pr_metadata(
                 self.owner_repo, pr_number
             )
             if isinstance(metadata, dict):
@@ -194,7 +196,7 @@ class HungMixin:
         try:
             if current_pr is not None and current_pr.number == pr_number:
                 current_pr.last_activity = datetime.now(timezone.utc)
-            github_client.post_comment(
+            gh_comments.post_comment(
                 self.owner_repo, pr_number, "@codex review"
             )
             self.log_event(
@@ -255,7 +257,7 @@ class HungMixin:
             # prior shape returned early on ``is_escalated`` and trapped
             # the runner there forever (Codex P1 on PR #222).
             try:
-                result = github_client.run_gh(
+                result = gh_runner.run_gh(
                     [
                         "pr",
                         "view",
@@ -304,7 +306,7 @@ class HungMixin:
             and current_pr is not None
         ):
             try:
-                github_client.post_comment(
+                gh_comments.post_comment(
                     self.owner_repo,
                     current_pr.number,
                     "@codex review",

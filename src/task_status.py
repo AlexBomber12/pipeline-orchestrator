@@ -7,7 +7,7 @@ import subprocess
 from collections.abc import Iterable
 from pathlib import Path
 
-from src.github_client import extract_queue_pr_id
+from src.github.prs import extract_queue_pr_id
 from src.models import PRInfo, QueueTask, TaskStatus
 from src.queue_parser import (
     _PR_ID_RE,

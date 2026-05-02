@@ -1,12 +1,8 @@
-"""src.github package — split out from src.github_client during PR-226a/b.
+"""GitHub API helpers split out of the legacy ``github_client`` module.
 
-Foundation submodule (gh_runner) plus three thematic API-domain submodules
-(prs, checks, reviews). The remaining four domains (reactions, comments,
-rate_limit, cache) still live in src.github_client until PR-226b finishes
-the migration; this package re-exports the moved domains so callers can
-opt into the new import surface incrementally.
+Foundation submodule (``gh_runner``) plus thematic API-domain submodules
+(``cache``, ``checks``, ``comments``, ``prs``, ``rate_limit``,
+``reactions``, ``reviews``). PR-226b finished the migration: the legacy
+``github_client`` shim is gone, callers must import from
+``src.github.<module>`` explicitly.
 """
-
-from src.github import checks, gh_runner, prs, reviews
-
-__all__ = ["checks", "gh_runner", "prs", "reviews"]

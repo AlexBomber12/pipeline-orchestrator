@@ -1,9 +1,8 @@
 """GitHub commit/check-run status helpers.
 
 Owns the REST ``check-runs`` + commit ``status`` fetch path that powers the
-WATCH gate's CI status read. Cache primitives (``_etag_get``,
-``_gh_api_paginated``) still live in ``src.github_client`` until PR-226b;
-this module accesses them via ``from src import github_client``.
+WATCH gate's CI status read. Reuses ``cache._etag_get`` and
+``cache._gh_api_paginated`` for ETag-conditional REST reads.
 """
 
 from __future__ import annotations
@@ -11,6 +10,7 @@ from __future__ import annotations
 import json
 import time
 
+from src.github import cache
 from src.models import CIStatus
 from src.retry import retry_transient
 
@@ -82,8 +82,6 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
     not stall on a transient REST-budget squeeze, matching the existing
     GraphQL-rate-limit fallback in ``_get_open_prs_rest``.
     """
-    from src import github_client as _ghc
-
     check_runs: list[dict] = []
     status_payload: dict = {}
     if not sha:
@@ -104,7 +102,7 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
     check_runs_path = f"repos/{repo}/commits/{sha}/check-runs?per_page=100"
     check_runs_ok = False
     try:
-        cr_pages = _ghc._gh_api_paginated(check_runs_path)
+        cr_pages = cache._gh_api_paginated(check_runs_path)
     except RuntimeError:
         cr_pages = None
     else:
@@ -119,7 +117,7 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
     status_ok = False
     try:
         raw_status = retry_transient(
-            lambda: _ghc._etag_get(status_path),
+            lambda: cache._etag_get(status_path),
             operation_name=f"gh api {status_path}",
         )
     except RuntimeError:

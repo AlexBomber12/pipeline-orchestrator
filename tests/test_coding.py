@@ -5,9 +5,9 @@ import subprocess
 from typing import Any
 
 import pytest
-from src import github_client
 from src.daemon import git_ops
 from src.daemon.handlers import coding as coding_module
+from src.github import gh_runner
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 
 from tests.runner import _helpers as h
@@ -23,9 +23,7 @@ def _runner(
     post_create_failure_attempts: int = 0,
 ):
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(
-        h.claude_cli, "run_planned_pr_async", h._async_cli_result(0, "ok", "")
-    )
+    monkeypatch.setattr(h.claude_cli, "run_planned_pr_async", h._async_cli_result(0, "ok", ""))
     pr_list_calls = {"n": 0}
 
     def _fake_open_prs(repo: str, **kw: Any) -> list[PRInfo]:
@@ -41,9 +39,7 @@ def _runner(
             return []
         return open_prs_after_create or []
 
-    monkeypatch.setattr(
-        h.runner_module.github_client, "get_open_prs", _fake_open_prs
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", _fake_open_prs)
 
     async def _sleep(_seconds: float) -> None:
         return None
@@ -70,9 +66,7 @@ def _patch_branch_state(
     def fake_git(repo_path: str, *args: str, **kwargs: Any):
         if args[:3] == ("rev-parse", "--verify", "--quiet"):
             rc = 0 if local_exists else 1
-            return subprocess.CompletedProcess(
-                args=list(args), returncode=rc, stdout="", stderr=""
-            )
+            return subprocess.CompletedProcess(args=list(args), returncode=rc, stdout="", stderr="")
         if args[:1] == ("ls-remote",):
             if remote_exists:
                 return subprocess.CompletedProcess(
@@ -81,12 +75,8 @@ def _patch_branch_state(
                     stdout="abcdef refs/heads/pr-001\n",
                     stderr="",
                 )
-            return subprocess.CompletedProcess(
-                args=list(args), returncode=2, stdout="", stderr=""
-            )
-        return subprocess.CompletedProcess(
-            args=list(args), returncode=0, stdout="", stderr=""
-        )
+            return subprocess.CompletedProcess(args=list(args), returncode=2, stdout="", stderr="")
+        return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(git_ops, "_git", fake_git)
 
@@ -110,9 +100,7 @@ def test_case_a_no_branch_no_remote_marks_hung(
     asyncio.run(runner.handle_coding())
     assert runner.state.state == PipelineState.HUNG
     assert "did nothing" in (runner.state.error_message or "")
-    assert any(
-        "did nothing" in entry["event"] for entry in runner.state.history
-    )
+    assert any("did nothing" in entry["event"] for entry in runner.state.history)
 
 
 def test_branch_mismatch_after_coder_exit_escalates_explicitly(
@@ -131,16 +119,10 @@ def test_branch_mismatch_after_coder_exit_escalates_explicitly(
 
     def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
         if cmd[:3] == ["git", "rev-parse", "--abbrev-ref"]:
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout="pr-001-typo\n", stderr=""
-            )
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout="", stderr=""
-        )
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="pr-001-typo\n", stderr="")
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr(
-        "src.branch_context.subprocess.run", fake_run
-    )
+    monkeypatch.setattr("src.branch_context.subprocess.run", fake_run)
 
     asyncio.run(runner.handle_coding())
 
@@ -176,7 +158,7 @@ def test_case_c_remote_branch_no_pr_daemon_creates_pr(
         create_calls.append(args)
         return ""
 
-    monkeypatch.setattr(github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     asyncio.run(runner.handle_coding())
 
@@ -186,9 +168,7 @@ def test_case_c_remote_branch_no_pr_daemon_creates_pr(
     assert create_calls and create_calls[0][:2] == ["pr", "create"]
     assert "--head" in create_calls[0]
     assert "pr-001" in create_calls[0]
-    assert any(
-        "daemon creating PR" in entry["event"] for entry in runner.state.history
-    )
+    assert any("daemon creating PR" in entry["event"] for entry in runner.state.history)
 
 
 def test_case_c_branch_mismatch_does_not_block_daemon_recovery(
@@ -208,15 +188,11 @@ def test_case_c_branch_mismatch_does_not_block_daemon_recovery(
 
     def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
         if cmd[:3] == ["git", "rev-parse", "--abbrev-ref"]:
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout="main\n", stderr=""
-            )
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout="", stderr=""
-        )
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="main\n", stderr="")
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("src.branch_context.subprocess.run", fake_run)
-    monkeypatch.setattr(github_client, "run_gh", lambda *a, **kw: "")
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: "")
 
     asyncio.run(runner.handle_coding())
 
@@ -236,7 +212,7 @@ def test_case_c_create_pr_failure_marks_hung(
     def fake_run_gh(args: list[str], repo: str | None = None, **_kw: Any):
         raise RuntimeError("gh boom")
 
-    monkeypatch.setattr(github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     asyncio.run(runner.handle_coding())
 
@@ -254,16 +230,12 @@ def test_case_c_post_create_list_failure_persists_marks_error(
     state on a purely transient read outage."""
     runner = _runner(monkeypatch, raise_on_post_create_list=True)
     _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
-    monkeypatch.setattr(
-        github_client, "run_gh", lambda *a, **kw: ""
-    )
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: "")
 
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.ERROR
-    assert "list failed after 3 attempts" in (
-        runner.state.error_message or ""
-    )
+    assert "list failed after 3 attempts" in (runner.state.error_message or "")
 
 
 def test_case_c_post_create_list_transient_failure_recovers(
@@ -280,17 +252,14 @@ def test_case_c_post_create_list_transient_failure_recovers(
         post_create_failure_attempts=1,
     )
     _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
-    monkeypatch.setattr(github_client, "run_gh", lambda *a, **kw: "")
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: "")
 
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.number == 77
-    assert any(
-        "Daemon-created PR list failed" in entry["event"]
-        for entry in runner.state.history
-    )
+    assert any("Daemon-created PR list failed" in entry["event"] for entry in runner.state.history)
 
 
 def test_case_c_pr_not_found_after_create_marks_hung(
@@ -298,9 +267,7 @@ def test_case_c_pr_not_found_after_create_marks_hung(
 ) -> None:
     runner = _runner(monkeypatch, open_prs_after_create=[])
     _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
-    monkeypatch.setattr(
-        github_client, "run_gh", lambda *a, **kw: ""
-    )
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: "")
 
     asyncio.run(runner.handle_coding())
 
@@ -322,17 +289,14 @@ def test_case_c_post_create_eventual_consistency_succeeds(
         post_create_empty_attempts=2,
     )
     _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
-    monkeypatch.setattr(github_client, "run_gh", lambda *a, **kw: "")
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: "")
 
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.number == 123
-    assert any(
-        "Daemon-created PR not visible yet" in entry["event"]
-        for entry in runner.state.history
-    )
+    assert any("Daemon-created PR not visible yet" in entry["event"] for entry in runner.state.history)
 
 
 def test_local_branch_exists_handles_subprocess_error(
@@ -359,9 +323,7 @@ def test_remote_branch_exists_returns_false_on_empty_stdout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fake_git(*args: Any, **kwargs: Any):
-        return subprocess.CompletedProcess(
-            args=["git"], returncode=0, stdout="", stderr=""
-        )
+        return subprocess.CompletedProcess(args=["git"], returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(git_ops, "_git", fake_git)
     assert coding_module._remote_branch_exists("/tmp/nope", "any") is False
@@ -386,13 +348,11 @@ def test_daemon_create_pr_uses_pr_id_when_title_missing(
         captured.append(args)
         return ""
 
-    monkeypatch.setattr(github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     asyncio.run(runner.handle_coding())
     assert runner.state.state == PipelineState.WATCH
-    create_args = next(
-        args for args in captured if args[:2] == ["pr", "create"]
-    )
+    create_args = next(args for args in captured if args[:2] == ["pr", "create"])
     title_idx = create_args.index("--title") + 1
     assert create_args[title_idx] == "PR-001"
     body_idx = create_args.index("--body") + 1
@@ -412,22 +372,19 @@ def test_case_c_already_exists_error_recovers_to_watch(
 
     def fake_run_gh(args: list[str], repo: str | None = None, **_kw: Any):
         raise RuntimeError(
-            'gh pr create failed (exit 1): a pull request for branch '
+            "gh pr create failed (exit 1): a pull request for branch "
             '"pr-001" into branch "main" already exists: '
-            'https://github.com/octo/demo/pull/314'
+            "https://github.com/octo/demo/pull/314"
         )
 
-    monkeypatch.setattr(github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.number == 314
-    assert any(
-        "already exists" in entry["event"].lower()
-        for entry in runner.state.history
-    )
+    assert any("already exists" in entry["event"].lower() for entry in runner.state.history)
 
 
 def test_case_c_already_exists_error_falls_through_when_pr_invisible(
@@ -443,7 +400,7 @@ def test_case_c_already_exists_error_falls_through_when_pr_invisible(
     def fake_run_gh(args: list[str], repo: str | None = None, **_kw: Any):
         raise RuntimeError("already exists: https://example/pull/1")
 
-    monkeypatch.setattr(github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     asyncio.run(runner.handle_coding())
 
@@ -509,7 +466,7 @@ def test_diagnose_honors_stop_request_before_pr_creation(
         create_calls.append(args)
         return ""
 
-    monkeypatch.setattr(github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     asyncio.run(runner.handle_coding())
 
@@ -543,7 +500,7 @@ def test_diagnose_honors_stop_request_during_post_create_retry(
         return pop_calls["n"] == 9
 
     monkeypatch.setattr(runner, "_pop_stop_request", fake_pop_stop_request)
-    monkeypatch.setattr(github_client, "run_gh", lambda *a, **kw: "")
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: "")
 
     asyncio.run(runner.handle_coding())
 
@@ -574,7 +531,7 @@ def test_diagnose_honors_stop_request_after_post_create_loop(
         return pop_calls["n"] == 9
 
     monkeypatch.setattr(runner, "_pop_stop_request", fake_pop_stop_request)
-    monkeypatch.setattr(github_client, "run_gh", lambda *a, **kw: "")
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: "")
 
     asyncio.run(runner.handle_coding())
 
@@ -596,9 +553,7 @@ def _patch_codex_reactions(
     a brand-new push.
     """
     last_push_iso = "2026-04-30T12:00:00Z"
-    reaction_iso = (
-        "2026-04-30T11:00:00Z" if eyes_stale else "2026-04-30T12:30:00Z"
-    )
+    reaction_iso = "2026-04-30T11:00:00Z" if eyes_stale else "2026-04-30T12:30:00Z"
     payload = (
         [
             {
@@ -611,12 +566,12 @@ def _patch_codex_reactions(
         else []
     )
     monkeypatch.setattr(
-        github_client, "_get_codex_issue_reactions",
+        "src.github.reactions._get_codex_issue_reactions",
         lambda repo, number: payload,
     )
     monkeypatch.setattr(
-        github_client, "get_pr_last_push_time",
-        lambda repo, number: github_client._parse_iso(last_push_iso),
+        "src.github.prs.get_pr_last_push_time",
+        lambda repo, number: gh_runner._parse_iso(last_push_iso),
     )
 
 
@@ -637,8 +592,7 @@ def test_handle_coding_skips_codex_review_when_eyes_already_reacted(
     assert runner.state.state == PipelineState.WATCH
     assert posted == []
     assert any(
-        "Codex auto-trigger detected, skipping duplicate "
-        "@codex review post" in entry["event"]
+        "Codex auto-trigger detected, skipping duplicate @codex review post" in entry["event"]
         for entry in runner.state.history
     )
 
@@ -669,7 +623,7 @@ def test_should_skip_codex_review_post_fails_open_on_api_error(
     def boom(*_a: Any, **_kw: Any) -> list[dict]:
         raise RuntimeError("api boom")
 
-    monkeypatch.setattr(github_client, "_get_codex_issue_reactions", boom)
+    monkeypatch.setattr("src.github.reactions._get_codex_issue_reactions", boom)
     assert runner._should_skip_codex_review_post(42) is False
 
 
@@ -680,8 +634,7 @@ def test_should_skip_codex_review_post_fails_open_on_push_time_error(
     runner = h._make_runner()
 
     monkeypatch.setattr(
-        github_client,
-        "_get_codex_issue_reactions",
+        "src.github.reactions._get_codex_issue_reactions",
         lambda repo, number: [
             {
                 "content": "eyes",
@@ -694,7 +647,7 @@ def test_should_skip_codex_review_post_fails_open_on_push_time_error(
     def boom(*_a: Any, **_kw: Any) -> Any:
         raise RuntimeError("push-time boom")
 
-    monkeypatch.setattr(github_client, "get_pr_last_push_time", boom)
+    monkeypatch.setattr("src.github.prs.get_pr_last_push_time", boom)
     assert runner._should_skip_codex_review_post(42) is False
 
 
@@ -704,8 +657,7 @@ def test_should_skip_codex_review_post_fails_open_on_missing_push_time(
     """A ``None`` last-push time (activity API degraded) must fail open."""
     runner = h._make_runner()
     monkeypatch.setattr(
-        github_client,
-        "_get_codex_issue_reactions",
+        "src.github.reactions._get_codex_issue_reactions",
         lambda repo, number: [
             {
                 "content": "eyes",
@@ -715,8 +667,7 @@ def test_should_skip_codex_review_post_fails_open_on_missing_push_time(
         ],
     )
     monkeypatch.setattr(
-        github_client,
-        "get_pr_last_push_time",
+        "src.github.prs.get_pr_last_push_time",
         lambda repo, number: None,
     )
     assert runner._should_skip_codex_review_post(42) is False
@@ -728,8 +679,7 @@ def test_should_skip_codex_review_post_skips_when_eyes_after_push(
     """A fresh EYES reaction (after the last push) suppresses the mention."""
     runner = h._make_runner()
     monkeypatch.setattr(
-        github_client,
-        "_get_codex_issue_reactions",
+        "src.github.reactions._get_codex_issue_reactions",
         lambda repo, number: [
             {
                 "content": "eyes",
@@ -739,11 +689,8 @@ def test_should_skip_codex_review_post_skips_when_eyes_after_push(
         ],
     )
     monkeypatch.setattr(
-        github_client,
-        "get_pr_last_push_time",
-        lambda repo, number: github_client._parse_iso(
-            "2026-04-30T12:00:00Z"
-        ),
+        "src.github.prs.get_pr_last_push_time",
+        lambda repo, number: gh_runner._parse_iso("2026-04-30T12:00:00Z"),
     )
     assert runner._should_skip_codex_review_post(42) is True
 
@@ -754,8 +701,7 @@ def test_should_skip_codex_review_post_does_not_skip_when_eyes_predates_push(
     """A stale EYES reaction must not suppress review after a new push."""
     runner = h._make_runner()
     monkeypatch.setattr(
-        github_client,
-        "_get_codex_issue_reactions",
+        "src.github.reactions._get_codex_issue_reactions",
         lambda repo, number: [
             {
                 "content": "eyes",
@@ -765,11 +711,8 @@ def test_should_skip_codex_review_post_does_not_skip_when_eyes_predates_push(
         ],
     )
     monkeypatch.setattr(
-        github_client,
-        "get_pr_last_push_time",
-        lambda repo, number: github_client._parse_iso(
-            "2026-04-30T12:00:00Z"
-        ),
+        "src.github.prs.get_pr_last_push_time",
+        lambda repo, number: gh_runner._parse_iso("2026-04-30T12:00:00Z"),
     )
     assert runner._should_skip_codex_review_post(42) is False
 
@@ -787,8 +730,7 @@ def test_should_skip_codex_review_post_does_not_skip_on_backdated_head_commit(
     """
     runner = h._make_runner()
     monkeypatch.setattr(
-        github_client,
-        "_get_codex_issue_reactions",
+        "src.github.reactions._get_codex_issue_reactions",
         lambda repo, number: [
             {
                 "content": "eyes",
@@ -798,11 +740,8 @@ def test_should_skip_codex_review_post_does_not_skip_on_backdated_head_commit(
         ],
     )
     monkeypatch.setattr(
-        github_client,
-        "get_pr_last_push_time",
-        lambda repo, number: github_client._parse_iso(
-            "2026-04-30T12:00:00Z"
-        ),
+        "src.github.prs.get_pr_last_push_time",
+        lambda repo, number: gh_runner._parse_iso("2026-04-30T12:00:00Z"),
     )
     assert runner._should_skip_codex_review_post(42) is False
 
@@ -816,8 +755,7 @@ def test_should_skip_codex_review_post_normalizes_naive_timestamps(
 
     runner = h._make_runner()
     monkeypatch.setattr(
-        github_client,
-        "_get_codex_issue_reactions",
+        "src.github.reactions._get_codex_issue_reactions",
         lambda repo, number: [
             {
                 "content": "eyes",
@@ -827,13 +765,11 @@ def test_should_skip_codex_review_post_normalizes_naive_timestamps(
         ],
     )
     monkeypatch.setattr(
-        github_client,
-        "get_pr_last_push_time",
+        "src.github.prs.get_pr_last_push_time",
         lambda repo, number: _dt(2026, 4, 30, 12, 0, 0),
     )
     monkeypatch.setattr(
-        github_client,
-        "_parse_iso",
+        "src.github.gh_runner._parse_iso",
         lambda value: _dt(2026, 4, 30, 12, 30, 0) if value else None,
     )
 
@@ -846,8 +782,7 @@ def test_should_skip_codex_review_post_ignores_eyes_without_created_at(
     """Reaction missing ``created_at`` cannot prove freshness; do not skip."""
     runner = h._make_runner()
     monkeypatch.setattr(
-        github_client,
-        "_get_codex_issue_reactions",
+        "src.github.reactions._get_codex_issue_reactions",
         lambda repo, number: [
             {
                 "content": "eyes",
@@ -856,11 +791,8 @@ def test_should_skip_codex_review_post_ignores_eyes_without_created_at(
         ],
     )
     monkeypatch.setattr(
-        github_client,
-        "get_pr_last_push_time",
-        lambda repo, number: github_client._parse_iso(
-            "2026-04-30T12:00:00Z"
-        ),
+        "src.github.prs.get_pr_last_push_time",
+        lambda repo, number: gh_runner._parse_iso("2026-04-30T12:00:00Z"),
     )
     assert runner._should_skip_codex_review_post(42) is False
 
@@ -873,7 +805,7 @@ def test_diagnose_case_c_skips_codex_review_when_eyes_already_reacted(
     runner = _runner(monkeypatch, open_prs_after_create=[created])
     _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
     _patch_codex_reactions(monkeypatch, eyes_present=True)
-    monkeypatch.setattr(github_client, "run_gh", lambda *a, **kw: "")
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: "")
     posted: list[int] = []
     runner._post_codex_review = lambda pr_number: (  # type: ignore[method-assign]
         posted.append(pr_number) or True
@@ -884,7 +816,6 @@ def test_diagnose_case_c_skips_codex_review_when_eyes_already_reacted(
     assert runner.state.state == PipelineState.WATCH
     assert posted == []
     assert any(
-        "Codex auto-trigger detected, skipping duplicate "
-        "@codex review post" in entry["event"]
+        "Codex auto-trigger detected, skipping duplicate @codex review post" in entry["event"]
         for entry in runner.state.history
     )

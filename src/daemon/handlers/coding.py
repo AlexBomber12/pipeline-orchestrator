@@ -10,9 +10,11 @@ import asyncio
 import subprocess
 from typing import Awaitable, Callable
 
-from src import github_client
 from src.branch_context import BranchContext
 from src.daemon import git_ops
+from src.github import cache as gh_cache
+from src.github import gh_runner
+from src.github import prs as gh_prs
 from src.models import PipelineState
 
 
@@ -149,7 +151,7 @@ class CodingMixin:
             if target_branch:
                 for _attempt in range(3):
                     try:
-                        prs = github_client.get_open_prs(
+                        prs = gh_prs.get_open_prs(
                             self.owner_repo,
                             allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
                         )
@@ -192,7 +194,7 @@ class CodingMixin:
             if target_branch:
                 for _attempt in range(3):
                     try:
-                        prs = github_client.get_open_prs(
+                        prs = gh_prs.get_open_prs(
                             self.owner_repo,
                             allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
                         )
@@ -275,7 +277,7 @@ class CodingMixin:
         # still reflects the pre-create state. Invalidate before polling
         # so the first ``get_open_prs`` REST fallback returns a fresh 200
         # instead of a 304-cached page that omits the new PR.
-        github_client._invalidate_etag_cache(
+        gh_cache._invalidate_etag_cache(
             f"repos/{self.owner_repo}/pulls"
         )
         candidate = None
@@ -283,7 +285,7 @@ class CodingMixin:
             if await pause_for_stop_if_requested():
                 return
             try:
-                prs = github_client.get_open_prs(
+                prs = gh_prs.get_open_prs(
                     self.owner_repo,
                     allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
                 )
@@ -438,7 +440,7 @@ class CodingMixin:
             if await pause_for_stop_if_requested():
                 return
             try:
-                prs = github_client.get_open_prs(
+                prs = gh_prs.get_open_prs(
                     self.owner_repo,
                     allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
                 )
@@ -547,7 +549,7 @@ class CodingMixin:
 
         base_branch = self.repo_config.branch
         try:
-            github_client.run_gh(
+            gh_runner.run_gh(
                 [
                     "pr",
                     "create",
@@ -574,7 +576,7 @@ class CodingMixin:
                 # drop any cached pages so the post-create visibility loop
                 # fetches a fresh 200 instead of looping on a 304-cached
                 # page that still misses it.
-                github_client._invalidate_etag_cache(
+                gh_cache._invalidate_etag_cache(
                     f"repos/{self.owner_repo}/pulls"
                 )
                 return True
@@ -590,7 +592,7 @@ class CodingMixin:
                 log_message=f"{message}.",
             )
             return False
-        github_client._invalidate_etag_cache(
+        gh_cache._invalidate_etag_cache(
             f"repos/{self.owner_repo}/pulls"
         )
         return True

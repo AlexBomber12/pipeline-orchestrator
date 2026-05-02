@@ -10,7 +10,9 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
-from src import github_client
+from src.github import cache as gh_cache
+from src.github import gh_runner
+from src.github import prs as gh_prs
 from src.models import CIStatus, FeedbackCheckResult, PipelineState, ReviewStatus
 
 logger = logging.getLogger(__name__)
@@ -92,7 +94,7 @@ class WatchMixin:
             return
 
         try:
-            prs = github_client.get_open_prs(
+            prs = gh_prs.get_open_prs(
                 self.owner_repo,
                 allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
             )
@@ -112,7 +114,7 @@ class WatchMixin:
         if found is not None:
             self._observe_watch_event_signature(found)
         if found is None:
-            merged = github_client.is_pr_merged(self.owner_repo, current_number)
+            merged = gh_prs.is_pr_merged(self.owner_repo, current_number)
             if merged is True:
                 await self._save_current_run_record("success_merged")
                 self.log_event(
@@ -285,11 +287,11 @@ class WatchMixin:
         if last_activity.tzinfo is None:
             last_activity = last_activity.replace(tzinfo=timezone.utc)
         try:
-            comments = github_client._gh_api_paginated(
+            comments = gh_cache._gh_api_paginated(
                 f"repos/{self.owner_repo}/issues/"
                 f"{self.state.current_pr.number}/comments"
             ) or []
-            review_comments = github_client._gh_api_paginated(
+            review_comments = gh_cache._gh_api_paginated(
                 f"repos/{self.owner_repo}/pulls/"
                 f"{self.state.current_pr.number}/comments"
             ) or []
@@ -305,7 +307,7 @@ class WatchMixin:
             user = (c.get("user") or {}).get("login", "")
             if "codex" not in user.lower():
                 continue
-            created = github_client._parse_iso(c.get("created_at"))
+            created = gh_runner._parse_iso(c.get("created_at"))
             if created is None:
                 continue
             if created.tzinfo is None:
@@ -339,7 +341,7 @@ class WatchMixin:
         else:
             return False
 
-        last_push_age_seconds = github_client.get_last_push_age_seconds(
+        last_push_age_seconds = gh_prs.get_last_push_age_seconds(
             self.owner_repo,
             pr_number,
         )
@@ -383,7 +385,7 @@ class WatchMixin:
         WATCH cycle.
         """
         try:
-            comments = github_client._gh_api_paginated(
+            comments = gh_cache._gh_api_paginated(
                 f"repos/{self.owner_repo}/issues/{pr_number}/comments"
             ) or []
         except Exception:
@@ -403,7 +405,7 @@ class WatchMixin:
             body = c.get("body") or ""
             if not any(pat in body for pat in CODEX_BOT_ERROR_PATTERNS):
                 continue
-            created = github_client._parse_iso(c.get("created_at"))
+            created = gh_runner._parse_iso(c.get("created_at"))
             if created is None:
                 continue
             if created.tzinfo is None:

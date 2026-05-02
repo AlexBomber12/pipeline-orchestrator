@@ -9,7 +9,6 @@ and the real GitHub rate-limit fetch path.
 from __future__ import annotations
 
 import pytest
-from src.daemon import runner as runner_module
 from src.daemon.handlers import idle as idle_module
 
 
@@ -34,7 +33,6 @@ def _disable_github_rate_limit_fetch_by_default(
 ) -> None:
     """Tests that don't pin a budget shouldn't actually call the gh CLI."""
     monkeypatch.setattr(
-        runner_module.github_client,
-        "fetch_rate_limit_buckets",
+        "src.github.rate_limit.fetch_rate_limit_buckets",
         lambda: (None, None),
     )

@@ -53,13 +53,11 @@ def test_handle_idle_rereads_pause_flag_before_coding_transition(
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: task)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -92,8 +90,7 @@ def test_handle_idle_rereads_pause_flag_before_coding_transition(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert any(
-        entry["event"]
-        == "[INFRA] Pause requested while preparing PR-042; deferring CODING."
+        entry["event"] == "[INFRA] Pause requested while preparing PR-042; deferring CODING."
         for entry in runner.state.history
     )
 
@@ -135,8 +132,7 @@ def test_handle_coding_honors_persisted_pause_after_fast_cli_exit(
     assert runner.state.user_paused is True
     assert runner.state.error_message == "coder failed fast"
     assert any(
-        "finishing current run before honoring pause" in entry["event"].lower()
-        for entry in runner.state.history
+        "finishing current run before honoring pause" in entry["event"].lower() for entry in runner.state.history
     )
 
 
@@ -150,18 +146,15 @@ def test_handle_coding_finishes_success_path_when_pause_persists_during_exit(
         h._async_cli_result(0, "ok", ""),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
-        lambda repo, **kw: [
-            PRInfo(number=127, branch="pr-127-control-endpoints-backend")
-        ],
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [PRInfo(number=127, branch="pr-127-control-endpoints-backend")],
     )
     posted: list[tuple[str, int, str]] = []
 
     def fake_post(repo: str, number: int, body: str) -> None:
         posted.append((repo, number, body))
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
 
     runner = h._make_runner()
     runner.state.current_task = QueueTask(
@@ -192,8 +185,7 @@ def test_handle_coding_finishes_success_path_when_pause_persists_during_exit(
     assert runner.state.current_pr.number == 127
     assert posted == [(runner.owner_repo, 127, "@codex review")]
     assert any(
-        "finishing current run before honoring pause" in entry["event"].lower()
-        for entry in runner.state.history
+        "finishing current run before honoring pause" in entry["event"].lower() for entry in runner.state.history
     )
 
 
@@ -240,15 +232,11 @@ def test_handle_fix_breach_cancel_resets_no_push_counter(
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
     monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_inflight_breach", breach_cancel_monitor
-    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_inflight_breach", breach_cancel_monitor)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
-    runner.state.current_pr = PRInfo(
-        number=227, branch="pr-227", no_push_fix_count=2
-    )
+    runner.state.current_pr = PRInfo(number=227, branch="pr-227", no_push_fix_count=2)
     monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda pr: None)
     monkeypatch.setattr(runner, "_post_codex_review", lambda pr_number: True)
 
@@ -302,20 +290,14 @@ def test_handle_fix_late_breach_resets_no_push_counter(
         breach_flag["breached"] = True
 
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
-    monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "ok", "")
-    )
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "ok", ""))
     monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
-    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_inflight_breach", no_breach_monitor)
     monkeypatch.setattr(PipelineRunner, "_check_late_breach", fake_late_breach)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
-    runner.state.current_pr = PRInfo(
-        number=228, branch="pr-228", no_push_fix_count=2
-    )
+    runner.state.current_pr = PRInfo(number=228, branch="pr-228", no_push_fix_count=2)
     monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda pr: None)
     monkeypatch.setattr(runner, "_post_codex_review", lambda pr_number: True)
 
@@ -378,9 +360,7 @@ def test_handle_merge_aborts_when_conflict_resolution_is_rate_limited(
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
 
     asyncio.run(runner.handle_merge())
 
@@ -426,14 +406,12 @@ def test_handle_merge_pauses_when_conflict_resolution_hits_rate_limit(
     def fake_merge_pr(repo: str, num: int) -> None:
         merge_pr_calls.append((repo, num))
 
-    monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge_pr)
+    monkeypatch.setattr("src.github.prs.merge_pr", fake_merge_pr)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
 
     asyncio.run(runner.handle_merge())
 
@@ -441,14 +419,9 @@ def test_handle_merge_pauses_when_conflict_resolution_hits_rate_limit(
     assert runner.state.error_message is None
     assert runner.state.rate_limited_until is not None
     assert not merge_pr_calls, "merge_pr must not be called while paused"
-    abort_cmds = [
-        cmd for cmd in git_calls
-        if cmd[:3] == ["git", "merge", "--abort"]
-    ]
+    abort_cmds = [cmd for cmd in git_calls if cmd[:3] == ["git", "merge", "--abort"]]
     assert abort_cmds, "git merge --abort must be invoked"
-    assert any(
-        "Rate limit pause active until" in e["event"] for e in runner.state.history
-    )
+    assert any("Rate limit pause active until" in e["event"] for e in runner.state.history)
 
 
 def test_publish_state_preserves_concurrent_pause_write(
@@ -574,7 +547,7 @@ def test_poll_github_during_fix_skips_iteration_when_budget_paused(
             raise asyncio.CancelledError
 
     monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr(fix_module.github_client, "pr_state", fake_pr_state)
+    monkeypatch.setattr("src.github.prs.pr_state", fake_pr_state)
 
     async def run_loop() -> None:
         loop = asyncio.get_running_loop()
@@ -634,9 +607,7 @@ def test_handle_coding_skips_when_rate_limited(
     )
     runner = h._make_runner()
     runner.state.state = PipelineState.CODING
-    runner.state.current_task = QueueTask(
-        pr_id="PR-099", title="test", branch="pr-099-test", status=TaskStatus.TODO
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-099", title="test", branch="pr-099-test", status=TaskStatus.TODO)
     runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
 
     asyncio.run(runner.handle_coding())
@@ -655,9 +626,7 @@ def test_handle_paused_resumes_to_error_when_error_message_present(
     runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
     runner.state.error_message = "Build failed: missing dependency X"
     runner.state.current_pr = PRInfo(number=50, branch="pr-050")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-050", title="test", branch="pr-050", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-050", title="test", branch="pr-050", status=TaskStatus.DOING)
 
     asyncio.run(runner.handle_paused())
 
@@ -677,9 +646,7 @@ def test_handle_paused_clears_legacy_rate_limit_error_message(
     runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
     runner.state.error_message = "API rate limit exceeded (429)"
     runner.state.current_pr = PRInfo(number=50, branch="pr-050")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-050", title="test", branch="pr-050", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-050", title="test", branch="pr-050", status=TaskStatus.DOING)
 
     asyncio.run(runner.handle_paused())
 
@@ -691,7 +658,6 @@ def test_handle_paused_clears_legacy_rate_limit_error_message(
 def test_handle_paused_resumes_with_other_coder_while_preserving_pause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-
     h._patch_subprocess(monkeypatch)
 
     runner = h._make_runner(coder=CoderType.CODEX)
@@ -711,7 +677,6 @@ def test_handle_paused_resumes_with_other_coder_while_preserving_pause(
 def test_handle_paused_uses_selector_for_pinned_repo_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-
     h._patch_subprocess(monkeypatch)
 
     runner = h._make_runner(coder=CoderType.CODEX)
@@ -928,16 +893,12 @@ def test_handle_fix_sets_error_when_breach_cancel_review_post_fails(
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
     monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_inflight_breach", breach_cancel_monitor
-    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_inflight_breach", breach_cancel_monitor)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=42, branch="pr-042-fix")
-    monkeypatch.setattr(
-        runner, "_rehydrate_last_push_at", lambda pr: rehydrated.append(pr.number)
-    )
+    monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda pr: rehydrated.append(pr.number))
     monkeypatch.setattr(runner, "_post_codex_review", lambda pr_number: False)
 
     asyncio.run(runner.handle_fix())
@@ -958,9 +919,7 @@ def test_handle_fix_pauses_when_breach_cancel_rev_parse_fails(
         if args[:2] == ("rev-parse", "HEAD"):
             rev_parse_calls["count"] += 1
             if rev_parse_calls["count"] == 1:
-                return h._FakeCompletedProcess(
-                    args=["git", *args], stdout="aaa111\n", returncode=0
-                )
+                return h._FakeCompletedProcess(args=["git", *args], stdout="aaa111\n", returncode=0)
             raise RuntimeError("rev-parse lost HEAD")
         return h._FakeCompletedProcess(args=["git", *args], returncode=0)
 
@@ -992,16 +951,12 @@ def test_handle_fix_pauses_when_breach_cancel_rev_parse_fails(
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
     monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_inflight_breach", breach_cancel_monitor
-    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_inflight_breach", breach_cancel_monitor)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=42, branch="pr-042-fix")
-    monkeypatch.setattr(
-        runner, "_rehydrate_last_push_at", lambda pr: rehydrated.append(pr.number)
-    )
+    monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda pr: rehydrated.append(pr.number))
     monkeypatch.setattr(
         runner,
         "_post_codex_review",
@@ -1058,21 +1013,15 @@ def test_handle_fix_sets_error_when_late_breach_review_post_fails(
         breach_flag["breached"] = True
 
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
-    monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "ok", "")
-    )
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "ok", ""))
     monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
-    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_inflight_breach", no_breach_monitor)
     monkeypatch.setattr(PipelineRunner, "_check_late_breach", fake_late_breach)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=42, branch="pr-042-fix")
-    monkeypatch.setattr(
-        runner, "_rehydrate_last_push_at", lambda pr: rehydrated.append(pr.number)
-    )
+    monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda pr: rehydrated.append(pr.number))
     monkeypatch.setattr(runner, "_post_codex_review", lambda pr_number: False)
 
     asyncio.run(runner.handle_fix())
@@ -1093,9 +1042,7 @@ def test_handle_fix_pauses_when_late_breach_rev_parse_fails(
         if args[:2] == ("rev-parse", "HEAD"):
             rev_parse_calls["count"] += 1
             if rev_parse_calls["count"] == 1:
-                return h._FakeCompletedProcess(
-                    args=["git", *args], stdout="aaa111\n", returncode=0
-                )
+                return h._FakeCompletedProcess(args=["git", *args], stdout="aaa111\n", returncode=0)
             raise RuntimeError("rev-parse lost HEAD")
         return h._FakeCompletedProcess(args=["git", *args], returncode=0)
 
@@ -1127,21 +1074,15 @@ def test_handle_fix_pauses_when_late_breach_rev_parse_fails(
         breach_flag["breached"] = True
 
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
-    monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "ok", "")
-    )
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "ok", ""))
     monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
-    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_inflight_breach", no_breach_monitor)
     monkeypatch.setattr(PipelineRunner, "_check_late_breach", fake_late_breach)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=42, branch="pr-042-fix")
-    monkeypatch.setattr(
-        runner, "_rehydrate_last_push_at", lambda pr: rehydrated.append(pr.number)
-    )
+    monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda pr: rehydrated.append(pr.number))
     monkeypatch.setattr(
         runner,
         "_post_codex_review",
@@ -1197,17 +1138,13 @@ def test_handle_fix_breach_cancel_skips_codex_review_when_eyes_already_reacted(
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
     monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_inflight_breach", breach_cancel_monitor
-    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_inflight_breach", breach_cancel_monitor)
     h._patch_eyes_reaction_present(monkeypatch)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=42, branch="pr-042-fix")
-    monkeypatch.setattr(
-        runner, "_rehydrate_last_push_at", lambda pr: None
-    )
+    monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda pr: None)
     monkeypatch.setattr(
         runner,
         "_post_codex_review",
@@ -1218,9 +1155,7 @@ def test_handle_fix_breach_cancel_skips_codex_review_when_eyes_already_reacted(
 
     assert runner.state.state == PipelineState.PAUSED
     assert any(
-        "Codex auto-trigger detected, skipping duplicate "
-        "@codex review post" in e["event"]
-        for e in runner.state.history
+        "Codex auto-trigger detected, skipping duplicate @codex review post" in e["event"] for e in runner.state.history
     )
 
 
@@ -1265,22 +1200,16 @@ def test_handle_fix_late_breach_skips_codex_review_when_eyes_already_reacted(
         breach_flag["breached"] = True
 
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
-    monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "ok", "")
-    )
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "ok", ""))
     monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
-    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_inflight_breach", no_breach_monitor)
     monkeypatch.setattr(PipelineRunner, "_check_late_breach", fake_late_breach)
     h._patch_eyes_reaction_present(monkeypatch)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=42, branch="pr-042-fix")
-    monkeypatch.setattr(
-        runner, "_rehydrate_last_push_at", lambda pr: None
-    )
+    monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda pr: None)
     monkeypatch.setattr(
         runner,
         "_post_codex_review",
@@ -1291,9 +1220,7 @@ def test_handle_fix_late_breach_skips_codex_review_when_eyes_already_reacted(
 
     assert runner.state.state == PipelineState.PAUSED
     assert any(
-        "Codex auto-trigger detected, skipping duplicate "
-        "@codex review post" in e["event"]
-        for e in runner.state.history
+        "Codex auto-trigger detected, skipping duplicate @codex review post" in e["event"] for e in runner.state.history
     )
 
 
@@ -1324,13 +1251,9 @@ def test_handle_fix_sets_error_on_non_rate_limit_cli_failure(
         await asyncio.sleep(0)
 
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
-    monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(7, "", "plain failure")
-    )
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(7, "", "plain failure"))
     monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
-    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_inflight_breach", no_breach_monitor)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -1355,9 +1278,7 @@ def test_handle_coding_sets_paused_on_rate_limit(
 
     runner = h._make_runner()
     runner.state.state = PipelineState.CODING
-    runner.state.current_task = QueueTask(
-        pr_id="PR-099", title="test", branch="pr-099-test", status=TaskStatus.TODO
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-099", title="test", branch="pr-099-test", status=TaskStatus.TODO)
 
     asyncio.run(runner.handle_coding())
 
@@ -1380,9 +1301,7 @@ def test_handle_coding_saves_record_on_proactive_rate_limit(
 ) -> None:
     runner = h._make_runner()
     runner.state.state = PipelineState.CODING
-    runner.state.current_task = QueueTask(
-        pr_id="PR-099", title="test", branch="pr-099-test", status=TaskStatus.TODO
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-099", title="test", branch="pr-099-test", status=TaskStatus.TODO)
 
     async def fake_check_rate_limit(
         proactive_coder: str | None = None,
@@ -1437,9 +1356,7 @@ def test_handle_coding_reuses_selected_coder_for_rate_limit(
 ) -> None:
     runner = h._make_runner()
     runner.state.state = PipelineState.CODING
-    runner.state.current_task = QueueTask(
-        pr_id="PR-099", title="test", branch="pr-099-test", status=TaskStatus.TODO
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-099", title="test", branch="pr-099-test", status=TaskStatus.TODO)
     runner._get_coder = (  # type: ignore[method-assign]
         lambda **kwargs: ("codex", runner._registry.get("codex"))
     )
@@ -1498,17 +1415,14 @@ def test_handle_coding_success_ignores_rate_limit_text_in_stderr(
     )
     pr = PRInfo(number=42, branch="pr-001")
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
 
     runner = h._make_runner()
     runner._post_codex_review = lambda _pr_number: True  # type: ignore[method-assign]
     runner.state.state = PipelineState.CODING
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="test", branch="pr-001", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="test", branch="pr-001", status=TaskStatus.DOING)
 
     asyncio.run(runner.handle_coding())
 
@@ -1591,7 +1505,6 @@ def test_handle_paused_clearable_rate_limit_error_resumes_to_watch(
 def test_handle_paused_clears_other_coder_from_rate_limited_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-
     h._patch_subprocess(monkeypatch)
 
     runner = h._make_runner(coder=CoderType.CODEX)
@@ -1610,7 +1523,6 @@ def test_handle_paused_clears_other_coder_from_rate_limited_set(
 def test_handle_paused_preserves_legacy_pause_for_other_coder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-
     h._patch_subprocess(monkeypatch)
 
     runner = h._make_runner(coder=CoderType.CODEX)
@@ -1659,9 +1571,7 @@ def test_handle_paused_resumes_to_watch_when_window_expires(
     runner.state.state = PipelineState.PAUSED
     runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
     runner.state.current_pr = PRInfo(number=50, branch="pr-050")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-050", title="test", branch="pr-050", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-050", title="test", branch="pr-050", status=TaskStatus.DOING)
 
     asyncio.run(runner.handle_paused())
 
@@ -1792,11 +1702,7 @@ def test_run_cycle_short_circuits_idle_when_user_paused(
     assert idle_calls == []
     assert preflight_calls == []
     assert publishes == ["published", "published"]
-    assert sum(
-        1
-        for entry in runner.state.history
-        if entry["event"] == "[INFRA] Paused. Press Play to resume."
-    ) == 1
+    assert sum(1 for entry in runner.state.history if entry["event"] == "[INFRA] Paused. Press Play to resume.") == 1
 
 
 def test_run_cycle_short_circuits_paused_when_user_paused(
@@ -1835,11 +1741,7 @@ def test_run_cycle_short_circuits_paused_when_user_paused(
     assert paused_calls == []
     assert preflight_calls == []
     assert publishes == ["published", "published"]
-    assert sum(
-        1
-        for entry in runner.state.history
-        if entry["event"] == "[INFRA] Paused. Press Play to resume."
-    ) == 1
+    assert sum(1 for entry in runner.state.history if entry["event"] == "[INFRA] Paused. Press Play to resume.") == 1
 
 
 @pytest.mark.parametrize(
@@ -1887,11 +1789,7 @@ def test_run_cycle_short_circuits_active_watch_and_merge_when_user_paused(
     assert handler_calls == []
     assert preflight_calls == []
     assert publishes == ["published", "published"]
-    assert sum(
-        1
-        for entry in runner.state.history
-        if entry["event"] == "[INFRA] Paused. Press Play to resume."
-    ) == 1
+    assert sum(1 for entry in runner.state.history if entry["event"] == "[INFRA] Paused. Press Play to resume.") == 1
 
 
 def test_run_cycle_skips_preflight_after_pause_refresh(
@@ -1977,11 +1875,7 @@ def test_run_cycle_rereads_pause_flag_before_idle_dispatch(
     assert preflight_calls == ["preflight"]
     assert idle_calls == []
     assert publishes == ["published"]
-    assert sum(
-        1
-        for entry in runner.state.history
-        if entry["event"] == "[INFRA] Paused. Press Play to resume."
-    ) == 1
+    assert sum(1 for entry in runner.state.history if entry["event"] == "[INFRA] Paused. Press Play to resume.") == 1
 
 
 @pytest.mark.parametrize(
@@ -2101,7 +1995,8 @@ def test_rate_limited_until_uses_resets_at_timestamp(
 
 
 def test_monitor_inflight_breach_cancels_claude_task_on_marker(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Breach marker file triggers task cancellation and PAUSED state."""
     h._patch_subprocess(monkeypatch)
@@ -2128,20 +2023,27 @@ def test_monitor_inflight_breach_cancels_claude_task_on_marker(
         breach_flag: dict[str, bool] = {"breached": False}
         monitor = asyncio.create_task(
             runner._monitor_inflight_breach(
-                str(tmp_path), breach_run_id, task, breach_flag,
+                str(tmp_path),
+                breach_run_id,
+                task,
+                breach_flag,
             )
         )
 
         # Write breach marker after a short delay
         await asyncio.sleep(0.1)
         marker = tmp_path / f"{breach_run_id}.breach"
-        marker.write_text(json.dumps({
-            "type": "session",
-            "resets_at": 1700000000,
-            "session_pct": 97,
-            "weekly_pct": 30,
-            "detected_at": 1234567890.0,
-        }))
+        marker.write_text(
+            json.dumps(
+                {
+                    "type": "session",
+                    "resets_at": 1700000000,
+                    "session_pct": 97,
+                    "weekly_pct": 30,
+                    "detected_at": 1234567890.0,
+                }
+            )
+        )
 
         # Wait for monitor to detect and cancel
         await asyncio.sleep(0.3)
@@ -2156,7 +2058,8 @@ def test_monitor_inflight_breach_cancels_claude_task_on_marker(
 
 
 def test_monitor_inflight_breach_sets_paused_state_with_resets_at(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Breach monitor sets rate_limited_until from breach marker resets_at."""
     h._patch_subprocess(monkeypatch)
@@ -2177,18 +2080,25 @@ def test_monitor_inflight_breach_sets_paused_state_with_resets_at(
         breach_flag: dict[str, bool] = {"breached": False}
         monitor = asyncio.create_task(
             runner._monitor_inflight_breach(
-                str(tmp_path), breach_run_id, task, breach_flag,
+                str(tmp_path),
+                breach_run_id,
+                task,
+                breach_flag,
             )
         )
 
         marker = tmp_path / f"{breach_run_id}.breach"
-        marker.write_text(json.dumps({
-            "type": "weekly",
-            "resets_at": 1800000000,
-            "session_pct": 50,
-            "weekly_pct": 105,
-            "detected_at": 1234567890.0,
-        }))
+        marker.write_text(
+            json.dumps(
+                {
+                    "type": "weekly",
+                    "resets_at": 1800000000,
+                    "session_pct": 50,
+                    "weekly_pct": 105,
+                    "detected_at": 1234567890.0,
+                }
+            )
+        )
 
         await asyncio.sleep(0.3)
         assert runner.state.rate_limited_until is not None
@@ -2200,7 +2110,8 @@ def test_monitor_inflight_breach_sets_paused_state_with_resets_at(
 
 
 def test_monitor_inflight_breach_exits_when_claude_task_completes(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Monitor exits cleanly when the CLI task completes without a breach."""
     h._patch_subprocess(monkeypatch)
@@ -2221,7 +2132,10 @@ def test_monitor_inflight_breach_exits_when_claude_task_completes(
         breach_flag: dict[str, bool] = {"breached": False}
         monitor = asyncio.create_task(
             runner._monitor_inflight_breach(
-                str(tmp_path), breach_run_id, task, breach_flag,
+                str(tmp_path),
+                breach_run_id,
+                task,
+                breach_flag,
             )
         )
 
@@ -2238,7 +2152,8 @@ def test_monitor_inflight_breach_exits_when_claude_task_completes(
 
 
 def test_handle_coding_cleans_up_breach_marker_after_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Late breach marker is detected, causes PAUSED, and is cleaned up."""
     h._patch_subprocess(monkeypatch)
@@ -2259,17 +2174,20 @@ def test_handle_coding_cleans_up_breach_marker_after_run(
 
     monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_planned)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [PRInfo(number=1, branch="pr-001")],
     )
     monkeypatch.setattr(
-        runner_module.github_client, "post_comment", lambda *a, **kw: None,
+        "src.github.comments.post_comment",
+        lambda *a, **kw: None,
     )
 
     runner = h._make_runner()
     runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001",
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
     )
     asyncio.run(runner.handle_coding())
 
@@ -2283,7 +2201,8 @@ def test_handle_coding_cleans_up_breach_marker_after_run(
 
 
 def test_handle_coding_pauses_on_inflight_breach(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """handle_coding transitions to PAUSED when in-flight breach is detected."""
     h._patch_subprocess(monkeypatch)
@@ -2297,13 +2216,17 @@ def test_handle_coding_pauses_on_inflight_breach(
         # Write breach marker immediately to simulate mid-flight breach
         if run_id:
             marker = tmp_path / f"{run_id}.breach"
-            marker.write_text(json.dumps({
-                "type": "session",
-                "resets_at": 1700000000,
-                "session_pct": 98,
-                "weekly_pct": 30,
-                "detected_at": 1234567890.0,
-            }))
+            marker.write_text(
+                json.dumps(
+                    {
+                        "type": "session",
+                        "resets_at": 1700000000,
+                        "session_pct": 98,
+                        "weekly_pct": 30,
+                        "detected_at": 1234567890.0,
+                    }
+                )
+            )
         await asyncio.sleep(999)  # Block until cancelled
         return (0, "", "")
 
@@ -2311,7 +2234,10 @@ def test_handle_coding_pauses_on_inflight_breach(
 
     runner = h._make_runner()
     runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001",
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
     )
     asyncio.run(runner.handle_coding())
 
@@ -2335,7 +2261,10 @@ def test_handle_coding_reraises_cancelled_error_without_breach(
 
     runner = h._make_runner(coder=CoderType.CODEX)
     runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001",
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
     )
 
     with pytest.raises(asyncio.CancelledError):
@@ -2343,7 +2272,8 @@ def test_handle_coding_reraises_cancelled_error_without_breach(
 
 
 def test_handle_coding_records_pr_before_breach_cancel_pause(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """In-flight breach cancellation still records the just-opened PR."""
     h._patch_subprocess(monkeypatch)
@@ -2356,13 +2286,17 @@ def test_handle_coding_records_pr_before_breach_cancel_pause(
         run_id = kwargs.get("breach_run_id", "")
         if run_id:
             marker = tmp_path / f"{run_id}.breach"
-            marker.write_text(json.dumps({
-                "type": "session",
-                "resets_at": 1700000000,
-                "session_pct": 98,
-                "weekly_pct": 30,
-                "detected_at": 1234567890.0,
-            }))
+            marker.write_text(
+                json.dumps(
+                    {
+                        "type": "session",
+                        "resets_at": 1700000000,
+                        "session_pct": 98,
+                        "weekly_pct": 30,
+                        "detected_at": 1234567890.0,
+                    }
+                )
+            )
         await asyncio.sleep(999)
         return (0, "", "")
 
@@ -2386,25 +2320,26 @@ def test_handle_coding_records_pr_before_breach_cancel_pause(
         await original_sleep(0)
 
     monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_planned_hangs)
-    monkeypatch.setattr(runner_module.github_client, "get_open_prs", fake_get_open_prs)
+    monkeypatch.setattr("src.github.prs.get_open_prs", fake_get_open_prs)
     monkeypatch.setattr(coding_module.asyncio, "sleep", fast_sleep)
 
     runner = h._make_runner()
     runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001",
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
     )
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.current_pr == pr
-    assert any(
-        "Recorded PR #42 before breach-cancel pause" in entry["event"]
-        for entry in runner.state.history
-    )
+    assert any("Recorded PR #42 before breach-cancel pause" in entry["event"] for entry in runner.state.history)
 
 
 def test_handle_coding_records_pr_before_late_breach_pause(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Late breach pauses still attach the matching PR before returning."""
     h._patch_subprocess(monkeypatch)
@@ -2432,33 +2367,36 @@ def test_handle_coding_records_pr_before_late_breach_pause(
         return [pr]
 
     def fake_check_late_breach(
-        breach_dir: str, breach_run_id: str, breach_flag: dict[str, bool],
+        breach_dir: str,
+        breach_run_id: str,
+        breach_flag: dict[str, bool],
     ) -> None:
         breach_flag["breached"] = True
         runner.state.rate_limited_until = datetime.fromtimestamp(
-            1700000000, tz=timezone.utc,
+            1700000000,
+            tz=timezone.utc,
         )
 
     async def fast_sleep(seconds: float) -> None:
         await original_sleep(0)
 
     monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_planned)
-    monkeypatch.setattr(runner_module.github_client, "get_open_prs", fake_get_open_prs)
+    monkeypatch.setattr("src.github.prs.get_open_prs", fake_get_open_prs)
     monkeypatch.setattr(coding_module.asyncio, "sleep", fast_sleep)
 
     runner = h._make_runner()
     monkeypatch.setattr(runner, "_check_late_breach", fake_check_late_breach)
     runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001",
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
     )
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.current_pr == pr
-    assert any(
-        "Recorded PR #42 before late-breach pause" in entry["event"]
-        for entry in runner.state.history
-    )
+    assert any("Recorded PR #42 before late-breach pause" in entry["event"] for entry in runner.state.history)
 
 
 def test_get_coder_auto_fallback_switches_on_rate_limit_via_selector(
@@ -2588,7 +2526,6 @@ def test_check_rate_limit_invalidates_cache_before_fallback_proactive_check(
 def test_check_rate_limit_honors_effective_coder_pause_before_proactive_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-
     h._patch_subprocess(monkeypatch)
     runner = h._make_runner(coder=CoderType.CODEX)
     runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
@@ -2676,7 +2613,6 @@ def test_check_rate_limit_preserves_per_coder_expiry_windows() -> None:
 def test_check_rate_limit_reapplies_effective_coder_pause_after_other_expires(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-
     h._patch_subprocess(monkeypatch)
     runner = h._make_runner(coder=CoderType.CODEX)
     now = datetime.now(timezone.utc)
@@ -2873,8 +2809,7 @@ def test_detect_rate_limit_codex_progress_output_with_seconds_retry_triggers(
     h._patch_subprocess(monkeypatch)
     runner = h._make_runner(coder=CoderType.CODEX)
     runner._detect_rate_limit(
-        "Progress update: 87% remaining for weekly rate limit\n"
-        "Rate limit reached. Please try again in 6.379s",
+        "Progress update: 87% remaining for weekly rate limit\nRate limit reached. Please try again in 6.379s",
         coder_name="codex",
     )
     assert runner.state.rate_limited_until is not None
@@ -2893,7 +2828,8 @@ def test_detect_rate_limit_generic_fallback_still_applies_to_claude(
 
 
 def test_monitor_inflight_breach_retries_bad_marker_then_uses_default_reset(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Bad marker JSON should be retried before defaulting to a 30-minute pause."""
     h._patch_subprocess(monkeypatch)
@@ -2912,18 +2848,25 @@ def test_monitor_inflight_breach_retries_bad_marker_then_uses_default_reset(
         breach_flag: dict[str, bool] = {"breached": False}
         monitor = asyncio.create_task(
             runner._monitor_inflight_breach(
-                str(tmp_path), breach_run_id, task, breach_flag,
+                str(tmp_path),
+                breach_run_id,
+                task,
+                breach_flag,
             )
         )
 
         marker = tmp_path / f"{breach_run_id}.breach"
         marker.write_text("{not-json")
         await asyncio.sleep(0.1)
-        marker.write_text(json.dumps({
-            "type": "session",
-            "resets_at": 0,
-            "session_pct": 99,
-        }))
+        marker.write_text(
+            json.dumps(
+                {
+                    "type": "session",
+                    "resets_at": 0,
+                    "session_pct": 99,
+                }
+            )
+        )
 
         await asyncio.sleep(0.2)
 
@@ -2940,7 +2883,8 @@ def test_monitor_inflight_breach_retries_bad_marker_then_uses_default_reset(
 
 
 def test_check_late_breach_returns_after_retry_exhaustion(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Late breach detection should stop after repeated marker read failures."""
     h._patch_subprocess(monkeypatch)
@@ -2958,7 +2902,8 @@ def test_check_late_breach_returns_after_retry_exhaustion(
 
 
 def test_check_late_breach_uses_resets_at_timestamp(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Late breach detection should use the marker reset timestamp when present."""
     h._patch_subprocess(monkeypatch)
@@ -2967,11 +2912,15 @@ def test_check_late_breach_uses_resets_at_timestamp(
     breach_flag = {"breached": False}
     resets_at = 1800000000
     marker = tmp_path / "late-reset.breach"
-    marker.write_text(json.dumps({
-        "type": "weekly",
-        "resets_at": resets_at,
-        "weekly_pct": 101,
-    }))
+    marker.write_text(
+        json.dumps(
+            {
+                "type": "weekly",
+                "resets_at": resets_at,
+                "weekly_pct": 101,
+            }
+        )
+    )
 
     runner._check_late_breach(str(tmp_path), "late-reset", breach_flag)
 
@@ -2981,7 +2930,8 @@ def test_check_late_breach_uses_resets_at_timestamp(
 
 
 def test_cleanup_breach_marker_ignores_unlink_oserror(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Cleanup should swallow filesystem unlink failures."""
     h._patch_subprocess(monkeypatch)
@@ -3011,11 +2961,7 @@ def test_handle_paused_logs_user_pause_only_once() -> None:
     asyncio.run(runner.handle_paused())
     asyncio.run(runner.handle_paused())
 
-    assert sum(
-        1
-        for entry in runner.state.history
-        if entry["event"] == "[INFRA] Paused. Press Play to resume."
-    ) == 1
+    assert sum(1 for entry in runner.state.history if entry["event"] == "[INFRA] Paused. Press Play to resume.") == 1
 
 
 def test_refresh_user_paused_from_redis_ignores_invalid_json() -> None:
@@ -3038,9 +2984,7 @@ def test_check_budget_returns_false_below_pause_threshold() -> None:
 
     assert proceed is False
     assert runner._github_api_pause_attempts == 1
-    assert any(
-        "GitHub API budget critical" in e["event"] for e in runner.state.history
-    )
+    assert any("GitHub API budget critical" in e["event"] for e in runner.state.history)
 
 
 def test_check_budget_pause_log_only_fires_once_per_window() -> None:
@@ -3052,9 +2996,7 @@ def test_check_budget_pause_log_only_fires_once_per_window() -> None:
     asyncio.run(runner._check_github_api_budget())
     asyncio.run(runner._check_github_api_budget())
 
-    pause_logs = [
-        e for e in runner.state.history if "GitHub API budget critical" in e["event"]
-    ]
+    pause_logs = [e for e in runner.state.history if "GitHub API budget critical" in e["event"]]
     assert len(pause_logs) == 1
 
 
@@ -3109,9 +3051,7 @@ def test_effective_watch_poll_interval_stacks_with_rate_limit_slowdown() -> None
     assert runner.effective_watch_poll_interval == 600
 
     # Slowdown active past window (fast=45) → max(45, 600) = 600.
-    runner._watch_entered_at = (
-        datetime.now(timezone.utc) - timedelta(minutes=10)
-    )
+    runner._watch_entered_at = datetime.now(timezone.utc) - timedelta(minutes=10)
     assert runner.effective_watch_poll_interval == 600
 
 
@@ -3169,18 +3109,14 @@ def test_check_budget_slowdown_runs_one_in_n_cycles() -> None:
     runner.app_config.daemon.github_api_slowdown_multiplier = 5
     h._set_budget(runner, h._budget(remaining=500, limit=5000))  # 10%
 
-    decisions = [
-        asyncio.run(runner._check_github_api_budget()) for _ in range(11)
-    ]
+    decisions = [asyncio.run(runner._check_github_api_budget()) for _ in range(11)]
 
     # cycles 0, 5, 10 proceed; everything else skipped
     assert decisions[0] is True
     assert decisions[5] is True
     assert decisions[10] is True
     assert decisions[1:5] == [False, False, False, False]
-    slowdown_logs = [
-        e for e in runner.state.history if "GitHub API budget low" in e["event"]
-    ]
+    slowdown_logs = [e for e in runner.state.history if "GitHub API budget low" in e["event"]]
     assert len(slowdown_logs) == 1
 
 
@@ -3202,9 +3138,7 @@ def test_check_budget_no_skip_when_extended_idle_active() -> None:
 
     runner._idle_streak = 5  # past idle_extended_after_cycles
 
-    decisions = [
-        asyncio.run(runner._check_github_api_budget()) for _ in range(6)
-    ]
+    decisions = [asyncio.run(runner._check_github_api_budget()) for _ in range(6)]
 
     assert decisions == [True] * 6
     assert runner._github_api_slowdown_cycle == 0
@@ -3245,9 +3179,7 @@ def test_check_budget_zero_multiplier_falls_back_to_one(
     runner = h._make_runner()
     runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
     # bypass pydantic validator to exercise the max(1, ...) guard
-    object.__setattr__(
-        runner.app_config.daemon, "github_api_slowdown_multiplier", 0
-    )
+    object.__setattr__(runner.app_config.daemon, "github_api_slowdown_multiplier", 0)
     h._set_budget(runner, h._budget(remaining=500, limit=5000))
 
     proceed = asyncio.run(runner._check_github_api_budget())
@@ -3262,8 +3194,7 @@ def test_refresh_github_api_budget_fetches_and_persists(
     runner = h._make_runner()
     fetched = h._budget(remaining=4321, limit=5000)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "fetch_rate_limit_buckets",
+        "src.github.rate_limit.fetch_rate_limit_buckets",
         lambda: (fetched, None),
     )
 
@@ -3291,8 +3222,7 @@ def test_refresh_github_api_budget_persists_per_bucket_snapshots(
     rest = h._budget(remaining=4321, limit=5000)
     graphql = h._budget(remaining=120, limit=5000)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "fetch_rate_limit_buckets",
+        "src.github.rate_limit.fetch_rate_limit_buckets",
         lambda: (rest, graphql),
     )
 
@@ -3302,12 +3232,8 @@ def test_refresh_github_api_budget_persists_per_bucket_snapshots(
     # is also persisted under its own key so the dashboard can render them
     # individually rather than collapsing both into a single bar.
     assert result is not None and result.remaining == graphql.remaining
-    stored_rest = RateLimitBudget.from_redis_payload(
-        runner.redis.store[BUDGET_REST_REDIS_KEY]
-    )
-    stored_graphql = RateLimitBudget.from_redis_payload(
-        runner.redis.store[BUDGET_GRAPHQL_REDIS_KEY]
-    )
+    stored_rest = RateLimitBudget.from_redis_payload(runner.redis.store[BUDGET_REST_REDIS_KEY])
+    stored_graphql = RateLimitBudget.from_redis_payload(runner.redis.store[BUDGET_GRAPHQL_REDIS_KEY])
     assert stored_rest is not None and stored_rest.remaining == rest.remaining
     assert stored_graphql is not None and stored_graphql.remaining == graphql.remaining
     assert BUDGET_REDIS_KEY in runner.redis.store
@@ -3329,17 +3255,12 @@ def test_refresh_github_api_budget_clears_missing_bucket_snapshots(
 
     runner = h._make_runner()
     # Pre-populate both buckets to simulate a prior healthy snapshot.
-    runner.redis.store[BUDGET_REST_REDIS_KEY] = h._budget(
-        remaining=4500
-    ).to_redis_payload()
-    runner.redis.store[BUDGET_GRAPHQL_REDIS_KEY] = h._budget(
-        remaining=4500
-    ).to_redis_payload()
+    runner.redis.store[BUDGET_REST_REDIS_KEY] = h._budget(remaining=4500).to_redis_payload()
+    runner.redis.store[BUDGET_GRAPHQL_REDIS_KEY] = h._budget(remaining=4500).to_redis_payload()
 
     rest = h._budget(remaining=4321, limit=5000)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "fetch_rate_limit_buckets",
+        "src.github.rate_limit.fetch_rate_limit_buckets",
         lambda: (rest, None),
     )
 
@@ -3365,9 +3286,7 @@ def test_refresh_github_api_budget_uses_cache_within_ttl(
         calls["count"] += 1
         return h._budget(remaining=1), None
 
-    monkeypatch.setattr(
-        runner_module.github_client, "fetch_rate_limit_buckets", _fetch
-    )
+    monkeypatch.setattr("src.github.rate_limit.fetch_rate_limit_buckets", _fetch)
 
     result = asyncio.run(runner._refresh_github_api_budget())
 
@@ -3384,8 +3303,7 @@ def test_run_cycle_short_circuits_when_budget_critical(
     runner._recovered = True
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "fetch_rate_limit_buckets",
+        "src.github.rate_limit.fetch_rate_limit_buckets",
         lambda: (h._budget(remaining=1, limit=5000), None),
     )
 
@@ -3393,9 +3311,7 @@ def test_run_cycle_short_circuits_when_budget_critical(
 
     # Critical-budget path skips preflight/state machine and just publishes.
     assert runner.redis.writes, "publish_state should still run on early-return"
-    assert any(
-        "GitHub API budget critical" in e["event"] for e in runner.state.history
-    )
+    assert any("GitHub API budget critical" in e["event"] for e in runner.state.history)
 
 
 def test_refresh_github_api_budget_picks_up_sibling_update_within_ttl(
@@ -3424,9 +3340,7 @@ def test_refresh_github_api_budget_picks_up_sibling_update_within_ttl(
         fetch_calls["count"] += 1  # pragma: no cover - probe must not be invoked
         return h._budget(remaining=1), None
 
-    monkeypatch.setattr(
-        runner_module.github_client, "fetch_rate_limit_buckets", _fetch
-    )
+    monkeypatch.setattr("src.github.rate_limit.fetch_rate_limit_buckets", _fetch)
 
     result = asyncio.run(runner._refresh_github_api_budget())
 
@@ -3443,12 +3357,9 @@ def test_refresh_github_api_budget_keeps_cache_when_fetch_fails(
     runner = h._make_runner()
     cached = h._budget(remaining=999)
     runner._github_api_budget_cache = cached
-    runner._github_api_budget_last_fetched = (
-        datetime.now(timezone.utc) - timedelta(seconds=120)
-    )
+    runner._github_api_budget_last_fetched = datetime.now(timezone.utc) - timedelta(seconds=120)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "fetch_rate_limit_buckets",
+        "src.github.rate_limit.fetch_rate_limit_buckets",
         lambda: (None, None),
     )
 
@@ -3470,8 +3381,7 @@ def test_refresh_github_api_budget_releases_lock_when_probe_returns_none(
 
     runner = h._make_runner()
     monkeypatch.setattr(
-        runner_module.github_client,
-        "fetch_rate_limit_buckets",
+        "src.github.rate_limit.fetch_rate_limit_buckets",
         lambda: (None, None),
     )
 
@@ -3503,9 +3413,7 @@ def test_refresh_github_api_budget_skips_fetch_when_lock_held(
         fetch_calls["count"] += 1
         return h._budget(remaining=1), None
 
-    monkeypatch.setattr(
-        runner_module.github_client, "fetch_rate_limit_buckets", _fetch
-    )
+    monkeypatch.setattr("src.github.rate_limit.fetch_rate_limit_buckets", _fetch)
 
     result = asyncio.run(runner._refresh_github_api_budget())
 
@@ -3534,9 +3442,7 @@ def test_refresh_github_api_budget_lock_serializes_concurrent_runners(
         fetch_calls["count"] += 1
         return fetched, None
 
-    monkeypatch.setattr(
-        runner_module.github_client, "fetch_rate_limit_buckets", _fetch
-    )
+    monkeypatch.setattr("src.github.rate_limit.fetch_rate_limit_buckets", _fetch)
 
     result_a = asyncio.run(runner_a._refresh_github_api_budget())
     result_b = asyncio.run(runner_b._refresh_github_api_budget())
@@ -3559,8 +3465,7 @@ def test_refresh_github_api_budget_falls_back_to_local_cache_when_shared_empty(
     runner.redis.store[REFRESH_LOCK_REDIS_KEY] = "1"
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "fetch_rate_limit_buckets",
+        "src.github.rate_limit.fetch_rate_limit_buckets",
         lambda: (h._budget(remaining=1), None),
     )
 
@@ -3583,8 +3488,7 @@ def test_refresh_github_api_budget_keeps_ttl_unset_when_no_snapshot(
     runner.redis.store[REFRESH_LOCK_REDIS_KEY] = "1"
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "fetch_rate_limit_buckets",
+        "src.github.rate_limit.fetch_rate_limit_buckets",
         lambda: (None, None),  # pragma: no cover - lock held, fetch never invoked
     )
 
@@ -3638,9 +3542,7 @@ def test_run_cycle_records_graphql_burn_when_budget_drops(
 
     async def fake_run_cycle_body() -> None:
         # Simulate API consumption observed via a sibling refresh mid-cycle.
-        runner.redis.store[BUDGET_REDIS_KEY] = h._budget(
-            remaining=4480
-        ).to_redis_payload()
+        runner.redis.store[BUDGET_REDIS_KEY] = h._budget(remaining=4480).to_redis_payload()
 
     monkeypatch.setattr(runner, "_run_cycle_body", fake_run_cycle_body)
 
@@ -3665,9 +3567,7 @@ def test_run_cycle_records_zero_burn_when_window_resets(
     runner.redis.store[BUDGET_REDIS_KEY] = h._budget(remaining=120).to_redis_payload()
 
     async def fake_run_cycle_body() -> None:
-        runner.redis.store[BUDGET_REDIS_KEY] = h._budget(
-            remaining=5000
-        ).to_redis_payload()
+        runner.redis.store[BUDGET_REDIS_KEY] = h._budget(remaining=5000).to_redis_payload()
 
     monkeypatch.setattr(runner, "_run_cycle_body", fake_run_cycle_body)
 

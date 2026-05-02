@@ -6,7 +6,7 @@ Covers the four scenarios called out in tasks/PR-195.md:
 2. Five distinct force-pushes → ``push_count == 5``.
 3. Cross-restart persistence (Redis-backed via ``RepoState`` JSON
    round-trip) preserves the observed-SHA set.
-4. ``github_client.get_open_prs`` populates the set with the API's
+4. ``prs.get_open_prs`` populates the set with the API's
    current head SHA on the initial fetch.
 """
 
@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from src.github_client import get_open_prs
+from src.github.prs import get_open_prs
 from src.models import (
     CIStatus,
     PipelineState,
@@ -257,13 +257,13 @@ def test_get_open_prs_populates_observed_head_shas_with_current_head(
             return raw
         raise AssertionError(f"unexpected run_gh call: {args}")
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     monkeypatch.setattr(
-        "src.github_client._fetch_ci_status_rest",
+        "src.github.checks._fetch_ci_status_rest",
         lambda repo, sha: ([], {}, True),
     )
     monkeypatch.setattr(
-        "src.github_client.get_pr_review_status",
+        "src.github.reviews.get_pr_review_status",
         lambda repo, number, pr_author, head_sha: ReviewStatus.PENDING,
     )
 

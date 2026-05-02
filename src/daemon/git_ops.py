@@ -17,7 +17,7 @@ import logging
 import subprocess
 from pathlib import Path
 
-from src import github_client
+from src.github import gh_runner
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ _FETCH_MISSING_REF_NEEDLE = "couldn't find remote ref"
 
 def repo_owner_from_url(url: str) -> str:
     """Return ``owner/repo`` for a GitHub URL."""
-    return github_client.get_repo_full_name(url)
+    return gh_runner.get_repo_full_name(url)
 
 
 def _git(

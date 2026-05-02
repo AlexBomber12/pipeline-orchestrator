@@ -14,8 +14,8 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src import github_client
 from src.dag import get_eligible_tasks
+from src.github import prs as gh_prs
 from src.models import PipelineState, QueueTask, TaskStatus
 from src.queue_parser import (
     QueueValidationError,
@@ -439,7 +439,7 @@ class IdleMixin:
                 return
 
         try:
-            prs = github_client.get_open_prs(
+            prs = gh_prs.get_open_prs(
                 self.owner_repo,
                 allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
             )
@@ -459,7 +459,7 @@ class IdleMixin:
             and previous_open_pr_snapshot != open_pr_snapshot
         )
         try:
-            merged_prs = github_client.get_merged_prs(
+            merged_prs = gh_prs.get_merged_prs(
                 self.owner_repo,
                 self.repo_config.branch,
                 refresh=refresh_merged_prs,

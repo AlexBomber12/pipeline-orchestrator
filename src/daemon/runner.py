@@ -34,7 +34,6 @@ from typing import Any
 import redis.asyncio as aioredis
 from redis.exceptions import RedisError
 
-from src import github_client  # noqa: F401 — tests reference runner_module.github_client
 from src.coder_registry import CoderPlugin, CoderRegistry
 from src.coders import build_coder_registry
 from src.config import AppConfig, CoderType, RepoConfig, load_config
@@ -79,6 +78,8 @@ from src.daemon.selector import (
     select_coder,
 )
 from src.events import publish_repo_event
+from src.github import comments as gh_comments
+from src.github import rate_limit as gh_rate_limit
 from src.keyspace import (
     cli_log_history,
     cli_log_latest,
@@ -1086,7 +1087,7 @@ class PipelineRunner(
                 soft-fail log prefixes (``"FIX no-push"``, ``"FIX
                 coder ESCALATE"``, ...) survive the migration.
             post_comment_on_pr: When non-None, posts the supplied text
-                via ``github_client.post_comment``. Failure is logged
+                via ``comments.post_comment``. Failure is logged
                 with a generic ``[INFRA] Warning:`` prefix; callers
                 that need a custom failure-log body (e.g. fix.py
                 wrappers asserted on by regression tests) post the
@@ -1105,7 +1106,7 @@ class PipelineRunner(
 
         if post_comment_on_pr is not None and pr is not None:
             try:
-                github_client.post_comment(
+                gh_comments.post_comment(
                     self.owner_repo, pr.number, post_comment_on_pr
                 )
             except Exception as exc:
@@ -1390,7 +1391,7 @@ class PipelineRunner(
             return self._github_api_budget_cache
         if await try_claim_refresh_lock(self.redis, ttl_seconds=60):
             rest, graphql = await asyncio.to_thread(
-                github_client.fetch_rate_limit_buckets
+                gh_rate_limit.fetch_rate_limit_buckets
             )
             if rest is not None:
                 await write_rest_budget(self.redis, rest)

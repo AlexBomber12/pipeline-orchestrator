@@ -54,8 +54,6 @@ from src.daemon import recovery as recovery_module  # noqa: F401  (sanity)
 from src.daemon import runner as runner_module
 from src.daemon.handlers import coding as coding_module  # noqa: F401  # noqa: F401,F811
 from src.daemon.handlers import error as error_module  # noqa: F401  # noqa: F401,F811
-from src.daemon.handlers import fix as fix_module  # noqa: F811
-from src.daemon.handlers import hung as hung_module  # noqa: F811
 from src.daemon.handlers import idle as idle_module  # noqa: F811
 from src.daemon.handlers import merge as merge_module  # noqa: F401  # noqa: F401,F811
 from src.daemon.handlers import watch as watch_module  # noqa: F401  # noqa: F401,F811
@@ -132,8 +130,7 @@ def test_recovery_clears_task_on_already_merged_doing(
     )
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
@@ -151,10 +148,7 @@ def test_recovery_clears_task_on_already_merged_doing(
     # Site falls through to the no-recoverable branch which clears these:
     assert runner.state.current_pr is None
     assert runner.state.state == PipelineState.IDLE
-    assert any(
-        f"ignoring stale DOING entry {task.pr_id}" in e["event"]
-        for e in runner.state.history
-    )
+    assert any(f"ignoring stale DOING entry {task.pr_id}" in e["event"] for e in runner.state.history)
 
 
 def test_recovery_clears_task_on_no_pr_after_crash(
@@ -178,8 +172,7 @@ def test_recovery_clears_task_on_no_pr_after_crash(
     )
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
     monkeypatch.setattr(
@@ -202,10 +195,7 @@ def test_recovery_clears_task_on_no_pr_after_crash(
     assert runner.state.error_message is None
     assert runner.state.state == PipelineState.IDLE
     assert "PR-200" in runner._crashed_task_pr_ids
-    assert any(
-        "Task PR-200 crashed, marking CANCELED" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("Task PR-200 crashed, marking CANCELED" in e["event"] for e in runner.state.history)
 
 
 def test_recovery_clears_task_at_idle_resolution(
@@ -220,8 +210,7 @@ def test_recovery_clears_task_at_idle_resolution(
     in the codebase outside the crashed-DOING path.
     """
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
 
@@ -243,10 +232,7 @@ def test_recovery_clears_task_at_idle_resolution(
     assert runner.state.current_task is None
     assert runner.state.current_pr is None
     assert runner._error_diagnose_count == 0
-    assert any(
-        "no DOING tasks, no open PRs -> IDLE" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("no DOING tasks, no open PRs -> IDLE" in e["event"] for e in runner.state.history)
 
 
 def test_idle_clears_task_on_open_pr_check_failure(
@@ -274,12 +260,14 @@ def test_idle_clears_task_on_open_pr_check_failure(
     def _raise(repo: str, **kw: Any) -> list[PRInfo]:
         raise RuntimeError("API down")
 
-    monkeypatch.setattr(runner_module.github_client, "get_open_prs", _raise)
+    monkeypatch.setattr("src.github.prs.get_open_prs", _raise)
 
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(number=5, branch="stale")
     runner.state.current_task = QueueTask(
-        pr_id="PR-OLD", title="t", status=TaskStatus.TODO,
+        pr_id="PR-OLD",
+        title="t",
+        status=TaskStatus.TODO,
     )
     runner.state.error_message = "stale before clear"
     runner._idle_dispatch_deferred = False
@@ -291,9 +279,7 @@ def test_idle_clears_task_on_open_pr_check_failure(
     assert runner.state.current_task is None
     assert runner._idle_dispatch_deferred is True
     assert runner.state.error_message is None
-    assert any(
-        "open PR check failed" in e["event"] for e in runner.state.history
-    )
+    assert any("open PR check failed" in e["event"] for e in runner.state.history)
 
 
 def test_idle_clears_task_on_user_pause_during_prep(
@@ -317,11 +303,11 @@ def test_idle_clears_task_on_user_pause_during_prep(
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: task)
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [],
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -339,10 +325,7 @@ def test_idle_clears_task_on_user_pause_during_prep(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert runner.state.current_pr is None
-    assert any(
-        "Pause requested while preparing PR-042" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("Pause requested while preparing PR-042" in e["event"] for e in runner.state.history)
 
 
 def test_fix_clears_task_on_terminal_pr_state(
@@ -356,9 +339,7 @@ def test_fix_clears_task_on_terminal_pr_state(
     ``publish_state`` (the FIX handler publishes after dropping the
     work because IDLE consumers depend on the transition signal).
     """
-    monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
-    )
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.FIX
@@ -384,11 +365,7 @@ def test_fix_clears_task_on_terminal_pr_state(
     assert runner.state.current_task is None
     assert runner.state.error_message is None
     assert publish_calls  # publish_state was called
-    assert any(
-        "PR #42 merged externally during FIX, returning to IDLE."
-        in e["event"]
-        for e in runner.state.history
-    )
+    assert any("PR #42 merged externally during FIX, returning to IDLE." in e["event"] for e in runner.state.history)
 
 
 def test_hung_clears_task_on_resolved(
@@ -405,8 +382,7 @@ def test_hung_clears_task_on_resolved(
     ``error_message`` field is reserved for an active failure.
     """
     monkeypatch.setattr(
-        hung_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda *a, **kw: {"state": "MERGED"},
     )
 
@@ -414,7 +390,9 @@ def test_hung_clears_task_on_resolved(
     runner.state.state = PipelineState.HUNG
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="parked", status=TaskStatus.DOING,
+        pr_id="PR-001",
+        title="parked",
+        status=TaskStatus.DOING,
     )
     runner.state.error_message = "operator review reason"
 
@@ -424,10 +402,7 @@ def test_hung_clears_task_on_resolved(
     assert runner.state.current_pr is None
     assert runner.state.current_task is None
     assert runner.state.error_message is None
-    assert any(
-        "PR #5 MERGED by operator -> IDLE" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("PR #5 MERGED by operator -> IDLE" in e["event"] for e in runner.state.history)
 
 
 def test_merge_clears_task_after_successful_merge(
@@ -443,17 +418,22 @@ def test_merge_clears_task_after_successful_merge(
     """
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        runner_module.github_client, "merge_pr", lambda repo, num: None,
+        "src.github.prs.merge_pr",
+        lambda repo, num: None,
     )
     monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None,
+        runner_module.PipelineRunner,
+        "_mark_queue_done",
+        lambda self: None,
     )
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING,
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
     )
     runner._start_current_run_record("claude", "opus")
 
@@ -463,9 +443,7 @@ def test_merge_clears_task_after_successful_merge(
     assert runner.state.current_pr is None
     assert runner.state.current_task is None
     assert runner._current_run_record is None
-    assert any(
-        "Merged PR #5 -> IDLE" in e["event"] for e in runner.state.history
-    )
+    assert any("Merged PR #5 -> IDLE" in e["event"] for e in runner.state.history)
 
 
 def test_error_diagnose_skip_clears_task(
@@ -478,17 +456,23 @@ def test_error_diagnose_skip_clears_task(
     ``_error_diagnose_count``, transitions to IDLE.
     """
     monkeypatch.setattr(
-        claude_cli, "diagnose_error_async", h._async_cli_result(0, "SKIP", ""),
+        claude_cli,
+        "diagnose_error_async",
+        h._async_cli_result(0, "SKIP", ""),
     )
     monkeypatch.setattr(
-        codex_cli, "diagnose_error_async", h._async_cli_result(0, "SKIP", ""),
+        codex_cli,
+        "diagnose_error_async",
+        h._async_cli_result(0, "SKIP", ""),
     )
 
     runner = h._make_runner()
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "boom"
     runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="active", status=TaskStatus.DOING,
+        pr_id="PR-001",
+        title="active",
+        status=TaskStatus.DOING,
     )
     runner.state.current_pr = PRInfo(number=42, branch="pr-001-feature")
     runner._error_diagnose_count = 1
@@ -500,10 +484,7 @@ def test_error_diagnose_skip_clears_task(
     assert runner.state.current_pr is None
     assert runner.state.error_message is None
     assert runner._error_diagnose_count == 0
-    assert any(
-        "diagnose_error: SKIP -> IDLE" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("diagnose_error: SKIP -> IDLE" in e["event"] for e in runner.state.history)
 
 
 @pytest.mark.parametrize(
@@ -528,11 +509,11 @@ def test_watch_clears_task_on_pr_terminal(
     none of them silently diverged from the shared callsite.
     """
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [],
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "is_pr_merged",
+        "src.github.prs.is_pr_merged",
         lambda repo, num: merged_value,
     )
 
@@ -540,7 +521,9 @@ def test_watch_clears_task_on_pr_terminal(
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=7, branch="pr-007")
     runner.state.current_task = QueueTask(
-        pr_id="PR-007", title="watching", status=TaskStatus.DOING,
+        pr_id="PR-007",
+        title="watching",
+        status=TaskStatus.DOING,
     )
     runner._start_current_run_record("claude", "opus")
 
@@ -550,9 +533,7 @@ def test_watch_clears_task_on_pr_terminal(
     assert runner.state.current_pr is None
     assert runner.state.current_task is None
     assert runner._current_run_record is None
-    assert any(
-        expected_log_fragment in e["event"] for e in runner.state.history
-    )
+    assert any(expected_log_fragment in e["event"] for e in runner.state.history)
 
 
 # =========================================================================
@@ -579,13 +560,11 @@ def test_recovery_assigns_doing_task(
     pr = PRInfo(number=33, branch="pr-300-resume")
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, num: {"head_commit_date": "2026-04-14T12:00:00Z"},
     )
 
@@ -599,10 +578,7 @@ def test_recovery_assigns_doing_task(
     assert runner.state.current_pr.number == 33
     assert runner.state.state == PipelineState.WATCH
     assert runner._watch_entered_at is not None
-    assert any(
-        f"Recovered: DOING task {task.pr_id} -> WATCH PR #33" in e["event"]
-        for e in runner.state.history
-    )
+    assert any(f"Recovered: DOING task {task.pr_id} -> WATCH PR #33" in e["event"] for e in runner.state.history)
 
 
 def test_recovery_assigns_matched_task(
@@ -624,13 +600,11 @@ def test_recovery_assigns_matched_task(
     pr = PRInfo(number=34, branch="pr-301-match")
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, num: {"head_commit_date": "2026-04-14T12:00:00Z"},
     )
 
@@ -644,10 +618,7 @@ def test_recovery_assigns_matched_task(
     assert runner.state.current_pr.number == 34
     assert runner.state.state == PipelineState.WATCH
     assert runner._watch_entered_at is not None
-    assert any(
-        "Recovered: DONE task PR-301 -> WATCH PR #34" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("Recovered: DONE task PR-301 -> WATCH PR #34" in e["event"] for e in runner.state.history)
 
 
 def test_idle_assigns_active_task(
@@ -671,11 +642,11 @@ def test_idle_assigns_active_task(
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: task)
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [],
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_merged_prs",
+        "src.github.prs.get_merged_prs",
         lambda repo, branch, refresh=False: [],
     )
 
@@ -692,10 +663,7 @@ def test_idle_assigns_active_task(
     assert runner.state.current_task == task
     assert runner.state.state == PipelineState.CODING
     assert coding_calls == [None]
-    assert any(
-        f"Picked task {task.pr_id}" in e["event"]
-        for e in runner.state.history
-    )
+    assert any(f"Picked task {task.pr_id}" in e["event"] for e in runner.state.history)
 
 
 # =========================================================================
@@ -727,10 +695,7 @@ def test_idle_transitions_error_on_sync_to_main_failure(
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message == "sync_to_main failed: network unreachable"
     assert publish_calls == []
-    assert any(
-        e["event"] == "[INFRA] sync_to_main failed: network unreachable."
-        for e in runner.state.history
-    )
+    assert any(e["event"] == "[INFRA] sync_to_main failed: network unreachable." for e in runner.state.history)
 
 
 def test_fix_transitions_error_on_post_comment_failure(
@@ -744,10 +709,11 @@ def test_fix_transitions_error_on_post_comment_failure(
     a ``[FIX]`` log event. The label-create / label-apply steps are
     not reached because the post comes first.
     """
+
     def fail_post(repo: str, number: int, body: str) -> None:
         raise RuntimeError("network unreachable")
 
-    monkeypatch.setattr(fix_module.github_client, "post_comment", fail_post)
+    monkeypatch.setattr("src.github.comments.post_comment", fail_post)
 
     runner = h._make_runner()
     cap = runner.app_config.daemon.fix_iteration_cap
@@ -759,10 +725,7 @@ def test_fix_transitions_error_on_post_comment_failure(
 
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message == "post_comment failed: network unreachable"
-    assert any(
-        e["event"] == "[FIX] post_comment failed: network unreachable."
-        for e in runner.state.history
-    )
+    assert any(e["event"] == "[FIX] post_comment failed: network unreachable." for e in runner.state.history)
 
 
 def test_coding_transitions_error_on_missing_branch(
@@ -779,20 +742,16 @@ def test_coding_transitions_error_on_missing_branch(
     runner = h._make_runner()
     runner.state.state = PipelineState.IDLE
     runner.state.current_task = QueueTask(
-        pr_id="PR-600", title="no branch", status=TaskStatus.TODO,
+        pr_id="PR-600",
+        title="no branch",
+        status=TaskStatus.TODO,
     )
 
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.error_message == (
-        "Current task has no branch; cannot identify PR"
-    )
-    assert any(
-        e["event"]
-        == "[CODING] Current task has no branch; cannot identify PR."
-        for e in runner.state.history
-    )
+    assert runner.state.error_message == ("Current task has no branch; cannot identify PR")
+    assert any(e["event"] == "[CODING] Current task has no branch; cannot identify PR." for e in runner.state.history)
 
 
 def test_watch_transitions_error_on_open_prs_failure(
@@ -813,15 +772,13 @@ def test_watch_transitions_error_on_open_prs_failure(
     def boom(repo: str, **kw: Any) -> list[PRInfo]:
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(runner_module.github_client, "get_open_prs", boom)
+    monkeypatch.setattr("src.github.prs.get_open_prs", boom)
 
     asyncio.run(runner.handle_watch())
 
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message == "get_open_prs failed: boom"
-    assert any(
-        e["event"] == "[WATCH] boom." for e in runner.state.history
-    )
+    assert any(e["event"] == "[WATCH] boom." for e in runner.state.history)
 
 
 def test_merge_transitions_error_on_no_eligible_coder(
@@ -849,7 +806,9 @@ def test_merge_transitions_error_on_no_eligible_coder(
         if cmd[:2] == ["git", "rev-list"]:
             # Signal "ahead of origin" so the pre-merge sync fires.
             return h._FakeCompletedProcess(
-                args=cmd, stdout="1\n", returncode=0,
+                args=cmd,
+                stdout="1\n",
+                returncode=0,
             )
         return h._FakeCompletedProcess(args=cmd, stdout="", returncode=0)
 
@@ -860,19 +819,17 @@ def test_merge_transitions_error_on_no_eligible_coder(
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=70, branch=pr_branch)
     runner.state.current_task = QueueTask(
-        pr_id="PR-700", title="merge", status=TaskStatus.DOING,
+        pr_id="PR-700",
+        title="merge",
+        status=TaskStatus.DOING,
     )
 
     asyncio.run(runner.handle_merge())
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.error_message == (
-        "No eligible coder available for merge conflict resolution"
-    )
+    assert runner.state.error_message == ("No eligible coder available for merge conflict resolution")
     assert any(
-        e["event"]
-        == "[MERGE] No eligible coder available for merge conflict resolution."
-        for e in runner.state.history
+        e["event"] == "[MERGE] No eligible coder available for merge conflict resolution." for e in runner.state.history
     )
 
 
@@ -888,8 +845,7 @@ def test_recovery_transitions_error_on_get_open_prs_failure(
     recovery on the next tick instead of marking ``_recovered`` true.
     """
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: (_ for _ in ()).throw(RuntimeError("API down")),
     )
 
@@ -900,13 +856,8 @@ def test_recovery_transitions_error_on_get_open_prs_failure(
 
     assert completed is False
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.error_message == (
-        "recover_state: get_open_prs failed: API down"
-    )
-    assert any(
-        e["event"] == "[INFRA] recover_state failed: API down."
-        for e in runner.state.history
-    )
+    assert runner.state.error_message == ("recover_state: get_open_prs failed: API down")
+    assert any(e["event"] == "[INFRA] recover_state failed: API down." for e in runner.state.history)
 
 
 def test_error_transitions_error_on_review_trigger_failure_after_fix_push(
@@ -927,9 +878,7 @@ def test_error_transitions_error_on_review_trigger_failure_after_fix_push(
     returns immediately), matching the contract for non-publishing
     ERROR transitions in fix/watch/hung/recovery sampled above.
     """
-    runner, _calls, _warnings, review_requests = h._run_dirty_diagnose(
-        monkeypatch, tmp_path, review_post_ok=False
-    )
+    runner, _calls, _warnings, review_requests = h._run_dirty_diagnose(monkeypatch, tmp_path, review_post_ok=False)
 
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message == (
@@ -938,15 +887,13 @@ def test_error_transitions_error_on_review_trigger_failure_after_fix_push(
         "to avoid fix/push loop"
     )
     assert review_requests == [119]
-    assert any(
-        e["event"] == f"[ERROR] {runner.state.error_message}."
-        for e in runner.state.history
-    )
+    assert any(e["event"] == f"[ERROR] {runner.state.error_message}." for e in runner.state.history)
 
 
 # ---------------------------------------------------------------------------
 # PR-224a moved from tests/test_runner.py
 # ---------------------------------------------------------------------------
+
 
 def test_handle_coding_no_pr_routes_to_diagnostic(
     monkeypatch: pytest.MonkeyPatch,
@@ -958,8 +905,7 @@ def test_handle_coding_no_pr_routes_to_diagnostic(
         h._async_cli_result(0, "ok", ""),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
 
@@ -974,9 +920,7 @@ def test_handle_coding_no_pr_routes_to_diagnostic(
     monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
 
     runner = h._make_runner()
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001")
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.HUNG
@@ -994,23 +938,18 @@ def test_handle_coding_creates_run_record(
         h._async_cli_result(0, "ok", ""),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [PRInfo(number=42, branch="pr-001")],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
 
     task_file = tmp_path / "tasks" / "PR-001.md"
     task_file.parent.mkdir(parents=True)
     task_file.write_text(
-        "# PR-001: Sample\n\n"
-        "Branch: pr-001\n"
-        "- Type: feature\n"
-        "- Complexity: low\n",
+        "# PR-001: Sample\n\nBranch: pr-001\n- Type: feature\n- Complexity: low\n",
         encoding="utf-8",
     )
 
@@ -1045,23 +984,18 @@ def test_handle_coding_normalizes_task_type_synonym(
         h._async_cli_result(0, "ok", ""),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [PRInfo(number=42, branch="pr-001")],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
 
     task_file = tmp_path / "tasks" / "PR-001.md"
     task_file.parent.mkdir(parents=True)
     task_file.write_text(
-        "# PR-001: Sample\n\n"
-        "Branch: pr-001\n"
-        "- Type: bug\n"
-        "- Complexity: low\n",
+        "# PR-001: Sample\n\nBranch: pr-001\n- Type: bug\n- Complexity: low\n",
         encoding="utf-8",
     )
 
@@ -1092,20 +1026,16 @@ def test_handle_coding_saves_record_on_success(
         h._async_cli_result(0, "ok", ""),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [PRInfo(number=42, branch="pr-001")],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
 
     runner = h._make_runner()
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001")
 
     asyncio.run(runner.handle_coding())
 
@@ -1135,9 +1065,7 @@ def test_handle_coding_saves_record_on_error(
     )
 
     runner = h._make_runner()
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001")
 
     asyncio.run(runner.handle_coding())
 
@@ -1170,8 +1098,7 @@ def test_handle_coding_rejects_unmatched_branch(
     )
     unrelated = PRInfo(number=99, branch="other-branch")
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [unrelated],
     )
 
@@ -1186,9 +1113,7 @@ def test_handle_coding_rejects_unmatched_branch(
     monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
 
     runner = h._make_runner()
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001")
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.HUNG
@@ -1211,8 +1136,7 @@ def test_handle_coding_posts_codex_review_after_pr_found(
     )
     opened_pr = PRInfo(number=42, branch="pr-019")
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [opened_pr],
     )
     posted: list[tuple[str, int, str]] = []
@@ -1220,22 +1144,17 @@ def test_handle_coding_posts_codex_review_after_pr_found(
     def fake_post(repo: str, number: int, body: str) -> None:
         posted.append((repo, number, body))
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
 
     runner = h._make_runner()
-    runner.state.current_task = QueueTask(
-        pr_id="PR-019", title="t", status=TaskStatus.DOING, branch="pr-019"
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-019", title="t", status=TaskStatus.DOING, branch="pr-019")
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.number == 42
     assert posted == [(runner.owner_repo, 42, "@codex review")]
-    assert any(
-        "Posted @codex review on PR #42" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("Posted @codex review on PR #42" in e["event"] for e in runner.state.history)
 
 
 def test_handle_coding_survives_post_comment_failure(
@@ -1253,20 +1172,17 @@ def test_handle_coding_survives_post_comment_failure(
     )
     opened_pr = PRInfo(number=42, branch="pr-019")
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [opened_pr],
     )
 
     def boom(repo: str, number: int, body: str) -> None:
         raise RuntimeError("gh transient failure")
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", boom)
+    monkeypatch.setattr("src.github.comments.post_comment", boom)
 
     runner = h._make_runner()
-    runner.state.current_task = QueueTask(
-        pr_id="PR-019", title="t", status=TaskStatus.DOING, branch="pr-019"
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-019", title="t", status=TaskStatus.DOING, branch="pr-019")
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.WATCH
@@ -1274,8 +1190,7 @@ def test_handle_coding_survives_post_comment_failure(
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.number == 42
     assert any(
-        "Warning: failed to post @codex review" in e["event"]
-        and "gh transient failure" in e["event"]
+        "Warning: failed to post @codex review" in e["event"] and "gh transient failure" in e["event"]
         for e in runner.state.history
     )
 
@@ -1340,10 +1255,7 @@ def test_handle_coding_stop_request_terminates_process(
     assert stop_called["terminate"] == 1
     assert stop_called["kill"] == 0
     assert stop_called["wait"] >= 1
-    assert any(
-        "user stop requested" in entry["event"].lower()
-        for entry in runner.state.history
-    )
+    assert any("user stop requested" in entry["event"].lower() for entry in runner.state.history)
 
 
 def test_handle_coding_honors_persisted_stop_after_fast_cli_exit(
@@ -1378,10 +1290,7 @@ def test_handle_coding_honors_persisted_stop_after_fast_cli_exit(
     assert runner.state.user_paused is True
     assert runner.state.error_message is None
     assert f"control:{runner.name}:stop" not in runner.redis.store
-    assert any(
-        "after coder exit" in entry["event"].lower()
-        for entry in runner.state.history
-    )
+    assert any("after coder exit" in entry["event"].lower() for entry in runner.state.history)
 
 
 def test_handle_coding_honors_stop_requested_during_pr_retry_after_cli_exit(
@@ -1423,7 +1332,7 @@ def test_handle_coding_honors_stop_requested_during_pr_retry_after_cli_exit(
         status=TaskStatus.DOING,
         branch="pr-127-control-endpoints-backend",
     )
-    monkeypatch.setattr(runner_module.github_client, "get_open_prs", fake_get_open_prs)
+    monkeypatch.setattr("src.github.prs.get_open_prs", fake_get_open_prs)
     monkeypatch.setattr(runner, "_pop_stop_request", fake_pop_stop_request)
     monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
     monkeypatch.setattr(runner, "_monitor_stop_request", stale_stop_monitor)
@@ -1434,10 +1343,7 @@ def test_handle_coding_honors_stop_requested_during_pr_retry_after_cli_exit(
     assert runner.state.user_paused is True
     assert runner.state.current_pr is None
     assert attempts["count"] == 1
-    assert any(
-        "after coder exit" in entry["event"].lower()
-        for entry in runner.state.history
-    )
+    assert any("after coder exit" in entry["event"].lower() for entry in runner.state.history)
 
 
 def test_handle_coding_errors_when_task_has_no_branch(
@@ -1450,15 +1356,12 @@ def test_handle_coding_errors_when_task_has_no_branch(
         h._async_cli_result(0, "ok", ""),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [PRInfo(number=1, branch="anything")],
     )
 
     runner = h._make_runner()
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )  # no branch
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)  # no branch
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.ERROR
@@ -1497,12 +1400,9 @@ def test_handle_coding_retries_pr_detection(
             return []
         return [opened_pr]
 
+    monkeypatch.setattr("src.github.prs.get_open_prs", flaky_get_open_prs)
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", flaky_get_open_prs
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
 
@@ -1514,9 +1414,7 @@ def test_handle_coding_retries_pr_detection(
     monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
 
     runner = h._make_runner()
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001")
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.WATCH
@@ -1524,10 +1422,7 @@ def test_handle_coding_retries_pr_detection(
     assert runner.state.current_pr.number == 42
     assert call_count["n"] == 2
     assert 5 in slept
-    assert any(
-        "PR not found for 'pr-001'" in e["event"] and "1/3" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("PR not found for 'pr-001'" in e["event"] and "1/3" in e["event"] for e in runner.state.history)
 
 
 def test_handle_coding_runs_three_retries_before_diagnostic(
@@ -1544,9 +1439,7 @@ def test_handle_coding_runs_three_retries_before_diagnostic(
         call_count["n"] += 1
         return []
 
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", always_empty
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", always_empty)
 
     def fake_git(repo_path: str, *args: str, **kwargs: Any):
         return h._FakeCompletedProcess(args=list(args), returncode=1)
@@ -1563,14 +1456,10 @@ def test_handle_coding_runs_three_retries_before_diagnostic(
     class _CodexPlugin:
         supports_breach_lifecycle = False
 
-        async def run_planned_pr(
-            self, path: str, **kwargs: object
-        ) -> tuple[int, str, str]:
+        async def run_planned_pr(self, path: str, **kwargs: object) -> tuple[int, str, str]:
             return (0, "ok", "")
 
-        def build_run_kwargs(
-            self, *, daemon_config: Any, **_kw: object
-        ) -> dict[str, Any]:
+        def build_run_kwargs(self, *, daemon_config: Any, **_kw: object) -> dict[str, Any]:
             return {"model": daemon_config.codex_model}
 
     runner = h._make_runner()
@@ -1578,9 +1467,7 @@ def test_handle_coding_runs_three_retries_before_diagnostic(
         "codex",
         _CodexPlugin(),
     )
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001")
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.HUNG
@@ -1597,10 +1484,9 @@ def test_handle_hung_posts_codex_review_and_returns_to_watch(
     def fake_post(repo: str, number: int, body: str) -> None:
         posted.append((repo, number, body))
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda *a, **kw: {"state": "OPEN"},
     )
 
@@ -1625,32 +1511,25 @@ def test_handle_hung_stays_hung_when_pr_is_escalated(
     posted: list[tuple[str, int, str]] = []
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: posted.append((repo, number, body)),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda *a, **kw: {"state": "OPEN"},
     )
 
     runner = h._make_runner()
     assert runner.app_config.daemon.hung_fallback_codex_review is True
     runner.state.state = PipelineState.HUNG
-    runner.state.current_pr = PRInfo(
-        number=217, branch="pr-217", is_escalated=True
-    )
+    runner.state.current_pr = PRInfo(number=217, branch="pr-217", is_escalated=True)
     asyncio.run(runner.handle_hung())
 
     assert posted == []
     assert runner.state.state == PipelineState.HUNG
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.is_escalated is True
-    assert any(
-        "PR #217 escalated; staying HUNG" in entry["event"]
-        for entry in runner.state.history
-    )
+    assert any("PR #217 escalated; staying HUNG" in entry["event"] for entry in runner.state.history)
 
 
 def test_handle_hung_escalated_pr_resolved_externally_transitions_to_idle(
@@ -1663,25 +1542,19 @@ def test_handle_hung_escalated_pr_resolved_externally_transitions_to_idle(
     posted: list[tuple[str, int, str]] = []
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: posted.append((repo, number, body)),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda *a, **kw: {"state": "MERGED"},
     )
 
     runner = h._make_runner()
     assert runner.app_config.daemon.hung_fallback_codex_review is True
     runner.state.state = PipelineState.HUNG
-    runner.state.current_pr = PRInfo(
-        number=217, branch="pr-217", is_escalated=True
-    )
-    runner.state.current_task = QueueTask(
-        pr_id="PR-217", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_pr = PRInfo(number=217, branch="pr-217", is_escalated=True)
+    runner.state.current_task = QueueTask(pr_id="PR-217", title="t", status=TaskStatus.DOING)
     asyncio.run(runner.handle_hung())
 
     assert posted == []
@@ -1696,10 +1569,9 @@ def test_handle_hung_sets_error_when_fallback_post_fails(
     def boom(repo: str, number: int, body: str) -> None:
         raise RuntimeError("gh unavailable")
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", boom)
+    monkeypatch.setattr("src.github.comments.post_comment", boom)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda *a, **kw: {"state": "OPEN"},
     )
 
@@ -1710,10 +1582,7 @@ def test_handle_hung_sets_error_when_fallback_post_fails(
 
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message == "post_comment failed: gh unavailable"
-    assert any(
-        entry["event"] == "[ESCALATE] gh unavailable."
-        for entry in runner.state.history
-    )
+    assert any(entry["event"] == "[ESCALATE] gh unavailable." for entry in runner.state.history)
 
 
 def test_handle_hung_preserves_context_when_fallback_disabled(
@@ -1722,8 +1591,7 @@ def test_handle_hung_preserves_context_when_fallback_disabled(
     """When hung_fallback_codex_review=False and PR is still open, runner
     stays in HUNG with current_pr and current_task preserved."""
     monkeypatch.setattr(
-        runner_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda *a, **kw: {"state": "OPEN"},
     )
     runner = PipelineRunner(
@@ -1737,9 +1605,7 @@ def test_handle_hung_preserves_context_when_fallback_disabled(
     )
     runner.state.state = PipelineState.HUNG
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     asyncio.run(runner.handle_hung())
 
     assert runner.state.state == PipelineState.HUNG
@@ -1755,7 +1621,7 @@ def test_handle_hung_stays_hung_when_pr_state_lookup_fails(
     def boom(*args: object, **kwargs: object) -> dict[str, str]:
         raise RuntimeError("gh view failed")
 
-    monkeypatch.setattr(runner_module.github_client, "run_gh", boom)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", boom)
     runner = PipelineRunner(
         h._repo_cfg(),
         AppConfig(
@@ -1767,17 +1633,14 @@ def test_handle_hung_stays_hung_when_pr_state_lookup_fails(
     )
     runner.state.state = PipelineState.HUNG
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     asyncio.run(runner.handle_hung())
 
     assert runner.state.state == PipelineState.HUNG
     assert runner.state.current_pr is not None
     assert runner.state.current_task is not None
     assert any(
-        "hung: failed to check PR state: gh view failed; staying HUNG"
-        in entry["event"]
+        "hung: failed to check PR state: gh view failed; staying HUNG" in entry["event"]
         for entry in runner.state.history
     )
 
@@ -1790,8 +1653,7 @@ def test_handle_hung_transitions_to_idle_when_pr_resolved(
     """When hung_fallback_codex_review=False and the operator has closed or
     merged the PR, the runner should transition back to IDLE."""
     monkeypatch.setattr(
-        runner_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda *a, **kw: {"state": pr_state},
     )
     runner = PipelineRunner(
@@ -1805,9 +1667,7 @@ def test_handle_hung_transitions_to_idle_when_pr_resolved(
     )
     runner.state.state = PipelineState.HUNG
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     asyncio.run(runner.handle_hung())
 
     assert runner.state.state == PipelineState.IDLE
@@ -1817,18 +1677,16 @@ def test_handle_hung_transitions_to_idle_when_pr_resolved(
 
 def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None:
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(
-        runner_module.github_client, "merge_pr", lambda repo, num: None
-    )
-    monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
-    )
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING,
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
     )
     asyncio.run(runner.handle_merge())
 
@@ -1855,23 +1713,21 @@ def test_handle_merge_queue_sync_failure_still_goes_idle(
     (set eagerly inside _mark_queue_done) gates handle_idle from
     re-dispatching the same task."""
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(
-        runner_module.github_client, "merge_pr", lambda repo, num: None
-    )
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
 
     def _failing_mark(self: Any) -> None:
         self.state.pending_queue_sync_branch = "queue-done-pr-001"
         raise RuntimeError("push rejected")
 
-    monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", _failing_mark
-    )
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", _failing_mark)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING,
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
     )
     asyncio.run(runner.handle_merge())
 
@@ -1884,9 +1740,7 @@ def test_escalate_queue_sync_transitions_to_error_when_expired(
 ) -> None:
     runner = h._make_runner()
     runner.state.pending_queue_sync_branch = "queue-done-pr-001"
-    runner.state.pending_queue_sync_started_at = (
-        datetime.now(timezone.utc) - timedelta(hours=2)
-    )
+    runner.state.pending_queue_sync_started_at = datetime.now(timezone.utc) - timedelta(hours=2)
     events: list[str] = []
     monkeypatch.setattr(runner, "log_event", events.append)
 
@@ -1896,12 +1750,8 @@ def test_escalate_queue_sync_transitions_to_error_when_expired(
     assert runner.state.pending_queue_sync_started_at is None
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message is not None
-    assert "queue-sync PR queue-done-pr-001 unresolved after " in (
-        runner.state.error_message
-    )
-    assert f"(max {merge_module._QUEUE_SYNC_MAX_WAIT_SEC}s)" in (
-        runner.state.error_message
-    )
+    assert "queue-sync PR queue-done-pr-001 unresolved after " in (runner.state.error_message)
+    assert f"(max {merge_module._QUEUE_SYNC_MAX_WAIT_SEC}s)" in (runner.state.error_message)
     assert events == [f"[MERGE] {runner.state.error_message}."]
 
 
@@ -1911,7 +1761,7 @@ def test_handle_merge_failure_sets_error(monkeypatch: pytest.MonkeyPatch) -> Non
     def boom(repo: str, num: int) -> None:
         raise RuntimeError("merge conflict")
 
-    monkeypatch.setattr(runner_module.github_client, "merge_pr", boom)
+    monkeypatch.setattr("src.github.prs.merge_pr", boom)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -1931,9 +1781,7 @@ def test_handle_merge_syncs_with_main(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_git(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
         git_calls.append(cmd)
         if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
-            return h._FakeCompletedProcess(
-                args=cmd, stdout="Already up to date.\n", returncode=0
-            )
+            return h._FakeCompletedProcess(args=cmd, stdout="Already up to date.\n", returncode=0)
         return h._FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
@@ -1943,32 +1791,23 @@ def test_handle_merge_syncs_with_main(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_merge_pr(repo: str, num: int) -> None:
         merge_pr_calls.append((repo, num))
 
-    monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge_pr)
-    monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
-    )
+    monkeypatch.setattr("src.github.prs.merge_pr", fake_merge_pr)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     asyncio.run(runner.handle_merge())
 
     assert runner.state.state == PipelineState.IDLE
     assert merge_pr_calls == [(runner.owner_repo, 5)]
 
-    merge_idx = next(
-        i for i, cmd in enumerate(git_calls)
-        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd
-    )
+    merge_idx = next(i for i, cmd in enumerate(git_calls) if cmd[:2] == ["git", "merge"] and "origin/main" in cmd)
     merge_pr_call_idx = len(git_calls)  # merge_pr ran after all git calls
     assert merge_idx < merge_pr_call_idx
     # No push because the merge was a no-op.
-    assert not any(
-        cmd[:2] == ["git", "push"] and "pr-001" in cmd for cmd in git_calls
-    )
+    assert not any(cmd[:2] == ["git", "push"] and "pr-001" in cmd for cmd in git_calls)
 
 
 def test_handle_merge_marks_pr_ready_before_merge(
@@ -1986,18 +1825,14 @@ def test_handle_merge_marks_pr_ready_before_merge(
         assert (repo, num) == (runner.owner_repo, 5)
         call_order.append("merge")
 
-    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_run_gh)
-    monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge_pr)
-    monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
-    )
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.prs.merge_pr", fake_merge_pr)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
 
     asyncio.run(runner.handle_merge())
 
@@ -2021,18 +1856,14 @@ def test_handle_merge_ignores_pr_ready_failure(
         assert (repo, num) == (runner.owner_repo, 5)
         call_order.append("merge")
 
-    monkeypatch.setattr(runner_module.github_client, "run_gh", fail_run_gh)
-    monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge_pr)
-    monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
-    )
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fail_run_gh)
+    monkeypatch.setattr("src.github.prs.merge_pr", fake_merge_pr)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
 
     asyncio.run(runner.handle_merge())
 
@@ -2045,15 +1876,11 @@ def test_handle_merge_captures_success_stats_before_queue_sync(
 ) -> None:
     def fake_git(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
         if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
-            return h._FakeCompletedProcess(
-                args=cmd, stdout="Already up to date.\n", returncode=0
-            )
+            return h._FakeCompletedProcess(args=cmd, stdout="Already up to date.\n", returncode=0)
         return h._FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
-    monkeypatch.setattr(
-        runner_module.github_client, "merge_pr", lambda repo, num: None
-    )
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
 
     call_order: list[str] = []
 
@@ -2073,14 +1900,10 @@ def test_handle_merge_captures_success_stats_before_queue_sync(
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     runner._start_current_run_record("claude", "opus")
     monkeypatch.setattr(runner, "_compute_diff_stats", fake_compute)
-    monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", fake_mark
-    )
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", fake_mark)
 
     asyncio.run(runner.handle_merge())
 
@@ -2128,15 +1951,13 @@ def test_handle_merge_returns_to_watch_after_sync_push(
 
     merge_pr_calls: list[tuple[str, int]] = []
     monkeypatch.setattr(
-        runner_module.github_client,
-        "merge_pr",
+        "src.github.prs.merge_pr",
         lambda repo, num: merge_pr_calls.append((repo, num)),
     )
 
     post_calls: list[tuple[str, int, str]] = []
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, num, body: post_calls.append((repo, num, body)),
     )
 
@@ -2144,22 +1965,16 @@ def test_handle_merge_returns_to_watch_after_sync_push(
     runner.state.state = PipelineState.WATCH
     pr = PRInfo(number=5, branch="pr-001")
     runner.state.current_pr = pr
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     asyncio.run(runner.handle_merge())
 
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is pr
-    assert not merge_pr_calls, (
-        "merge_pr must not run with stale gate results after sync push"
+    assert not merge_pr_calls, "merge_pr must not run with stale gate results after sync push"
+    assert any(cmd[:2] == ["git", "push"] and "pr-001" in cmd for cmd in git_calls), (
+        "sync must push the merged PR branch"
     )
-    assert any(
-        cmd[:2] == ["git", "push"] and "pr-001" in cmd for cmd in git_calls
-    ), "sync must push the merged PR branch"
-    assert post_calls == [(runner.owner_repo, 5, "@codex review")], (
-        "must re-request Codex review on the refreshed HEAD"
-    )
+    assert post_calls == [(runner.owner_repo, 5, "@codex review")], "must re-request Codex review on the refreshed HEAD"
 
 
 def test_handle_merge_errors_when_codex_post_fails_after_sync_push(
@@ -2169,6 +1984,7 @@ def test_handle_merge_errors_when_codex_post_fails_after_sync_push(
     runner into ERROR: without a fresh review trigger on the new
     HEAD, the prior anchor +1 keeps the PR APPROVED and a subsequent
     handle_watch cycle would merge on stale approval."""
+
     def fake_git(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
         if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
             return h._FakeCompletedProcess(
@@ -2183,14 +1999,12 @@ def test_handle_merge_errors_when_codex_post_fails_after_sync_push(
     def boom(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("gh api failure")
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", boom)
+    monkeypatch.setattr("src.github.comments.post_comment", boom)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     asyncio.run(runner.handle_merge())
 
     assert runner.state.state == PipelineState.ERROR
@@ -2235,35 +2049,29 @@ def test_handle_merge_resolves_conflict(
 
     merge_pr_calls: list[tuple[str, int]] = []
     monkeypatch.setattr(
-        runner_module.github_client,
-        "merge_pr",
+        "src.github.prs.merge_pr",
         lambda repo, num: merge_pr_calls.append((repo, num)),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, num, body: None,
     )
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_merge())
 
     assert runner.state.state == PipelineState.WATCH
     assert claude_calls, "Claude must be invoked on merge conflict"
-    assert not merge_pr_calls, (
-        "merge_pr must not run with stale gate results after sync push"
-    )
+    assert not merge_pr_calls, "merge_pr must not run with stale gate results after sync push"
     assert runner._current_run_record is not None
     assert runner._current_run_record.had_merge_conflict is True
-    assert any(
-        cmd[:2] == ["git", "push"] and "pr-001" in cmd for cmd in git_calls
-    ), "conflict-resolved HEAD must be pushed to origin"
+    assert any(cmd[:2] == ["git", "push"] and "pr-001" in cmd for cmd in git_calls), (
+        "conflict-resolved HEAD must be pushed to origin"
+    )
 
 
 def test_handle_merge_falls_back_to_codex_for_conflict_resolution(
@@ -2322,17 +2130,14 @@ def test_handle_merge_falls_back_to_codex_for_conflict_resolution(
         ),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, num, body: None,
     )
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
 
     asyncio.run(runner.handle_merge())
 
@@ -2403,10 +2208,7 @@ def test_handle_merge_sets_error_when_no_auxiliary_coder_is_eligible(
     )
 
     assert runner.state.state == PipelineState.ERROR
-    assert (
-        runner.state.error_message
-        == "No eligible coder available for merge conflict resolution"
-    )
+    assert runner.state.error_message == "No eligible coder available for merge conflict resolution"
     assert ("merge", "--abort") in git_calls
     assert not claude_calls
     assert not codex_calls
@@ -2430,33 +2232,25 @@ def test_handle_merge_skips_sync_for_cross_repo_pr(
 
     merge_pr_calls: list[tuple[str, int]] = []
     monkeypatch.setattr(
-        runner_module.github_client,
-        "merge_pr",
+        "src.github.prs.merge_pr",
         lambda repo, num: merge_pr_calls.append((repo, num)),
     )
-    monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
-    )
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
-    runner.state.current_pr = PRInfo(
-        number=5, branch="pr-001", is_cross_repository=True
-    )
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001", is_cross_repository=True)
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     asyncio.run(runner.handle_merge())
 
     assert runner.state.state == PipelineState.IDLE
     assert merge_pr_calls == [(runner.owner_repo, 5)]
-    assert not any(
-        cmd[:2] == ["git", "push"] and "pr-001" in cmd for cmd in git_calls
-    ), "cross-repo PRs must not push the head branch to origin"
-    assert not any(
-        cmd[:2] == ["git", "merge"] and "origin/main" in cmd
-        for cmd in git_calls
-    ), "cross-repo PRs must not merge base locally"
+    assert not any(cmd[:2] == ["git", "push"] and "pr-001" in cmd for cmd in git_calls), (
+        "cross-repo PRs must not push the head branch to origin"
+    )
+    assert not any(cmd[:2] == ["git", "merge"] and "origin/main" in cmd for cmd in git_calls), (
+        "cross-repo PRs must not merge base locally"
+    )
 
 
 def test_handle_merge_refreshes_pr_head_before_merge(
@@ -2473,47 +2267,29 @@ def test_handle_merge_refreshes_pr_head_before_merge(
         return h._FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
     monkeypatch.setattr(
-        runner_module.github_client, "merge_pr", lambda repo, num: None
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, num, body: None,
     )
-    monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
-    )
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     asyncio.run(runner.handle_merge())
 
-    fetch_cmds = [
-        cmd for cmd in git_calls
-        if cmd[:4] == ["git", "fetch", "--prune", "origin"]
-    ]
+    fetch_cmds = [cmd for cmd in git_calls if cmd[:4] == ["git", "fetch", "--prune", "origin"]]
     assert fetch_cmds and any("pr-001" in cmd for cmd in fetch_cmds), (
         "must fetch origin/<pr_branch> with --prune before local merge"
     )
-    reset_cmds = [
-        cmd for cmd in git_calls
-        if cmd[:3] == ["git", "reset", "--hard"] and "origin/pr-001" in cmd
-    ]
+    reset_cmds = [cmd for cmd in git_calls if cmd[:3] == ["git", "reset", "--hard"] and "origin/pr-001" in cmd]
     assert reset_cmds, "must reset local PR branch to origin/<pr_branch>"
 
     reset_idx = git_calls.index(reset_cmds[0])
-    merge_idx = next(
-        i for i, cmd in enumerate(git_calls)
-        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd
-    )
-    assert reset_idx < merge_idx, (
-        "reset to origin/<pr_branch> must happen before merging base"
-    )
+    merge_idx = next(i for i, cmd in enumerate(git_calls) if cmd[:2] == ["git", "merge"] and "origin/main" in cmd)
+    assert reset_idx < merge_idx, "reset to origin/<pr_branch> must happen before merging base"
 
 
 def test_handle_merge_sets_error_on_non_conflict_sync_failure(
@@ -2566,7 +2342,7 @@ def test_handle_merge_aborts_on_unresolvable_conflict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When Claude fails to resolve the conflict, handle_merge aborts
-    the merge, sets ERROR, and does not call github_client.merge_pr."""
+    the merge, sets ERROR, and does not call prs.merge_pr."""
     git_calls: list[list[str]] = []
 
     def fake_git(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
@@ -2601,25 +2377,18 @@ def test_handle_merge_aborts_on_unresolvable_conflict(
     def fake_merge_pr(repo: str, num: int) -> None:
         merge_pr_calls.append((repo, num))
 
-    monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge_pr)
+    monkeypatch.setattr("src.github.prs.merge_pr", fake_merge_pr)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     asyncio.run(runner.handle_merge())
 
     assert runner.state.state == PipelineState.ERROR
-    assert "Merge conflict resolution failed" in (
-        runner.state.error_message or ""
-    )
+    assert "Merge conflict resolution failed" in (runner.state.error_message or "")
     assert not merge_pr_calls, "merge_pr must not be called on abort"
-    abort_cmds = [
-        cmd for cmd in git_calls
-        if cmd[:3] == ["git", "merge", "--abort"]
-    ]
+    abort_cmds = [cmd for cmd in git_calls if cmd[:3] == ["git", "merge", "--abort"]]
     assert abort_cmds, "git merge --abort must be invoked"
 
 
@@ -2681,20 +2450,16 @@ def test_handle_coding_saves_stdout(
     )
     pr = PRInfo(number=42, branch="pr-001")
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda *a, **kw: None,
     )
 
     runner = h._make_runner()
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001")
     asyncio.run(runner.handle_coding())
 
     redis_keys = [k for k, _v in runner.redis.writes]
@@ -2720,13 +2485,11 @@ def test_handle_coding_uses_configured_timeout(
 
     monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_planned)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [PRInfo(number=1, branch="pr-001")],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda *a, **kw: None,
     )
 
@@ -2742,9 +2505,7 @@ def test_handle_coding_uses_configured_timeout(
         h._FakeRedis(),
         *h._usage_providers(),
     )
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001")
     asyncio.run(runner.handle_coding())
     assert captured.get("timeout") == 1234
 
@@ -2785,8 +2546,7 @@ def test_handle_external_terminal_pr_state_closed_transitions_to_hung(
     assert saved == ["closed_unmerged"]
     assert runner._current_run_record is None
     assert any(
-        "PR #55 closed externally during FIX, transitioning to HUNG."
-        in entry["event"]
+        "PR #55 closed externally during FIX, transitioning to HUNG." in entry["event"]
         for entry in runner.state.history
     )
 
@@ -2803,29 +2563,23 @@ def test_handle_coding_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:
         async_calls.append(path)
         return (0, "ok", "")
 
-    def fake_sync(
-        path: str, model: str | None = None, timeout: int | None = None
-    ) -> tuple[int, str, str]:
+    def fake_sync(path: str, model: str | None = None, timeout: int | None = None) -> tuple[int, str, str]:
         sync_calls.append(path)
         return (0, "ok", "")
 
     monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_async)
     monkeypatch.setattr(claude_cli, "run_planned_pr", fake_sync)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [PRInfo(number=1, branch="pr-001")],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda *a, **kw: None,
     )
 
     runner = h._make_runner()
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001")
     asyncio.run(runner.handle_coding())
 
     assert async_calls, "run_planned_pr_async must be called"
@@ -2858,13 +2612,10 @@ def test_handle_coding_publishes_heartbeat(
 
     monkeypatch.setattr(claude_cli, "run_planned_pr_async", slow_cli)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [PRInfo(number=1, branch="pr-001")],
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "post_comment", lambda *a, **kw: None
-    )
+    monkeypatch.setattr("src.github.comments.post_comment", lambda *a, **kw: None)
 
     async def fast_heartbeat(self: Any, label: str) -> None:
         while True:
@@ -2873,15 +2624,11 @@ def test_handle_coding_publishes_heartbeat(
             heartbeat_publishes.append(label)
             await self.publish_state()
 
-    monkeypatch.setattr(
-        PipelineRunner, "_publish_while_waiting", fast_heartbeat
-    )
+    monkeypatch.setattr(PipelineRunner, "_publish_while_waiting", fast_heartbeat)
 
     async def run() -> None:
         runner = h._make_runner()
-        runner.state.current_task = QueueTask(
-            pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001"
-        )
+        runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001")
         task = asyncio.create_task(runner.handle_coding())
         await asyncio.sleep(0.05)
         cli_done.set_result(None)
@@ -2902,26 +2649,27 @@ def test_handle_coding_errors_when_get_open_prs_raises(
 
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        codex_cli, "run_planned_pr_async", h._async_cli_result(0, "ok", ""),
+        codex_cli,
+        "run_planned_pr_async",
+        h._async_cli_result(0, "ok", ""),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda *args, **kwargs: h._raise_runtime_error("gh unavailable"),
     )
 
     runner = h._make_runner(coder=CoderType.CODEX)
     runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001",
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
     )
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message == "get_open_prs failed: gh unavailable"
-    assert any(
-        entry["event"] == "[CODING] get_open_prs failed: gh unavailable."
-        for entry in runner.state.history
-    )
+    assert any(entry["event"] == "[CODING] get_open_prs failed: gh unavailable." for entry in runner.state.history)
 
 
 def test_handle_coding_uses_codex_cli_when_coder_is_codex(
@@ -2938,25 +2686,28 @@ def test_handle_coding_uses_codex_cli_when_coder_is_codex(
 
     monkeypatch.setattr(codex_cli, "run_planned_pr_async", fake_run_planned_pr)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
-        lambda *a, **kw: [PRInfo(
-            number=42,
-            url="https://github.com/octo/demo/pull/42",
-            branch="pr-001",
-            ci_status=CIStatus.PENDING,
-            review_status=ReviewStatus.PENDING,
-        )],
+        "src.github.prs.get_open_prs",
+        lambda *a, **kw: [
+            PRInfo(
+                number=42,
+                url="https://github.com/octo/demo/pull/42",
+                branch="pr-001",
+                ci_status=CIStatus.PENDING,
+                review_status=ReviewStatus.PENDING,
+            )
+        ],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda *a, **kw: True,
     )
 
     runner = h._make_runner(coder=CoderType.CODEX)
     runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001",
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
     )
     asyncio.run(runner.handle_coding())
 
@@ -3001,7 +2752,7 @@ def test_handle_coding_honors_stop_requested_after_pr_poll_exhaustion(
         attempts["count"] += 1
         return []
 
-    monkeypatch.setattr(runner_module.github_client, "get_open_prs", fake_get_open_prs)
+    monkeypatch.setattr("src.github.prs.get_open_prs", fake_get_open_prs)
     monkeypatch.setattr(runner, "_pop_stop_request", fake_pop_stop_request)
     monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
     monkeypatch.setattr(runner, "_monitor_stop_request", stale_stop_monitor)
@@ -3012,7 +2763,4 @@ def test_handle_coding_honors_stop_requested_after_pr_poll_exhaustion(
     assert runner.state.error_message is None
     assert runner.state.current_pr is None
     assert attempts["count"] == 3
-    assert any(
-        entry["event"] == "[CODING] CODING aborted: user stop requested."
-        for entry in runner.state.history
-    )
+    assert any(entry["event"] == "[CODING] CODING aborted: user stop requested." for entry in runner.state.history)

@@ -32,7 +32,6 @@ from tests.runner import _helpers as h
 claude_cli = claude_plugin_module.claude_cli
 
 
-
 # ---------------------------------------------------------------------------
 # PR-224b moved from tests/test_runner.py — misc group
 # ---------------------------------------------------------------------------
@@ -80,6 +79,7 @@ def test_preflight_handles_oserror(monkeypatch: pytest.MonkeyPatch) -> None:
     handler and the runner state stays stale; preflight must translate
     it into ERROR state.
     """
+
     def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
         raise FileNotFoundError("git: not found")
 
@@ -95,6 +95,7 @@ def test_sync_to_main_handles_oserror(monkeypatch: pytest.MonkeyPatch) -> None:
     """``sync_to_main`` translates ``OSError`` to ``RuntimeError`` so
     the caller's structured error-state translation covers missing git
     binary / cwd instead of letting the exception escape unhandled."""
+
     def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
         raise FileNotFoundError("git: not found")
 
@@ -180,10 +181,7 @@ def test_log_event_starts_new_counter_after_different_event() -> None:
 
 
 def test_normalize_for_dedup_replaces_numeric_runs() -> None:
-    assert (
-        runner_module._normalize_for_dedup("PR #221 waiting 1/20m")
-        == "PR #221 waiting #/#m"
-    )
+    assert runner_module._normalize_for_dedup("PR #221 waiting 1/20m") == "PR #221 waiting #/#m"
     assert runner_module._normalize_for_dedup("no numbers here") == "no numbers here"
     assert runner_module._normalize_for_dedup("123") == "#"
     assert runner_module._normalize_for_dedup("1a2b3") == "#a#b#"
@@ -191,12 +189,8 @@ def test_normalize_for_dedup_replaces_numeric_runs() -> None:
 
 def test_normalize_for_dedup_preserves_pr_identifier() -> None:
     """``PR #<n>`` tokens are NOT normalized so different PRs stay distinct."""
-    five = runner_module._normalize_for_dedup(
-        "PR #5 waiting (review=APPROVED, ci=SUCCESS, 1/20m)"
-    )
-    six = runner_module._normalize_for_dedup(
-        "PR #6 waiting (review=APPROVED, ci=SUCCESS, 1/20m)"
-    )
+    five = runner_module._normalize_for_dedup("PR #5 waiting (review=APPROVED, ci=SUCCESS, 1/20m)")
+    six = runner_module._normalize_for_dedup("PR #6 waiting (review=APPROVED, ci=SUCCESS, 1/20m)")
     assert five != six
     assert "PR #5" in five
     assert "PR #6" in six
@@ -572,8 +566,7 @@ def test_restore_current_run_record_logs_metrics_lookup_failure() -> None:
 
     assert runner._current_run_record is None
     assert any(
-        "restore_current_run_record failed for PR-001: metrics unavailable"
-        in entry["event"]
+        "restore_current_run_record failed for PR-001: metrics unavailable" in entry["event"]
         for entry in runner.state.history
     )
 
@@ -613,12 +606,8 @@ def test_save_current_run_record_sets_duration_none_for_invalid_started_at() -> 
 
 def test_merge_finalizes_record(monkeypatch: pytest.MonkeyPatch) -> None:
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(
-        runner_module.github_client, "merge_pr", lambda repo, num: None
-    )
-    monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
-    )
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -651,12 +640,8 @@ def test_merge_finalizes_record(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_merge_calculates_duration(monkeypatch: pytest.MonkeyPatch) -> None:
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(
-        runner_module.github_client, "merge_pr", lambda repo, num: None
-    )
-    monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
-    )
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
 
     fixed_now = datetime(2026, 4, 18, 12, 0, 6, 500000, tzinfo=timezone.utc)
 
@@ -718,9 +703,7 @@ def test_preflight_routes_through_bounded_recovery_policy(
         maybe_escalate_calls.append(self.name)
         return await orig_maybe_escalate(self, ctx)
 
-    monkeypatch.setattr(
-        recovery_policy_module.BoundedRecoveryPolicy, "increment", spy_increment
-    )
+    monkeypatch.setattr(recovery_policy_module.BoundedRecoveryPolicy, "increment", spy_increment)
     monkeypatch.setattr(
         recovery_policy_module.BoundedRecoveryPolicy,
         "maybe_escalate",
@@ -735,9 +718,7 @@ def test_preflight_routes_through_bounded_recovery_policy(
 def test_save_cli_log_includes_stderr() -> None:
     """Both stdout and stderr must be saved to the CLI log."""
     runner = h._make_runner()
-    asyncio.run(
-        runner._save_cli_log("out text", "err text", "LABEL")
-    )
+    asyncio.run(runner._save_cli_log("out text", "err text", "LABEL"))
     stored = runner.redis.store.get(f"cli_log:{runner.name}:latest")
     assert stored is not None
     assert "out text" in stored
@@ -845,9 +826,7 @@ def test_git_checkout_does_not_retry(
     def fake_git(repo_path: str, *args: str, **kw: Any) -> h._FakeCompletedProcess:
         calls.append(args)
         if args[0] == "checkout":
-            raise subprocess.CalledProcessError(
-                1, ["git", "checkout"], stderr="error: pathspec 'foo' did not match"
-            )
+            raise subprocess.CalledProcessError(1, ["git", "checkout"], stderr="error: pathspec 'foo' did not match")
         return h._FakeCompletedProcess(args=list(args), returncode=0)
 
     monkeypatch.setattr(git_ops_module, "_git", fake_git)

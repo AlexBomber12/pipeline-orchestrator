@@ -1,4 +1,4 @@
-"""Tests for src/github_client.py."""
+"""Tests for the split src.github.* modules (legacy github_client surface)."""
 
 from __future__ import annotations
 
@@ -9,38 +9,46 @@ from datetime import timezone as _tz
 from typing import Any
 
 import pytest
-import src.github_client as github_client
-from src.github_client import (
-    _compute_review_status,
+from src.github import cache, checks, comments, prs, rate_limit, reactions, reviews  # noqa: F401
+from src.github import comments as gh_comments
+from src.github.cache import clear_etag_cache  # noqa: F401 — used in tests
+from src.github.checks import (
     _fetch_ci_status_rest,
-    _get_codex_issue_reactions,
-    _get_codex_review_signals,
-    _get_latest_codex_review_info,
-    _is_codex_user,
-    _is_plus_one,
-    _is_reaction_content,
     _map_rest_ci_status_to_enum,
-    _parse_iso,
     clear_ci_status_cache,
+)
+from src.github.comments import (
+    has_recent_codex_review_request,
+    post_comment,
+)
+from src.github.gh_runner import _parse_iso, get_repo_full_name, run_gh
+from src.github.prs import (
     clear_last_known_sha,
     clear_merged_prs_cache,
-    clear_review_status_cache,
     get_branch_last_push_time,
     get_last_push_age_seconds,
-    get_pr_last_push_time,
     get_merged_prs,
     get_open_prs,
     get_pr_author,
     get_pr_head_commit_iso,
+    get_pr_last_push_time,
     get_pr_metadata,
-    get_pr_review_status,
-    get_repo_full_name,
-    has_recent_codex_review_request,
     is_pr_merged,
     merge_pr,
-    post_comment,
     pr_state,
-    run_gh,
+)
+from src.github.reactions import (
+    _get_codex_issue_reactions,
+    _is_codex_user,
+    _is_plus_one,
+    _is_reaction_content,
+)
+from src.github.reviews import (
+    _compute_review_status,
+    _get_codex_review_signals,
+    _get_latest_codex_review_info,
+    clear_review_status_cache,
+    get_pr_review_status,
 )
 from src.models import CIStatus, ReviewStatus
 
@@ -177,7 +185,7 @@ def test_get_merged_prs_paginates_closed_prs_without_fixed_limit(
             },
         ]
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
     prs = get_merged_prs("owner/name")
 
@@ -193,6 +201,7 @@ def test_get_merged_prs_filters_by_base_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clear_merged_prs_cache()
+
     def fake_paginated(path: str) -> list[dict[str, Any]]:
         assert path == "repos/owner/name/pulls?state=closed&base=main&per_page=100"
         return [
@@ -218,7 +227,7 @@ def test_get_merged_prs_filters_by_base_branch(
             },
         ]
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
     prs = get_merged_prs("owner/name", base_branch="main")
 
@@ -231,13 +240,10 @@ def test_get_merged_prs_url_encodes_base_branch_filter(
     clear_merged_prs_cache()
 
     def fake_paginated(path: str) -> list[dict[str, Any]]:
-        assert (
-            path
-            == "repos/owner/name/pulls?state=closed&base=release%2F2026.04&per_page=100"
-        )
+        assert path == "repos/owner/name/pulls?state=closed&base=release%2F2026.04&per_page=100"
         return []
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
     assert get_merged_prs("owner/name", base_branch="release/2026.04") == []
 
@@ -246,6 +252,7 @@ def test_get_merged_prs_handles_deleted_head_repo(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clear_merged_prs_cache()
+
     def fake_paginated(path: str) -> list[dict[str, Any]]:
         assert path == "repos/owner/name/pulls?state=closed&per_page=100"
         return [
@@ -261,7 +268,7 @@ def test_get_merged_prs_handles_deleted_head_repo(
             }
         ]
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
     prs = get_merged_prs("owner/name")
 
@@ -279,7 +286,7 @@ def test_get_merged_prs_raises_when_github_lookup_fails(
     def fake_paginated(path: str) -> list[dict[str, Any]]:
         raise RuntimeError(f"boom: {path}")
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
     with pytest.raises(RuntimeError, match="boom"):
         get_merged_prs("owner/name", base_branch="main")
@@ -289,7 +296,7 @@ def test_is_pr_merged_true_when_merged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "src.github_client.run_gh",
+        "src.github.gh_runner.run_gh",
         lambda args: {"state": "closed", "merged": True},
     )
 
@@ -300,7 +307,7 @@ def test_is_pr_merged_false_when_closed_unmerged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "src.github_client.run_gh",
+        "src.github.gh_runner.run_gh",
         lambda args: {"state": "closed", "merged": False},
     )
 
@@ -313,7 +320,7 @@ def test_is_pr_merged_none_on_runtime_error(
     def fake_run_gh(args: list[str]) -> dict[str, object]:
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     assert is_pr_merged("owner/name", 12) is None
 
@@ -324,7 +331,7 @@ def test_is_pr_merged_none_on_timeout(
     def fake_run_gh(args: list[str]) -> dict[str, object]:
         raise subprocess.TimeoutExpired(cmd=args, timeout=30)
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     assert is_pr_merged("owner/name", 12) is None
 
@@ -335,7 +342,7 @@ def test_is_pr_merged_none_on_oserror(
     def fake_run_gh(args: list[str]) -> dict[str, object]:
         raise OSError("gh not found")
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     assert is_pr_merged("owner/name", 12) is None
 
@@ -343,7 +350,7 @@ def test_is_pr_merged_none_on_oserror(
 def test_is_pr_merged_none_on_malformed_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("src.github_client.run_gh", lambda args: "{not-json")
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda args: "{not-json")
 
     assert is_pr_merged("owner/name", 12) is None
 
@@ -371,7 +378,7 @@ def test_get_merged_prs_uses_cache_within_ttl(
             }
         ]
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
     first = get_merged_prs("owner/name", base_branch="main")
     second = get_merged_prs("owner/name", base_branch="main")
@@ -403,7 +410,7 @@ def test_clear_merged_prs_cache_forces_refresh(
             }
         ]
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
     first = get_merged_prs("owner/name", base_branch="main")
     clear_merged_prs_cache()
@@ -436,7 +443,7 @@ def test_get_merged_prs_refresh_bypasses_cache_and_replaces_cached_value(
             }
         ]
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
     first = get_merged_prs("owner/name", base_branch="main")
     refreshed = get_merged_prs(
@@ -502,16 +509,9 @@ def test_get_pr_review_status_approved_via_pr_body_reaction(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status("owner/name", 42, pr_author="author")
-        == ReviewStatus.APPROVED
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.APPROVED
 
-    assert any(
-        "issues/42/reactions" in arg
-        for cmd in invocations
-        for arg in cmd
-    )
+    assert any("issues/42/reactions" in arg for cmd in invocations for arg in cmd)
 
 
 def test_get_pr_review_status_approved_via_first_author_comment_reaction(
@@ -547,10 +547,7 @@ def test_get_pr_review_status_approved_via_first_author_comment_reaction(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status("owner/name", 42, pr_author="author")
-        == ReviewStatus.APPROVED
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.APPROVED
 
     assert len(invocations) == 4
     assert not any(cmd[-1].endswith("/pulls/42/reviews") for cmd in invocations)
@@ -591,12 +588,7 @@ def test_review_api_without_reaction_stays_pending(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status(
-            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
-        )
-        == ReviewStatus.PENDING
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222") == ReviewStatus.PENDING
 
 
 def test_review_api_approved_requires_matching_head_sha(
@@ -632,12 +624,7 @@ def test_review_api_approved_requires_matching_head_sha(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status(
-            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
-        )
-        == ReviewStatus.PENDING
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222") == ReviewStatus.PENDING
 
 
 def test_review_api_approval_does_not_override_post_anchor_codex_comment(
@@ -687,9 +674,7 @@ def test_review_api_approval_does_not_override_post_anchor_codex_comment(
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert (
-        get_pr_review_status(
-            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
-        )
+        get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222")
         == ReviewStatus.CHANGES_REQUESTED
     )
 
@@ -741,9 +726,7 @@ def test_review_api_approved_beats_older_post_anchor_codex_comment(
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert (
-        get_pr_review_status(
-            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
-        )
+        get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222")
         == ReviewStatus.CHANGES_REQUESTED
     )
 
@@ -761,20 +744,22 @@ def test_latest_codex_review_state_overrides_older_approval(
             return _FakeCompletedProcess(stdout="2026-01-01T00:00:00Z")
         path = _find_api_path(cmd)
         if path.endswith("/pulls/42/reviews"):
-            data = [[
-                {
-                    "user": {"login": "chatgpt-codex-bot"},
-                    "state": "APPROVED",
-                    "commit_id": "bbbbbb2222",
-                    "submitted_at": "2026-01-02T00:00:00Z",
-                },
-                {
-                    "user": {"login": "chatgpt-codex-bot"},
-                    "state": "CHANGES_REQUESTED",
-                    "commit_id": "bbbbbb2222",
-                    "submitted_at": "2026-01-03T00:00:00Z",
-                },
-            ]]
+            data = [
+                [
+                    {
+                        "user": {"login": "chatgpt-codex-bot"},
+                        "state": "APPROVED",
+                        "commit_id": "bbbbbb2222",
+                        "submitted_at": "2026-01-02T00:00:00Z",
+                    },
+                    {
+                        "user": {"login": "chatgpt-codex-bot"},
+                        "state": "CHANGES_REQUESTED",
+                        "commit_id": "bbbbbb2222",
+                        "submitted_at": "2026-01-03T00:00:00Z",
+                    },
+                ]
+            ]
         elif "issues" in path and path.endswith("/comments"):
             data = [[]]
         elif "pulls" in path and path.endswith("/comments"):
@@ -785,12 +770,7 @@ def test_latest_codex_review_state_overrides_older_approval(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status(
-            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
-        )
-        == ReviewStatus.PENDING
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222") == ReviewStatus.PENDING
 
 
 def test_review_api_errors_do_not_block_reaction_fallback(
@@ -804,9 +784,7 @@ def test_review_api_errors_do_not_block_reaction_fallback(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         path = _find_api_path(cmd)
         if path.endswith("/pulls/42/reviews"):
-            return _FakeCompletedProcess(
-                stderr="HTTP 403 rate limit exceeded", returncode=1
-            )
+            return _FakeCompletedProcess(stderr="HTTP 403 rate limit exceeded", returncode=1)
         if path.endswith("/issues/42/reactions"):
             data = [
                 {
@@ -827,12 +805,7 @@ def test_review_api_errors_do_not_block_reaction_fallback(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status(
-            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
-        )
-        == ReviewStatus.APPROVED
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222") == ReviewStatus.APPROVED
 
 
 def test_review_api_approved_does_not_trust_unknown_head_commit_time(
@@ -868,12 +841,7 @@ def test_review_api_approved_does_not_trust_unknown_head_commit_time(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status(
-            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
-        )
-        == ReviewStatus.PENDING
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222") == ReviewStatus.PENDING
 
 
 def test_get_pr_review_status_skips_teammate_comment(
@@ -905,10 +873,7 @@ def test_get_pr_review_status_skips_teammate_comment(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status("owner/name", 42, pr_author="author")
-        == ReviewStatus.APPROVED
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.APPROVED
 
 
 def test_get_pr_review_status_ignores_non_trigger_author_comment(
@@ -940,10 +905,7 @@ def test_get_pr_review_status_ignores_non_trigger_author_comment(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status("owner/name", 42, pr_author="author")
-        == ReviewStatus.APPROVED
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.APPROVED
 
 
 def test_get_pr_review_status_pending_when_no_codex_reaction(
@@ -958,9 +920,7 @@ def test_get_pr_review_status_pending_when_no_codex_reaction(
         path = _find_api_path(cmd)
         if path.endswith("/reactions"):
             return _FakeCompletedProcess(stdout=_json.dumps([]))
-        return _FakeCompletedProcess(
-            stdout=_json.dumps([[{"id": 1, "user": {"login": "author"}, "body": "hi"}]])
-        )
+        return _FakeCompletedProcess(stdout=_json.dumps([[{"id": 1, "user": {"login": "author"}, "body": "hi"}]]))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
@@ -1004,10 +964,7 @@ def test_get_pr_review_status_changes_requested_on_p1(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status("owner/name", 42, pr_author="author")
-        == ReviewStatus.CHANGES_REQUESTED
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.CHANGES_REQUESTED
 
 
 def test_get_pr_review_status_ignores_stale_p1(
@@ -1047,10 +1004,7 @@ def test_get_pr_review_status_ignores_stale_p1(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status("owner/name", 42, pr_author="author")
-        == ReviewStatus.PENDING
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.PENDING
 
 
 def test_get_pr_review_status_uses_latest_author_comment(
@@ -1092,10 +1046,7 @@ def test_get_pr_review_status_uses_latest_author_comment(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status("owner/name", 42, pr_author="author")
-        == ReviewStatus.PENDING
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.PENDING
 
 
 def test_review_status_changes_requested_without_p1_p2_tags(
@@ -1135,10 +1086,7 @@ def test_review_status_changes_requested_without_p1_p2_tags(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status("owner/name", 42, pr_author="author")
-        == ReviewStatus.CHANGES_REQUESTED
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.CHANGES_REQUESTED
 
 
 def test_review_status_ignores_codex_onboarding_comment(
@@ -1162,10 +1110,7 @@ def test_review_status_ignores_codex_onboarding_comment(
                     {
                         "id": 20,
                         "user": {"login": "chatgpt-codex-connector"},
-                        "body": (
-                            "To use Codex here, create a Codex account "
-                            "and connect to github."
-                        ),
+                        "body": ("To use Codex here, create a Codex account and connect to github."),
                         "created_at": "2026-01-01T00:01:00Z",
                     },
                 ],
@@ -1180,10 +1125,7 @@ def test_review_status_ignores_codex_onboarding_comment(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status("owner/name", 42, pr_author="author")
-        == ReviewStatus.PENDING
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.PENDING
 
 
 def test_review_status_pending_when_no_codex_activity(
@@ -1259,10 +1201,7 @@ def test_review_status_approved_wins_over_codex_comment(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status("owner/name", 42, pr_author="author")
-        == ReviewStatus.APPROVED
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.APPROVED
 
 
 def test_review_status_eyes_wins_over_codex_comment(
@@ -1302,10 +1241,7 @@ def test_review_status_eyes_wins_over_codex_comment(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status("owner/name", 42, pr_author="author")
-        == ReviewStatus.EYES
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.EYES
 
 
 def test_body_eyes_wins_over_anchor_plus_one(
@@ -1319,14 +1255,16 @@ def test_body_eyes_wins_over_anchor_plus_one(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         path = _find_api_path(cmd)
         if "issues" in path and path.endswith("/comments"):
-            data = [[
-                {
-                    "id": 10,
-                    "user": {"login": "author"},
-                    "body": "@codex review",
-                    "created_at": "2026-01-01T00:00:00Z",
-                }
-            ]]
+            data = [
+                [
+                    {
+                        "id": 10,
+                        "user": {"login": "author"},
+                        "body": "@codex review",
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ]
+            ]
         elif "pulls" in path and path.endswith("/comments"):
             data = []
         elif "comments/10/reactions" in path:
@@ -1339,10 +1277,7 @@ def test_body_eyes_wins_over_anchor_plus_one(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status("owner/name", 42, pr_author="author")
-        == ReviewStatus.EYES
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.EYES
 
 
 def test_anchor_eyes_wins_over_body_plus_one(
@@ -1356,14 +1291,16 @@ def test_anchor_eyes_wins_over_body_plus_one(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         path = _find_api_path(cmd)
         if "issues" in path and path.endswith("/comments"):
-            data = [[
-                {
-                    "id": 10,
-                    "user": {"login": "author"},
-                    "body": "@codex review",
-                    "created_at": "2026-01-01T00:00:00Z",
-                }
-            ]]
+            data = [
+                [
+                    {
+                        "id": 10,
+                        "user": {"login": "author"},
+                        "body": "@codex review",
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ]
+            ]
         elif "pulls" in path and path.endswith("/comments"):
             data = []
         elif "comments/10/reactions" in path:
@@ -1376,10 +1313,7 @@ def test_anchor_eyes_wins_over_body_plus_one(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status("owner/name", 42, pr_author="author")
-        == ReviewStatus.EYES
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.EYES
 
 
 def test_review_api_with_body_eyes_stays_eyes(
@@ -1393,23 +1327,27 @@ def test_review_api_with_body_eyes_stays_eyes(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         path = _find_api_path(cmd)
         if path.endswith("/pulls/42/reviews"):
-            data = [[
-                {
-                    "user": {"login": "chatgpt-codex-bot"},
-                    "state": "APPROVED",
-                    "commit_id": "bbbbbb2222",
-                    "submitted_at": "2026-01-02T00:00:00Z",
-                }
-            ]]
+            data = [
+                [
+                    {
+                        "user": {"login": "chatgpt-codex-bot"},
+                        "state": "APPROVED",
+                        "commit_id": "bbbbbb2222",
+                        "submitted_at": "2026-01-02T00:00:00Z",
+                    }
+                ]
+            ]
         elif "issues" in path and path.endswith("/comments"):
-            data = [[
-                {
-                    "id": 10,
-                    "user": {"login": "author"},
-                    "body": "@codex review",
-                    "created_at": "2026-01-01T00:00:00Z",
-                }
-            ]]
+            data = [
+                [
+                    {
+                        "id": 10,
+                        "user": {"login": "author"},
+                        "body": "@codex review",
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ]
+            ]
         elif "pulls" in path and path.endswith("/comments"):
             data = []
         elif path.endswith("/reactions"):
@@ -1420,12 +1358,7 @@ def test_review_api_with_body_eyes_stays_eyes(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status(
-            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
-        )
-        == ReviewStatus.EYES
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222") == ReviewStatus.EYES
 
 
 def test_review_api_with_anchor_eyes_stays_eyes(
@@ -1439,23 +1372,27 @@ def test_review_api_with_anchor_eyes_stays_eyes(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         path = _find_api_path(cmd)
         if path.endswith("/pulls/42/reviews"):
-            data = [[
-                {
-                    "user": {"login": "chatgpt-codex-bot"},
-                    "state": "APPROVED",
-                    "commit_id": "bbbbbb2222",
-                    "submitted_at": "2026-01-02T00:00:00Z",
-                }
-            ]]
+            data = [
+                [
+                    {
+                        "user": {"login": "chatgpt-codex-bot"},
+                        "state": "APPROVED",
+                        "commit_id": "bbbbbb2222",
+                        "submitted_at": "2026-01-02T00:00:00Z",
+                    }
+                ]
+            ]
         elif "issues" in path and path.endswith("/comments"):
-            data = [[
-                {
-                    "id": 10,
-                    "user": {"login": "author"},
-                    "body": "@codex review",
-                    "created_at": "2026-01-01T00:00:00Z",
-                }
-            ]]
+            data = [
+                [
+                    {
+                        "id": 10,
+                        "user": {"login": "author"},
+                        "body": "@codex review",
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ]
+            ]
         elif "pulls" in path and path.endswith("/comments"):
             data = []
         elif "comments/10/reactions" in path:
@@ -1468,12 +1405,7 @@ def test_review_api_with_anchor_eyes_stays_eyes(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status(
-            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
-        )
-        == ReviewStatus.EYES
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222") == ReviewStatus.EYES
 
 
 def test_get_pr_review_status_handles_404(
@@ -1512,9 +1444,7 @@ def test_get_pr_review_status_propagates_error_on_pr_404(
     clear_review_status_cache()
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        return _FakeCompletedProcess(
-            stderr="HTTP 403 rate limit exceeded", returncode=1
-        )
+        return _FakeCompletedProcess(stderr="HTTP 403 rate limit exceeded", returncode=1)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
@@ -1528,7 +1458,7 @@ def test_get_codex_issue_reactions_returns_empty_on_runtime_error(
     def fake_paginated(path: str) -> list[dict]:
         raise RuntimeError("net/http: TLS handshake timeout")
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
     assert _get_codex_issue_reactions("owner/name", 42) == []
 
@@ -1540,17 +1470,13 @@ def test_get_codex_issue_reactions_logs_warning_on_runtime_error(
     def fake_paginated(path: str) -> list[dict]:
         raise RuntimeError("net/http: TLS handshake timeout")
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
     caplog.set_level(logging.WARNING)
 
     assert _get_codex_issue_reactions("owner/name", 42) == []
     assert any(
         record.levelno == logging.WARNING
-        and record.getMessage()
-        == (
-            "Reactions fetch degraded for PR 42 in owner/name: "
-            "net/http: TLS handshake timeout"
-        )
+        and record.getMessage() == ("Reactions fetch degraded for PR 42 in owner/name: net/http: TLS handshake timeout")
         for record in caplog.records
     )
 
@@ -1574,7 +1500,7 @@ def test_compute_review_status_propagates_non_transient_body_reactions_error(
             return []
         raise AssertionError(f"unexpected path: {path}")
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
     with pytest.raises(RuntimeError, match="403"):
         _compute_review_status("owner/name", 42, "author", "")
@@ -1601,12 +1527,9 @@ def test_compute_review_status_degrades_when_anchor_reactions_fail(
             raise RuntimeError("i/o timeout")
         raise AssertionError(f"unexpected path: {path}")
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
-    assert (
-        _compute_review_status("owner/name", 42, "author", "")
-        == ReviewStatus.PENDING
-    )
+    assert _compute_review_status("owner/name", 42, "author", "") == ReviewStatus.PENDING
 
 
 def test_compute_review_status_propagates_non_transient_anchor_reactions_error(
@@ -1630,7 +1553,7 @@ def test_compute_review_status_propagates_non_transient_anchor_reactions_error(
             raise RuntimeError("HTTP 403 rate limit exceeded")
         raise AssertionError(f"unexpected path: {path}")
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
     with pytest.raises(RuntimeError, match="403"):
         _compute_review_status("owner/name", 42, "author", "")
@@ -1671,12 +1594,7 @@ def test_body_plus_one_before_head_commit_is_stale(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status(
-            "owner/name", 42, pr_author="author", head_sha="bbbbbb2222"
-        )
-        == ReviewStatus.PENDING
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222") == ReviewStatus.PENDING
 
 
 def test_body_plus_one_after_head_commit_approves(
@@ -1706,12 +1624,7 @@ def test_body_plus_one_after_head_commit_approves(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status(
-            "owner/name", 42, pr_author="author", head_sha="aabbcc112233"
-        )
-        == ReviewStatus.APPROVED
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="aabbcc112233") == ReviewStatus.APPROVED
 
 
 def test_body_plus_one_no_commit_time_trusts(
@@ -1740,12 +1653,7 @@ def test_body_plus_one_no_commit_time_trusts(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status(
-            "owner/name", 42, pr_author="author", head_sha="deadbeef"
-        )
-        == ReviewStatus.APPROVED
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="deadbeef") == ReviewStatus.APPROVED
 
 
 def test_no_plus_one_does_not_fetch_head_commit_time(
@@ -1783,12 +1691,7 @@ def test_no_plus_one_does_not_fetch_head_commit_time(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status(
-            "owner/name", 42, pr_author="author", head_sha="deadbeef"
-        )
-        == ReviewStatus.PENDING
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="deadbeef") == ReviewStatus.PENDING
 
 
 def test_body_eyes_returns_before_comment_fetches(
@@ -1820,9 +1723,9 @@ def test_body_eyes_returns_before_comment_fetches(
 
 def test_find_codex_plus_one_picks_newest() -> None:
     """_find_codex_plus_one_reaction must return the most recent +1."""
-    from src.github_client import _find_codex_plus_one_reaction
+    from src.github.reactions import _find_codex_plus_one_reaction
 
-    reactions = [
+    items = [
         {
             "content": "+1",
             "user": {"login": "chatgpt-codex-connector"},
@@ -1839,7 +1742,7 @@ def test_find_codex_plus_one_picks_newest() -> None:
             "created_at": "2026-01-10T00:00:00Z",
         },
     ]
-    best = _find_codex_plus_one_reaction(reactions)
+    best = _find_codex_plus_one_reaction(items)
     assert best is not None
     assert best["created_at"] == "2026-01-05T00:00:00Z"
 
@@ -1870,10 +1773,7 @@ def test_approval_without_head_sha(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status("owner/name", 42, pr_author="author")
-        == ReviewStatus.APPROVED
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.APPROVED
 
 
 def test_merge_pr_uses_squash(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1900,9 +1800,7 @@ def test_merge_pr_uses_squash(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _iso_utc_now_minus(seconds: int) -> str:
-    return (
-        datetime.now(_tz.utc) - timedelta(seconds=seconds)
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (datetime.now(_tz.utc) - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def test_has_recent_codex_review_request_true(
@@ -1927,12 +1825,7 @@ def test_has_recent_codex_review_request_true(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        has_recent_codex_review_request(
-            "owner/name", 42, pr_author="author", within_minutes=5
-        )
-        is True
-    )
+    assert has_recent_codex_review_request("owner/name", 42, pr_author="author", within_minutes=5) is True
 
 
 def test_has_recent_codex_review_request_false_too_old(
@@ -1956,12 +1849,7 @@ def test_has_recent_codex_review_request_false_too_old(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        has_recent_codex_review_request(
-            "owner/name", 42, pr_author="author", within_minutes=5
-        )
-        is False
-    )
+    assert has_recent_codex_review_request("owner/name", 42, pr_author="author", within_minutes=5) is False
 
 
 def test_has_recent_codex_review_request_false_no_comment(
@@ -1991,12 +1879,7 @@ def test_has_recent_codex_review_request_false_no_comment(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        has_recent_codex_review_request(
-            "owner/name", 42, pr_author="author", within_minutes=5
-        )
-        is False
-    )
+    assert has_recent_codex_review_request("owner/name", 42, pr_author="author", within_minutes=5) is False
 
 
 def test_get_pr_author_returns_login(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2008,16 +1891,11 @@ def test_get_pr_author_returns_login(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         captured.append(cmd)
         body = '{"user": {"login": "claude-cli-bot"}}'
-        stdout = (
-            "HTTP/2.0 200 OK\r\n"
-            'ETag: W/"abc"\r\n'
-            "\r\n"
-            f"{body}"
-        )
+        stdout = f'HTTP/2.0 200 OK\r\nETag: W/"abc"\r\n\r\n{body}'
         return _FakeCompletedProcess(stdout=stdout)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    github_client.clear_etag_cache()
+    cache.clear_etag_cache()
 
     assert get_pr_author("owner/name", 42) == "claude-cli-bot"
     assert captured, "gh must be invoked"
@@ -2030,10 +1908,9 @@ def test_get_pr_author_returns_empty_on_error(
 ) -> None:
     """A ``gh api`` failure must not crash the caller — the dedup path
     simply skips when no author can be resolved."""
+
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        return _FakeCompletedProcess(
-            stdout="", stderr="not found", returncode=1
-        )
+        return _FakeCompletedProcess(stdout="", stderr="not found", returncode=1)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
@@ -2049,6 +1926,7 @@ def test_get_pr_author_returns_empty_on_timeout(
     and abort ``handle_fix`` before the coder runs, contradicting the
     intended best-effort behavior of omitting unavailable context.
     """
+
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         raise subprocess.TimeoutExpired(cmd=cmd, timeout=30)
 
@@ -2061,6 +1939,7 @@ def test_get_pr_author_returns_empty_on_oserror(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A missing ``gh`` binary (OSError) must degrade to "" rather than crash."""
+
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         raise FileNotFoundError("gh: command not found")
 
@@ -2093,9 +1972,7 @@ def test_has_recent_codex_review_request_respects_after_iso(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    just_now = (
-        datetime.now(_tz.utc) - timedelta(seconds=10)
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    just_now = (datetime.now(_tz.utc) - timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     assert (
         has_recent_codex_review_request(
@@ -2118,9 +1995,7 @@ def test_get_pr_head_commit_iso_returns_committer_date(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         invocations.append(cmd)
-        path = next(
-            (arg for arg in cmd if arg.startswith("repos/")), ""
-        )
+        path = next((arg for arg in cmd if arg.startswith("repos/")), "")
         if path.endswith("/pulls/42"):
             return _FakeCompletedProcess(stdout="abc1234")
         if path.startswith("repos/owner/name/commits/"):
@@ -2129,14 +2004,9 @@ def test_get_pr_head_commit_iso_returns_committer_date(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_head_commit_iso("owner/name", 42)
-        == "2026-04-14T13:37:00Z"
-    )
+    assert get_pr_head_commit_iso("owner/name", 42) == "2026-04-14T13:37:00Z"
     assert any("repos/owner/name/pulls/42" in a for a in invocations[0])
-    assert any(
-        "repos/owner/name/commits/abc1234" in a for a in invocations[1]
-    )
+    assert any("repos/owner/name/commits/abc1234" in a for a in invocations[1])
 
 
 def test_get_pr_head_commit_iso_returns_empty_on_error(
@@ -2145,10 +2015,9 @@ def test_get_pr_head_commit_iso_returns_empty_on_error(
     """Errors from either lookup must not propagate — the caller
     treats "" as "no constraint" and the dedup filter degrades
     gracefully to pure time-window matching."""
+
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        return _FakeCompletedProcess(
-            stdout="", stderr="boom", returncode=1
-        )
+        return _FakeCompletedProcess(stdout="", stderr="boom", returncode=1)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
@@ -2194,12 +2063,7 @@ def test_body_plus_one_stale_after_force_push_to_old_commit(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status(
-            "owner/name", 42, pr_author="author", head_sha="oldSha5678"
-        )
-        == ReviewStatus.PENDING
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="oldSha5678") == ReviewStatus.PENDING
 
 
 def test_body_plus_one_approved_when_codex_review_on_head(
@@ -2239,12 +2103,7 @@ def test_body_plus_one_approved_when_codex_review_on_head(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status(
-            "owner/name", 42, pr_author="author", head_sha="currentHead"
-        )
-        == ReviewStatus.APPROVED
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="currentHead") == ReviewStatus.APPROVED
 
 
 def test_body_plus_one_same_second_as_head_approves(
@@ -2275,12 +2134,7 @@ def test_body_plus_one_same_second_as_head_approves(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        get_pr_review_status(
-            "owner/name", 42, pr_author="author", head_sha="abc"
-        )
-        == ReviewStatus.APPROVED
-    )
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="abc") == ReviewStatus.APPROVED
 
 
 def test_review_status_cached(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2295,9 +2149,7 @@ def test_review_status_cached(monkeypatch: pytest.MonkeyPatch) -> None:
         call_count += 1
         path = _find_api_path(cmd)
         if path.endswith("/issues/42/reactions"):
-            data = [
-                {"content": "+1", "user": {"login": "chatgpt-codex-connector"}}
-            ]
+            data = [{"content": "+1", "user": {"login": "chatgpt-codex-connector"}}]
         elif "issues" in path and path.endswith("/comments"):
             data = [[]]
         elif "pulls" in path and path.endswith("/comments"):
@@ -2308,14 +2160,10 @@ def test_review_status_cached(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    result1 = get_pr_review_status(
-        "owner/name", 42, pr_author="author", head_sha="sha123"
-    )
+    result1 = get_pr_review_status("owner/name", 42, pr_author="author", head_sha="sha123")
     calls_after_first = call_count
 
-    result2 = get_pr_review_status(
-        "owner/name", 42, pr_author="author", head_sha="sha123"
-    )
+    result2 = get_pr_review_status("owner/name", 42, pr_author="author", head_sha="sha123")
 
     assert result1 == ReviewStatus.APPROVED
     assert result2 == ReviewStatus.APPROVED
@@ -2333,9 +2181,7 @@ def test_get_pr_metadata_single_call(monkeypatch: pytest.MonkeyPatch) -> None:
         invocations.append(cmd)
         path = _find_api_path(cmd)
         if path.endswith("/pulls/42"):
-            return _FakeCompletedProcess(
-                stdout=_json.dumps({"author": "alice", "head_sha": "abc123"})
-            )
+            return _FakeCompletedProcess(stdout=_json.dumps({"author": "alice", "head_sha": "abc123"}))
         if "/commits/" in path:
             return _FakeCompletedProcess(stdout="2026-04-15T12:00:00Z")
         return _FakeCompletedProcess(stdout="")
@@ -2377,8 +2223,7 @@ def test_map_rest_ci_status_empty_defaults_to_pending() -> None:
 def test_map_rest_ci_status_empty_with_flag_returns_success() -> None:
     """Empty REST signals with empty_is_success=True must return SUCCESS."""
     assert (
-        _map_rest_ci_status_to_enum([], {"state": "pending", "statuses": []}, empty_is_success=True)
-        == CIStatus.SUCCESS
+        _map_rest_ci_status_to_enum([], {"state": "pending", "statuses": []}, empty_is_success=True) == CIStatus.SUCCESS
     )
 
 
@@ -2400,18 +2245,8 @@ def test_map_rest_ci_status_failed_fetch_follows_empty_is_success() -> None:
     suite (``poll_interval_sec=2``, per-token quota shared across runs)
     must not strand WATCH on a testbed PR that has no checks at all.
     """
-    assert (
-        _map_rest_ci_status_to_enum(
-            [], {}, empty_is_success=True, fetch_ok=False
-        )
-        == CIStatus.SUCCESS
-    )
-    assert (
-        _map_rest_ci_status_to_enum(
-            [], {}, empty_is_success=False, fetch_ok=False
-        )
-        == CIStatus.PENDING
-    )
+    assert _map_rest_ci_status_to_enum([], {}, empty_is_success=True, fetch_ok=False) == CIStatus.SUCCESS
+    assert _map_rest_ci_status_to_enum([], {}, empty_is_success=False, fetch_ok=False) == CIStatus.PENDING
 
 
 # ---------------------------------------------------------------------------
@@ -2421,16 +2256,14 @@ def test_map_rest_ci_status_failed_fetch_follows_empty_is_success() -> None:
 
 def test_gh_api_paginated_retries_on_503(monkeypatch: pytest.MonkeyPatch) -> None:
     """_gh_api_paginated retries on transient 503 then succeeds."""
-    from src.github_client import _gh_api_paginated
+    from src.github.cache import _gh_api_paginated
 
     calls: list[int] = []
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         calls.append(1)
         if len(calls) == 1:
-            raise subprocess.CalledProcessError(
-                1, cmd, stderr="HTTP 503 Service Unavailable"
-            )
+            raise subprocess.CalledProcessError(1, cmd, stderr="HTTP 503 Service Unavailable")
         return _FakeCompletedProcess(
             stdout='[[{"id": 1}]]',
             returncode=0,
@@ -2446,12 +2279,10 @@ def test_gh_api_paginated_retries_on_503(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_gh_api_paginated_fails_after_retries(monkeypatch: pytest.MonkeyPatch) -> None:
     """_gh_api_paginated raises RuntimeError after all retries exhausted."""
-    from src.github_client import _gh_api_paginated
+    from src.github.cache import _gh_api_paginated
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        raise subprocess.CalledProcessError(
-            1, cmd, stderr="503 Service Unavailable"
-        )
+        raise subprocess.CalledProcessError(1, cmd, stderr="503 Service Unavailable")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
@@ -2463,11 +2294,11 @@ def test_gh_api_paginated_fails_after_retries(monkeypatch: pytest.MonkeyPatch) -
 def test_begin_review_cache_cycle_initializes_and_increments() -> None:
     clear_review_status_cache()
 
-    github_client._begin_review_cache_cycle()
-    assert github_client._review_status_cache_cycle == 1
+    reviews._begin_review_cache_cycle()
+    assert reviews._review_status_cache_cycle == 1
 
-    github_client._begin_review_cache_cycle()
-    assert github_client._review_status_cache_cycle == 2
+    reviews._begin_review_cache_cycle()
+    assert reviews._review_status_cache_cycle == 2
 
 
 def test_is_reaction_content_rejects_non_dict() -> None:
@@ -2500,13 +2331,13 @@ def test_get_open_prs_returns_prinfo_objects(
             return raw
         raise AssertionError(f"unexpected run_gh call: {args}")
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     monkeypatch.setattr(
-        "src.github_client._fetch_ci_status_rest",
+        "src.github.checks._fetch_ci_status_rest",
         lambda repo, sha: ([], {}, True),
     )
     monkeypatch.setattr(
-        "src.github_client.get_pr_review_status",
+        "src.github.reviews.get_pr_review_status",
         lambda repo, number, pr_author, head_sha: ReviewStatus.APPROVED,
     )
 
@@ -2557,10 +2388,10 @@ def test_get_open_prs_invokes_rest_helper_with_head_sha(
             True,
         )
 
-    monkeypatch.setattr("src.github_client.run_gh", lambda *a, **kw: raw)
-    monkeypatch.setattr("src.github_client._fetch_ci_status_rest", fake_fetch)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: raw)
+    monkeypatch.setattr("src.github.checks._fetch_ci_status_rest", fake_fetch)
     monkeypatch.setattr(
-        "src.github_client.get_pr_review_status",
+        "src.github.reviews.get_pr_review_status",
         lambda repo, number, pr_author, head_sha: ReviewStatus.PENDING,
     )
 
@@ -2597,13 +2428,13 @@ def test_get_open_prs_rest_fetch_failure_follows_allow_merge_without_checks(
         }
     ]
 
-    monkeypatch.setattr("src.github_client.run_gh", lambda *a, **kw: raw)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: raw)
     monkeypatch.setattr(
-        "src.github_client._fetch_ci_status_rest",
+        "src.github.checks._fetch_ci_status_rest",
         lambda repo, sha: ([], {}, False),
     )
     monkeypatch.setattr(
-        "src.github_client.get_pr_review_status",
+        "src.github.reviews.get_pr_review_status",
         lambda repo, number, pr_author, head_sha: ReviewStatus.PENDING,
     )
 
@@ -2618,9 +2449,9 @@ def test_get_open_prs_falls_back_to_rest_on_graphql_rate_limit(
     def fail_graphql(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("GraphQL: API rate limit exceeded")
 
-    monkeypatch.setattr("src.github_client.run_gh", fail_graphql)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fail_graphql)
     monkeypatch.setattr(
-        "src.github_client._gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [
             {"number": 0},
             {
@@ -2635,11 +2466,11 @@ def test_get_open_prs_falls_back_to_rest_on_graphql_rate_limit(
                 "updated_at": "2026-04-18T11:22:33Z",
                 "user": {"login": "alice"},
                 "labels": [{"name": "escalated"}],
-            }
+            },
         ],
     )
     monkeypatch.setattr(
-        "src.github_client.get_pr_review_status",
+        "src.github.reviews.get_pr_review_status",
         lambda repo, number, pr_author, head_sha: ReviewStatus.PENDING,
     )
 
@@ -2660,7 +2491,7 @@ def test_get_open_prs_propagates_non_rate_limit_errors(
     def fail_graphql(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("gh failed")
 
-    monkeypatch.setattr("src.github_client.run_gh", fail_graphql)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fail_graphql)
 
     with pytest.raises(RuntimeError, match="gh failed"):
         get_open_prs("owner/name")
@@ -2672,8 +2503,8 @@ def test_get_open_prs_rest_fallback_returns_empty_for_unexpected_payload(
     def fail_graphql(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("GraphQL: API rate limit exceeded")
 
-    monkeypatch.setattr("src.github_client.run_gh", fail_graphql)
-    monkeypatch.setattr("src.github_client._gh_api_paginated", lambda path: None)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fail_graphql)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", lambda path: None)
 
     assert get_open_prs("owner/name") == []
 
@@ -2681,7 +2512,7 @@ def test_get_open_prs_rest_fallback_returns_empty_for_unexpected_payload(
 def test_get_open_prs_returns_empty_for_non_list_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: {"items": []})
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: {"items": []})
     assert get_open_prs("owner/name") == []
 
 
@@ -2689,7 +2520,7 @@ def test_get_merged_prs_raises_on_unexpected_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clear_merged_prs_cache()
-    monkeypatch.setattr("src.github_client._gh_api_paginated", lambda path: None)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", lambda path: None)
 
     with pytest.raises(RuntimeError, match="unexpected payload"):
         get_merged_prs("owner/name", refresh=True)
@@ -2700,7 +2531,7 @@ def test_get_merged_prs_skips_zero_number_entries(
 ) -> None:
     clear_merged_prs_cache()
     monkeypatch.setattr(
-        "src.github_client._gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [
             {
                 "number": 0,
@@ -2718,7 +2549,7 @@ def test_get_merged_prs_skips_zero_number_entries(
 def test_is_pr_merged_returns_none_for_non_string_non_dict_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: ["bad"])
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: ["bad"])
     assert is_pr_merged("owner/name", 42) is None
 
 
@@ -2726,7 +2557,7 @@ def test_is_pr_merged_returns_none_for_open_unmerged_pr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "src.github_client.run_gh",
+        "src.github.gh_runner.run_gh",
         lambda *args, **kwargs: {"state": "open", "merged": False},
     )
     assert is_pr_merged("owner/name", 42) is None
@@ -2745,7 +2576,7 @@ def test_pr_state_returns_dict_for_merged_pr(
             "closedAt": "2026-04-26T12:00:00Z",
         }
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     result = pr_state("owner/name", 42)
 
@@ -2754,15 +2585,17 @@ def test_pr_state_returns_dict_for_merged_pr(
         "mergedAt": "2026-04-26T12:00:00Z",
         "closedAt": "2026-04-26T12:00:00Z",
     }
-    assert captured == [(
-        ["pr", "view", "42", "--json", "state,mergedAt,closedAt"],
-        {"repo": "owner/name"},
-    )]
+    assert captured == [
+        (
+            ["pr", "view", "42", "--json", "state,mergedAt,closedAt"],
+            {"repo": "owner/name"},
+        )
+    ]
 
 
 def test_pr_state_returns_dict_for_open_pr(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "src.github_client.run_gh",
+        "src.github.gh_runner.run_gh",
         lambda *args, **kwargs: {"state": "open", "mergedAt": None, "closedAt": None},
     )
 
@@ -2775,11 +2608,8 @@ def test_pr_state_returns_dict_for_open_pr(monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_pr_state_parses_string_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "src.github_client.run_gh",
-        lambda *args, **kwargs: (
-            '{"state": "closed", "mergedAt": null, '
-            '"closedAt": "2026-04-26T13:00:00Z"}'
-        ),
+        "src.github.gh_runner.run_gh",
+        lambda *args, **kwargs: ('{"state": "closed", "mergedAt": null, "closedAt": "2026-04-26T13:00:00Z"}'),
     )
 
     assert pr_state("owner/name", 42) == {
@@ -2795,7 +2625,7 @@ def test_pr_state_returns_none_on_runtime_error(
     def fake_run_gh(args: list[str], **kwargs: Any) -> object:
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     assert pr_state("owner/name", 42) is None
 
 
@@ -2805,7 +2635,7 @@ def test_pr_state_returns_none_on_timeout(
     def fake_run_gh(args: list[str], **kwargs: Any) -> object:
         raise subprocess.TimeoutExpired(cmd=args, timeout=30)
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     assert pr_state("owner/name", 42) is None
 
 
@@ -2815,25 +2645,21 @@ def test_pr_state_returns_none_on_oserror(
     def fake_run_gh(args: list[str], **kwargs: Any) -> object:
         raise OSError("gh missing")
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     assert pr_state("owner/name", 42) is None
 
 
 def test_pr_state_returns_none_for_malformed_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        "src.github_client.run_gh", lambda *args, **kwargs: "{not-json"
-    )
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: "{not-json")
     assert pr_state("owner/name", 42) is None
 
 
 def test_pr_state_returns_none_for_unexpected_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        "src.github_client.run_gh", lambda *args, **kwargs: ["unexpected"]
-    )
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: ["unexpected"])
     assert pr_state("owner/name", 42) is None
 
 
@@ -2841,7 +2667,7 @@ def test_pr_state_returns_none_when_state_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "src.github_client.run_gh",
+        "src.github.gh_runner.run_gh",
         lambda *args, **kwargs: {"mergedAt": None, "closedAt": None},
     )
     assert pr_state("owner/name", 42) is None
@@ -2851,7 +2677,7 @@ def test_pr_state_normalizes_non_string_timestamps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "src.github_client.run_gh",
+        "src.github.gh_runner.run_gh",
         lambda *args, **kwargs: {
             "state": "closed",
             "mergedAt": 12345,
@@ -2876,7 +2702,7 @@ def test_get_pr_review_status_propagates_issue_comment_error(
             raise RuntimeError("boom")
         return []
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
     with pytest.raises(RuntimeError, match="boom"):
         get_pr_review_status("owner/name", 42, pr_author="author")
@@ -2894,7 +2720,7 @@ def test_get_pr_review_status_propagates_review_comment_error(
             raise RuntimeError("boom")
         return []
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
     with pytest.raises(RuntimeError, match="boom"):
         get_pr_review_status("owner/name", 42, pr_author="author")
@@ -2921,7 +2747,7 @@ def test_get_pr_review_status_ignores_anchor_reaction_404(
             raise RuntimeError("HTTP 404 not found")
         return []
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.PENDING
 
@@ -2935,7 +2761,7 @@ def test_post_comment_uses_pr_comment_command(
         calls.append((args, repo))
         return ""
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     post_comment("owner/name", 42, "hello")
 
@@ -2945,14 +2771,14 @@ def test_post_comment_uses_pr_comment_command(
 def test_get_pr_author_returns_empty_for_non_string_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: {"login": "alice"})
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: {"login": "alice"})
     assert get_pr_author("owner/name", 42) == ""
 
 
 def test_get_pr_head_commit_iso_returns_empty_when_head_sha_missing_type(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: {"sha": "abc"})
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: {"sha": "abc"})
     assert get_pr_head_commit_iso("owner/name", 42) == ""
 
 
@@ -2964,7 +2790,7 @@ def test_get_pr_head_commit_iso_returns_empty_when_commit_lookup_fails(
             return {"head": {"sha": "abc123"}}
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     assert get_pr_head_commit_iso("owner/name", 42) == ""
 
@@ -2972,7 +2798,7 @@ def test_get_pr_head_commit_iso_returns_empty_when_commit_lookup_fails(
 def test_get_pr_metadata_returns_empty_on_invalid_json_string(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: "{not-json")
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: "{not-json")
 
     assert get_pr_metadata("owner/name", 42) == {
         "author": "",
@@ -2985,7 +2811,7 @@ def test_get_pr_metadata_parses_json_string_without_commit_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "src.github_client.run_gh",
+        "src.github.gh_runner.run_gh",
         lambda *args, **kwargs: '{"author": "alice", "head_sha": ""}',
     )
 
@@ -2999,7 +2825,7 @@ def test_get_pr_metadata_parses_json_string_without_commit_lookup(
 def test_get_pr_metadata_returns_empty_on_non_mapping_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: ["bad"])
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: ["bad"])
 
     assert get_pr_metadata("owner/name", 42) == {
         "author": "",
@@ -3016,7 +2842,7 @@ def test_get_pr_metadata_ignores_commit_date_error(
             return {"author": "alice", "head_sha": "abc123"}
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     assert get_pr_metadata("owner/name", 42) == {
         "author": "alice",
@@ -3030,8 +2856,8 @@ def test_get_branch_last_push_time_tracks_new_sha(
 ) -> None:
     clear_last_known_sha()
     shas = iter(["sha1", "sha1", "sha2"])
-    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: next(shas))
-    monkeypatch.setattr("src.github_client.time.monotonic", lambda: 123.45)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(shas))
+    monkeypatch.setattr("src.github.prs.time.monotonic", lambda: 123.45)
 
     assert get_branch_last_push_time("owner/name", 42) is None
     assert get_branch_last_push_time("owner/name", 42) is None
@@ -3041,7 +2867,7 @@ def test_get_branch_last_push_time_tracks_new_sha(
 def test_get_branch_last_push_time_returns_none_for_empty_sha(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: "")
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: "")
     assert get_branch_last_push_time("owner/name", 42) is None
 
 
@@ -3049,24 +2875,24 @@ def test_get_branch_last_push_time_propagates_poll_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "src.github_client.run_gh",
+        "src.github.gh_runner.run_gh",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
     )
 
-    with pytest.raises(github_client.GitHubPollError, match="boom"):
+    with pytest.raises(prs.GitHubPollError, match="boom"):
         get_branch_last_push_time("owner/name", 42)
 
 
 def test_clear_last_known_sha_resets_tracking() -> None:
-    github_client._last_known_sha["owner/name#42"] = "sha1"
+    prs._last_known_sha["owner/name#42"] = "sha1"
     clear_last_known_sha()
-    assert github_client._last_known_sha == {}
+    assert prs._last_known_sha == {}
 
 
 def test_get_last_push_age_seconds_returns_none_without_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: "")
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: "")
     assert get_last_push_age_seconds("owner/name", 42) is None
 
 
@@ -3079,8 +2905,8 @@ def test_get_last_push_age_seconds_returns_computed_age(
             return cls(2026, 4, 19, 12, 0, 0, tzinfo=tz)
 
     responses = iter(["feature-branch", "2026-04-19T11:59:30Z"])
-    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: next(responses))
-    monkeypatch.setattr("src.github_client.datetime", _FakeDateTime)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr("src.github.prs.datetime", _FakeDateTime)
 
     assert get_last_push_age_seconds("owner/name", 42) == 30.0
 
@@ -3089,7 +2915,7 @@ def test_get_last_push_age_seconds_returns_none_for_empty_push_timestamp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     responses = iter(["feature-branch", ""])
-    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
     assert get_last_push_age_seconds("owner/name", 42) is None
 
 
@@ -3097,7 +2923,7 @@ def test_get_last_push_age_seconds_returns_none_on_parse_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     responses = iter(["feature-branch", "not-a-date"])
-    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
     assert get_last_push_age_seconds("owner/name", 42) is None
 
 
@@ -3105,9 +2931,7 @@ def test_get_pr_last_push_time_returns_parsed_datetime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     responses = iter(["feature-branch", "2026-04-30T11:59:30Z"])
-    monkeypatch.setattr(
-        "src.github_client.run_gh", lambda *args, **kwargs: next(responses)
-    )
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
 
     result = get_pr_last_push_time("owner/name", 42)
 
@@ -3117,7 +2941,7 @@ def test_get_pr_last_push_time_returns_parsed_datetime(
 def test_get_pr_last_push_time_returns_none_without_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("src.github_client.run_gh", lambda *args, **kwargs: "")
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: "")
     assert get_pr_last_push_time("owner/name", 42) is None
 
 
@@ -3125,9 +2949,7 @@ def test_get_pr_last_push_time_returns_none_when_activity_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     responses = iter(["feature-branch", ""])
-    monkeypatch.setattr(
-        "src.github_client.run_gh", lambda *args, **kwargs: next(responses)
-    )
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
     assert get_pr_last_push_time("owner/name", 42) is None
 
 
@@ -3135,9 +2957,7 @@ def test_get_pr_last_push_time_returns_none_on_parse_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     responses = iter(["feature-branch", "not-a-date"])
-    monkeypatch.setattr(
-        "src.github_client.run_gh", lambda *args, **kwargs: next(responses)
-    )
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
     assert get_pr_last_push_time("owner/name", 42) is None
 
 
@@ -3147,7 +2967,7 @@ def test_get_pr_last_push_time_returns_none_on_run_gh_failure(
     def boom(*_a: Any, **_kw: Any) -> str:
         raise RuntimeError("gh boom")
 
-    monkeypatch.setattr("src.github_client.run_gh", boom)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", boom)
     assert get_pr_last_push_time("owner/name", 42) is None
 
 
@@ -3157,7 +2977,7 @@ def test_has_recent_codex_review_request_returns_false_on_404(
     def fake_paginated(path: str) -> list[dict]:
         raise RuntimeError("HTTP 404 not found")
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
     assert has_recent_codex_review_request("owner/name", 42, "author") is False
 
@@ -3168,7 +2988,7 @@ def test_has_recent_codex_review_request_propagates_non_404(
     def fake_paginated(path: str) -> list[dict]:
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
     with pytest.raises(RuntimeError, match="boom"):
         has_recent_codex_review_request("owner/name", 42, "author")
@@ -3178,7 +2998,7 @@ def test_has_recent_codex_review_request_skips_invalid_timestamp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "src.github_client._gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [
             {
                 "user": {"login": "author"},
@@ -3200,7 +3020,7 @@ def test_has_recent_codex_review_request_handles_naive_datetime(
             return cls(2026, 4, 19, 12, 0, 0, tzinfo=tz)
 
     monkeypatch.setattr(
-        "src.github_client._gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [
             {
                 "user": {"login": "author"},
@@ -3210,10 +3030,10 @@ def test_has_recent_codex_review_request_handles_naive_datetime(
         ],
     )
     monkeypatch.setattr(
-        "src.github_client._parse_iso",
+        "src.github.gh_runner._parse_iso",
         lambda value: datetime(2026, 4, 19, 11, 59, 30),
     )
-    monkeypatch.setattr("src.github_client.datetime", _FakeDateTime)
+    monkeypatch.setattr("src.github.comments.datetime", _FakeDateTime)
 
     assert has_recent_codex_review_request("owner/name", 42, "author") is True
 
@@ -3221,10 +3041,10 @@ def test_has_recent_codex_review_request_handles_naive_datetime(
 def test_gh_api_paginated_returns_none_for_non_list_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from src.github_client import _gh_api_paginated
+    from src.github.cache import _gh_api_paginated
 
     monkeypatch.setattr(
-        "src.github_client.retry_transient",
+        "src.github.cache.retry_transient",
         lambda func, operation_name=None: {"items": []},
     )
 
@@ -3237,7 +3057,7 @@ def test_get_codex_review_signals_returns_empty_on_404(
     def fake_paginated(path: str) -> list[dict]:
         raise RuntimeError("HTTP 404 not found")
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
     assert _get_codex_review_signals("owner/name", 42) == {
         "latest_sha": "",
@@ -3250,7 +3070,7 @@ def test_get_codex_review_signals_skips_non_codex_and_invalid_timestamp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "src.github_client._gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [
             {
                 "user": {"login": "alice"},
@@ -3279,7 +3099,7 @@ def test_get_latest_codex_review_info_returns_tuple(
 ) -> None:
     submitted_at = datetime(2026, 4, 19, 11, 0, 0, tzinfo=_tz.utc)
     monkeypatch.setattr(
-        "src.github_client._get_codex_review_signals",
+        "src.github.reviews._get_codex_review_signals",
         lambda repo, pr_number: {
             "latest_sha": "sha123",
             "latest_time": submitted_at,
@@ -3313,12 +3133,7 @@ def test_map_rest_ci_status_failure_from_commit_status_only() -> None:
 
 def test_map_rest_ci_status_action_required_treated_as_failure() -> None:
     """``action_required`` is a check-run failure conclusion in REST."""
-    assert (
-        _map_rest_ci_status_to_enum(
-            [{"conclusion": "action_required"}], {}
-        )
-        == CIStatus.FAILURE
-    )
+    assert _map_rest_ci_status_to_enum([{"conclusion": "action_required"}], {}) == CIStatus.FAILURE
 
 
 def test_map_rest_ci_status_success_requires_all_states_success_like() -> None:
@@ -3337,12 +3152,7 @@ def test_map_rest_ci_status_success_requires_all_states_success_like() -> None:
 
 def test_map_rest_ci_status_pending_when_states_missing_or_mixed() -> None:
     assert _map_rest_ci_status_to_enum([{}, {"conclusion": ""}], {}) == CIStatus.PENDING
-    assert (
-        _map_rest_ci_status_to_enum(
-            [{"conclusion": "success"}, {"status": "in_progress"}], {}
-        )
-        == CIStatus.PENDING
-    )
+    assert _map_rest_ci_status_to_enum([{"conclusion": "success"}, {"status": "in_progress"}], {}) == CIStatus.PENDING
 
 
 def test_map_rest_ci_status_pending_from_status_in_progress() -> None:
@@ -3476,7 +3286,7 @@ def test_fetch_ci_status_rest_combines_check_runs_and_status(
             ]
         return {"state": "pending", "statuses": [{"state": "pending"}]}
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
 
@@ -3503,7 +3313,7 @@ def test_fetch_ci_status_rest_degrades_on_check_runs_failure(
             raise RuntimeError("HTTP 503")
         return {"state": "success", "statuses": [{"state": "success"}]}
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
 
     check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
@@ -3522,7 +3332,7 @@ def test_fetch_ci_status_rest_degrades_on_status_failure(
             return [{"check_runs": [{"conclusion": "success"}]}]
         raise RuntimeError("HTTP 503")
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
 
     check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
@@ -3544,7 +3354,7 @@ def test_fetch_ci_status_rest_marks_fetch_failure_when_both_endpoints_fail(
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         raise RuntimeError("HTTP 403")
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
 
     check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
@@ -3574,7 +3384,7 @@ def test_fetch_ci_status_rest_partial_failure_trusts_empty_survivor(
             raise RuntimeError("HTTP 403")
         return {"state": "pending", "statuses": []}
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
 
     check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
@@ -3593,7 +3403,7 @@ def test_fetch_ci_status_rest_partial_failure_status_side_with_empty_check_runs(
             return [{"check_runs": []}]
         raise RuntimeError("HTTP 403")
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
 
     check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
@@ -3612,7 +3422,7 @@ def test_fetch_ci_status_rest_parses_string_status_payload(
             return [{"check_runs": []}]
         return '{"state": "success", "statuses": [{"state": "success"}]}'
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     _, status_payload, _ = _fetch_ci_status_rest("owner/name", "abc123")
     assert status_payload == {"state": "success", "statuses": [{"state": "success"}]}
@@ -3628,7 +3438,7 @@ def test_fetch_ci_status_rest_string_status_invalid_json_falls_back(
             return [{"check_runs": []}]
         return "not-json"
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     _, status_payload, _ = _fetch_ci_status_rest("owner/name", "abc123")
     assert status_payload == {}
@@ -3644,7 +3454,7 @@ def test_fetch_ci_status_rest_ignores_non_list_pages(
             return {"unexpected": True}
         return {"state": "pending", "statuses": []}
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     check_runs, _, _ = _fetch_ci_status_rest("owner/name", "abc123")
     assert check_runs == []
@@ -3664,7 +3474,7 @@ def test_fetch_ci_status_rest_skips_non_dict_pages(
             ]
         return {}
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     check_runs, _, _ = _fetch_ci_status_rest("owner/name", "abc123")
     assert check_runs == [{"conclusion": "success"}]
@@ -3688,7 +3498,7 @@ def test_fetch_ci_status_rest_caches_per_repo_sha(
             return [{"check_runs": [{"conclusion": "success"}]}]
         return {"state": "success", "statuses": [{"state": "success"}]}
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     first = _fetch_ci_status_rest("owner/name", "abc123")
     second = _fetch_ci_status_rest("owner/name", "abc123")
@@ -3709,7 +3519,7 @@ def test_fetch_ci_status_rest_cache_misses_on_new_sha(
             return [{"check_runs": [{"conclusion": "success", "id": sha}]}]
         return {"state": "success", "statuses": [{"state": "success"}]}
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     first_runs, _, _ = _fetch_ci_status_rest("owner/name", "abc123")
     second_runs, _, _ = _fetch_ci_status_rest("owner/name", "def456")
@@ -3736,8 +3546,8 @@ def test_fetch_ci_status_rest_cache_expires_after_ttl(
     def fake_monotonic() -> float:
         return fake_now["value"]
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
-    monkeypatch.setattr("src.github_client.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.prs.time.monotonic", fake_monotonic)
 
     first, _, _ = _fetch_ci_status_rest("owner/name", "abc123")
     fake_now["value"] += 5.0
@@ -3761,7 +3571,7 @@ def test_clear_ci_status_cache_forces_refetch(
             return [{"check_runs": [{"conclusion": f"call_{state['calls']}"}]}]
         return {}
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     _fetch_ci_status_rest("owner/name", "abc123")
     clear_ci_status_cache()
@@ -3780,7 +3590,7 @@ def test_fetch_ci_status_rest_evicts_expired_entries_for_old_shas(
     one entry (with its full check-run payload) per push for every
     watched repo, since lookups only touch the currently requested key.
     """
-    from src.github_client import _ci_status_cache
+    from src.github.checks import _ci_status_cache
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
@@ -3792,8 +3602,8 @@ def test_fetch_ci_status_rest_evicts_expired_entries_for_old_shas(
     def fake_monotonic() -> float:
         return fake_now["value"]
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
-    monkeypatch.setattr("src.github_client.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.prs.time.monotonic", fake_monotonic)
 
     _fetch_ci_status_rest("owner/name", "sha-old")
     assert ("owner/name", "sha-old") in _ci_status_cache
@@ -3811,7 +3621,7 @@ def test_fetch_ci_status_rest_eviction_preserves_unexpired_entries(
 ) -> None:
     """Entries that are still inside the TTL must not be swept when a
     cache miss for a different SHA triggers eviction."""
-    from src.github_client import _ci_status_cache
+    from src.github.checks import _ci_status_cache
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
@@ -3823,8 +3633,8 @@ def test_fetch_ci_status_rest_eviction_preserves_unexpired_entries(
     def fake_monotonic() -> float:
         return fake_now["value"]
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
-    monkeypatch.setattr("src.github_client.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.prs.time.monotonic", fake_monotonic)
 
     _fetch_ci_status_rest("owner/name", "sha-fresh")
     fake_now["value"] += 1.0  # still well inside the 15s TTL
@@ -3863,7 +3673,7 @@ def test_get_current_rate_limit_budget_returns_persisted_value(
         reset_at=datetime.fromtimestamp(1745683200, tz=_tz.utc),
     ).to_redis_payload()
 
-    result = asyncio.run(github_client.get_current_rate_limit_budget(redis))
+    result = asyncio.run(rate_limit.get_current_rate_limit_budget(redis))
     assert result is not None
     assert result.remaining == 42
 
@@ -3875,9 +3685,7 @@ def test_get_current_rate_limit_budget_none_when_no_observation() -> None:
         async def get(self, key: str) -> str | None:
             return None
 
-    assert asyncio.run(
-        github_client.get_current_rate_limit_budget(_FakeRedis())
-    ) is None
+    assert asyncio.run(rate_limit.get_current_rate_limit_budget(_FakeRedis())) is None
 
 
 def _bucket(remaining: int, limit: int = 5000, reset: int = 1745683200) -> dict:
@@ -3888,14 +3696,13 @@ def test_fetch_rate_limit_budget_parses_dict_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda args, **kw: {
             "core": _bucket(remaining=4321),
             "graphql": _bucket(remaining=4900),
         },
     )
-    budget = github_client.fetch_rate_limit_budget()
+    budget = rate_limit.fetch_rate_limit_budget()
     assert budget is not None
     assert budget.remaining == 4321
     assert budget.limit == 5000
@@ -3905,14 +3712,13 @@ def test_fetch_rate_limit_budget_parses_string_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda args, **kw: (
             '{"core": {"remaining": 100, "limit": 5000, "reset": 0},'
             ' "graphql": {"remaining": 4500, "limit": 5000, "reset": 0}}'
         ),
     )
-    budget = github_client.fetch_rate_limit_budget()
+    budget = rate_limit.fetch_rate_limit_budget()
     assert budget is not None
     assert budget.remaining == 100
 
@@ -3922,14 +3728,13 @@ def test_fetch_rate_limit_budget_returns_graphql_when_more_constrained(
 ) -> None:
     """GraphQL exhaustion must surface even when REST/core is healthy."""
     monkeypatch.setattr(
-        github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda args, **kw: {
             "core": _bucket(remaining=4900),
             "graphql": _bucket(remaining=10),
         },
     )
-    budget = github_client.fetch_rate_limit_budget()
+    budget = rate_limit.fetch_rate_limit_budget()
     assert budget is not None
     assert budget.remaining == 10
 
@@ -3938,11 +3743,10 @@ def test_fetch_rate_limit_budget_falls_back_when_one_bucket_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda args, **kw: {"core": _bucket(remaining=4321)},
     )
-    budget = github_client.fetch_rate_limit_budget()
+    budget = rate_limit.fetch_rate_limit_budget()
     assert budget is not None
     assert budget.remaining == 4321
 
@@ -3950,35 +3754,32 @@ def test_fetch_rate_limit_budget_falls_back_when_one_bucket_missing(
 def test_fetch_rate_limit_budget_returns_none_for_invalid_json_string(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        github_client, "run_gh", lambda args, **kw: "not-json"
-    )
-    assert github_client.fetch_rate_limit_budget() is None
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda args, **kw: "not-json")
+    assert rate_limit.fetch_rate_limit_budget() is None
 
 
 def test_fetch_rate_limit_budget_returns_none_for_unexpected_type(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(github_client, "run_gh", lambda args, **kw: [1, 2])
-    assert github_client.fetch_rate_limit_budget() is None
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda args, **kw: [1, 2])
+    assert rate_limit.fetch_rate_limit_budget() is None
 
 
 def test_fetch_rate_limit_budget_returns_none_for_missing_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda args, **kw: {"core": {"remaining": 10}},
     )
-    assert github_client.fetch_rate_limit_budget() is None
+    assert rate_limit.fetch_rate_limit_budget() is None
 
 
 def test_fetch_rate_limit_budget_returns_none_when_both_buckets_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(github_client, "run_gh", lambda args, **kw: {})
-    assert github_client.fetch_rate_limit_budget() is None
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda args, **kw: {})
+    assert rate_limit.fetch_rate_limit_budget() is None
 
 
 def test_fetch_rate_limit_budget_returns_none_when_gh_raises(
@@ -3987,8 +3788,8 @@ def test_fetch_rate_limit_budget_returns_none_when_gh_raises(
     def _raise(args: list[str], **kw: Any) -> None:
         raise RuntimeError("API rate limit exceeded")
 
-    monkeypatch.setattr(github_client, "run_gh", _raise)
-    assert github_client.fetch_rate_limit_budget() is None
+    monkeypatch.setattr("src.github.gh_runner.run_gh", _raise)
+    assert rate_limit.fetch_rate_limit_budget() is None
 
 
 def test_fetch_rate_limit_budget_returns_none_when_gh_oserror(
@@ -3997,22 +3798,21 @@ def test_fetch_rate_limit_budget_returns_none_when_gh_oserror(
     def _raise(args: list[str], **kw: Any) -> None:
         raise OSError("gh missing")
 
-    monkeypatch.setattr(github_client, "run_gh", _raise)
-    assert github_client.fetch_rate_limit_budget() is None
+    monkeypatch.setattr("src.github.gh_runner.run_gh", _raise)
+    assert rate_limit.fetch_rate_limit_budget() is None
 
 
 def test_fetch_rate_limit_budget_returns_none_on_malformed_int(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda args, **kw: {
             "core": {"remaining": "abc", "limit": 5000, "reset": 0},
             "graphql": {"remaining": "xyz", "limit": 5000, "reset": 0},
         },
     )
-    assert github_client.fetch_rate_limit_budget() is None
+    assert rate_limit.fetch_rate_limit_budget() is None
 
 
 def test_fetch_rate_limit_buckets_returns_each_bucket_separately(
@@ -4020,14 +3820,13 @@ def test_fetch_rate_limit_buckets_returns_each_bucket_separately(
 ) -> None:
     """Both buckets surface independently so the dashboard renders each chip."""
     monkeypatch.setattr(
-        github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda args, **kw: {
             "core": _bucket(remaining=4321),
             "graphql": _bucket(remaining=120),
         },
     )
-    rest, graphql = github_client.fetch_rate_limit_buckets()
+    rest, graphql = rate_limit.fetch_rate_limit_buckets()
     assert rest is not None and rest.remaining == 4321
     assert graphql is not None and graphql.remaining == 120
 
@@ -4038,31 +3837,29 @@ def test_fetch_rate_limit_buckets_returns_pair_of_none_on_gh_error(
     def _raise(args: list[str], **kw: Any) -> None:
         raise RuntimeError("gh down")
 
-    monkeypatch.setattr(github_client, "run_gh", _raise)
-    assert github_client.fetch_rate_limit_buckets() == (None, None)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", _raise)
+    assert rate_limit.fetch_rate_limit_buckets() == (None, None)
 
 
 def test_fetch_rate_limit_buckets_returns_pair_of_none_on_invalid_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(github_client, "run_gh", lambda args, **kw: "not-json")
-    assert github_client.fetch_rate_limit_buckets() == (None, None)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda args, **kw: "not-json")
+    assert rate_limit.fetch_rate_limit_buckets() == (None, None)
 
 
 def test_fetch_rate_limit_buckets_returns_pair_of_none_on_unexpected_type(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(github_client, "run_gh", lambda args, **kw: [1])
-    assert github_client.fetch_rate_limit_buckets() == (None, None)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda args, **kw: [1])
+    assert rate_limit.fetch_rate_limit_buckets() == (None, None)
 
 
 def test_get_latest_codex_feedback_collects_post_anchor_codex_comments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Issue and review comments authored by Codex after the anchor are joined."""
-    monkeypatch.setattr(
-        github_client, "get_pr_author", lambda repo, n: "author"
-    )
+    monkeypatch.setattr("src.github.prs.get_pr_author", lambda repo, n: "author")
 
     def fake_paginated(path: str) -> list[dict]:
         if path.endswith("/issues/42/comments"):
@@ -4103,18 +3900,16 @@ def test_get_latest_codex_feedback_collects_post_anchor_codex_comments(
             ]
         raise AssertionError(f"unexpected path: {path}")
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
-    out = github_client.get_latest_codex_feedback("owner/name", 42)
+    out = comments.get_latest_codex_feedback("owner/name", 42)
     assert out == "P1: rename foo\n\nP2: extract helper"
 
 
 def test_get_latest_codex_feedback_returns_none_when_no_codex_comments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        github_client, "get_pr_author", lambda repo, n: "author"
-    )
+    monkeypatch.setattr("src.github.prs.get_pr_author", lambda repo, n: "author")
 
     def fake_paginated(path: str) -> list[dict]:
         if path.endswith("/issues/42/comments"):
@@ -4130,17 +3925,15 @@ def test_get_latest_codex_feedback_returns_none_when_no_codex_comments(
             return []
         raise AssertionError(f"unexpected path: {path}")
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
-    assert github_client.get_latest_codex_feedback("owner/name", 42) is None
+    assert comments.get_latest_codex_feedback("owner/name", 42) is None
 
 
 def test_get_latest_codex_feedback_skips_onboarding_comment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        github_client, "get_pr_author", lambda repo, n: "author"
-    )
+    monkeypatch.setattr("src.github.prs.get_pr_author", lambda repo, n: "author")
 
     def fake_paginated(path: str) -> list[dict]:
         if path.endswith("/issues/42/comments"):
@@ -4162,18 +3955,16 @@ def test_get_latest_codex_feedback_skips_onboarding_comment(
             return []
         raise AssertionError(f"unexpected path: {path}")
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
-    assert github_client.get_latest_codex_feedback("owner/name", 42) is None
+    assert comments.get_latest_codex_feedback("owner/name", 42) is None
 
 
 def test_get_latest_codex_feedback_returns_all_codex_comments_when_no_anchor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """No PR-author ``@codex review`` trigger: every Codex comment counts."""
-    monkeypatch.setattr(
-        github_client, "get_pr_author", lambda repo, n: "author"
-    )
+    monkeypatch.setattr("src.github.prs.get_pr_author", lambda repo, n: "author")
 
     def fake_paginated(path: str) -> list[dict]:
         if path.endswith("/issues/42/comments"):
@@ -4189,9 +3980,9 @@ def test_get_latest_codex_feedback_returns_all_codex_comments_when_no_anchor(
             return []
         raise AssertionError(f"unexpected path: {path}")
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
-    out = github_client.get_latest_codex_feedback("owner/name", 42)
+    out = comments.get_latest_codex_feedback("owner/name", 42)
     assert out == "feedback before any anchor"
 
 
@@ -4199,9 +3990,7 @@ def test_get_latest_codex_feedback_skips_non_author_anchor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An ``@codex review`` posted by a teammate is not the anchor."""
-    monkeypatch.setattr(
-        github_client, "get_pr_author", lambda repo, n: "author"
-    )
+    monkeypatch.setattr("src.github.prs.get_pr_author", lambda repo, n: "author")
 
     def fake_paginated(path: str) -> list[dict]:
         if path.endswith("/issues/42/comments"):
@@ -4223,25 +4012,23 @@ def test_get_latest_codex_feedback_skips_non_author_anchor(
             return []
         raise AssertionError(f"unexpected path: {path}")
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
-    out = github_client.get_latest_codex_feedback("owner/name", 42)
+    out = comments.get_latest_codex_feedback("owner/name", 42)
     assert out == "P1: real feedback"
 
 
 def test_get_latest_codex_feedback_returns_none_when_endpoints_fail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        github_client, "get_pr_author", lambda repo, n: "author"
-    )
+    monkeypatch.setattr("src.github.prs.get_pr_author", lambda repo, n: "author")
 
     def fake_paginated(path: str) -> list[dict]:
         raise RuntimeError("api blew up")
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
-    assert github_client.get_latest_codex_feedback("owner/name", 42) is None
+    assert comments.get_latest_codex_feedback("owner/name", 42) is None
 
 
 def test_get_latest_codex_feedback_returns_none_when_endpoints_timeout(
@@ -4250,9 +4037,7 @@ def test_get_latest_codex_feedback_returns_none_when_endpoints_timeout(
     """Endpoint ``TimeoutExpired`` / ``OSError`` must degrade to ``None``,
     not bubble out and abort the FIX cycle before the coder runs.
     """
-    monkeypatch.setattr(
-        github_client, "get_pr_author", lambda repo, n: "author"
-    )
+    monkeypatch.setattr("src.github.prs.get_pr_author", lambda repo, n: "author")
 
     raised: list[type[BaseException]] = []
     exceptions: list[BaseException] = [
@@ -4267,9 +4052,9 @@ def test_get_latest_codex_feedback_returns_none_when_endpoints_timeout(
         raised.append(type(exc))
         raise exc
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
-    assert github_client.get_latest_codex_feedback("owner/name", 42) is None
+    assert comments.get_latest_codex_feedback("owner/name", 42) is None
     assert raised == [subprocess.TimeoutExpired, FileNotFoundError]
 
 
@@ -4279,9 +4064,7 @@ def test_get_latest_codex_feedback_truncates_oversized_output(
     """Joined feedback must be capped to avoid ``Argument list too long``
     when the FIX prompt embeds it as a single CLI argument.
     """
-    monkeypatch.setattr(
-        github_client, "get_pr_author", lambda repo, n: "author"
-    )
+    monkeypatch.setattr("src.github.prs.get_pr_author", lambda repo, n: "author")
 
     big_body = "x" * 6000
 
@@ -4305,21 +4088,19 @@ def test_get_latest_codex_feedback_truncates_oversized_output(
             return []
         raise AssertionError(f"unexpected path: {path}")
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
-    out = github_client.get_latest_codex_feedback("owner/name", 42)
+    out = comments.get_latest_codex_feedback("owner/name", 42)
     assert out is not None
     assert out.startswith("[truncated]\n")
-    assert len(out) == len("[truncated]\n") + github_client._REVIEW_FEEDBACK_TRUNCATE_CHARS
+    assert len(out) == len("[truncated]\n") + gh_comments._REVIEW_FEEDBACK_TRUNCATE_CHARS
     assert out.endswith("x" * 100)
 
 
 def test_get_latest_codex_feedback_skips_empty_codex_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        github_client, "get_pr_author", lambda repo, n: "author"
-    )
+    monkeypatch.setattr("src.github.prs.get_pr_author", lambda repo, n: "author")
 
     def fake_paginated(path: str) -> list[dict]:
         if path.endswith("/issues/42/comments"):
@@ -4341,9 +4122,9 @@ def test_get_latest_codex_feedback_skips_empty_codex_body(
             return []
         raise AssertionError(f"unexpected path: {path}")
 
-    monkeypatch.setattr("src.github_client._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
-    assert github_client.get_latest_codex_feedback("owner/name", 42) is None
+    assert comments.get_latest_codex_feedback("owner/name", 42) is None
 
 
 # ---------------------------------------------------------------------------
@@ -4367,7 +4148,7 @@ def _build_include_response(
 
 @pytest.fixture(autouse=True)
 def _clear_etag_cache_between_tests() -> None:
-    github_client.clear_etag_cache()
+    cache.clear_etag_cache()
 
 
 def test_etag_get_first_call_populates_cache(
@@ -4378,18 +4159,16 @@ def test_etag_get_first_call_populates_cache(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         captured.append(cmd)
-        return _FakeCompletedProcess(
-            stdout=_build_include_response('{"merged": true}', etag='W/"abc"')
-        )
+        return _FakeCompletedProcess(stdout=_build_include_response('{"merged": true}', etag='W/"abc"'))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    payload = github_client._etag_get("repos/owner/name/pulls/42")
+    payload = cache._etag_get("repos/owner/name/pulls/42")
 
     assert payload == {"merged": True}
     assert "--include" in captured[0]
     assert not any("If-None-Match" in arg for arg in captured[0])
-    assert github_client._etag_cache["repos/owner/name/pulls/42"] == (
+    assert cache._etag_cache["repos/owner/name/pulls/42"] == (
         'W/"abc"',
         {"merged": True},
     )
@@ -4413,8 +4192,8 @@ def test_etag_get_second_call_sends_if_none_match(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    github_client._etag_get("repos/owner/name/pulls/7")
-    github_client._etag_get("repos/owner/name/pulls/7")
+    cache._etag_get("repos/owner/name/pulls/7")
+    cache._etag_get("repos/owner/name/pulls/7")
 
     assert 'If-None-Match: W/"v1"' in captured[1]
 
@@ -4435,8 +4214,8 @@ def test_etag_get_304_returns_cached_payload(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    first = github_client._etag_get("repos/owner/name/pulls/9")
-    second = github_client._etag_get("repos/owner/name/pulls/9")
+    first = cache._etag_get("repos/owner/name/pulls/9")
+    second = cache._etag_get("repos/owner/name/pulls/9")
 
     assert first == {"merged": True, "n": 1}
     assert second == {"merged": True, "n": 1}
@@ -4458,12 +4237,12 @@ def test_etag_get_200_with_new_etag_replaces_cache(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    first = github_client._etag_get("repos/owner/name/commits/abc")
-    second = github_client._etag_get("repos/owner/name/commits/abc")
+    first = cache._etag_get("repos/owner/name/commits/abc")
+    second = cache._etag_get("repos/owner/name/commits/abc")
 
     assert first == {"v": 1}
     assert second == {"v": 2}
-    assert github_client._etag_cache["repos/owner/name/commits/abc"] == (
+    assert cache._etag_cache["repos/owner/name/commits/abc"] == (
         'W/"v2"',
         {"v": 2},
     )
@@ -4473,29 +4252,27 @@ def test_etag_get_evicts_oldest_when_max_entries_exceeded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The cache must drop the least-recently-used entry past ``_ETAG_CACHE_MAX_ENTRIES``."""
-    monkeypatch.setattr(github_client, "_ETAG_CACHE_MAX_ENTRIES", 3)
+    monkeypatch.setattr("src.github.cache._ETAG_CACHE_MAX_ENTRIES", 3)
     counter = {"i": 0}
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         counter["i"] += 1
         body = f'{{"i": {counter["i"]}}}'
-        return _FakeCompletedProcess(
-            stdout=_build_include_response(body, etag=f'W/"e{counter["i"]}"')
-        )
+        return _FakeCompletedProcess(stdout=_build_include_response(body, etag=f'W/"e{counter["i"]}"'))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    github_client._etag_get("repos/x/y/pulls/1")
-    github_client._etag_get("repos/x/y/pulls/2")
-    github_client._etag_get("repos/x/y/pulls/3")
-    github_client._etag_get("repos/x/y/pulls/4")  # forces eviction of /pulls/1
+    cache._etag_get("repos/x/y/pulls/1")
+    cache._etag_get("repos/x/y/pulls/2")
+    cache._etag_get("repos/x/y/pulls/3")
+    cache._etag_get("repos/x/y/pulls/4")  # forces eviction of /pulls/1
 
-    assert "repos/x/y/pulls/1" not in github_client._etag_cache
+    assert "repos/x/y/pulls/1" not in cache._etag_cache
     assert {
         "repos/x/y/pulls/2",
         "repos/x/y/pulls/3",
         "repos/x/y/pulls/4",
-    } <= set(github_client._etag_cache.keys())
+    } <= set(cache._etag_cache.keys())
 
 
 def test_etag_get_returns_none_on_unparseable_body(
@@ -4504,14 +4281,12 @@ def test_etag_get_returns_none_on_unparseable_body(
     """A 200 with malformed JSON must not crash and must not poison the cache."""
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        return _FakeCompletedProcess(
-            stdout=_build_include_response("{not-json", etag='W/"v1"')
-        )
+        return _FakeCompletedProcess(stdout=_build_include_response("{not-json", etag='W/"v1"'))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert github_client._etag_get("repos/owner/name/pulls/1") is None
-    assert "repos/owner/name/pulls/1" not in github_client._etag_cache
+    assert cache._etag_get("repos/owner/name/pulls/1") is None
+    assert "repos/owner/name/pulls/1" not in cache._etag_cache
 
 
 def test_etag_get_304_without_cache_retries_without_if_none_match(
@@ -4532,12 +4307,12 @@ def test_etag_get_304_without_cache_retries_without_if_none_match(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    payload = github_client._etag_get("repos/owner/name/pulls/3")
+    payload = cache._etag_get("repos/owner/name/pulls/3")
 
     assert payload == {"merged": True}
     assert len(captured) == 2
     assert not any("If-None-Match" in arg for arg in captured[1])
-    assert github_client._etag_cache["repos/owner/name/pulls/3"] == (
+    assert cache._etag_cache["repos/owner/name/pulls/3"] == (
         'W/"v2"',
         {"merged": True},
     )
@@ -4559,8 +4334,8 @@ def test_etag_get_304_no_cache_retry_returns_none_on_non_2xx(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert github_client._etag_get("repos/owner/name/pulls/3") is None
-    assert "repos/owner/name/pulls/3" not in github_client._etag_cache
+    assert cache._etag_get("repos/owner/name/pulls/3") is None
+    assert "repos/owner/name/pulls/3" not in cache._etag_cache
 
 
 def test_etag_get_304_no_cache_retry_returns_none_on_empty_body(
@@ -4579,7 +4354,7 @@ def test_etag_get_304_no_cache_retry_returns_none_on_empty_body(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert github_client._etag_get("repos/owner/name/pulls/3") is None
+    assert cache._etag_get("repos/owner/name/pulls/3") is None
 
 
 def test_etag_get_304_no_cache_retry_returns_none_on_unparseable_body(
@@ -4598,8 +4373,8 @@ def test_etag_get_304_no_cache_retry_returns_none_on_unparseable_body(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert github_client._etag_get("repos/owner/name/pulls/3") is None
-    assert "repos/owner/name/pulls/3" not in github_client._etag_cache
+    assert cache._etag_get("repos/owner/name/pulls/3") is None
+    assert "repos/owner/name/pulls/3" not in cache._etag_cache
 
 
 def test_etag_get_304_no_cache_retry_passes_through_pre_parsed_run_gh(
@@ -4614,9 +4389,9 @@ def test_etag_get_304_no_cache_retry_passes_through_pre_parsed_run_gh(
             return _build_include_response("", status=304, etag='W/"v1"')
         return {"merged": True}
 
-    monkeypatch.setattr("src.github_client.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
-    payload = github_client._etag_get("repos/owner/name/pulls/4")
+    payload = cache._etag_get("repos/owner/name/pulls/4")
 
     assert payload == {"merged": True}
     assert len(calls) == 2
@@ -4630,28 +4405,26 @@ def test_etag_get_passthrough_for_pre_parsed_run_gh(
     ``_etag_get`` must surface it directly so call-site tests retain their
     semantics without crafting raw ``--include`` strings."""
     monkeypatch.setattr(
-        "src.github_client.run_gh",
+        "src.github.gh_runner.run_gh",
         lambda args: {"merged": True, "state": "closed"},
     )
 
-    payload = github_client._etag_get("repos/owner/name/pulls/5")
+    payload = cache._etag_get("repos/owner/name/pulls/5")
     assert payload == {"merged": True, "state": "closed"}
     # Cache stays empty because the test bypassed the --include path.
-    assert "repos/owner/name/pulls/5" not in github_client._etag_cache
+    assert "repos/owner/name/pulls/5" not in cache._etag_cache
 
 
 def test_etag_get_returns_none_on_5xx(monkeypatch: pytest.MonkeyPatch) -> None:
     """A 5xx response (rare; gh normally raises) yields None and leaves cache untouched."""
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        return _FakeCompletedProcess(
-            stdout=_build_include_response("server error", status=500, etag=None)
-        )
+        return _FakeCompletedProcess(stdout=_build_include_response("server error", status=500, etag=None))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert github_client._etag_get("repos/owner/name/pulls/8") is None
-    assert "repos/owner/name/pulls/8" not in github_client._etag_cache
+    assert cache._etag_get("repos/owner/name/pulls/8") is None
+    assert "repos/owner/name/pulls/8" not in cache._etag_cache
 
 
 def test_etag_get_empty_200_body_returns_none(
@@ -4660,13 +4433,11 @@ def test_etag_get_empty_200_body_returns_none(
     """A 200 with no body (degenerate) yields None rather than crashing on JSON."""
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        return _FakeCompletedProcess(
-            stdout=_build_include_response("", status=200, etag='W/"v1"')
-        )
+        return _FakeCompletedProcess(stdout=_build_include_response("", status=200, etag='W/"v1"'))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert github_client._etag_get("repos/owner/name/pulls/9") is None
+    assert cache._etag_get("repos/owner/name/pulls/9") is None
 
 
 # ---------------------------------------------------------------------------
@@ -4694,21 +4465,13 @@ def test_etag_get_paginated_walks_pages_and_caches_each(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    items = github_client._etag_get_paginated(
-        "repos/owner/name/pulls?state=open&per_page=100"
-    )
+    items = cache._etag_get_paginated("repos/owner/name/pulls?state=open&per_page=100")
 
     assert items is not None
     assert [item["n"] for item in items] == list(range(102))
     assert len(captured) == 2
-    assert (
-        "repos/owner/name/pulls?state=open&per_page=100&page=1"
-        in github_client._etag_cache
-    )
-    assert (
-        "repos/owner/name/pulls?state=open&per_page=100&page=2"
-        in github_client._etag_cache
-    )
+    assert "repos/owner/name/pulls?state=open&per_page=100&page=1" in cache._etag_cache
+    assert "repos/owner/name/pulls?state=open&per_page=100&page=2" in cache._etag_cache
 
 
 def test_etag_get_paginated_304_returns_cached_pages(
@@ -4734,8 +4497,8 @@ def test_etag_get_paginated_304_returns_cached_pages(
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     base = "repos/owner/name/pulls?state=open&per_page=100"
-    first = github_client._etag_get_paginated(base)
-    second = github_client._etag_get_paginated(base)
+    first = cache._etag_get_paginated(base)
+    second = cache._etag_get_paginated(base)
 
     assert first == [{"n": i} for i in range(101)]
     assert second == first
@@ -4752,15 +4515,11 @@ def test_etag_get_paginated_stops_when_short_page(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         captured.append(cmd)
-        return _FakeCompletedProcess(
-            stdout=_build_include_response('[{"n": 1}]', etag='W/"only"')
-        )
+        return _FakeCompletedProcess(stdout=_build_include_response('[{"n": 1}]', etag='W/"only"'))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    items = github_client._etag_get_paginated(
-        "repos/owner/name/pulls?state=closed&per_page=100"
-    )
+    items = cache._etag_get_paginated("repos/owner/name/pulls?state=closed&per_page=100")
 
     assert items == [{"n": 1}]
     assert len(captured) == 1
@@ -4784,15 +4543,11 @@ def test_etag_get_paginated_walks_past_legacy_100_page_cap(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         state["calls"] += 1
         body = full_body if state["calls"] <= full_pages else short_body
-        return _FakeCompletedProcess(
-            stdout=_build_include_response(body, etag=f'W/"p{state["calls"]}"')
-        )
+        return _FakeCompletedProcess(stdout=_build_include_response(body, etag=f'W/"p{state["calls"]}"'))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    items = github_client._etag_get_paginated(
-        "repos/owner/name/pulls?state=closed&per_page=2"
-    )
+    items = cache._etag_get_paginated("repos/owner/name/pulls?state=closed&per_page=2")
 
     assert items is not None
     assert len(items) == full_pages * 2 + 1
@@ -4806,13 +4561,11 @@ def test_etag_get_paginated_uses_default_per_page_when_unspecified(
     body = "[" + ",".join(f'{{"n": {i}}}' for i in range(15)) + "]"
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        return _FakeCompletedProcess(
-            stdout=_build_include_response(body, etag='W/"single"')
-        )
+        return _FakeCompletedProcess(stdout=_build_include_response(body, etag='W/"single"'))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    items = github_client._etag_get_paginated("repos/owner/name/pulls")
+    items = cache._etag_get_paginated("repos/owner/name/pulls")
 
     assert items == [{"n": i} for i in range(15)]
 
@@ -4823,18 +4576,11 @@ def test_etag_get_paginated_first_page_none_returns_none(
     """A None payload on the first page (e.g. 5xx) yields None overall."""
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        return _FakeCompletedProcess(
-            stdout=_build_include_response("server error", status=500, etag=None)
-        )
+        return _FakeCompletedProcess(stdout=_build_include_response("server error", status=500, etag=None))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        github_client._etag_get_paginated(
-            "repos/owner/name/pulls?state=open&per_page=100"
-        )
-        is None
-    )
+    assert cache._etag_get_paginated("repos/owner/name/pulls?state=open&per_page=100") is None
 
 
 def test_etag_get_paginated_first_page_non_list_returns_none(
@@ -4843,18 +4589,11 @@ def test_etag_get_paginated_first_page_non_list_returns_none(
     """An object body (not a JSON array) on the first page yields None."""
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        return _FakeCompletedProcess(
-            stdout=_build_include_response('{"unexpected": true}', etag='W/"v1"')
-        )
+        return _FakeCompletedProcess(stdout=_build_include_response('{"unexpected": true}', etag='W/"v1"'))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert (
-        github_client._etag_get_paginated(
-            "repos/owner/name/pulls?state=open&per_page=100"
-        )
-        is None
-    )
+    assert cache._etag_get_paginated("repos/owner/name/pulls?state=open&per_page=100") is None
 
 
 def test_etag_get_paginated_later_page_none_surfaces_partial(
@@ -4874,9 +4613,7 @@ def test_etag_get_paginated_later_page_none_surfaces_partial(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    items = github_client._etag_get_paginated(
-        "repos/owner/name/pulls?state=open&per_page=100"
-    )
+    items = cache._etag_get_paginated("repos/owner/name/pulls?state=open&per_page=100")
     assert items == [{"n": i} for i in range(100)]
 
 
@@ -4897,9 +4634,7 @@ def test_etag_get_paginated_later_page_non_list_breaks(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    items = github_client._etag_get_paginated(
-        "repos/owner/name/pulls?state=open&per_page=100"
-    )
+    items = cache._etag_get_paginated("repos/owner/name/pulls?state=open&per_page=100")
     assert items == [{"n": i} for i in range(100)]
 
 
@@ -4914,9 +4649,7 @@ def test_etag_get_paginated_first_page_runtime_error_propagates(
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     with pytest.raises(RuntimeError, match="boom"):
-        github_client._etag_get_paginated(
-            "repos/owner/name/pulls?state=open&per_page=100"
-        )
+        cache._etag_get_paginated("repos/owner/name/pulls?state=open&per_page=100")
 
 
 def test_etag_get_paginated_later_page_runtime_error_breaks(
@@ -4929,19 +4662,13 @@ def test_etag_get_paginated_later_page_runtime_error_breaks(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         state["calls"] += 1
         if state["calls"] == 1:
-            return _FakeCompletedProcess(
-                stdout=_build_include_response(page1_body, etag='W/"p1"')
-            )
+            return _FakeCompletedProcess(stdout=_build_include_response(page1_body, etag='W/"p1"'))
         return _FakeCompletedProcess(stderr="transient", returncode=1)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(
-        "src.github_client.is_transient_error", lambda exc: False
-    )
+    monkeypatch.setattr("src.retry.is_transient_error", lambda exc: False)
 
-    items = github_client._etag_get_paginated(
-        "repos/owner/name/pulls?state=open&per_page=100"
-    )
+    items = cache._etag_get_paginated("repos/owner/name/pulls?state=open&per_page=100")
     assert items == [{"n": i} for i in range(100)]
 
 
@@ -4952,13 +4679,11 @@ def test_gh_api_paginated_routes_pulls_list_through_etag_helper(
     routed: list[str] = []
 
     monkeypatch.setattr(
-        "src.github_client._etag_get_paginated",
+        "src.github.cache._etag_get_paginated",
         lambda path: routed.append(path) or [{"n": 1}],
     )
 
-    result = github_client._gh_api_paginated(
-        "repos/owner/name/pulls?state=open&per_page=100"
-    )
+    result = cache._gh_api_paginated("repos/owner/name/pulls?state=open&per_page=100")
 
     assert result == [{"n": 1}]
     assert routed == ["repos/owner/name/pulls?state=open&per_page=100"]
@@ -4974,15 +4699,13 @@ def test_gh_api_paginated_keeps_legacy_slurp_for_other_paths(
         routed.append(path)
         raise AssertionError("should not be called for sub-resource paths")
 
-    monkeypatch.setattr("src.github_client._etag_get_paginated", fake_etag_helper)
+    monkeypatch.setattr("src.github.cache._etag_get_paginated", fake_etag_helper)
     monkeypatch.setattr(
-        "src.github_client.run_gh",
+        "src.github.gh_runner.run_gh",
         lambda args: [[{"id": 1}], [{"id": 2}]],
     )
 
-    result = github_client._gh_api_paginated(
-        "repos/owner/name/issues/42/comments"
-    )
+    result = cache._gh_api_paginated("repos/owner/name/issues/42/comments")
 
     assert result == [{"id": 1}, {"id": 2}]
     assert routed == []
@@ -4992,49 +4715,46 @@ def test_invalidate_etag_cache_drops_matching_prefixes_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``_invalidate_etag_cache`` must remove only the prefix-matching entries."""
-    github_client._etag_cache_put(
+    cache._etag_cache_put(
         "repos/owner/name/pulls?state=open&per_page=100&page=1",
         'W/"a"',
         [{"n": 1}],
     )
-    github_client._etag_cache_put(
+    cache._etag_cache_put(
         "repos/owner/name/pulls?state=closed&page=1",
         'W/"b"',
         [{"n": 2}],
     )
-    github_client._etag_cache_put(
+    cache._etag_cache_put(
         "repos/owner/name/issues/42/comments",
         'W/"c"',
         [{"id": 3}],
     )
 
-    github_client._invalidate_etag_cache("repos/owner/name/pulls")
+    cache._invalidate_etag_cache("repos/owner/name/pulls")
 
-    assert "repos/owner/name/issues/42/comments" in github_client._etag_cache
-    assert not any(
-        key.startswith("repos/owner/name/pulls")
-        for key in github_client._etag_cache
-    )
+    assert "repos/owner/name/issues/42/comments" in cache._etag_cache
+    assert not any(key.startswith("repos/owner/name/pulls") for key in cache._etag_cache)
 
 
 def test_invalidate_etag_cache_no_op_when_prefix_absent() -> None:
     """A prefix that matches nothing must leave the cache untouched."""
-    github_client._etag_cache_put(
+    cache._etag_cache_put(
         "repos/owner/name/pulls?state=open&page=1",
         'W/"a"',
         [{"n": 1}],
     )
 
-    github_client._invalidate_etag_cache("repos/different/repo/pulls")
+    cache._invalidate_etag_cache("repos/different/repo/pulls")
 
-    assert "repos/owner/name/pulls?state=open&page=1" in github_client._etag_cache
+    assert "repos/owner/name/pulls?state=open&page=1" in cache._etag_cache
 
 
 def test_merge_pr_invalidates_pulls_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A successful ``merge_pr`` drops cached ``repos/{repo}/pulls`` entries."""
-    github_client._etag_cache_put(
+    cache._etag_cache_put(
         "repos/owner/name/pulls?state=open&per_page=100&page=1",
         'W/"a"',
         [{"n": 1}],
@@ -5045,33 +4765,24 @@ def test_merge_pr_invalidates_pulls_cache(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    github_client.merge_pr("owner/name", 42)
+    prs.merge_pr("owner/name", 42)
 
-    assert (
-        "repos/owner/name/pulls?state=open&per_page=100&page=1"
-        not in github_client._etag_cache
-    )
+    assert "repos/owner/name/pulls?state=open&per_page=100&page=1" not in cache._etag_cache
 
 
 def test_get_pr_metadata_extracts_nested_user_and_head(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Production payload: nested ``.user.login`` and ``.head.sha`` are extracted."""
-    pr_body = (
-        '{"user": {"login": "alice"}, "head": {"sha": "abc123"}}'
-    )
+    pr_body = '{"user": {"login": "alice"}, "head": {"sha": "abc123"}}'
     commit_body = '{"commit": {"committer": {"date": "2026-04-15T12:00:00Z"}}}'
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         path = next((a for a in cmd if a.startswith("repos/")), "")
         if "/pulls/" in path:
-            return _FakeCompletedProcess(
-                stdout=_build_include_response(pr_body, etag='W/"p1"')
-            )
+            return _FakeCompletedProcess(stdout=_build_include_response(pr_body, etag='W/"p1"'))
         if "/commits/" in path:
-            return _FakeCompletedProcess(
-                stdout=_build_include_response(commit_body, etag='W/"c1"')
-            )
+            return _FakeCompletedProcess(stdout=_build_include_response(commit_body, etag='W/"c1"'))
         return _FakeCompletedProcess(stdout="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)

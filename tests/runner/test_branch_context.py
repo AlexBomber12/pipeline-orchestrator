@@ -76,12 +76,9 @@ def _runner_with_task(
     tests sit on the same fixture surface as the existing CODING tests.
     """
     h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(h.claude_cli, "run_planned_pr_async", h._async_cli_result(0, "ok", ""))
     monkeypatch.setattr(
-        h.claude_cli, "run_planned_pr_async", h._async_cli_result(0, "ok", "")
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **_kw: list(open_prs or []),
     )
 
@@ -119,9 +116,7 @@ def _patch_branch_state(
             ref = args[3] if len(args) > 3 else ""
             wanted = ref.removeprefix("refs/heads/")
             rc = 0 if local_branch is not None and wanted == local_branch else 1
-            return subprocess.CompletedProcess(
-                args=list(args), returncode=rc, stdout="", stderr=""
-            )
+            return subprocess.CompletedProcess(args=list(args), returncode=rc, stdout="", stderr="")
         if args[:1] == ("ls-remote",):
             ref = args[-1] if args else ""
             wanted = ref.removeprefix("refs/heads/")
@@ -132,12 +127,8 @@ def _patch_branch_state(
                     stdout=f"abcdef refs/heads/{remote_branch}\n",
                     stderr="",
                 )
-            return subprocess.CompletedProcess(
-                args=list(args), returncode=2, stdout="", stderr=""
-            )
-        return subprocess.CompletedProcess(
-            args=list(args), returncode=0, stdout="", stderr=""
-        )
+            return subprocess.CompletedProcess(args=list(args), returncode=2, stdout="", stderr="")
+        return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(git_ops, "_git", fake_git)
 
@@ -179,9 +170,7 @@ def _run_coder_no_target_scenario(monkeypatch: pytest.MonkeyPatch) -> Any:
 
 def _run_coder_wrong_remote_scenario(monkeypatch: pytest.MonkeyPatch) -> Any:
     runner = _runner_with_task(monkeypatch, task_branch=TASK_BRANCH)
-    _patch_branch_state(
-        monkeypatch, local_branch=None, remote_branch=WRONG_BRANCH
-    )
+    _patch_branch_state(monkeypatch, local_branch=None, remote_branch=WRONG_BRANCH)
     asyncio.run(runner.handle_coding())
     return runner
 
@@ -203,15 +192,12 @@ def _run_recovery_branch_mismatch_scenario(
         review_status=ReviewStatus.PENDING,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **_kw: [open_pr],
     )
 
     runner = h._make_runner()
-    runner.repo_config = runner.repo_config.model_copy(
-        update={"branch": BASE_BRANCH}
-    )
+    runner.repo_config = runner.repo_config.model_copy(update={"branch": BASE_BRANCH})
     runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
     runner._parse_base_queue = lambda **_: [doing]  # type: ignore[method-assign]
     # Preserve must succeed (no local branch present) so the path
@@ -238,21 +224,15 @@ def _run_dirty_tree_scenario(
     def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
         git_commands.append(cmd)
         if cmd[:3] == ["git", "status", "--porcelain"]:
-            return h._FakeCompletedProcess(
-                args=cmd, stdout=" M src/foo.py\n", returncode=0
-            )
+            return h._FakeCompletedProcess(args=cmd, stdout=" M src/foo.py\n", returncode=0)
         if cmd[:2] == ["git", "rev-parse"] and "--abbrev-ref" in cmd:
-            return h._FakeCompletedProcess(
-                args=cmd, stdout=f"{FEATURE_BRANCH}\n", returncode=0
-            )
+            return h._FakeCompletedProcess(args=cmd, stdout=f"{FEATURE_BRANCH}\n", returncode=0)
         return h._FakeCompletedProcess(args=cmd, stdout="", returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
 
     runner = h._make_runner()
-    runner.repo_config = runner.repo_config.model_copy(
-        update={"branch": BASE_BRANCH}
-    )
+    runner.repo_config = runner.repo_config.model_copy(update={"branch": BASE_BRANCH})
     runner.state.current_task = QueueTask(
         pr_id="PR-FOO",
         title="Active task",
@@ -434,10 +414,7 @@ def test_open_pr_on_wrong_branch_does_not_match_task() -> None:
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.PENDING,
     )
-    assert (
-        find_matching_open_pr("PR-FOO", task_branch, [pr, matching_pr])
-        is matching_pr
-    )
+    assert find_matching_open_pr("PR-FOO", task_branch, [pr, matching_pr]) is matching_pr
 
 
 # ---------------------------------------------------------------------------
@@ -478,10 +455,7 @@ def test_recover_state_with_branch_mismatch_marks_task_canceled_and_idles(
     assert runner.state.current_pr is None
     assert runner.state.error_message is None
     log = _log_text(runner)
-    assert (
-        "[INFRA] Task PR-FOO crashed, marking CANCELED. "
-        "Manually re-upload to retry."
-    ) in log
+    assert ("[INFRA] Task PR-FOO crashed, marking CANCELED. Manually re-upload to retry.") in log
 
 
 @pytest.mark.xfail(strict=True, reason=XFAIL_BRANCH_CONTEXT_REASON)
@@ -542,15 +516,8 @@ def test_dirty_tree_on_feature_branch_resets_after_three_cycles(
     assert runner.state.error_message is None
     assert runner._consecutive_dirty_cycles == 0
     # The reset chain ran with the base branch name only.
-    assert any(
-        cmd[:4] == ["git", "checkout", "--force", BASE_BRANCH]
-        for cmd in git_commands
-    )
-    assert any(
-        cmd[:3] == ["git", "reset", "--hard"]
-        and cmd[-1] == f"origin/{BASE_BRANCH}"
-        for cmd in git_commands
-    )
+    assert any(cmd[:4] == ["git", "checkout", "--force", BASE_BRANCH] for cmd in git_commands)
+    assert any(cmd[:3] == ["git", "reset", "--hard"] and cmd[-1] == f"origin/{BASE_BRANCH}" for cmd in git_commands)
     assert any(cmd[:3] == ["git", "clean", "-fd"] for cmd in git_commands)
     log = _log_text(runner)
     assert "Auto-recovered from dirty tree -> IDLE" in log
@@ -659,7 +626,4 @@ def _assert_branch_context_in_diagnostic(
             )
             if not present_marker.search(haystack):
                 missing.append(f"{label}={value!r} not labeled")
-    assert not missing, (
-        "BranchContext diagnostic is missing required branch identifiers: "
-        + ", ".join(missing)
-    )
+    assert not missing, "BranchContext diagnostic is missing required branch identifiers: " + ", ".join(missing)

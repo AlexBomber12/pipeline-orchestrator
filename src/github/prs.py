@@ -2,15 +2,9 @@
 
 Owns the ``gh pr`` reads (open, merged, single PR), per-PR metadata
 extraction (author, head sha, head commit date), branch push tracking,
-and the ``merge_pr`` action. Cache and paginated GET primitives still
-live in ``src.github_client`` until PR-226b; this module accesses them
-via ``from src import github_client``.
-
-Names that the existing test suite monkeypatches on ``src.github_client``
-(``run_gh``, ``datetime``, ``_fetch_ci_status_rest``,
-``_map_rest_ci_status_to_enum``, ``get_pr_review_status``, ETag cache
-primitives) are looked up live on the shim through ``_ghc`` so the
-patches keep targeting their original ``src.github_client.X`` paths.
+and the ``merge_pr`` action. Cache and paginated GET primitives live in
+``src.github.cache``; CI-status helpers live in ``src.github.checks``;
+review status lives in ``src.github.reviews``.
 """
 
 from __future__ import annotations
@@ -20,9 +14,10 @@ import logging
 import re
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import quote
 
+from src.github import cache, checks, gh_runner, reviews
 from src.github.gh_runner import (
     _extract_commit_date,
     _extract_head_sha,
@@ -67,11 +62,10 @@ def get_open_prs(
     allow_merge_without_checks: bool = False,
 ) -> list[PRInfo]:
     """Return open PRs for ``repo`` (``owner/repo``) with CI and review status."""
-    from src import github_client as _ghc
 
     _begin_review_cache_cycle()
     try:
-        raw = _ghc.run_gh(
+        raw = gh_runner.run_gh(
             [
                 "pr",
                 "list",
@@ -103,7 +97,7 @@ def get_open_prs(
         commits = entry.get("commits") or []
         head_sha = entry.get("headRefOid", "")
         title = entry.get("title", "")
-        check_runs, status_payload, fetch_ok = _ghc._fetch_ci_status_rest(
+        check_runs, status_payload, fetch_ok = checks._fetch_ci_status_rest(
             repo, head_sha
         )
         prs.append(
@@ -112,13 +106,13 @@ def get_open_prs(
                 branch=entry.get("headRefName", ""),
                 title=title,
                 pr_id=extract_queue_pr_id(title),
-                ci_status=_ghc._map_rest_ci_status_to_enum(
+                ci_status=checks._map_rest_ci_status_to_enum(
                     check_runs,
                     status_payload,
                     empty_is_success=allow_merge_without_checks,
                     fetch_ok=fetch_ok,
                 ),
-                review_status=_ghc.get_pr_review_status(
+                review_status=reviews.get_pr_review_status(
                     repo,
                     number,
                     pr_author=(entry.get("author") or {}).get("login", ""),
@@ -146,9 +140,8 @@ def _get_open_prs_rest(
     allow_merge_without_checks: bool,
 ) -> list[PRInfo]:
     """Return open PRs via REST when GraphQL status rollup is unavailable."""
-    from src import github_client as _ghc
 
-    raw = _ghc._gh_api_paginated(f"repos/{repo}/pulls?state=open&per_page=100")
+    raw = cache._gh_api_paginated(f"repos/{repo}/pulls?state=open&per_page=100")
     if raw is None:
         return []
 
@@ -173,7 +166,7 @@ def _get_open_prs_rest(
                     if allow_merge_without_checks
                     else CIStatus.PENDING
                 ),
-                review_status=_ghc.get_pr_review_status(
+                review_status=reviews.get_pr_review_status(
                     repo,
                     number,
                     pr_author=user.get("login", ""),
@@ -209,7 +202,6 @@ def get_merged_prs(
     cannot be queried, return an empty list and let callers fall back to
     their local heuristics.
     """
-    from src import github_client as _ghc
 
     cache_key = (repo, base_branch or "")
     cached = _merged_prs_cache.get(cache_key)
@@ -228,7 +220,7 @@ def get_merged_prs(
             f"&base={quote(base_branch, safe='')}&per_page=100"
         )
 
-    raw = _ghc._gh_api_paginated(path)
+    raw = cache._gh_api_paginated(path)
     if raw is None:
         raise RuntimeError(
             f"gh api repos/{repo}/pulls returned unexpected payload"
@@ -272,10 +264,9 @@ def pr_state(repo: str, pr_number: int) -> dict[str, str | None] | None:
     ``"MERGED"``. Used by the FIX-cycle polling task to detect external
     merge or close events while a coder process is running.
     """
-    from src import github_client as _ghc
 
     try:
-        raw = _ghc.run_gh(
+        raw = gh_runner.run_gh(
             [
                 "pr",
                 "view",
@@ -308,10 +299,9 @@ def pr_state(repo: str, pr_number: int) -> dict[str, str | None] | None:
 
 def is_pr_merged(repo: str, pr_number: int) -> bool | None:
     """Return True if PR is merged, False if closed without merge, None on lookup failure."""
-    from src import github_client as _ghc
 
     try:
-        payload = _ghc._etag_get(f"repos/{repo}/pulls/{pr_number}")
+        payload = cache._etag_get(f"repos/{repo}/pulls/{pr_number}")
     except (RuntimeError, subprocess.TimeoutExpired, OSError):
         return None
     if not isinstance(payload, dict):
@@ -331,12 +321,11 @@ def merge_pr(repo: str, pr_number: int) -> None:
     ``state=open`` instead of returning a stale 304-cached page that
     still contains it.
     """
-    from src import github_client as _ghc
 
-    _ghc.run_gh(
+    gh_runner.run_gh(
         ["pr", "merge", str(pr_number), "--squash", "--delete-branch"], repo=repo
     )
-    _ghc._invalidate_etag_cache(f"repos/{repo}/pulls")
+    cache._invalidate_etag_cache(f"repos/{repo}/pulls")
 
 
 def get_pr_author(repo: str, pr_number: int) -> str:
@@ -349,10 +338,9 @@ def get_pr_author(repo: str, pr_number: int) -> str:
     ``has_recent_codex_review_request`` to miss the trigger that the
     real author already posted.
     """
-    from src import github_client as _ghc
 
     try:
-        payload = _ghc._etag_get(f"repos/{repo}/pulls/{pr_number}")
+        payload = cache._etag_get(f"repos/{repo}/pulls/{pr_number}")
     except (RuntimeError, subprocess.TimeoutExpired, OSError):
         return ""
     if isinstance(payload, dict):
@@ -375,17 +363,16 @@ def get_pr_head_commit_iso(repo: str, pr_number: int) -> str:
     author and daemon share a gh identity, suppressing the fresh
     review anchor that the new commit needs.
     """
-    from src import github_client as _ghc
 
     try:
-        pr_payload = _ghc._etag_get(f"repos/{repo}/pulls/{pr_number}")
+        pr_payload = cache._etag_get(f"repos/{repo}/pulls/{pr_number}")
     except RuntimeError:
         return ""
     sha = _extract_head_sha(pr_payload)
     if not sha:
         return ""
     try:
-        commit_payload = _ghc._etag_get(f"repos/{repo}/commits/{sha}")
+        commit_payload = cache._etag_get(f"repos/{repo}/commits/{sha}")
     except RuntimeError:
         return ""
     return _extract_commit_date(commit_payload)
@@ -397,11 +384,10 @@ def get_pr_metadata(repo: str, pr_number: int) -> dict:
     Replaces separate ``get_pr_author`` + ``get_pr_head_commit_iso`` calls.
     Returns ``{"author": str, "head_sha": str, "head_commit_date": str}``.
     """
-    from src import github_client as _ghc
 
     empty = {"author": "", "head_sha": "", "head_commit_date": ""}
     try:
-        pr_payload = _ghc._etag_get(f"repos/{repo}/pulls/{pr_number}")
+        pr_payload = cache._etag_get(f"repos/{repo}/pulls/{pr_number}")
     except RuntimeError:
         return dict(empty)
     author, head_sha = _extract_author_and_head_sha(pr_payload)
@@ -411,7 +397,7 @@ def get_pr_metadata(repo: str, pr_number: int) -> dict:
     head_commit_date = ""
     if head_sha:
         try:
-            commit_payload = _ghc._etag_get(f"repos/{repo}/commits/{head_sha}")
+            commit_payload = cache._etag_get(f"repos/{repo}/commits/{head_sha}")
             head_commit_date = _extract_commit_date(commit_payload)
         except RuntimeError:
             pass
@@ -462,11 +448,10 @@ def get_branch_last_push_time(repo: str, pr_number: int) -> float | None:
     Raises ``GitHubPollError`` when the API call fails so callers can
     distinguish "no push" from "could not check."
     """
-    from src import github_client as _ghc
 
     key = f"{repo}#{pr_number}"
     try:
-        payload = _ghc._etag_get(f"repos/{repo}/pulls/{pr_number}")
+        payload = cache._etag_get(f"repos/{repo}/pulls/{pr_number}")
     except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
         raise GitHubPollError(str(exc)) from exc
     sha = _extract_head_sha(payload)
@@ -495,10 +480,9 @@ def get_pr_last_push_time(repo: str, pr_number: int) -> datetime | None:
     Returns ``None`` on any API or parse failure (callers must fail
     open).
     """
-    from src import github_client as _ghc
 
     try:
-        branch_raw = _ghc.run_gh([
+        branch_raw = gh_runner.run_gh([
             "api",
             f"repos/{repo}/pulls/{pr_number}",
             "--jq",
@@ -507,7 +491,7 @@ def get_pr_last_push_time(repo: str, pr_number: int) -> datetime | None:
         branch = branch_raw.strip() if isinstance(branch_raw, str) else ""
         if not branch:
             return None
-        date_raw = _ghc.run_gh([
+        date_raw = gh_runner.run_gh([
             "api",
             f"repos/{repo}/activity",
             "-f", f"ref=refs/heads/{branch}",
@@ -520,7 +504,7 @@ def get_pr_last_push_time(repo: str, pr_number: int) -> datetime | None:
         date_str = date_raw.strip() if isinstance(date_raw, str) else ""
         if not date_str:
             return None
-        return _ghc.datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
     except Exception:
         return None
 
@@ -530,9 +514,8 @@ def get_last_push_age_seconds(repo: str, pr_number: int) -> float | None:
 
     Returns ``None`` on any API or parse failure.
     """
-    from src import github_client as _ghc
 
     push_dt = get_pr_last_push_time(repo, pr_number)
     if push_dt is None:
         return None
-    return max(0.0, (_ghc.datetime.now(_ghc.timezone.utc) - push_dt).total_seconds())
+    return max(0.0, (datetime.now(timezone.utc) - push_dt).total_seconds())

@@ -13,9 +13,10 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src import github_client
 from src.branch_context import BranchContext
 from src.daemon import git_ops
+from src.github import gh_runner
+from src.github import prs as gh_prs
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 from src.queue_parser import QueueValidationError
 from src.task_status import get_merged_pr_ids
@@ -197,7 +198,7 @@ class RecoveryMixin:
             tasks = []
 
         try:
-            prs = github_client.get_open_prs(
+            prs = gh_prs.get_open_prs(
                 self.owner_repo,
                 allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
             )
@@ -481,13 +482,13 @@ class RecoveryMixin:
         next poll instead of latching a wrong value.
         """
         try:
-            metadata = github_client.get_pr_metadata(
+            metadata = gh_prs.get_pr_metadata(
                 self.owner_repo, pr.number
             )
             head_iso = metadata.get("head_commit_date", "")
         except Exception:
             head_iso = ""
-        head_time = github_client._parse_iso(head_iso) if head_iso else None
+        head_time = gh_runner._parse_iso(head_iso) if head_iso else None
         if head_time is not None and head_time.tzinfo is None:
             head_time = head_time.replace(tzinfo=timezone.utc)
         if self._last_push_at_pr_number != pr.number:

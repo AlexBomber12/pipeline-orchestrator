@@ -47,8 +47,6 @@ import pytest
 from src.daemon import runner as runner_module
 from src.daemon.handlers import coding as coding_module  # noqa: F401,F811
 from src.daemon.handlers import error as error_module  # noqa: F401,F811
-from src.daemon.handlers import fix as fix_module  # noqa: F811
-from src.daemon.handlers import hung as hung_module  # noqa: F811
 from src.daemon.handlers import idle as idle_module  # noqa: F811
 from src.daemon.handlers import merge as merge_module  # noqa: F401,F811
 from src.daemon.handlers import watch as watch_module  # noqa: F401,F811
@@ -96,8 +94,7 @@ def test_dirty_tree_recovery_composes_with_crashed_task_marker(
     )
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
     )
 
@@ -123,10 +120,7 @@ def test_dirty_tree_recovery_composes_with_crashed_task_marker(
     assert runner.state.current_task is None
     assert runner.state.current_pr is None
     assert any(
-        e["event"].startswith(
-            "[INFRA] Task PR-100 crashed, marking CANCELED. "
-            "Manually re-upload to retry."
-        )
+        e["event"].startswith("[INFRA] Task PR-100 crashed, marking CANCELED. Manually re-upload to retry.")
         for e in runner.state.history
     )
 
@@ -137,9 +131,7 @@ def test_dirty_tree_recovery_composes_with_crashed_task_marker(
     def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
         reset_commands.append(cmd)
         if cmd[:3] == ["git", "status", "--porcelain"]:
-            return h._FakeCompletedProcess(
-                args=cmd, stdout=" M src/foo.py\n", returncode=0
-            )
+            return h._FakeCompletedProcess(args=cmd, stdout=" M src/foo.py\n", returncode=0)
         return h._FakeCompletedProcess(args=cmd, stdout="", returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
@@ -147,18 +139,9 @@ def test_dirty_tree_recovery_composes_with_crashed_task_marker(
     assert asyncio.run(runner.preflight()) is True
     assert runner.state.state == PipelineState.IDLE
     assert runner._consecutive_dirty_cycles == 0
-    assert any(
-        cmd[:2] == ["git", "reset"] and "--hard" in cmd
-        for cmd in reset_commands
-    )
-    assert any(
-        "Auto-recovered from dirty tree" in e["event"]
-        for e in runner.state.history
-    )
-    assert any(
-        "PR-100 crashed, marking CANCELED" in e["event"]
-        for e in runner.state.history
-    )
+    assert any(cmd[:2] == ["git", "reset"] and "--hard" in cmd for cmd in reset_commands)
+    assert any("Auto-recovered from dirty tree" in e["event"] for e in runner.state.history)
+    assert any("PR-100 crashed, marking CANCELED" in e["event"] for e in runner.state.history)
 
 
 # ---------------------------------------------------------------------------
@@ -184,13 +167,11 @@ def test_no_push_escalation_blocks_codex_review_fallback_in_hung(
     gh_calls: list[list[str]] = []
 
     monkeypatch.setattr(
-        fix_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: posted.append((repo, number, body)),
     )
     monkeypatch.setattr(
-        fix_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda cmd, **kwargs: gh_calls.append(cmd) or "",
     )
 
@@ -210,22 +191,16 @@ def test_no_push_escalation_blocks_codex_review_fallback_in_hung(
     assert pr.no_push_fix_count == 0
     assert posted == [(runner.owner_repo, 400, expected_message)]
     assert ["pr", "edit", "400", "--add-label", "escalated"] in gh_calls
-    assert any(
-        e["event"] == f"[ESCALATE] {expected_message}"
-        for e in runner.state.history
-    )
+    assert any(e["event"] == f"[ESCALATE] {expected_message}" for e in runner.state.history)
 
     review_posts: list[tuple[str, int, str]] = []
 
     def record_or_fail(repo: str, number: int, body: str) -> None:
         review_posts.append((repo, number, body))
 
+    monkeypatch.setattr("src.github.comments.post_comment", record_or_fail)
     monkeypatch.setattr(
-        hung_module.github_client, "post_comment", record_or_fail
-    )
-    monkeypatch.setattr(
-        hung_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda cmd, **kwargs: {"state": "OPEN"},
     )
 
@@ -235,9 +210,7 @@ def test_no_push_escalation_blocks_codex_review_fallback_in_hung(
     assert pr.is_escalated is True
     assert review_posts == []
     assert any(
-        "PR #400 escalated; staying HUNG, skipping @codex review fallback."
-        in e["event"]
-        for e in runner.state.history
+        "PR #400 escalated; staying HUNG, skipping @codex review fallback." in e["event"] for e in runner.state.history
     )
 
 
@@ -264,8 +237,7 @@ def test_coder_escalate_label_apply_failure_parks_in_hung(
     posted: list[tuple[str, int, str]] = []
 
     monkeypatch.setattr(
-        fix_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: posted.append((repo, number, body)),
     )
 
@@ -274,38 +246,29 @@ def test_coder_escalate_label_apply_failure_parks_in_hung(
             raise RuntimeError("gh down")
         return ""
 
-    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     runner = h._make_runner()
     pr = PRInfo(number=401, branch="pr-401-coder-escalate")
     runner.state.state = PipelineState.FIX
     runner.state.current_pr = pr
 
-    asyncio.run(
-        runner._escalate_fix_coder_initiated(pr, "transient infra failure")
-    )
+    asyncio.run(runner._escalate_fix_coder_initiated(pr, "transient infra failure"))
 
     assert runner.state.state == PipelineState.HUNG
     assert pr.is_escalated is True
     assert runner.state.error_message is not None
     assert "FIX coder ESCALATE on PR #401" in runner.state.error_message
-    assert (
-        "failed to apply `escalated` label" in runner.state.error_message
-    )
+    assert "failed to apply `escalated` label" in runner.state.error_message
     assert "transient infra failure" in runner.state.error_message
     assert posted == [
         (
             runner.owner_repo,
             401,
-            "Coder explicitly escalated this PR. "
-            "Reason: transient infra failure. Manual review required.",
+            "Coder explicitly escalated this PR. Reason: transient infra failure. Manual review required.",
         )
     ]
-    assert any(
-        "failed to apply escalated label to PR #401: gh down"
-        in e["event"]
-        for e in runner.state.history
-    )
+    assert any("failed to apply escalated label to PR #401: gh down" in e["event"] for e in runner.state.history)
 
 
 # ---------------------------------------------------------------------------
@@ -332,8 +295,7 @@ def test_iteration_cap_label_apply_failure_transitions_to_error(
     label_create_calls: list[list[str]] = []
 
     monkeypatch.setattr(
-        fix_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: posted.append((repo, number, body)),
     )
 
@@ -342,12 +304,10 @@ def test_iteration_cap_label_apply_failure_transitions_to_error(
             label_create_calls.append(cmd)
             return ""
         if cmd[:2] == ["pr", "edit"]:
-            raise subprocess.CalledProcessError(
-                1, cmd, stderr="rate limit exceeded"
-            )
+            raise subprocess.CalledProcessError(1, cmd, stderr="rate limit exceeded")
         return ""
 
-    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     runner = h._make_runner()
     cap = runner.app_config.daemon.fix_iteration_cap
@@ -369,8 +329,7 @@ def test_iteration_cap_label_apply_failure_transitions_to_error(
         (
             runner.owner_repo,
             402,
-            f"@AlexBomber12 FIX iteration cap reached ({cap}/{cap}). "
-            "Escalating for manual review.",
+            f"@AlexBomber12 FIX iteration cap reached ({cap}/{cap}). Escalating for manual review.",
         )
     ]
     assert label_create_calls and label_create_calls[0][:3] == [
@@ -378,15 +337,13 @@ def test_iteration_cap_label_apply_failure_transitions_to_error(
         "create",
         "escalated",
     ]
-    assert any(
-        e["event"].startswith("[FIX] pr edit failed:")
-        for e in runner.state.history
-    )
+    assert any(e["event"].startswith("[FIX] pr edit failed:") for e in runner.state.history)
 
 
 # ---------------------------------------------------------------------------
 # PR-224a moved from tests/test_runner.py
 # ---------------------------------------------------------------------------
+
 
 def test_select_next_task_from_dag_skips_crashed_task_marked_canceled(
     monkeypatch: pytest.MonkeyPatch,
@@ -485,9 +442,7 @@ def test_select_next_task_from_dag_preserves_doing_for_crashed_task_with_visible
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
-    runner._idle_open_prs = [
-        PRInfo(number=42, branch="pr-001-crashed", pr_id="PR-001")
-    ]
+    runner._idle_open_prs = [PRInfo(number=42, branch="pr-001-crashed", pr_id="PR-001")]
     runner._idle_merged_prs = []
     runner._crashed_task_pr_ids.add("PR-001")
 
@@ -527,9 +482,7 @@ def test_select_next_task_from_dag_clears_crashed_flag_when_done(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(
-        idle_module, "get_merged_pr_ids", lambda *args, **kwargs: {"PR-001"}
-    )
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: {"PR-001"})
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
@@ -554,9 +507,7 @@ def test_dirty_tree_auto_recovery_after_3_cycles(
     def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
         commands.append(cmd)
         if cmd[:3] == ["git", "status", "--porcelain"]:
-            return h._FakeCompletedProcess(
-                args=cmd, stdout=" M src/foo.py\n", returncode=0
-            )
+            return h._FakeCompletedProcess(args=cmd, stdout=" M src/foo.py\n", returncode=0)
         return h._FakeCompletedProcess(args=cmd, stdout="", returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
@@ -574,15 +525,9 @@ def test_dirty_tree_auto_recovery_after_3_cycles(
     assert runner._consecutive_dirty_cycles == 0
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.error_message is None
-    assert any(
-        cmd[:2] == ["git", "reset"] and "--hard" in cmd
-        for cmd in commands
-    )
+    assert any(cmd[:2] == ["git", "reset"] and "--hard" in cmd for cmd in commands)
     assert any(cmd[:3] == ["git", "clean", "-fd"] for cmd in commands)
-    assert any(
-        "Auto-recovered from dirty tree" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("Auto-recovered from dirty tree" in e["event"] for e in runner.state.history)
 
 
 def test_dirty_tree_auto_recovery_preserves_watch_with_open_pr(
@@ -593,19 +538,16 @@ def test_dirty_tree_auto_recovery_preserves_watch_with_open_pr(
     re-pick the still-TODO task from origin/main's QUEUE.md and open a
     duplicate PR — exactly the churn this safety net is meant to
     avoid."""
+
     def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
         if cmd[:3] == ["git", "status", "--porcelain"]:
-            return h._FakeCompletedProcess(
-                args=cmd, stdout=" M src/foo.py\n", returncode=0
-            )
+            return h._FakeCompletedProcess(args=cmd, stdout=" M src/foo.py\n", returncode=0)
         return h._FakeCompletedProcess(args=cmd, stdout="", returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(number=99, branch="pr-099-wip")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-099", title="wip", status=TaskStatus.DOING, branch="pr-099-wip"
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-099", title="wip", status=TaskStatus.DOING, branch="pr-099-wip")
 
     asyncio.run(runner.preflight())
     asyncio.run(runner.preflight())
@@ -614,10 +556,7 @@ def test_dirty_tree_auto_recovery_preserves_watch_with_open_pr(
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.number == 99
     assert runner.state.current_task is not None
-    assert any(
-        "auto-recovered from dirty tree -> watch" in e["event"].lower()
-        for e in runner.state.history
-    )
+    assert any("auto-recovered from dirty tree -> watch" in e["event"].lower() for e in runner.state.history)
 
 
 def test_dirty_tree_counter_resets_on_clean(
@@ -642,15 +581,12 @@ def test_dirty_tree_auto_recovery_failure_stays_error(
     """When the auto-reset git commands themselves fail, preflight must
     leave the runner in ERROR so the operator still sees the issue
     rather than silently declaring the tree clean."""
+
     def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
         if cmd[:3] == ["git", "status", "--porcelain"]:
-            return h._FakeCompletedProcess(
-                args=cmd, stdout=" M src/foo.py\n", returncode=0
-            )
+            return h._FakeCompletedProcess(args=cmd, stdout=" M src/foo.py\n", returncode=0)
         if cmd[:2] == ["git", "reset"]:
-            raise subprocess.CalledProcessError(
-                1, cmd, stderr="reset refused"
-            )
+            raise subprocess.CalledProcessError(1, cmd, stderr="reset refused")
         return h._FakeCompletedProcess(args=cmd, stdout="", returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
@@ -660,10 +596,7 @@ def test_dirty_tree_auto_recovery_failure_stays_error(
     asyncio.run(runner.preflight())
     assert asyncio.run(runner.preflight()) is False
     assert runner.state.state == PipelineState.ERROR
-    assert any(
-        "Auto-recovery failed" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("Auto-recovery failed" in e["event"] for e in runner.state.history)
 
 
 def test_recover_state_rehydrates_last_push_at(
@@ -687,13 +620,11 @@ def test_recover_state_rehydrates_last_push_at(
 
     head_iso = "2026-04-10T12:00:00Z"
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": head_iso},
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [PRInfo(number=7, branch="pr-001")],
     )
 
@@ -722,9 +653,7 @@ def test_run_cycle_resets_stale_transient_state(
     h._patch_subprocess(monkeypatch, stdout="")
     monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
     monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     runner = h._make_runner()
     # _recovered=True skips recover_state so this test exercises the
@@ -812,7 +741,4 @@ def test_run_cycle_runs_recovery_before_honoring_user_pause(
     assert preflight_calls == []
     assert publishes == ["published"]
     assert runner._recovered is True
-    assert not any(
-        entry["event"] == "[INFRA] Paused. Press Play to resume."
-        for entry in runner.state.history
-    )
+    assert not any(entry["event"] == "[INFRA] Paused. Press Play to resume." for entry in runner.state.history)

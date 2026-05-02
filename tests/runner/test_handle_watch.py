@@ -40,26 +40,20 @@ def test_handle_watch_approved_and_green_merges(
         ci_status=CIStatus.SUCCESS,
         review_status=ReviewStatus.APPROVED,
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
 
     merged: list[tuple[str, int]] = []
 
     def fake_merge(repo: str, number: int) -> None:
         merged.append((repo, number))
 
-    monkeypatch.setattr(runner_module.github_client, "merge_pr", fake_merge)
-    monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
-    )
+    monkeypatch.setattr("src.github.prs.merge_pr", fake_merge)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_watch())
 
@@ -76,10 +70,7 @@ def test_handle_watch_without_current_pr_returns_to_idle() -> None:
     asyncio.run(runner.handle_watch())
 
     assert runner.state.state == PipelineState.IDLE
-    assert (
-        runner.state.history[-1]["event"]
-        == "[WATCH] WATCH without current_pr -> IDLE."
-    )
+    assert runner.state.history[-1]["event"] == "[WATCH] WATCH without current_pr -> IDLE."
 
 
 def test_handle_watch_open_pr_lookup_failure_sets_error(
@@ -93,8 +84,7 @@ def test_handle_watch_open_pr_lookup_failure_sets_error(
         raise RuntimeError("boom")
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         _raise,
     )
 
@@ -114,32 +104,25 @@ def test_handle_watch_green_but_auto_merge_disabled_stays_watching(
         ci_status=CIStatus.SUCCESS,
         review_status=ReviewStatus.APPROVED,
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
 
     merged: list[tuple[str, int]] = []
     monkeypatch.setattr(
-        runner_module.github_client,
-        "merge_pr",
+        "src.github.prs.merge_pr",
         lambda repo, number: merged.append((repo, number)),
     )
 
     runner = h._make_runner(auto_merge=False)
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_watch())
 
     assert merged == []
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
-    assert any(
-        "auto_merge disabled" in e["event"] for e in runner.state.history
-    )
+    assert any("auto_merge disabled" in e["event"] for e in runner.state.history)
 
 
 def test_handle_watch_changes_requested_triggers_fix(
@@ -152,15 +135,10 @@ def test_handle_watch_changes_requested_triggers_fix(
         ci_status=CIStatus.SUCCESS,
         review_status=ReviewStatus.CHANGES_REQUESTED,
     )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
-    )
-    monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
 
@@ -185,9 +163,7 @@ def test_handle_watch_preserves_fix_iteration_count_for_same_pr(
         review_status=ReviewStatus.PENDING,
         last_activity=datetime.now(timezone.utc),
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -216,9 +192,7 @@ def test_handle_watch_preserves_no_push_fix_count_for_same_pr(
         review_status=ReviewStatus.PENDING,
         last_activity=datetime.now(timezone.utc),
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -252,9 +226,7 @@ def test_handle_watch_counts_new_head_sha_after_pre_pr195_upgrade(
         observed_head_shas={"polled-head-sha"},
         push_count=1,
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [polled]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [polled])
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -283,9 +255,7 @@ def test_handle_watch_no_fix_when_ci_pending_and_changes_requested(
         review_status=ReviewStatus.CHANGES_REQUESTED,
         last_activity=datetime.now(timezone.utc),
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
     fix_called: list[bool] = []
 
     async def _no_fix(*_args: object, **_kwargs: object) -> tuple:
@@ -294,8 +264,7 @@ def test_handle_watch_no_fix_when_ci_pending_and_changes_requested(
 
     monkeypatch.setattr(claude_cli, "fix_review_async", _no_fix)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
 
@@ -320,15 +289,10 @@ def test_handle_watch_fix_when_ci_success_and_changes_requested(
         ci_status=CIStatus.SUCCESS,
         review_status=ReviewStatus.CHANGES_REQUESTED,
     )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
-    )
-    monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
 
@@ -353,15 +317,10 @@ def test_handle_watch_ci_failure_triggers_fix(
         ci_status=CIStatus.FAILURE,
         review_status=ReviewStatus.PENDING,
     )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
     monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
-    )
-    monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
 
@@ -386,9 +345,7 @@ def test_handle_watch_timeout_sets_hung(
         review_status=ReviewStatus.EYES,
         last_activity=stale,
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
 
     runner = h._make_runner(review_timeout_min=30)
     runner.state.state = PipelineState.WATCH
@@ -409,9 +366,7 @@ def test_handle_watch_within_timeout_stays_watching(
         review_status=ReviewStatus.EYES,
         last_activity=fresh,
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
 
     runner = h._make_runner(review_timeout_min=30)
     runner.state.state = PipelineState.WATCH
@@ -432,9 +387,7 @@ def test_handle_watch_naive_last_activity_is_treated_as_utc(
         review_status=ReviewStatus.PENDING,
         last_activity=recent.replace(tzinfo=None),
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
 
     runner = h._make_runner(review_timeout_min=30)
     runner.state.state = PipelineState.WATCH
@@ -460,9 +413,7 @@ def test_handle_watch_approved_but_ci_pending_applies_timeout(
         review_status=ReviewStatus.APPROVED,
         last_activity=stale,
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
 
     runner = h._make_runner(review_timeout_min=30)
     runner.state.state = PipelineState.WATCH
@@ -470,10 +421,7 @@ def test_handle_watch_approved_but_ci_pending_applies_timeout(
     asyncio.run(runner.handle_watch())
 
     assert runner.state.state == PipelineState.HUNG
-    assert any(
-        "review=APPROVED" in e["event"] and "ci=PENDING" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("review=APPROVED" in e["event"] and "ci=PENDING" in e["event"] for e in runner.state.history)
 
 
 def test_handle_watch_falls_back_to_daemon_review_timeout(
@@ -497,9 +445,7 @@ def test_handle_watch_falls_back_to_daemon_review_timeout(
         review_status=ReviewStatus.EYES,
         last_activity=stale,
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
 
     # ``review_timeout_min=None`` on the repo → the runner must use the
     # daemon's 30-minute default. 40 minutes of inactivity is past that,
@@ -511,9 +457,7 @@ def test_handle_watch_falls_back_to_daemon_review_timeout(
         review_timeout_min=None,
         poll_interval_sec=60,
     )
-    app_cfg = AppConfig(
-        repositories=[], daemon=DaemonConfig(review_timeout_min=30)
-    )
+    app_cfg = AppConfig(repositories=[], daemon=DaemonConfig(review_timeout_min=30))
     runner = PipelineRunner(
         repo_cfg,
         app_cfg,
@@ -545,9 +489,7 @@ def test_handle_watch_repo_timeout_override_wins_over_daemon_default(
         review_status=ReviewStatus.EYES,
         last_activity=stale,
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
 
     # repo pins 120 min, daemon default is 30 min. 90 minutes of
     # inactivity is below the repo override, so the PR stays WATCH.
@@ -558,9 +500,7 @@ def test_handle_watch_repo_timeout_override_wins_over_daemon_default(
         review_timeout_min=120,
         poll_interval_sec=60,
     )
-    app_cfg = AppConfig(
-        repositories=[], daemon=DaemonConfig(review_timeout_min=30)
-    )
+    app_cfg = AppConfig(repositories=[], daemon=DaemonConfig(review_timeout_min=30))
     runner = PipelineRunner(
         repo_cfg,
         app_cfg,
@@ -585,9 +525,7 @@ def test_handle_watch_approved_ci_pending_within_timeout_waits(
         review_status=ReviewStatus.APPROVED,
         last_activity=fresh,
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pr]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
 
     runner = h._make_runner(review_timeout_min=30)
     runner.state.state = PipelineState.WATCH
@@ -595,28 +533,19 @@ def test_handle_watch_approved_ci_pending_within_timeout_waits(
     asyncio.run(runner.handle_watch())
 
     assert runner.state.state == PipelineState.WATCH
-    assert any(
-        "waiting" in e["event"] and "review=APPROVED" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("waiting" in e["event"] and "review=APPROVED" in e["event"] for e in runner.state.history)
 
 
 def test_handle_watch_captures_success_merged_on_external_merge(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
-    monkeypatch.setattr(
-        runner_module.github_client, "is_pr_merged", lambda repo, number: True
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
+    monkeypatch.setattr("src.github.prs.is_pr_merged", lambda repo, number: True)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_watch())
 
@@ -637,19 +566,13 @@ def test_handle_watch_captures_success_merged_on_external_merge(
 def test_handle_watch_captures_closed_unmerged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
-    monkeypatch.setattr(
-        runner_module.github_client, "is_pr_merged", lambda repo, number: False
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
+    monkeypatch.setattr("src.github.prs.is_pr_merged", lambda repo, number: False)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     runner._start_current_run_record("claude", "opus")
 
     asyncio.run(runner.handle_watch())
@@ -670,19 +593,13 @@ def test_handle_watch_captures_closed_unmerged(
 def test_handle_watch_unknown_merge_state_logs_but_does_not_save(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
-    monkeypatch.setattr(
-        runner_module.github_client, "is_pr_merged", lambda repo, number: None
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
+    monkeypatch.setattr("src.github.prs.is_pr_merged", lambda repo, number: None)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001", title="t", status=TaskStatus.DOING
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     runner._start_current_run_record("claude", "opus")
 
     asyncio.run(runner.handle_watch())
@@ -697,9 +614,7 @@ def test_handle_watch_unknown_merge_state_logs_but_does_not_save(
 
     assert runner.state.state == PipelineState.IDLE
     assert recent == []
-    assert any(
-        "state unknown" in entry["event"] for entry in runner.state.history
-    )
+    assert any("state unknown" in entry["event"] for entry in runner.state.history)
 
 
 def test_handle_watch_skips_fix_no_new_feedback(
@@ -716,14 +631,12 @@ def test_handle_watch_skips_fix_no_new_feedback(
         last_activity=last_push,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     # No Codex comments at all -> no new feedback.
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [],
     )
     fix_called: list[bool] = []
@@ -740,10 +653,7 @@ def test_handle_watch_skips_fix_no_new_feedback(
     asyncio.run(runner.handle_watch())
 
     assert fix_called == []
-    assert any(
-        "no new Codex feedback" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("no new Codex feedback" in e["event"] for e in runner.state.history)
 
 
 def test_handle_watch_triggers_fix_new_feedback(
@@ -760,8 +670,7 @@ def test_handle_watch_triggers_fix_new_feedback(
         last_activity=last_push,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
 
@@ -779,8 +688,7 @@ def test_handle_watch_triggers_fix_new_feedback(
         return []
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         fake_paginated,
     )
     fix_called: list[bool] = []
@@ -811,8 +719,7 @@ def test_handle_watch_still_fixes_ci_failure(
         last_activity=datetime.now(timezone.utc),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     fix_called: list[bool] = []
@@ -844,13 +751,11 @@ def test_handle_watch_stale_feedback_still_times_out(
         last_activity=last_push,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [],
     )
     fix_called: list[bool] = []
@@ -882,18 +787,15 @@ def test_handle_watch_retriggers_stale_changes_requested_review(
         last_activity=now,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_last_push_age_seconds",
+        "src.github.prs.get_last_push_age_seconds",
         lambda repo, number: 11 * 60,
     )
     retriggers: list[int] = []
@@ -922,9 +824,7 @@ def test_handle_watch_retriggers_stale_changes_requested_review(
     assert bypass_flags == [True]
     assert runner.state.last_stale_retrigger_at is not None
     assert any(
-        entry["event"]
-        == "[WATCH] Stale CHANGES_REQUESTED on PR #42; re-triggering "
-        "@codex review."
+        entry["event"] == "[WATCH] Stale CHANGES_REQUESTED on PR #42; re-triggering @codex review."
         for entry in runner.state.history
     )
 
@@ -941,18 +841,15 @@ def test_handle_watch_retries_after_author_dedup_window_expires(
         last_activity=now,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_last_push_age_seconds",
+        "src.github.prs.get_last_push_age_seconds",
         lambda repo, number: 11 * 60,
     )
     bypass_flags: list[bool] = []
@@ -1006,18 +903,15 @@ def test_handle_watch_debounces_failed_stale_review_retrigger(
 
     monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_last_push_age_seconds",
+        "src.github.prs.get_last_push_age_seconds",
         lambda repo, number: 11 * 60,
     )
     bypass_flags: list[bool] = []
@@ -1056,18 +950,15 @@ def test_handle_watch_does_not_retrigger_recent_changes_requested_review(
         last_activity=now,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_last_push_age_seconds",
+        "src.github.prs.get_last_push_age_seconds",
         lambda repo, number: 5 * 60,
     )
     retriggers: list[int] = []
@@ -1104,18 +995,15 @@ def test_handle_watch_does_not_retrigger_within_debounce_window(
 
     monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_last_push_age_seconds",
+        "src.github.prs.get_last_push_age_seconds",
         lambda repo, number: 60 * 60,
     )
     retriggers: list[int] = []
@@ -1153,18 +1041,15 @@ def test_handle_watch_normalizes_naive_stale_retrigger_timestamps(
 
     monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_last_push_age_seconds",
+        "src.github.prs.get_last_push_age_seconds",
         lambda repo, number: 60 * 60,
     )
     retriggers: list[int] = []
@@ -1202,18 +1087,15 @@ def test_handle_watch_retriggers_stale_eyes_review(
 
     monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_last_push_age_seconds",
+        "src.github.prs.get_last_push_age_seconds",
         lambda repo, number: 6 * 60,
     )
 
@@ -1263,18 +1145,15 @@ def test_handle_watch_does_not_retrigger_eyes_below_threshold(
 
     monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_last_push_age_seconds",
+        "src.github.prs.get_last_push_age_seconds",
         lambda repo, number: 2 * 60,
     )
 
@@ -1317,18 +1196,15 @@ def test_handle_watch_does_not_retrigger_changes_requested_below_default_thresho
 
     monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_last_push_age_seconds",
+        "src.github.prs.get_last_push_age_seconds",
         lambda repo, number: 6 * 60,
     )
 
@@ -1363,8 +1239,7 @@ def test_handle_watch_does_not_retrigger_for_non_changes_requested_status(
         last_activity=now,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     retriggers: list[int] = []
@@ -1390,8 +1265,7 @@ def test_handle_watch_allows_pending_review_only_when_repo_bypasses_review(
         last_activity=datetime.now(timezone.utc),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     merged: list[int] = []
@@ -1420,13 +1294,11 @@ def test_handle_watch_does_not_bypass_changes_requested_review(
         last_activity=datetime.now(timezone.utc),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [],
     )
     merged: list[int] = []
@@ -1461,13 +1333,11 @@ def test_handle_watch_retries_rehydrate_last_push_at(
         last_activity=datetime.now(timezone.utc),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": "2026-04-14T18:00:00Z"},
     )
 
@@ -1496,13 +1366,11 @@ def test_handle_watch_falls_through_for_fork_with_ci_failure(
         is_cross_repository=True,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": ""},
     )
     fix_called: list[bool] = []
@@ -1535,13 +1403,11 @@ def test_handle_watch_falls_through_for_fork_with_changes_requested(
         is_cross_repository=True,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": ""},
     )
     fix_called: list[bool] = []
@@ -1568,8 +1434,7 @@ def test_handle_watch_rehydrates_on_pr_number_mismatch(
     would keep the stale previous-PR timestamp forever."""
     head_iso = "2026-04-14T18:00:00Z"
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": head_iso},
     )
     pr = PRInfo(
@@ -1580,8 +1445,7 @@ def test_handle_watch_rehydrates_on_pr_number_mismatch(
         last_activity=datetime.now(timezone.utc),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
 
@@ -1611,8 +1475,7 @@ def test_handle_watch_stays_in_watch_on_unknown_feedback(
         last_activity=last_push,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
 
@@ -1620,8 +1483,7 @@ def test_handle_watch_stays_in_watch_on_unknown_feedback(
         raise RuntimeError("GitHub API unavailable")
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         _raise,
     )
     fix_called: list[bool] = []
@@ -1639,10 +1501,7 @@ def test_handle_watch_stays_in_watch_on_unknown_feedback(
 
     assert fix_called == []
     assert runner.state.state == PipelineState.WATCH
-    assert any(
-        "feedback check failed" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("feedback check failed" in e["event"] for e in runner.state.history)
 
 
 def test_handle_watch_skips_hung_timeout_on_unknown(
@@ -1662,8 +1521,7 @@ def test_handle_watch_skips_hung_timeout_on_unknown(
         last_activity=last_push,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
 
@@ -1671,8 +1529,7 @@ def test_handle_watch_skips_hung_timeout_on_unknown(
         raise RuntimeError("GitHub API unavailable")
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         _raise,
     )
     fix_called: list[bool] = []
@@ -1690,10 +1547,7 @@ def test_handle_watch_skips_hung_timeout_on_unknown(
 
     assert fix_called == []
     assert runner.state.state == PipelineState.WATCH
-    assert any(
-        "feedback check failed" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("feedback check failed" in e["event"] for e in runner.state.history)
 
 
 def test_handle_watch_retriggers_on_codex_bot_error_comment(
@@ -1701,13 +1555,11 @@ def test_handle_watch_retriggers_on_codex_bot_error_comment(
 ) -> None:
     pr = h._codex_bot_pr()
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [h._codex_bot_error_comment()],
     )
 
@@ -1730,10 +1582,7 @@ def test_handle_watch_retriggers_on_codex_bot_error_comment(
 
     assert posted == [(42, True)]
     assert runner.state.last_codex_retrigger_at is not None
-    assert any(
-        "Codex bot error comment on PR #42" in entry["event"]
-        for entry in runner.state.history
-    )
+    assert any("Codex bot error comment on PR #42" in entry["event"] for entry in runner.state.history)
 
 
 def test_handle_watch_does_not_retrigger_on_non_matching_comment(
@@ -1741,13 +1590,11 @@ def test_handle_watch_does_not_retrigger_on_non_matching_comment(
 ) -> None:
     pr = h._codex_bot_pr()
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [
             h._codex_bot_error_comment(body="LGTM, all clear from Codex"),
         ],
@@ -1779,13 +1626,11 @@ def test_handle_watch_does_not_retrigger_on_non_bot_author(
 ) -> None:
     pr = h._codex_bot_pr()
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [
             h._codex_bot_error_comment(user="some-human"),
         ],
@@ -1818,13 +1663,11 @@ def test_handle_watch_codex_bot_error_cooldown_blocks_rapid_retriggers(
     now = datetime(2026, 4, 30, 12, 0, tzinfo=timezone.utc)
     pr = h._codex_bot_pr()
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [
             h._codex_bot_error_comment(
                 created_at=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1868,13 +1711,11 @@ def test_handle_watch_codex_bot_error_skips_already_handled_comment(
     handled in a prior cycle and must not retrigger again."""
     pr = h._codex_bot_pr()
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [
             h._codex_bot_error_comment(
                 created_at="2026-04-30T11:00:00Z",
@@ -1895,9 +1736,7 @@ def test_handle_watch_codex_bot_error_skips_already_handled_comment(
     runner = h._make_runner()
     runner.state.current_pr = pr
     runner.state.state = PipelineState.WATCH
-    runner.state.last_codex_retrigger_at = datetime(
-        2026, 4, 30, 12, 0, tzinfo=timezone.utc
-    )
+    runner.state.last_codex_retrigger_at = datetime(2026, 4, 30, 12, 0, tzinfo=timezone.utc)
     runner._post_codex_review_result = fake_post  # type: ignore[assignment]
 
     asyncio.run(runner.handle_watch())
@@ -1911,8 +1750,7 @@ def test_handle_watch_codex_bot_error_comment_api_failure_logs(
 ) -> None:
     pr = h._codex_bot_pr()
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
 
@@ -1920,8 +1758,7 @@ def test_handle_watch_codex_bot_error_comment_api_failure_logs(
         raise RuntimeError("api boom")
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         _raise,
     )
 
@@ -1932,10 +1769,7 @@ def test_handle_watch_codex_bot_error_comment_api_failure_logs(
     with caplog.at_level("WARNING", logger=watch_module.logger.name):
         asyncio.run(runner.handle_watch())
 
-    assert any(
-        "codex bot error comments for PR #42" in record.message
-        for record in caplog.records
-    )
+    assert any("codex bot error comments for PR #42" in record.message for record in caplog.records)
     assert runner.state.last_codex_retrigger_at is None
 
 
@@ -1944,18 +1778,15 @@ def test_handle_watch_codex_bot_error_skips_unparseable_created_at(
 ) -> None:
     pr = h._codex_bot_pr()
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_parse_iso",
+        "src.github.gh_runner._parse_iso",
         lambda value: None,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [
             h._codex_bot_error_comment(),
             h._codex_bot_error_comment(),
@@ -1992,13 +1823,11 @@ def test_handle_watch_codex_bot_error_skips_marker_on_post_failure(
     """
     pr = h._codex_bot_pr()
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [h._codex_bot_error_comment()],
     )
 
@@ -2030,8 +1859,7 @@ def test_handle_watch_codex_bot_error_normalizes_naive_timestamps(
     are both treated as UTC, so the cooldown comparison still works."""
     pr = h._codex_bot_pr()
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
 
@@ -2045,13 +1873,11 @@ def test_handle_watch_codex_bot_error_normalizes_naive_timestamps(
 
     monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_parse_iso",
+        "src.github.gh_runner._parse_iso",
         lambda value: naive_created if value else None,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [h._codex_bot_error_comment()],
     )
 
@@ -2097,20 +1923,17 @@ def test_handle_watch_eyes_skips_stale_review_after_bot_error_post(
 
     monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [h._codex_bot_error_comment()],
     )
     # Push age well past the EYES stale threshold so the stale path WOULD
     # otherwise fire if it were called.
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_last_push_age_seconds",
+        "src.github.prs.get_last_push_age_seconds",
         lambda repo, number: 10 * 60,
     )
 
@@ -2154,22 +1977,19 @@ def test_handle_watch_eyes_runs_stale_review_when_bot_error_does_not_post(
 
     monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
     # An error comment older than ``last_codex_retrigger_at`` is treated
     # as already handled, so bot-error returns without posting.
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [
             h._codex_bot_error_comment(created_at="2026-04-30T11:00:00Z"),
         ],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_last_push_age_seconds",
+        "src.github.prs.get_last_push_age_seconds",
         lambda repo, number: 6 * 60,
     )
 
@@ -2210,8 +2030,7 @@ def test_handle_watch_skips_codex_bot_error_check_outside_eyes(
     poll during normal CI=PENDING/PR-waiting states."""
     pr = h._codex_bot_pr(review=review)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
 
@@ -2222,13 +2041,11 @@ def test_handle_watch_skips_codex_bot_error_check_outside_eyes(
         return []
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         fake_paginated,
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_last_push_age_seconds",
+        "src.github.prs.get_last_push_age_seconds",
         lambda repo, number: None,
     )
 
@@ -2323,9 +2140,7 @@ def test_effective_watch_poll_interval_becomes_fast_past_window() -> None:
     runner = h._make_runner(poll_interval_sec=60)
     h._configure_watch_adaptive_defaults(runner)
 
-    runner._watch_entered_at = (
-        datetime.now(timezone.utc) - timedelta(minutes=5, seconds=1)
-    )
+    runner._watch_entered_at = datetime.now(timezone.utc) - timedelta(minutes=5, seconds=1)
 
     assert runner.effective_watch_poll_interval == 45
 
@@ -2405,9 +2220,7 @@ def test_run_cycle_resets_watch_anchors_when_state_leaves_watch(
 
     monkeypatch.setattr(PipelineRunner, "ensure_repo_cloned", _noop_cloned)
     monkeypatch.setattr(PipelineRunner, "_check_github_api_budget", _budget_ok)
-    monkeypatch.setattr(
-        PipelineRunner, "_refresh_user_paused_from_redis", _no_user_paused
-    )
+    monkeypatch.setattr(PipelineRunner, "_refresh_user_paused_from_redis", _no_user_paused)
     monkeypatch.setattr(PipelineRunner, "preflight", _preflight_ok)
     monkeypatch.setattr(PipelineRunner, "handle_watch", _watch_to_idle)
     monkeypatch.setattr(PipelineRunner, "publish_state", _publish_state)
@@ -2457,9 +2270,7 @@ def test_run_cycle_anchors_watch_entered_at_on_transition_into_watch(
 
     monkeypatch.setattr(PipelineRunner, "ensure_repo_cloned", _noop_cloned)
     monkeypatch.setattr(PipelineRunner, "_check_github_api_budget", _budget_ok)
-    monkeypatch.setattr(
-        PipelineRunner, "_refresh_user_paused_from_redis", _no_user_paused
-    )
+    monkeypatch.setattr(PipelineRunner, "_refresh_user_paused_from_redis", _no_user_paused)
     monkeypatch.setattr(PipelineRunner, "preflight", _preflight_ok)
     monkeypatch.setattr(PipelineRunner, "handle_idle", _idle_to_watch)
     monkeypatch.setattr(PipelineRunner, "publish_state", _publish_state)
@@ -2491,9 +2302,7 @@ def test_check_budget_no_skip_when_state_is_watch() -> None:
 
     runner.state.state = PipelineState.WATCH
 
-    decisions = [
-        asyncio.run(runner._check_github_api_budget()) for _ in range(5)
-    ]
+    decisions = [asyncio.run(runner._check_github_api_budget()) for _ in range(5)]
 
     assert decisions == [True] * 5
     assert runner._github_api_slowdown_cycle == 0

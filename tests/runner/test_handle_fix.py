@@ -45,15 +45,13 @@ def test_handle_fix_posts_codex_review_after_push(
     """PR-019: after a successful fix push, ``handle_fix`` must post
     ``@codex review`` so Codex reviews the freshly-pushed iteration."""
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
-    )
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
     posted: list[tuple[str, int, str]] = []
 
     def fake_post(repo: str, number: int, body: str) -> None:
         posted.append((repo, number, body))
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -65,10 +63,7 @@ def test_handle_fix_posts_codex_review_after_push(
     assert runner.state.current_pr.push_count == 1
     assert runner.state.current_pr.fix_iteration_count == 1
     assert posted == [(runner.owner_repo, 77, "@codex review")]
-    assert any(
-        "Posted @codex review on PR #77" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("Posted @codex review on PR #77" in e["event"] for e in runner.state.history)
 
 
 def test_handle_fix_injects_ci_logs_when_ci_failed(
@@ -77,20 +72,19 @@ def test_handle_fix_injects_ci_logs_when_ci_failed(
     """ci_status=FAILURE: handle_fix passes CI logs into the FIX prompt."""
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        fix_module, "_fetch_failed_ci_logs",
+        fix_module,
+        "_fetch_failed_ci_logs",
         lambda repo, branch: "pytest assertion error: boom",
     )
     monkeypatch.setattr(
-        fix_module.github_client, "get_latest_codex_feedback",
+        "src.github.comments.get_latest_codex_feedback",
         lambda repo, pr_number: None,
     )
     captured = h._capture_fix_kwargs(monkeypatch)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
-    runner.state.current_pr = PRInfo(
-        number=77, branch="pr-019", ci_status=CIStatus.FAILURE
-    )
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019", ci_status=CIStatus.FAILURE)
     asyncio.run(runner.handle_fix())
 
     extra_context = captured["kwargs"]["extra_context"]
@@ -105,11 +99,12 @@ def test_handle_fix_injects_review_feedback_when_changes_requested(
     """review_status=CHANGES_REQUESTED: handle_fix passes review body into prompt."""
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        fix_module, "_fetch_failed_ci_logs",
+        fix_module,
+        "_fetch_failed_ci_logs",
         lambda repo, branch: None,
     )
     monkeypatch.setattr(
-        fix_module.github_client, "get_latest_codex_feedback",
+        "src.github.comments.get_latest_codex_feedback",
         lambda repo, pr_number: "P1: please rename foo to bar",
     )
     captured = h._capture_fix_kwargs(monkeypatch)
@@ -134,11 +129,12 @@ def test_handle_fix_injects_both_ci_logs_and_review_feedback(
 ) -> None:
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
-        fix_module, "_fetch_failed_ci_logs",
+        fix_module,
+        "_fetch_failed_ci_logs",
         lambda repo, branch: "ci-boom",
     )
     monkeypatch.setattr(
-        fix_module.github_client, "get_latest_codex_feedback",
+        "src.github.comments.get_latest_codex_feedback",
         lambda repo, pr_number: "review-feedback-text",
     )
     captured = h._capture_fix_kwargs(monkeypatch)
@@ -179,15 +175,13 @@ def test_handle_fix_finishes_push_bookkeeping_before_post_exit_stop_pause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
-    )
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
     posted: list[tuple[str, int, str]] = []
 
     def fake_post(repo: str, number: int, body: str) -> None:
         posted.append((repo, number, body))
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -210,8 +204,7 @@ def test_handle_fix_finishes_push_bookkeeping_before_post_exit_stop_pause(
     assert runner.state.current_pr.fix_iteration_count == 1
     assert posted == [(runner.owner_repo, 77, "@codex review")]
     assert any(
-        "deferring pause until fix bookkeeping completes" in entry["event"].lower()
-        for entry in runner.state.history
+        "deferring pause until fix bookkeeping completes" in entry["event"].lower() for entry in runner.state.history
     )
     assert any("Fix pushed, iteration #1" in e["event"] for e in runner.state.history)
 
@@ -267,10 +260,7 @@ def test_handle_fix_honors_stop_requested_during_fix(
     assert stop_called["terminate"] == 1
     assert stop_called["kill"] == 0
     assert stop_called["wait"] >= 1
-    assert any(
-        "user stop requested" in entry["event"].lower()
-        for entry in runner.state.history
-    )
+    assert any("user stop requested" in entry["event"].lower() for entry in runner.state.history)
 
 
 def test_handle_fix_escalates_at_iteration_cap_before_next_spawn(
@@ -281,9 +271,7 @@ def test_handle_fix_escalates_at_iteration_cap_before_next_spawn(
     fix_called: list[bool] = []
 
     class _UnexpectedPlugin:
-        async def fix_review(
-            self, path: str, **kwargs: object
-        ) -> tuple[int, str, str]:
+        async def fix_review(self, path: str, **kwargs: object) -> tuple[int, str, str]:
             fix_called.append(True)
             return (0, "", "")
 
@@ -294,8 +282,8 @@ def test_handle_fix_escalates_at_iteration_cap_before_next_spawn(
         gh_calls.append(cmd)
         return ""
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
-    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     runner = h._make_runner()
     runner._get_coder = lambda allow_exploration=False: (  # type: ignore[method-assign]
@@ -319,8 +307,7 @@ def test_handle_fix_escalates_at_iteration_cap_before_next_spawn(
         (
             runner.owner_repo,
             77,
-            "@AlexBomber12 FIX iteration cap reached (15/15). "
-            "Escalating for manual review.",
+            "@AlexBomber12 FIX iteration cap reached (15/15). Escalating for manual review.",
         )
     ]
     assert gh_calls == [
@@ -336,9 +323,7 @@ def test_handle_fix_escalates_at_iteration_cap_before_next_spawn(
         ["pr", "edit", "77", "--add-label", "escalated"],
     ]
     assert any(
-        entry["event"]
-        == "[ESCALATE] FIX cap reached (15/15) on PR #77: escalated, "
-        "moving to IDLE."
+        entry["event"] == "[ESCALATE] FIX cap reached (15/15) on PR #77: escalated, moving to IDLE."
         for entry in runner.state.history
     )
 
@@ -350,9 +335,7 @@ def test_handle_fix_cap_ignores_existing_label_create_failure(
     gh_calls: list[list[str]] = []
 
     class _UnexpectedPlugin:
-        async def fix_review(
-            self, path: str, **kwargs: object
-        ) -> tuple[int, str, str]:
+        async def fix_review(self, path: str, **kwargs: object) -> tuple[int, str, str]:
             raise AssertionError("fix_review should not run at cap boundary")
 
     def fake_post(repo: str, number: int, body: str) -> None:
@@ -364,8 +347,8 @@ def test_handle_fix_cap_ignores_existing_label_create_failure(
             raise RuntimeError("label already exists")
         return ""
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
-    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     runner = h._make_runner()
     runner._get_coder = lambda allow_exploration=False: (  # type: ignore[method-assign]
@@ -386,8 +369,7 @@ def test_handle_fix_cap_ignores_existing_label_create_failure(
         (
             runner.owner_repo,
             88,
-            "@AlexBomber12 FIX iteration cap reached (2/2). "
-            "Escalating for manual review.",
+            "@AlexBomber12 FIX iteration cap reached (2/2). Escalating for manual review.",
         )
     ]
     assert gh_calls == [
@@ -415,19 +397,15 @@ def test_handle_fix_cap_skips_repeat_escalation_when_pr_already_escalated(
     gh_calls: list[list[str]] = []
 
     class _UnexpectedPlugin:
-        async def fix_review(
-            self, path: str, **kwargs: object
-        ) -> tuple[int, str, str]:
+        async def fix_review(self, path: str, **kwargs: object) -> tuple[int, str, str]:
             raise AssertionError("fix_review should not run at cap boundary")
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: posted.append((repo, number, body)),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda cmd, **kwargs: gh_calls.append(cmd) or "",
     )
 
@@ -452,9 +430,7 @@ def test_handle_fix_cap_skips_repeat_escalation_when_pr_already_escalated(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.user_paused is True
     assert any(
-        entry["event"]
-        == "[FIX] FIX blocked for escalated PR #91, moving to IDLE."
-        for entry in runner.state.history
+        entry["event"] == "[FIX] FIX blocked for escalated PR #91, moving to IDLE." for entry in runner.state.history
     )
 
 
@@ -465,19 +441,15 @@ def test_handle_fix_blocks_escalated_pr_even_when_counter_resets(
     gh_calls: list[list[str]] = []
 
     class _UnexpectedPlugin:
-        async def fix_review(
-            self, path: str, **kwargs: object
-        ) -> tuple[int, str, str]:
+        async def fix_review(self, path: str, **kwargs: object) -> tuple[int, str, str]:
             raise AssertionError("fix_review should not run for escalated PRs")
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: posted.append((repo, number, body)),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda cmd, **kwargs: gh_calls.append(cmd) or "",
     )
 
@@ -500,9 +472,7 @@ def test_handle_fix_blocks_escalated_pr_even_when_counter_resets(
     assert gh_calls == []
     assert runner.state.state == PipelineState.IDLE
     assert any(
-        entry["event"]
-        == "[FIX] FIX blocked for escalated PR #92, moving to IDLE."
-        for entry in runner.state.history
+        entry["event"] == "[FIX] FIX blocked for escalated PR #92, moving to IDLE." for entry in runner.state.history
     )
 
 
@@ -510,17 +480,12 @@ def test_handle_fix_cap_sets_error_when_comment_post_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _UnexpectedPlugin:
-        async def fix_review(
-            self, path: str, **kwargs: object
-        ) -> tuple[int, str, str]:
+        async def fix_review(self, path: str, **kwargs: object) -> tuple[int, str, str]:
             raise AssertionError("fix_review should not run at cap boundary")
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
-        lambda repo, number, body: (_ for _ in ()).throw(
-            RuntimeError("gh unavailable")
-        ),
+        "src.github.comments.post_comment",
+        lambda repo, number, body: (_ for _ in ()).throw(RuntimeError("gh unavailable")),
     )
 
     runner = h._make_runner()
@@ -547,9 +512,7 @@ def test_handle_fix_cap_sets_error_when_add_label_fails(
     posted: list[tuple[str, int, str]] = []
 
     class _UnexpectedPlugin:
-        async def fix_review(
-            self, path: str, **kwargs: object
-        ) -> tuple[int, str, str]:
+        async def fix_review(self, path: str, **kwargs: object) -> tuple[int, str, str]:
             raise AssertionError("fix_review should not run at cap boundary")
 
     def fake_post(repo: str, number: int, body: str) -> None:
@@ -560,8 +523,8 @@ def test_handle_fix_cap_sets_error_when_add_label_fails(
             raise RuntimeError("add label failed")
         return ""
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
-    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     runner = h._make_runner()
     runner._get_coder = lambda allow_exploration=False: (  # type: ignore[method-assign]
@@ -581,8 +544,7 @@ def test_handle_fix_cap_sets_error_when_add_label_fails(
         (
             runner.owner_repo,
             90,
-            "@AlexBomber12 FIX iteration cap reached (2/2). "
-            "Escalating for manual review.",
+            "@AlexBomber12 FIX iteration cap reached (2/2). Escalating for manual review.",
         )
     ]
     assert runner.state.state == PipelineState.ERROR
@@ -600,19 +562,15 @@ def test_handle_fix_routes_iteration_cap_through_bounded_recovery_policy(
     gh_calls: list[list[str]] = []
 
     class _UnexpectedPlugin:
-        async def fix_review(
-            self, path: str, **kwargs: object
-        ) -> tuple[int, str, str]:
+        async def fix_review(self, path: str, **kwargs: object) -> tuple[int, str, str]:
             raise AssertionError("fix_review must not run at cap boundary")
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: posted.append((repo, number, body)),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda cmd, **kwargs: gh_calls.append(cmd) or "",
     )
 
@@ -680,24 +638,23 @@ def test_handle_fix_three_no_push_cycles_transition_to_hung(
     # path stays parked instead of bouncing back to WATCH.
     assert runner.state.current_pr.is_escalated is True
     assert posted[-1] == (runner.owner_repo, 217, expected_msg)
-    assert any(
-        entry["event"] == f"[ESCALATE] {expected_msg}"
-        for entry in runner.state.history
-    )
+    assert any(entry["event"] == f"[ESCALATE] {expected_msg}" for entry in runner.state.history)
 
 
 def test_handle_fix_productive_push_resets_no_push_counter_before_threshold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Two no-push cycles followed by a productive push reset the counter."""
-    seq = iter([
-        "aaa000",  # call 1 head_before
-        "aaa000",  # call 1 head_after  → no-push
-        "aaa000",  # call 2 head_before
-        "aaa000",  # call 2 head_after  → no-push
-        "aaa000",  # call 3 head_before
-        "bbb111",  # call 3 head_after  → productive push
-    ])
+    seq = iter(
+        [
+            "aaa000",  # call 1 head_before
+            "aaa000",  # call 1 head_after  → no-push
+            "aaa000",  # call 2 head_before
+            "aaa000",  # call 2 head_after  → no-push
+            "aaa000",  # call 3 head_before
+            "bbb111",  # call 3 head_after  → productive push
+        ]
+    )
     posted = h._patch_no_push_fix(monkeypatch, head_seq=lambda: next(seq))
 
     runner = h._make_runner()
@@ -717,9 +674,7 @@ def test_handle_fix_productive_push_resets_no_push_counter_before_threshold(
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr.no_push_fix_count == 0
     assert runner.state.current_pr.push_count == 1
-    assert all(
-        "FIX deadlock" not in entry["event"] for entry in runner.state.history
-    )
+    assert all("FIX deadlock" not in entry["event"] for entry in runner.state.history)
     assert all("FIX deadlock" not in body for _repo, _num, body in posted)
 
 
@@ -727,14 +682,16 @@ def test_handle_fix_no_push_counter_resets_between_productive_pushes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """No-push, productive push, then no-push again must not trigger HUNG."""
-    seq = iter([
-        "aaa000",  # call 1 head_before
-        "aaa000",  # call 1 head_after  → no-push  (counter 0→1)
-        "aaa000",  # call 2 head_before
-        "bbb111",  # call 2 head_after  → productive push (counter 1→0)
-        "bbb111",  # call 3 head_before
-        "bbb111",  # call 3 head_after  → no-push  (counter 0→1)
-    ])
+    seq = iter(
+        [
+            "aaa000",  # call 1 head_before
+            "aaa000",  # call 1 head_after  → no-push  (counter 0→1)
+            "aaa000",  # call 2 head_before
+            "bbb111",  # call 2 head_after  → productive push (counter 1→0)
+            "bbb111",  # call 3 head_before
+            "bbb111",  # call 3 head_after  → no-push  (counter 0→1)
+        ]
+    )
     posted = h._patch_no_push_fix(monkeypatch, head_seq=lambda: next(seq))
 
     runner = h._make_runner()
@@ -753,9 +710,7 @@ def test_handle_fix_no_push_counter_resets_between_productive_pushes(
     asyncio.run(runner.handle_fix())
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr.no_push_fix_count == 1
-    assert all(
-        "FIX deadlock" not in entry["event"] for entry in runner.state.history
-    )
+    assert all("FIX deadlock" not in entry["event"] for entry in runner.state.history)
     assert all("FIX deadlock" not in body for _repo, _num, body in posted)
 
 
@@ -839,17 +794,13 @@ def test_handle_fix_no_push_deadlock_post_failure_still_transitions_to_hung(
         return h._FakeCompletedProcess(args=cmd, stdout="", returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
     monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("gh down")),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda *a, **kw: "",
     )
 
@@ -865,14 +816,9 @@ def test_handle_fix_no_push_deadlock_post_failure_still_transitions_to_hung(
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.no_push_fix_count == 0
     assert runner.state.current_pr.is_escalated is True
+    assert any("failed to post FIX deadlock comment" in entry["event"] for entry in runner.state.history)
     assert any(
-        "failed to post FIX deadlock comment" in entry["event"]
-        for entry in runner.state.history
-    )
-    assert any(
-        "FIX deadlock: 2 consecutive no-push FIX cycles on PR #222"
-        in entry["event"]
-        for entry in runner.state.history
+        "FIX deadlock: 2 consecutive no-push FIX cycles on PR #222" in entry["event"] for entry in runner.state.history
     )
 
 
@@ -889,7 +835,7 @@ def test_handle_fix_no_push_deadlock_applies_escalated_label(
         gh_calls.append(cmd)
         return ""
 
-    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     runner = h._make_runner()
     runner._app_config = h._app_cfg(fix_no_push_cap=2)
@@ -902,11 +848,7 @@ def test_handle_fix_no_push_deadlock_applies_escalated_label(
     assert runner.state.state == PipelineState.HUNG
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.is_escalated is True
-    escalation_calls = [
-        cmd
-        for cmd in gh_calls
-        if cmd[:1] == ["label"] or cmd[:2] == ["pr", "edit"]
-    ]
+    escalation_calls = [cmd for cmd in gh_calls if cmd[:1] == ["label"] or cmd[:2] == ["pr", "edit"]]
     assert escalation_calls == [
         [
             "label",
@@ -936,7 +878,7 @@ def test_handle_fix_no_push_deadlock_label_failures_do_not_block_hung(
             raise RuntimeError("gh down")
         return ""
 
-    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     runner = h._make_runner()
     runner._app_config = h._app_cfg(fix_no_push_cap=2)
@@ -950,23 +892,17 @@ def test_handle_fix_no_push_deadlock_label_failures_do_not_block_hung(
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.is_escalated is True
     assert any(
-        "FIX no-push label create skipped: label already exists"
-        in entry["event"]
-        for entry in runner.state.history
+        "FIX no-push label create skipped: label already exists" in entry["event"] for entry in runner.state.history
     )
     assert any(
-        "failed to apply escalated label to PR #224: gh down"
-        in entry["event"]
-        for entry in runner.state.history
+        "failed to apply escalated label to PR #224: gh down" in entry["event"] for entry in runner.state.history
     )
 
 
 def test_handle_fix_coder_escalate_transitions_to_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    posted, gh_calls = h._patch_fix_with_stdout(
-        monkeypatch, stdout="working...\nESCALATE: rate limit exceeded\n"
-    )
+    posted, gh_calls = h._patch_fix_with_stdout(monkeypatch, stdout="working...\nESCALATE: rate limit exceeded\n")
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -977,25 +913,22 @@ def test_handle_fix_coder_escalate_transitions_to_idle(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.is_escalated is True
-    expected_message = (
-        "Coder explicitly escalated this PR. Reason: rate limit exceeded. "
-        "Manual review required."
-    )
+    expected_message = "Coder explicitly escalated this PR. Reason: rate limit exceeded. Manual review required."
     assert posted == [(runner.owner_repo, 300, expected_message)]
-    assert [
-        cmd for cmd in gh_calls
-        if cmd[:1] == ["label"] or cmd[:2] == ["pr", "edit"]
-    ] == [
+    assert [cmd for cmd in gh_calls if cmd[:1] == ["label"] or cmd[:2] == ["pr", "edit"]] == [
         [
-            "label", "create", "escalated", "--color", "B60205",
-            "--description", "Daemon escalated, manual review required",
+            "label",
+            "create",
+            "escalated",
+            "--color",
+            "B60205",
+            "--description",
+            "Daemon escalated, manual review required",
         ],
         ["pr", "edit", "300", "--add-label", "escalated"],
     ]
     assert any(
-        entry["event"]
-        == "[ESCALATE] FIX coder ESCALATE on PR #300: rate limit "
-        "exceeded. Moving to IDLE."
+        entry["event"] == "[ESCALATE] FIX coder ESCALATE on PR #300: rate limit exceeded. Moving to IDLE."
         for entry in runner.state.history
     )
 
@@ -1026,9 +959,7 @@ def test_handle_fix_coder_escalate_only_last_non_empty_line_triggers(
 def test_handle_fix_coder_escalate_no_marker_keeps_normal_flow(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    posted, gh_calls = h._patch_fix_with_stdout(
-        monkeypatch, stdout="ran tests\nall good\n"
-    )
+    posted, gh_calls = h._patch_fix_with_stdout(monkeypatch, stdout="ran tests\nall good\n")
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -1040,10 +971,7 @@ def test_handle_fix_coder_escalate_no_marker_keeps_normal_flow(
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.is_escalated is False
     assert posted == []
-    assert all(
-        cmd[:1] != ["label"] and cmd[:2] != ["pr", "edit"]
-        for cmd in gh_calls
-    )
+    assert all(cmd[:1] != ["label"] and cmd[:2] != ["pr", "edit"] for cmd in gh_calls)
 
 
 def test_handle_fix_coder_escalate_empty_reason_uses_placeholder(
@@ -1060,15 +988,9 @@ def test_handle_fix_coder_escalate_empty_reason_uses_placeholder(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.is_escalated is True
-    expected_message = (
-        "Coder explicitly escalated this PR. Reason: (no reason provided). "
-        "Manual review required."
-    )
+    expected_message = "Coder explicitly escalated this PR. Reason: (no reason provided). Manual review required."
     assert posted == [(runner.owner_repo, 303, expected_message)]
-    assert any(
-        "(no reason provided)" in entry["event"]
-        for entry in runner.state.history
-    )
+    assert any("(no reason provided)" in entry["event"] for entry in runner.state.history)
 
 
 def test_handle_fix_coder_escalate_wins_over_productive_push(
@@ -1106,8 +1028,7 @@ def test_handle_fix_coder_escalate_wins_over_productive_push(
         (
             runner.owner_repo,
             304,
-            "Coder explicitly escalated this PR. Reason: cannot resolve. "
-            "Manual review required.",
+            "Coder explicitly escalated this PR. Reason: cannot resolve. Manual review required.",
         )
     ]
 
@@ -1116,15 +1037,10 @@ def test_handle_fix_coder_escalate_post_failure_still_parks_pr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Comment-post failure must not block the IDLE transition."""
-    h._patch_fix_with_stdout(
-        monkeypatch, stdout="ESCALATE: cannot recover\n"
-    )
+    h._patch_fix_with_stdout(monkeypatch, stdout="ESCALATE: cannot recover\n")
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
-        lambda repo, number, body: (_ for _ in ()).throw(
-            RuntimeError("gh down")
-        ),
+        "src.github.comments.post_comment",
+        lambda repo, number, body: (_ for _ in ()).throw(RuntimeError("gh down")),
     )
 
     runner = h._make_runner()
@@ -1137,8 +1053,7 @@ def test_handle_fix_coder_escalate_post_failure_still_parks_pr(
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.is_escalated is True
     assert any(
-        "failed to post FIX coder ESCALATE comment on PR #305" in entry["event"]
-        for entry in runner.state.history
+        "failed to post FIX coder ESCALATE comment on PR #305" in entry["event"] for entry in runner.state.history
     )
 
 
@@ -1155,9 +1070,7 @@ def test_handle_fix_coder_escalate_label_apply_failure_parks_in_hung(
     PR. The comment is still posted (descriptive record) and the
     ``label create`` soft-fail is unchanged.
     """
-    posted, _ = h._patch_fix_with_stdout(
-        monkeypatch, stdout="ESCALATE: infra error\n"
-    )
+    posted, _ = h._patch_fix_with_stdout(monkeypatch, stdout="ESCALATE: infra error\n")
 
     def fake_run_gh(cmd: list[str], **kwargs: Any) -> str:
         if cmd[:3] == ["label", "create", "escalated"]:
@@ -1166,7 +1079,7 @@ def test_handle_fix_coder_escalate_label_apply_failure_parks_in_hung(
             raise RuntimeError("gh down")
         return ""
 
-    monkeypatch.setattr(runner_module.github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -1182,14 +1095,11 @@ def test_handle_fix_coder_escalate_label_apply_failure_parks_in_hung(
     assert "infra error" in runner.state.error_message
     assert posted and posted[0][1] == 306
     assert any(
-        "FIX coder ESCALATE label create skipped: label already exists"
-        in entry["event"]
+        "FIX coder ESCALATE label create skipped: label already exists" in entry["event"]
         for entry in runner.state.history
     )
     assert any(
-        "failed to apply escalated label to PR #306: gh down"
-        in entry["event"]
-        for entry in runner.state.history
+        "failed to apply escalated label to PR #306: gh down" in entry["event"] for entry in runner.state.history
     )
 
 
@@ -1203,9 +1113,7 @@ def test_handle_fix_coder_escalate_honors_deferred_stop_request(
     must override so the operator's pause is not silently dropped
     (Codex P1 on PR #228).
     """
-    posted, _ = h._patch_fix_with_stdout(
-        monkeypatch, stdout="ESCALATE: handing off\n"
-    )
+    posted, _ = h._patch_fix_with_stdout(monkeypatch, stdout="ESCALATE: handing off\n")
 
     async def fake_pop_stop_request() -> bool:
         return True
@@ -1223,10 +1131,7 @@ def test_handle_fix_coder_escalate_honors_deferred_stop_request(
     assert runner.state.current_pr.is_escalated is True
     # ESCALATE bookkeeping (comment + label) still ran before PAUSED.
     assert posted and posted[0][1] == 308
-    assert any(
-        entry["event"] == "[FIX] FIX aborted: user stop requested."
-        for entry in runner.state.history
-    )
+    assert any(entry["event"] == "[FIX] FIX aborted: user stop requested." for entry in runner.state.history)
 
 
 def test_handle_fix_coder_escalate_resets_no_push_counter(
@@ -1238,9 +1143,7 @@ def test_handle_fix_coder_escalate_resets_no_push_counter(
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
-    runner.state.current_pr = PRInfo(
-        number=307, branch="pr-307", no_push_fix_count=2
-    )
+    runner.state.current_pr = PRInfo(number=307, branch="pr-307", no_push_fix_count=2)
 
     asyncio.run(runner.handle_fix())
 
@@ -1267,13 +1170,10 @@ def test_handle_fix_failure_resets_no_push_counter(
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: posted.append((repo, number, body)),
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "run_gh", lambda *a, **kw: ""
-    )
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: "")
 
     cycles = iter([(0, "", ""), (1, "", "boom"), (0, "", "")])
 
@@ -1315,13 +1215,9 @@ def test_handle_fix_stop_cancel_resets_no_push_counter(
 
     def fake_git(repo_path: str, *args: str, **kwargs: Any) -> h._FakeCompletedProcess:
         if args[:2] == ("rev-parse", "HEAD"):
-            return h._FakeCompletedProcess(
-                args=["git", *args], stdout="aaa111\n", returncode=0
-            )
+            return h._FakeCompletedProcess(args=["git", *args], stdout="aaa111\n", returncode=0)
         if args[:2] == ("rev-parse", "origin/pr-229"):
-            return h._FakeCompletedProcess(
-                args=["git", *args], stdout="aaa111\n", returncode=0
-            )
+            return h._FakeCompletedProcess(args=["git", *args], stdout="aaa111\n", returncode=0)
         return h._FakeCompletedProcess(args=["git", *args], returncode=0)
 
     async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
@@ -1349,15 +1245,11 @@ def test_handle_fix_stop_cancel_resets_no_push_counter(
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
     monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
-    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_inflight_breach", no_breach_monitor)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
-    runner.state.current_pr = PRInfo(
-        number=229, branch="pr-229", no_push_fix_count=2
-    )
+    runner.state.current_pr = PRInfo(number=229, branch="pr-229", no_push_fix_count=2)
 
     async def stop_monitor(
         cli_task: asyncio.Task[tuple[int, str, str]],
@@ -1396,13 +1288,10 @@ def test_handle_fix_idle_timeout_resets_no_push_counter(
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: posted.append((repo, number, body)),
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "run_gh", lambda *a, **kw: ""
-    )
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: "")
 
     async def idle_timeout_monitor(
         self: object,
@@ -1414,9 +1303,7 @@ def test_handle_fix_idle_timeout_resets_no_push_counter(
         idle_flag["timed_out"] = True
         target.cancel()
 
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_fix_idle", idle_timeout_monitor
-    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", idle_timeout_monitor)
 
     async def slow_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
         await asyncio.Future()
@@ -1427,9 +1314,7 @@ def test_handle_fix_idle_timeout_resets_no_push_counter(
     runner = h._make_runner()
     runner._app_config = h._app_cfg(fix_no_push_cap=2)
     runner.state.state = PipelineState.WATCH
-    runner.state.current_pr = PRInfo(
-        number=226, branch="pr-226", no_push_fix_count=1
-    )
+    runner.state.current_pr = PRInfo(number=226, branch="pr-226", no_push_fix_count=1)
 
     asyncio.run(runner.handle_fix())
 
@@ -1487,9 +1372,7 @@ def test_handle_fix_finishes_push_bookkeeping_before_stop_cancel_pause(
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
     monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
-    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_inflight_breach", no_breach_monitor)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -1508,9 +1391,7 @@ def test_handle_fix_finishes_push_bookkeeping_before_stop_cancel_pause(
 
     monkeypatch.setattr(runner, "_save_cli_log", save_log)
     monkeypatch.setattr(runner, "_monitor_stop_request", stop_monitor)
-    monkeypatch.setattr(
-        runner, "_post_codex_review", lambda pr_number: posted.append(pr_number) or True
-    )
+    monkeypatch.setattr(runner, "_post_codex_review", lambda pr_number: posted.append(pr_number) or True)
 
     asyncio.run(runner.handle_fix())
 
@@ -1575,9 +1456,7 @@ def test_handle_fix_stop_cancel_skips_push_bookkeeping_when_remote_head_is_stale
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
     monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
-    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_inflight_breach", no_breach_monitor)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -1596,9 +1475,7 @@ def test_handle_fix_stop_cancel_skips_push_bookkeeping_when_remote_head_is_stale
 
     monkeypatch.setattr(runner, "_save_cli_log", save_log)
     monkeypatch.setattr(runner, "_monitor_stop_request", stop_monitor)
-    monkeypatch.setattr(
-        runner, "_post_codex_review", lambda pr_number: posted.append(pr_number) or True
-    )
+    monkeypatch.setattr(runner, "_post_codex_review", lambda pr_number: posted.append(pr_number) or True)
 
     asyncio.run(runner.handle_fix())
 
@@ -1612,10 +1489,7 @@ def test_handle_fix_stop_cancel_skips_push_bookkeeping_when_remote_head_is_stale
     assert runner._last_push_at_pr_number is None
     assert posted == []
     assert saved_logs == [("", "", "FIX FEEDBACK output [claude]")]
-    assert any(
-        "outside the fetched remote branch" in e["event"].lower()
-        for e in runner.state.history
-    )
+    assert any("outside the fetched remote branch" in e["event"].lower() for e in runner.state.history)
 
 
 def test_handle_fix_stop_cancel_records_push_when_remote_advanced_past_local_head(
@@ -1666,9 +1540,7 @@ def test_handle_fix_stop_cancel_records_push_when_remote_advanced_past_local_hea
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
     monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
-    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_inflight_breach", no_breach_monitor)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -1683,9 +1555,7 @@ def test_handle_fix_stop_cancel_records_push_when_remote_advanced_past_local_hea
         cli_task.cancel()
 
     monkeypatch.setattr(runner, "_monitor_stop_request", stop_monitor)
-    monkeypatch.setattr(
-        runner, "_post_codex_review", lambda pr_number: posted.append(pr_number) or True
-    )
+    monkeypatch.setattr(runner, "_post_codex_review", lambda pr_number: posted.append(pr_number) or True)
 
     asyncio.run(runner.handle_fix())
 
@@ -1724,8 +1594,7 @@ def test_handle_fix_honors_persisted_stop_after_fast_fix_exit(
     assert runner.state.error_message is None
     assert f"control:{runner.name}:stop" not in runner.redis.store
     assert any(
-        "deferring pause until fix bookkeeping completes" in entry["event"].lower()
-        for entry in runner.state.history
+        "deferring pause until fix bookkeeping completes" in entry["event"].lower() for entry in runner.state.history
     )
 
 
@@ -1745,14 +1614,12 @@ def test_handle_fix_errors_when_post_comment_fails(
     trapping the daemon in a silent fix/push loop.
     """
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
-    )
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
 
     def boom(repo: str, number: int, body: str) -> None:
         raise RuntimeError("gh rate limited")
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", boom)
+    monkeypatch.setattr("src.github.comments.post_comment", boom)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -1765,8 +1632,7 @@ def test_handle_fix_errors_when_post_comment_fails(
     assert "#77" in (runner.state.error_message or "")
     assert "fix/push loop" in (runner.state.error_message or "")
     assert any(
-        "Warning: failed to post @codex review" in e["event"]
-        and "gh rate limited" in e["event"]
+        "Warning: failed to post @codex review" in e["event"] and "gh rate limited" in e["event"]
         for e in runner.state.history
     )
 
@@ -1787,12 +1653,9 @@ def test_handle_fix_skips_checkout_on_cross_repo_pr(
         return h._FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
     monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
 
@@ -1829,8 +1692,7 @@ def test_handle_fix_fetches_and_resets_branch_before_fix_review(
 
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
 
@@ -1840,24 +1702,17 @@ def test_handle_fix_fetches_and_resets_branch_before_fix_review(
     asyncio.run(runner.handle_fix())
 
     fetch_calls = [
-        i for i, cmd in enumerate(calls)
-        if cmd[:2] == ["git", "fetch"]
-        and any("pr-042-fix" in arg for arg in cmd)
+        i for i, cmd in enumerate(calls) if cmd[:2] == ["git", "fetch"] and any("pr-042-fix" in arg for arg in cmd)
     ]
-    checkout_calls = [
-        i for i, cmd in enumerate(calls)
-        if cmd[:2] == ["git", "checkout"] and "pr-042-fix" in cmd
-    ]
+    checkout_calls = [i for i, cmd in enumerate(calls) if cmd[:2] == ["git", "checkout"] and "pr-042-fix" in cmd]
     reset_calls = [
-        i for i, cmd in enumerate(calls)
-        if cmd[:2] == ["git", "reset"]
-        and "--hard" in cmd
-        and "origin/pr-042-fix" in cmd
+        i
+        for i, cmd in enumerate(calls)
+        if cmd[:2] == ["git", "reset"] and "--hard" in cmd and "origin/pr-042-fix" in cmd
     ]
     assert fetch_calls, "expected git fetch origin pr-042-fix"
     assert all("--prune" in calls[i] for i in fetch_calls), (
-        "git fetch in handle_fix must pass --prune to drop stale "
-        "remote-tracking refs (PR-161)"
+        "git fetch in handle_fix must pass --prune to drop stale remote-tracking refs (PR-161)"
     )
     assert checkout_calls, "expected git checkout pr-042-fix"
     assert reset_calls, "expected git reset --hard origin/pr-042-fix"
@@ -1877,9 +1732,7 @@ def test_handle_fix_errors_when_fetch_fails(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
         if cmd[:2] == ["git", "fetch"] and any("pr-042-fix" in a for a in cmd):
-            raise subprocess.CalledProcessError(
-                1, cmd, stderr="fatal: couldn't find remote ref pr-042-fix"
-            )
+            raise subprocess.CalledProcessError(1, cmd, stderr="fatal: couldn't find remote ref pr-042-fix")
         return h._FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
@@ -1911,9 +1764,7 @@ def test_handle_fix_errors_when_reset_fails(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
         if cmd[:2] == ["git", "reset"] and "origin/pr-042-fix" in cmd:
-            raise subprocess.CalledProcessError(
-                1, cmd, stderr="fatal: ambiguous argument"
-            )
+            raise subprocess.CalledProcessError(1, cmd, stderr="fatal: ambiguous argument")
         return h._FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
@@ -1975,8 +1826,7 @@ def test_handle_fix_saves_stdout(
         h._async_cli_result(0, "fix output here", ""),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda *a, **kw: None,
     )
 
@@ -2013,10 +1863,7 @@ def test_handle_fix_skips_fork(monkeypatch: pytest.MonkeyPatch) -> None:
     asyncio.run(runner.handle_fix())
     assert fix_called == []
     assert runner.state.state == PipelineState.WATCH
-    assert any(
-        "Skipping FIX for cross-repo" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("Skipping FIX for cross-repo" in e["event"] for e in runner.state.history)
 
 
 def test_handle_fix_does_not_forward_idle_timeout_as_cli_timeout(
@@ -2034,8 +1881,7 @@ def test_handle_fix_does_not_forward_idle_timeout_as_cli_timeout(
 
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda *a, **kw: None,
     )
 
@@ -2059,15 +1905,16 @@ def test_handle_fix_external_merge_during_coder_transitions_to_idle(
 ) -> None:
     """A polling task that detects MERGED while the coder runs must drive IDLE."""
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
-    )
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
 
     runner = h._make_runner()
     runner._app_config = h._app_cfg(fix_poll_interval_sec=1)
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(
-        number=77, branch="pr-077", no_push_fix_count=1, fix_iteration_count=3,
+        number=77,
+        branch="pr-077",
+        no_push_fix_count=1,
+        fix_iteration_count=3,
     )
 
     poll_started: asyncio.Event | None = None
@@ -2083,13 +1930,9 @@ def test_handle_fix_external_merge_during_coder_transitions_to_idle(
         terminal_flag["state"] = "MERGED"
         target.cancel()
 
-    monkeypatch.setattr(
-        fix_module.FixMixin, "_poll_github_during_fix", fake_poll
-    )
+    monkeypatch.setattr(fix_module.FixMixin, "_poll_github_during_fix", fake_poll)
 
-    async def fake_fix_review_async(
-        *args: object, **kwargs: object
-    ) -> tuple[int, str, str]:
+    async def fake_fix_review_async(*args: object, **kwargs: object) -> tuple[int, str, str]:
         try:
             await asyncio.sleep(3600)
         except asyncio.CancelledError:
@@ -2097,19 +1940,14 @@ def test_handle_fix_external_merge_during_coder_transitions_to_idle(
         return (0, "", "")
 
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix_review_async)
-    monkeypatch.setattr(
-        runner_module.github_client, "post_comment", lambda *a, **kw: None
-    )
+    monkeypatch.setattr("src.github.comments.post_comment", lambda *a, **kw: None)
 
     asyncio.run(runner.handle_fix())
 
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is None
     assert runner.state.error_message is None
-    assert any(
-        "merged externally during FIX" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("merged externally during FIX" in e["event"] for e in runner.state.history)
 
 
 def test_handle_fix_external_close_during_coder_transitions_to_hung(
@@ -2132,13 +1970,9 @@ def test_handle_fix_external_close_during_coder_transitions_to_hung(
         terminal_flag["state"] = "CLOSED"
         target.cancel()
 
-    monkeypatch.setattr(
-        fix_module.FixMixin, "_poll_github_during_fix", fake_poll
-    )
+    monkeypatch.setattr(fix_module.FixMixin, "_poll_github_during_fix", fake_poll)
 
-    async def fake_fix_review_async(
-        *args: object, **kwargs: object
-    ) -> tuple[int, str, str]:
+    async def fake_fix_review_async(*args: object, **kwargs: object) -> tuple[int, str, str]:
         try:
             await asyncio.sleep(3600)
         except asyncio.CancelledError:
@@ -2146,17 +1980,12 @@ def test_handle_fix_external_close_during_coder_transitions_to_hung(
         return (0, "", "")
 
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix_review_async)
-    monkeypatch.setattr(
-        runner_module.github_client, "post_comment", lambda *a, **kw: None
-    )
+    monkeypatch.setattr("src.github.comments.post_comment", lambda *a, **kw: None)
 
     asyncio.run(runner.handle_fix())
 
     assert runner.state.state == PipelineState.HUNG
-    assert any(
-        "closed externally during FIX" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("closed externally during FIX" in e["event"] for e in runner.state.history)
 
 
 def test_handle_fix_normal_completion_cancels_polling_task(
@@ -2164,12 +1993,8 @@ def test_handle_fix_normal_completion_cancels_polling_task(
 ) -> None:
     """When the coder exits normally, the polling task must be cancelled cleanly."""
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
-    )
-    monkeypatch.setattr(
-        runner_module.github_client, "post_comment", lambda *a, **kw: None
-    )
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
+    monkeypatch.setattr("src.github.comments.post_comment", lambda *a, **kw: None)
 
     cancellations: list[bool] = []
 
@@ -2185,9 +2010,7 @@ def test_handle_fix_normal_completion_cancels_polling_task(
             cancellations.append(True)
             raise
 
-    monkeypatch.setattr(
-        fix_module.FixMixin, "_poll_github_during_fix", fake_poll
-    )
+    monkeypatch.setattr(fix_module.FixMixin, "_poll_github_during_fix", fake_poll)
 
     runner = h._make_runner()
     runner._app_config = h._app_cfg(fix_poll_interval_sec=1)
@@ -2208,12 +2031,8 @@ def test_handle_fix_external_merge_when_coder_exits_during_grace(
     no-op and ``await claude_task`` returns normally), the post-finally
     branch must still drive IDLE on MERGED (Codex P1 on PR #223)."""
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
-    )
-    monkeypatch.setattr(
-        runner_module.github_client, "post_comment", lambda *a, **kw: None
-    )
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
+    monkeypatch.setattr("src.github.comments.post_comment", lambda *a, **kw: None)
 
     async def fake_poll(
         self: object,
@@ -2225,18 +2044,17 @@ def test_handle_fix_external_merge_when_coder_exits_during_grace(
         # where the coder finishes during the SIGTERM grace.
         terminal_flag["state"] = "MERGED"
 
-    monkeypatch.setattr(
-        fix_module.FixMixin, "_poll_github_during_fix", fake_poll
-    )
-    monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
-    )
+    monkeypatch.setattr(fix_module.FixMixin, "_poll_github_during_fix", fake_poll)
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
 
     runner = h._make_runner()
     runner._app_config = h._app_cfg(fix_poll_interval_sec=1)
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(
-        number=81, branch="pr-081", no_push_fix_count=1, fix_iteration_count=2,
+        number=81,
+        branch="pr-081",
+        no_push_fix_count=1,
+        fix_iteration_count=2,
     )
 
     asyncio.run(runner.handle_fix())
@@ -2244,10 +2062,7 @@ def test_handle_fix_external_merge_when_coder_exits_during_grace(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is None
     assert runner.state.error_message is None
-    assert any(
-        "merged externally during FIX" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("merged externally during FIX" in e["event"] for e in runner.state.history)
 
 
 def test_handle_fix_records_last_push_at(
@@ -2263,8 +2078,7 @@ def test_handle_fix_records_last_push_at(
         h._async_cli_result(0, "", ""),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda *a, **kw: None,
     )
 
@@ -2291,17 +2105,14 @@ def test_handle_fix_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:
         async_calls.append(path)
         return (0, "", "")
 
-    def fake_sync(
-        path: str, model: str | None = None, timeout: int | None = None
-    ) -> tuple[int, str, str]:
+    def fake_sync(path: str, model: str | None = None, timeout: int | None = None) -> tuple[int, str, str]:
         sync_calls.append(path)
         return (0, "", "")
 
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_async)
     monkeypatch.setattr(claude_cli, "fix_review", fake_sync)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda *a, **kw: None,
     )
 
@@ -2339,9 +2150,7 @@ def test_handle_fix_publishes_heartbeat(
         return (0, "", "")
 
     monkeypatch.setattr(claude_cli, "fix_review_async", slow_cli)
-    monkeypatch.setattr(
-        runner_module.github_client, "post_comment", lambda *a, **kw: None
-    )
+    monkeypatch.setattr("src.github.comments.post_comment", lambda *a, **kw: None)
 
     async def fast_heartbeat(self: Any, label: str) -> None:
         while True:
@@ -2352,9 +2161,7 @@ def test_handle_fix_publishes_heartbeat(
                 two_heartbeats.set()
             await self.publish_state()
 
-    monkeypatch.setattr(
-        PipelineRunner, "_publish_while_waiting", fast_heartbeat
-    )
+    monkeypatch.setattr(PipelineRunner, "_publish_while_waiting", fast_heartbeat)
 
     async def run() -> None:
         runner = h._make_runner()
@@ -2380,13 +2187,9 @@ def test_handle_fix_skips_review_post_when_head_unchanged(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
         if cmd[:2] == ["git", "rev-parse"] and "HEAD" in cmd:
-            return h._FakeCompletedProcess(
-                args=cmd, stdout=f"{same_sha}\n", returncode=0
-            )
+            return h._FakeCompletedProcess(args=cmd, stdout=f"{same_sha}\n", returncode=0)
         if cmd[:2] == ["git", "rev-list"]:
-            return h._FakeCompletedProcess(
-                args=cmd, stdout="0\n", returncode=0
-            )
+            return h._FakeCompletedProcess(args=cmd, stdout="0\n", returncode=0)
         return h._FakeCompletedProcess(args=cmd, stdout="", returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
@@ -2397,8 +2200,7 @@ def test_handle_fix_skips_review_post_when_head_unchanged(
     )
     posted: list[str] = []
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda *a, **kw: posted.append("posted"),
     )
 
@@ -2411,10 +2213,7 @@ def test_handle_fix_skips_review_post_when_head_unchanged(
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.push_count == 0
     assert posted == []
-    assert any(
-        "HEAD unchanged" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("HEAD unchanged" in e["event"] for e in runner.state.history)
 
 
 def test_handle_fix_counts_push_when_head_changes(
@@ -2430,17 +2229,11 @@ def test_handle_fix_counts_push_when_head_changes(
         if cmd[:3] == ["git", "rev-parse", "HEAD"]:
             call_count["n"] += 1
             sha = sha_before if call_count["n"] == 1 else sha_after
-            return h._FakeCompletedProcess(
-                args=cmd, stdout=f"{sha}\n", returncode=0
-            )
+            return h._FakeCompletedProcess(args=cmd, stdout=f"{sha}\n", returncode=0)
         if cmd[:2] == ["git", "rev-parse"] and "--abbrev-ref" in cmd:
-            return h._FakeCompletedProcess(
-                args=cmd, stdout="pr-050\n", returncode=0
-            )
+            return h._FakeCompletedProcess(args=cmd, stdout="pr-050\n", returncode=0)
         if cmd[:2] == ["git", "rev-list"]:
-            return h._FakeCompletedProcess(
-                args=cmd, stdout="0\n", returncode=0
-            )
+            return h._FakeCompletedProcess(args=cmd, stdout="0\n", returncode=0)
         return h._FakeCompletedProcess(args=cmd, stdout="", returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
@@ -2450,8 +2243,7 @@ def test_handle_fix_counts_push_when_head_changes(
         h._async_cli_result(0, "", ""),
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda *a, **kw: None,
     )
 
@@ -2480,17 +2272,11 @@ def test_handle_fix_error_on_rev_parse_after_failure(
         if cmd[:2] == ["git", "rev-parse"] and "HEAD" in cmd:
             call_count["n"] += 1
             if call_count["n"] == 1:
-                return h._FakeCompletedProcess(
-                    args=cmd, stdout="aaa111\n", returncode=0
-                )
+                return h._FakeCompletedProcess(args=cmd, stdout="aaa111\n", returncode=0)
             # Second call: simulate failure
-            raise subprocess.CalledProcessError(
-                128, cmd, stderr="fatal: bad object HEAD"
-            )
+            raise subprocess.CalledProcessError(128, cmd, stderr="fatal: bad object HEAD")
         if cmd[:2] == ["git", "rev-list"]:
-            return h._FakeCompletedProcess(
-                args=cmd, stdout="0\n", returncode=0
-            )
+            return h._FakeCompletedProcess(args=cmd, stdout="0\n", returncode=0)
         return h._FakeCompletedProcess(args=cmd, stdout="", returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
@@ -2519,12 +2305,8 @@ def test_handle_fix_ignores_initial_rev_parse_failure_and_logs_iteration_zero(
         if args[:2] == ("rev-parse", "HEAD"):
             rev_parse_calls["count"] += 1
             if rev_parse_calls["count"] == 1:
-                raise subprocess.CalledProcessError(
-                    128, ["git", *args], stderr="fatal: bad object HEAD"
-                )
-            return h._FakeCompletedProcess(
-                args=["git", *args], stdout="bbb222\n", returncode=0
-            )
+                raise subprocess.CalledProcessError(128, ["git", *args], stderr="fatal: bad object HEAD")
+            return h._FakeCompletedProcess(args=["git", *args], stdout="bbb222\n", returncode=0)
         return h._FakeCompletedProcess(args=["git", *args], returncode=0)
 
     async def no_idle_monitor(
@@ -2546,13 +2328,9 @@ def test_handle_fix_ignores_initial_rev_parse_failure_and_logs_iteration_zero(
         await asyncio.sleep(0)
 
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
-    monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "ok", "")
-    )
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "ok", ""))
     monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
-    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_inflight_breach", no_breach_monitor)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -2596,9 +2374,7 @@ def test_handle_fix_reraises_unexpected_cancelled_error(
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
     monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", no_idle_monitor)
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_inflight_breach", no_breach_monitor
-    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_inflight_breach", no_breach_monitor)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -2612,15 +2388,13 @@ def test_handle_fix_normal_push_skips_codex_review_when_eyes_already_reacted(
 ) -> None:
     """OBS-Z: normal fix-push path honors the EYES race-window dedup."""
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
-    )
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
     posted: list[tuple[str, int, str]] = []
 
     def fake_post(repo: str, number: int, body: str) -> None:
         posted.append((repo, number, body))
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
     h._patch_eyes_reaction_present(monkeypatch)
 
     runner = h._make_runner()
@@ -2631,9 +2405,7 @@ def test_handle_fix_normal_push_skips_codex_review_when_eyes_already_reacted(
 
     assert posted == []
     assert any(
-        "Codex auto-trigger detected, skipping duplicate "
-        "@codex review post" in e["event"]
-        for e in runner.state.history
+        "Codex auto-trigger detected, skipping duplicate @codex review post" in e["event"] for e in runner.state.history
     )
 
 
@@ -2648,15 +2420,13 @@ def test_handle_fix_normal_push_posts_codex_review_when_eyes_predates_head(
     debounce in ``watch.py`` recovered.
     """
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
-    )
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
     posted: list[tuple[str, int, str]] = []
 
     def fake_post(repo: str, number: int, body: str) -> None:
         posted.append((repo, number, body))
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
     h._patch_eyes_reaction_stale(monkeypatch)
 
     runner = h._make_runner()
@@ -2667,16 +2437,13 @@ def test_handle_fix_normal_push_posts_codex_review_when_eyes_predates_head(
 
     assert posted == [(runner.owner_repo, 77, "@codex review")]
     assert not any(
-        "Codex auto-trigger detected, skipping duplicate "
-        "@codex review post" in e["event"]
-        for e in runner.state.history
+        "Codex auto-trigger detected, skipping duplicate @codex review post" in e["event"] for e in runner.state.history
     )
 
 
 def test_handle_fix_uses_codex_cli_when_coder_is_codex(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-
     h._patch_subprocess(monkeypatch)
     captured_module: list[str] = []
 
@@ -2686,8 +2453,7 @@ def test_handle_fix_uses_codex_cli_when_coder_is_codex(
 
     monkeypatch.setattr(codex_cli, "fix_review_async", fake_fix_review)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda *a, **kw: True,
     )
 
@@ -2729,10 +2495,7 @@ def test_handle_fix_head_unchanged_honors_stop_requested_after_exit(
 
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.error_message is None
-    assert any(
-        entry["event"] == "[FIX] FIX aborted: user stop requested."
-        for entry in runner.state.history
-    )
+    assert any(entry["event"] == "[FIX] FIX aborted: user stop requested." for entry in runner.state.history)
 
 
 def test_handle_fix_stop_cancel_returns_when_rev_parse_after_fix_fails(
@@ -2744,9 +2507,7 @@ def test_handle_fix_stop_cancel_returns_when_rev_parse_after_fix_fails(
         if args[:2] == ("rev-parse", "HEAD"):
             rev_parse_calls["count"] += 1
             if rev_parse_calls["count"] == 1:
-                return h._FakeCompletedProcess(
-                    args=["git", *args], stdout="aaa111\n", returncode=0
-                )
+                return h._FakeCompletedProcess(args=["git", *args], stdout="aaa111\n", returncode=0)
             raise subprocess.CalledProcessError(128, ["git", *args], stderr="boom")
         return h._FakeCompletedProcess(args=["git", *args], returncode=0)
 
@@ -2855,10 +2616,7 @@ def test_handle_fix_stop_cancel_logs_fetch_failure_after_stop(
     asyncio.run(runner.handle_fix())
 
     assert runner.state.state == PipelineState.PAUSED
-    assert any(
-        "fetch pr-042-fix failed after FIX stop" in entry["event"]
-        for entry in runner.state.history
-    )
+    assert any("fetch pr-042-fix failed after FIX stop" in entry["event"] for entry in runner.state.history)
 
 
 def test_handle_fix_stop_cancel_logs_remote_rev_parse_failure_after_stop(
@@ -2919,10 +2677,7 @@ def test_handle_fix_stop_cancel_logs_remote_rev_parse_failure_after_stop(
     asyncio.run(runner.handle_fix())
 
     assert runner.state.state == PipelineState.PAUSED
-    assert any(
-        "rev-parse origin/pr-042-fix failed after FIX stop" in entry["event"]
-        for entry in runner.state.history
-    )
+    assert any("rev-parse origin/pr-042-fix failed after FIX stop" in entry["event"] for entry in runner.state.history)
 
 
 def test_handle_fix_stop_cancel_logs_merge_base_failure_after_stop(
@@ -2985,10 +2740,7 @@ def test_handle_fix_stop_cancel_logs_merge_base_failure_after_stop(
     asyncio.run(runner.handle_fix())
 
     assert runner.state.state == PipelineState.PAUSED
-    assert any(
-        "merge-base ancestry check failed after FIX stop" in entry["event"]
-        for entry in runner.state.history
-    )
+    assert any("merge-base ancestry check failed after FIX stop" in entry["event"] for entry in runner.state.history)
 
 
 def test_handle_fix_stop_cancel_short_circuits_when_head_matches_before(
@@ -2996,9 +2748,7 @@ def test_handle_fix_stop_cancel_short_circuits_when_head_matches_before(
 ) -> None:
     def fake_git(repo_path: str, *args: str, **kwargs: Any) -> h._FakeCompletedProcess:
         if args[:2] == ("rev-parse", "HEAD"):
-            return h._FakeCompletedProcess(
-                args=["git", *args], stdout="aaa111\n", returncode=0
-            )
+            return h._FakeCompletedProcess(args=["git", *args], stdout="aaa111\n", returncode=0)
         if args[:2] == ("fetch", "origin"):
             return h._FakeCompletedProcess(args=["git", *args], returncode=0)
         if args[:2] == ("rev-parse", "origin/pr-042-fix"):
@@ -3110,9 +2860,7 @@ def test_handle_fix_stop_cancel_errors_when_review_post_fails(
     asyncio.run(runner.handle_fix())
 
     assert runner.state.state == PipelineState.ERROR
-    assert "Failed to post @codex review on PR #42 after stop-cancel fix push" in (
-        runner.state.error_message or ""
-    )
+    assert "Failed to post @codex review on PR #42 after stop-cancel fix push" in (runner.state.error_message or "")
 
 
 def test_handle_fix_normal_exit_records_push_when_remote_contains_head(
@@ -3131,7 +2879,9 @@ def test_handle_fix_normal_exit_records_push_when_remote_contains_head(
             return h._FakeCompletedProcess(args=["git", *args], stdout=sha, returncode=0)
         if args[:2] == ("rev-parse", "origin/pr-190"):
             return h._FakeCompletedProcess(
-                args=["git", *args], stdout="bbb222\n", returncode=0,
+                args=["git", *args],
+                stdout="bbb222\n",
+                returncode=0,
             )
         return h._FakeCompletedProcess(args=["git", *args], returncode=0)
 
@@ -3140,12 +2890,8 @@ def test_handle_fix_normal_exit_records_push_when_remote_contains_head(
 
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_fix_idle", h._pr190_no_idle_monitor_async
-    )
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_inflight_breach", h._pr190_no_breach_monitor_async
-    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", h._pr190_no_idle_monitor_async)
+    monkeypatch.setattr(PipelineRunner, "_monitor_inflight_breach", h._pr190_no_breach_monitor_async)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -3183,7 +2929,9 @@ def test_handle_fix_normal_exit_treats_unverified_push_as_no_push(
             return h._FakeCompletedProcess(args=["git", *args], stdout=sha, returncode=0)
         if args[:2] == ("rev-parse", "origin/pr-190"):
             return h._FakeCompletedProcess(
-                args=["git", *args], stdout="aaa111\n", returncode=0,
+                args=["git", *args],
+                stdout="aaa111\n",
+                returncode=0,
             )
         return h._FakeCompletedProcess(args=["git", *args], returncode=0)
 
@@ -3192,12 +2940,8 @@ def test_handle_fix_normal_exit_treats_unverified_push_as_no_push(
 
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_fix_idle", h._pr190_no_idle_monitor_async
-    )
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_inflight_breach", h._pr190_no_breach_monitor_async
-    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", h._pr190_no_idle_monitor_async)
+    monkeypatch.setattr(PipelineRunner, "_monitor_inflight_breach", h._pr190_no_breach_monitor_async)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -3216,10 +2960,7 @@ def test_handle_fix_normal_exit_treats_unverified_push_as_no_push(
     assert runner.state.current_pr.fix_iteration_count == 0
     assert runner.state.current_pr.no_push_fix_count == 1
     assert posted == []
-    assert any(
-        "Coder exited cleanly but no push detected" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("Coder exited cleanly but no push detected" in e["event"] for e in runner.state.history)
 
 
 def test_handle_fix_normal_exit_fails_open_when_verification_fetch_fails(
@@ -3239,7 +2980,9 @@ def test_handle_fix_normal_exit_fails_open_when_verification_fetch_fails(
             # second fetch is the verification fetch we want to fail.
             if fetch_calls["count"] == 2:
                 raise subprocess.CalledProcessError(
-                    1, ["git", *args], stderr="fetch fail",
+                    1,
+                    ["git", *args],
+                    stderr="fetch fail",
                 )
             return h._FakeCompletedProcess(args=["git", *args], returncode=0)
         if args[:2] == ("rev-parse", "HEAD"):
@@ -3253,12 +2996,8 @@ def test_handle_fix_normal_exit_fails_open_when_verification_fetch_fails(
 
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_fix_idle", h._pr190_no_idle_monitor_async
-    )
-    monkeypatch.setattr(
-        PipelineRunner, "_monitor_inflight_breach", h._pr190_no_breach_monitor_async
-    )
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", h._pr190_no_idle_monitor_async)
+    monkeypatch.setattr(PipelineRunner, "_monitor_inflight_breach", h._pr190_no_breach_monitor_async)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -3277,14 +3016,9 @@ def test_handle_fix_normal_exit_fails_open_when_verification_fetch_fails(
     assert runner.state.current_pr.fix_iteration_count == 1
     assert posted == [190]
     assert any(
-        "FIX push verification unavailable; proceeding optimistically"
-        in e["event"]
-        for e in runner.state.history
+        "FIX push verification unavailable; proceeding optimistically" in e["event"] for e in runner.state.history
     )
-    assert any(
-        "fetch pr-190 failed after FIX exit" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("fetch pr-190 failed after FIX exit" in e["event"] for e in runner.state.history)
 
 
 # ---------------------------------------------------------------------------
@@ -3305,7 +3039,7 @@ def test_fetch_failed_ci_logs_truncates_to_last_5000_chars(
             return long_log
         raise AssertionError(f"unexpected gh call: {args}")
 
-    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     out = fix_module._fetch_failed_ci_logs("octo/demo", "pr-019")
 
@@ -3327,7 +3061,7 @@ def test_fetch_failed_ci_logs_short_log_returned_as_is(
             return short_log
         raise AssertionError(f"unexpected gh call: {args}")
 
-    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") == short_log
 
@@ -3335,9 +3069,7 @@ def test_fetch_failed_ci_logs_short_log_returned_as_is(
 def test_fetch_failed_ci_logs_returns_none_when_no_failed_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        fix_module.github_client, "run_gh", lambda args, **kwargs: []
-    )
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda args, **kwargs: [])
     assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
 
 
@@ -3345,8 +3077,7 @@ def test_fetch_failed_ci_logs_returns_none_on_non_list_runs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        fix_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda args, **kwargs: "not a list",
     )
     assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
@@ -3356,8 +3087,7 @@ def test_fetch_failed_ci_logs_returns_none_when_first_entry_not_dict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        fix_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda args, **kwargs: ["unexpected-string"],
     )
     assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
@@ -3367,8 +3097,7 @@ def test_fetch_failed_ci_logs_returns_none_when_database_id_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        fix_module.github_client,
-        "run_gh",
+        "src.github.gh_runner.run_gh",
         lambda args, **kwargs: [{"databaseId": None}],
     )
     assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
@@ -3382,7 +3111,7 @@ def test_fetch_failed_ci_logs_returns_none_when_run_view_empty(
             return [{"databaseId": 9}]
         return ""
 
-    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
 
 
@@ -3392,7 +3121,7 @@ def test_fetch_failed_ci_logs_returns_none_on_run_list_failure(
     def fake_run_gh(args: list[str], **kwargs: Any) -> object:
         raise RuntimeError("api blew up")
 
-    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
 
 
@@ -3404,7 +3133,7 @@ def test_fetch_failed_ci_logs_returns_none_on_run_view_failure(
             return [{"databaseId": 9}]
         raise RuntimeError("log fetch blew up")
 
-    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
 
 
@@ -3439,12 +3168,9 @@ def test_parse_escalate_marker(stdout: str, expected: str | None) -> None:
 
 def test_fix_increments_iterations(monkeypatch: pytest.MonkeyPatch) -> None:
     h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
     monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
 
@@ -3503,17 +3229,13 @@ def test_fix_iterations_survive_recovery_until_merge(
         "_parse_base_queue",
         lambda self, **_: parsed_tasks,
     )
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
     monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [PRInfo(number=77, branch="pr-001")],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, number: {
             "author": "",
             "head_sha": "",
@@ -3521,16 +3243,11 @@ def test_fix_iterations_survive_recovery_until_merge(
         },
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "merge_pr", lambda repo, num: None
-    )
-    monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
-    )
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
 
     redis = h._FakeRedis()
     claude_provider, codex_provider = h._usage_providers()
@@ -3621,13 +3338,11 @@ def test_codex_review_not_reposted_same_pr_same_push(
     def fake_post(repo: str, number: int, body: str) -> None:
         posted.append((repo, number, body))
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
     monkeypatch.setattr(
         git_ops_module,
         "_git",
-        lambda *args, **kwargs: h._FakeCompletedProcess(
-            args=list(args), stdout="head-1\n", returncode=0
-        ),
+        lambda *args, **kwargs: h._FakeCompletedProcess(args=list(args), stdout="head-1\n", returncode=0),
     )
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
@@ -3637,10 +3352,7 @@ def test_codex_review_not_reposted_same_pr_same_push(
     assert posted == [(runner.owner_repo, 42, "@codex review")]
     assert runner._last_codex_review_pr == 42
     assert runner._last_codex_review_head_sha == "head-1"
-    assert any(
-        "Skipping duplicate @codex review for PR #42" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("Skipping duplicate @codex review for PR #42" in e["event"] for e in runner.state.history)
 
 
 def test_codex_review_reposted_after_new_push(
@@ -3652,14 +3364,12 @@ def test_codex_review_reposted_after_new_push(
     def fake_post(repo: str, number: int, body: str) -> None:
         posted.append((repo, number, body))
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
     head_shas = iter(["head-1\n", "head-2\n"])
     monkeypatch.setattr(
         git_ops_module,
         "_git",
-        lambda *args, **kwargs: h._FakeCompletedProcess(
-            args=list(args), stdout=next(head_shas), returncode=0
-        ),
+        lambda *args, **kwargs: h._FakeCompletedProcess(args=list(args), stdout=next(head_shas), returncode=0),
     )
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
@@ -3685,22 +3395,23 @@ def test_codex_review_reposted_same_head_when_bypass_requested(
     def fake_post(repo: str, number: int, body: str) -> None:
         posted.append((repo, number, body))
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
     monkeypatch.setattr(
         git_ops_module,
         "_git",
-        lambda *args, **kwargs: h._FakeCompletedProcess(
-            args=list(args), stdout="head-1\n", returncode=0
-        ),
+        lambda *args, **kwargs: h._FakeCompletedProcess(args=list(args), stdout="head-1\n", returncode=0),
     )
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
 
     assert runner._post_codex_review(42) is True
-    assert runner._post_codex_review(
-        42,
-        bypass_same_head_dedup=True,
-    ) is True
+    assert (
+        runner._post_codex_review(
+            42,
+            bypass_same_head_dedup=True,
+        )
+        is True
+    )
 
     assert posted == [
         (runner.owner_repo, 42, "@codex review"),
@@ -3722,10 +3433,9 @@ def test_codex_review_not_reposted_when_author_already_requested_review(
 
     runner = h._make_runner()
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, number: {
             "author": "alice",
             "head_sha": "head-1",
@@ -3733,21 +3443,15 @@ def test_codex_review_not_reposted_when_author_already_requested_review(
         },
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "has_recent_codex_review_request",
+        "src.github.comments.has_recent_codex_review_request",
         lambda repo, number, pr_author, within_minutes=5, after_iso=None: (
-            repo == runner.owner_repo
-            and number == 42
-            and pr_author == "alice"
-            and after_iso == "2026-04-17T23:14:11Z"
+            repo == runner.owner_repo and number == 42 and pr_author == "alice" and after_iso == "2026-04-17T23:14:11Z"
         ),
     )
     monkeypatch.setattr(
         git_ops_module,
         "_git",
-        lambda *args, **kwargs: h._FakeCompletedProcess(
-            args=list(args), stdout="head-1\n", returncode=0
-        ),
+        lambda *args, **kwargs: h._FakeCompletedProcess(args=list(args), stdout="head-1\n", returncode=0),
     )
     runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
 
@@ -3755,10 +3459,7 @@ def test_codex_review_not_reposted_when_author_already_requested_review(
     assert posted == []
     assert runner._last_codex_review_pr == 42
     assert runner._last_codex_review_head_sha == "head-1"
-    assert any(
-        "PR author already requested review for this head" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("PR author already requested review for this head" in e["event"] for e in runner.state.history)
 
 
 def test_codex_review_result_returns_retry_at_for_author_dedup(
@@ -3768,8 +3469,7 @@ def test_codex_review_result_returns_retry_at_for_author_dedup(
     runner = h._make_runner()
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, number: {
             "author": "alice",
             "head_sha": "head-1",
@@ -3789,9 +3489,7 @@ def test_codex_review_result_returns_retry_at_for_author_dedup(
     monkeypatch.setattr(
         git_ops_module,
         "_git",
-        lambda *args, **kwargs: h._FakeCompletedProcess(
-            args=list(args), stdout="head-1\n", returncode=0
-        ),
+        lambda *args, **kwargs: h._FakeCompletedProcess(args=list(args), stdout="head-1\n", returncode=0),
     )
     runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
 
@@ -3814,7 +3512,7 @@ def test_codex_review_git_head_lookup_failure_does_not_dedup(
     def fake_git(*args: object, **kwargs: object) -> h._FakeCompletedProcess:
         raise RuntimeError("git rev-parse failed")
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
@@ -3827,10 +3525,7 @@ def test_codex_review_git_head_lookup_failure_does_not_dedup(
     ]
     assert runner._last_codex_review_pr is None
     assert runner._last_codex_review_head_sha is None
-    assert any(
-        "posting @codex review without dedup" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("posting @codex review without dedup" in e["event"] for e in runner.state.history)
 
 
 def test_codex_review_metadata_failure_posts_without_pr_author_dedup(
@@ -3842,18 +3537,15 @@ def test_codex_review_metadata_failure_posts_without_pr_author_dedup(
     def fake_post(repo: str, number: int, body: str) -> None:
         posted.append((repo, number, body))
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, number: (_ for _ in ()).throw(OSError("gh timed out")),
     )
     monkeypatch.setattr(
         git_ops_module,
         "_git",
-        lambda *args, **kwargs: h._FakeCompletedProcess(
-            args=list(args), stdout="head-1\n", returncode=0
-        ),
+        lambda *args, **kwargs: h._FakeCompletedProcess(args=list(args), stdout="head-1\n", returncode=0),
     )
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
@@ -3862,18 +3554,14 @@ def test_codex_review_metadata_failure_posts_without_pr_author_dedup(
     assert posted == [(runner.owner_repo, 42, "@codex review")]
     assert runner._last_codex_review_pr == 42
     assert runner._last_codex_review_head_sha == "head-1"
-    assert any(
-        "failed to load PR metadata for @codex review dedup" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("failed to load PR metadata for @codex review dedup" in e["event"] for e in runner.state.history)
 
 
 def test_author_already_requested_review_fails_open_on_lookup_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        hung_module.github_client,
-        "has_recent_codex_review_request",
+        "src.github.comments.has_recent_codex_review_request",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
     )
 
@@ -3892,8 +3580,7 @@ def test_author_recent_review_requested_at_fails_open_on_lookup_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        hung_module.github_client,
-        "get_recent_codex_review_request_time",
+        "src.github.comments.get_recent_codex_review_request_time",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
     )
 
@@ -3914,13 +3601,11 @@ def test_codex_review_post_failure_clears_cached_dedup_key(
     def boom(repo: str, number: int, body: str) -> None:
         raise RuntimeError("gh rate limited")
 
-    monkeypatch.setattr(runner_module.github_client, "post_comment", boom)
+    monkeypatch.setattr("src.github.comments.post_comment", boom)
     monkeypatch.setattr(
         git_ops_module,
         "_git",
-        lambda *args, **kwargs: h._FakeCompletedProcess(
-            args=list(args), stdout="head-1\n", returncode=0
-        ),
+        lambda *args, **kwargs: h._FakeCompletedProcess(args=list(args), stdout="head-1\n", returncode=0),
     )
 
     runner = h._make_runner()
@@ -3930,8 +3615,7 @@ def test_codex_review_post_failure_clears_cached_dedup_key(
     assert runner._last_codex_review_pr is None
     assert runner._last_codex_review_head_sha is None
     assert any(
-        "Warning: failed to post @codex review on PR #42: gh rate limited"
-        in entry["event"]
+        "Warning: failed to post @codex review on PR #42: gh rate limited" in entry["event"]
         for entry in runner.state.history
     )
 
@@ -3960,12 +3644,9 @@ def test_fix_idle_timeout_kills_on_no_push(
         target.cancel()
 
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix_hangs)
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", immediate_cancel_monitor)
     monkeypatch.setattr(
-        PipelineRunner, "_monitor_fix_idle", immediate_cancel_monitor
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda *a, **kw: None,
     )
 
@@ -4015,12 +3696,9 @@ def test_fix_idle_timeout_defers_to_user_stop_after_exit(
         return None
 
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix_hangs)
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", immediate_cancel_monitor)
     monkeypatch.setattr(
-        PipelineRunner, "_monitor_fix_idle", immediate_cancel_monitor
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda *a, **kw: None,
     )
 
@@ -4067,8 +3745,7 @@ def test_fix_idle_timeout_resets_on_push(
 
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix_quick)
     monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda *a, **kw: None,
     )
 
@@ -4112,12 +3789,9 @@ def test_fix_idle_timeout_monitor_resets_on_push(
         return (0, "", "")
 
     monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix_quick)
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", monitor_with_push_then_finish)
     monkeypatch.setattr(
-        PipelineRunner, "_monitor_fix_idle", monitor_with_push_then_finish
-    )
-    monkeypatch.setattr(
-        runner_module.github_client,
-        "post_comment",
+        "src.github.comments.post_comment",
         lambda *a, **kw: None,
     )
 
@@ -4146,7 +3820,7 @@ def test_monitor_fix_idle_times_out_without_push_history(
     monkeypatch.setattr(runner, "log_event", events.append)
 
     branch_results: list[object] = [
-        fix_module.github_client.GitHubPollError("bootstrap failed"),
+        fix_module.gh_prs.GitHubPollError("bootstrap failed"),
         None,
     ]
 
@@ -4164,13 +3838,11 @@ def test_monitor_fix_idle_times_out_without_push_history(
 
     monotonic_values = iter([100.0, 105.0])
     monkeypatch.setattr(
-        fix_module.github_client,
-        "get_branch_last_push_time",
+        "src.github.prs.get_branch_last_push_time",
         fake_branch_last_push,
     )
     monkeypatch.setattr(
-        fix_module.github_client,
-        "get_last_push_age_seconds",
+        "src.github.prs.get_last_push_age_seconds",
         lambda repo, pr: None,
     )
     monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
@@ -4212,13 +3884,11 @@ def test_monitor_fix_idle_backdates_elapsed_time_from_head_age(
 
     monotonic_values = iter([100.0, 250.0])
     monkeypatch.setattr(
-        fix_module.github_client,
-        "get_branch_last_push_time",
+        "src.github.prs.get_branch_last_push_time",
         lambda repo, pr: None,
     )
     monkeypatch.setattr(
-        fix_module.github_client,
-        "get_last_push_age_seconds",
+        "src.github.prs.get_last_push_age_seconds",
         lambda repo, pr: 30.0,
     )
     monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
@@ -4258,7 +3928,7 @@ def test_monitor_fix_idle_resets_timer_on_detected_push(
         pass
 
     branch_results: list[object] = [
-        fix_module.github_client.GitHubPollError("bootstrap failed"),
+        fix_module.gh_prs.GitHubPollError("bootstrap failed"),
         50.0,
         220.0,
     ]
@@ -4282,13 +3952,11 @@ def test_monitor_fix_idle_resets_timer_on_detected_push(
 
     monotonic_values = iter([100.0, 150.0, 230.0, 250.0])
     monkeypatch.setattr(
-        fix_module.github_client,
-        "get_branch_last_push_time",
+        "src.github.prs.get_branch_last_push_time",
         fake_branch_last_push,
     )
     monkeypatch.setattr(
-        fix_module.github_client,
-        "get_last_push_age_seconds",
+        "src.github.prs.get_last_push_age_seconds",
         lambda repo, pr: None,
     )
     monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
@@ -4336,7 +4004,7 @@ def test_monitor_fix_idle_logs_poll_failures_before_timing_out(
         if fake_branch_last_push.calls == 0:
             fake_branch_last_push.calls += 1
             return None
-        raise fix_module.github_client.GitHubPollError("poll failed")
+        raise fix_module.gh_prs.GitHubPollError("poll failed")
 
     fake_branch_last_push.calls = 0
 
@@ -4348,13 +4016,11 @@ def test_monitor_fix_idle_logs_poll_failures_before_timing_out(
 
     monotonic_values = iter([100.0, 130.0])
     monkeypatch.setattr(
-        fix_module.github_client,
-        "get_branch_last_push_time",
+        "src.github.prs.get_branch_last_push_time",
         fake_branch_last_push,
     )
     monkeypatch.setattr(
-        fix_module.github_client,
-        "get_last_push_age_seconds",
+        "src.github.prs.get_last_push_age_seconds",
         lambda repo, pr: None,
     )
     monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
@@ -4425,7 +4091,7 @@ def test_poll_github_during_fix_logs_and_continues_on_exception(
 
     monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
-    monkeypatch.setattr(fix_module.github_client, "pr_state", fake_pr_state)
+    monkeypatch.setattr("src.github.prs.pr_state", fake_pr_state)
 
     async def run_loop() -> None:
         loop = asyncio.get_running_loop()
@@ -4477,7 +4143,7 @@ def test_poll_github_during_fix_continues_when_pr_remains_open(
 
     monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
-    monkeypatch.setattr(fix_module.github_client, "pr_state", fake_pr_state)
+    monkeypatch.setattr("src.github.prs.pr_state", fake_pr_state)
 
     async def run_loop() -> dict[str, str | None]:
         loop = asyncio.get_running_loop()
@@ -4524,7 +4190,7 @@ def test_poll_github_during_fix_terminates_coder_on_external_merge(
 
     monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
-    monkeypatch.setattr(fix_module.github_client, "pr_state", fake_pr_state)
+    monkeypatch.setattr("src.github.prs.pr_state", fake_pr_state)
 
     async def run_loop() -> tuple[dict[str, str | None], asyncio.Task[None]]:
         loop = asyncio.get_running_loop()
@@ -4545,10 +4211,7 @@ def test_poll_github_during_fix_terminates_coder_on_external_merge(
     assert flag == {"state": "MERGED"}
     assert terminated == [True]
     assert target.cancelled() is True
-    assert any(
-        "PR #99 reached terminal state MERGED during FIX" in e
-        for e in events
-    )
+    assert any("PR #99 reached terminal state MERGED during FIX" in e for e in events)
 
 
 def test_handle_external_terminal_pr_state_merged_resets_counters_and_marks_done(
@@ -4584,8 +4247,7 @@ def test_handle_external_terminal_pr_state_merged_resets_counters_and_marks_done
     assert runner.state.current_task is None
     assert runner.state.error_message is None
     assert any(
-        "PR #42 merged externally during FIX, returning to IDLE." in entry["event"]
-        for entry in runner.state.history
+        "PR #42 merged externally during FIX, returning to IDLE." in entry["event"] for entry in runner.state.history
     )
 
 
@@ -4622,8 +4284,7 @@ def test_handle_external_terminal_pr_state_swallows_mark_queue_done_failure(
     assert runner.state.pending_queue_sync_branch == "queue-done-pr-044"
     assert runner.state.pending_queue_sync_started_at == sync_started_at
     assert any(
-        "_mark_queue_done failed during external-merge cleanup" in entry["event"]
-        for entry in runner.state.history
+        "_mark_queue_done failed during external-merge cleanup" in entry["event"] for entry in runner.state.history
     )
 
 
@@ -4634,15 +4295,10 @@ def test_handle_external_terminal_pr_state_logs_without_pr_number(
     runner = h._make_runner()
     runner.state.current_pr = None
 
-    monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
-    )
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
     asyncio.run(runner._handle_external_terminal_pr_state("MERGED"))
     assert runner.state.state == PipelineState.IDLE
-    assert any(
-        "merged externally during FIX" in entry["event"]
-        for entry in runner.state.history
-    )
+    assert any("merged externally during FIX" in entry["event"] for entry in runner.state.history)
 
 
 def test_handle_external_terminal_pr_state_closed_logs_without_pr_number() -> None:
@@ -4651,10 +4307,7 @@ def test_handle_external_terminal_pr_state_closed_logs_without_pr_number() -> No
     runner.state.current_pr = None
     asyncio.run(runner._handle_external_terminal_pr_state("CLOSED"))
     assert runner.state.state == PipelineState.HUNG
-    assert any(
-        "closed externally during FIX" in entry["event"]
-        for entry in runner.state.history
-    )
+    assert any("closed externally during FIX" in entry["event"] for entry in runner.state.history)
 
 
 def test_handle_external_terminal_pr_state_merged_saves_success_merged_record(
@@ -4674,12 +4327,8 @@ def test_handle_external_terminal_pr_state_merged_saves_success_merged_record(
     runner.state.current_pr = PRInfo(number=91, branch="pr-091")
     runner._start_current_run_record("claude", "opus")
 
-    monkeypatch.setattr(
-        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
-    )
-    monkeypatch.setattr(
-        runner, "_compute_diff_stats", lambda base_branch: {}
-    )
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
+    monkeypatch.setattr(runner, "_compute_diff_stats", lambda base_branch: {})
 
     saved: list[str] = []
     original_save = runner._save_current_run_record
@@ -4725,9 +4374,7 @@ def test_terminate_current_coder_uses_configured_grace(
         captured_timeouts.append(timeout)
         return await original_wait_for(coro, timeout)
 
-    monkeypatch.setattr(
-        runner_module.asyncio, "wait_for", fake_wait_for
-    )
+    monkeypatch.setattr(runner_module.asyncio, "wait_for", fake_wait_for)
 
     asyncio.run(runner._terminate_current_coder())
 
@@ -4766,8 +4413,7 @@ def test_maybe_retrigger_stale_review_returns_for_missing_push_age(
     )
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_last_push_age_seconds",
+        "src.github.prs.get_last_push_age_seconds",
         lambda repo, number: None,
     )
 
@@ -4784,8 +4430,7 @@ def test_rehydrate_last_push_at_from_head_commit(
     trigger FIX on the first post-restart cycle."""
     head_iso = "2026-04-14T20:00:00Z"
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": head_iso},
     )
     runner = h._make_runner()
@@ -4805,8 +4450,7 @@ def test_rehydrate_last_push_at_no_fallback_to_last_activity(
     pending P1/P2 comment and silently skip the fix. Leaving it None
     lets handle_watch retry the rehydrate next cycle."""
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": ""},
     )
     fallback = datetime(2026, 4, 1, 10, 0, tzinfo=timezone.utc)
@@ -4825,8 +4469,7 @@ def test_rehydrate_replaces_last_push_at_on_different_pr(
     feedback on the new PR look stale."""
     head_iso = "2026-04-10T12:00:00Z"
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": head_iso},
     )
     runner = h._make_runner()
@@ -4851,8 +4494,7 @@ def test_rehydrate_clears_stale_on_mismatch_when_fetch_fails(
     meantime the None baseline lets _has_new_codex_feedback_since_last_push
     return True so one fix attempt can run."""
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": ""},
     )
     runner = h._make_runner()
@@ -4887,8 +4529,7 @@ def test_has_new_feedback_returns_true_for_any_codex_comment_after_push(
     runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [
             {
                 "user": {"login": "chatgpt-codex-bot"},
@@ -4910,8 +4551,7 @@ def test_has_new_feedback_returns_false_for_old_comments(
     runner._last_push_at = datetime(2026, 1, 1, 1, 0, 0, tzinfo=timezone.utc)
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [
             {
                 "user": {"login": "chatgpt-codex-bot"},
@@ -4932,8 +4572,7 @@ def test_has_new_feedback_normalizes_naive_timestamps(
     runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0)
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [
             {
                 "user": {"login": "chatgpt-codex-bot"},
@@ -4954,8 +4593,7 @@ def test_has_new_feedback_ignores_non_codex_users(
     runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [
             {
                 "user": {"login": "some-reviewer"},
@@ -4976,8 +4614,7 @@ def test_has_new_feedback_skips_unparseable_codex_comment(
     runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         lambda path: [
             {
                 "user": {"login": "chatgpt-codex-bot"},
@@ -5001,8 +4638,7 @@ def test_feedback_check_returns_unknown_on_api_failure(
         raise RuntimeError("GitHub API unavailable")
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "_gh_api_paginated",
+        "src.github.cache._gh_api_paginated",
         _raise,
     )
 
@@ -5100,12 +4736,15 @@ def test_verify_pushes_since_returns_false_when_remote_diverged(
     to a SHA that does not contain ``head_after`` (e.g. force-pushed
     over the FIX commit). This exercises the merge-base branch where
     the early-out shortcut against ``last_known_sha`` does not apply."""
+
     def fake_git(repo_path: str, *args: str, **kwargs: Any) -> h._FakeCompletedProcess:
         if args and args[0] == "fetch":
             return h._FakeCompletedProcess(args=["git", *args], returncode=0)
         if args[:2] == ("rev-parse", "origin/pr-190"):
             return h._FakeCompletedProcess(
-                args=["git", *args], stdout="ddd444\n", returncode=0,
+                args=["git", *args],
+                stdout="ddd444\n",
+                returncode=0,
             )
         if args[:2] == ("merge-base", "--is-ancestor"):
             return h._FakeCompletedProcess(args=["git", *args], returncode=1)
@@ -5115,7 +4754,10 @@ def test_verify_pushes_since_returns_false_when_remote_diverged(
 
     runner = h._make_runner()
     result = runner._verify_pushes_since(
-        "pr-190", "aaa111", "bbb222", context="after FIX exit",
+        "pr-190",
+        "aaa111",
+        "bbb222",
+        context="after FIX exit",
     )
 
     assert result is False

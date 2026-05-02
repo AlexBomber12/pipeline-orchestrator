@@ -43,7 +43,7 @@ class _FakeRedis:
         values = self.lists.get(key, [])
         if stop < 0:
             stop = len(values) + stop
-        self.lists[key] = values[start:stop + 1]
+        self.lists[key] = values[start : stop + 1]
 
     async def publish(self, key: str, value: str) -> int:
         return 1
@@ -128,9 +128,7 @@ def test_recover_doing_task_with_matching_pr_recovers_to_watch(
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.PENDING,
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [matching_pr]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [matching_pr])
 
     coding_called = False
 
@@ -152,8 +150,7 @@ def test_recover_doing_task_with_matching_pr_recovers_to_watch(
     assert runner.state.queue_total == 1
     assert coding_called is False
     assert any(
-        "Recovered: DOING task PR-042" in e["event"] and "WATCH PR #17" in e["event"]
-        for e in runner.state.history
+        "Recovered: DOING task PR-042" in e["event"] and "WATCH PR #17" in e["event"] for e in runner.state.history
     )
 
 
@@ -162,12 +159,16 @@ def test_recover_state_sets_queue_counters(
 ) -> None:
     """recover_state must populate queue_done and queue_total."""
     done_task = QueueTask(
-        pr_id="PR-001", title="Done", status=TaskStatus.DONE,
+        pr_id="PR-001",
+        title="Done",
+        status=TaskStatus.DONE,
         branch="pr-001-done",
     )
     doing_task = _doing_task()
     todo_task = QueueTask(
-        pr_id="PR-043", title="Todo", status=TaskStatus.TODO,
+        pr_id="PR-043",
+        title="Todo",
+        status=TaskStatus.TODO,
         branch="pr-043-todo",
     )
     matching_pr = PRInfo(
@@ -176,9 +177,7 @@ def test_recover_state_sets_queue_counters(
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.PENDING,
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [matching_pr]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [matching_pr])
 
     runner = _make_runner()
     runner._parse_base_queue = lambda **_: [done_task, doing_task, todo_task]  # type: ignore[method-assign]
@@ -194,12 +193,16 @@ def test_recover_state_publish_state_emits_progress_update(
 ) -> None:
     """Recovery should emit one progress_updated event after state save."""
     done_task = QueueTask(
-        pr_id="PR-001", title="Done", status=TaskStatus.DONE,
+        pr_id="PR-001",
+        title="Done",
+        status=TaskStatus.DONE,
         branch="pr-001-done",
     )
     doing_task = _doing_task()
     todo_task = QueueTask(
-        pr_id="PR-043", title="Todo", status=TaskStatus.TODO,
+        pr_id="PR-043",
+        title="Todo",
+        status=TaskStatus.TODO,
         branch="pr-043-todo",
     )
     matching_pr = PRInfo(
@@ -218,9 +221,7 @@ def test_recover_state_publish_state_emits_progress_update(
     ) -> None:
         published.append((repo_name, event_type, payload, redis_client))
 
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [matching_pr]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [matching_pr])
     monkeypatch.setattr(runner_module, "publish_repo_event", _fake_publish_repo_event)
 
     runner = _make_runner()
@@ -251,9 +252,7 @@ def test_recover_state_restores_pending_queue_sync_branch(
         branch="queue-done-20260419",
         last_activity=datetime(2026, 4, 19, 12, 0, tzinfo=timezone.utc),
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pending_sync]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pending_sync])
 
     runner = _make_runner()
     runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
@@ -264,10 +263,7 @@ def test_recover_state_restores_pending_queue_sync_branch(
     assert runner.state.pending_queue_sync_branch == "queue-done-20260419"
     assert runner.state.pending_queue_sync_started_at == pending_sync.last_activity
     assert runner.state.state == PipelineState.IDLE
-    assert any(
-        "Recovered pending queue-sync branch: queue-done-20260419" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("Recovered pending queue-sync branch: queue-done-20260419" in e["event"] for e in runner.state.history)
 
 
 def test_recover_state_pending_queue_sync_uses_now_when_last_activity_missing(
@@ -283,9 +279,7 @@ def test_recover_state_pending_queue_sync_uses_now_when_last_activity_missing(
             assert tz is timezone.utc
             return frozen_now
 
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [pending_sync]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pending_sync])
     monkeypatch.setattr(recovery_module, "datetime", _FrozenDateTime)
 
     runner = _make_runner()
@@ -316,9 +310,7 @@ def test_recover_state_drops_ghost_doing_entry_with_missing_task_file(
         branch="pr-999-ghost",
         task_file="tasks/PR-999.md",
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
     coding_calls: list[str] = []
 
     async def fake_coding() -> None:  # pragma: no cover - must not fire
@@ -336,10 +328,7 @@ def test_recover_state_drops_ghost_doing_entry_with_missing_task_file(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert runner.state.queue_total == 0
-    assert any(
-        "ignoring ghost QUEUE.md entry PR-999" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("ignoring ghost QUEUE.md entry PR-999" in e["event"] for e in runner.state.history)
 
 
 def test_recover_state_keeps_doing_entry_when_queue_sourced_from_origin(
@@ -363,13 +352,11 @@ def test_recover_state_keeps_doing_entry_when_queue_sourced_from_origin(
     )
     matching_pr = PRInfo(number=555, branch="pr-555-feature")
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [matching_pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda owner_repo, number: {"head_commit_date": ""},
     )
 
@@ -387,10 +374,7 @@ def test_recover_state_keeps_doing_entry_when_queue_sourced_from_origin(
     assert runner.state.current_task.pr_id == "PR-555"
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.number == 555
-    assert not any(
-        "ignoring ghost QUEUE.md entry" in e["event"]
-        for e in runner.state.history
-    )
+    assert not any("ignoring ghost QUEUE.md entry" in e["event"] for e in runner.state.history)
 
 
 def test_recover_state_uses_single_probe_for_parse_and_ghost_filter(
@@ -415,13 +399,11 @@ def test_recover_state_uses_single_probe_for_parse_and_ghost_filter(
     )
     matching_pr = PRInfo(number=777, branch="pr-777-feature")
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [matching_pr],
     )
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda owner_repo, number: {"head_commit_date": ""},
     )
 
@@ -449,18 +431,14 @@ def test_recover_state_uses_single_probe_for_parse_and_ghost_filter(
 
     assert result is True
     assert len(probe_calls) == 1, (
-        "expected a single _origin_queue_md_tracked probe shared by "
-        "the parse-source and ghost-filter decisions"
+        "expected a single _origin_queue_md_tracked probe shared by the parse-source and ghost-filter decisions"
     )
     assert len(parse_kwargs) == 1
     assert parse_kwargs[0].get("queue_from_origin") is True
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_task is not None
     assert runner.state.current_task.pr_id == "PR-777"
-    assert not any(
-        "ignoring ghost QUEUE.md entry" in e["event"]
-        for e in runner.state.history
-    )
+    assert not any("ignoring ghost QUEUE.md entry" in e["event"] for e in runner.state.history)
 
 
 def test_recover_doing_task_skipped_when_already_merged_on_origin(
@@ -477,9 +455,7 @@ def test_recover_doing_task_skipped_when_already_merged_on_origin(
     already-merged task on every daemon restart.
     """
     task = _doing_task()
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     coding_ran: list[bool] = []
 
@@ -504,14 +480,10 @@ def test_recover_doing_task_skipped_when_already_merged_on_origin(
     assert runner.state.current_task is None
     assert runner.state.current_pr is None
     assert any(
-        "ignoring stale DOING entry PR-042" in e["event"]
-        and "already merged on origin/main" in e["event"]
+        "ignoring stale DOING entry PR-042" in e["event"] and "already merged on origin/main" in e["event"]
         for e in runner.state.history
     )
-    assert not any(
-        "re-running CODING" in e["event"]
-        for e in runner.state.history
-    )
+    assert not any("re-running CODING" in e["event"] for e in runner.state.history)
 
 
 def test_recover_doing_task_without_pr_marks_canceled_and_idles(
@@ -521,9 +493,7 @@ def test_recover_doing_task_without_pr_marks_canceled_and_idles(
     must mark it CANCELED and stay IDLE rather than re-running CODING in a
     loop."""
     task = _doing_task()
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     coding_calls: list[str] = []
 
@@ -542,10 +512,7 @@ def test_recover_doing_task_without_pr_marks_canceled_and_idles(
     assert runner.state.current_pr is None
     assert runner._crashed_task_pr_ids == {"PR-042"}
     assert any(
-        e["event"].startswith(
-            "[INFRA] Task PR-042 crashed, marking CANCELED. "
-            "Manually re-upload to retry."
-        )
+        e["event"].startswith("[INFRA] Task PR-042 crashed, marking CANCELED. Manually re-upload to retry.")
         for e in runner.state.history
     )
 
@@ -568,9 +535,7 @@ def test_recover_seeds_crashed_set_from_canceled_queue_entries(
         branch="pr-042-inflight",
     )
     todo = _todo_task()
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     runner = _make_runner()
     runner._parse_base_queue = lambda **_: [canceled, todo]  # type: ignore[method-assign]
@@ -591,9 +556,7 @@ def test_recover_paused_doing_task_without_pr_defers_coding(
 ) -> None:
     """Paused recovery should discover the DOING task without restarting CODING."""
     task = _doing_task()
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     coding_calls: list[str] = []
 
@@ -622,9 +585,7 @@ def test_recover_paused_doing_task_without_pr_defers_coding(
     assert runner.state.current_task.pr_id == "PR-042"
     assert runner.state.current_pr is None
     assert any(
-        "[INFRA] Recovered: DOING task PR-042, no PR but user_paused "
-        "-> defer CODING until resume."
-        == e["event"]
+        "[INFRA] Recovered: DOING task PR-042, no PR but user_paused -> defer CODING until resume." == e["event"]
         for e in runner.state.history
     )
 
@@ -634,9 +595,7 @@ def test_recover_paused_doing_task_without_pr_errors_when_preserve_fails(
 ) -> None:
     """Paused recovery must still refuse to defer if crashed-run commits are unsafe."""
     task = _doing_task()
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     runner = _make_runner()
     runner.state.user_paused = True
@@ -661,9 +620,7 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
     crashed run must still be preserved on origin first so the work is
     not lost when the user re-uploads to retry."""
     task = _doing_task()
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     events: list[str] = []
 
@@ -673,23 +630,29 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
     def fake_run(cmd: list[str], **kwargs: Any) -> Any:
         if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
             events.append("probe")
+
             # Local branch exists.
             class R:
                 returncode = 0
                 stdout = "abc\n"
                 stderr = ""
+
             return R()
         if cmd[:2] == ["git", "push"]:
             events.append(f"push:{cmd[-1]}")
+
             class R:
                 returncode = 0
                 stdout = ""
                 stderr = ""
+
             return R()
+
         class R:
             returncode = 0
             stdout = ""
             stderr = ""
+
         return R()
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
@@ -703,10 +666,7 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
     # the work is durable on origin even when the task is CANCELED.
     assert "coding" not in events
     assert "push:pr-042-inflight:pr-042-inflight" in events
-    assert any(
-        "Preserved crashed-run commits on pr-042-inflight" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("Preserved crashed-run commits on pr-042-inflight" in e["event"] for e in runner.state.history)
     assert runner.state.state == PipelineState.IDLE
     assert "PR-042" in runner._crashed_task_pr_ids
 
@@ -718,9 +678,7 @@ def test_recover_preserve_tolerates_missing_local_branch(
     Claude's first commit), ``_preserve_crashed_run_commits`` must be a
     no-op rather than failing recovery."""
     task = _doing_task()
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     pushes: list[list[str]] = []
 
@@ -729,17 +687,21 @@ def test_recover_preserve_tolerates_missing_local_branch(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> Any:
         if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
+
             class R:
                 returncode = 1
                 stdout = ""
                 stderr = ""
+
             return R()
         if cmd[:2] == ["git", "push"]:
             pushes.append(cmd)
+
         class R:
             returncode = 0
             stdout = ""
             stderr = ""
+
         return R()
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
@@ -773,9 +735,7 @@ def test_recover_preserve_refuses_base_branch(
         status=TaskStatus.DOING,
         branch="main",  # Same as the repo's base branch.
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     pushes: list[list[str]] = []
     probes: list[list[str]] = []
@@ -789,10 +749,12 @@ def test_recover_preserve_refuses_base_branch(
             probes.append(cmd)
         if cmd[:2] == ["git", "push"]:
             pushes.append(cmd)
+
         class R:
             returncode = 0
             stdout = ""
             stderr = ""
+
         return R()
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
@@ -808,13 +770,9 @@ def test_recover_preserve_refuses_base_branch(
     assert probes == []
     assert coding_ran == [], "handle_coding must not run after refusal"
     assert runner.state.state == PipelineState.ERROR
-    assert "could not preserve crashed-run commits on 'main'" in (
-        runner.state.error_message or ""
-    )
+    assert "could not preserve crashed-run commits on 'main'" in (runner.state.error_message or "")
     assert any(
-        "Refusing to preserve crashed-run commits on base branch 'main'"
-        in e["event"]
-        for e in runner.state.history
+        "Refusing to preserve crashed-run commits on base branch 'main'" in e["event"] for e in runner.state.history
     )
 
 
@@ -826,9 +784,7 @@ def test_recover_aborts_when_preserve_push_fails(
     would let Claude reset the branch from origin/main and orphan the
     work). Stop in ERROR so an operator can intervene."""
     task = _doing_task()
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     coding_ran: list[bool] = []
 
@@ -837,19 +793,21 @@ def test_recover_aborts_when_preserve_push_fails(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> Any:
         if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
+
             class R:
                 returncode = 0
                 stdout = "abc\n"
                 stderr = ""
+
             return R()
         if cmd[:2] == ["git", "push"]:
-            raise subprocess.CalledProcessError(
-                1, cmd, stderr="auth transient"
-            )
+            raise subprocess.CalledProcessError(1, cmd, stderr="auth transient")
+
         class R:
             returncode = 0
             stdout = ""
             stderr = ""
+
         return R()
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
@@ -861,14 +819,8 @@ def test_recover_aborts_when_preserve_push_fails(
 
     assert coding_ran == [], "handle_coding must not run after preserve fail"
     assert runner.state.state == PipelineState.ERROR
-    assert "could not preserve crashed-run commits on 'pr-042-inflight'" in (
-        runner.state.error_message or ""
-    )
-    assert any(
-        "Failed to preserve unpushed commits on pr-042-inflight"
-        in e["event"]
-        for e in runner.state.history
-    )
+    assert "could not preserve crashed-run commits on 'pr-042-inflight'" in (runner.state.error_message or "")
+    assert any("Failed to preserve unpushed commits on pr-042-inflight" in e["event"] for e in runner.state.history)
 
 
 @pytest.mark.parametrize(
@@ -885,9 +837,7 @@ def test_recover_aborts_when_branch_probe_fails(
 ) -> None:
     """A failed local-branch probe must stop recovery before CODING reruns."""
     task = _doing_task()
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     coding_ran: list[bool] = []
 
@@ -926,12 +876,9 @@ def test_recover_aborts_when_branch_probe_fails(
 
     assert coding_ran == []
     assert runner.state.state == PipelineState.ERROR
-    assert "could not preserve crashed-run commits on 'pr-042-inflight'" in (
-        runner.state.error_message or ""
-    )
+    assert "could not preserve crashed-run commits on 'pr-042-inflight'" in (runner.state.error_message or "")
     assert any(
-        "Could not probe local branch pr-042-inflight" in e["event"]
-        and message_fragment in e["event"]
+        "Could not probe local branch pr-042-inflight" in e["event"] and message_fragment in e["event"]
         for e in runner.state.history
     )
 
@@ -950,9 +897,7 @@ def test_recover_no_doing_with_done_matched_pr_recovers_to_watch(
         ci_status=CIStatus.SUCCESS,
         review_status=ReviewStatus.APPROVED,
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [done_pr]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [done_pr])
 
     runner = _make_runner()
     runner._parse_base_queue = lambda **_: [done, todo]  # type: ignore[method-assign]
@@ -964,9 +909,7 @@ def test_recover_no_doing_with_done_matched_pr_recovers_to_watch(
     assert runner.state.current_task is not None
     assert runner.state.current_task.pr_id == "PR-041"
     assert any(
-        "Recovered: DONE task PR-041" in e["event"]
-        and "WATCH PR #88" in e["event"]
-        for e in runner.state.history
+        "Recovered: DONE task PR-041" in e["event"] and "WATCH PR #88" in e["event"] for e in runner.state.history
     )
 
 
@@ -992,9 +935,7 @@ def test_recover_no_doing_with_todo_matched_pr_recovers_to_watch(
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.PENDING,
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [in_flight]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [in_flight])
 
     runner = _make_runner()
     runner._parse_base_queue = lambda **_: [todo]  # type: ignore[method-assign]
@@ -1008,9 +949,7 @@ def test_recover_no_doing_with_todo_matched_pr_recovers_to_watch(
     assert runner.state.current_task.pr_id == "PR-010"
     assert runner.state.current_task.status == TaskStatus.TODO
     assert any(
-        "Recovered: TODO task PR-010" in e["event"]
-        and "WATCH PR #17" in e["event"]
-        for e in runner.state.history
+        "Recovered: TODO task PR-010" in e["event"] and "WATCH PR #17" in e["event"] for e in runner.state.history
     )
 
 
@@ -1032,9 +971,7 @@ def test_recover_unrelated_open_pr_stays_idle(
         branch="pr-050-queued",
     )
     unrelated = PRInfo(number=99, branch="dependabot/npm/foo")
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [unrelated]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [unrelated])
 
     runner = _make_runner()
     runner._parse_base_queue = lambda **_: [queued_todo]  # type: ignore[method-assign]
@@ -1043,9 +980,7 @@ def test_recover_unrelated_open_pr_stays_idle(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is None
     assert runner.state.current_task is None
-    assert any(
-        "not matched to any" in e["event"] for e in runner.state.history
-    )
+    assert any("not matched to any" in e["event"] for e in runner.state.history)
 
 
 def test_recover_attaches_only_to_done_matched_pr_among_many(
@@ -1063,8 +998,7 @@ def test_recover_attaches_only_to_done_matched_pr_among_many(
     )
     unrelated_last = PRInfo(number=202, branch="user/experiment")
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_open_prs",
+        "src.github.prs.get_open_prs",
         lambda repo, **kw: [unrelated_first, matching, unrelated_last],
     )
 
@@ -1083,9 +1017,7 @@ def test_recover_no_doing_no_prs_stays_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Clean slate: no DOING tasks and no open PRs -> stays IDLE."""
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     runner = _make_runner()
     runner._parse_base_queue = lambda **_: [_todo_task()]  # type: ignore[method-assign]
@@ -1098,14 +1030,8 @@ def test_recover_no_doing_no_prs_stays_idle(
     # The crashed-set is only populated when recovery detects a DOING task
     # without a matching PR (the crash signature).
     assert runner._crashed_task_pr_ids == set()
-    assert any(
-        "no DOING tasks, no open PRs" in e["event"]
-        for e in runner.state.history
-    )
-    assert not any(
-        "crashed, marking CANCELED" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("no DOING tasks, no open PRs" in e["event"] for e in runner.state.history)
+    assert not any("crashed, marking CANCELED" in e["event"] for e in runner.state.history)
 
 
 def test_recover_crashed_preflight_task_marks_canceled_and_idles(
@@ -1119,9 +1045,7 @@ def test_recover_crashed_preflight_task_marks_canceled_and_idles(
     so the next IDLE cycle's selector skips it instead of dispatching
     another doomed run."""
     task = _doing_task()
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     coding_calls: list[str] = []
 
@@ -1147,10 +1071,7 @@ def test_recover_crashed_preflight_task_marks_canceled_and_idles(
     # against a quiesced repo.
     assert runner.state.error_message is None
     assert any(
-        e["event"].startswith(
-            "[INFRA] Task PR-042 crashed, marking CANCELED. "
-            "Manually re-upload to retry."
-        )
+        e["event"].startswith("[INFRA] Task PR-042 crashed, marking CANCELED. Manually re-upload to retry.")
         for e in runner.state.history
     )
 
@@ -1164,16 +1085,12 @@ def test_recover_clean_slate_resets_prior_error_state(
     to IDLE and clear error_message — otherwise the runner would return
     True, run_cycle would publish the still-ERROR state, and (with
     error_handler_use_ai disabled) the queue would never progress."""
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     runner = _make_runner()
     runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
     runner.state.state = PipelineState.ERROR
-    runner.state.error_message = (
-        "recover_state: get_open_prs failed: gh api rate limited"
-    )
+    runner.state.error_message = "recover_state: get_open_prs failed: gh api rate limited"
 
     result = asyncio.run(runner.recover_state())
 
@@ -1192,9 +1109,7 @@ def test_recover_clean_slate_resets_error_with_unrelated_prs_present(
     is semantically 'no in-flight work to resume' and must restore IDLE
     from any prior ERROR state, not just the strictly empty-PR case."""
     unrelated = PRInfo(number=77, branch="dependabot/npm/foo")
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [unrelated]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [unrelated])
 
     runner = _make_runner()
     runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
@@ -1221,7 +1136,7 @@ def test_recover_get_open_prs_failure_sets_error(
     def boom(repo: str, **kw: Any) -> list[PRInfo]:
         raise RuntimeError("gh auth token expired")
 
-    monkeypatch.setattr(runner_module.github_client, "get_open_prs", boom)
+    monkeypatch.setattr("src.github.prs.get_open_prs", boom)
 
     runner = _make_runner()
     runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
@@ -1237,6 +1152,7 @@ def test_recover_state_runs_only_once_per_process(
 ) -> None:
     """run_cycle must call recover_state exactly once; subsequent cycles
     must honor the _recovered flag and skip it."""
+
     # Make ensure_repo_cloned, preflight, and handle_idle cheap no-ops so the
     # test isolates the recovery gate.
     async def noop_ensure() -> None:
@@ -1288,9 +1204,7 @@ def test_run_cycle_recovered_watch_does_not_dispatch_handle_watch(
         ci_status=CIStatus.FAILURE,
         review_status=ReviewStatus.CHANGES_REQUESTED,
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [recovered_pr]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [recovered_pr])
 
     async def noop_ensure() -> None:
         return None
@@ -1341,9 +1255,7 @@ def test_run_cycle_recovered_idle_does_not_dispatch_handle_idle(
     complicates the invariant and obscures the 'recovery cycle only
     discovers' contract. The next cycle's handle_idle will sync_to_main
     and pick up the next task normally."""
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     async def noop_ensure() -> None:
         return None
@@ -1388,9 +1300,7 @@ def test_run_cycle_dirty_tree_does_not_clobber_recovered_watch(
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.PENDING,
     )
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: [matching_pr]
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [matching_pr])
 
     async def noop_ensure() -> None:
         return None
@@ -1448,7 +1358,7 @@ def test_run_cycle_transient_discovery_failure_stays_retryable(
             raise RuntimeError("gh api rate limited")
         return [matching_pr]
 
-    monkeypatch.setattr(runner_module.github_client, "get_open_prs", probe)
+    monkeypatch.setattr("src.github.prs.get_open_prs", probe)
 
     async def noop_ensure() -> None:
         return None
@@ -1489,9 +1399,7 @@ def test_run_cycle_recovery_never_invokes_handle_coding(
     handle_coding is never called from recover_state, so a CODING crash
     cannot loop on the same task across recovery cycles."""
     task = _doing_task()
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     coding_calls: list[int] = []
 
@@ -1623,9 +1531,7 @@ def test_recover_state_local_queue_missing_falls_back_to_idle(
     and ``run_cycle`` exits before ``preflight`` can auto-reset. Instead
     recovery completes with an empty queue + IDLE so the next cycle
     runs preflight and self-heals."""
-    monkeypatch.setattr(
-        runner_module.github_client, "get_open_prs", lambda repo, **kw: []
-    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     runner = _make_runner()
     runner._parse_base_queue = lambda **_: None  # type: ignore[method-assign]
@@ -1638,10 +1544,7 @@ def test_recover_state_local_queue_missing_falls_back_to_idle(
     assert runner.state.error_message is None
     assert runner.state.current_task is None
     assert runner.state.current_pr is None
-    assert any(
-        "tasks/QUEUE.md absent in working tree" in e["event"]
-        for e in runner.state.history
-    )
+    assert any("tasks/QUEUE.md absent in working tree" in e["event"] for e in runner.state.history)
 
 
 def test_recover_state_origin_queue_read_failure_sets_error_and_returns_false(
@@ -1658,7 +1561,7 @@ def test_recover_state_origin_queue_read_failure_sets_error_and_returns_false(
         gh_calls.append(repo)
         return []
 
-    monkeypatch.setattr(runner_module.github_client, "get_open_prs", spy_gh)
+    monkeypatch.setattr("src.github.prs.get_open_prs", spy_gh)
 
     runner = _make_runner()
     runner._parse_base_queue = lambda **_: None  # type: ignore[method-assign]
@@ -1695,7 +1598,7 @@ def test_recover_state_probe_failure_errors_instead_of_walking_working_tree(
         gh_calls.append(repo)
         return []
 
-    monkeypatch.setattr(runner_module.github_client, "get_open_prs", spy_gh)
+    monkeypatch.setattr("src.github.prs.get_open_prs", spy_gh)
 
     runner = _make_runner()
     runner._parse_base_queue = fake_parse  # type: ignore[method-assign]
@@ -1707,8 +1610,7 @@ def test_recover_state_probe_failure_errors_instead_of_walking_working_tree(
     assert runner.state.state == PipelineState.ERROR
     assert "tracking probe failed" in (runner.state.error_message or "")
     assert parse_calls == [], (
-        "must not parse queue when probe is indeterminate — origin vs "
-        "working-tree decision is unsafe"
+        "must not parse queue when probe is indeterminate — origin vs working-tree decision is unsafe"
     )
     assert gh_calls == [], "must bail before probing GitHub"
 
@@ -1741,7 +1643,7 @@ def test_rehydrate_last_push_at_ignores_metadata_failure_for_new_pr(
     def boom(repo: str, number: int) -> dict[str, str]:
         raise RuntimeError("gh unavailable")
 
-    monkeypatch.setattr(runner_module.github_client, "get_pr_metadata", boom)
+    monkeypatch.setattr("src.github.prs.get_pr_metadata", boom)
 
     runner = _make_runner()
     runner._last_push_at = datetime(2026, 4, 18, 12, 0, tzinfo=timezone.utc)
@@ -1761,11 +1663,10 @@ def test_rehydrate_last_push_at_adds_utc_to_naive_timestamp(
     parsed = datetime(2026, 4, 19, 10, 15)
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, number: {"head_commit_date": "2026-04-19T10:15:00"},
     )
-    monkeypatch.setattr(runner_module.github_client, "_parse_iso", lambda iso: parsed)
+    monkeypatch.setattr("src.github.gh_runner._parse_iso", lambda iso: parsed)
 
     runner = _make_runner()
 
@@ -1783,8 +1684,7 @@ def test_rehydrate_last_push_at_keeps_existing_timestamp_when_metadata_missing(
     existing = datetime(2026, 4, 19, 9, 0, tzinfo=timezone.utc)
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, number: {"head_commit_date": ""},
     )
 
@@ -1811,20 +1711,18 @@ def test_rehydrate_last_push_at_updates_only_when_newer(
     runner._last_push_at = newer
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, number: {"head_commit_date": "2026-04-19T08:00:00+00:00"},
     )
-    monkeypatch.setattr(runner_module.github_client, "_parse_iso", lambda iso: older)
+    monkeypatch.setattr("src.github.gh_runner._parse_iso", lambda iso: older)
     runner._rehydrate_last_push_at(pr)
     assert runner._last_push_at == newer
 
     monkeypatch.setattr(
-        runner_module.github_client,
-        "get_pr_metadata",
+        "src.github.prs.get_pr_metadata",
         lambda repo, number: {"head_commit_date": "2026-04-19T12:00:00+00:00"},
     )
-    monkeypatch.setattr(runner_module.github_client, "_parse_iso", lambda iso: newer)
+    monkeypatch.setattr("src.github.gh_runner._parse_iso", lambda iso: newer)
     runner._last_push_at = older
     runner._rehydrate_last_push_at(pr)
     assert runner._last_push_at == newer

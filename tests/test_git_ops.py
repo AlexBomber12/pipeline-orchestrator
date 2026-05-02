@@ -29,15 +29,12 @@ def test_repo_owner_from_url_delegates_to_github_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        git_ops.github_client,
+        git_ops.gh_runner,
         "get_repo_full_name",
         lambda url: f"parsed:{url}",
     )
 
-    assert (
-        git_ops.repo_owner_from_url("https://github.com/octo/demo.git")
-        == "parsed:https://github.com/octo/demo.git"
-    )
+    assert git_ops.repo_owner_from_url("https://github.com/octo/demo.git") == "parsed:https://github.com/octo/demo.git"
 
 
 def test_git_runs_subprocess_with_standard_flags(
