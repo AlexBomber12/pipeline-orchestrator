@@ -1,11 +1,8 @@
 """PR-209: Branch mismatch regression tests.
 
-These tests document current behavior at 2026-05-01, not desired behavior.
-They establish a regression baseline before the BranchContext refactor
-lands so that a single canonical branch-mismatch detection path can be
-added with explicit confidence about what changes.
-
-The 4 branch concepts each test tracks:
+These tests pin the divergence-diagnostic behavior delivered by the
+PR-222 ``BranchContext`` refactor. The 4 branch concepts each test
+tracks:
 
 - ``base_branch``        — ``repo_config.branch`` (typically ``"main"``)
 - ``task_branch``        — ``QueueTask.branch`` (from the task header)
@@ -13,20 +10,16 @@ The 4 branch concepts each test tracks:
                            (``git rev-parse --abbrev-ref HEAD``)
 - ``pr_head_branch``     — ``PRInfo.branch`` (the PR head, if any)
 
-For each affected scenario, the file pairs a ``test_<scenario>``
-function (which captures today's observable state, error_message, and
-log text) with a sibling ``test_<scenario>_branch_context_diagnostic``
-function decorated with ``@pytest.mark.xfail(strict=True)``. Each
-sibling re-runs the same scenario and asserts that all four branch
-identifiers appear in the divergence diagnostic.
-
-Today every sibling fails its assertion (XFAIL). When the future
-BranchContext PR threads branch context through the affected log lines,
-each assertion will pass and ``strict`` will convert the resulting XPASS
-into a hard failure — the explicit signal to drop the xfail marker.
-This is intentionally NOT a runtime ``pytest.xfail()`` call, because
-runtime ``xfail`` reports a normal ``PASS`` when the divergence is
-fixed and would let stale guardrails linger silently.
+After PR-222, scenarios where ``BranchContext.from_runner`` can name
+all four surfaces (CODING case-A and the dirty-tree auto-recovery)
+surface them in their terminal log entry. Sibling tests with
+``@pytest.mark.xfail(strict=True)`` cover the residual gaps where one
+of the four surfaces is genuinely unreachable from
+``BranchContext`` alone (a remote branch pushed to a suffixed name
+without a PR; the open PR list visited from ``recover_state`` before
+``current_pr`` is set). Those siblings continue to XFAIL strictly so
+the day BranchContext grows to cover them, the resulting XPASS forces
+the marker to be dropped.
 """
 
 from __future__ import annotations
@@ -64,10 +57,12 @@ WRONG_BRANCH = "pr-foo-2"  # the OBS-AI scenario suffix
 FEATURE_BRANCH = "pr-bar"  # used by the dirty-tree test
 
 XFAIL_BRANCH_CONTEXT_REASON = (
-    "OBS-AI class gap, fixed in BranchContext PR. Once branch context is "
-    "threaded through the divergence diagnostic, this assertion will pass "
-    "and strict=True will convert the resulting XPASS into a hard failure, "
-    "signaling that this xfail marker should be removed."
+    "PR-222 BranchContext only surfaces ``pr_head_branch`` from "
+    "``state.current_pr.branch``; this scenario's expected value is "
+    "reachable only via a wider context surface (raw ``ls-remote`` "
+    "output or the ``recover_state`` open-PR list). The strict=True "
+    "marker stays so the day BranchContext grows to cover it the "
+    "resulting XPASS forces this marker to be dropped."
 )
 
 
@@ -285,11 +280,9 @@ def _run_dirty_tree_scenario(
 def test_coder_exit_zero_with_no_target_branch_marks_hung(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Documenting current behavior at 2026-05-01.
-
-    Scenario: ``handle_coding`` runs the coder which exits 0 but never
-    creates the task branch locally and never pushes anywhere. Neither
-    ``refs/heads/pr-foo`` nor ``origin/pr-foo`` exists.
+    """Scenario: ``handle_coding`` runs the coder which exits 0 but
+    never creates the task branch locally and never pushes anywhere.
+    Neither ``refs/heads/pr-foo`` nor ``origin/pr-foo`` exists.
 
     Branch values in this scenario:
 
@@ -298,12 +291,11 @@ def test_coder_exit_zero_with_no_target_branch_marks_hung(
     - current_git_branch  = (absent)      (no checkout occurred for pr-foo)
     - pr_head_branch      = (absent)      (no PR exists)
 
-    The runner correctly transitions to HUNG via the case-A diagnostic
-    in ``coding.py``, and ``error_message`` contains the canonical
-    "did nothing" wording. The OBS-AI gap captured by the strict-xfail
-    sibling below is that the error_message and log line do NOT name
-    the missing target branch, so a future ``BranchContext`` PR can
-    thread it through.
+    The runner transitions to HUNG via the case-A diagnostic in
+    ``coding.py`` and the ``[ESCALATE]`` log line names every surface
+    via ``BranchContext.log_summary`` so an operator can tell from a
+    single log entry which branches were known when the diagnostic
+    fired (PR-222 acceptance check).
     """
     runner = _run_coder_no_target_scenario(monkeypatch)
 
@@ -312,15 +304,12 @@ def test_coder_exit_zero_with_no_target_branch_marks_hung(
     log = _log_text(runner)
     assert "[ESCALATE]" in log
     assert "did nothing" in log
-    # base_branch is the PR target; not part of this code path's log.
-    assert BASE_BRANCH not in (runner.state.error_message or "")
 
 
-@pytest.mark.xfail(strict=True, reason=XFAIL_BRANCH_CONTEXT_REASON)
 def test_coder_exit_zero_with_no_target_branch_branch_context_diagnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Strict-xfail: BranchContext PR will name all 4 branches in [ESCALATE]."""
+    """PR-222: BranchContext threads all 4 branches through [ESCALATE]."""
     runner = _run_coder_no_target_scenario(monkeypatch)
     _assert_branch_context_in_diagnostic(
         _diagnostic_for(runner, "[ESCALATE]"),
@@ -569,12 +558,11 @@ def test_dirty_tree_on_feature_branch_resets_after_three_cycles(
     assert "Auto-recovered from dirty tree -> IDLE" in log
 
 
-@pytest.mark.xfail(strict=True, reason=XFAIL_BRANCH_CONTEXT_REASON)
 def test_dirty_tree_on_feature_branch_branch_context_diagnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Strict-xfail: BranchContext PR will name the wiped feature branch
-    and the expected task branch in the auto-recovery diagnostic."""
+    """PR-222: the auto-recovery diagnostic names the wiped feature
+    branch and the expected task branch via ``BranchContext.log_summary``."""
     runner, _ = _run_dirty_tree_scenario(monkeypatch)
     _assert_branch_context_in_diagnostic(
         _diagnostic_for(runner, "Auto-recovered from dirty tree"),

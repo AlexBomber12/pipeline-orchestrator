@@ -8,15 +8,19 @@ Mixin methods:
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 from src import github_client
+from src.branch_context import BranchContext
 from src.daemon import git_ops
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 from src.queue_parser import QueueValidationError
 from src.task_status import get_merged_pr_ids
+
+logger = logging.getLogger(__name__)
 
 
 class RecoveryMixin:
@@ -331,13 +335,18 @@ class RecoveryMixin:
                     log_prefix="[INFRA]",
                 )
                 return True
+            # Capture branch surfaces before clearing ``current_task``
+            # so the cancellation diagnostic names the task branch the
+            # crash was associated with rather than ``<absent>``.
+            ctx = BranchContext.from_runner(self)
             self._crashed_task_pr_ids.add(doing.pr_id)
             self.state.current_task = None
             self._reset_runner_local_task_counters()
             self.state.state = PipelineState.IDLE
             self.log_event(
                 f"[INFRA] Task {doing.pr_id} crashed, marking CANCELED. "
-                f"Manually re-upload to retry."
+                f"Manually re-upload to retry. "
+                f"({ctx.log_summary()})"
             )
             return True
 

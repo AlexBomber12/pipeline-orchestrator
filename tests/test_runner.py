@@ -4400,9 +4400,18 @@ def _patch_no_push_fix(
     posted: list[tuple[str, int, str]] = []
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        if cmd[:2] == ["git", "rev-parse"] and "HEAD" in cmd:
+        # ``git rev-parse HEAD`` is the no-push detection probe whose
+        # sequencing the test stitches together via ``head_seq``. The
+        # ``--abbrev-ref HEAD`` form is the BranchContext probe and
+        # must not consume from ``head_seq`` — return a stable branch
+        # name so the no-push counter sequence stays deterministic.
+        if cmd[:3] == ["git", "rev-parse", "HEAD"]:
             return _FakeCompletedProcess(
                 args=cmd, stdout=f"{head_seq()}\n", returncode=0
+            )
+        if cmd[:2] == ["git", "rev-parse"] and "--abbrev-ref" in cmd:
+            return _FakeCompletedProcess(
+                args=cmd, stdout="pr-218\n", returncode=0
             )
         if cmd[:2] == ["git", "rev-list"]:
             return _FakeCompletedProcess(args=cmd, stdout="0\n", returncode=0)
@@ -16925,11 +16934,15 @@ def test_handle_fix_counts_push_when_head_changes(
     call_count = {"n": 0}
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        if cmd[:2] == ["git", "rev-parse"] and "HEAD" in cmd:
+        if cmd[:3] == ["git", "rev-parse", "HEAD"]:
             call_count["n"] += 1
             sha = sha_before if call_count["n"] == 1 else sha_after
             return _FakeCompletedProcess(
                 args=cmd, stdout=f"{sha}\n", returncode=0
+            )
+        if cmd[:2] == ["git", "rev-parse"] and "--abbrev-ref" in cmd:
+            return _FakeCompletedProcess(
+                args=cmd, stdout="pr-050\n", returncode=0
             )
         if cmd[:2] == ["git", "rev-list"]:
             return _FakeCompletedProcess(
