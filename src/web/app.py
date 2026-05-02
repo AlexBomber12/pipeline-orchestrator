@@ -1970,7 +1970,7 @@ async def put_settings_daemon(
         return await _render_settings_daemon_error(request, str(exc), 422)
 
     try:
-        update_daemon_config(path=CONFIG_PATH, **updates)
+        refreshed_cfg = update_daemon_config(path=CONFIG_PATH, **updates)
     except ValueError as exc:
         return await _render_settings_daemon_error(request, str(exc), 422)
     except OSError as exc:
@@ -1980,7 +1980,6 @@ async def put_settings_daemon(
 
     redis_client = getattr(request.app.state, "redis", None)
     if redis_client is not None:
-        refreshed_cfg = load_config(CONFIG_PATH)
         repo_names = [
             repo_slug_from_url(repo.url) for repo in refreshed_cfg.repositories
         ]
