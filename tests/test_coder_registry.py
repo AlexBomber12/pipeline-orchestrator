@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import re
 
 import pytest
-from src.coder_registry import CoderRegistry
+from src import claude_cli, codex_cli
+from src.coder_registry import CoderPlugin, CoderRegistry
+from src.coders.claude import ClaudePlugin
+from src.coders.codex import CodexPlugin
 
 
 class DummyCoderPlugin:
@@ -30,6 +34,11 @@ class DummyCoderPlugin:
 
     def rate_limit_patterns(self) -> list[re.Pattern[str]]:
         return [re.compile("limit")]
+
+    async def diagnose_error(
+        self, repo_path: str, context: str, model: str
+    ) -> tuple[int, str, str]:
+        return (0, f"{repo_path}|{context}|{model}", "")
 
 
 def test_register_and_get() -> None:
@@ -65,3 +74,70 @@ def test_coder_names() -> None:
     registry.register(DummyCoderPlugin(name="codex", display_name="Codex"))
 
     assert registry.coder_names() == ["claude", "codex"]
+
+
+def test_protocol_includes_diagnose_error() -> None:
+    """``CoderPlugin`` declares ``diagnose_error`` and ``isinstance`` checks
+    succeed for the bundled plugins."""
+    plugin = DummyCoderPlugin(name="claude", display_name="Claude")
+    assert isinstance(plugin, CoderPlugin)
+    assert isinstance(ClaudePlugin(), CoderPlugin)
+    assert isinstance(CodexPlugin(), CoderPlugin)
+
+
+def test_claude_plugin_diagnose_error_delegates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake(
+        repo_path: str, context: str, *, model: str | None = None
+    ) -> tuple[int, str, str]:
+        captured["repo_path"] = repo_path
+        captured["context"] = context
+        captured["model"] = model
+        return (0, "FIX", "")
+
+    monkeypatch.setattr(claude_cli, "diagnose_error_async", fake)
+
+    code, stdout, stderr = asyncio.run(
+        ClaudePlugin().diagnose_error(
+            "/tmp/repo", "ci red", model="opus"
+        )
+    )
+
+    assert (code, stdout, stderr) == (0, "FIX", "")
+    assert captured == {
+        "repo_path": "/tmp/repo",
+        "context": "ci red",
+        "model": "opus",
+    }
+
+
+def test_codex_plugin_diagnose_error_delegates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake(
+        repo_path: str, context: str, *, model: str | None = None
+    ) -> tuple[int, str, str]:
+        captured["repo_path"] = repo_path
+        captured["context"] = context
+        captured["model"] = model
+        return (0, "SKIP", "")
+
+    monkeypatch.setattr(codex_cli, "diagnose_error_async", fake)
+
+    code, stdout, stderr = asyncio.run(
+        CodexPlugin().diagnose_error(
+            "/tmp/repo", "ci red", model="gpt-5.4"
+        )
+    )
+
+    assert (code, stdout, stderr) == (0, "SKIP", "")
+    assert captured == {
+        "repo_path": "/tmp/repo",
+        "context": "ci red",
+        "model": "gpt-5.4",
+    }

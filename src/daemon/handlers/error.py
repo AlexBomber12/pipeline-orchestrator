@@ -17,7 +17,6 @@ import subprocess
 from datetime import datetime, timezone
 from enum import Enum
 
-from src import claude_cli, codex_cli
 from src.daemon import git_ops
 from src.diagnosis import parse_diagnosis
 from src.models import PipelineState
@@ -177,7 +176,7 @@ class ErrorMixin:
                 "staying ERROR."
             )
             return
-        coder_name, _plugin = selected
+        coder_name, plugin = selected
         provider = (
             self._claude_usage_provider
             if coder_name == "claude"
@@ -228,14 +227,14 @@ class ErrorMixin:
             ).stdout.strip()
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             pass
-        if coder_name == "claude":
-            code, stdout, stderr = await claude_cli.diagnose_error_async(
-                self.repo_path, context, model=self.app_config.daemon.claude_model
-            )
-        else:
-            code, stdout, stderr = await codex_cli.diagnose_error_async(
-                self.repo_path, context, model=self.app_config.daemon.codex_model
-            )
+        model = (
+            self.app_config.daemon.claude_model
+            if coder_name == "claude"
+            else self.app_config.daemon.codex_model
+        )
+        code, stdout, stderr = await plugin.diagnose_error(
+            self.repo_path, context, model=model
+        )
         self._detect_rate_limit(stderr, coder_name=coder_name)
         if self.state.rate_limited_until is not None:
             self.state.state = PipelineState.PAUSED

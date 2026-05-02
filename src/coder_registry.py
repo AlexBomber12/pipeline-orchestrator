@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from src.usage import UsageProvider
 
 
+@runtime_checkable
 class CoderPlugin(Protocol):
     @property
     def name(self) -> str: ...
@@ -39,6 +40,13 @@ class CoderPlugin(Protocol):
     def create_usage_provider(self, **kwargs: Any) -> UsageProvider | None: ...
 
     def rate_limit_patterns(self) -> list[re.Pattern[str]]: ...
+
+    async def diagnose_error(
+        self,
+        repo_path: str,
+        context: str,
+        model: str,
+    ) -> tuple[int, str, str]: ...
 
 
 class CoderRegistry:
