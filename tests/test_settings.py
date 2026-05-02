@@ -16,6 +16,7 @@ from src.config import load_config
 from src.models import PipelineState, RepoState
 from src.web import app as web_app
 from src.web.app import app
+from src.web.services import auth_probe as _auth_probe
 
 
 class _StubAioredisClient:
@@ -1148,7 +1149,7 @@ def test_check_gh_auth_without_output_reports_not_configured(
     empty_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        web_app,
+        _auth_probe,
         "_run_auth_command",
         lambda *args, **kwargs: (1, "", ""),
     )
@@ -2091,3 +2092,15 @@ def test_put_repo_detail_coder_handles_missing_invalid_clear_and_write_error(
 
     assert write_error.status_code == 503
     assert "Failed to write config.yml" in write_error.text
+
+
+def test_settings_helpers_resolve_via_module_getattr() -> None:
+    """Settings helpers stay importable as ``web_app.X`` after the PR-225b split.
+
+    Tests historically reached for ``web_app._coerce_int`` and friends; the
+    helpers now live in ``src.web.routes.settings`` and are re-exported
+    through :func:`src.web.app.__getattr__`. Probing one entry per
+    ``_SETTINGS_REEXPORTS`` set keeps that proxy branch exercised.
+    """
+    assert web_app._coerce_int("3", "field", min_value=1) == 3
+    assert callable(web_app._render_settings_repo_list)

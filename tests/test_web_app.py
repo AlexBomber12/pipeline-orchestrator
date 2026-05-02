@@ -3315,3 +3315,62 @@ def test_repo_coder_selector_form_has_spinner(
     assert "Saving..." in rendered
     assert "htmx-indicator" in rendered
     assert "animate-spin" in rendered
+
+
+@pytest.mark.parametrize(
+    "route_module",
+    [
+        "src.web.routes.dashboard",
+        "src.web.routes.onboarding",
+        "src.web.routes.repo_control",
+        "src.web.routes.settings",
+        "src.web.routes.uploads",
+    ],
+)
+def test_route_module_entry_point_registers_all_routes(route_module: str) -> None:
+    """Importing any route module before ``src.web.app`` must not drop routes.
+
+    Each route module imports ``src.web.app`` to reach shared helpers. If the
+    route module is the entry point of the import (a test or tool that does
+    ``import src.web.routes.<name>`` first), Python returns the partial route
+    module to ``app.py``'s ``from src.web.routes import <name> as ...`` line
+    while the route module's ``@router`` decorators have not yet run.
+    FastAPI snapshots ``router.routes`` at ``app.include_router`` time, so a
+    naive early import would silently strip every endpoint declared after the
+    import. Guard via subprocess so each entry point starts with a fresh
+    ``sys.modules``.
+    """
+    import subprocess
+    import sys
+
+    script = (
+        f"import {route_module}\n"
+        "from src.web.app import app\n"
+        "import json, sys\n"
+        "json.dump(sorted({getattr(r, 'path', '') for r in app.routes}), sys.stdout)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    paths = set(json.loads(proc.stdout))
+
+    baseline_script = (
+        "from src.web.app import app\n"
+        "import json, sys\n"
+        "json.dump(sorted({getattr(r, 'path', '') for r in app.routes}), sys.stdout)\n"
+    )
+    baseline_proc = subprocess.run(
+        [sys.executable, "-c", baseline_script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    baseline = set(json.loads(baseline_proc.stdout))
+
+    assert paths == baseline, (
+        f"{route_module} as entry point produced different routes than baseline: "
+        f"missing={baseline - paths}, extra={paths - baseline}"
+    )
