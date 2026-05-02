@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from src.usage import UsageProvider
+
+if TYPE_CHECKING:
+    from src.config import DaemonConfig
 
 
 @runtime_checkable
@@ -68,6 +71,26 @@ class CoderPlugin(Protocol):
         context: str,
         model: str,
     ) -> tuple[int, str, str]: ...
+
+    def build_run_kwargs(
+        self,
+        *,
+        daemon_config: "DaemonConfig",
+        breach_dir: str | None = None,
+        breach_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Construct plugin-specific kwargs for run_planned_pr / fix_review.
+
+        Returns the model selection plus any plugin-specific extras
+        (e.g. breach monitoring inputs for plugins that support the
+        breach lifecycle). Handlers compose handler-specific keys
+        (timeout, on_process_start, extra_context) on top of the
+        returned dict and pass the merged mapping via ``**kwargs`` to
+        ``run_planned_pr`` / ``fix_review``. Plugins that ignore the
+        breach inputs (``supports_breach_lifecycle`` False) silently
+        drop them so callers can pass them unconditionally.
+        """
+        ...
 
 
 class CoderRegistry:

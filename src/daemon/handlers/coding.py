@@ -79,11 +79,10 @@ class CodingMixin:
         current_pr_id = self.state.current_task.pr_id if self.state.current_task is not None else None
         await self._refresh_auth_status_cache()
         coder_name, plugin = self._get_coder()
-        model = (
-            self.app_config.daemon.codex_model
-            if coder_name == "codex"
-            else self.app_config.daemon.claude_model
+        plugin_run_kwargs = plugin.build_run_kwargs(
+            daemon_config=self.app_config.daemon,
         )
+        model = plugin_run_kwargs["model"]
         self._start_current_run_record(coder_name, model)
         if not await self._check_rate_limit(proactive_coder=coder_name):
             await self._save_current_run_record("rate_limit")
@@ -106,18 +105,16 @@ class CodingMixin:
         breach_flag: dict[str, bool] = {"breached": False}
 
         heartbeat = asyncio.create_task(self._publish_while_waiting("CODING"))
+        plugin_run_kwargs = plugin.build_run_kwargs(
+            daemon_config=self.app_config.daemon,
+            breach_dir=breach_dir,
+            breach_run_id=breach_run_id,
+        )
         coder_kwargs: dict[str, object] = {
-            "model": model,
+            **plugin_run_kwargs,
             "timeout": self.app_config.daemon.planned_pr_timeout_sec,
             "on_process_start": self._track_current_coder_process,
         }
-        if plugin.supports_breach_lifecycle:
-            coder_kwargs.update(
-                breach_dir=breach_dir,
-                breach_run_id=breach_run_id,
-                session_threshold=self.app_config.daemon.rate_limit_session_pause_percent,
-                weekly_threshold=self.app_config.daemon.rate_limit_weekly_pause_percent,
-            )
         cli_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
             plugin.run_planned_pr(
                 self.repo_path,

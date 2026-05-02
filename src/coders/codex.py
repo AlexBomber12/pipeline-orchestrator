@@ -6,11 +6,14 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from src import codex_cli
 from src.config import AppConfig, load_config
 from src.usage import OpenAIUsageProvider, UsageProvider
+
+if TYPE_CHECKING:
+    from src.config import DaemonConfig
 
 CONFIG_PATH = os.environ.get("PO_CONFIG_PATH", "config.yml")
 _AUTH_CHECK_TIMEOUT_SEC = 5
@@ -187,3 +190,15 @@ class CodexPlugin:
             context,
             model=model,
         )
+
+    def build_run_kwargs(
+        self,
+        *,
+        daemon_config: "DaemonConfig",
+        breach_dir: str | None = None,
+        breach_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        # breach inputs are accepted for Protocol uniformity but ignored —
+        # supports_breach_lifecycle is False, so the plugin emits no
+        # breach kwargs even when callers pass them unconditionally.
+        return {"model": daemon_config.codex_model}

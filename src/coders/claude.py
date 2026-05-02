@@ -6,11 +6,14 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from src import claude_cli
 from src.config import AppConfig, load_config
 from src.usage import OAuthUsageProvider, UsageProvider
+
+if TYPE_CHECKING:
+    from src.config import DaemonConfig
 
 CONFIG_PATH = os.environ.get("PO_CONFIG_PATH", "config.yml")
 _AUTH_CHECK_TIMEOUT_SEC = 5
@@ -137,3 +140,22 @@ class ClaudePlugin:
             context,
             model=model,
         )
+
+    def build_run_kwargs(
+        self,
+        *,
+        daemon_config: "DaemonConfig",
+        breach_dir: str | None = None,
+        breach_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"model": daemon_config.claude_model}
+        if breach_dir is not None and breach_run_id is not None:
+            kwargs["breach_dir"] = breach_dir
+            kwargs["breach_run_id"] = breach_run_id
+            kwargs["session_threshold"] = (
+                daemon_config.rate_limit_session_pause_percent
+            )
+            kwargs["weekly_threshold"] = (
+                daemon_config.rate_limit_weekly_pause_percent
+            )
+        return kwargs

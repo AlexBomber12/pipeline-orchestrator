@@ -29,9 +29,8 @@ from fastapi import FastAPI, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
+from src.coder_registry import CoderPlugin
 from src.coders import build_coder_registry
-from src.coders.claude import ClaudePlugin
-from src.coders.codex import CodexPlugin
 from src.config import (
     AppConfig,
     DaemonConfig,
@@ -626,7 +625,7 @@ def _validate_coder_model(
     model: str,
     *,
     field_name: str,
-    plugin: ClaudePlugin | CodexPlugin,
+    plugin: CoderPlugin,
     default_model: str | None = None,
 ) -> str:
     """Return a supported model value for ``plugin``."""
@@ -1953,19 +1952,21 @@ async def put_settings_daemon(
             if coder not in ("claude", "codex"):
                 raise ValueError("coder must be 'claude' or 'codex'")
             updates["coder"] = coder
-        if claude_model is not None:
-            updates["claude_model"] = _validate_coder_model(
-                claude_model,
-                field_name="claude_model",
-                plugin=ClaudePlugin(),
-                default_model=DaemonConfig().claude_model,
-            )
-        if codex_model is not None:
-            updates["codex_model"] = _validate_coder_model(
-                codex_model,
-                field_name="codex_model",
-                plugin=CodexPlugin(),
-            )
+        if claude_model is not None or codex_model is not None:
+            registry = build_coder_registry()
+            if claude_model is not None:
+                updates["claude_model"] = _validate_coder_model(
+                    claude_model,
+                    field_name="claude_model",
+                    plugin=registry.get("claude"),
+                    default_model=DaemonConfig().claude_model,
+                )
+            if codex_model is not None:
+                updates["codex_model"] = _validate_coder_model(
+                    codex_model,
+                    field_name="codex_model",
+                    plugin=registry.get("codex"),
+                )
     except ValueError as exc:
         return await _render_settings_daemon_error(request, str(exc), 422)
 
@@ -2049,12 +2050,16 @@ def _first_probe_line(text: str) -> str:
 
 def _check_claude_auth() -> dict[str, str]:
     """Probe the ``claude`` CLI and report its authorization status."""
-    return ClaudePlugin().check_auth(config_path=CONFIG_PATH)
+    return build_coder_registry().get("claude").check_auth(
+        config_path=CONFIG_PATH
+    )
 
 
 def _check_codex_auth() -> dict[str, str]:
     """Probe the ``codex`` CLI and report its authorization status."""
-    return CodexPlugin().check_auth(config_path=CONFIG_PATH)
+    return build_coder_registry().get("codex").check_auth(
+        config_path=CONFIG_PATH
+    )
 
 
 def _check_gh_auth() -> dict[str, str]:
