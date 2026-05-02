@@ -19,6 +19,7 @@ from enum import Enum
 
 from src import claude_cli, codex_cli
 from src.daemon import git_ops
+from src.diagnosis import parse_diagnosis
 from src.models import PipelineState
 from src.retry import retry_transient
 
@@ -252,7 +253,7 @@ class ErrorMixin:
             return
 
         summary = stdout.strip().splitlines()[-1] if stdout.strip() else ""
-        verdict = claude_cli.parse_diagnosis(stdout)
+        verdict = parse_diagnosis(stdout)
         dirty = ""
         try:
             dirty = git_ops._git(self.repo_path, "status", "--porcelain").stdout.strip()
