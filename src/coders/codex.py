@@ -163,3 +163,15 @@ class CodexPlugin:
 
     def rate_limit_patterns(self) -> list[re.Pattern[str]]:
         return [_CODEX_RETRY_PATTERN, _CODEX_USAGE_LIMIT_PATTERN]
+
+    async def diagnose_error(
+        self,
+        repo_path: str,
+        context: str,
+        model: str,
+    ) -> tuple[int, str, str]:
+        return await codex_cli.diagnose_error_async(
+            repo_path,
+            context,
+            model=model,
+        )

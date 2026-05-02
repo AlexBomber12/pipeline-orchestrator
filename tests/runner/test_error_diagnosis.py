@@ -40,6 +40,21 @@ from tests import test_runner as h
 claude_cli = claude_plugin_module.claude_cli
 
 
+def _patch_plugin_diagnose(
+    monkeypatch: pytest.MonkeyPatch,
+    runner: Any,
+    coder_name: str,
+    result: tuple[int, str, str],
+) -> None:
+    """Replace plugin.diagnose_error on the runner's registry."""
+    plugin = runner._registry.get(coder_name)
+
+    async def _fn(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        return result
+
+    monkeypatch.setattr(plugin, "diagnose_error", _fn)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -248,18 +263,9 @@ def test_diagnose_skip_clears_task_pr_error_and_returns_idle(
     both ``current_task`` and ``current_pr`` before returning to IDLE so
     the next cycle re-selects a task from scratch.
     """
-    monkeypatch.setattr(
-        claude_cli,
-        "diagnose_error_async",
-        h._async_cli_result(0, "SKIP", ""),
-    )
-    monkeypatch.setattr(
-        codex_cli,
-        "diagnose_error_async",
-        h._async_cli_result(0, "SKIP", ""),
-    )
-
     runner = h._make_runner()
+    _patch_plugin_diagnose(monkeypatch, runner, "claude", (0, "SKIP", ""))
+    _patch_plugin_diagnose(monkeypatch, runner, "codex", (0, "SKIP", ""))
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "boom"
     runner.state.current_task = QueueTask(
@@ -293,17 +299,6 @@ def test_diagnose_fix_clears_error_and_returns_idle(
     ``error_message`` is cleared because the diagnosis itself is the
     resolution attempt for the original error.
     """
-    monkeypatch.setattr(
-        claude_cli,
-        "diagnose_error_async",
-        h._async_cli_result(0, "FIX\nrepair config", ""),
-    )
-    monkeypatch.setattr(
-        codex_cli,
-        "diagnose_error_async",
-        h._async_cli_result(0, "FIX\nrepair config", ""),
-    )
-
     task = QueueTask(
         pr_id="PR-002",
         title="active task",
@@ -312,6 +307,12 @@ def test_diagnose_fix_clears_error_and_returns_idle(
     pr = PRInfo(number=99, branch="pr-002-feature")
 
     runner = h._make_runner()
+    _patch_plugin_diagnose(
+        monkeypatch, runner, "claude", (0, "FIX\nrepair config", "")
+    )
+    _patch_plugin_diagnose(
+        monkeypatch, runner, "codex", (0, "FIX\nrepair config", "")
+    )
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "boom"
     runner.state.current_task = task
@@ -445,3 +446,93 @@ def test_error_diagnose_policy_threshold_fires_after_count_exceeds_three() -> No
         in entry["event"]
         for entry in runner.state.history
     )
+
+
+# ---------------------------------------------------------------------------
+# PR-221 — handle_error dispatches to plugin.diagnose_error via the registry
+# ---------------------------------------------------------------------------
+
+
+def test_handle_error_dispatches_to_codex_plugin_when_codex_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the auxiliary coder is Codex, ``plugin.diagnose_error`` of the
+    Codex plugin is invoked — Claude's plugin is not.
+
+    Establishes that ``error.py`` no longer branches on ``coder_name`` to
+    pick the diagnosis CLI: dispatch flows through the plugin contract,
+    so the active coder's plugin alone is consulted.
+    """
+    runner = h._make_runner()
+    claude_plugin = runner._registry.get("claude")
+    codex_plugin = runner._registry.get("codex")
+
+    claude_calls: list[tuple[str, str, str]] = []
+    codex_calls: list[tuple[str, str, str]] = []
+
+    async def claude_diag(
+        repo_path: str, context: str, model: str
+    ) -> tuple[int, str, str]:
+        claude_calls.append((repo_path, context, model))
+        return (0, "SKIP", "")
+
+    async def codex_diag(
+        repo_path: str, context: str, model: str
+    ) -> tuple[int, str, str]:
+        codex_calls.append((repo_path, context, model))
+        return (0, "SKIP", "")
+
+    monkeypatch.setattr(claude_plugin, "diagnose_error", claude_diag)
+    monkeypatch.setattr(codex_plugin, "diagnose_error", codex_diag)
+    runner._get_auxiliary_coder = lambda: ("codex", codex_plugin)
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+
+    asyncio.run(runner.handle_error())
+
+    assert codex_calls and codex_calls[0][1] == "boom"
+    assert codex_calls[0][2] == runner.app_config.daemon.codex_model
+    assert claude_calls == []
+
+
+def test_handle_error_dispatches_to_third_coder_plugin_without_handler_edits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hypothetical third coder plugin is dispatched correctly without
+    any edits to ``error.py``.
+
+    Verifies the Protocol contract: ``handle_error`` takes whatever
+    plugin ``_get_auxiliary_coder`` returns and calls
+    ``plugin.diagnose_error`` on it. Adding a new coder requires
+    implementing the method on its plugin and registering it; no
+    handler change is needed.
+    """
+
+    class _ThirdCoderPlugin:
+        name = "third"
+        display_name = "Third Coder"
+        models = ["m1"]
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, str]] = []
+
+        async def diagnose_error(
+            self, repo_path: str, context: str, model: str
+        ) -> tuple[int, str, str]:
+            self.calls.append((repo_path, context, model))
+            return (0, "FIX\nsynthetic", "")
+
+    third = _ThirdCoderPlugin()
+
+    runner = h._make_runner()
+    runner._registry.register(third)  # type: ignore[arg-type]
+    runner._get_auxiliary_coder = lambda: ("third", third)
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom from third"
+
+    asyncio.run(runner.handle_error())
+
+    assert third.calls and third.calls[0][1] == "boom from third"
+    # FIX verdict transitions back to IDLE.
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None

@@ -113,3 +113,15 @@ class ClaudePlugin:
 
     def rate_limit_patterns(self) -> list[re.Pattern[str]]:
         return [_ANTHROPIC_RATE_LIMIT_PATTERN]
+
+    async def diagnose_error(
+        self,
+        repo_path: str,
+        context: str,
+        model: str,
+    ) -> tuple[int, str, str]:
+        return await claude_cli.diagnose_error_async(
+            repo_path,
+            context,
+            model=model,
+        )
