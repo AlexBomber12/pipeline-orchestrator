@@ -1,4 +1,13 @@
-"""Wrapper around the `gh` CLI for reading PR state and performing PR actions."""
+"""Partial shim during PR-226a→PR-226b migration.
+
+Foundation, PR-list, CI-checks, and review-status code now lives in
+``src.github.*`` (PR-226a). The remaining four domains — reactions
+(``_get_codex_issue_reactions``), comments (``post_comment``,
+``get_latest_codex_feedback``, ``has_recent_codex_review_request``),
+rate-limit (``fetch_rate_limit_*``), and ETag cache primitives — still
+live here and will move in PR-226b. Existing ``from src.github_client``
+imports remain valid for the entire migration window.
+"""
 
 from __future__ import annotations
 
@@ -8,54 +17,33 @@ import json
 import logging
 import re
 import subprocess
-import time
+import time  # noqa: F401 — submodules look up time.monotonic via this binding so test patches on src.github_client.time.monotonic flow through.
 from datetime import datetime, timezone
-from urllib.parse import quote
 
 from src.daemon.github_rate_limit import RateLimitBudget, read_budget
-from src.models import CIStatus, PRInfo, ReviewStatus
-from src.retry import is_transient_error, retry_transient
+
+# ===== Foundation re-exports (src.github.gh_runner) =====
+from src.github.gh_runner import (  # noqa: F401
+    _REPO_URL_RE,
+    _extract_commit_date,
+    _extract_head_sha,
+    _is_http_404_error,
+    _parse_iso,
+    get_repo_full_name,
+    run_gh,
+)
+from src.models import CIStatus, PRInfo, ReviewStatus  # noqa: F401 — re-exported for callers
+from src.retry import (  # noqa: F401 — re-exported so submodules and tests reach them through src.github_client
+    is_transient_error,
+    retry_transient,
+)
 
 logger = logging.getLogger(__name__)
 
-_REPO_URL_RE = re.compile(
-    r"github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"
-)
-CODEX_BOT_LOGIN_PATTERN = re.compile(
-    r"codex", re.IGNORECASE
-)
-_CODEX_ONBOARDING_TEXT = "create a Codex account and connect to github"
-
-_review_status_cache: dict[str, "ReviewStatus"] = {}
-_review_status_cache_cycle: int | None = None
-
 _REVIEW_FEEDBACK_TRUNCATE_CHARS = 5000
 
-_last_known_sha: dict[str, str] = {}
-_merged_prs_cache: dict[tuple[str, str], tuple[float, list["PRInfo"]]] = {}
-_MERGED_PRS_CACHE_TTL_SECONDS = 60.0
-
-#: Per-(repo, sha) cache for the REST CI status fetch. The two REST calls
-#: (``commits/{sha}/check-runs`` + ``commits/{sha}/status``) are the dominant
-#: REST consumer in the daemon poll loop now that ``statusCheckRollup`` has
-#: been removed. With ``poll_interval_sec`` as low as 2s in the e2e config,
-#: refetching on every cycle exhausts the 5000/hour REST budget within
-#: minutes — even one open PR at 2s polling burns 3600 calls/hour. The
-#: cache key embeds ``head_sha`` so a new push immediately invalidates the
-#: prior result; CI transitions on the same SHA are observed within
-#: ``_CI_STATUS_CACHE_TTL_SECONDS`` of when GitHub publishes them, which is
-#: well under the typical CI run length.
+# ===== ETag cache primitives (still here, move in PR-226b) =====
 #:
-#: Expired entries are swept on every write (i.e. on every cache miss).
-#: Without that sweep the cache grows by one entry per push for every
-#: watched repo — long-running daemons would retain full check-run
-#: payloads for SHAs that will never be queried again. Sweeping on write
-#: keeps the resident set ~O(unique SHAs queried within one TTL window).
-_ci_status_cache: dict[
-    tuple[str, str], tuple[float, list[dict], dict, bool]
-] = {}
-_CI_STATUS_CACHE_TTL_SECONDS = 15.0
-
 #: In-memory ETag cache for single-resource REST GET helpers. Keyed by the
 #: ``gh api`` path (the same string passed to ``_etag_get``); the value is
 #: ``(etag, parsed_payload)``. Sending ``If-None-Match`` on a cached path
@@ -218,956 +206,6 @@ def _etag_get_no_cache(path: str) -> object:
     return payload
 
 
-def _evict_expired_ci_status_cache(now: float) -> None:
-    """Drop ``_ci_status_cache`` entries older than the TTL.
-
-    Called from the cache-miss write path so the working set is bounded
-    by the number of unique SHAs polled within a single TTL window
-    rather than growing once per push for every watched repo.
-    """
-    expired = [
-        key
-        for key, entry in _ci_status_cache.items()
-        if (now - entry[0]) >= _CI_STATUS_CACHE_TTL_SECONDS
-    ]
-    for key in expired:
-        _ci_status_cache.pop(key, None)
-
-
-def _is_http_404_error(exc: RuntimeError) -> bool:
-    return ("HTTP" + " 404") in str(exc)
-
-
-def _should_degrade_reactions_error(exc: RuntimeError) -> bool:
-    return _is_http_404_error(exc) or is_transient_error(exc)
-
-
-def _cache_key(repo: str, pr_number: int, head_sha: str) -> str:
-    return f"{repo}#{pr_number}#{head_sha}"
-
-
-def clear_review_status_cache() -> None:
-    """Clear the review status cache (used in tests)."""
-    global _review_status_cache_cycle
-    _review_status_cache.clear()
-    _review_status_cache_cycle = None
-
-
-def clear_merged_prs_cache() -> None:
-    """Clear merged PR lookup cache (used in tests)."""
-    _merged_prs_cache.clear()
-
-
-def clear_ci_status_cache() -> None:
-    """Clear the REST CI status cache (used in tests)."""
-    _ci_status_cache.clear()
-
-
-def _begin_review_cache_cycle() -> None:
-    """Start a new cache cycle, invalidating all previous entries."""
-    global _review_status_cache_cycle
-    _review_status_cache.clear()
-    if _review_status_cache_cycle is None:
-        _review_status_cache_cycle = 0
-    _review_status_cache_cycle += 1
-
-
-def _is_codex_user(user_dict: dict | None) -> bool:
-    """Return True if the GitHub user object represents a Codex bot."""
-    if not isinstance(user_dict, dict):
-        return False
-    login = user_dict.get("login", "") or ""
-    return bool(CODEX_BOT_LOGIN_PATTERN.search(login))
-
-
-def _is_codex_onboarding_comment(comment: dict) -> bool:
-    """Return True for Codex connector setup guidance, not review feedback."""
-    body = comment.get("body") or ""
-    return _CODEX_ONBOARDING_TEXT.lower() in body.lower()
-
-
-def _is_reaction_content(reaction: dict, content: str) -> bool:
-    """Return True when a reaction matches an exact content from Codex."""
-    if not isinstance(reaction, dict):
-        return False
-    if reaction.get("content") != content:
-        return False
-    return _is_codex_user(reaction.get("user"))
-
-
-def _is_plus_one(reaction: dict) -> bool:
-    """Return True if the reaction is exactly +1 from a Codex user."""
-    return _is_reaction_content(reaction, "+1")
-
-
-def extract_queue_pr_id(subject: str) -> str | None:
-    """Return the canonical queue PR id from a title/subject prefix."""
-    match = re.match(r"^(PR-[A-Za-z0-9_.-]+):(?:\s|$)", subject.strip())
-    if match is None:
-        return None
-    return match.group(1)
-
-
-def run_gh(
-    args: list[str],
-    repo: str | None = None,
-    timeout: int = 30,
-) -> dict | list | str:
-    """Run `gh` with the given arguments and return parsed output.
-
-    If ``repo`` is provided, ``-R <repo>`` is appended. The command's stdout is
-    parsed as JSON when possible; otherwise the raw stripped string is returned.
-    A non-zero exit raises ``RuntimeError`` with stderr.
-    """
-    cmd: list[str] = ["gh", *args]
-    if repo:
-        cmd.extend(["-R", repo])
-
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"gh {' '.join(args)} failed (exit {result.returncode}): "
-            f"{result.stderr.strip()}"
-        )
-
-    stdout = result.stdout.strip()
-    if not stdout:
-        return ""
-
-    try:
-        return json.loads(stdout)
-    except json.JSONDecodeError:
-        return stdout
-
-
-def get_repo_full_name(url: str) -> str:
-    """Extract ``owner/repo`` from a GitHub URL.
-
-    Accepts ``https://github.com/owner/repo``, ``...repo.git``, ``...repo/``,
-    and ``git@github.com:owner/repo.git``.
-    """
-    match = _REPO_URL_RE.search(url.strip())
-    if not match:
-        raise ValueError(f"Not a recognizable GitHub URL: {url!r}")
-    return f"{match.group('owner')}/{match.group('repo')}"
-
-
-def get_open_prs(
-    repo: str,
-    allow_merge_without_checks: bool = False,
-) -> list[PRInfo]:
-    """Return open PRs for ``repo`` (``owner/repo``) with CI and review status."""
-    _begin_review_cache_cycle()
-    try:
-        raw = run_gh(
-            [
-                "pr",
-                "list",
-                "--state",
-                "open",
-                "--json",
-                "number,title,headRefName,headRefOid,url,updatedAt,commits,author,isCrossRepository,labels",
-            ],
-            repo=repo,
-        )
-    except RuntimeError as exc:
-        if "GraphQL: API rate limit" not in str(exc):
-            raise
-        logger.warning(
-            "gh pr list GraphQL rate-limited for %s; falling back to REST", repo
-        )
-        return _get_open_prs_rest(
-            repo,
-            allow_merge_without_checks=allow_merge_without_checks,
-        )
-    if not isinstance(raw, list):
-        return []
-
-    prs: list[PRInfo] = []
-    for entry in raw:
-        number = int(entry.get("number", 0))
-        if not number:
-            continue
-        commits = entry.get("commits") or []
-        head_sha = entry.get("headRefOid", "")
-        title = entry.get("title", "")
-        check_runs, status_payload, fetch_ok = _fetch_ci_status_rest(
-            repo, head_sha
-        )
-        prs.append(
-            PRInfo(
-                number=number,
-                branch=entry.get("headRefName", ""),
-                title=title,
-                pr_id=extract_queue_pr_id(title),
-                ci_status=_map_rest_ci_status_to_enum(
-                    check_runs,
-                    status_payload,
-                    empty_is_success=allow_merge_without_checks,
-                    fetch_ok=fetch_ok,
-                ),
-                review_status=get_pr_review_status(
-                    repo,
-                    number,
-                    pr_author=(entry.get("author") or {}).get("login", ""),
-                    head_sha=head_sha,
-                ),
-                commits_count=len(commits),
-                push_count=1 if head_sha else 0,
-                observed_head_shas={head_sha} if head_sha else set(),
-                url=entry.get("url", ""),
-                last_activity=_parse_iso(entry.get("updatedAt")),
-                is_escalated=any(
-                    isinstance(label, dict)
-                    and (label.get("name") or "").lower() == "escalated"
-                    for label in (entry.get("labels") or [])
-                ),
-                is_cross_repository=bool(entry.get("isCrossRepository", False)),
-            )
-        )
-    return prs
-
-
-def _get_open_prs_rest(
-    repo: str,
-    *,
-    allow_merge_without_checks: bool,
-) -> list[PRInfo]:
-    """Return open PRs via REST when GraphQL status rollup is unavailable."""
-    raw = _gh_api_paginated(f"repos/{repo}/pulls?state=open&per_page=100")
-    if raw is None:
-        return []
-
-    prs: list[PRInfo] = []
-    for entry in raw:
-        number = int(entry.get("number", 0))
-        if not number:
-            continue
-        head = entry.get("head") or {}
-        user = entry.get("user") or {}
-        title = entry.get("title", "")
-        head_sha = head.get("sha", "")
-        labels = entry.get("labels") or []
-        prs.append(
-            PRInfo(
-                number=number,
-                branch=head.get("ref", ""),
-                title=title,
-                pr_id=extract_queue_pr_id(title),
-                ci_status=(
-                    CIStatus.SUCCESS
-                    if allow_merge_without_checks
-                    else CIStatus.PENDING
-                ),
-                review_status=get_pr_review_status(
-                    repo,
-                    number,
-                    pr_author=user.get("login", ""),
-                    head_sha=head_sha,
-                ),
-                commits_count=1 if head_sha else 0,
-                push_count=1 if head_sha else 0,
-                observed_head_shas={head_sha} if head_sha else set(),
-                url=entry.get("html_url", ""),
-                last_activity=_parse_iso(entry.get("updated_at")),
-                is_escalated=any(
-                    isinstance(label, dict)
-                    and (label.get("name") or "").lower() == "escalated"
-                    for label in labels
-                ),
-                is_cross_repository=bool(head.get("repo", {}).get("fork", False)),
-            )
-        )
-    return prs
-
-
-def get_merged_prs(
-    repo: str,
-    base_branch: str | None = None,
-    *,
-    refresh: bool = False,
-) -> list[PRInfo]:
-    """Return merged PRs for ``repo``.
-
-    This is a best-effort fallback used by queue status derivation when
-    merged work can no longer be inferred from local git history alone
-    (for example after squash-merging with a custom title). If GitHub
-    cannot be queried, return an empty list and let callers fall back to
-    their local heuristics.
-    """
-    cache_key = (repo, base_branch or "")
-    cached = _merged_prs_cache.get(cache_key)
-    now = time.monotonic()
-    if (
-        not refresh
-        and cached is not None
-        and (now - cached[0]) < _MERGED_PRS_CACHE_TTL_SECONDS
-    ):
-        return list(cached[1])
-
-    path = f"repos/{repo}/pulls?state=closed&per_page=100"
-    if base_branch:
-        path = (
-            f"repos/{repo}/pulls?state=closed"
-            f"&base={quote(base_branch, safe='')}&per_page=100"
-        )
-
-    raw = _gh_api_paginated(path)
-    if raw is None:
-        raise RuntimeError(
-            f"gh api repos/{repo}/pulls returned unexpected payload"
-        )
-
-    prs: list[PRInfo] = []
-    for entry in raw:
-        if entry.get("merged_at") in (None, ""):
-            continue
-        base = entry.get("base") or {}
-        if base_branch and base.get("ref") != base_branch:
-            continue
-        number = int(entry.get("number", 0))
-        if not number:
-            continue
-        title = entry.get("title", "")
-        head = entry.get("head") or {}
-        head_repo = head.get("repo")
-        if not isinstance(head_repo, dict):
-            head_repo = {}
-        prs.append(
-            PRInfo(
-                number=number,
-                branch=head.get("ref", ""),
-                title=title,
-                pr_id=extract_queue_pr_id(title),
-                url="",
-                is_cross_repository=bool(head_repo.get("fork", False)),
-                last_activity=_parse_iso(entry.get("merged_at")),
-            )
-        )
-    _merged_prs_cache[cache_key] = (now, prs)
-    return list(prs)
-
-
-def pr_state(repo: str, pr_number: int) -> dict[str, str | None] | None:
-    """Return the PR's terminal state markers, or ``None`` on lookup failure.
-
-    Returned dict shape: ``{"state": str, "mergedAt": str|None, "closedAt": str|None}``
-    where ``state`` is the GitHub-normalized ``"OPEN"``, ``"CLOSED"``, or
-    ``"MERGED"``. Used by the FIX-cycle polling task to detect external
-    merge or close events while a coder process is running.
-    """
-    try:
-        raw = run_gh(
-            [
-                "pr",
-                "view",
-                str(pr_number),
-                "--json",
-                "state,mergedAt,closedAt",
-            ],
-            repo=repo,
-        )
-    except (RuntimeError, subprocess.TimeoutExpired, OSError):
-        return None
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except json.JSONDecodeError:
-            return None
-    if not isinstance(raw, dict):
-        return None
-    state = raw.get("state")
-    if not isinstance(state, str):
-        return None
-    merged_at = raw.get("mergedAt") if isinstance(raw.get("mergedAt"), str) else None
-    closed_at = raw.get("closedAt") if isinstance(raw.get("closedAt"), str) else None
-    return {
-        "state": state.upper(),
-        "mergedAt": merged_at,
-        "closedAt": closed_at,
-    }
-
-
-def is_pr_merged(repo: str, pr_number: int) -> bool | None:
-    """Return True if PR is merged, False if closed without merge, None on lookup failure."""
-    try:
-        payload = _etag_get(f"repos/{repo}/pulls/{pr_number}")
-    except (RuntimeError, subprocess.TimeoutExpired, OSError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    if payload.get("merged") is True:
-        return True
-    if payload.get("state") == "closed":
-        return False
-    return None
-
-
-def get_pr_review_status(
-    repo: str,
-    pr_number: int,
-    pr_author: str = "",
-    head_sha: str = "",
-) -> ReviewStatus:
-    """Derive a Codex review status from PR issue comments, review comments, and reactions.
-
-    Logic:
-    1. Find the latest ``@codex review`` trigger comment by the PR author.
-    2. Check reactions on that comment from Codex: +1 → APPROVED, eyes → EYES.
-    3. If neither reaction, scan Codex comments (issue + review) posted after
-       the anchor for P1/P2 → CHANGES_REQUESTED.
-    4. Otherwise → PENDING.
-    """
-    if head_sha:
-        ck = _cache_key(repo, pr_number, head_sha)
-        cached = _review_status_cache.get(ck)
-        if cached is not None:
-            return cached
-
-    result = _compute_review_status(repo, pr_number, pr_author, head_sha)
-
-    if head_sha:
-        _review_status_cache[_cache_key(repo, pr_number, head_sha)] = result
-    return result
-
-
-def _get_codex_issue_reactions(
-    repo: str, pr_number: int
-) -> list[dict]:
-    """Fetch Codex reactions on a PR body."""
-    try:
-        reactions = _gh_api_paginated(
-            f"repos/{repo}/issues/{pr_number}/reactions"
-        )
-    except RuntimeError as exc:
-        if _is_http_404_error(exc):
-            return []
-        if not is_transient_error(exc):
-            raise
-        logger.warning(
-            "Reactions fetch degraded for PR %s in %s: %s",
-            pr_number,
-            repo,
-            exc,
-        )
-        return []
-    if not reactions:
-        return []
-    return [
-        r for r in reactions
-        if isinstance(r, dict)
-        and _is_codex_user(r.get("user"))
-    ]
-
-
-def _compute_review_status(
-    repo: str,
-    pr_number: int,
-    pr_author: str,
-    head_sha: str,
-) -> ReviewStatus:
-    """Core review status logic, separated for caching."""
-    body_eyes = False
-    body_approved = False
-    head_commit_time: datetime | None = None
-
-    try:
-        codex_reactions = _get_codex_issue_reactions(repo, pr_number)
-        if codex_reactions:
-            plus_one = _find_codex_plus_one_reaction(codex_reactions)
-            if plus_one is not None:
-                if head_sha:
-                    try:
-                        review_info = _get_codex_review_signals(repo, pr_number)
-                    except RuntimeError:
-                        review_info = {
-                            "latest_sha": "",
-                            "latest_time": None,
-                            "latest_state": "",
-                        }
-                    latest_review_time = review_info["latest_time"]
-                    latest_review_sha = review_info["latest_sha"]
-                    reaction_time = _parse_iso(plus_one.get("created_at"))
-                    if latest_review_sha and latest_review_sha == head_sha:
-                        body_approved = True
-                    else:
-                        head_commit_time = _get_commit_time(repo, head_sha)
-                        threshold = head_commit_time
-                        if (
-                            latest_review_time is not None
-                            and (
-                                threshold is None
-                                or latest_review_time > threshold
-                            )
-                        ):
-                            threshold = latest_review_time
-                        if (
-                            reaction_time
-                            and threshold
-                            and reaction_time >= threshold
-                        ):
-                            body_approved = True
-                        elif not threshold:
-                            body_approved = True
-                else:
-                    body_approved = True
-            if not body_approved and any(
-                _is_reaction_content(reaction, "eyes")
-                for reaction in codex_reactions
-            ):
-                body_eyes = True
-                return ReviewStatus.EYES
-    except RuntimeError as exc:
-        if not _is_http_404_error(exc):
-            raise
-
-    try:
-        issue_comments = _gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
-    except RuntimeError as exc:
-        if not _is_http_404_error(exc):
-            raise
-        issue_comments = []
-    try:
-        review_comments = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments") or []
-    except RuntimeError as exc:
-        if not _is_http_404_error(exc):
-            raise
-        review_comments = []
-
-    anchor = None
-    for c in reversed(issue_comments):
-        author = (c.get("user") or {}).get("login", "")
-        if pr_author and author != pr_author:
-            continue
-        if "@codex review" in (c.get("body") or "").lower():
-            anchor = c
-            break
-
-    anchor_approved = False
-    anchor_eyes = False
-    if anchor is not None:
-        cid = anchor.get("id")
-        if cid is not None:
-            try:
-                reactions = _gh_api_paginated(
-                    f"repos/{repo}/issues/comments/{cid}/reactions"
-                )
-                if reactions:
-                    if any(_is_plus_one(reaction) for reaction in reactions):
-                        anchor_approved = True
-                    elif any(
-                        _is_reaction_content(reaction, "eyes")
-                        for reaction in reactions
-                    ):
-                        anchor_eyes = True
-            except RuntimeError as exc:
-                if _is_http_404_error(exc):
-                    pass
-                elif _should_degrade_reactions_error(exc):
-                    logger.warning(
-                        "Anchor comment reactions fetch degraded for comment %s in %s: %s",
-                        cid,
-                        repo,
-                        exc,
-                    )
-                else:
-                    raise
-
-    if body_eyes or anchor_eyes:
-        return ReviewStatus.EYES
-    if body_approved:
-        return ReviewStatus.APPROVED
-    if anchor_approved:
-        return ReviewStatus.APPROVED
-
-    anchor_ts = (anchor.get("created_at") or "") if anchor else ""
-    for comment in issue_comments + review_comments:
-        if not _is_codex_user(comment.get("user")):
-            continue
-        if _is_codex_onboarding_comment(comment):
-            continue
-        if anchor_ts and (comment.get("created_at") or "") <= anchor_ts:
-            continue
-        return ReviewStatus.CHANGES_REQUESTED
-
-    return ReviewStatus.PENDING
-
-
-def get_latest_codex_feedback(repo: str, pr_number: int) -> str | None:
-    """Return concatenated Codex feedback comments after the latest review anchor.
-
-    Pulls from the same sources as ``_compute_review_status`` — Codex-authored
-    issue and pull review comments posted after the most recent
-    ``@codex review`` trigger by the PR author, with onboarding messages
-    filtered out — so the FIX prompt sees exactly the feedback that drove
-    ``ReviewStatus.CHANGES_REQUESTED``. Returns ``None`` when no qualifying
-    feedback exists or both comment endpoints are unreachable; the FIX
-    prompt then omits the section instead of blocking on observability.
-    """
-    pr_author = get_pr_author(repo, pr_number)
-    try:
-        issue_comments = (
-            _gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
-        )
-    except (RuntimeError, subprocess.TimeoutExpired, OSError):
-        issue_comments = []
-    try:
-        review_comments = (
-            _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments") or []
-        )
-    except (RuntimeError, subprocess.TimeoutExpired, OSError):
-        review_comments = []
-
-    anchor_ts = ""
-    for c in reversed(issue_comments):
-        author = (c.get("user") or {}).get("login", "")
-        if pr_author and author != pr_author:
-            continue
-        if "@codex review" in (c.get("body") or "").lower():
-            anchor_ts = c.get("created_at") or ""
-            break
-
-    sections: list[str] = []
-    for comment in issue_comments + review_comments:
-        if not _is_codex_user(comment.get("user")):
-            continue
-        if _is_codex_onboarding_comment(comment):
-            continue
-        if anchor_ts and (comment.get("created_at") or "") <= anchor_ts:
-            continue
-        body = (comment.get("body") or "").strip()
-        if body:
-            sections.append(body)
-
-    if not sections:
-        return None
-    joined = "\n\n".join(sections)
-    if len(joined) > _REVIEW_FEEDBACK_TRUNCATE_CHARS:
-        return f"[truncated]\n{joined[-_REVIEW_FEEDBACK_TRUNCATE_CHARS:]}"
-    return joined
-
-
-def merge_pr(repo: str, pr_number: int) -> None:
-    """Merge a PR using ``gh pr merge --squash --delete-branch``.
-
-    Invalidates the cached ``repos/{repo}/pulls`` ETag entries on success
-    so the next REST list fetch sees the merged PR drop out of
-    ``state=open`` instead of returning a stale 304-cached page that
-    still contains it.
-    """
-    run_gh(["pr", "merge", str(pr_number), "--squash", "--delete-branch"], repo=repo)
-    _invalidate_etag_cache(f"repos/{repo}/pulls")
-
-
-def post_comment(repo: str, pr_number: int, body: str) -> None:
-    """Post a comment on a PR via ``gh pr comment``."""
-    run_gh(["pr", "comment", str(pr_number), "--body", body], repo=repo)
-
-
-def get_pr_author(repo: str, pr_number: int) -> str:
-    """Return the GitHub login of the PR's author, or "" on failure.
-
-    Read directly from PR metadata rather than the daemon's ``gh``
-    identity: Claude CLI may run under a different authentication
-    context than the daemon, so ``gh api user`` is not a reliable
-    proxy for "who opened this PR" and using it would cause
-    ``has_recent_codex_review_request`` to miss the trigger that the
-    real author already posted.
-    """
-    try:
-        payload = _etag_get(f"repos/{repo}/pulls/{pr_number}")
-    except (RuntimeError, subprocess.TimeoutExpired, OSError):
-        return ""
-    if isinstance(payload, dict):
-        user = payload.get("user")
-        if isinstance(user, dict):
-            login = user.get("login")
-            if isinstance(login, str):
-                return login.strip()
-    return ""
-
-
-def get_pr_head_commit_iso(repo: str, pr_number: int) -> str:
-    """Return the ISO-8601 committer date of the PR's head commit, or "".
-
-    Used by the dedup gate on ``_post_codex_review`` to tell
-    "Claude already triggered a review for THIS commit" apart from
-    "the daemon posted a trigger for an earlier commit". Without a
-    commit-time threshold, the daemon's own post from a prior cycle
-    would be seen as a duplicate on the next fix push when the PR
-    author and daemon share a gh identity, suppressing the fresh
-    review anchor that the new commit needs.
-    """
-    try:
-        pr_payload = _etag_get(f"repos/{repo}/pulls/{pr_number}")
-    except RuntimeError:
-        return ""
-    sha = _extract_head_sha(pr_payload)
-    if not sha:
-        return ""
-    try:
-        commit_payload = _etag_get(f"repos/{repo}/commits/{sha}")
-    except RuntimeError:
-        return ""
-    return _extract_commit_date(commit_payload)
-
-
-def _extract_head_sha(payload: object) -> str:
-    """Pull ``.head.sha`` out of a PR detail payload (or a bare-string mock)."""
-    if isinstance(payload, dict):
-        head = payload.get("head")
-        if isinstance(head, dict):
-            sha = head.get("sha")
-            if isinstance(sha, str):
-                return sha.strip()
-    elif isinstance(payload, str):
-        return payload.strip()
-    return ""
-
-
-def _extract_commit_date(payload: object) -> str:
-    """Pull ``.commit.committer.date`` out of a commit detail payload."""
-    if isinstance(payload, dict):
-        commit = payload.get("commit")
-        if isinstance(commit, dict):
-            committer = commit.get("committer")
-            if isinstance(committer, dict):
-                date = committer.get("date")
-                if isinstance(date, str):
-                    return date.strip()
-    elif isinstance(payload, str):
-        return payload.strip()
-    return ""
-
-
-def get_pr_metadata(repo: str, pr_number: int) -> dict:
-    """Fetch PR author, head SHA, and head commit date in 1-2 API calls.
-
-    Replaces separate ``get_pr_author`` + ``get_pr_head_commit_iso`` calls.
-    Returns ``{"author": str, "head_sha": str, "head_commit_date": str}``.
-    """
-    empty = {"author": "", "head_sha": "", "head_commit_date": ""}
-    try:
-        pr_payload = _etag_get(f"repos/{repo}/pulls/{pr_number}")
-    except RuntimeError:
-        return dict(empty)
-    author, head_sha = _extract_author_and_head_sha(pr_payload)
-    if author == "" and head_sha == "" and not isinstance(pr_payload, (dict, str)):
-        return dict(empty)
-
-    head_commit_date = ""
-    if head_sha:
-        try:
-            commit_payload = _etag_get(f"repos/{repo}/commits/{head_sha}")
-            head_commit_date = _extract_commit_date(commit_payload)
-        except RuntimeError:
-            pass
-
-    return {
-        "author": author,
-        "head_sha": head_sha,
-        "head_commit_date": head_commit_date,
-    }
-
-
-def _extract_author_and_head_sha(payload: object) -> tuple[str, str]:
-    """Pull author + head sha out of a PR payload, accepting dict or jq string."""
-    if isinstance(payload, dict):
-        user = payload.get("user")
-        if isinstance(user, dict):
-            login = user.get("login")
-            author = login if isinstance(login, str) else ""
-        else:
-            top_author = payload.get("author")
-            author = top_author if isinstance(top_author, str) else ""
-        head = payload.get("head")
-        if isinstance(head, dict):
-            sha = head.get("sha")
-            head_sha = sha if isinstance(sha, str) else ""
-        else:
-            top_sha = payload.get("head_sha")
-            head_sha = top_sha if isinstance(top_sha, str) else ""
-        return author, head_sha
-    if isinstance(payload, str):
-        try:
-            parsed = json.loads(payload)
-        except json.JSONDecodeError:
-            return "", ""
-        if isinstance(parsed, dict):
-            return _extract_author_and_head_sha(parsed)
-    return "", ""
-
-
-class GitHubPollError(Exception):
-    """Raised when a GitHub API poll fails (transient)."""
-
-
-def get_branch_last_push_time(
-    repo: str, pr_number: int
-) -> float | None:
-    """Return ``time.monotonic()`` if the PR's head SHA changed since last call.
-
-    Compares the current head SHA from the GitHub API against the
-    previously observed SHA for this ``(repo, pr_number)`` pair.
-    Returns the current monotonic time when a new SHA is detected,
-    or ``None`` when the SHA is unchanged (or on first call).
-
-    Raises ``GitHubPollError`` when the API call fails so callers can
-    distinguish "no push" from "could not check."
-    """
-    key = f"{repo}#{pr_number}"
-    try:
-        payload = _etag_get(f"repos/{repo}/pulls/{pr_number}")
-    except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
-        raise GitHubPollError(str(exc)) from exc
-    sha = _extract_head_sha(payload)
-    if not sha:
-        return None
-
-    prev = _last_known_sha.get(key)
-    _last_known_sha[key] = sha
-    if prev is None:
-        return None
-    if sha != prev:
-        return time.monotonic()
-    return None
-
-
-def get_pr_last_push_time(repo: str, pr_number: int) -> datetime | None:
-    """Return the timestamp of the most recent push to the PR's head ref.
-
-    Uses the GitHub repository activity API, which records the actual
-    push event time. This is distinct from the head commit's committer
-    date: a cherry-picked, amended, or rebased commit can carry a
-    committer date that predates the push that put it on the branch.
-    Anywhere we want "did X happen after this branch's latest push?",
-    push time is the correct anchor.
-
-    Returns ``None`` on any API or parse failure (callers must fail
-    open).
-    """
-    try:
-        branch_raw = run_gh([
-            "api",
-            f"repos/{repo}/pulls/{pr_number}",
-            "--jq",
-            ".head.ref",
-        ])
-        branch = branch_raw.strip() if isinstance(branch_raw, str) else ""
-        if not branch:
-            return None
-        date_raw = run_gh([
-            "api",
-            f"repos/{repo}/activity",
-            "-f", f"ref=refs/heads/{branch}",
-            "-f", "activity_type=push",
-            "-f", "per_page=1",
-            "-f", "direction=desc",
-            "--jq",
-            ".[0].pushed_at",
-        ])
-        date_str = date_raw.strip() if isinstance(date_raw, str) else ""
-        if not date_str:
-            return None
-        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-
-def get_last_push_age_seconds(repo: str, pr_number: int) -> float | None:
-    """Return seconds since the last push to the PR branch.
-
-    Returns ``None`` on any API or parse failure.
-    """
-    push_dt = get_pr_last_push_time(repo, pr_number)
-    if push_dt is None:
-        return None
-    return max(0.0, (datetime.now(timezone.utc) - push_dt).total_seconds())
-
-
-def clear_last_known_sha() -> None:
-    """Reset SHA tracking state (used in tests)."""
-    _last_known_sha.clear()
-
-
-def has_recent_codex_review_request(
-    repo: str,
-    pr_number: int,
-    pr_author: str,
-    within_minutes: int = 5,
-    after_iso: str | None = None,
-) -> bool:
-    """Return ``True`` iff ``pr_author`` recently posted ``@codex review``.
-
-    The daemon posts ``@codex review`` after every coding/fix cycle, but
-    Claude may also post one itself from the AGENTS.md runbook. Without
-    this guard both trigger comments land back-to-back and Codex starts
-    two redundant reviews. The caller checks this before posting and
-    skips when a qualifying trigger already exists within
-    ``within_minutes``.
-
-    ``after_iso`` optionally restricts matches to comments created
-    strictly after the given ISO-8601 timestamp. Callers pass the
-    PR's current head-commit time so a trigger posted for an earlier
-    commit does not suppress the fresh anchor the new commit needs —
-    this is what keeps the dedup safe when the daemon and PR author
-    share a gh identity.
-    """
-    return (
-        get_recent_codex_review_request_time(
-            repo,
-            pr_number,
-            pr_author,
-            within_minutes=within_minutes,
-            after_iso=after_iso,
-        )
-        is not None
-    )
-
-
-def get_recent_codex_review_request_time(
-    repo: str,
-    pr_number: int,
-    pr_author: str,
-    within_minutes: int = 5,
-    after_iso: str | None = None,
-) -> datetime | None:
-    """Return the latest qualifying PR-author ``@codex review`` timestamp."""
-    try:
-        comments = _gh_api_paginated(
-            f"repos/{repo}/issues/{pr_number}/comments"
-        ) or []
-    except RuntimeError as exc:
-        if _is_http_404_error(exc):
-            return None
-        raise
-    now = datetime.now(timezone.utc)
-    cutoff = within_minutes * 60
-    for c in reversed(comments):
-        author = (c.get("user") or {}).get("login", "")
-        if author != pr_author:
-            continue
-        if "@codex review" not in (c.get("body") or "").lower():
-            continue
-        created_raw = c.get("created_at") or ""
-        if after_iso and (not created_raw or created_raw <= after_iso):
-            continue
-        created = _parse_iso(created_raw)
-        if created is None:
-            continue
-        if created.tzinfo is None:
-            created = created.replace(tzinfo=timezone.utc)
-        if (now - created).total_seconds() < cutoff:
-            return created
-    return None
-
-
 def _gh_api_paginated(path: str) -> list[dict] | None:
     """Fetch every page of a GitHub REST endpoint that returns a JSON array.
 
@@ -1267,240 +305,210 @@ def _etag_get_paginated(path: str) -> list[dict] | None:
     return items
 
 
-def _find_codex_plus_one_reaction(reactions: list[dict]) -> dict | None:
-    """Return the most recent +1 reaction from a Codex user, or None."""
-    best: dict | None = None
-    for r in reactions:
-        if not _is_plus_one(r):
-            continue
-        if best is None or (r.get("created_at") or "") > (best.get("created_at") or ""):
-            best = r
-    return best
+# ===== CI-status re-exports (src.github.checks) =====
+from src.github.checks import (  # noqa: E402, F401
+    _CI_STATUS_CACHE_TTL_SECONDS,
+    _REST_CI_FAILURE_STATES,
+    _REST_CI_SUCCESS_STATES,
+    _ci_status_cache,
+    _evict_expired_ci_status_cache,
+    _fetch_ci_status_rest,
+    _map_rest_ci_status_to_enum,
+    clear_ci_status_cache,
+)
+
+# ===== PR re-exports (src.github.prs) =====
+from src.github.prs import (  # noqa: E402, F401
+    _MERGED_PRS_CACHE_TTL_SECONDS,
+    GitHubPollError,
+    _extract_author_and_head_sha,
+    _get_open_prs_rest,
+    _last_known_sha,
+    _merged_prs_cache,
+    clear_last_known_sha,
+    clear_merged_prs_cache,
+    extract_queue_pr_id,
+    get_branch_last_push_time,
+    get_last_push_age_seconds,
+    get_merged_prs,
+    get_open_prs,
+    get_pr_author,
+    get_pr_head_commit_iso,
+    get_pr_last_push_time,
+    get_pr_metadata,
+    is_pr_merged,
+    merge_pr,
+    pr_state,
+)
+
+# ===== Review-status re-exports (src.github.reviews) =====
+from src.github.reviews import (  # noqa: E402, F401
+    _CODEX_ONBOARDING_TEXT,
+    CODEX_BOT_LOGIN_PATTERN,
+    _begin_review_cache_cycle,
+    _cache_key,
+    _compute_review_status,
+    _find_codex_plus_one_reaction,
+    _get_codex_issue_reactions,
+    _get_codex_review_signals,
+    _get_commit_time,
+    _get_latest_codex_review_info,
+    _is_codex_onboarding_comment,
+    _is_codex_user,
+    _is_plus_one,
+    _is_reaction_content,
+    _review_status_cache,
+    _should_degrade_reactions_error,
+    clear_review_status_cache,
+    get_pr_review_status,
+)
 
 
-def _get_commit_time(repo: str, sha: str) -> datetime | None:
-    """Return the committer date of a commit, or None on failure."""
-    try:
-        payload = _etag_get(f"repos/{repo}/commits/{sha}")
-    except RuntimeError:
-        return None
-    return _parse_iso(_extract_commit_date(payload))
+def __getattr__(name: str) -> object:
+    """Forward live reads of mutable module-level state held in src.github.*.
 
-
-def _get_codex_review_signals(
-    repo: str, pr_number: int
-) -> dict[str, str | datetime | None]:
-    """Return the latest Codex review timestamp, sha, and state."""
-    try:
-        reviews = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/reviews")
-    except RuntimeError as exc:
-        if not _is_http_404_error(exc):
-            raise
-        return {
-            "latest_sha": "",
-            "latest_time": None,
-            "latest_state": "",
-        }
-    if not reviews:
-        return {
-            "latest_sha": "",
-            "latest_time": None,
-            "latest_state": "",
-        }
-
-    best_sha = ""
-    best_time: datetime | None = None
-    best_raw = ""
-    best_state = ""
-    for review in reviews:
-        if not _is_codex_user(review.get("user")):
-            continue
-        submitted_raw = review.get("submitted_at") or ""
-        parsed = _parse_iso(submitted_raw)
-        if parsed is None:
-            continue
-        if best_time is None or submitted_raw > best_raw:
-            best_sha = review.get("commit_id") or ""
-            best_time = parsed
-            best_raw = submitted_raw
-            best_state = (review.get("state") or "").upper()
-    return {
-        "latest_sha": best_sha,
-        "latest_time": best_time,
-        "latest_state": best_state,
-    }
-
-
-def _get_latest_codex_review_info(
-    repo: str, pr_number: int
-) -> tuple[str, datetime | None]:
-    """Return ``(commit_id, submitted_at)`` of the most recent Codex review."""
-    signals = _get_codex_review_signals(repo, pr_number)
-    latest_sha = signals["latest_sha"]
-    latest_time = signals["latest_time"]
-    return str(latest_sha or ""), latest_time if isinstance(latest_time, datetime) else None
-
-
-_REST_CI_FAILURE_STATES = {
-    "FAILURE",
-    "FAILED",
-    "ERROR",
-    "CANCELLED",
-    "TIMED_OUT",
-    "ACTION_REQUIRED",
-}
-_REST_CI_SUCCESS_STATES = {"SUCCESS", "COMPLETED", "NEUTRAL", "SKIPPED"}
-
-
-def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
-    """Fetch combined CI signals for ``sha`` via the REST API.
-
-    Returns ``(check_runs, status_payload, fetch_ok)`` where ``check_runs`` is
-    a flat list of all check_run dicts across pages from
-    ``GET /repos/{repo}/commits/{sha}/check-runs`` and ``status_payload`` is
-    the ``{"state": ..., "statuses": [...]}`` shape of
-    ``GET /repos/{repo}/commits/{sha}/status``. ``fetch_ok`` is ``False`` only
-    when *both* REST calls raised ``RuntimeError``; the caller currently
-    folds that case back into ``empty_is_success`` so the WATCH gate does
-    not stall on a transient REST-budget squeeze, matching the existing
-    GraphQL-rate-limit fallback in ``_get_open_prs_rest``.
+    Module-level integers reassigned via ``global`` (notably
+    ``_review_status_cache_cycle``) lose their connection to the shim's
+    ``from src.github.reviews import ...`` snapshot when the canonical
+    module rebinds them, so we look those names up live on each access
+    and return the current value.
     """
-    check_runs: list[dict] = []
-    status_payload: dict = {}
-    if not sha:
-        return check_runs, status_payload, True
+    if name == "_review_status_cache_cycle":
+        from src.github import reviews
 
-    cache_key = (repo, sha)
-    cached = _ci_status_cache.get(cache_key)
-    now = time.monotonic()
-    if cached is not None and (now - cached[0]) < _CI_STATUS_CACHE_TTL_SECONDS:
-        return list(cached[1]), dict(cached[2]), cached[3]
+        return reviews._review_status_cache_cycle
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-    # check-runs is a paginated endpoint (per_page max 100). A commit can
-    # carry more than 100 runs, and ``_map_rest_ci_status_to_enum`` reads
-    # every entry — truncating to page 1 would let a failing or pending
-    # run beyond the cap masquerade as SUCCESS and misclassify the PR as
-    # mergeable, so we walk every page rather than relying on ETag-cached
-    # single-page reads.
-    check_runs_path = f"repos/{repo}/commits/{sha}/check-runs?per_page=100"
-    check_runs_ok = False
+
+def get_latest_codex_feedback(repo: str, pr_number: int) -> str | None:
+    """Return concatenated Codex feedback comments after the latest review anchor.
+
+    Pulls from the same sources as ``_compute_review_status`` — Codex-authored
+    issue and pull review comments posted after the most recent
+    ``@codex review`` trigger by the PR author, with onboarding messages
+    filtered out — so the FIX prompt sees exactly the feedback that drove
+    ``ReviewStatus.CHANGES_REQUESTED``. Returns ``None`` when no qualifying
+    feedback exists or both comment endpoints are unreachable; the FIX
+    prompt then omits the section instead of blocking on observability.
+    """
+    pr_author = get_pr_author(repo, pr_number)
     try:
-        cr_pages = _gh_api_paginated(check_runs_path)
-    except RuntimeError:
-        cr_pages = None
-    else:
-        check_runs_ok = True
-    if isinstance(cr_pages, list):
-        for page in cr_pages:
-            runs = page.get("check_runs")
-            if isinstance(runs, list):
-                check_runs.extend(r for r in runs if isinstance(r, dict))
-
-    status_path = f"repos/{repo}/commits/{sha}/status"
-    status_ok = False
-    try:
-        raw_status = retry_transient(
-            lambda: _etag_get(status_path),
-            operation_name=f"gh api {status_path}",
+        issue_comments = (
+            _gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
         )
-    except RuntimeError:
-        raw_status = None
-    else:
-        status_ok = True
-    if isinstance(raw_status, dict):
-        status_payload = raw_status
-    elif isinstance(raw_status, str) and raw_status:
-        try:
-            parsed = json.loads(raw_status)
-        except json.JSONDecodeError:
-            parsed = None
-        if isinstance(parsed, dict):
-            status_payload = parsed
-
-    fetch_ok = check_runs_ok or status_ok
-    _evict_expired_ci_status_cache(now)
-    _ci_status_cache[cache_key] = (now, list(check_runs), dict(status_payload), fetch_ok)
-    return check_runs, status_payload, fetch_ok
-
-
-def _map_rest_ci_status_to_enum(
-    check_runs: list[dict],
-    status_payload: dict,
-    empty_is_success: bool = False,
-    fetch_ok: bool = True,
-) -> CIStatus:
-    """Combine REST ``check-runs`` + commit ``status`` payloads into a ``CIStatus``.
-
-    Mirrors the semantics of the previous rollup mapping: any failure-like
-    state wins; SUCCESS only when every observed state is success-like;
-    otherwise PENDING. When neither check-runs nor commit statuses are
-    present the result follows ``empty_is_success`` so repos without
-    required checks can still merge.
-
-    When ``fetch_ok`` is ``False`` and there is no observable check data,
-    the result still follows ``empty_is_success``: this matches the
-    GraphQL-rate-limit fallback in ``_get_open_prs_rest``, which already
-    returns SUCCESS for ``allow_merge_without_checks=True`` whenever the
-    primary fetch is unavailable. Diverging here would mean a transient
-    REST-budget squeeze (recurring in the e2e suite, where ``poll_interval_sec``
-    is 2s and per-token quota is shared across runs) leaves the daemon
-    permanently in WATCH on a testbed PR that has no checks at all,
-    burning more REST on each retry without ever converging.
-
-    The combined commit-status endpoint embeds at most the first page of
-    ``statuses`` while ``status_payload["state"]`` reflects the aggregate
-    across every context. In repos with many legacy status contexts the
-    embedded list can omit a failing context entirely; honoring the
-    aggregate ``state`` whenever any status context is reported keeps the
-    pagination-capped failure from being silently classified SUCCESS.
-
-    The ``statuses`` list itself is reverse-chronological history across
-    contexts — the same context can appear multiple times with older
-    states first overwritten by newer ones. ``state`` already reduces
-    those entries to the latest per context, so the per-entry list is
-    deliberately not consulted for the FAILURE/SUCCESS rollup; otherwise
-    a stale ``failure`` from an earlier retry would force ``FAILURE``
-    even after the latest status for that context turned green.
-    """
-    del fetch_ok  # retained for caller signature compatibility
-    statuses_raw = (
-        status_payload.get("statuses") if isinstance(status_payload, dict) else None
-    )
-    statuses = statuses_raw if isinstance(statuses_raw, list) else []
-    combined_state = (
-        status_payload.get("state") if isinstance(status_payload, dict) else None
-    )
-
-    if not check_runs and not statuses:
-        return CIStatus.SUCCESS if empty_is_success else CIStatus.PENDING
-
-    states: list[str] = []
-    for run in check_runs:
-        if not isinstance(run, dict):
-            continue
-        value = run.get("conclusion") or run.get("status")
-        if value:
-            states.append(str(value).upper())
-
-    if statuses and isinstance(combined_state, str) and combined_state:
-        states.append(combined_state.upper())
-
-    if not states:
-        return CIStatus.PENDING
-    if any(s in _REST_CI_FAILURE_STATES for s in states):
-        return CIStatus.FAILURE
-    if all(s in _REST_CI_SUCCESS_STATES for s in states):
-        return CIStatus.SUCCESS
-    return CIStatus.PENDING
-
-
-def _parse_iso(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value:
-        return None
+    except (RuntimeError, subprocess.TimeoutExpired, OSError):
+        issue_comments = []
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        review_comments = (
+            _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments") or []
+        )
+    except (RuntimeError, subprocess.TimeoutExpired, OSError):
+        review_comments = []
+
+    anchor_ts = ""
+    for c in reversed(issue_comments):
+        author = (c.get("user") or {}).get("login", "")
+        if pr_author and author != pr_author:
+            continue
+        if "@codex review" in (c.get("body") or "").lower():
+            anchor_ts = c.get("created_at") or ""
+            break
+
+    sections: list[str] = []
+    for comment in issue_comments + review_comments:
+        if not _is_codex_user(comment.get("user")):
+            continue
+        if _is_codex_onboarding_comment(comment):
+            continue
+        if anchor_ts and (comment.get("created_at") or "") <= anchor_ts:
+            continue
+        body = (comment.get("body") or "").strip()
+        if body:
+            sections.append(body)
+
+    if not sections:
         return None
+    joined = "\n\n".join(sections)
+    if len(joined) > _REVIEW_FEEDBACK_TRUNCATE_CHARS:
+        return f"[truncated]\n{joined[-_REVIEW_FEEDBACK_TRUNCATE_CHARS:]}"
+    return joined
+
+
+def post_comment(repo: str, pr_number: int, body: str) -> None:
+    """Post a comment on a PR via ``gh pr comment``."""
+    run_gh(["pr", "comment", str(pr_number), "--body", body], repo=repo)
+
+
+def has_recent_codex_review_request(
+    repo: str,
+    pr_number: int,
+    pr_author: str,
+    within_minutes: int = 5,
+    after_iso: str | None = None,
+) -> bool:
+    """Return ``True`` iff ``pr_author`` recently posted ``@codex review``.
+
+    The daemon posts ``@codex review`` after every coding/fix cycle, but
+    Claude may also post one itself from the AGENTS.md runbook. Without
+    this guard both trigger comments land back-to-back and Codex starts
+    two redundant reviews. The caller checks this before posting and
+    skips when a qualifying trigger already exists within
+    ``within_minutes``.
+
+    ``after_iso`` optionally restricts matches to comments created
+    strictly after the given ISO-8601 timestamp. Callers pass the
+    PR's current head-commit time so a trigger posted for an earlier
+    commit does not suppress the fresh anchor the new commit needs —
+    this is what keeps the dedup safe when the daemon and PR author
+    share a gh identity.
+    """
+    return (
+        get_recent_codex_review_request_time(
+            repo,
+            pr_number,
+            pr_author,
+            within_minutes=within_minutes,
+            after_iso=after_iso,
+        )
+        is not None
+    )
+
+
+def get_recent_codex_review_request_time(
+    repo: str,
+    pr_number: int,
+    pr_author: str,
+    within_minutes: int = 5,
+    after_iso: str | None = None,
+) -> datetime | None:
+    """Return the latest qualifying PR-author ``@codex review`` timestamp."""
+    try:
+        comments = _gh_api_paginated(
+            f"repos/{repo}/issues/{pr_number}/comments"
+        ) or []
+    except RuntimeError as exc:
+        if _is_http_404_error(exc):
+            return None
+        raise
+    now = datetime.now(timezone.utc)
+    cutoff = within_minutes * 60
+    for c in reversed(comments):
+        author = (c.get("user") or {}).get("login", "")
+        if author != pr_author:
+            continue
+        if "@codex review" not in (c.get("body") or "").lower():
+            continue
+        created_raw = c.get("created_at") or ""
+        if after_iso and (not created_raw or created_raw <= after_iso):
+            continue
+        created = _parse_iso(created_raw)
+        if created is None:
+            continue
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if (now - created).total_seconds() < cutoff:
+            return created
+    return None
 
 
 async def get_current_rate_limit_budget(
