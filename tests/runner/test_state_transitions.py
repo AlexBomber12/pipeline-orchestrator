@@ -69,7 +69,7 @@ from src.models import (
     TaskStatus,  # noqa: F811
 )
 
-from tests import test_runner as h
+from tests.runner import _helpers as h
 
 claude_cli = claude_plugin_module.claude_cli
 

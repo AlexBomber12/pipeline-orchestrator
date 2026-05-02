@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 
-from tests import test_runner as h
+from tests.runner import _helpers as h
 
 
 def test_reset_runner_local_task_counters_zeroes_all_fields() -> None:

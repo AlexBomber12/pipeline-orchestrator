@@ -19,7 +19,7 @@ import asyncio
 from src.metrics import RunRecord
 from src.models import PipelineState, QueueTask, TaskStatus
 
-from tests import test_runner as h
+from tests.runner import _helpers as h
 
 
 def _install_publish_state_spy(runner) -> list[None]:

@@ -46,6 +46,7 @@ from src.daemon.handlers import error as error_module  # noqa: F401,F811
 from src.daemon.handlers import idle as idle_module  # noqa: F811
 from src.daemon.handlers import merge as merge_module  # noqa: F401,F811
 from src.daemon.handlers import watch as watch_module  # noqa: F401,F811
+from src.daemon.runner import ErrorCategory, _classify_error
 from src.models import (
     PipelineState,  # noqa: F811
     PRInfo,  # noqa: F811
@@ -54,7 +55,7 @@ from src.models import (
 )
 from src.usage import UsageSnapshot
 
-from tests import test_runner as h
+from tests.runner import _helpers as h
 
 claude_cli = claude_plugin_module.claude_cli
 
@@ -1700,3 +1701,258 @@ def test_handle_error_recovers_within_two_cycles_after_tls_timeout(
     # is IDLE so the dispatcher cannot loop in the ERROR branch.
     runner.state.error_message = None
     assert runner.state.state == PipelineState.IDLE
+
+
+# ---------------------------------------------------------------------------
+# PR-224b moved from tests/test_runner.py — error_diagnosis group
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "msg,expected",
+    [
+        ("git fetch origin main failed after 3 attempts", True),
+        ("Could not connect to github.com", True),
+        ("Failed to connect to api.github.com", True),
+        ("ensure_repo_cloned failed", True),
+        (
+            "git push origin HEAD:foo failed after 3 attempts: connection reset",
+            True,
+        ),
+        ("git clone failed after 2 attempts: i/o timeout", True),
+        ("gh api repos/x/y/commits/z/check-runs failed after 3 attempts", True),
+        # Network-symptom strings count as infra only when paired with an
+        # explicit git/GitHub reference in the surrounding context.
+        (
+            "fatal: unable to access 'https://github.com/o/r': Connection timed out",
+            True,
+        ),
+        ("git fetch origin: dial tcp 1.2.3.4:443: i/o timeout", True),
+        ("gh: network is unreachable while contacting api.github.com", True),
+        ("gh: failed to run git: dial tcp 140.82.112.4:443: i/o timeout", True),
+        # ``gh: failed to ...`` without a network symptom must NOT short-circuit
+        # diagnose_error: the same prefix is emitted for auth failures and
+        # workflow rejections that need real FIX/ESCALATE routing.
+        ("gh: failed to run git", False),
+        ("get_open_prs failed: gh: failed to authenticate to github.com", False),
+        (
+            "merge_pr failed: gh: failed to run git: "
+            "not possible to fast-forward, you may want to integrate first",
+            False,
+        ),
+        # Push rejections, branch-protection denials, auth/policy errors must
+        # NOT be classified as infra so diagnose_error can route FIX/ESCALATE.
+        ("git push origin HEAD:foo rejected (non-fast-forward)", False),
+        ("remote: Branch protection rule prevents push", False),
+        ("git push: 403 forbidden", False),
+        # Generic retry strings without a git/gh operation prefix must not
+        # trigger infra bypass — they may come from API/validation/workflow
+        # retry loops that need real diagnosis.
+        ("failed after 7 attempts", False),
+        ("pipeline step failed after 5 attempts", False),
+        # Bare network-symptom strings without git/GitHub context are NOT
+        # infra: they can come from app or test failures (e.g. database,
+        # Redis, third-party API clients) that need real diagnosis.
+        ("Connection timed out", False),
+        ("network is unreachable", False),
+        ("dial tcp 1.2.3.4:443: i/o timeout", False),
+        ("Failed to connect to database", False),
+        ("Could not connect to redis at localhost:6379", False),
+        ("pytest: 3 failed in test_x.py", False),
+        ("ImportError: cannot import name 'foo'", False),
+        ("API rate limit exceeded", False),
+        ("", False),
+    ],
+)
+def test_is_infra_error_classifies_messages(msg: str, expected: bool) -> None:
+    """_is_infra_error classifies known infra strings, ignores everything else."""
+    from src.daemon.runner import _is_infra_error
+
+    assert _is_infra_error(msg) is expected
+
+
+def test_run_cycle_clears_soft_skip_budget_after_successful_non_error_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.config import CoderType
+    from src.usage import UsageSnapshot
+
+    cli_calls: list[str] = []
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "diagnose_error_async",
+        h._async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
+    )
+
+    runner = h._make_runner(coder=CoderType.CODEX)
+    runner._recovered = True
+    runner.app_config.daemon.rate_limit_session_pause_percent = 80
+    runner._claude_usage_provider = h._FakeUsageProvider(
+        snapshot=UsageSnapshot(
+            session_percent=90,
+            session_resets_at=int(time.time()) + 3600,
+            weekly_percent=10,
+            weekly_resets_at=int(time.time()) + 86400,
+            fetched_at=time.time(),
+        )
+    )
+
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "sync_to_main failed: auth denied"
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner._error_skip_count == 1
+    assert runner._error_skip_active is True
+
+    async def fake_handle_idle() -> None:
+        runner.log_event("successful idle cycle")
+        runner.state.state = PipelineState.IDLE
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", h._preflight_true_stub)
+
+    asyncio.run(runner.run_cycle())
+
+    assert runner._error_skip_count == 0
+    assert runner._error_skip_context is None
+    assert runner._error_skip_active is False
+
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "sync_to_main failed: auth denied"
+    asyncio.run(runner.handle_error())
+
+    assert cli_calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner._error_skip_count == 1
+
+
+def test_run_cycle_dispatches_error_handler_when_ai_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    publishes: list[str] = []
+    runner = h._make_runner()
+    runner._recovered = True
+    runner._scaffolded = True
+    runner.state.state = PipelineState.ERROR
+    runner.state.rate_limited_until = None
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_handle_error() -> None:
+        calls.append("handle_error")
+
+    async def fake_publish_state() -> None:
+        publishes.append("published")
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", h._preflight_true_stub)
+    monkeypatch.setattr(runner, "handle_error", fake_handle_error)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+
+    asyncio.run(runner.run_cycle())
+
+    assert calls == ["handle_error"]
+    assert publishes == ["published"]
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["Timeout after 3600s", "network timeout", "claude CLI timeout after 900s"],
+)
+def test_classify_error_timeout(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.TIMEOUT
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["file not found", "Unknown error"],
+)
+def test_classify_error_other(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.OTHER
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["OOM killer invoked", "process killed: out of memory", "worker oom"],
+)
+def test_classify_oom(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.OOM
+
+
+def test_classify_oom_requires_token_boundary() -> None:
+    assert _classify_error("No room left on device") == ErrorCategory.OTHER
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["auth failed", "401 Unauthorized", "unauthorized request"],
+)
+def test_classify_auth_failure(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.AUTH_FAILURE
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["CI failed on main", "ci job fail", "CI checks failing"],
+)
+def test_classify_ci_failure(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.CI_FAILURE
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "Push rejected: non-fast-forward update required",
+        "Branch drift detected; needs rebase before retry",
+        "stale branch state blocks merge",
+    ],
+)
+def test_classify_stale_branch(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.STALE_BRANCH
+
+
+def test_classify_ci_failure_requires_ci_word_boundary() -> None:
+    assert _classify_error("decision failed during merge") == ErrorCategory.OTHER
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["ghost push detected", "HEAD SHA changed unexpectedly"],
+)
+def test_classify_ghost_push(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.GHOST_PUSH
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["codex cli not found", "CLI executable not found"],
+)
+def test_classify_cli_not_found(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.CLI_NOT_FOUND
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["git push failed", "git error: detached head"],
+)
+def test_classify_git_error(msg: str) -> None:
+    assert _classify_error(msg) == ErrorCategory.GIT_ERROR
+
+
+def test_classify_git_error_requires_git_token() -> None:
+    assert _classify_error("GitHub API request failed") == ErrorCategory.OTHER
+
+
+def test_classify_git_error_for_fatal_stderr() -> None:
+    assert (
+        _classify_error("fatal: could not resolve host: github.com")
+        == ErrorCategory.GIT_ERROR
+    )

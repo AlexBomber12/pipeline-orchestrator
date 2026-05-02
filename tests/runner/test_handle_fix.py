@@ -7,8 +7,11 @@ tests/test_runner.py and are referenced via the ``h`` alias.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import subprocess
-from datetime import datetime, timezone
+import types
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -19,15 +22,19 @@ from src.daemon import git_ops as git_ops_module
 from src.daemon import recovery_policy as recovery_policy_module
 from src.daemon import runner as runner_module
 from src.daemon.handlers import fix as fix_module
+from src.daemon.handlers import hung as hung_module
 from src.daemon.runner import PipelineRunner
 from src.models import (
     CIStatus,
+    FeedbackCheckResult,
     PipelineState,
     PRInfo,
+    QueueTask,
     ReviewStatus,
+    TaskStatus,
 )
 
-from tests import test_runner as h
+from tests.runner import _helpers as h
 
 claude_cli = claude_plugin_module.claude_cli
 
@@ -3278,3 +3285,1837 @@ def test_handle_fix_normal_exit_fails_open_when_verification_fetch_fails(
         "fetch pr-190 failed after FIX exit" in e["event"]
         for e in runner.state.history
     )
+
+
+# ---------------------------------------------------------------------------
+# PR-224b moved from tests/test_runner.py — handle_fix group
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_failed_ci_logs_truncates_to_last_5000_chars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_fetch_failed_ci_logs returns last 5000 chars prefixed with [truncated]."""
+    long_log = "X" * 6000
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
+        if args[:2] == ["run", "list"]:
+            return [{"databaseId": 12345}]
+        if args[:2] == ["run", "view"]:
+            return long_log
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
+
+    out = fix_module._fetch_failed_ci_logs("octo/demo", "pr-019")
+
+    assert out is not None
+    assert out.startswith("[truncated]\n")
+    assert out.endswith("X" * 5000)
+    assert len(out) == len("[truncated]\n") + 5000
+
+
+def test_fetch_failed_ci_logs_short_log_returned_as_is(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    short_log = "tiny failure trace"
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
+        if args[:2] == ["run", "list"]:
+            return [{"databaseId": 12345}]
+        if args[:2] == ["run", "view"]:
+            return short_log
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
+
+    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") == short_log
+
+
+def test_fetch_failed_ci_logs_returns_none_when_no_failed_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        fix_module.github_client, "run_gh", lambda args, **kwargs: []
+    )
+    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
+
+
+def test_fetch_failed_ci_logs_returns_none_on_non_list_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "run_gh",
+        lambda args, **kwargs: "not a list",
+    )
+    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
+
+
+def test_fetch_failed_ci_logs_returns_none_when_first_entry_not_dict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "run_gh",
+        lambda args, **kwargs: ["unexpected-string"],
+    )
+    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
+
+
+def test_fetch_failed_ci_logs_returns_none_when_database_id_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "run_gh",
+        lambda args, **kwargs: [{"databaseId": None}],
+    )
+    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
+
+
+def test_fetch_failed_ci_logs_returns_none_when_run_view_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
+        if args[:2] == ["run", "list"]:
+            return [{"databaseId": 9}]
+        return ""
+
+    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
+    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
+
+
+def test_fetch_failed_ci_logs_returns_none_on_run_list_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
+        raise RuntimeError("api blew up")
+
+    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
+    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
+
+
+def test_fetch_failed_ci_logs_returns_none_on_run_view_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
+        if args[:2] == ["run", "list"]:
+            return [{"databaseId": 9}]
+        raise RuntimeError("log fetch blew up")
+
+    monkeypatch.setattr(fix_module.github_client, "run_gh", fake_run_gh)
+    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
+
+
+@pytest.mark.parametrize(
+    "stdout, expected",
+    [
+        # Last non-empty line is ESCALATE: <reason>
+        ("doing things\nESCALATE: rate limit exceeded\n", "rate limit exceeded"),
+        # Trailing blank lines are ignored
+        ("ESCALATE: foo\n\n\n", "foo"),
+        # ESCALATE in the middle, last line is something else → no trigger
+        ("ESCALATE: stale\nfollow-up unrelated\n", None),
+        # Empty stdout
+        ("", None),
+        # No marker at all
+        ("ran tests\nall good\n", None),
+        # Empty reason → empty string (caller substitutes placeholder)
+        ("ESCALATE:\n", ""),
+        ("ESCALATE: \n", ""),
+        # Strict case-sensitive: lowercase variant rejected
+        ("escalate: typo\n", None),
+        # Past-tense variant rejected
+        ("ESCALATED: misnamed\n", None),
+        # Strict start-of-line: indented marker must NOT trigger
+        ("  ESCALATE: indented\n", None),
+        ("\tESCALATE: tabbed\n", None),
+    ],
+)
+def test_parse_escalate_marker(stdout: str, expected: str | None) -> None:
+    assert fix_module._parse_escalate_marker(stdout) == expected
+
+
+def test_fix_increments_iterations(monkeypatch: pytest.MonkeyPatch) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._start_current_run_record("claude", "opus")
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-001")
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner._current_run_record is not None
+    assert runner._current_run_record.fix_iterations == 1
+
+
+def test_fix_iterations_survive_recovery_until_merge(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parsed_tasks = [
+        QueueTask(
+            pr_id="PR-001",
+            title="t",
+            status=TaskStatus.DOING,
+            branch="pr-001",
+            task_file="tasks/PR-001.md",
+        )
+    ]
+    (tmp_path / "tasks").mkdir(parents=True)
+    (tmp_path / "tasks" / "PR-001.md").write_text("# PR-001\n")
+
+    def fake_git(repo_path: str, *args: str, **kw: Any) -> Any:
+        if args[:2] == ("rev-parse", "HEAD"):
+            return h._FakeCompletedProcess(
+                args=["git", "rev-parse", "HEAD"],
+                stdout="abc123\n",
+                returncode=0,
+            )
+        if args[0] == "merge" and len(args) > 1 and args[1].startswith("origin/"):
+            return h._FakeCompletedProcess(
+                args=["git", *args],
+                stdout="Already up to date.\n",
+                returncode=0,
+            )
+        return h._FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_parse_base_queue",
+        lambda self, **_: parsed_tasks,
+    )
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: [PRInfo(number=77, branch="pr-001")],
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: {
+            "author": "",
+            "head_sha": "",
+            "head_commit_date": "2026-04-18T12:00:00Z",
+        },
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda repo, number, body: None,
+    )
+    monkeypatch.setattr(
+        runner_module.github_client, "merge_pr", lambda repo, num: None
+    )
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+
+    redis = h._FakeRedis()
+    claude_provider, codex_provider = h._usage_providers()
+    runner = PipelineRunner(
+        h._repo_cfg(),
+        h._app_cfg(),
+        redis,
+        claude_provider,
+        codex_provider,
+    )
+    runner.repo_path = str(tmp_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner.state.current_pr = PRInfo(number=77, branch="pr-001")
+    runner.state.state = PipelineState.WATCH
+    runner._start_current_run_record("claude", "opus")
+    asyncio.run(runner._save_current_run_record("coding_complete"))
+
+    asyncio.run(runner.handle_fix())
+
+    recovered = PipelineRunner(
+        h._repo_cfg(),
+        h._app_cfg(),
+        redis,
+        *h._usage_providers(),
+    )
+    recovered.repo_path = str(tmp_path)
+    asyncio.run(recovered.recover_state())
+
+    assert recovered.state.state == PipelineState.WATCH
+    assert recovered._current_run_record is not None
+    assert recovered._current_run_record.fix_iterations == 1
+
+    asyncio.run(recovered.handle_merge())
+
+    recent = asyncio.run(
+        recovered._metrics_store.recent(
+            task_id="PR-001",
+            limit=1,
+            repo_name=recovered.name,
+        )
+    )
+
+    assert len(recent) == 1
+    assert recent[0].fix_iterations == 1
+    assert recent[0].exit_reason == "success_merged"
+
+
+def test_preserve_fix_iteration_count_counts_new_head_sha_after_upgrade() -> None:
+    """``_preserve_fix_iteration_count`` is the IDLE-side mirror of the
+    WATCH merge. A pre-PR-195 ``current_pr`` carrying a legacy
+    ``push_count`` with empty ``observed_head_shas`` must bump the
+    counter when IDLE rehydrates a freshly fetched PRInfo with a new
+    head SHA — same regression, different polling path.
+    """
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=21,
+        branch="pr-021",
+        push_count=7,
+        observed_head_shas=set(),
+    )
+    polled = PRInfo(
+        number=21,
+        branch="pr-021",
+        push_count=1,
+        observed_head_shas={"new-polled-sha"},
+    )
+
+    rehydrated = runner._preserve_fix_iteration_count(polled)
+
+    assert rehydrated.observed_head_shas == {"new-polled-sha"}
+    assert rehydrated.push_count == 8
+
+
+def test_codex_review_not_reposted_same_pr_same_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runner must not repost ``@codex review`` for the same PR
+    when no new push has happened since the last post."""
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr(
+        git_ops_module,
+        "_git",
+        lambda *args, **kwargs: h._FakeCompletedProcess(
+            args=list(args), stdout="head-1\n", returncode=0
+        ),
+    )
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
+
+    assert runner._post_codex_review(42) is True
+    assert runner._post_codex_review(42) is True
+    assert posted == [(runner.owner_repo, 42, "@codex review")]
+    assert runner._last_codex_review_pr == 42
+    assert runner._last_codex_review_head_sha == "head-1"
+    assert any(
+        "Skipping duplicate @codex review for PR #42" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_codex_review_reposted_after_new_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new push on the same PR must allow a fresh review trigger."""
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    head_shas = iter(["head-1\n", "head-2\n"])
+    monkeypatch.setattr(
+        git_ops_module,
+        "_git",
+        lambda *args, **kwargs: h._FakeCompletedProcess(
+            args=list(args), stdout=next(head_shas), returncode=0
+        ),
+    )
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
+
+    assert runner._post_codex_review(42) is True
+    runner.state.current_pr.push_count += 1
+
+    assert runner._post_codex_review(42) is True
+    assert posted == [
+        (runner.owner_repo, 42, "@codex review"),
+        (runner.owner_repo, 42, "@codex review"),
+    ]
+    assert runner._last_codex_review_pr == 42
+    assert runner._last_codex_review_head_sha == "head-2"
+
+
+def test_codex_review_reposted_same_head_when_bypass_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forced stale-review retrigger must bypass same-head cache dedup."""
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr(
+        git_ops_module,
+        "_git",
+        lambda *args, **kwargs: h._FakeCompletedProcess(
+            args=list(args), stdout="head-1\n", returncode=0
+        ),
+    )
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
+
+    assert runner._post_codex_review(42) is True
+    assert runner._post_codex_review(
+        42,
+        bypass_same_head_dedup=True,
+    ) is True
+
+    assert posted == [
+        (runner.owner_repo, 42, "@codex review"),
+        (runner.owner_repo, 42, "@codex review"),
+    ]
+    assert runner._last_codex_review_pr == 42
+    assert runner._last_codex_review_head_sha == "head-1"
+
+
+def test_codex_review_not_reposted_when_author_already_requested_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recent PR-author trigger on the current head should suppress
+    the daemon's first duplicate comment for that same head."""
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    runner = h._make_runner()
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: {
+            "author": "alice",
+            "head_sha": "head-1",
+            "head_commit_date": "2026-04-17T23:14:11Z",
+        },
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "has_recent_codex_review_request",
+        lambda repo, number, pr_author, within_minutes=5, after_iso=None: (
+            repo == runner.owner_repo
+            and number == 42
+            and pr_author == "alice"
+            and after_iso == "2026-04-17T23:14:11Z"
+        ),
+    )
+    monkeypatch.setattr(
+        git_ops_module,
+        "_git",
+        lambda *args, **kwargs: h._FakeCompletedProcess(
+            args=list(args), stdout="head-1\n", returncode=0
+        ),
+    )
+    runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
+
+    assert runner._post_codex_review(42) is True
+    assert posted == []
+    assert runner._last_codex_review_pr == 42
+    assert runner._last_codex_review_head_sha == "head-1"
+    assert any(
+        "PR author already requested review for this head" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_codex_review_result_returns_retry_at_for_author_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_at = datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc)
+    runner = h._make_runner()
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: {
+            "author": "alice",
+            "head_sha": "head-1",
+            "head_commit_date": "2026-04-17T23:14:11Z",
+        },
+    )
+    monkeypatch.setattr(
+        hung_module,
+        "_author_already_requested_review",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        hung_module,
+        "_author_recent_review_requested_at",
+        lambda *args, **kwargs: requested_at,
+    )
+    monkeypatch.setattr(
+        git_ops_module,
+        "_git",
+        lambda *args, **kwargs: h._FakeCompletedProcess(
+            args=list(args), stdout="head-1\n", returncode=0
+        ),
+    )
+    runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
+
+    success, posted, retry_at = runner._post_codex_review_result(42)
+
+    assert success is True
+    assert posted is False
+    assert retry_at == requested_at + timedelta(minutes=5)
+
+
+def test_codex_review_git_head_lookup_failure_does_not_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient HEAD lookup failure must not suppress review requests."""
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    def fake_git(*args: object, **kwargs: object) -> h._FakeCompletedProcess:
+        raise RuntimeError("git rev-parse failed")
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
+
+    assert runner._post_codex_review(42) is True
+    assert runner._post_codex_review(42) is True
+    assert posted == [
+        (runner.owner_repo, 42, "@codex review"),
+        (runner.owner_repo, 42, "@codex review"),
+    ]
+    assert runner._last_codex_review_pr is None
+    assert runner._last_codex_review_head_sha is None
+    assert any(
+        "posting @codex review without dedup" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_codex_review_metadata_failure_posts_without_pr_author_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Metadata lookup failures must not escape or suppress review posts."""
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", fake_post)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: (_ for _ in ()).throw(OSError("gh timed out")),
+    )
+    monkeypatch.setattr(
+        git_ops_module,
+        "_git",
+        lambda *args, **kwargs: h._FakeCompletedProcess(
+            args=list(args), stdout="head-1\n", returncode=0
+        ),
+    )
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
+
+    assert runner._post_codex_review(42) is True
+    assert posted == [(runner.owner_repo, 42, "@codex review")]
+    assert runner._last_codex_review_pr == 42
+    assert runner._last_codex_review_head_sha == "head-1"
+    assert any(
+        "failed to load PR metadata for @codex review dedup" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_author_already_requested_review_fails_open_on_lookup_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        hung_module.github_client,
+        "has_recent_codex_review_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    assert (
+        hung_module._author_already_requested_review(
+            "octo/demo",
+            42,
+            "alice",
+            "2026-04-17T23:14:11Z",
+        )
+        is False
+    )
+
+
+def test_author_recent_review_requested_at_fails_open_on_lookup_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        hung_module.github_client,
+        "get_recent_codex_review_request_time",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    assert (
+        hung_module._author_recent_review_requested_at(
+            "octo/demo",
+            42,
+            "alice",
+            "2026-04-17T23:14:11Z",
+        )
+        is None
+    )
+
+
+def test_codex_review_post_failure_clears_cached_dedup_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(repo: str, number: int, body: str) -> None:
+        raise RuntimeError("gh rate limited")
+
+    monkeypatch.setattr(runner_module.github_client, "post_comment", boom)
+    monkeypatch.setattr(
+        git_ops_module,
+        "_git",
+        lambda *args, **kwargs: h._FakeCompletedProcess(
+            args=list(args), stdout="head-1\n", returncode=0
+        ),
+    )
+
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
+
+    assert runner._post_codex_review(42) is False
+    assert runner._last_codex_review_pr is None
+    assert runner._last_codex_review_head_sha is None
+    assert any(
+        "Warning: failed to post @codex review on PR #42: gh rate limited"
+        in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_fix_idle_timeout_kills_on_no_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude task must be cancelled when no push is detected within idle limit."""
+    h._patch_subprocess(monkeypatch)
+
+    async def fake_fix_hangs(
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+    ) -> tuple[int, str, str]:
+        await asyncio.Future()
+        return (0, "", "")
+
+    async def immediate_cancel_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+        idle_flag["timed_out"] = True
+        target.cancel()
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix_hangs)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_fix_idle", immediate_cancel_monitor
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = PipelineRunner(
+        h._repo_cfg(),
+        AppConfig(
+            repositories=[],
+            daemon=DaemonConfig(fix_idle_timeout_sec=5),
+        ),
+        h._FakeRedis(),
+        *h._usage_providers(),
+    )
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.ERROR
+    assert "idle timeout" in (runner.state.error_message or "")
+
+
+def test_fix_idle_timeout_defers_to_user_stop_after_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop consumed alongside idle timeout should pause instead of erroring."""
+    h._patch_subprocess(monkeypatch)
+    saved_logs: list[tuple[str, str, str]] = []
+
+    async def fake_fix_hangs(
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+    ) -> tuple[int, str, str]:
+        await asyncio.Future()
+        return (0, "", "")
+
+    async def immediate_cancel_monitor(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+        idle_flag["timed_out"] = True
+        target.cancel()
+
+    async def stale_stop_monitor(
+        _cli_task: asyncio.Task[tuple[int, str, str]],
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix_hangs)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_fix_idle", immediate_cancel_monitor
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = PipelineRunner(
+        h._repo_cfg(),
+        AppConfig(
+            repositories=[],
+            daemon=DaemonConfig(fix_idle_timeout_sec=5),
+        ),
+        h._FakeRedis(),
+        *h._usage_providers(),
+    )
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.redis.store[f"control:{runner.name}:stop"] = "1"
+
+    async def save_log(stdout: str, stderr: str, label: str) -> None:
+        saved_logs.append((stdout, stderr, label))
+
+    monkeypatch.setattr(runner, "_monitor_stop_request", stale_stop_monitor)
+    monkeypatch.setattr(runner, "_save_cli_log", save_log)
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.user_paused is True
+    assert runner.state.error_message is None
+    assert f"control:{runner.name}:stop" not in runner.redis.store
+    assert saved_logs == [("", "", "FIX idle timeout")]
+    assert any("user stop requested" in e["event"].lower() for e in runner.state.history)
+
+
+def test_fix_idle_timeout_resets_on_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timer must reset when a push is detected, allowing Claude to finish."""
+    h._patch_subprocess(monkeypatch)
+
+    async def fake_fix_quick(
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+    ) -> tuple[int, str, str]:
+        await asyncio.sleep(0)
+        return (0, "", "")
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix_quick)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = PipelineRunner(
+        h._repo_cfg(),
+        AppConfig(
+            repositories=[],
+            daemon=DaemonConfig(fix_idle_timeout_sec=1800),
+        ),
+        h._FakeRedis(),
+        *h._usage_providers(),
+    )
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.WATCH
+
+
+def test_fix_idle_timeout_monitor_resets_on_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Push detection resets the idle timer so a productive session is not killed."""
+    h._patch_subprocess(monkeypatch)
+
+    push_detected = [False]
+
+    async def monitor_with_push_then_finish(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        push_detected[0] = True
+        await asyncio.sleep(0)
+
+    async def fake_fix_quick(
+        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+    ) -> tuple[int, str, str]:
+        await asyncio.sleep(0)
+        return (0, "", "")
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix_quick)
+    monkeypatch.setattr(
+        PipelineRunner, "_monitor_fix_idle", monitor_with_push_then_finish
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = PipelineRunner(
+        h._repo_cfg(),
+        AppConfig(
+            repositories=[],
+            daemon=DaemonConfig(fix_idle_timeout_sec=1800),
+        ),
+        h._FakeRedis(),
+        *h._usage_providers(),
+    )
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.WATCH
+    assert push_detected[0]
+
+
+def test_monitor_fix_idle_times_out_without_push_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_monitor_fix_idle should tolerate missing push history and still time out."""
+    runner = h._make_runner()
+    events: list[str] = []
+    monkeypatch.setattr(runner, "log_event", events.append)
+
+    branch_results: list[object] = [
+        fix_module.github_client.GitHubPollError("bootstrap failed"),
+        None,
+    ]
+
+    def fake_branch_last_push(repo: str, pr_number: int) -> float | None:
+        result = branch_results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    async def fake_to_thread(func: Any, *args: object, **kwargs: object) -> Any:
+        return func(*args, **kwargs)
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    monotonic_values = iter([100.0, 105.0])
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "get_branch_last_push_time",
+        fake_branch_last_push,
+    )
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, pr: None,
+    )
+    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        fix_module,
+        "time",
+        types.SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+    )
+
+    async def run_monitor() -> tuple[dict[str, bool], asyncio.Task[None]]:
+        idle_flag = {"timed_out": False}
+        blocker: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+        async def wait_forever() -> None:
+            await blocker
+
+        target = asyncio.create_task(wait_forever())
+        await runner._monitor_fix_idle(5, 5, target, idle_flag)
+        return idle_flag, target
+
+    idle_flag, target = asyncio.run(run_monitor())
+    assert idle_flag["timed_out"] is True
+    assert target.cancelled() is True
+    assert events == ["[FIX] idle timeout (5s since last push), killing."]
+
+
+def test_monitor_fix_idle_backdates_elapsed_time_from_head_age(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Head age should backdate the idle deadline before the first poll."""
+    runner = h._make_runner()
+
+    async def fake_to_thread(func: Any, *args: object, **kwargs: object) -> Any:
+        return func(*args, **kwargs)
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    monotonic_values = iter([100.0, 250.0])
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "get_branch_last_push_time",
+        lambda repo, pr: None,
+    )
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, pr: 30.0,
+    )
+    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        fix_module,
+        "time",
+        types.SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+    )
+
+    async def run_monitor() -> tuple[dict[str, bool], asyncio.Task[None]]:
+        idle_flag = {"timed_out": False}
+        blocker: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+        async def wait_forever() -> None:
+            await blocker
+
+        target = asyncio.create_task(wait_forever())
+        await runner._monitor_fix_idle(5, 120, target, idle_flag)
+        return idle_flag, target
+
+    idle_flag, target = asyncio.run(run_monitor())
+    assert idle_flag["timed_out"] is True
+    assert target.cancelled() is True
+
+
+def test_monitor_fix_idle_resets_timer_on_detected_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newly detected push should reset the timer without cancelling the target."""
+    runner = h._make_runner()
+    runner.state.coder = "codex"
+    events: list[str] = []
+    monkeypatch.setattr(runner, "log_event", events.append)
+
+    class _StopMonitor(Exception):
+        pass
+
+    branch_results: list[object] = [
+        fix_module.github_client.GitHubPollError("bootstrap failed"),
+        50.0,
+        220.0,
+    ]
+
+    def fake_branch_last_push(repo: str, pr_number: int) -> float | None:
+        result = branch_results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    sleep_calls = 0
+
+    async def fake_sleep(delay: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 3:
+            raise _StopMonitor
+
+    async def fake_to_thread(func: Any, *args: object, **kwargs: object) -> Any:
+        return func(*args, **kwargs)
+
+    monotonic_values = iter([100.0, 150.0, 230.0, 250.0])
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "get_branch_last_push_time",
+        fake_branch_last_push,
+    )
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, pr: None,
+    )
+    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        fix_module,
+        "time",
+        types.SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+    )
+    idle_flag = {"timed_out": False}
+    target_holder: dict[str, asyncio.Task[None]] = {}
+
+    async def run_monitor() -> None:
+        blocker: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+        async def wait_forever() -> None:
+            await blocker
+
+        target = asyncio.create_task(wait_forever())
+        target_holder["task"] = target
+        try:
+            await runner._monitor_fix_idle(5, 100, target, idle_flag)
+        finally:
+            target.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await target
+
+    with pytest.raises(_StopMonitor):
+        asyncio.run(run_monitor())
+
+    assert idle_flag["timed_out"] is False
+    assert target_holder["task"].cancelled() is True
+    assert "[FIX] [codex] pushed, resetting idle timer." in events
+
+
+def test_monitor_fix_idle_logs_poll_failures_before_timing_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub poll failures should preserve the deadline and be logged."""
+    runner = h._make_runner()
+    events: list[str] = []
+    monkeypatch.setattr(runner, "log_event", events.append)
+
+    def fake_branch_last_push(repo: str, pr_number: int) -> float | None:
+        if fake_branch_last_push.calls == 0:
+            fake_branch_last_push.calls += 1
+            return None
+        raise fix_module.github_client.GitHubPollError("poll failed")
+
+    fake_branch_last_push.calls = 0
+
+    async def fake_to_thread(func: Any, *args: object, **kwargs: object) -> Any:
+        return func(*args, **kwargs)
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    monotonic_values = iter([100.0, 130.0])
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "get_branch_last_push_time",
+        fake_branch_last_push,
+    )
+    monkeypatch.setattr(
+        fix_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, pr: None,
+    )
+    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        fix_module,
+        "time",
+        types.SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+    )
+
+    async def run_monitor() -> tuple[dict[str, bool], asyncio.Task[None]]:
+        idle_flag = {"timed_out": False}
+        blocker: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+        async def wait_forever() -> None:
+            await blocker
+
+        target = asyncio.create_task(wait_forever())
+        await runner._monitor_fix_idle(5, 30, target, idle_flag)
+        return idle_flag, target
+
+    idle_flag, target = asyncio.run(run_monitor())
+    assert idle_flag["timed_out"] is True
+    assert target.cancelled() is True
+    assert events == [
+        "[FIX] GitHub API poll failed, preserving deadline.",
+        "[FIX] idle timeout (30s since last push), killing.",
+    ]
+
+
+def test_run_coder_with_polling_returns_none_when_pr_number_is_zero() -> None:
+    """No PR is in flight yet, so the polling task must not be spawned."""
+    runner = h._make_runner()
+    target = asyncio.new_event_loop().create_future()
+    try:
+        result = runner._run_coder_with_polling(0, target, {"state": None})
+    finally:
+        target.cancel()
+    assert result is None
+
+
+def test_poll_github_during_fix_logs_and_continues_on_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``gh pr view`` failures must be logged and not crash the loop."""
+    runner = h._make_runner()
+    runner._app_config = h._app_cfg(fix_poll_interval_sec=1)
+    events: list[str] = []
+    monkeypatch.setattr(runner, "log_event", events.append)
+
+    sequence: list[Any] = [RuntimeError("rate-limit"), None]
+
+    def fake_pr_state(repo: str, number: int) -> dict[str, str | None] | None:
+        result = sequence.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        if len(sleeps) >= len(sequence) + 2:
+            raise asyncio.CancelledError
+
+    async def fake_to_thread(func: Any, *args: object, **kwargs: object) -> Any:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_module.github_client, "pr_state", fake_pr_state)
+
+    async def run_loop() -> None:
+        loop = asyncio.get_running_loop()
+        target_fut: asyncio.Future[None] = loop.create_future()
+
+        async def hold() -> None:
+            await target_fut
+
+        target = asyncio.create_task(hold())
+        with contextlib.suppress(asyncio.CancelledError):
+            await runner._poll_github_during_fix(11, target, {"state": None})
+        target.cancel()
+        with contextlib.suppress(BaseException):
+            await target
+
+    asyncio.run(run_loop())
+
+    assert any("GitHub poll for PR #11 failed: rate-limit" in e for e in events)
+    assert any("returned no data" in e for e in events)
+
+
+def test_poll_github_during_fix_continues_when_pr_remains_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``OPEN`` payload must not trigger termination; the loop continues."""
+    runner = h._make_runner()
+    runner._app_config = h._app_cfg(fix_poll_interval_sec=1)
+
+    sequence: list[dict[str, str | None]] = [
+        {"state": "OPEN", "mergedAt": None, "closedAt": None},
+        {"state": "MERGED", "mergedAt": "now", "closedAt": None},
+    ]
+
+    def fake_pr_state(repo: str, number: int) -> dict[str, str | None]:
+        return sequence.pop(0)
+
+    terminated: list[bool] = []
+
+    async def fake_terminate() -> None:
+        terminated.append(True)
+
+    monkeypatch.setattr(runner, "_terminate_current_coder", fake_terminate)
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    async def fake_to_thread(func: Any, *args: object, **kwargs: object) -> Any:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_module.github_client, "pr_state", fake_pr_state)
+
+    async def run_loop() -> dict[str, str | None]:
+        loop = asyncio.get_running_loop()
+        target_fut: asyncio.Future[None] = loop.create_future()
+
+        async def hold() -> None:
+            await target_fut
+
+        target = asyncio.create_task(hold())
+        flag: dict[str, str | None] = {"state": None}
+        await runner._poll_github_during_fix(7, target, flag)
+        with contextlib.suppress(BaseException):
+            await target
+        return flag
+
+    flag = asyncio.run(run_loop())
+    assert flag == {"state": "MERGED"}
+    assert terminated == [True]
+
+
+def test_poll_github_during_fix_terminates_coder_on_external_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On detected MERGED, the loop must terminate the coder and cancel target."""
+    runner = h._make_runner()
+    runner._app_config = h._app_cfg(fix_poll_interval_sec=1)
+    events: list[str] = []
+    monkeypatch.setattr(runner, "log_event", events.append)
+    terminated = []
+
+    async def fake_terminate() -> None:
+        terminated.append(True)
+
+    monkeypatch.setattr(runner, "_terminate_current_coder", fake_terminate)
+
+    def fake_pr_state(repo: str, number: int) -> dict[str, str | None]:
+        return {"state": "merged", "mergedAt": "now", "closedAt": None}
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    async def fake_to_thread(func: Any, *args: object, **kwargs: object) -> Any:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_module.github_client, "pr_state", fake_pr_state)
+
+    async def run_loop() -> tuple[dict[str, str | None], asyncio.Task[None]]:
+        loop = asyncio.get_running_loop()
+        target_fut: asyncio.Future[None] = loop.create_future()
+
+        async def hold() -> None:
+            await target_fut
+
+        target = asyncio.create_task(hold())
+        flag: dict[str, str | None] = {"state": None}
+        await runner._poll_github_during_fix(99, target, flag)
+        with contextlib.suppress(BaseException):
+            await target
+        return flag, target
+
+    flag, target = asyncio.run(run_loop())
+
+    assert flag == {"state": "MERGED"}
+    assert terminated == [True]
+    assert target.cancelled() is True
+    assert any(
+        "PR #99 reached terminal state MERGED during FIX" in e
+        for e in events
+    )
+
+
+def test_handle_external_terminal_pr_state_merged_resets_counters_and_marks_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Detected external merge must reset counters and clean up bookkeeping."""
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=42,
+        branch="pr-042",
+        no_push_fix_count=2,
+        fix_iteration_count=4,
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-042",
+        title="external merge",
+        status=TaskStatus.DOING,
+        branch="pr-042",
+    )
+
+    queue_done_calls = {"count": 0}
+
+    def fake_mark_done(self: object) -> None:
+        queue_done_calls["count"] += 1
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", fake_mark_done)
+
+    asyncio.run(runner._handle_external_terminal_pr_state("MERGED"))
+
+    assert queue_done_calls["count"] == 1
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+    assert runner.state.current_task is None
+    assert runner.state.error_message is None
+    assert any(
+        "PR #42 merged externally during FIX, returning to IDLE." in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_external_terminal_pr_state_swallows_mark_queue_done_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A queue-sync failure on external merge must not block the IDLE
+    transition and must log a warning, but the
+    ``pending_queue_sync_branch`` guard MUST be preserved so a stale
+    ``DOING`` task is not redispatched on the next idle cycle —
+    ``_resolve_pending_queue_sync`` owns the retry/timeout from
+    ``handle_idle`` (Codex P2 round-2 + P1 round-3 on PR #223)."""
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=44, branch="pr-044")
+    sync_started_at = datetime.now(timezone.utc)
+
+    def fake_mark_done(self: object) -> None:
+        # Simulate _mark_queue_done's eager marker-then-fragile-op shape:
+        # set the marker, then raise to model a fetch/checkout failure
+        # mid-way through the sync.
+        self.state.pending_queue_sync_branch = "queue-done-pr-044"
+        self.state.pending_queue_sync_started_at = sync_started_at
+        raise RuntimeError("queue mutation failed")
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", fake_mark_done)
+
+    asyncio.run(runner._handle_external_terminal_pr_state("MERGED"))
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is None
+    # Marker preserved so handle_idle gates dispatch via
+    # _resolve_pending_queue_sync rather than redispatching the stale
+    # DOING task as new work.
+    assert runner.state.pending_queue_sync_branch == "queue-done-pr-044"
+    assert runner.state.pending_queue_sync_started_at == sync_started_at
+    assert any(
+        "_mark_queue_done failed during external-merge cleanup" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_external_terminal_pr_state_logs_without_pr_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even with no current_pr (race with cleanup), MERGED still moves to IDLE."""
+    runner = h._make_runner()
+    runner.state.current_pr = None
+
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+    asyncio.run(runner._handle_external_terminal_pr_state("MERGED"))
+    assert runner.state.state == PipelineState.IDLE
+    assert any(
+        "merged externally during FIX" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_external_terminal_pr_state_closed_logs_without_pr_number() -> None:
+    """No-pr CLOSED race must still transition to HUNG with a generic log."""
+    runner = h._make_runner()
+    runner.state.current_pr = None
+    asyncio.run(runner._handle_external_terminal_pr_state("CLOSED"))
+    assert runner.state.state == PipelineState.HUNG
+    assert any(
+        "closed externally during FIX" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_external_terminal_pr_state_merged_saves_success_merged_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """External MERGED in FIX must finalize the run record as ``success_merged``
+    so dashboard / metrics views don't see it stuck on ``coding_complete``
+    (Codex P2 on PR #223)."""
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-091",
+        title="external merge",
+        status=TaskStatus.DOING,
+        branch="pr-091",
+        task_file="tasks/PR-091.md",
+    )
+    runner.state.current_pr = PRInfo(number=91, branch="pr-091")
+    runner._start_current_run_record("claude", "opus")
+
+    monkeypatch.setattr(
+        runner_module.PipelineRunner, "_mark_queue_done", lambda self: None
+    )
+    monkeypatch.setattr(
+        runner, "_compute_diff_stats", lambda base_branch: {}
+    )
+
+    saved: list[str] = []
+    original_save = runner._save_current_run_record
+
+    async def spy_save(exit_reason: str, **kwargs: object) -> None:
+        saved.append(exit_reason)
+        await original_save(exit_reason, **kwargs)
+
+    runner._save_current_run_record = spy_save  # type: ignore[assignment]
+
+    asyncio.run(runner._handle_external_terminal_pr_state("MERGED"))
+
+    assert saved == ["success_merged"]
+    assert runner._current_run_record is None
+    assert runner.state.state == PipelineState.IDLE
+
+
+def test_terminate_current_coder_uses_configured_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``daemon.coder_terminate_grace_sec`` must drive the SIGTERM-to-SIGKILL
+    grace (Codex P3 on PR #223). Operators must be able to tune the grace
+    via config rather than the value being hard-coded."""
+    runner = h._make_runner()
+    runner._app_config = h._app_cfg(coder_terminate_grace_sec=42)
+
+    captured_timeouts: list[float] = []
+
+    class _Proc:
+        returncode = None
+
+        def terminate(self) -> None:
+            return None
+
+        async def wait(self) -> None:
+            return None
+
+    runner._current_coder_process = _Proc()
+
+    original_wait_for = asyncio.wait_for
+
+    async def fake_wait_for(coro: object, timeout: float) -> object:
+        captured_timeouts.append(timeout)
+        return await original_wait_for(coro, timeout)
+
+    monkeypatch.setattr(
+        runner_module.asyncio, "wait_for", fake_wait_for
+    )
+
+    asyncio.run(runner._terminate_current_coder())
+
+    assert captured_timeouts == [42]
+
+
+def test_maybe_retrigger_stale_review_returns_without_current_pr() -> None:
+    runner = h._make_runner()
+
+    runner._maybe_retrigger_stale_review(42)
+
+    assert runner.state.last_stale_retrigger_at is None
+
+
+def test_maybe_retrigger_stale_review_returns_for_non_changes_requested() -> None:
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        review_status=ReviewStatus.APPROVED,
+    )
+
+    runner._maybe_retrigger_stale_review(42)
+
+    assert runner.state.last_stale_retrigger_at is None
+
+
+def test_maybe_retrigger_stale_review_returns_for_missing_push_age(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_last_push_age_seconds",
+        lambda repo, number: None,
+    )
+
+    runner._maybe_retrigger_stale_review(42)
+
+    assert runner.state.last_stale_retrigger_at is None
+
+
+def test_rehydrate_last_push_at_from_head_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restart recovery must seed ``_last_push_at`` from the head commit
+    committer date so the stale-feedback guard does not immediately
+    trigger FIX on the first post-restart cycle."""
+    head_iso = "2026-04-14T20:00:00Z"
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": head_iso},
+    )
+    runner = h._make_runner()
+    assert runner._last_push_at is None
+    pr = PRInfo(number=99, branch="pr-001")
+    runner._rehydrate_last_push_at(pr)
+    assert runner._last_push_at is not None
+    assert runner._last_push_at.isoformat() == "2026-04-14T20:00:00+00:00"
+
+
+def test_rehydrate_last_push_at_no_fallback_to_last_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the head commit time can't be fetched, DO NOT fall back to
+    pr.last_activity. That value is GitHub's ``updatedAt`` which advances
+    on Codex comments, so using it could seed _last_push_at to AFTER a
+    pending P1/P2 comment and silently skip the fix. Leaving it None
+    lets handle_watch retry the rehydrate next cycle."""
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": ""},
+    )
+    fallback = datetime(2026, 4, 1, 10, 0, tzinfo=timezone.utc)
+    pr = PRInfo(number=99, branch="pr-001", last_activity=fallback)
+    runner = h._make_runner()
+    runner._rehydrate_last_push_at(pr)
+    assert runner._last_push_at is None
+
+
+def test_rehydrate_replaces_last_push_at_on_different_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Switching from PR A's timestamp to PR B must unconditionally
+    replace — the 'only update if newer' gate is safe only within one
+    PR. A newer-timestamp leak from the previous PR would make legit
+    feedback on the new PR look stale."""
+    head_iso = "2026-04-10T12:00:00Z"
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": head_iso},
+    )
+    runner = h._make_runner()
+    # Simulate a stale last_push_at from a previously-tracked PR (newer
+    # timestamp than the new PR's head commit).
+    runner._last_push_at = datetime(2026, 4, 20, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 999
+
+    runner._rehydrate_last_push_at(PRInfo(number=42, branch="pr-new"))
+
+    assert runner._last_push_at_pr_number == 42
+    assert runner._last_push_at is not None
+    assert runner._last_push_at.isoformat() == "2026-04-10T12:00:00+00:00"
+
+
+def test_rehydrate_clears_stale_on_mismatch_when_fetch_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a PR-number mismatch with a failing commit-time fetch, the
+    previous PR's stale timestamp must be cleared rather than carried
+    over. Next cycle's handle_watch retries the rehydrate; in the
+    meantime the None baseline lets _has_new_codex_feedback_since_last_push
+    return True so one fix attempt can run."""
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_pr_metadata",
+        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": ""},
+    )
+    runner = h._make_runner()
+    runner._last_push_at = datetime(2026, 4, 20, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 999
+
+    runner._rehydrate_last_push_at(PRInfo(number=42, branch="pr-new"))
+
+    assert runner._last_push_at is None
+    assert runner._last_push_at_pr_number == 42
+
+
+def test_has_new_feedback_returns_none_without_current_pr() -> None:
+    runner = h._make_runner()
+
+    assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.NONE
+
+
+def test_has_new_feedback_returns_true_without_last_push_timestamp() -> None:
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
+
+    assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.NEW
+
+
+def test_has_new_feedback_returns_true_for_any_codex_comment_after_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Codex comment without P1/P2 posted after _last_push_at -> True."""
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
+    runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [
+            {
+                "user": {"login": "chatgpt-codex-bot"},
+                "body": "Consider renaming this variable",
+                "created_at": "2026-01-01T00:05:00Z",
+            },
+        ],
+    )
+
+    assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.NEW
+
+
+def test_has_new_feedback_returns_false_for_old_comments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Codex comment posted before _last_push_at -> False."""
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
+    runner._last_push_at = datetime(2026, 1, 1, 1, 0, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [
+            {
+                "user": {"login": "chatgpt-codex-bot"},
+                "body": "Old feedback",
+                "created_at": "2026-01-01T00:30:00Z",
+            },
+        ],
+    )
+
+    assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.NONE
+
+
+def test_has_new_feedback_normalizes_naive_timestamps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
+    runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0)
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [
+            {
+                "user": {"login": "chatgpt-codex-bot"},
+                "created_at": "2026-01-01T00:05:00",
+            },
+        ],
+    )
+
+    assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.NEW
+
+
+def test_has_new_feedback_ignores_non_codex_users(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A comment from a regular user after _last_push_at -> False."""
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
+    runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [
+            {
+                "user": {"login": "some-reviewer"},
+                "body": "Please fix this",
+                "created_at": "2026-01-01T00:05:00Z",
+            },
+        ],
+    )
+
+    assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.NONE
+
+
+def test_has_new_feedback_skips_unparseable_codex_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
+    runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        lambda path: [
+            {
+                "user": {"login": "chatgpt-codex-bot"},
+                "created_at": "not-a-date",
+            },
+        ],
+    )
+
+    assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.NONE
+
+
+def test_feedback_check_returns_unknown_on_api_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub API failure during feedback check returns UNKNOWN, not NEW."""
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
+    runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    def _raise(path: str) -> list:
+        raise RuntimeError("GitHub API unavailable")
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "_gh_api_paginated",
+        _raise,
+    )
+
+    assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.UNKNOWN
+
+
+def test_terminate_current_coder_clears_exited_process() -> None:
+    runner = h._make_runner()
+
+    class _Proc:
+        returncode = 0
+
+    runner._current_coder_process = _Proc()
+
+    asyncio.run(runner._terminate_current_coder())
+
+    assert runner._current_coder_process is None
+
+
+def test_terminate_current_coder_handles_missing_process() -> None:
+    runner = h._make_runner()
+
+    class _Proc:
+        returncode = None
+
+        def terminate(self) -> None:
+            raise ProcessLookupError
+
+    runner._current_coder_process = _Proc()
+
+    asyncio.run(runner._terminate_current_coder())
+
+    assert runner._current_coder_process is None
+
+
+def test_terminate_current_coder_kills_after_timeout() -> None:
+    runner = h._make_runner()
+    calls: list[str] = []
+
+    class _Proc:
+        returncode = None
+
+        def terminate(self) -> None:
+            calls.append("terminate")
+
+        def kill(self) -> None:
+            calls.append("kill")
+
+        async def wait(self) -> None:
+            calls.append("wait")
+            if calls.count("wait") == 1:
+                raise asyncio.TimeoutError
+            return None
+
+    runner._current_coder_process = _Proc()
+
+    asyncio.run(runner._terminate_current_coder())
+
+    assert calls == ["terminate", "wait", "kill", "wait"]
+    assert runner._current_coder_process is None
+
+
+def test_terminate_current_coder_ignores_missing_process_on_kill() -> None:
+    runner = h._make_runner()
+    calls: list[str] = []
+
+    class _Proc:
+        returncode = None
+
+        def terminate(self) -> None:
+            calls.append("terminate")
+
+        def kill(self) -> None:
+            calls.append("kill")
+            raise ProcessLookupError
+
+        async def wait(self) -> None:
+            calls.append("wait")
+            if calls.count("wait") == 1:
+                raise asyncio.TimeoutError
+            return None
+
+    runner._current_coder_process = _Proc()
+
+    asyncio.run(runner._terminate_current_coder())
+
+    assert calls == ["terminate", "wait", "kill", "wait"]
+    assert runner._current_coder_process is None
+
+
+def test_verify_pushes_since_returns_false_when_remote_diverged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_verify_pushes_since`` returns ``False`` when the remote moved
+    to a SHA that does not contain ``head_after`` (e.g. force-pushed
+    over the FIX commit). This exercises the merge-base branch where
+    the early-out shortcut against ``last_known_sha`` does not apply."""
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> h._FakeCompletedProcess:
+        if args and args[0] == "fetch":
+            return h._FakeCompletedProcess(args=["git", *args], returncode=0)
+        if args[:2] == ("rev-parse", "origin/pr-190"):
+            return h._FakeCompletedProcess(
+                args=["git", *args], stdout="ddd444\n", returncode=0,
+            )
+        if args[:2] == ("merge-base", "--is-ancestor"):
+            return h._FakeCompletedProcess(args=["git", *args], returncode=1)
+        return h._FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+
+    runner = h._make_runner()
+    result = runner._verify_pushes_since(
+        "pr-190", "aaa111", "bbb222", context="after FIX exit",
+    )
+
+    assert result is False

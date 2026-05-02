@@ -25,7 +25,7 @@ from src.models import (
     TaskStatus,
 )
 
-from tests import test_runner as h
+from tests.runner import _helpers as h
 
 claude_cli = claude_plugin_module.claude_cli
 
@@ -2252,3 +2252,249 @@ def test_handle_watch_skips_codex_bot_error_check_outside_eyes(
     assert posted == []
     assert all("issues/42/comments" not in path for path in api_calls)
     assert runner.state.last_codex_retrigger_at is None
+
+
+# ---------------------------------------------------------------------------
+# PR-224b moved from tests/test_runner.py — handle_watch group
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("state", "handler_name"),
+    [
+        (PipelineState.WATCH, "handle_watch"),
+        (PipelineState.HUNG, "handle_hung"),
+    ],
+)
+def test_run_cycle_dispatches_watch_and_hung_handlers(
+    monkeypatch: pytest.MonkeyPatch,
+    state: PipelineState,
+    handler_name: str,
+) -> None:
+    calls: list[str] = []
+    publishes: list[str] = []
+    runner = h._make_runner()
+    runner._recovered = True
+    runner._scaffolded = True
+    runner.state.state = state
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_handler() -> None:
+        calls.append(handler_name)
+
+    async def fake_publish_state() -> None:
+        publishes.append("published")
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", h._preflight_true_stub)
+    monkeypatch.setattr(runner, handler_name, fake_handler)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+
+    asyncio.run(runner.run_cycle())
+
+    assert calls == [handler_name]
+    assert publishes == ["published"]
+
+
+def test_effective_watch_poll_interval_is_slow_immediately_after_entry() -> None:
+    """First WATCH cycle returns the slow interval (default 300s)."""
+    runner = h._make_runner(poll_interval_sec=60)
+    h._configure_watch_adaptive_defaults(runner)
+
+    runner._watch_entered_at = datetime.now(timezone.utc)
+
+    assert runner.effective_watch_poll_interval == 300
+
+
+def test_effective_watch_poll_interval_still_slow_inside_window() -> None:
+    """Four minutes after WATCH entry still uses the slow interval."""
+    runner = h._make_runner(poll_interval_sec=60)
+    h._configure_watch_adaptive_defaults(runner)
+
+    runner._watch_entered_at = datetime.now(timezone.utc) - timedelta(minutes=4)
+
+    assert runner.effective_watch_poll_interval == 300
+
+
+def test_effective_watch_poll_interval_becomes_fast_past_window() -> None:
+    """Past 5 min the slow window closes and polling drops to fast (45s)."""
+    runner = h._make_runner(poll_interval_sec=60)
+    h._configure_watch_adaptive_defaults(runner)
+
+    runner._watch_entered_at = (
+        datetime.now(timezone.utc) - timedelta(minutes=5, seconds=1)
+    )
+
+    assert runner.effective_watch_poll_interval == 45
+
+
+def test_effective_watch_poll_interval_event_resets_slow_window() -> None:
+    """A detected GitHub event re-anchors the slow window from event time."""
+    runner = h._make_runner(poll_interval_sec=60)
+    h._configure_watch_adaptive_defaults(runner)
+
+    # WATCH entered 6 minutes ago — past the slow window.
+    runner._watch_entered_at = datetime.now(timezone.utc) - timedelta(minutes=6)
+    assert runner.effective_watch_poll_interval == 45
+
+    # Prime a baseline signature, then observe a different signature.
+    baseline = PRInfo(number=42, branch="pr-042", ci_status=CIStatus.PENDING)
+    runner._observe_watch_event_signature(baseline)
+    changed = PRInfo(
+        number=42,
+        branch="pr-042",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.EYES,
+    )
+    runner._observe_watch_event_signature(changed)
+
+    assert runner._watch_last_event_at is not None
+    # Event reset → new anchor is recent → back inside slow window.
+    assert runner.effective_watch_poll_interval == 300
+
+
+def test_watch_polling_anchors_cleared_on_transition_out_of_watch() -> None:
+    """Leaving WATCH wipes the adaptive polling anchors for the next session."""
+    runner = h._make_runner(poll_interval_sec=60)
+    h._configure_watch_adaptive_defaults(runner)
+
+    runner._watch_entered_at = datetime.now(timezone.utc)
+    runner._watch_last_event_at = datetime.now(timezone.utc)
+    runner._watch_last_event_signature = (42, CIStatus.PENDING, ReviewStatus.PENDING, None)
+
+    runner._reset_watch_polling()
+
+    assert runner._watch_entered_at is None
+    assert runner._watch_last_event_at is None
+    assert runner._watch_last_event_signature is None
+    # No anchor → falls back to the static base interval.
+    assert runner.effective_watch_poll_interval == 60
+
+
+def test_run_cycle_resets_watch_anchors_when_state_leaves_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_run_cycle_body`` clears watch anchors when the cycle exits WATCH."""
+    runner = h._make_runner(poll_interval_sec=60)
+    h._configure_watch_adaptive_defaults(runner)
+    runner._recovered = True
+    runner._watch_entered_at = datetime.now(timezone.utc) - timedelta(minutes=2)
+    runner._watch_last_event_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    runner._watch_last_event_signature = (42, CIStatus.PENDING, ReviewStatus.PENDING, None)
+    runner.state.state = PipelineState.WATCH
+
+    async def _noop_cloned(self: PipelineRunner) -> None:
+        return None
+
+    async def _budget_ok(self: PipelineRunner) -> bool:
+        return True
+
+    async def _no_user_paused(self: PipelineRunner) -> None:
+        self.state.user_paused = False
+
+    async def _preflight_ok(self: PipelineRunner) -> bool:
+        return True
+
+    async def _watch_to_idle(self: PipelineRunner) -> None:
+        self.state.state = PipelineState.IDLE
+
+    async def _publish_state(self: PipelineRunner) -> None:
+        return None
+
+    monkeypatch.setattr(PipelineRunner, "ensure_repo_cloned", _noop_cloned)
+    monkeypatch.setattr(PipelineRunner, "_check_github_api_budget", _budget_ok)
+    monkeypatch.setattr(
+        PipelineRunner, "_refresh_user_paused_from_redis", _no_user_paused
+    )
+    monkeypatch.setattr(PipelineRunner, "preflight", _preflight_ok)
+    monkeypatch.setattr(PipelineRunner, "handle_watch", _watch_to_idle)
+    monkeypatch.setattr(PipelineRunner, "publish_state", _publish_state)
+
+    asyncio.run(runner._run_cycle_body())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner._watch_entered_at is None
+    assert runner._watch_last_event_at is None
+    assert runner._watch_last_event_signature is None
+
+
+def test_run_cycle_anchors_watch_entered_at_on_transition_into_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_run_cycle_body`` anchors ``_watch_entered_at`` at the transition.
+
+    A handler that pushes the runner from a non-WATCH state into WATCH
+    must leave the anchor set before ``_run_cycle_body`` returns so the
+    daemon's *next* call to ``_runner_poll_interval`` already sees the
+    slow cadence — otherwise the first interval after entry uses the
+    fast base poll and the slow-start window is wasted.
+    """
+    runner = h._make_runner(poll_interval_sec=60)
+    h._configure_watch_adaptive_defaults(runner)
+    runner._recovered = True
+    runner.state.state = PipelineState.IDLE
+    assert runner._watch_entered_at is None
+
+    async def _noop_cloned(self: PipelineRunner) -> None:
+        return None
+
+    async def _budget_ok(self: PipelineRunner) -> bool:
+        return True
+
+    async def _no_user_paused(self: PipelineRunner) -> None:
+        self.state.user_paused = False
+
+    async def _preflight_ok(self: PipelineRunner) -> bool:
+        return True
+
+    async def _idle_to_watch(self: PipelineRunner) -> None:
+        self.state.state = PipelineState.WATCH
+
+    async def _publish_state(self: PipelineRunner) -> None:
+        return None
+
+    monkeypatch.setattr(PipelineRunner, "ensure_repo_cloned", _noop_cloned)
+    monkeypatch.setattr(PipelineRunner, "_check_github_api_budget", _budget_ok)
+    monkeypatch.setattr(
+        PipelineRunner, "_refresh_user_paused_from_redis", _no_user_paused
+    )
+    monkeypatch.setattr(PipelineRunner, "preflight", _preflight_ok)
+    monkeypatch.setattr(PipelineRunner, "handle_idle", _idle_to_watch)
+    monkeypatch.setattr(PipelineRunner, "publish_state", _publish_state)
+
+    asyncio.run(runner._run_cycle_body())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._watch_entered_at is not None
+    # The next poll interval — computed by the daemon main loop *after*
+    # this cycle — already sees the slow cadence, not the base fallback.
+    assert runner.effective_watch_poll_interval == 300
+
+
+def test_check_budget_no_skip_when_state_is_watch() -> None:
+    """WATCH cadence already absorbs the slowdown; do not skip cycles.
+
+    ``effective_watch_poll_interval`` already takes
+    ``max(target, base * multiplier)`` when the rate-limit slowdown is
+    active. If ``_check_github_api_budget`` also skipped (multiplier-1)
+    out of every multiplier cycles, the effective poll spacing would
+    become ``effective_watch_poll_interval * multiplier`` and could
+    delay merge/fix transitions by an hour or more when quota is low.
+    """
+    runner = h._make_runner(poll_interval_sec=60)
+    runner.app_config.daemon.github_api_pause_threshold_percent = 5
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+    runner.app_config.daemon.github_api_slowdown_multiplier = 10
+    h._set_budget(runner, h._budget(remaining=500, limit=5000))  # 10%
+
+    runner.state.state = PipelineState.WATCH
+
+    decisions = [
+        asyncio.run(runner._check_github_api_budget()) for _ in range(5)
+    ]
+
+    assert decisions == [True] * 5
+    assert runner._github_api_slowdown_cycle == 0
+    assert runner._github_api_slowdown_attempts == 5

@@ -35,7 +35,7 @@ from src.models import (
     TaskStatus,
 )
 
-from tests import test_runner as h
+from tests.runner import _helpers as h
 
 claude_cli = claude_plugin_module.claude_cli
 
@@ -3113,3 +3113,634 @@ def test_effective_watch_poll_interval_stacks_with_rate_limit_slowdown() -> None
         datetime.now(timezone.utc) - timedelta(minutes=10)
     )
     assert runner.effective_watch_poll_interval == 600
+
+
+# ---------------------------------------------------------------------------
+# PR-224b moved from tests/test_runner.py — rate_limit group
+# ---------------------------------------------------------------------------
+
+
+def test_proactive_check_logs_degradation_at_10_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    runner = h._make_runner()
+    runner._claude_usage_provider = h._FakeUsageProvider(snapshot=None, failures=10)
+
+    result = asyncio.run(runner._proactive_usage_check())
+    assert result is True
+    assert any("degraded" in e.get("event", "").lower() for e in runner.state.history)
+
+
+def test_check_budget_returns_true_when_no_observation() -> None:
+    runner = h._make_runner()
+    assert asyncio.run(runner._check_github_api_budget()) is True
+
+
+def test_check_budget_slowdown_window_passed_means_proceed() -> None:
+    runner = h._make_runner()
+    runner.app_config.daemon.github_api_pause_threshold_percent = 5
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+    runner.app_config.daemon.github_api_slowdown_multiplier = 5
+    # Above the pause threshold but below slowdown, with reset already elapsed:
+    # the snapshot is stale so neither throttle branch should fire.
+    h._set_budget(
+        runner,
+        h._budget(
+            remaining=500,
+            limit=5000,
+            reset_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        ),
+    )
+    runner._github_api_slowdown_attempts = 3
+    runner._github_api_slowdown_cycle = 2
+
+    proceed = asyncio.run(runner._check_github_api_budget())
+
+    assert proceed is True
+    assert runner._github_api_slowdown_attempts == 0
+    assert runner._github_api_slowdown_cycle == 0
+
+
+def test_check_budget_slowdown_runs_one_in_n_cycles() -> None:
+    runner = h._make_runner()
+    runner.app_config.daemon.github_api_pause_threshold_percent = 5
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+    runner.app_config.daemon.github_api_slowdown_multiplier = 5
+    h._set_budget(runner, h._budget(remaining=500, limit=5000))  # 10%
+
+    decisions = [
+        asyncio.run(runner._check_github_api_budget()) for _ in range(11)
+    ]
+
+    # cycles 0, 5, 10 proceed; everything else skipped
+    assert decisions[0] is True
+    assert decisions[5] is True
+    assert decisions[10] is True
+    assert decisions[1:5] == [False, False, False, False]
+    slowdown_logs = [
+        e for e in runner.state.history if "GitHub API budget low" in e["event"]
+    ]
+    assert len(slowdown_logs) == 1
+
+
+def test_check_budget_no_skip_when_extended_idle_active() -> None:
+    """Extended-idle cadence already absorbs the slowdown; do not skip cycles.
+
+    With both slowdowns active, real cycles must space at
+    ``max(extended, base * multiplier)`` — not their product. The
+    extended-idle interval already handles the spacing, so the
+    budget check proceeds every cycle in this branch.
+    """
+    runner = h._make_runner(poll_interval_sec=60)
+    runner.app_config.daemon.github_api_pause_threshold_percent = 5
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+    runner.app_config.daemon.github_api_slowdown_multiplier = 5
+    runner.app_config.daemon.idle_extended_after_cycles = 3
+    runner.app_config.daemon.idle_extended_poll_interval_sec = 300
+    h._set_budget(runner, h._budget(remaining=500, limit=5000))  # 10%
+
+    runner._idle_streak = 5  # past idle_extended_after_cycles
+
+    decisions = [
+        asyncio.run(runner._check_github_api_budget()) for _ in range(6)
+    ]
+
+    assert decisions == [True] * 6
+    assert runner._github_api_slowdown_cycle == 0
+    assert runner._github_api_slowdown_attempts == 6
+
+
+def test_check_budget_slowdown_resets_on_recovery() -> None:
+    runner = h._make_runner()
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+
+    h._set_budget(runner, h._budget(remaining=500, limit=5000))
+    asyncio.run(runner._check_github_api_budget())
+    asyncio.run(runner._check_github_api_budget())
+    assert runner._github_api_slowdown_attempts == 2
+
+    h._set_budget(runner, h._budget(remaining=4500, limit=5000))
+    proceed = asyncio.run(runner._check_github_api_budget())
+
+    assert proceed is True
+    assert runner._github_api_slowdown_attempts == 0
+    assert runner._github_api_slowdown_cycle == 0
+
+
+def test_check_budget_normal_proceeds_without_changes() -> None:
+    runner = h._make_runner()
+    h._set_budget(runner, h._budget(remaining=4500, limit=5000))
+
+    proceed = asyncio.run(runner._check_github_api_budget())
+
+    assert proceed is True
+    assert runner._github_api_pause_attempts == 0
+    assert runner._github_api_slowdown_attempts == 0
+
+
+def test_check_budget_zero_multiplier_falls_back_to_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+    # bypass pydantic validator to exercise the max(1, ...) guard
+    object.__setattr__(
+        runner.app_config.daemon, "github_api_slowdown_multiplier", 0
+    )
+    h._set_budget(runner, h._budget(remaining=500, limit=5000))
+
+    proceed = asyncio.run(runner._check_github_api_budget())
+
+    # multiplier coerced to 1 means every cycle in slowdown still proceeds.
+    assert proceed is True
+
+
+def test_refresh_github_api_budget_fetches_and_persists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    fetched = h._budget(remaining=4321, limit=5000)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "fetch_rate_limit_buckets",
+        lambda: (fetched, None),
+    )
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    assert result is fetched
+    assert runner._github_api_budget_cache is fetched
+    from src.daemon.github_rate_limit import BUDGET_REDIS_KEY
+
+    assert BUDGET_REDIS_KEY in runner.redis.store
+
+
+def test_refresh_github_api_budget_persists_per_bucket_snapshots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REST and GraphQL buckets land in their own Redis keys for the dashboard."""
+    from src.daemon.github_rate_limit import (
+        BUDGET_GRAPHQL_REDIS_KEY,
+        BUDGET_REDIS_KEY,
+        BUDGET_REST_REDIS_KEY,
+        RateLimitBudget,
+    )
+
+    runner = h._make_runner()
+    rest = h._budget(remaining=4321, limit=5000)
+    graphql = h._budget(remaining=120, limit=5000)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "fetch_rate_limit_buckets",
+        lambda: (rest, graphql),
+    )
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    # Constrained min surfaces as the cached/legacy budget, but each bucket
+    # is also persisted under its own key so the dashboard can render them
+    # individually rather than collapsing both into a single bar.
+    assert result is not None and result.remaining == graphql.remaining
+    stored_rest = RateLimitBudget.from_redis_payload(
+        runner.redis.store[BUDGET_REST_REDIS_KEY]
+    )
+    stored_graphql = RateLimitBudget.from_redis_payload(
+        runner.redis.store[BUDGET_GRAPHQL_REDIS_KEY]
+    )
+    assert stored_rest is not None and stored_rest.remaining == rest.remaining
+    assert stored_graphql is not None and stored_graphql.remaining == graphql.remaining
+    assert BUDGET_REDIS_KEY in runner.redis.store
+
+
+def test_refresh_github_api_budget_clears_missing_bucket_snapshots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial probe (one bucket ``None``) drops the prior bucket snapshot.
+
+    Otherwise the dashboard keeps reading a stale per-bucket key and renders
+    the missing surface as healthy/warn/critical instead of the intended
+    neutral "no data" state during transient ``gh api rate_limit`` failures.
+    """
+    from src.daemon.github_rate_limit import (
+        BUDGET_GRAPHQL_REDIS_KEY,
+        BUDGET_REST_REDIS_KEY,
+    )
+
+    runner = h._make_runner()
+    # Pre-populate both buckets to simulate a prior healthy snapshot.
+    runner.redis.store[BUDGET_REST_REDIS_KEY] = h._budget(
+        remaining=4500
+    ).to_redis_payload()
+    runner.redis.store[BUDGET_GRAPHQL_REDIS_KEY] = h._budget(
+        remaining=4500
+    ).to_redis_payload()
+
+    rest = h._budget(remaining=4321, limit=5000)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "fetch_rate_limit_buckets",
+        lambda: (rest, None),
+    )
+
+    asyncio.run(runner._refresh_github_api_budget())
+
+    # REST snapshot is refreshed; GraphQL is dropped so the dashboard renders
+    # neutral instead of the stale value.
+    assert BUDGET_REST_REDIS_KEY in runner.redis.store
+    assert BUDGET_GRAPHQL_REDIS_KEY not in runner.redis.store
+
+
+def test_refresh_github_api_budget_uses_cache_within_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    cached = h._budget(remaining=999)
+    runner._github_api_budget_cache = cached
+    runner._github_api_budget_last_fetched = datetime.now(timezone.utc)
+
+    calls = {"count": 0}
+
+    def _fetch() -> object:
+        calls["count"] += 1
+        return h._budget(remaining=1), None
+
+    monkeypatch.setattr(
+        runner_module.github_client, "fetch_rate_limit_buckets", _fetch
+    )
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    assert result is cached
+    assert calls["count"] == 0
+
+
+def test_run_cycle_short_circuits_when_budget_critical(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch, stdout="")
+    runner = h._make_runner()
+    runner._scaffolded = True
+    runner._recovered = True
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "fetch_rate_limit_buckets",
+        lambda: (h._budget(remaining=1, limit=5000), None),
+    )
+
+    asyncio.run(runner.run_cycle())
+
+    # Critical-budget path skips preflight/state machine and just publishes.
+    assert runner.redis.writes, "publish_state should still run on early-return"
+    assert any(
+        "GitHub API budget critical" in e["event"] for e in runner.state.history
+    )
+
+
+def test_refresh_github_api_budget_picks_up_sibling_update_within_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Within the local TTL, a sibling's freshly published snapshot must win.
+
+    The local TTL only guards repeated ``gh api rate_limit`` probes from the
+    same runner; otherwise a multi-repo deployment can keep using a stale
+    "healthy" local cache for up to 60s after a sibling has already published
+    a "critical" update, exactly when the protection should engage.
+    """
+    from src.daemon.github_rate_limit import BUDGET_REDIS_KEY
+
+    runner = h._make_runner()
+    stale_local = h._budget(remaining=4500, limit=5000)
+    runner._github_api_budget_cache = stale_local
+    runner._github_api_budget_last_fetched = datetime.now(timezone.utc)
+
+    fresh_shared = h._budget(remaining=120, limit=5000)
+    runner.redis.store[BUDGET_REDIS_KEY] = fresh_shared.to_redis_payload()
+
+    fetch_calls = {"count": 0}
+
+    def _fetch() -> object:
+        fetch_calls["count"] += 1  # pragma: no cover - probe must not be invoked
+        return h._budget(remaining=1), None
+
+    monkeypatch.setattr(
+        runner_module.github_client, "fetch_rate_limit_buckets", _fetch
+    )
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    assert fetch_calls["count"] == 0
+    assert result is not None
+    assert result.remaining == fresh_shared.remaining
+    assert runner._github_api_budget_cache is not None
+    assert runner._github_api_budget_cache.remaining == fresh_shared.remaining
+
+
+def test_refresh_github_api_budget_keeps_cache_when_fetch_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    cached = h._budget(remaining=999)
+    runner._github_api_budget_cache = cached
+    runner._github_api_budget_last_fetched = (
+        datetime.now(timezone.utc) - timedelta(seconds=120)
+    )
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "fetch_rate_limit_buckets",
+        lambda: (None, None),
+    )
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    assert result is cached
+
+
+def test_refresh_github_api_budget_releases_lock_when_probe_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lock holder whose ``gh api`` call fails must free the lock for a sibling.
+
+    Otherwise every runner is blocked from probing for the full TTL window
+    while ``read_budget`` returns ``None``, silently disabling rate-limit
+    protection during exactly the conditions it was added to cover.
+    """
+    from src.daemon.github_rate_limit import REFRESH_LOCK_REDIS_KEY
+
+    runner = h._make_runner()
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "fetch_rate_limit_buckets",
+        lambda: (None, None),
+    )
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    assert result is None
+    assert REFRESH_LOCK_REDIS_KEY not in runner.redis.store
+    assert REFRESH_LOCK_REDIS_KEY in runner.redis.deleted
+
+
+def test_refresh_github_api_budget_skips_fetch_when_lock_held(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Other runners reuse the persisted observation instead of re-probing."""
+    from src.daemon.github_rate_limit import (
+        BUDGET_REDIS_KEY,
+        REFRESH_LOCK_REDIS_KEY,
+    )
+
+    runner = h._make_runner()
+    # Simulate another runner holding the lock and having published a budget.
+    persisted = h._budget(remaining=2500, limit=5000)
+    runner.redis.store[REFRESH_LOCK_REDIS_KEY] = "1"
+    runner.redis.store[BUDGET_REDIS_KEY] = persisted.to_redis_payload()
+
+    fetch_calls = {"count": 0}
+
+    def _fetch() -> object:
+        fetch_calls["count"] += 1
+        return h._budget(remaining=1), None
+
+    monkeypatch.setattr(
+        runner_module.github_client, "fetch_rate_limit_buckets", _fetch
+    )
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    assert fetch_calls["count"] == 0
+    assert result is not None
+    assert result.remaining == persisted.remaining
+    # Cache mirrors the shared observation so subsequent local-TTL hits work.
+    assert runner._github_api_budget_cache is not None
+    assert runner._github_api_budget_cache.remaining == persisted.remaining
+
+
+def test_refresh_github_api_budget_lock_serializes_concurrent_runners(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two runners sharing one Redis trigger exactly one ``gh api`` probe."""
+    shared_redis = h._FakeRedis()
+    runner_a = h._make_runner()
+    runner_b = h._make_runner()
+    runner_a.redis = shared_redis  # type: ignore[assignment]
+    runner_b.redis = shared_redis  # type: ignore[assignment]
+
+    fetched = h._budget(remaining=4000, limit=5000)
+    fetch_calls = {"count": 0}
+
+    def _fetch() -> object:
+        fetch_calls["count"] += 1
+        return fetched, None
+
+    monkeypatch.setattr(
+        runner_module.github_client, "fetch_rate_limit_buckets", _fetch
+    )
+
+    result_a = asyncio.run(runner_a._refresh_github_api_budget())
+    result_b = asyncio.run(runner_b._refresh_github_api_budget())
+
+    assert fetch_calls["count"] == 1
+    assert result_a is fetched
+    assert result_b is not None
+    assert result_b.remaining == fetched.remaining
+
+
+def test_refresh_github_api_budget_falls_back_to_local_cache_when_shared_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lock held but no shared observation yet — keep the previous local value."""
+    from src.daemon.github_rate_limit import REFRESH_LOCK_REDIS_KEY
+
+    runner = h._make_runner()
+    cached = h._budget(remaining=777)
+    runner._github_api_budget_cache = cached
+    runner.redis.store[REFRESH_LOCK_REDIS_KEY] = "1"
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "fetch_rate_limit_buckets",
+        lambda: (h._budget(remaining=1), None),
+    )
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    assert result is cached
+
+
+def test_refresh_github_api_budget_keeps_ttl_unset_when_no_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent-startup race: another runner holds the lock but has not yet
+    written a snapshot, and this runner has no local cache. The TTL must not
+    advance — otherwise budget protection silently disengages for 60s while
+    ``_check_github_api_budget()`` keeps short-circuiting to ``True``.
+    """
+    from src.daemon.github_rate_limit import REFRESH_LOCK_REDIS_KEY
+
+    runner = h._make_runner()
+    runner.redis.store[REFRESH_LOCK_REDIS_KEY] = "1"
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "fetch_rate_limit_buckets",
+        lambda: (None, None),  # pragma: no cover - lock held, fetch never invoked
+    )
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    assert result is None
+    assert runner._github_api_budget_last_fetched is None
+
+
+def test_refresh_github_api_budget_advances_ttl_on_shared_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once another runner publishes a snapshot, the next refresh picks it up
+    and advances the TTL so the local guard kicks in normally.
+    """
+    from src.daemon.github_rate_limit import (
+        BUDGET_REDIS_KEY,
+        REFRESH_LOCK_REDIS_KEY,
+    )
+
+    runner = h._make_runner()
+    persisted = h._budget(remaining=2500, limit=5000)
+    runner.redis.store[REFRESH_LOCK_REDIS_KEY] = "1"
+    runner.redis.store[BUDGET_REDIS_KEY] = persisted.to_redis_payload()
+
+    result = asyncio.run(runner._refresh_github_api_budget())
+
+    assert result is not None
+    assert result.remaining == persisted.remaining
+    assert runner._github_api_budget_last_fetched is not None
+
+
+def test_run_cycle_records_graphql_burn_when_budget_drops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A drop in remaining between before/after observations is captured.
+
+    The burn-record wrapper observes the shared snapshot before the cycle
+    body runs and again after, so a sibling-published refresh that lowers
+    the remaining count surfaces as a non-zero per-cycle delta.
+    """
+    from src.daemon.github_rate_limit import (
+        BUDGET_REDIS_KEY,
+        BURNS_REDIS_KEY_PREFIX,
+    )
+
+    runner = h._make_runner()
+    runner._scaffolded = True
+    runner._recovered = True
+    runner.redis.store[BUDGET_REDIS_KEY] = h._budget(remaining=4500).to_redis_payload()
+
+    async def fake_run_cycle_body() -> None:
+        # Simulate API consumption observed via a sibling refresh mid-cycle.
+        runner.redis.store[BUDGET_REDIS_KEY] = h._budget(
+            remaining=4480
+        ).to_redis_payload()
+
+    monkeypatch.setattr(runner, "_run_cycle_body", fake_run_cycle_body)
+
+    asyncio.run(runner.run_cycle())
+
+    bucket = runner.redis.lists.get(f"{BURNS_REDIS_KEY_PREFIX}{runner.name}")
+    assert bucket == ["20"]
+
+
+def test_run_cycle_records_zero_burn_when_window_resets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A negative delta (rate-limit window reset) clamps to zero, never -N."""
+    from src.daemon.github_rate_limit import (
+        BUDGET_REDIS_KEY,
+        BURNS_REDIS_KEY_PREFIX,
+    )
+
+    runner = h._make_runner()
+    runner._scaffolded = True
+    runner._recovered = True
+    runner.redis.store[BUDGET_REDIS_KEY] = h._budget(remaining=120).to_redis_payload()
+
+    async def fake_run_cycle_body() -> None:
+        runner.redis.store[BUDGET_REDIS_KEY] = h._budget(
+            remaining=5000
+        ).to_redis_payload()
+
+    monkeypatch.setattr(runner, "_run_cycle_body", fake_run_cycle_body)
+
+    asyncio.run(runner.run_cycle())
+
+    bucket = runner.redis.lists.get(f"{BURNS_REDIS_KEY_PREFIX}{runner.name}")
+    assert bucket == ["0"]
+
+
+def test_run_cycle_records_zero_burn_when_no_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No budget snapshot anywhere means we record zero rather than crashing."""
+    from src.daemon.github_rate_limit import BURNS_REDIS_KEY_PREFIX
+
+    runner = h._make_runner()
+    runner._scaffolded = True
+    runner._recovered = True
+
+    async def fake_run_cycle_body() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_run_cycle_body", fake_run_cycle_body)
+
+    asyncio.run(runner.run_cycle())
+
+    bucket = runner.redis.lists.get(f"{BURNS_REDIS_KEY_PREFIX}{runner.name}")
+    assert bucket == ["0"]
+
+
+def test_run_cycle_records_burn_even_when_body_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Burn recording lives in a finally block so transient body errors do not
+    silently suppress observability for the whole next polling cycle."""
+    from src.daemon.github_rate_limit import (
+        BUDGET_REDIS_KEY,
+        BURNS_REDIS_KEY_PREFIX,
+    )
+
+    runner = h._make_runner()
+    runner._scaffolded = True
+    runner._recovered = True
+    runner.redis.store[BUDGET_REDIS_KEY] = h._budget(remaining=4500).to_redis_payload()
+
+    async def fake_run_cycle_body() -> None:
+        raise RuntimeError("body failed mid-cycle")
+
+    monkeypatch.setattr(runner, "_run_cycle_body", fake_run_cycle_body)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(runner.run_cycle())
+
+    bucket = runner.redis.lists.get(f"{BURNS_REDIS_KEY_PREFIX}{runner.name}")
+    assert bucket == ["0"]
+
+
+def test_run_cycle_swallows_burn_recording_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recording failures must never propagate; observability is best-effort."""
+    runner = h._make_runner()
+    runner._scaffolded = True
+    runner._recovered = True
+
+    async def fake_run_cycle_body() -> None:
+        return None
+
+    async def boom_recorder(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("redis exploded")
+
+    monkeypatch.setattr(runner, "_run_cycle_body", fake_run_cycle_body)
+    monkeypatch.setattr(runner_module, "record_cycle_burn", boom_recorder)
+
+    # Must not raise even though the recorder itself is broken.
+    asyncio.run(runner.run_cycle())
