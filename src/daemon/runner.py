@@ -266,7 +266,7 @@ class PipelineRunner(
         self._last_codex_review_head_sha: str | None = None
         self._queue_progress_dirty = False
         self._last_published_queue_progress: tuple[int, int] | None = None
-        self._last_published_state_value: str | None = None
+        self._last_published_state_signature: tuple[str, tuple] | None = None
         self._pending_event_log_entries: list[dict[str, object]] = []
         self._usage_degraded_logged = False
         self._claude_usage_provider = claude_usage_provider
@@ -729,30 +729,61 @@ class PipelineRunner(
         self._last_published_queue_progress = progress
         self._queue_progress_dirty = False
 
+    def _summary_pr_signature(self) -> tuple:
+        """Return the visible PR fingerprint shown in the repo summary.
+
+        Captures the fields that ``handle_watch`` mutates while the
+        runner stays in WATCH for many cycles (CI conclusion, review
+        status, push and commit counters, plus the PR identity used in
+        the header). Without including these, the dashboard summary
+        would only refresh on ``state.state`` transitions and operator
+        history events — leaving CI/review status visibly stale until
+        an unrelated transition or a manual reload.
+        """
+        pr = self.state.current_pr
+        if pr is None:
+            return ()
+        return (
+            pr.number,
+            pr.branch,
+            pr.ci_status.value,
+            pr.review_status.value,
+            pr.push_count,
+            pr.commits_count,
+        )
+
     async def _publish_state_change_if_needed(self) -> None:
-        """Publish a state_change event when state.state transitions.
+        """Publish a state_change event when the visible repo state changes.
 
         Drives SSE-driven dashboard refreshes; replaces the legacy 5s
-        repo-summary poll that caused the OBS-AM badge stutter. The
-        published value mirrors what ``_serialize_latest_state`` writes
-        to Redis: inactive repos surface as ``IDLE`` regardless of
-        ``self.state.state`` so SSE-only views (repo.html) reflect the
-        deactivation immediately instead of staying on the last live
-        state until a manual reload.
+        repo-summary poll that caused the OBS-AM badge stutter. Beyond
+        ``state.state`` itself this also fires when the visible PR
+        metadata (CI conclusion, review status, push/commit counters)
+        changes — those mutate inside ``handle_watch`` while the runner
+        stays in WATCH for many cycles, and without a publish here the
+        summary card would stay stale until a state transition or an
+        unrelated history event arrived.
+
+        The published payload mirrors what ``_serialize_latest_state``
+        writes to Redis: inactive repos surface as ``IDLE`` regardless
+        of ``self.state.state`` so SSE-only views (repo.html) reflect
+        the deactivation immediately instead of staying on the last
+        live state until a manual reload.
         """
         if self.repo_config.active:
-            current = self.state.state.value
+            current_state = self.state.state.value
         else:
-            current = PipelineState.IDLE.value
-        if current == self._last_published_state_value:
+            current_state = PipelineState.IDLE.value
+        signature = (current_state, self._summary_pr_signature())
+        if signature == self._last_published_state_signature:
             return
         await publish_repo_event(
             self.name,
             "state_change",
-            {"state": current},
+            {"state": current_state},
             redis_client=self.redis,
         )
-        self._last_published_state_value = current
+        self._last_published_state_signature = signature
 
     async def _publish_pending_event_log_entries(self) -> None:
         """Drain queued log entries as event_log_append SSE events.

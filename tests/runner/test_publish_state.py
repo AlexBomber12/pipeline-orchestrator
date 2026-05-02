@@ -38,7 +38,7 @@ def test_publish_state_skips_progress_update_when_value_was_already_published(
 
     runner = _make_runner()
     runner._last_published_queue_progress = (1, 2)
-    runner._last_published_state_value = runner.state.state.value
+    runner._last_published_state_signature = (runner.state.state.value, ())
     runner._set_queue_progress(1, 2)
 
     asyncio.run(runner.publish_state())
@@ -163,9 +163,9 @@ def test_publish_while_waiting_handles_publish_error(
 def test_publish_state_emits_state_change_on_first_publish(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The first publish_state call seeds _last_published_state_value and
-    emits an SSE state_change so reconnecting dashboards see the current
-    state without waiting for the next transition."""
+    """The first publish_state call seeds _last_published_state_signature
+    and emits an SSE state_change so reconnecting dashboards see the
+    current state without waiting for the next transition."""
     published: list[tuple[str, str, dict[str, object], object | None]] = []
 
     async def _fake_publish_repo_event(
@@ -185,7 +185,10 @@ def test_publish_state_emits_state_change_on_first_publish(
     assert state_events == [
         (runner.name, "state_change", {"state": runner.state.state.value}, runner.redis)
     ]
-    assert runner._last_published_state_value == runner.state.state.value
+    assert runner._last_published_state_signature == (
+        runner.state.state.value,
+        (),
+    )
 
 
 def test_publish_state_emits_state_change_on_transition(
@@ -211,6 +214,66 @@ def test_publish_state_emits_state_change_on_transition(
 
     state_events = [event for event in published if event[1] == "state_change"]
     assert [event[2]["state"] for event in state_events] == ["IDLE", "WATCH"]
+
+
+def test_publish_state_emits_state_change_on_pr_field_change_in_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While the runner stays in WATCH, ``handle_watch`` still mutates
+    ``current_pr`` (CI conclusion, review status, push count) as it
+    polls. Each visible mutation must publish a fresh state_change so
+    the repo-detail summary refreshes — otherwise CI/review changes
+    would only surface on a state.state transition or manual reload."""
+    from src.models import CIStatus, PRInfo, ReviewStatus
+
+    published: list[tuple[str, str, dict[str, object], object | None]] = []
+
+    async def _fake_publish_repo_event(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, object],
+        redis_client: object | None = None,
+    ) -> None:
+        published.append((repo_name, event_type, payload, redis_client))
+
+    monkeypatch.setattr(runner_module, "publish_repo_event", _fake_publish_repo_event)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=42,
+        branch="pr-042",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        push_count=1,
+        commits_count=3,
+    )
+    asyncio.run(runner.publish_state())
+
+    # Identical PR signature on the next cycle -> no extra publish.
+    asyncio.run(runner.publish_state())
+
+    # CI conclusion changes mid-WATCH -> must publish.
+    runner.state.current_pr = runner.state.current_pr.model_copy(
+        update={"ci_status": CIStatus.SUCCESS}
+    )
+    asyncio.run(runner.publish_state())
+
+    # Review status changes mid-WATCH -> must publish.
+    runner.state.current_pr = runner.state.current_pr.model_copy(
+        update={"review_status": ReviewStatus.CHANGES_REQUESTED}
+    )
+    asyncio.run(runner.publish_state())
+
+    # New push observed mid-WATCH -> must publish.
+    runner.state.current_pr = runner.state.current_pr.model_copy(
+        update={"push_count": 2}
+    )
+    asyncio.run(runner.publish_state())
+
+    state_events = [event for event in published if event[1] == "state_change"]
+    assert len(state_events) == 4
+    assert all(event[2] == {"state": "WATCH"} for event in state_events)
 
 
 def test_publish_state_change_for_inactive_repo_emits_idle(
@@ -241,7 +304,10 @@ def test_publish_state_change_for_inactive_repo_emits_idle(
     assert state_events == [
         (runner.name, "state_change", {"state": PipelineState.IDLE.value}, runner.redis)
     ]
-    assert runner._last_published_state_value == PipelineState.IDLE.value
+    assert runner._last_published_state_signature == (
+        PipelineState.IDLE.value,
+        (),
+    )
 
 
 def test_publish_state_change_emits_idle_on_deactivation(
@@ -291,7 +357,7 @@ def test_publish_state_drains_pending_event_log_entries(
     monkeypatch.setattr(runner_module, "publish_repo_event", _fake_publish_repo_event)
 
     runner = _make_runner()
-    runner._last_published_state_value = runner.state.state.value
+    runner._last_published_state_signature = (runner.state.state.value, ())
     runner.log_event("first event")
     runner.log_event("second event")
 
@@ -329,7 +395,7 @@ def test_publish_pending_event_log_entries_requeues_on_failure(
     monkeypatch.setattr(runner_module, "publish_repo_event", _flaky_publish_repo_event)
 
     runner = _make_runner()
-    runner._last_published_state_value = runner.state.state.value
+    runner._last_published_state_signature = (runner.state.state.value, ())
     runner.log_event("first event")
     runner.log_event("second event")
     runner.log_event("third event")
@@ -369,7 +435,7 @@ def test_publish_pending_event_log_entries_retry_drains_remainder(
     monkeypatch.setattr(runner_module, "publish_repo_event", _publish_repo_event)
 
     runner = _make_runner()
-    runner._last_published_state_value = runner.state.state.value
+    runner._last_published_state_signature = (runner.state.state.value, ())
     runner.log_event("first event")
     runner.log_event("second event")
 
