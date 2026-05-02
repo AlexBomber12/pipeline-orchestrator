@@ -16,9 +16,15 @@
    transition. The event log lives outside this container so its DOM
    (and scroll position) is preserved when the summary swaps. The badge
    now runs its pulse animation between state transitions instead of
-   restarting every 5s, fixing OBS-AM. #}
+   restarting every 5s, fixing OBS-AM.
+
+   Keep `every 30s` alongside SSE: the "Rate limited — paused, Xm
+   remaining" line is derived from server `utcnow()` and ticks down
+   with wall-clock time even when no state/history event fires, so a
+   long PAUSED stretch would otherwise leave the countdown stale until
+   the next transition. #}
 <div hx-get="/partials/repo/{{ repo.name }}"
-     hx-trigger="load, repo:state_change from:body, repo:history_updated from:body"
+     hx-trigger="load, repo:state_change from:body, repo:history_updated from:body, every 30s"
      hx-swap="innerHTML">
     {% include "components/repo_summary.html" %}
 </div>
@@ -127,11 +133,18 @@
             if (source) {
                 source.close();
             }
-            source = new EventSource('/api/repos/' + encodeURIComponent(repoName) + '/events');
-            source.onopen = function () {
+            // Capture the stream this closure owns so late callbacks
+            // (especially `onerror` from a previous EventSource that
+            // errored after `connect()` ran again) cannot close a
+            // newer connection. Without this guard a stale error
+            // would force an unnecessary reconnect and could drop or
+            // delay live SSE updates for this repo.
+            const stream = new EventSource('/api/repos/' + encodeURIComponent(repoName) + '/events');
+            source = stream;
+            stream.onopen = function () {
                 delayMs = BASE_DELAY_MS;
             };
-            source.addEventListener('replay_complete', function (event) {
+            stream.addEventListener('replay_complete', function (event) {
                 // Only adopt the FIRST boundary's subscribed_at: events
                 // that arrive over a reconnect after a disconnection
                 // window have timestamps after that moment and must
@@ -155,7 +168,7 @@
                 }
             });
             RELAYED_EVENTS.forEach(function (eventName) {
-                source.addEventListener(eventName, function (event) {
+                stream.addEventListener(eventName, function (event) {
                     let payload = null;
                     try {
                         payload = event && event.data ? JSON.parse(event.data) : null;
@@ -181,11 +194,12 @@
                     delayMs = BASE_DELAY_MS;
                 });
             });
-            source.onerror = function () {
-                if (source) {
-                    source.close();
-                    source = null;
+            stream.onerror = function () {
+                if (source !== stream) {
+                    return;
                 }
+                stream.close();
+                source = null;
                 scheduleReconnect();
             };
         }

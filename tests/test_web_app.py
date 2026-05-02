@@ -1217,10 +1217,12 @@ def test_repo_detail_route_renders_full_page(
     # owns the play/pause/stop controls (their visibility depends on
     # repo.user_paused), so it must refresh on history_updated too —
     # otherwise an IDLE repo's controls stay stale until something else
-    # changes state.state.
+    # changes state.state. The `every 30s` fallback keeps the
+    # PAUSED rate-limit countdown (server `utcnow()`-derived) ticking
+    # during long pauses where no SSE event fires.
     assert (
         'hx-trigger="load, repo:state_change from:body, '
-        'repo:history_updated from:body"' in body
+        'repo:history_updated from:body, every 30s"' in body
     )
     assert "Current Task" in body
     assert "Current PR" in body
