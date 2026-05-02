@@ -762,12 +762,15 @@ class IdleMixin:
             await self._refresh_auth_status_cache()
             if self._select_coder(allow_exploration=False) is None:
                 self.state.current_pr = None
-                self.state.state = PipelineState.HUNG
-                self.state.error_message = (
+                message = (
                     f"Task {task.pr_id} pinned to {pin} but coder unavailable"
                 )
-                self.log_event(f"[INFRA] {self.state.error_message}.")
-                await self.publish_state()
+                await self._escalate_to_hung(
+                    message,
+                    apply_escalated_label=False,
+                    set_pr_escalated_flag=False,
+                    log_message=f"{message}.",
+                )
                 return
 
         self.state.state = PipelineState.CODING

@@ -226,10 +226,16 @@ class WatchMixin:
             else self.app_config.daemon.review_timeout_min
         )
         if elapsed_min >= timeout_min:
-            self.state.state = PipelineState.HUNG
-            self.log_event(
-                f"[WATCH] PR #{found.number} hung after {elapsed_min:.0f}m "
-                f"(review={review.value}, ci={ci.value})."
+            await self._escalate_to_hung(
+                f"PR #{found.number} hung after {elapsed_min:.0f}m "
+                f"(review={review.value}, ci={ci.value})",
+                error_message_override=None,
+                apply_escalated_label=False,
+                set_pr_escalated_flag=False,
+                log_message=(
+                    f"PR #{found.number} hung after {elapsed_min:.0f}m "
+                    f"(review={review.value}, ci={ci.value})."
+                ),
             )
         else:
             self.log_event(
