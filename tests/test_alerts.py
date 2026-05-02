@@ -523,4 +523,4 @@ def test_index_mounts_alerts_partial(alerts_config: Path) -> None:
     assert response.status_code == 200
     body = response.text
     assert 'hx-get="/partials/stats"' in body
-    assert 'hx-trigger="repo:state_change from:body"' in body
+    assert 'hx-trigger="repo:state_change from:body, every 30s"' in body

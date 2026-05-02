@@ -1051,9 +1051,14 @@ def test_index_bootstraps_progress_sse_manager(
         "['state_change', 'event_log_append', "
         "'history_updated', 'pr_metrics_update']" in body
     )
+    # The `every 30s` fallback covers repos beyond MAX_STREAMS (the SSE
+    # manager only subscribes to the first slice) and any SSE outage.
     assert (
         'hx-trigger="repo:state_change from:body, '
-        'repo:history_updated from:body"' in body
+        'repo:history_updated from:body, every 30s"' in body
+    )
+    assert (
+        'hx-trigger="repo:state_change from:body, every 30s"' in body
     )
 
 
