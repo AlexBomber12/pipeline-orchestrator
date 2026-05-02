@@ -731,16 +731,16 @@ class FixMixin(BreachMixin):
         idle_flag: dict[str, bool] = {"timed_out": False}
         external_state_flag: dict[str, str | None] = {"state": None}
 
-        model = (
-            self.app_config.daemon.codex_model
-            if coder_name == "codex"
-            else self.app_config.daemon.claude_model
+        plugin_run_kwargs = plugin.build_run_kwargs(
+            daemon_config=self.app_config.daemon,
+            breach_dir=breach_dir,
+            breach_run_id=breach_run_id,
         )
 
         heartbeat = asyncio.create_task(self._publish_while_waiting("FIX"))
         fix_kwargs: dict[str, object] = {
-            "model": model,
             "on_process_start": self._track_current_coder_process,
+            **plugin_run_kwargs,
         }
         if self.state.current_pr is not None:
             extra_context = await self._build_fix_feedback_context(
@@ -748,13 +748,6 @@ class FixMixin(BreachMixin):
             )
             if extra_context is not None:
                 fix_kwargs["extra_context"] = extra_context
-        if plugin.supports_breach_lifecycle:
-            fix_kwargs.update(
-                breach_dir=breach_dir,
-                breach_run_id=breach_run_id,
-                session_threshold=self.app_config.daemon.rate_limit_session_pause_percent,
-                weekly_threshold=self.app_config.daemon.rate_limit_weekly_pause_percent,
-            )
         claude_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
             plugin.fix_review(
                 self.repo_path,

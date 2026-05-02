@@ -6746,6 +6746,11 @@ def test_handle_coding_runs_three_retries_before_diagnostic(
         ) -> tuple[int, str, str]:
             return (0, "ok", "")
 
+        def build_run_kwargs(
+            self, *, daemon_config: Any, **_kw: object
+        ) -> dict[str, Any]:
+            return {"model": daemon_config.codex_model}
+
     runner = _make_runner()
     runner._get_coder = lambda allow_exploration=False: (  # type: ignore[method-assign]
         "codex",

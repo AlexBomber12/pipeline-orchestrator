@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import re
+from typing import Any
 
 import pytest
 from src import claude_cli, codex_cli
 from src.coder_registry import CoderPlugin, CoderRegistry
 from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
+from src.config import DaemonConfig
 
 
 class DummyCoderPlugin:
@@ -51,6 +53,15 @@ class DummyCoderPlugin:
         self, repo_path: str, context: str, model: str
     ) -> tuple[int, str, str]:
         return (0, f"{repo_path}|{context}|{model}", "")
+
+    def build_run_kwargs(
+        self,
+        *,
+        daemon_config: DaemonConfig,
+        breach_dir: str | None = None,
+        breach_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        return {"model": daemon_config.claude_model}
 
 
 def test_register_and_get() -> None:
@@ -195,3 +206,76 @@ def test_codex_plugin_diagnose_error_delegates(
         "context": "ci red",
         "model": "gpt-5.4",
     }
+
+
+def test_protocol_includes_build_run_kwargs() -> None:
+    """``CoderPlugin`` declares ``build_run_kwargs`` so handlers can
+    delegate plugin-specific kwargs construction without hardcoding
+    coder names."""
+    assert "build_run_kwargs" in dir(CoderPlugin)
+    assert isinstance(ClaudePlugin(), CoderPlugin)
+    assert isinstance(CodexPlugin(), CoderPlugin)
+
+
+def test_claude_plugin_build_run_kwargs_with_breach() -> None:
+    daemon = DaemonConfig(
+        claude_model="opus",
+        rate_limit_session_pause_percent=90,
+        rate_limit_weekly_pause_percent=70,
+    )
+    kwargs = ClaudePlugin().build_run_kwargs(
+        daemon_config=daemon,
+        breach_dir="/tmp/breach",
+        breach_run_id="abc123",
+    )
+    assert kwargs == {
+        "model": "opus",
+        "breach_dir": "/tmp/breach",
+        "breach_run_id": "abc123",
+        "session_threshold": 90,
+        "weekly_threshold": 70,
+    }
+
+
+def test_claude_plugin_build_run_kwargs_without_breach() -> None:
+    daemon = DaemonConfig(claude_model="sonnet")
+    kwargs = ClaudePlugin().build_run_kwargs(daemon_config=daemon)
+    assert kwargs == {"model": "sonnet"}
+
+
+def test_claude_plugin_build_run_kwargs_partial_breach_input_omits_breach() -> None:
+    """A single breach input without the other yields no breach kwargs.
+
+    Both ``breach_dir`` and ``breach_run_id`` must be supplied together
+    for the plugin to emit breach-monitoring kwargs.
+    """
+    daemon = DaemonConfig(claude_model="opus")
+    only_dir = ClaudePlugin().build_run_kwargs(
+        daemon_config=daemon, breach_dir="/tmp/breach"
+    )
+    only_id = ClaudePlugin().build_run_kwargs(
+        daemon_config=daemon, breach_run_id="abc"
+    )
+    assert only_dir == {"model": "opus"}
+    assert only_id == {"model": "opus"}
+
+
+def test_codex_plugin_build_run_kwargs_no_breach_keys() -> None:
+    """Codex returns only ``model`` even when breach inputs are passed.
+
+    ``supports_breach_lifecycle`` is False so the plugin silently
+    ignores breach inputs, letting callers pass them unconditionally.
+    """
+    daemon = DaemonConfig(codex_model="gpt-5.4")
+    kwargs = CodexPlugin().build_run_kwargs(
+        daemon_config=daemon,
+        breach_dir="/tmp/breach",
+        breach_run_id="abc123",
+    )
+    assert kwargs == {"model": "gpt-5.4"}
+
+
+def test_codex_plugin_build_run_kwargs_default_codex_model_empty() -> None:
+    daemon = DaemonConfig()
+    kwargs = CodexPlugin().build_run_kwargs(daemon_config=daemon)
+    assert kwargs == {"model": ""}
