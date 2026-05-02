@@ -213,6 +213,68 @@ def test_publish_state_emits_state_change_on_transition(
     assert [event[2]["state"] for event in state_events] == ["IDLE", "WATCH"]
 
 
+def test_publish_state_change_for_inactive_repo_emits_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inactive repos publish IDLE in the persisted payload — the
+    state_change SSE must mirror that, not leak self.state.state.value
+    (e.g. ERROR), or repo.html stays stuck on the pre-deactivation
+    state until manual reload."""
+    published: list[tuple[str, str, dict[str, object], object | None]] = []
+
+    async def _fake_publish_repo_event(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, object],
+        redis_client: object | None = None,
+    ) -> None:
+        published.append((repo_name, event_type, payload, redis_client))
+
+    monkeypatch.setattr(runner_module, "publish_repo_event", _fake_publish_repo_event)
+
+    runner = _make_runner(active=False)
+    runner.state.state = PipelineState.ERROR
+
+    asyncio.run(runner.publish_state())
+
+    state_events = [event for event in published if event[1] == "state_change"]
+    assert state_events == [
+        (runner.name, "state_change", {"state": PipelineState.IDLE.value}, runner.redis)
+    ]
+    assert runner._last_published_state_value == PipelineState.IDLE.value
+
+
+def test_publish_state_change_emits_idle_on_deactivation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Toggling active=False after a live state must publish a
+    transition to IDLE so SSE-driven views see the deactivation."""
+    published: list[tuple[str, str, dict[str, object], object | None]] = []
+
+    async def _fake_publish_repo_event(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, object],
+        redis_client: object | None = None,
+    ) -> None:
+        published.append((repo_name, event_type, payload, redis_client))
+
+    monkeypatch.setattr(runner_module, "publish_repo_event", _fake_publish_repo_event)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.WATCH
+    asyncio.run(runner.publish_state())
+
+    runner.repo_config.active = False
+    asyncio.run(runner.publish_state())
+
+    state_events = [event for event in published if event[1] == "state_change"]
+    assert [event[2]["state"] for event in state_events] == [
+        PipelineState.WATCH.value,
+        PipelineState.IDLE.value,
+    ]
+
+
 def test_publish_state_drains_pending_event_log_entries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -387,6 +449,62 @@ def test_save_current_run_record_emits_pr_metrics_update(
             runner.redis,
         )
     ]
+
+
+def test_save_current_run_record_swallows_publish_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pr_metrics_update SSE failure must not abort the cycle: the
+    run record was already persisted, and callers depend on
+    _save_current_run_record returning so post-save logic (state
+    transitions, review trigger, etc.) still runs. Otherwise a
+    transient Redis pub/sub blip turns a UI notification miss into
+    control-flow failure."""
+    from src.metrics import RunRecord
+
+    warnings: list[str] = []
+
+    async def _failing_publish_repo_event(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, object],
+        redis_client: object | None = None,
+    ) -> None:
+        raise RuntimeError("redis pubsub down")
+
+    async def _fake_save(record: object) -> None:
+        return None
+
+    monkeypatch.setattr(runner_module, "publish_repo_event", _failing_publish_repo_event)
+
+    runner = _make_runner()
+    monkeypatch.setattr(runner._metrics_store, "save", _fake_save)
+    monkeypatch.setattr(
+        runner_module.logger,
+        "warning",
+        lambda msg, *args: warnings.append(msg % args),
+    )
+    runner._current_run_record = RunRecord(
+        run_id="run-1",
+        task_id="PR-300",
+        profile_id="claude:claude-opus-4-7:container",
+        task_type="feature",
+        complexity="low",
+        started_at=datetime.now(timezone.utc).isoformat(),
+        ended_at=None,
+        duration_ms=None,
+        fix_iterations=0,
+        tokens_in=0,
+        tokens_out=0,
+        exit_reason="",
+        operator_intervention=False,
+        repo_name=runner.name,
+        stage="coder",
+    )
+
+    asyncio.run(runner._save_current_run_record("coding_complete"))
+
+    assert any("pr_metrics_update publish failed" in entry for entry in warnings)
 
 
 def test_save_current_run_record_noop_when_no_active_record(

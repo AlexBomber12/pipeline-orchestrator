@@ -733,9 +733,17 @@ class PipelineRunner(
         """Publish a state_change event when state.state transitions.
 
         Drives SSE-driven dashboard refreshes; replaces the legacy 5s
-        repo-summary poll that caused the OBS-AM badge stutter.
+        repo-summary poll that caused the OBS-AM badge stutter. The
+        published value mirrors what ``_serialize_latest_state`` writes
+        to Redis: inactive repos surface as ``IDLE`` regardless of
+        ``self.state.state`` so SSE-only views (repo.html) reflect the
+        deactivation immediately instead of staying on the last live
+        state until a manual reload.
         """
-        current = self.state.state.value
+        if self.repo_config.active:
+            current = self.state.state.value
+        else:
+            current = PipelineState.IDLE.value
         if current == self._last_published_state_value:
             return
         await publish_repo_event(
@@ -898,12 +906,25 @@ class PipelineRunner(
                 stats = self._compute_diff_stats(resolved_base_branch)
             self._apply_diff_stats(record, stats, resolved_base_branch)
         await self._metrics_store.save(record)
-        await publish_repo_event(
-            self.name,
-            "pr_metrics_update",
-            {"task_id": record.task_id, "exit_reason": record.exit_reason},
-            redis_client=self.redis,
-        )
+        # SSE notification is best-effort: a Redis pub/sub or list-op
+        # failure here must not abort the cycle, otherwise a transient
+        # outage would short-circuit downstream post-save logic in the
+        # caller (state transitions, review trigger, etc.) after the run
+        # record is already persisted.
+        try:
+            await publish_repo_event(
+                self.name,
+                "pr_metrics_update",
+                {"task_id": record.task_id, "exit_reason": record.exit_reason},
+                redis_client=self.redis,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] pr_metrics_update publish failed for %s: %s",
+                self.name,
+                record.task_id,
+                exc,
+            )
 
     # All ERROR transitions must use this primitive. Direct writes to
     # ``state.state = PipelineState.ERROR`` are forbidden after PR-219b.
