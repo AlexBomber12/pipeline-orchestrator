@@ -59,13 +59,13 @@ repositories:
 
 daemon:
   poll_interval_sec: 60
-  review_timeout_min: 60
+  review_timeout_min: 20
   hung_fallback_codex_review: true
   error_handler_use_ai: true
   claude_model: opus
   fix_idle_timeout_sec: 1800
   fix_iteration_cap: 15
-  planned_pr_timeout_sec: 900
+  planned_pr_timeout_sec: 3600
 
 web:
   host: 0.0.0.0

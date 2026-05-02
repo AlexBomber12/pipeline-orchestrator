@@ -110,7 +110,7 @@ class RepoConfig(BaseModel):
 
 class DaemonConfig(BaseModel):
     poll_interval_sec: int = 60
-    review_timeout_min: int = Field(default=60, ge=1)
+    review_timeout_min: int = Field(default=20, ge=1)
     stale_review_threshold_min: int = Field(default=10, ge=1)
     stale_review_threshold_eyes_min: int = Field(default=5, ge=1)
     hung_fallback_codex_review: bool = True
@@ -121,7 +121,7 @@ class DaemonConfig(BaseModel):
     fix_no_push_cap: int = Field(default=3, ge=1)
     fix_poll_interval_sec: int = Field(default=30, ge=1)
     coder_terminate_grace_sec: int = Field(default=5, ge=1)
-    planned_pr_timeout_sec: int = Field(default=900, ge=60)
+    planned_pr_timeout_sec: int = Field(default=3600, ge=60)
     rate_limit_session_pause_percent: int = Field(default=95, ge=0, le=100)
     rate_limit_weekly_pause_percent: int = Field(default=100, ge=0, le=100)
     strict_queue_validation: bool = True

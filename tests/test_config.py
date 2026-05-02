@@ -25,7 +25,7 @@ def test_load_config_missing_file_returns_defaults(tmp_path: Path) -> None:
     assert isinstance(cfg, AppConfig)
     assert cfg.repositories == []
     assert cfg.daemon.poll_interval_sec == 60
-    assert cfg.daemon.review_timeout_min == 60
+    assert cfg.daemon.review_timeout_min == 20
     assert cfg.daemon.hung_fallback_codex_review is True
     assert cfg.daemon.error_handler_use_ai is True
     assert cfg.daemon.claude_model == "opus"
@@ -446,7 +446,7 @@ def test_update_daemon_config_updates_fields(tmp_path: Path) -> None:
     assert cfg.daemon.poll_interval_sec == 120
     assert cfg.daemon.error_handler_use_ai is False
     # Unchanged fields keep their previous values.
-    assert cfg.daemon.review_timeout_min == 60
+    assert cfg.daemon.review_timeout_min == 20
     assert cfg.daemon.hung_fallback_codex_review is True
 
     reloaded = load_config(str(path))
@@ -543,7 +543,7 @@ def test_fix_review_timeout_removed() -> None:
 def test_daemon_config_planned_pr_timeout_default() -> None:
     from src.config import DaemonConfig
 
-    assert DaemonConfig().planned_pr_timeout_sec == 900
+    assert DaemonConfig().planned_pr_timeout_sec == 3600
 
 
 def test_config_rejects_negative_review_timeout(tmp_path: Path) -> None:
@@ -1265,3 +1265,19 @@ def test_deep_merge_overlay_replaces_scalar_with_dict(tmp_path: Path) -> None:
     merged = _deep_merge(base, overlay)
 
     assert merged == {"daemon": {"poll_interval_sec": 45}}
+
+
+def test_committed_config_yml_uses_production_defaults() -> None:
+    """The committed ``config.yml`` must ship operator-validated production
+    values. Loss of `usage_api_beta_header` on 2026-05-01 is the cautionary
+    tale — divergence between upstream defaults and the operator's running
+    daemon caused an outage on a routine deploy.
+    """
+    cfg = load_config("config.yml")
+
+    assert cfg.daemon.review_timeout_min == 20
+    assert cfg.daemon.planned_pr_timeout_sec == 3600
+    assert cfg.daemon.fix_iteration_cap == 15
+    assert cfg.daemon.usage_api_beta_header == "oauth-2025-04-20"
+    assert cfg.daemon.rate_limit_session_pause_percent == 95
+    assert cfg.daemon.rate_limit_weekly_pause_percent == 100
