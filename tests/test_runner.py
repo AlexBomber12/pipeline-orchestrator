@@ -10707,6 +10707,46 @@ def test_handle_idle_resets_merged_pr_http_304_streak_on_non_304_failure(
     )
 
 
+def test_handle_idle_resets_merged_pr_http_304_streak_when_check_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-236 follow-up: the 304 streak must reset whenever the merged-PR
+    check is skipped this cycle (e.g. ``get_open_prs`` failed earlier and
+    triggered an early return). Otherwise non-consecutive 304s across
+    skipped cycles would accumulate and emit a spurious degraded warning.
+    """
+    _patch_subprocess(monkeypatch)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_open_prs",
+        lambda repo, **kw: (_ for _ in ()).throw(RuntimeError("API down")),
+    )
+    merged_calls = {"n": 0}
+
+    def fail_get_merged_prs(repo, branch, refresh=False):
+        merged_calls["n"] += 1
+        raise AssertionError("get_merged_prs must not run when get_open_prs failed")
+
+    monkeypatch.setattr(
+        runner_module.github_client,
+        "get_merged_prs",
+        fail_get_merged_prs,
+    )
+
+    runner = _make_runner()
+    runner._idle_merged_pr_304_streak = 9
+    asyncio.run(runner.handle_idle())
+
+    assert merged_calls["n"] == 0
+    assert runner._idle_merged_pr_304_streak == 0
+    assert not any(
+        "merged-PR detection degraded" in e["event"]
+        for e in runner.state.history
+    )
+
+
 def test_handle_idle_uses_fallback_queue_counters_when_dag_picks_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -386,6 +386,18 @@ class IdleMixin:
             if not await self._resolve_pending_queue_sync():
                 return
 
+        # The 304 streak counts only cycles that actually reached
+        # ``get_merged_prs`` and saw HTTP 304. Reset by default so any
+        # other outcome — success, non-304 failure, or an early return
+        # that skips the merged-PR fetch entirely (e.g. ``sync_to_main``
+        # or ``get_open_prs`` failed earlier this cycle) — breaks the
+        # streak. The 304 branch below restores the prior count and
+        # increments it; any other path leaves the streak at zero.
+        prev_merged_pr_304_streak = getattr(
+            self, "_idle_merged_pr_304_streak", 0,
+        )
+        self._idle_merged_pr_304_streak = 0
+
         try:
             self.sync_to_main()
         except (
@@ -460,7 +472,7 @@ class IdleMixin:
                 # merges. Suppress the first few, then surface a degraded
                 # signal once the streak shows the failure isn't blowing
                 # over.
-                streak = getattr(self, "_idle_merged_pr_304_streak", 0) + 1
+                streak = prev_merged_pr_304_streak + 1
                 self._idle_merged_pr_304_streak = streak
                 if streak == _IDLE_MERGED_PR_304_WARN_AT or (
                     streak > _IDLE_MERGED_PR_304_WARN_AT
@@ -475,7 +487,6 @@ class IdleMixin:
                     )
                 merged_prs = []
             else:
-                self._idle_merged_pr_304_streak = 0
                 self.log_event(
                     f"[INFRA] IDLE: merged PR check failed: {exc}; "
                     f"continuing with local merged-status heuristics."
@@ -483,7 +494,6 @@ class IdleMixin:
                 merged_prs = []
         else:
             self._idle_open_pr_snapshot = open_pr_snapshot
-            self._idle_merged_pr_304_streak = 0
 
         queue_path = str(Path(self.repo_path) / "tasks" / "QUEUE.md")
         strict = self.app_config.daemon.strict_queue_validation
