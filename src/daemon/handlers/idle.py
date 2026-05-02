@@ -372,7 +372,7 @@ class IdleMixin:
 
     async def handle_idle(self) -> None:
         """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
-        self._error_diagnose_count = 0
+        self._error_diagnose_policy.reset(self)
         if self.state.user_paused:
             return
         if self.state.pending_queue_sync_branch is not None:
@@ -754,7 +754,7 @@ class IdleMixin:
         )
         clearable = other_coder
         if clearable:
-            self._error_diagnose_count = 0
+            self._error_diagnose_policy.reset(self)
             self._claude_usage_provider.invalidate_cache()
             self._codex_usage_provider.invalidate_cache()
             label = (
@@ -815,7 +815,7 @@ class IdleMixin:
         self.state.rate_limited_until = None
         self.state.rate_limit_reactive = False
         self.state.rate_limit_reactive_coder = None
-        self._error_diagnose_count = 0
+        self._error_diagnose_policy.reset(self)
         if self.state.error_message:
             lowered = self.state.error_message.lower()
             is_rate_limit_msg = (

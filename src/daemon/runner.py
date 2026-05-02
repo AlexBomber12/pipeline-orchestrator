@@ -341,6 +341,48 @@ class PipelineRunner(
             ),
             on_threshold=lambda r: r._enter_github_api_slowdown(),
         )
+        # PR-223: route the open-coded ``_error_skip_count`` and
+        # ``_error_diagnose_count`` ceilings through ``BoundedRecoveryPolicy``
+        # so all 5 threshold sites share one shape. ``max_attempts=4``
+        # preserves the legacy ``count > 3`` semantic: ``maybe_escalate``
+        # fires when the counter reaches ``max_attempts``, which after
+        # increment from 3 to 4 matches the original gate.
+        self._error_skip_policy: BoundedRecoveryPolicy[
+            "PipelineRunner"
+        ] = BoundedRecoveryPolicy(
+            name="error_skip",
+            max_attempts=4,
+            counter_getter=lambda r: r._error_skip_count,
+            counter_setter=lambda r, n: setattr(r, "_error_skip_count", n),
+            on_threshold=lambda r: r._on_error_skip_threshold(),
+        )
+        self._error_diagnose_policy: BoundedRecoveryPolicy[
+            "PipelineRunner"
+        ] = BoundedRecoveryPolicy(
+            name="error_diagnose",
+            max_attempts=4,
+            counter_getter=lambda r: r._error_diagnose_count,
+            counter_setter=lambda r, n: setattr(r, "_error_diagnose_count", n),
+            on_threshold=lambda r: r._on_error_diagnose_threshold(),
+        )
+
+    def _on_error_skip_threshold(self) -> None:
+        """Log when the soft-skip ceiling fires; stays ERROR.
+
+        The dynamic ``Skipping AI diagnosis: <Coder> rate limited`` line
+        is logged inline by ``handle_error`` before increment, so the
+        threshold callback only owns the ceiling message asserted by
+        the PR-210 baseline.
+        """
+        self.log_event(
+            "[ERROR] max soft-skip retries (3) reached, staying ERROR."
+        )
+
+    def _on_error_diagnose_threshold(self) -> None:
+        """Log when the diagnose-attempt ceiling fires; stays ERROR."""
+        self.log_event(
+            "[ERROR] diagnose_error: max attempts (3) reached, staying ERROR."
+        )
 
     @property
     def app_config(self) -> AppConfig:
@@ -412,9 +454,9 @@ class PipelineRunner(
         recovery.py:371-375 superset stays the universal contract.
         """
         self._error_skip_active = False
-        self._error_skip_count = 0
+        self._error_skip_policy.reset(self)
         self._error_skip_context = None
-        self._error_diagnose_count = 0
+        self._error_diagnose_policy.reset(self)
         self._idle_dispatch_deferred = False
 
     def _build_usage_providers_for_app_config(
@@ -1440,7 +1482,7 @@ class PipelineRunner(
             and self.state.state != PipelineState.ERROR
         ):
             self._error_skip_context = None
-            self._error_skip_count = 0
+            self._error_skip_policy.reset(self)
             self._error_skip_active = False
 
         self._update_idle_streak_after_cycle(pre_state)

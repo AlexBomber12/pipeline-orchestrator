@@ -136,7 +136,7 @@ class ErrorMixin:
         context = error_context or self.state.error_message or "Unknown error"
         if _is_infra_error(context):
             self._error_skip_context = None
-            self._error_skip_count = 0
+            self._error_skip_policy.reset(self)
             self._error_skip_active = False
             truncated = context if len(context) <= 200 else context[:197] + "..."
             self.log_event(
@@ -149,7 +149,7 @@ class ErrorMixin:
         category = _classify_error(context)
         if category == ErrorCategory.RATE_LIMIT:
             self._error_skip_context = None
-            self._error_skip_count = 0
+            self._error_skip_policy.reset(self)
             self._error_skip_active = False
             self.log_event(
                 "[ERROR] Skipping AI diagnosis for rate-limit error, "
@@ -160,7 +160,7 @@ class ErrorMixin:
             return
         if category == ErrorCategory.TIMEOUT:
             self._error_skip_context = None
-            self._error_skip_count = 0
+            self._error_skip_policy.reset(self)
             self._error_skip_active = False
             self.log_event(
                 "[ERROR] Skipping AI diagnosis for timeout error, "
@@ -194,18 +194,14 @@ class ErrorMixin:
             or snapshot.weekly_percent
             >= self.app_config.daemon.rate_limit_weekly_pause_percent
         ):
-            if context == self._error_skip_context:
-                self._error_skip_count += 1
-            else:
+            if context != self._error_skip_context:
+                self._error_skip_policy.reset(self)
                 self._error_skip_context = context
-                self._error_skip_count = 1
+            self._error_skip_policy.increment(self)
             self._error_skip_active = True
-            if self._error_skip_count > 3:
-                self.log_event(
-                    f"[ERROR] Skipping AI diagnosis: "
-                    f"{coder_name.capitalize()} rate limited; max "
-                    f"soft-skip retries (3) reached, staying ERROR."
-                )
+            if await self._error_skip_policy.maybe_escalate(self):
+                # Threshold callback already logged "[ERROR] max
+                # soft-skip retries (3) reached, staying ERROR."
                 return
 
             self.log_event(
@@ -214,18 +210,15 @@ class ErrorMixin:
             )
             self.state.state = PipelineState.IDLE
             self.state.error_message = None
-            self._error_diagnose_count = 0
+            self._error_diagnose_policy.reset(self)
             return
 
         self._error_skip_context = None
-        self._error_skip_count = 0
+        self._error_skip_policy.reset(self)
         self._error_skip_active = False
-        self._error_diagnose_count += 1
-        if self._error_diagnose_count > 3:
-            self.log_event(
-                "[ERROR] diagnose_error: max attempts (3) reached, "
-                "staying ERROR."
-            )
+        self._error_diagnose_policy.increment(self)
+        if await self._error_diagnose_policy.maybe_escalate(self):
+            # Threshold callback already logged the ceiling message.
             return
         dirty_before = ""
         try:
@@ -415,7 +408,7 @@ class ErrorMixin:
         elif verdict == "FIX":
             self.state.error_message = None
             self.state.state = PipelineState.IDLE
-            self._error_diagnose_count = 0
+            self._error_diagnose_policy.reset(self)
             self.log_event(
                 f"[ERROR] diagnose_error: FIX -> IDLE ({summary[:80]})."
             )
