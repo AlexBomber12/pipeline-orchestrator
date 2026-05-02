@@ -25,6 +25,8 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
+from src.keyspace import control_config_dirty
+
 logger = logging.getLogger(__name__)
 
 CONFIG_WATCH_INTERVAL_SEC = 5.0
@@ -75,7 +77,7 @@ async def _set_config_dirty_flags(
     """
     all_ok = True
     for name in repo_names:
-        key = f"control:{name}:config_dirty"
+        key = control_config_dirty(name)
         try:
             await redis_client.set(key, "1")
         except Exception:

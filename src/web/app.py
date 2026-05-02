@@ -50,6 +50,13 @@ from src.daemon.github_rate_limit import (
 )
 from src.events import publish_repo_event, publish_wake
 from src.events.sse import RepoEventsUnavailableError, stream_repo_events
+from src.keyspace import (
+    cli_log_latest,
+    control_config_dirty,
+    control_stop,
+    pipeline_state,
+    upload_pending,
+)
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState, TaskStatus
 from src.onboarding.markdown_sections import MarkerError
@@ -135,7 +142,7 @@ async def _get_repo_state_safe(
 ) -> tuple[RepoState, str | None]:
     """Return (state, warning). Warning is non-None when state is synthetic."""
     try:
-        raw = await redis_client.get(f"pipeline:{name}")
+        raw = await redis_client.get(pipeline_state(name))
     except Exception:
         st = _default_repo_state(name, url)
         st.state = PipelineState.PREFLIGHT
@@ -216,7 +223,7 @@ async def _apply_repo_control_update(
     redis_client = getattr(request.app.state, "redis", None)
     if redis_client is None:
         raise _RepoStateMutationError("Redis unavailable", status_code=503)
-    return redis_client, f"pipeline:{name}", repo.url
+    return redis_client, pipeline_state(name), repo.url
 
 
 async def _update_repo_pause_state(
@@ -236,7 +243,7 @@ async def _update_repo_pause_state(
     except _RepoStateMutationError as exc:
         return HTMLResponse(exc.message, status_code=exc.status_code)
 
-    stop_key = f"control:{name}:stop"
+    stop_key = control_stop(name)
     watch_keys: tuple[str, ...] = (state_key, stop_key) if stop_action != "leave" else (state_key,)
     failure_message = {
         "leave": "Failed to update repository state",
@@ -1391,8 +1398,8 @@ async def post_repo_detail_coder(
     except OSError as exc:
         return HTMLResponse(f"Failed to write config.yml: {exc}", status_code=503)
 
-    dirty_key = f"control:{name}:config_dirty"
-    state_key = f"pipeline:{name}"
+    dirty_key = control_config_dirty(name)
+    state_key = pipeline_state(name)
     try:
         await redis_client.set(dirty_key, "1")
         raw_state = await redis_client.get(state_key)
@@ -1547,7 +1554,7 @@ async def repo_cli_log(request: Request, name: str) -> HTMLResponse:
     log_text = ""
     if redis_client is not None:
         try:
-            raw = await redis_client.get(f"cli_log:{name}:latest")
+            raw = await redis_client.get(cli_log_latest(name))
             if raw is not None:
                 log_text = raw if isinstance(raw, str) else raw.decode()
         except Exception:
@@ -2551,7 +2558,7 @@ async def upload_tasks(
             repo_name=name,
         )
     try:
-        raw = await redis_client.get(f"pipeline:{name}")
+        raw = await redis_client.get(pipeline_state(name))
     except Exception:
         return _render_upload_error(
             request,
@@ -2822,7 +2829,7 @@ async def upload_tasks(
 
             uploaded_filenames = [fn for fn, _ in file_contents]
             manifest_filenames = list(uploaded_filenames)
-            pending_key = f"upload:{name}:pending"
+            pending_key = upload_pending(name)
             try:
                 existing_raw = await redis_client.get(pending_key)
             except Exception:

@@ -9,16 +9,18 @@ from typing import Any
 
 import redis.asyncio as aioredis
 
+from src.keyspace import repo_events_channel, repo_events_history
+
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 EVENT_HISTORY_LIMIT = 50
 
 
 def _channel_name(repo_name: str) -> str:
-    return f"repo-events:{repo_name}"
+    return repo_events_channel(repo_name)
 
 
 def _history_name(repo_name: str) -> str:
-    return f"repo-events-history:{repo_name}"
+    return repo_events_history(repo_name)
 
 
 def _utc_now() -> datetime:
