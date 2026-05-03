@@ -48,9 +48,12 @@ class PreflightMixin:
             # ``OSError`` (missing git binary, missing cwd, permission
             # errors) otherwise escapes to daemon.main's generic
             # handler and leaves the runner state stale.
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = f"preflight failed: {exc}"
-            self.log_event(f"[INFRA] preflight failed: {exc}.")
+            await self._transition_to_error(
+                f"preflight failed: {exc}",
+                log_prefix="[INFRA]",
+                save_run_record_as=None,
+                publish=False,
+            )
             return False
 
         dirty = result.stdout.strip()
@@ -66,9 +69,13 @@ class PreflightMixin:
                 if self.state.state in (PipelineState.IDLE, PipelineState.WATCH):
                     policy.reset(self)
                     return True
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = f"working tree dirty: {dirty}"
-            self.log_event("[INFRA] preflight: dirty working tree.")
+            await self._transition_to_error(
+                f"working tree dirty: {dirty}",
+                log_prefix="[INFRA]",
+                log_message="preflight: dirty working tree",
+                save_run_record_as=None,
+                publish=False,
+            )
             return False
         policy.reset(self)
         return True
