@@ -82,11 +82,14 @@ class CodingMixin:
 
         Reads top-down as a state-machine flow with three phases:
 
-        1. ``_prepare_coder_invocation`` — rate-limit check, breach env
-           allocation, kwargs build. Auth refresh happens before
-           ``_get_coder`` so the selector sees fresh statuses, and
-           ``_start_current_run_record`` runs before the branch guard so
-           the missing-branch ERROR transition still emits run telemetry.
+        1. ``_prepare_coder_invocation`` — breach env allocation, kwargs
+           build. Auth refresh happens before ``_get_coder`` so the
+           selector sees fresh statuses; ``_start_current_run_record``
+           runs before the branch guard so the missing-branch ERROR
+           transition still emits run telemetry; and
+           ``_check_rate_limit`` runs before the branch guard so an
+           active or renewed rate-limit window pauses the runner instead
+           of being overridden by the ERROR transition.
         2. ``_run_coder_with_supervision`` — subprocess plus stop and
            breach monitors; resolves user-stop and breach pauses.
         3. ``_post_coder_resolution`` — CLI log save, exit classification,
@@ -113,6 +116,15 @@ class CodingMixin:
             daemon_config=self.app_config.daemon,
         )
         self._start_current_run_record(coder_name, plugin_run_kwargs["model"])
+
+        # Run the rate-limit gate before the branch guard so an active
+        # or renewed pause window is honored as PAUSED. If this ran
+        # after the guard, a malformed task would short-circuit through
+        # ``_transition_to_error`` and bypass the cooldown that
+        # ``_check_rate_limit`` is responsible for enforcing.
+        if not await self._check_rate_limit(proactive_coder=coder_name):
+            await self._save_current_run_record("rate_limit")
+            return
 
         target_branch = (
             self.state.current_task.branch if self.state.current_task else None
@@ -157,23 +169,20 @@ class CodingMixin:
         coder_name: str,
         plugin: CoderPlugin,
     ) -> dict[str, Any]:
-        """Check rate limit, allocate breach env, build kwargs.
+        """Allocate breach env, build kwargs.
 
         Returns the kwargs dict ready to pass to ``plugin.run_planned_pr``.
         Allocates the breach env via ``_breach_env`` and stores it on
         ``self`` so ``_run_coder_with_supervision`` can wire monitors and
-        teardown without re-creating it. Raises ``CoderUnavailable`` if
-        the rate-limit check blocks invocation; in that case the runner
-        state has already been moved to PAUSED and the run record saved.
+        teardown without re-creating it.
 
-        Auth refresh and run-record start happen in ``handle_coding``
-        before this helper so the selector sees fresh statuses and the
-        branch-guard ERROR path still records run telemetry.
+        Auth refresh, run-record start, the rate-limit gate, and the
+        branch guard all happen in ``handle_coding`` before this helper
+        so the selector sees fresh statuses, the branch-guard ERROR path
+        still records run telemetry, and an active rate-limit window
+        keeps the runner PAUSED instead of falling through to the ERROR
+        transition.
         """
-        if not await self._check_rate_limit(proactive_coder=coder_name):
-            await self._save_current_run_record("rate_limit")
-            raise CoderUnavailable("rate_limit")
-
         self.log_event(f"[CODING] [{coder_name}] Starting PLANNED PR.")
 
         breach_dir, breach_run_id = self._breach_env()

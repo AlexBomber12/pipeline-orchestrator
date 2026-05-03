@@ -2,9 +2,9 @@
 
 Verifies the three async helpers extracted from ``handle_coding``:
 
-- ``_prepare_coder_invocation``: rate-limit check, breach env
-  allocation, kwargs build. (Auth refresh and run-record start happen
-  in ``handle_coding`` before this helper.)
+- ``_prepare_coder_invocation``: breach env allocation and kwargs
+  build. (Auth refresh, run-record start, rate-limit gate, and branch
+  guard all happen in ``handle_coding`` before this helper.)
 - ``_run_coder_with_supervision``: subprocess plus stop and breach
   monitors; resolves user-stop and breach pauses.
 - ``_post_coder_resolution``: CLI log save, exit classification, PR
@@ -41,34 +41,6 @@ def _runner_with_task(monkeypatch: pytest.MonkeyPatch):
 # ---------- _prepare_coder_invocation ----------
 
 
-def test_prepare_coder_invocation_raises_when_rate_limit_blocks(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``_check_rate_limit`` returning False raises ``CoderUnavailable``.
-
-    The helper must save the current run record as ``"rate_limit"`` before
-    raising so the metrics store reflects the proactive pause.
-    """
-    runner = _runner_with_task(monkeypatch)
-    coder_name, plugin = runner._get_coder()
-
-    async def fake_rate_limit(*args: Any, **kwargs: Any) -> bool:
-        return False
-
-    saved: list[str] = []
-
-    async def fake_save(reason: str) -> None:
-        saved.append(reason)
-
-    monkeypatch.setattr(runner, "_check_rate_limit", fake_rate_limit)
-    monkeypatch.setattr(runner, "_save_current_run_record", fake_save)
-
-    with pytest.raises(CoderUnavailable):
-        asyncio.run(runner._prepare_coder_invocation(coder_name, plugin))
-
-    assert saved == ["rate_limit"]
-
-
 def test_prepare_coder_invocation_returns_kwargs_with_breach_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -77,10 +49,6 @@ def test_prepare_coder_invocation_returns_kwargs_with_breach_env(
     runner = _runner_with_task(monkeypatch)
     coder_name, plugin = runner._get_coder()
 
-    async def fake_rate_limit(*args: Any, **kwargs: Any) -> bool:
-        return True
-
-    monkeypatch.setattr(runner, "_check_rate_limit", fake_rate_limit)
     monkeypatch.setattr(
         runner, "_breach_env", lambda: ("/tmp/breach", "run-abc")
     )
@@ -346,6 +314,58 @@ def test_handle_coding_refreshes_auth_before_selecting_coder(
     asyncio.run(runner.handle_coding())
 
     assert order == ["refresh", "select", "prepare"]
+
+
+def test_handle_coding_rate_limit_runs_before_branch_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_check_rate_limit`` must run before the missing-branch guard.
+
+    Pre-decomposition the gate ran ahead of the branch guard so an active
+    or renewed pause window kept the runner PAUSED with a ``"rate_limit"``
+    run record. The decomposition tucked the gate inside
+    ``_prepare_coder_invocation`` (called after the guard), so a malformed
+    task hit ``_transition_to_error`` first and the cooldown was bypassed.
+    Verify the rate-limit short-circuit fires even when ``branch=`` is
+    missing, recording ``"rate_limit"`` rather than ``"error"``.
+    """
+    h._patch_subprocess(monkeypatch)
+    runner = h._make_runner()
+    # No ``branch=`` so the branch guard would fire if reached.
+    runner.state.current_task = QueueTask(
+        pr_id="PR-701",
+        title="missing branch with rate limit",
+        status=TaskStatus.TODO,
+    )
+
+    rate_limit_calls: list[str | None] = []
+
+    async def fake_rate_limit(proactive_coder: str | None = None) -> bool:
+        rate_limit_calls.append(proactive_coder)
+        return False
+
+    transition_calls: list[str] = []
+
+    async def fake_transition(message: str, **kwargs: Any) -> None:
+        transition_calls.append(message)
+
+    monkeypatch.setattr(runner, "_check_rate_limit", fake_rate_limit)
+    monkeypatch.setattr(runner, "_transition_to_error", fake_transition)
+
+    saved: list[tuple[str, Any]] = []
+
+    async def fake_metrics_save(record: Any) -> None:
+        saved.append((record.exit_reason, record))
+
+    monkeypatch.setattr(runner._metrics_store, "save", fake_metrics_save)
+
+    asyncio.run(runner.handle_coding())
+
+    assert rate_limit_calls, "rate-limit gate must fire before the branch guard"
+    assert transition_calls == [], (
+        "missing-branch ERROR transition must not fire when rate-limited"
+    )
+    assert [reason for reason, _ in saved] == ["rate_limit"]
 
 
 def test_handle_coding_records_run_for_missing_branch_error(
