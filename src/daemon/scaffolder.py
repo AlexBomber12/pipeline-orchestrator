@@ -24,6 +24,44 @@ TEMPLATES_DIR = Path(__file__).resolve().parent.parent.parent / "templates"
 _GITIGNORE_ENTRIES = ("artifacts/", "tasks/QUEUE.md")
 _COMMIT_MESSAGE = "chore: initialize pipeline orchestrator structure"
 
+# OBS-AX (PR-242). User-authored CLAUDE.md content competes with AGENTS.md
+# as Claude Code's system prompt and causes the coder to HUNG with
+# "PLANNED PR alone isn't enough context" on first task pick. The
+# scaffolder rewrites CLAUDE.md to a canonical redirect on every onboarding
+# pass so the coder always picks AGENTS.md as the source of truth.
+_CLAUDE_MD_CANONICAL = "Read and follow AGENTS.md in this repository.\n"
+
+_SKILL_MD_REL_PATH = ".claude/skills/orch-context/SKILL.md"
+
+_SKILL_MD_CANONICAL = """\
+---
+name: orch-context
+description: >-
+  Use when working in a pipeline-orchestrator-managed repository.
+  Routes Claude to the canonical orchestrator rules in AGENTS.md
+  and the active task definition under tasks/PR-*.md.
+---
+
+# Pipeline orchestrator context
+
+This repository is managed by the pipeline-orchestrator daemon. The
+canonical rules for AI coders working here live in `AGENTS.md` at the
+repository root. Read it fully before generating code or opening PRs.
+
+When the daemon dispatches a PLANNED PR task, the active task file
+lives at `tasks/PR-XXX.md` and is identified by `tasks/QUEUE.md`,
+which is auto-generated from task headers and git state. Read the
+task file fully before starting; do not drift from its scope.
+
+For new task spec generation, follow the schema in
+`docs/TASK_SCHEMA.md` from the orchestrator repo (or the canonical
+schema documentation provided by the orchestrator's MCP server when
+that ships).
+
+The dashboard at `https://orchestrator.lan` shows live state and the
+event log; reference it when reasoning about recent runs.
+"""
+
 # Timeouts for git subprocess calls, mirroring the limits used elsewhere
 # in the daemon (see ``PipelineRunner``). Without an explicit timeout a
 # stalled network operation or an auth prompt during the first-clone
@@ -40,6 +78,31 @@ def _copy_template(src_name: str, dest: Path, executable: bool = False) -> None:
     shutil.copyfile(TEMPLATES_DIR / src_name, dest)
     if executable:
         dest.chmod(0o755)
+
+
+def _ensure_canonical_file(
+    repo_path: Path, rel_path: str, canonical_content: str
+) -> bool:
+    """Write ``canonical_content`` to ``repo_path/rel_path`` when content differs.
+
+    Returns ``True`` when a write occurred (file created or overwritten),
+    ``False`` when the existing content already matched. Idempotent:
+    repeated calls do not create commit churn for already-onboarded repos.
+    PR-242: existing files are overwritten unconditionally so user-authored
+    CLAUDE.md content cannot compete with AGENTS.md as Claude Code's
+    system prompt.
+    """
+    target = repo_path / rel_path
+    if target.exists():
+        try:
+            existing = target.read_text(encoding="utf-8")
+        except OSError:
+            existing = None
+        if existing == canonical_content:
+            return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(canonical_content, encoding="utf-8")
+    return True
 
 
 def _run_git(
@@ -256,13 +319,18 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
     created: list[str] = []
 
     agents = repo / "AGENTS.md"
-    claude = repo / "CLAUDE.md"
-    if not agents.exists() and not claude.exists():
+    # Snapshot CLAUDE.md presence before _ensure_canonical_file overwrites
+    # it: AGENTS.md backfill must respect the original "repo already had a
+    # CLAUDE.md" semantics so existing CLAUDE.md-only repos don't grow a
+    # second AGENTS.md file alongside the redirect.
+    claude_existed = (repo / "CLAUDE.md").exists()
+    if not agents.exists() and not claude_existed:
         _copy_template("AGENTS.md", agents)
         created.append("AGENTS.md")
-    if not claude.exists():
-        _copy_template("CLAUDE.md", claude)
+    if _ensure_canonical_file(repo, "CLAUDE.md", _CLAUDE_MD_CANONICAL):
         created.append("CLAUDE.md")
+    if _ensure_canonical_file(repo, _SKILL_MD_REL_PATH, _SKILL_MD_CANONICAL):
+        created.append(_SKILL_MD_REL_PATH)
 
     tasks_dir = repo / "tasks"
     if not tasks_dir.exists():
