@@ -244,39 +244,101 @@ def test_handle_watch_counts_new_head_sha_after_pre_pr195_upgrade(
     assert runner.state.current_pr.push_count == 5
 
 
-def test_handle_watch_no_fix_when_ci_pending_and_changes_requested(
+def test_watch_changes_requested_with_pending_ci_triggers_fix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    h._patch_subprocess(monkeypatch)
+    """PR-248: when CI is PENDING and review is CHANGES_REQUESTED with new
+    Codex feedback, CHANGES_REQUESTED takes precedence over PENDING and a
+    fix is triggered. Pre-PR-248 the PENDING branch swallowed this path."""
+    last_push = datetime.now(timezone.utc) - timedelta(minutes=10)
+    recent = datetime.now(timezone.utc) - timedelta(minutes=1)
     pr = PRInfo(
-        number=5,
+        number=42,
         branch="pr-001",
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.CHANGES_REQUESTED,
-        last_activity=datetime.now(timezone.utc),
+        last_activity=last_push,
     )
-    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+
+    comments = [
+        {
+            "user": {"login": "chatgpt-codex-connector"},
+            "body": "P1: missing null check",
+            "created_at": recent.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    ]
+
+    def fake_paginated(path: str) -> list[dict]:
+        if "issues" in path:
+            return comments
+        return []
+
+    monkeypatch.setattr(
+        "src.github.cache._gh_api_paginated",
+        fake_paginated,
+    )
+
     fix_called: list[bool] = []
 
-    async def _no_fix(*_args: object, **_kwargs: object) -> tuple:
+    async def fake_fix() -> None:
         fix_called.append(True)
-        return (0, "", "")
-
-    monkeypatch.setattr(claude_cli, "fix_review_async", _no_fix)
-    monkeypatch.setattr(
-        "src.github.comments.post_comment",
-        lambda repo, number, body: None,
-    )
 
     runner = h._make_runner()
+    runner._last_push_at = last_push
+    runner._last_push_at_pr_number = pr.number
+    runner.state.current_pr = pr
     runner.state.state = PipelineState.WATCH
-    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.handle_fix = fake_fix  # type: ignore[assignment]
     asyncio.run(runner.handle_watch())
 
-    assert runner.state.state == PipelineState.WATCH
+    assert fix_called == [True]
+
+
+def test_watch_changes_requested_with_pending_ci_no_feedback_logs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-248: CI=PENDING + review=CHANGES_REQUESTED + no new Codex
+    feedback must NOT be swallowed by the PENDING branch — the
+    CHANGES_REQUESTED no-new-feedback log line must be emitted instead."""
+    last_push = datetime.now(timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-001",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=last_push,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        "src.github.cache._gh_api_paginated",
+        lambda path: [],
+    )
+
+    fix_called: list[bool] = []
+
+    async def fake_fix() -> None:
+        fix_called.append(True)
+
+    runner = h._make_runner()
+    runner._last_push_at = last_push
+    runner._last_push_at_pr_number = pr.number
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.handle_fix = fake_fix  # type: ignore[assignment]
+    asyncio.run(runner.handle_watch())
+
     assert fix_called == []
-    assert runner.state.current_pr is not None
-    assert runner.state.current_pr.push_count == 0
+    assert any(
+        "CHANGES_REQUESTED but no new" in e["event"]
+        for e in runner.state.history
+    )
 
 
 def test_handle_watch_fix_when_ci_success_and_changes_requested(

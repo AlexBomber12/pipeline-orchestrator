@@ -182,8 +182,6 @@ class WatchMixin:
         elif ci == CIStatus.FAILURE:
             await self.handle_fix()
             return
-        elif ci == CIStatus.PENDING:
-            pass
         elif review == ReviewStatus.CHANGES_REQUESTED:
             result = self._has_new_codex_feedback_since_last_push()
             if result == FeedbackCheckResult.NEW:
@@ -201,6 +199,8 @@ class WatchMixin:
                 f"Codex feedback since last push; waiting for fresh review."
             )
             self._maybe_retrigger_stale_review(found.number)
+        elif ci == CIStatus.PENDING:
+            pass
 
         # EYES is the only state where the bot may have errored mid-review;
         # gating avoids paginating issue comments on every WATCH poll.
