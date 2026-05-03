@@ -780,6 +780,24 @@ async def api_stats(request: Request) -> JSONResponse:
     return JSONResponse(_compute_stats(states))
 
 
+@router.get("/api/alerts")
+async def api_alerts(request: Request) -> JSONResponse:
+    """Lightweight alert summary for the dashboard's checkAlerts poll.
+
+    Returns ``{"has_alerts": bool, "count": int}``. Sized independently of
+    the repo count so the per-poll cost does not grow with deployment size,
+    unlike ``/api/states`` which serializes every ``RepoState`` in full.
+    The alert criterion mirrors ``_ALERT_STATES`` (HUNG/ERROR) so the badge
+    and the dashboard ``alerts`` panel agree on what an alert is.
+    """
+    redis_client = getattr(request.app.state, "redis", None)
+    states, _warning = await _app.get_all_repo_states(
+        redis_client, _app.CONFIG_PATH
+    )
+    count = sum(1 for s in states if s.state in _ALERT_STATES)
+    return JSONResponse({"has_alerts": count > 0, "count": count})
+
+
 @router.get("/api/repos/{name}/events")
 async def api_repo_events(name: str, request: Request) -> Response:
     redis_client = getattr(request.app.state, "redis", None)

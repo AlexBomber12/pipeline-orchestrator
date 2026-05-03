@@ -600,12 +600,10 @@
             }
 
             function checkAlerts() {
-                fetch('/api/states')
+                fetch('/api/alerts')
                     .then(r => r.json())
-                    .then(states => {
-                        const hasAlert = states.some(s =>
-                            s.state === 'ERROR' || s.state === 'HUNG'
-                        );
+                    .then(data => {
+                        const hasAlert = !!data.has_alerts;
                         if (hasAlert && !blinking) {
                             startBlink();
                         } else if (!hasAlert && blinking) {
