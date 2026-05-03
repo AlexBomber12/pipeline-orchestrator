@@ -2,7 +2,7 @@
 
 Живой документ. Обновляется после каждой merge'нутой волны и после каждой chat-session.
 
-Последнее обновление: 2026-05-02 (MCP server design decisions resolved: Q1 storage = filesystem only, all documents in git in orchestrator repo, no SQLite for MCP (SQLite migration remains separately scheduled for Sprint 17 metrics scope only); Q2 AGENTS.md conflict detection = combo (onboarding-time scan Sprint 13 + inline scan during validate_task_spec Sprint 14 + periodic scan at daemon sync Sprint 14, all using deterministic pattern-match in v1, LLM-based grey area detection deferred to v2); Q3 LLM editing policy for managed repo = advisory in SKILL.md v1 Sprint 13 + pre-commit hook enforcement v2 Sprint 15+. MCP section now in architectural decisions state, implementation pending Sprint 13 spec generation. Earlier same-day work: major cleanup pass, sprint nomenclature unified Sprint 12-17, OBS-BE expanded scope, Cancellation policy v1 with v1.1 refinements, Vision C companion app, Vision D conversational morning triage 4-stage gating, Sprint 14 expanded with OBS-BK + OBS-BL + OBS-BM. Throughput baseline 25-30 PR/day. License Apache 2.0 ASAP confirmed Sprint 13).
+Последнее обновление: 2026-05-02 (Sprint 17 = Documentation Sprint inserted, was Sprint 17+ Vision A which becomes Sprint 18+. Documentation tooling decision MkDocs Material. Sprint 17 estimated 10-15 PRs ~32h covering getting-started + concepts + operating + reference + architecture + uninstall sections, ships before non-author alpha user exposure as parallel gate alongside Sprint 16 multi-testbed. OBS-BH scope expanded from "strip [STATE_NAME] from text" to "structured event payload + multi-badge UI with color coding" per operator preference: state moved into typed field, UI renders state/category/actor/action as separate colored badges, clean text. Color scheme fixed: IDLE grey, CODING blue, WATCH amber, FIX orange, MERGE green, HUNG purple, ESCALATED red. Sprint 15 OBS-BH cost grew from ~1-2h to ~3-4h. Sprint 14 expanded with AGENTS.md inline + periodic conflict scans (~4h additional, MCP tool extensions). Sprint 13 estimate corrected from stale 4-5 PRs ~8h to actual 5-6 PRs ~11-12h reflecting MCP server core inclusion. Total Sprint 13-17: ~38-49 PRs ~104-115 daemon-hours, calendar 4-6 weeks at sustainable pace. Sprint 18+ Vision A first slice adds ~50h and 4-6 more weeks calendar; combined Sprint 12-18+ end-to-end ~2-3 months calendar before Thompson Sampling production. Earlier same-day work: MCP server design decisions Q1 filesystem-only Q2 conflict combo Q3 advisory editing v1, Cancellation policy v1, Vision C Companion App, Vision D Conversational triage, OBS-BK + OBS-BL + OBS-BM additions, License Apache 2.0 Sprint 13).
 
 Предыдущие: 2026-05-01 (PR-180..PR-207 shipped, все 28 PR merged. Multi-repo isolation audit complete, parallel run_cycle in main loop deployed. Foundation Sprint 36 PR specs generated for PR-208..PR-236 batch, internal architecture cleanup. Architectural future work section added for post-Foundation: AGENTS template scope, per-repo config, onboarding wizard, CI script generator MICRO PR. Onboarding of megaraid-dashboard и sms-gateway-v2 actively in progress; reconciled AGENTS.md files prepared, scripts/ci.sh manual creation required pre-onboarding due to scaffolder stub trap), 2026-04-29 (full roadmap rewrite на основе Implementation Audit), 2026-04-28 (sigkill recovery test multi-race resolved via PR-228/PR-232/PR-234/PR-236; production daemon deployed on fresh main; GraphQL quota burn analyzed; onboarding test subjects identified), 2026-04-27 (OBS-AA test pollution v1 misdiagnosis + v2 docker-exec fix; OBS-Y premature merge; Multi-tier agent direction; OBS-Z Codex EYES race), 2026-04-26 (Sprint F1.0 + PR-156/157 + PR-158/159 merged; Variant D direction; Development model & Layer 2 substrate observations), 2026-04-24 (after code audit zip __27__).
 
@@ -15,13 +15,14 @@ Continuous sprint numbering aligned with operator's mental model. Replaces ad-ho
 | Sprint | Content | Status | Estimate |
 |---|---|---|---|
 | Sprint 12 | Foundation Sprint (PR-208..PR-236) | In progress | 36 PRs, ~25 daemon-hours, ~1 daemon-day at 25-30 PR/day |
-| Sprint 13 | OBS-AX scaffolder fix + OBS-AY UI freeze fix + License Apache 2.0 switch (was Wave 1 + Wave 2 + new license task added 2026-05-02) | Queued | 4-5 PRs, ~8 daemon-hours |
+| Sprint 13 | OBS-AX scaffolder fix + OBS-AY UI freeze fix + License Apache 2.0 switch + MCP server core (was Wave 1 + Wave 2 + new license + MCP additions 2026-05-02) | Queued | 5-6 PRs, ~11-12 daemon-hours |
 | Sprint 14 | Recovery + Cancellation policy expanded (was Wave 5; reordered earlier than Wave 3-4 due to throughput cost demonstrated 2026-05-02; expanded with OBS-BK + OBS-BL + OBS-BM additions) | Queued | 9-11 PRs, ~27 daemon-hours |
 | Sprint 15 | UX polish + vocabulary + DONE-row metrics Path A (was Wave 3 + Wave 4, plus OBS-BH + OBS-BI Path A locked + OBS-BJ from 2026-05-02) | Queued | 7-9 PRs, ~17-19 daemon-hours |
 | Sprint 16 | Multi-testbed harness + multi-repo tests (was Wave 6 + Wave 7) | Queued | 7+ PRs, ~15 daemon-hours |
-| Sprint 17+ | Vision A multi-vendor routing first slice | Pending strategic decision | TBD |
+| Sprint 17 | Documentation Sprint (MkDocs Material, full operator + contributor docs, getting-started + concepts + operating + reference + architecture + uninstall, added 2026-05-02) | Queued | 10-15 PRs, ~32 daemon-hours |
+| Sprint 18+ | Vision A multi-vendor routing first slice (Plugin Protocol generalization, API plugins, SQLite Scenario A migration, Analytics dashboard, Thompson Sampling) | Pending strategic decision | TBD |
 
-Earlier "Wave X" references inside OBS items remain for backward compatibility; mapping is `Wave 1+2 = Sprint 13`, `Wave 5 = Sprint 14`, `Wave 3+4 = Sprint 15`, `Wave 6+7 = Sprint 16`. New OBS items added 2026-05-02 use sprint terminology directly.
+Earlier "Wave X" references inside OBS items remain for backward compatibility; mapping is `Wave 1+2 = Sprint 13`, `Wave 5 = Sprint 14`, `Wave 3+4 = Sprint 15`, `Wave 6+7 = Sprint 16`. Sprint 17 (Documentation) and Sprint 18+ (Vision A) are new entries with no Wave-era predecessor. New OBS items added 2026-05-02 use sprint terminology directly.
 
 ---
 
@@ -85,7 +86,36 @@ Pre-2026-04-29 sprint legacy summary (Sprint F1.0..F4.2 detailed status) removed
   **Behaviour aspects** (when daemon goes ESCALATED vs CANCELED, operator availability signal, dependency-aware blocking, dashboard surfacing): covered separately in **Cancellation policy** section below. OBS-BE handles the storage/preservation problem; Cancellation policy handles the routing/policy problem. Both ship together in Wave 5.
 - OBS-BF (task generator produces internally-contradictory specs that violate established AGENTS.md rules): **OPEN, medium severity, root cause finding** — observed 2026-05-02 morning on PR-231 spec, surfaced by coder's ESCALATE reasoning. Task spec for PR-231 included a fallback instruction "Open a draft PR with TODO markers… wait for operator to fill in the values" but AGENTS.md and PR-196 establish hard rule "PRs must be created in ready state, not draft." Coder correctly flagged the contradiction. **Root cause:** task generator (whoever/whatever produced PR-231 spec — likely chat session like this one) did not have full context of AGENTS.md rules, so emitted instructions that conflict with established conventions. **This is a structural problem that grows with project age:** as the repo accumulates conventions, a generator without full rule context produces increasing rate of conflicting specs. Coder catches it via ESCALATE if smart enough; otherwise produces non-conforming PRs. **Fix approach:** (a) task generator must read AGENTS.md before producing spec; (b) automated linter on task files that checks for known anti-patterns ("open draft PR", "use --force", "skip CI", etc.); (c) longer-term, Sprint F2.1 SoT (Source of Truth direct instructions) where daemon validates task spec against AGENTS.md rules before accepting upload. ~2 PRs short-term (linter + generator-context-check), full Sprint F2.1 long-term. **Wave 4 vocabulary alongside OBS-AV** (both about task spec validation). Strategic: this is the **author's own task generation reliability problem**, distinct from coder reliability — surfaces only when sufficiently smart coder catches it via ESCALATE. With weaker coders, contradictory specs would silently produce non-conforming PRs (OBS-AX class).
 
-- OBS-BH (event log badge text duplicates badge label): **OPEN, low severity, observed 2026-05-02 by operator** - every event log line in the dashboard has the form `[BADGE_NAME] message text` (e.g. `[INFRA] Posted @codex review on PR #298`, `[FIX] [claude] entering FIX`, `[CODING] Opened PR #298 → WATCH`). The badge is also rendered as a coloured pill on the same row. The bracketed prefix in the text is therefore redundant and visually noisy. Fix: strip leading `[STATE_NAME]` token from the text rendering when the corresponding badge is present (template-side change, no event-log storage migration needed). Keep `[STATE_NAME]` in the underlying log payload for grep / debugging in raw mode, render-time stripping only. ~1 PR, ~1-2 daemon-hours. **Sprint 15 polish bucket.**
+- OBS-BH (structured event payload + multi-badge UI with color coding): **OPEN, low-medium severity, observed 2026-05-02 by operator, scope expanded same day** - every event log line in the dashboard contains multiple bracket prefixes simultaneously, e.g. `[FIX] [claude] entering FIX`, `[INFRA] Posted @codex review on PR #298`, `[CODING] Opened PR #298 -> WATCH`. The text duplicates state information that is also rendered as a colored pill badge on the same row. Badges and prefixes coexist redundantly.
+
+  **Refined scope (operator decision 2026-05-02):** instead of stripping `[STATE_NAME]` text in render layer, refactor event payloads to carry structured fields explicitly:
+
+  ```
+  {
+    "ts": ...,
+    "state": "FIX",            # pipeline state
+    "category": "INFRA"|null,  # meta-category, optional
+    "actor": "claude"|null,    # coder identifier, optional
+    "action": "ESCALATE"|null, # action marker, optional
+    "text": "entering FIX"     # clean message, no prefixes
+  }
+  ```
+
+  UI rendering: each event row shows one or more badges on the left (state primary chip + optional category/actor/action chips), then clean text. Color coding scheme:
+
+  | State | Color |
+  |---|---|
+  | IDLE | neutral grey |
+  | CODING | blue |
+  | WATCH | amber |
+  | FIX | orange |
+  | MERGE | green |
+  | HUNG | purple |
+  | ESCALATED (Sprint 14 addition) | red |
+  | INFRA category chip | outlined neutral |
+  | ESCALATE action chip | outlined orange |
+
+  Backward compat: render-time strip of legacy `[PREFIX]` text if structured fields absent. No bulk migration of existing Redis event lists needed; lists naturally rotate within a few days. ~1 PR, ~3-4 daemon-hours. **Sprint 15 polish bucket. Bundle with OBS-BI and OBS-BJ in same sprint, possibly same PR if scope stays compact.**
 
 - OBS-BI (per-PR metrics surface in DONE list rows): **OPEN, low-medium severity, observed 2026-05-02 by operator** - DONE list currently shows only PR ID + title + branch. Per-PR metrics are collected (RunRecord schema in `src/metrics.py` has `duration_ms`, `fix_iterations`, `tokens_in`, `tokens_out`, `task_type`, `complexity`, `exit_reason`, `files_touched_count`, `diff_lines_added/deleted`) and surfaced as a separate "Recent PRs" panel (`src/web/templates/components/pr_metrics.html`, endpoint `/partials/repo/{name}/metrics`, polls every 60s, last 20 records: Task / Coder / Model / Duration / FIX Iterations / Exit Reason). However, this panel is **not visible from the DONE list view** that the operator uses for historical browsing - it lives in a different repo-detail surface that does not naturally surface for completed PRs.
 
@@ -385,7 +415,7 @@ All MCP-served documents live in git as plain files in orchestrator repo:
 
 To update schema: edit `docs/TASK_SCHEMA.md`, commit via standard PR workflow, deploy stack (`docker compose up -d --build`). Git history preserved, code review preserved, rollback via git revert. No admin UI to maintain, no DB schema migrations to coordinate, no backup story to design.
 
-SQLite migration remains scheduled for Sprint 17 territory **before Thompson Sampling**, but its scope is **metrics only** (Scenario A from memory item #25): long-term RunRecord aggregation for posterior stability. MCP server is independent of that migration.
+SQLite migration remains scheduled for Sprint 18+ within Vision A first slice **before Thompson Sampling**, but its scope is **metrics only** (Scenario A from memory item #25): long-term RunRecord aggregation for posterior stability. MCP server is independent of that migration.
 
 **AGENTS.md conflict detection: combo with pattern-matching first pass.**
 
@@ -1645,51 +1675,96 @@ Each operator using pipeline-orchestrator brings their own Claude account, used 
 **Order of execution (post-Sprint 12 / post-Foundation):**
 
 ```
-Sprint 13 (external onboarding readiness + UI scaling + license switch):
-  - OBS-AX scaffolder CLAUDE.md replace      (1 PR,  ~2h)
+Sprint 13 (external onboarding readiness + UI scaling + license + MCP server core):
+  - MCP server core                          (1 PR,  ~3-4h) NEW 2026-05-02
+    FastMCP service, 4 v1 tools (validate_task_spec, get_task_schema,
+    get_agents_md_template, suggest_next_pr_number), docker compose service
+  - OBS-AX scaffolder + SKILL.md placement
+    + advisory editing policy + CLAUDE.md redirect (1 PR, ~2h)
   - OBS-AY setInterval cleanup + /api/states (2-3 PRs, ~5h)
-  - License switch MIT to Apache 2.0         (1 PR,  ~1h)  NEW 2026-05-02
-  Total: 4-5 PRs, ~8 daemon-hours
-  License task is mechanical (replace LICENSE file content, add NOTICE,
-  update pyproject.toml license field). Operator confirmed ASAP 2026-05-02.
-  Independent of OBS-AX and OBS-AY; can ship in parallel within sprint.
+  - License switch MIT to Apache 2.0         (1 PR,  ~1h)
+  Total: 5-6 PRs, ~11-12 daemon-hours
+  License task is mechanical. MCP server core is foundational - several
+  PR-FUTURE items (1, 3, 4, 7) collapse into MCP tools after this ships.
+  OBS-AX scaffolder simplification leverages MCP for AGENTS.md template
+  retrieval, reducing per-repo duplication.
 
-Sprint 14 (recovery + cancellation policy, REORDERED EARLIER 2026-05-02, EXPANDED with BK/BL/BM):
+Sprint 14 (recovery + cancellation policy + AGENTS.md conflict scans):
   - OBS-AW HUNG button                       (~2h)
   - OBS-BB FIX-no-push                       (~2h)
   - OBS-BC CI infra-failure classification   (~5h)
   - OBS-BE expanded cause preservation       (~7h)
   - Cancellation policy v1                   (~9h)
-  - OBS-BK elif chain ordering fix           (~3h)  NEW 2026-05-02
-  - OBS-BL WATCH↔HUNG circuit breaker        (~3h)  NEW 2026-05-02
-  - OBS-BM CI stuck PENDING classification   (~5h)  NEW 2026-05-02
-  Total: 9-11 PRs, ~27 daemon-hours
+  - OBS-BK elif chain ordering fix           (~3h)
+  - OBS-BL WATCH↔HUNG circuit breaker        (~3h)
+  - OBS-BM CI stuck PENDING classification   (~5h)
+  - AGENTS.md inline conflict scan in
+    validate_task_spec MCP tool              (~2h) NEW 2026-05-02
+  - AGENTS.md periodic conflict scan at
+    daemon sync time                         (~2h) NEW 2026-05-02
+  Total: 11-13 PRs, ~31 daemon-hours
   Reordering rationale: 2026-05-02 production session demonstrated 4-hour
   hang on PR-227c due to interaction of OBS-BK (elif blocks FIX trigger),
   OBS-BL (no circuit breaker on retry loop), and OBS-BM (CI concurrency-lock
   stuck not classified). All three combined with absent Cancellation policy
-  caused ~10 PR throughput loss. Sprint 14 now ships the full recovery suite
-  to prevent this class of incident across all four trigger paths.
+  caused ~10 PR throughput loss. AGENTS.md conflict scans extend MCP server
+  to detect drift between user-authored prose and orchestrator-managed rules.
 
 Sprint 15 (UX polish + vocabulary + DONE metrics):
   - OBS-AU spinner + OBS-AS toast/initializing
     + OBS-AZ + OBS-BA layout                 (3-4 PRs, ~5h)
   - OBS-AV synonyms + atomic upload + OBS-BF (3 PRs,  ~5h)
   - OBS-BD label create idempotency          (~1h)
-  - OBS-BH event log badge text dedup        (~1-2h)  NEW 2026-05-02
-  - OBS-BI per-PR metrics in DONE row (Path A locked) (~3h)  NEW 2026-05-02
-  - OBS-BJ DONE list newest-first sort       (~1-2h)  NEW 2026-05-02
-  Total: 7-9 PRs, ~17-19 daemon-hours
+  - OBS-BH structured event payload + multi-badge UI
+    with color coding                        (~3-4h) UPDATED 2026-05-02
+    Move [STATE_NAME]/[CATEGORY]/[ACTOR] from text into structured
+    fields, render as colored badges. Color scheme: IDLE grey, CODING
+    blue, WATCH amber, FIX orange, MERGE green, HUNG purple, ESCALATED
+    red. Backward compat: render-time strip if structured fields absent.
+  - OBS-BI per-PR metrics in DONE row (Path A locked) (~3h)
+  - OBS-BJ DONE list newest-first sort       (~1-2h)
+  Total: 7-9 PRs, ~18-21 daemon-hours
 
 Sprint 16 (multi-testbed test infrastructure):
   - Provisioning + conftest + base patterns  (2-3 PRs, ~5h)
   - One PR per multi-repo test scenario      (5+ PRs, ~10h)
   Total: 7+ PRs, ~15 daemon-hours
 
-Sprint 17+ (Vision A multi-vendor first slice): TBD pending strategic decision.
+Sprint 17 (Documentation Sprint - MkDocs Material):
+  - Tooling setup                            (1 PR,  ~2h)
+    mkdocs.yml, theme, navigation, deploy pipeline (GitHub Pages or
+    self-host docker service)
+  - Reference docs                           (2-3 PRs, ~6h)
+    task-schema, agents-md-template, config-yml, mcp-tools, /api endpoints
+  - Concepts docs                            (2-3 PRs, ~8h)
+    state machine, task specs, coder plugins, queue model, cancellation
+    policy
+  - Operating docs                           (2-3 PRs, ~6h)
+    dashboard tour, controls, presence, triage, troubleshooting
+  - Getting started                          (1-2 PRs, ~4h)
+    installation, GitHub auth, first repo onboarding, verification
+  - Architecture decisions records (ADR)     (1-2 PRs, ~4h)
+    Extract key decisions from roadmap.md into ADR format
+  - Uninstall procedures                     (1 PR,  ~2h)
+    drain repos, export data, shutdown
+  Total: 10-15 PRs, ~32 daemon-hours
+  Strategic significance: ships before non-author alpha user exposure.
+  Same gate as Sprint 16 multi-testbed. Documentation surfaces system gaps
+  through forcing function of explanation; bugs discovered during authoring
+  fixed inline.
+
+Sprint 18+ (Vision A multi-vendor first slice): TBD pending strategic decision.
+  Sequence within Sprint 18+:
+    - Plugin Protocol generalization         (~12h) CLI vs API plugin shapes
+    - API plugins                            (~8h)  Anthropic + GPT-5
+    - SQLite Scenario A migration            (~8h)  Metrics scope, before Thompson
+    - Analytics dashboard                    (~8h)  Cross-vendor stage-aware
+    - Thompson Sampling bandit               (~15h) Cost-aware reward
+  Total estimated: 18-24 PRs, ~50 daemon-hours.
+
 ```
 
-**Total Sprint 13-16: ~23-27 PRs, ~51-56 daemon-hours, ~2-3 daemon-days** at 25-30 PR/day throughput. Calendar 1.5-2 weeks with sustainable pace.
+**Total Sprint 13-17: ~38-49 PRs, ~104-115 daemon-hours, ~4-5 daemon-days** at 25-30 PR/day throughput. Calendar 4-6 weeks with sustainable pace, before Vision A starts. Sprint 18+ Vision A first slice adds ~50 daemon-hours and 4-6 weeks calendar to reach Thompson Sampling production. Combined Sprint 12-18+ end-to-end: ~2-3 months calendar at sustainable pace before bandit goes live.
 
 **Current testbed:** `tests/e2e/lib/coder_shim.sh` mocks Claude/Codex CLIs, drives a single testbed repo (`AlexBomber12/pipeline-orchestrator-testbed`) for e2e tests covering upload, merge, fix-escalate, redis recovery, sigkill recovery, stop/resume. All e2e tests are **single-repo**.
 
@@ -2357,7 +2432,7 @@ Daemon работает из `/data/repos/<slug>/tasks/` (docker volume). Deploy
 ### Strategic decisions confirmed today (2026-05-02)
 
 - **License Apache 2.0 - CONFIRMED, ASAP, scheduled Sprint 13.** Current LICENSE is MIT (not AGPL as memory implied). Action: replace with Apache 2.0 + NOTICE file. ~1 PR ~1h. Added to Sprint 13 batch alongside OBS-AX and OBS-AY (operator decision 2026-05-02).
-- **Vision A timing CONFIRMED:** Sprint 17+ after Sprint 16 multi-testbed. Plugin Protocol generalization is prerequisite for Thompson Sampling and managed product fork.
+- **Vision A timing CONFIRMED:** Sprint 18+ after Sprint 16 multi-testbed and Sprint 17 documentation. Plugin Protocol generalization is prerequisite for Thompson Sampling and managed product fork.
 - **SQLite Scenario A migration BEFORE Thompson Sampling.** Long-term posterior stability requires not 90-day TTL. Sprint slot: between Vision A first slice and Thompson Sampling work, likely Sprint 18-19 territory.
 - **PR-FUTURE-7 (eliminate QUEUE.md) CONFIRMED.** In-memory queue model. Sprint slot: post-Sprint 16, parallel-eligible with Vision A first slice if scope permits.
 - **PR-FUTURE-4 tier'ed scaffolder** AFTER Sprint 13 OBS-AX (CLAUDE.md replace fix). Likely Sprint 16-17 territory.
@@ -2369,7 +2444,7 @@ Daemon работает из `/data/repos/<slug>/tasks/` (docker volume). Deploy
 - **GitHub App migration timing.** Diet PRs reduced GraphQL burn substantially; even at 3 active repos operator observed below 80% utilization. App created (`alexbomber-pipeline-orchestrator`, scopes Contents/Issues/Metadata/PR R+W, "Only on this account") but private key still pending download. Activation deferred indefinitely; revisit only if quota exhaustion returns OR third-party adoption becomes relevant.
 - **Multi-tier agent (Tier 2 architect/diagnostic).** Recorded as Vision direction, not actioning soon (see Vision section).
 - **Tester role / Release Qualification Agent.** Vision item, not actioning.
-- **Telegram bot Vision D D.1 (digest push).** Operator confirmed Sprint 17+ slot, not opportunistic earlier.
+- **Telegram bot Vision D D.1 (digest push).** Operator confirmed Sprint 18+ slot, not opportunistic earlier.
 
 ### New questions arising during cleanup (2026-05-02)
 
@@ -2378,7 +2453,7 @@ Daemon работает из `/data/repos/<slug>/tasks/` (docker volume). Deploy
 
 ### Resolved decisions (closing entries from prior sessions)
 
-- **Sprint nomenclature:** unified 2026-05-02. Sprint 12 = Foundation, 13 = OBS-AX + OBS-AY, 14 = recovery + cancellation, 15 = polish + DONE metrics, 16 = multi-testbed, 17+ = Vision A.
+- **Sprint nomenclature:** unified 2026-05-02. Sprint 12 = Foundation, 13 = OBS-AX + OBS-AY + License + MCP, 14 = recovery + cancellation, 15 = polish + DONE metrics, 16 = multi-testbed, 17 = Documentation Sprint, 18+ = Vision A multi-vendor.
 - **Sigkill multi-race resolution path** → 4 PRs merged 2026-04-28 via direct commits (legacy numbering, predates current task-file numbering). Closed.
 - **Roadmap rewrite** → executed 2026-04-29 + cleanup 2026-05-02. Latest version (this document).
 - **PR numbering rule** → continuous, no reservation. Established 2026-04-29.
