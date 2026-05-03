@@ -289,6 +289,14 @@ class HungMixin:
         button. The IDLE selector consults the set and forces
         ``CANCELED``; the user's task re-upload clears it (matching the
         PR-186 ``_crashed_task_pr_ids`` retry contract).
+
+        Also snapshots the set to Redis so the marker survives a daemon
+        restart between the recover click and the user's task re-upload
+        — without that persistence ``recover_state`` would rehydrate the
+        CANCELED row into ``_crashed_task_pr_ids`` instead, and the IDLE
+        selector would discard the override on the still-open PR
+        deriving back to ``DOING``, reattaching the runner to WATCH on
+        the same stuck PR.
         """
         current_pr = self.state.current_pr
         pr_label = (
@@ -297,6 +305,7 @@ class HungMixin:
         current_task = self.state.current_task
         if current_task is not None:
             self._recovered_task_pr_ids.add(current_task.pr_id)
+            await self._persist_recovered_task_pr_ids()
         self.log_event(
             f"[RECOVERY] Operator-initiated recovery from HUNG ({pr_label}) "
             f"-> IDLE."

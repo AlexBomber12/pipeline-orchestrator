@@ -433,7 +433,16 @@ return 0
                 crashed_pr_ids.difference_update(uploaded_pr_ids)
             recovered_pr_ids = getattr(self, "_recovered_task_pr_ids", None)
             if recovered_pr_ids:
+                before = set(recovered_pr_ids)
                 recovered_pr_ids.difference_update(uploaded_pr_ids)
+                if recovered_pr_ids != before:
+                    # PR-247 follow-up: persist the trimmed set so the
+                    # cross-restart recover marker drops the just-re-
+                    # uploaded PR-IDs. Without this, a daemon restart
+                    # immediately after upload would rehydrate the stale
+                    # set from Redis and re-cancel the freshly retried
+                    # task on the next IDLE cycle.
+                    await self._persist_recovered_task_pr_ids()
             if uploaded_pr_ids:
                 self._clear_canceled_queue_rows(uploaded_pr_ids)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:

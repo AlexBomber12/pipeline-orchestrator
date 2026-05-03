@@ -69,9 +69,15 @@ class _Runner(repo_ops.RepoOpsMixin):
         self.events: list[str] = []
         self._crashed_task_pr_ids: set[str] = set()
         self._recovered_task_pr_ids: set[str] = set()
+        self._recovered_persist_calls: list[frozenset[str]] = []
 
     def log_event(self, message: str) -> None:
         self.events.append(message)
+
+    async def _persist_recovered_task_pr_ids(self) -> None:
+        self._recovered_persist_calls.append(
+            frozenset(self._recovered_task_pr_ids)
+        )
 
 
 def _run(coro: Any) -> Any:
@@ -914,6 +920,10 @@ def test_process_pending_uploads_clears_recovered_pr_ids_on_reupload(
 
     assert _run(runner.process_pending_uploads()) is True
     assert runner._recovered_task_pr_ids == {"PR-999"}
+    # PR-247 follow-up: the trimmed recovered-task set must be persisted
+    # so a daemon restart immediately after upload does not rehydrate
+    # the stale set from Redis and re-cancel the freshly retried task.
+    assert runner._recovered_persist_calls == [frozenset({"PR-999"})]
 
 
 def test_process_pending_uploads_clears_canceled_queue_rows_on_reupload(

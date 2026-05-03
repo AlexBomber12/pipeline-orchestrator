@@ -1797,6 +1797,48 @@ def test_handle_hung_recovery_signal_getdel_atomicity(
     assert f"control:{runner.name}:recover" not in runner.redis.store
 
 
+def test_handle_hung_persists_recovered_task_pr_ids_to_redis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-247 follow-up: ``_perform_operator_recovery`` must snapshot the
+    in-memory ``_recovered_task_pr_ids`` set to Redis. Without this, a
+    daemon restart between the recover click and the user's task re-
+    upload would lose the marker; ``recover_state`` would rehydrate the
+    QUEUE.md ``CANCELED`` row into ``_crashed_task_pr_ids`` instead, and
+    the IDLE selector would discard the stricter override on the still-
+    open PR re-deriving DOING — reattaching the runner to WATCH on the
+    same stuck PR. Persisting the set lets the next recover_state cycle
+    hydrate the stronger ``_recovered_task_pr_ids`` override across
+    restarts so the abandon contract holds."""
+    monkeypatch.setattr(
+        "src.github.gh_runner.run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(number=42, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="parked", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.redis.set(f"control:{runner.name}:recover", "1"))
+    asyncio.run(runner.handle_hung())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert "PR-001" in runner._recovered_task_pr_ids
+    raw = runner.redis.store.get(f"recovered_tasks:{runner.name}")
+    assert raw is not None, (
+        "operator recovery must snapshot _recovered_task_pr_ids to Redis"
+    )
+    import json as _json
+    assert _json.loads(raw) == ["PR-001"]
+
+
 def test_handle_hung_recovery_signal_getdel_failure_falls_through(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

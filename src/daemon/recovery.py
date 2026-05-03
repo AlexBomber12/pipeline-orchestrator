@@ -130,6 +130,15 @@ class RecoveryMixin:
         work.
         """
         strict = self.app_config.daemon.strict_queue_validation
+        # PR-247 follow-up: hydrate the operator-recovered task set from
+        # Redis before any DOING-task decision. The HUNG recover button
+        # writes through ``_persist_recovered_task_pr_ids``; without this
+        # load the marker is process-local and a daemon restart between
+        # the click and the user's task re-upload would lose it,
+        # collapsing the stronger "abandon until re-upload" override
+        # back into the PR-186 crashed-task path which intentionally
+        # discards on a still-open PR re-deriving DOING.
+        await self._load_recovered_task_pr_ids()
         # Probe the queue source ONCE and reuse the result for both the
         # parse-source decision (origin/{branch} vs working tree) and the
         # ghost-filter decision below. A second independent probe inside
@@ -240,6 +249,27 @@ class RecoveryMixin:
                 self._crashed_task_pr_ids.add(queued.pr_id)
 
         doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
+
+        # PR-247 follow-up: a DOING entry whose PR-ID is in the operator-
+        # recovered set is one the operator already abandoned via the
+        # HUNG recover button. The IDLE cycle that would have rewritten
+        # the QUEUE.md row to CANCELED never ran (or its snapshot was
+        # not yet visible), so the row still reads DOING. Treat it the
+        # same as no DOING entry — staying IDLE — so neither the WATCH
+        # re-attach nor the PR-186 crashed-task path runs against the
+        # abandoned task. The IDLE selector's stricter override will
+        # surface CANCELED on the next cycle.
+        if doing is not None and doing.pr_id in self._recovered_task_pr_ids:
+            ctx = BranchContext.from_runner(self)
+            self.log_event(
+                f"[INFRA] Operator-recovered task {doing.pr_id} still DOING "
+                f"in queue; staying IDLE pending re-upload. "
+                f"({ctx.log_summary()})"
+            )
+            self.state.current_task = None
+            self._reset_runner_local_task_counters()
+            self.state.state = PipelineState.IDLE
+            return True
 
         pending_sync = next(
             (p for p in prs if (p.branch or "").startswith("queue-done-")),
