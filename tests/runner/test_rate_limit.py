@@ -22,6 +22,7 @@ from src.daemon import runner as runner_module
 from src.daemon import selector as selector_module
 from src.daemon.handlers import breach as breach_module
 from src.daemon.handlers import coding as coding_module
+from src.daemon import fix_supervision as fix_supervision_module
 from src.daemon.handlers import fix as fix_module
 from src.daemon.handlers import idle as idle_module
 from src.daemon.runner import ErrorCategory, PipelineRunner, _classify_error
@@ -546,7 +547,7 @@ def test_poll_github_during_fix_skips_iteration_when_budget_paused(
         if len(sleeps) >= 2:
             raise asyncio.CancelledError
 
-    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(fix_supervision_module.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr("src.github.prs.pr_state", fake_pr_state)
 
     async def run_loop() -> None:

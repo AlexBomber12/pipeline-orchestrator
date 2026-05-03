@@ -21,6 +21,8 @@ from src.config import AppConfig, CoderType, DaemonConfig
 from src.daemon import git_ops as git_ops_module
 from src.daemon import recovery_policy as recovery_policy_module
 from src.daemon import runner as runner_module
+from src.daemon import fix_escalation as fix_escalation_module
+from src.daemon import fix_supervision as fix_supervision_module
 from src.daemon.handlers import fix as fix_module
 from src.daemon.handlers import hung as hung_module
 from src.daemon.runner import PipelineRunner
@@ -3163,7 +3165,7 @@ def test_fetch_failed_ci_logs_returns_none_on_run_view_failure(
     ],
 )
 def test_parse_escalate_marker(stdout: str, expected: str | None) -> None:
-    assert fix_module._parse_escalate_marker(stdout) == expected
+    assert fix_escalation_module.parse_escalate_marker(stdout) == expected
 
 
 def test_fix_increments_iterations(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3820,7 +3822,7 @@ def test_monitor_fix_idle_times_out_without_push_history(
     monkeypatch.setattr(runner, "log_event", events.append)
 
     branch_results: list[object] = [
-        fix_module.gh_prs.GitHubPollError("bootstrap failed"),
+        fix_supervision_module.gh_prs.GitHubPollError("bootstrap failed"),
         None,
     ]
 
@@ -3845,10 +3847,10 @@ def test_monitor_fix_idle_times_out_without_push_history(
         "src.github.prs.get_last_push_age_seconds",
         lambda repo, pr: None,
     )
-    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
-    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(fix_supervision_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_supervision_module.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(
-        fix_module,
+        fix_supervision_module,
         "time",
         types.SimpleNamespace(monotonic=lambda: next(monotonic_values)),
     )
@@ -3891,10 +3893,10 @@ def test_monitor_fix_idle_backdates_elapsed_time_from_head_age(
         "src.github.prs.get_last_push_age_seconds",
         lambda repo, pr: 30.0,
     )
-    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
-    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(fix_supervision_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_supervision_module.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(
-        fix_module,
+        fix_supervision_module,
         "time",
         types.SimpleNamespace(monotonic=lambda: next(monotonic_values)),
     )
@@ -3928,7 +3930,7 @@ def test_monitor_fix_idle_resets_timer_on_detected_push(
         pass
 
     branch_results: list[object] = [
-        fix_module.gh_prs.GitHubPollError("bootstrap failed"),
+        fix_supervision_module.gh_prs.GitHubPollError("bootstrap failed"),
         50.0,
         220.0,
     ]
@@ -3959,10 +3961,10 @@ def test_monitor_fix_idle_resets_timer_on_detected_push(
         "src.github.prs.get_last_push_age_seconds",
         lambda repo, pr: None,
     )
-    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
-    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(fix_supervision_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_supervision_module.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(
-        fix_module,
+        fix_supervision_module,
         "time",
         types.SimpleNamespace(monotonic=lambda: next(monotonic_values)),
     )
@@ -4004,7 +4006,7 @@ def test_monitor_fix_idle_logs_poll_failures_before_timing_out(
         if fake_branch_last_push.calls == 0:
             fake_branch_last_push.calls += 1
             return None
-        raise fix_module.gh_prs.GitHubPollError("poll failed")
+        raise fix_supervision_module.gh_prs.GitHubPollError("poll failed")
 
     fake_branch_last_push.calls = 0
 
@@ -4023,10 +4025,10 @@ def test_monitor_fix_idle_logs_poll_failures_before_timing_out(
         "src.github.prs.get_last_push_age_seconds",
         lambda repo, pr: None,
     )
-    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
-    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(fix_supervision_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_supervision_module.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(
-        fix_module,
+        fix_supervision_module,
         "time",
         types.SimpleNamespace(monotonic=lambda: next(monotonic_values)),
     )
@@ -4089,8 +4091,8 @@ def test_poll_github_during_fix_logs_and_continues_on_exception(
     async def fake_to_thread(func: Any, *args: object, **kwargs: object) -> Any:
         return func(*args, **kwargs)
 
-    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_supervision_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(fix_supervision_module.asyncio, "to_thread", fake_to_thread)
     monkeypatch.setattr("src.github.prs.pr_state", fake_pr_state)
 
     async def run_loop() -> None:
@@ -4141,8 +4143,8 @@ def test_poll_github_during_fix_continues_when_pr_remains_open(
     async def fake_to_thread(func: Any, *args: object, **kwargs: object) -> Any:
         return func(*args, **kwargs)
 
-    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_supervision_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(fix_supervision_module.asyncio, "to_thread", fake_to_thread)
     monkeypatch.setattr("src.github.prs.pr_state", fake_pr_state)
 
     async def run_loop() -> dict[str, str | None]:
@@ -4188,8 +4190,8 @@ def test_poll_github_during_fix_terminates_coder_on_external_merge(
     async def fake_to_thread(func: Any, *args: object, **kwargs: object) -> Any:
         return func(*args, **kwargs)
 
-    monkeypatch.setattr(fix_module.asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr(fix_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(fix_supervision_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(fix_supervision_module.asyncio, "to_thread", fake_to_thread)
     monkeypatch.setattr("src.github.prs.pr_state", fake_pr_state)
 
     async def run_loop() -> tuple[dict[str, str | None], asyncio.Task[None]]:
