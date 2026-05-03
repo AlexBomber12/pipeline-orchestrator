@@ -1675,6 +1675,140 @@ def test_handle_hung_transitions_to_idle_when_pr_resolved(
     assert runner.state.current_task is None
 
 
+def test_handle_hung_consumes_operator_recovery_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-247: a one-shot ``control:{name}:recover`` flag transitions the
+    runner from HUNG back to IDLE without nudging the reviewer or checking
+    the upstream PR state."""
+    gh_calls: list[object] = []
+    posted: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(
+        "src.github.gh_runner.run_gh",
+        lambda *a, **kw: gh_calls.append((a, kw)) or {"state": "OPEN"},
+    )
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(number=42, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="parked", status=TaskStatus.DOING
+    )
+    runner._error_skip_active = True
+    runner._idle_dispatch_deferred = True
+
+    asyncio.run(runner.redis.set(f"control:{runner.name}:recover", "1"))
+    asyncio.run(runner.handle_hung())
+
+    # Recovery short-circuits the @codex review and PR-state probe paths.
+    assert posted == []
+    assert gh_calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.current_pr is None
+    assert runner.state.error_message is None
+    assert runner._error_skip_active is False
+    assert runner._idle_dispatch_deferred is False
+    # Flag is consumed (read-and-clear).
+    assert f"control:{runner.name}:recover" not in runner.redis.store
+    # Operator-visible event records the recovery cause.
+    assert any(
+        "[RECOVERY] Operator-initiated recovery from HUNG" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_hung_runs_normal_path_when_no_recovery_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the recover flag, ``handle_hung`` falls through to the
+    @codex review fallback exactly as before PR-247."""
+    posted: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(
+        "src.github.gh_runner.run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(number=99, branch="pr-099")
+
+    asyncio.run(runner.handle_hung())
+
+    assert posted == [(runner.owner_repo, 99, "@codex review")]
+    assert runner.state.state == PipelineState.WATCH
+
+
+def test_handle_hung_recovery_signal_delete_failure_still_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure clearing the recover flag must not block the recovery —
+    the daemon proceeds with the IDLE transition and the next tick will
+    consume any leftover flag (idempotent because state will be IDLE,
+    not HUNG)."""
+    monkeypatch.setattr(
+        "src.github.gh_runner.run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(number=11, branch="pr-011")
+
+    asyncio.run(runner.redis.set(f"control:{runner.name}:recover", "1"))
+
+    async def _boom_delete(_key: str) -> int:
+        raise RuntimeError("delete down")
+
+    monkeypatch.setattr(runner.redis, "delete", _boom_delete)
+
+    asyncio.run(runner.handle_hung())
+
+    assert runner.state.state == PipelineState.IDLE
+
+
+def test_handle_hung_recovery_signal_redis_failure_falls_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Redis read failure on the recover key must not invent a recovery
+    transition — fail closed and continue with the normal HUNG path."""
+    posted: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(
+        "src.github.gh_runner.run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(number=7, branch="pr-007")
+
+    async def _boom_get(_key: str) -> str | None:
+        raise RuntimeError("redis down")
+
+    monkeypatch.setattr(runner.redis, "get", _boom_get)
+
+    asyncio.run(runner.handle_hung())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert posted == [(runner.owner_repo, 7, "@codex review")]
+
+
 def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None:
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)

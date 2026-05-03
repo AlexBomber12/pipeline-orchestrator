@@ -30,6 +30,16 @@ def control_config_dirty(repo_name: str) -> str:
     return f"control:{repo_name}:config_dirty"
 
 
+def control_recover(repo_name: str) -> str:
+    """One-shot recovery signal written by the web layer for HUNG repos.
+
+    The HUNG handler reads-and-clears this key to exit HUNG and return to
+    IDLE without waiting for the operator to merge or close the parked PR
+    (PR-247).
+    """
+    return f"control:{repo_name}:recover"
+
+
 def upload_pending(repo_name: str) -> str:
     """Key for the pending-upload manifest consumed by the daemon."""
     return f"upload:{repo_name}:pending"

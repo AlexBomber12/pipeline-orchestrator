@@ -14,6 +14,7 @@ from src.daemon import git_ops
 from src.github import comments as gh_comments
 from src.github import gh_runner, reactions
 from src.github import prs as gh_prs
+from src.keyspace import control_recover
 from src.models import PipelineState
 
 
@@ -247,8 +248,55 @@ class HungMixin:
         )
         return success
 
+    async def _check_operator_recovery_signal(self) -> bool:
+        """Read-and-clear the one-shot recover flag set by the web layer.
+
+        Fails closed (returns ``False``) on any Redis error so a transient
+        outage cannot manufacture a recovery transition the operator did
+        not request. The flag carries a short TTL on the web side so a
+        stale signal cannot strand around for hours.
+        """
+        key = control_recover(self.name)
+        try:
+            raw = await self.redis.get(key)
+        except Exception:
+            return False
+        if not raw:
+            return False
+        try:
+            await self.redis.delete(key)
+        except Exception:
+            pass
+        return True
+
+    async def _perform_operator_recovery(self) -> None:
+        """Exit HUNG to IDLE on operator request (PR-247).
+
+        Clears ``current_task`` so the IDLE handler picks up the next
+        task and resets the runner-private SKIP/diagnose counters tied
+        to the trapped task. The persisted RepoState's ``__setattr__``
+        hook releases ``current_pr`` and ``error_message`` when
+        ``current_task`` flips to None, so we do not need to clear them
+        explicitly here.
+        """
+        current_pr = self.state.current_pr
+        pr_label = (
+            f"PR #{current_pr.number}" if current_pr is not None else "no PR"
+        )
+        self.log_event(
+            f"[RECOVERY] Operator-initiated recovery from HUNG ({pr_label}) "
+            f"-> IDLE."
+        )
+        self.state.current_task = None
+        self._reset_runner_local_task_counters()
+        self.state.state = PipelineState.IDLE
+        await self.publish_state()
+
     async def handle_hung(self) -> None:
         """Nudge the reviewer with ``@codex review`` or give up, per config."""
+        if await self._check_operator_recovery_signal():
+            await self._perform_operator_recovery()
+            return
         current_pr = self.state.current_pr
         if current_pr is not None:
             # Always check whether the operator resolved the PR before

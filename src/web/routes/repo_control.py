@@ -18,7 +18,7 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from src.config import load_config
-from src.keyspace import control_stop, pipeline_state
+from src.keyspace import control_recover, control_stop, pipeline_state
 from src.models import PipelineState, RepoState, TaskStatus
 from src.web.services.coder import _effective_coder_name
 from src.web.services.repo_state import (
@@ -279,6 +279,68 @@ async def stop_repo(request: Request, name: str) -> Response:
                 exc_info=True,
             )
     return JSONResponse({"ok": True, "user_paused": True})
+
+
+@router.post("/repos/{name}/recover")
+async def recover_repo(request: Request, name: str) -> Response:
+    """Operator-initiated recovery from HUNG state (PR-247).
+
+    Validates current state == HUNG (HTTP 400 otherwise — recovery is
+    HUNG-specific and never applies to CODING/FIX/WATCH/MERGE/IDLE/ERROR),
+    then writes a one-shot ``control:{name}:recover`` flag and publishes
+    a wake event so ``handle_hung`` picks up the signal on the next
+    daemon tick and performs the actual transition (clear current task,
+    return to IDLE). The HTTP response confirms the signal was queued —
+    not that the transition has already executed — so the client UI must
+    refresh state after receiving 200 to observe the new IDLE.
+    """
+    try:
+        redis_client, state_key, repo_url = await _apply_repo_control_update(
+            request, name
+        )
+    except _RepoStateMutationError as exc:
+        return HTMLResponse(exc.message, status_code=exc.status_code)
+
+    try:
+        raw = await redis_client.get(state_key)
+    except Exception:
+        return HTMLResponse("Failed to read repository state", status_code=503)
+    if raw is None:
+        state = _default_repo_state(name, repo_url)
+    else:
+        try:
+            state = RepoState.model_validate_json(raw)
+        except Exception:
+            return HTMLResponse("Repository state unavailable", status_code=503)
+
+    if state.state != PipelineState.HUNG:
+        return JSONResponse(
+            {
+                "error": "recovery_only_from_hung",
+                "current_state": state.state.value,
+            },
+            status_code=400,
+        )
+
+    recover_key = control_recover(name)
+    try:
+        await redis_client.set(recover_key, "1", ex=300)
+    except Exception:
+        return HTMLResponse(
+            "Failed to queue recovery request", status_code=503
+        )
+
+    try:
+        await _app.publish_wake(redis_client, name, "recover")
+    except Exception:
+        _app.logger.warning(
+            "publish_wake failed for %s; daemon will pick up recover on "
+            "next tick",
+            name,
+            exc_info=True,
+        )
+
+    return JSONResponse({"ok": True, "queued_state": "IDLE"})
 
 
 @router.post("/repos/{name}/coder", response_class=HTMLResponse)
