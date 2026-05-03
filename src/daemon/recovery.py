@@ -250,6 +250,29 @@ class RecoveryMixin:
 
         doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
 
+        # Record any outstanding queue-sync PR before any DOING-path early
+        # return below. ``handle_idle`` gates dispatch on
+        # ``pending_queue_sync_branch``; if recovery exits early without
+        # setting it (e.g. the operator-recovered branch immediately
+        # below), the daemon would resume dispatching new work while a
+        # ``queue-done-*`` PR is still open, regressing the prior ordering
+        # contract that pending sync is always seen before subsequent
+        # transitions.
+        pending_sync = next(
+            (p for p in prs if (p.branch or "").startswith("queue-done-")),
+            None,
+        )
+        if pending_sync is not None:
+            self.state.pending_queue_sync_branch = pending_sync.branch
+            self.state.pending_queue_sync_started_at = (
+                pending_sync.last_activity
+                or datetime.now(timezone.utc)
+            )
+            self.log_event(
+                f"[INFRA] Recovered pending queue-sync branch: "
+                f"{pending_sync.branch}."
+            )
+
         # PR-247 follow-up: a DOING entry whose PR-ID is in the operator-
         # recovered set is one the operator already abandoned via the
         # HUNG recover button. The IDLE cycle that would have rewritten
@@ -270,21 +293,6 @@ class RecoveryMixin:
             self._reset_runner_local_task_counters()
             self.state.state = PipelineState.IDLE
             return True
-
-        pending_sync = next(
-            (p for p in prs if (p.branch or "").startswith("queue-done-")),
-            None,
-        )
-        if pending_sync is not None:
-            self.state.pending_queue_sync_branch = pending_sync.branch
-            self.state.pending_queue_sync_started_at = (
-                pending_sync.last_activity
-                or datetime.now(timezone.utc)
-            )
-            self.log_event(
-                f"[INFRA] Recovered pending queue-sync branch: "
-                f"{pending_sync.branch}."
-            )
 
         if doing is not None:
             self.state.current_task = doing

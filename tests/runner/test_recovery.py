@@ -740,6 +740,59 @@ def test_recover_state_doing_task_in_recovered_set_stays_idle(
     )
 
 
+def test_recover_state_records_pending_queue_sync_before_recovered_doing_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-247 follow-up: when both an operator-recovered DOING task and an
+    open ``queue-done-*`` queue-sync PR exist at startup, the queue-sync
+    marker MUST be recorded before recovery exits IDLE for the recovered
+    task. ``handle_idle`` gates dispatch on
+    ``state.pending_queue_sync_branch``; without this ordering the daemon
+    would resume dispatching new work while the queue-sync PR is still
+    open, regressing the prior contract that pending sync is recorded
+    before any DOING-path early return."""
+    import json
+    from datetime import datetime, timezone
+
+    task = QueueTask(
+        pr_id="PR-100",
+        title="Operator-abandoned mid-CODING",
+        status=TaskStatus.DOING,
+        branch="pr-100-stuck",
+    )
+    sync_started_at = datetime(2026, 4, 19, 12, 0, tzinfo=timezone.utc)
+    pending_sync = PRInfo(
+        number=301,
+        branch="queue-done-20260419",
+        last_activity=sync_started_at,
+    )
+
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [
+            PRInfo(number=42, branch="pr-100-stuck"),
+            pending_sync,
+        ],
+    )
+
+    runner = h._make_runner()
+    runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    asyncio.run(
+        runner.redis.set(
+            f"recovered_tasks:{runner.name}",
+            json.dumps(["PR-100"]),
+        )
+    )
+
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.pending_queue_sync_branch == "queue-done-20260419"
+    assert runner.state.pending_queue_sync_started_at == sync_started_at
+
+
 def test_dirty_tree_auto_recovery_after_3_cycles(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
