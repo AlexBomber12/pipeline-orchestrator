@@ -38,6 +38,20 @@ services:
     depends_on:
       - redis
 
+  mcp:
+    build: .
+    command: python -m src.mcp.server
+    user: "1000:1000"
+    mem_limit: 1g
+    ports:
+      - "${MCP_PORT:-5173}:5173"
+    volumes:
+      - .:/app:ro
+      - ./data/repos:/data/repos:ro
+    environment:
+      PYTHONUNBUFFERED: "1"
+    restart: unless-stopped
+
   redis:
     image: redis:7-alpine
     mem_limit: 1g
