@@ -45,6 +45,11 @@ daemon:
   watch_slow_window_sec: 300
   watch_slow_poll_interval_sec: 300
   watch_fast_poll_interval_sec: 45
+  # PR-249 OBS-BL: cap WATCH<->HUNG retrigger cycles. After N retriggers
+  # with no fresh review activity (codex EYES, comment, push), escalate
+  # to HUNG with the ``escalated`` label instead of looping. Default 3 =
+  # ride out genuine codex hiccups before paging the operator.
+  watch_retrigger_cap: 3
   # PR-231: Anthropic OAuth beta header. Required for current API tier.
   # NOTE: Anthropic periodically rotates beta headers. If auth breaks after
   # an Anthropic announcement, re-verify this value matches the current

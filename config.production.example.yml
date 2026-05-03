@@ -29,3 +29,9 @@ daemon:
 
   # Raise the planned-PR timeout for slower production hardware.
   planned_pr_timeout_sec: 1800
+
+  # PR-249 OBS-BL: tolerance for codex-silent WATCH<->HUNG cycles before
+  # the daemon escalates the PR with the ``escalated`` label and stops
+  # spending API budget on a stuck review. Set lower (e.g. 2) to page
+  # operators sooner; higher to ride out longer outages.
+  watch_retrigger_cap: 3

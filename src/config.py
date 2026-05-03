@@ -70,6 +70,7 @@ _DAEMON_FIELDS = {
     "watch_slow_window_sec",
     "watch_slow_poll_interval_sec",
     "watch_fast_poll_interval_sec",
+    "watch_retrigger_cap",
 }
 
 _DAEMON_ENV_OVERRIDES = {
@@ -148,6 +149,7 @@ class DaemonConfig(BaseModel):
     watch_slow_window_sec: int = Field(default=300, ge=1)
     watch_slow_poll_interval_sec: int = Field(default=300, ge=1)
     watch_fast_poll_interval_sec: int = Field(default=45, ge=1)
+    watch_retrigger_cap: int = Field(default=3, ge=1)
 
 
 class WebConfig(BaseModel):
