@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from src.branch_context import BranchContext
+from src.coder_registry import CoderPlugin
 from src.daemon import git_ops
+from src.daemon.handlers import CoderUnavailable
 from src.github import cache as gh_cache
 from src.github import gh_runner
 from src.github import prs as gh_prs
@@ -77,21 +79,52 @@ class CodingMixin:
         branch from origin/main"). After the CLI returns 0 we poll GitHub
         for the PR; because the list API is eventually consistent, we
         retry a few times before surfacing an ERROR.
+
+        Reads top-down as a state-machine flow with three phases:
+
+        1. ``_prepare_coder_invocation`` — breach env allocation, kwargs
+           build. Auth refresh happens before ``_get_coder`` so the
+           selector sees fresh statuses; ``_start_current_run_record``
+           runs before the branch guard so the missing-branch ERROR
+           transition still emits run telemetry; and
+           ``_check_rate_limit`` runs before the branch guard so an
+           active or renewed rate-limit window pauses the runner instead
+           of being overridden by the ERROR transition.
+        2. ``_run_coder_with_supervision`` — subprocess plus stop and
+           breach monitors; resolves user-stop and breach pauses.
+        3. ``_post_coder_resolution`` — CLI log save, exit classification,
+           PR lookup or daemon-side PR creation, run record save.
         """
         self._stop_requested = False
-        current_pr_id = self.state.current_task.pr_id if self.state.current_task is not None else None
+        current_pr_id = (
+            self.state.current_task.pr_id
+            if self.state.current_task is not None
+            else None
+        )
+        # Refresh auth before _get_coder so the selector sees fresh
+        # statuses; selecting first would let a stale/empty auth cache
+        # pick an ineligible coder that no later refresh can undo.
         await self._refresh_auth_status_cache()
         coder_name, plugin = self._get_coder()
+
+        # Start the run record before the branch guard so a malformed
+        # task (no Branch:) still produces error telemetry — otherwise
+        # the ``_save_current_run_record("error")`` inside
+        # ``_transition_to_error`` would no-op against an absent record
+        # and the missing-branch path would silently lose its run.
         plugin_run_kwargs = plugin.build_run_kwargs(
             daemon_config=self.app_config.daemon,
         )
-        model = plugin_run_kwargs["model"]
-        self._start_current_run_record(coder_name, model)
+        self._start_current_run_record(coder_name, plugin_run_kwargs["model"])
+
+        # Run the rate-limit gate before the branch guard so an active
+        # or renewed pause window is honored as PAUSED. If this ran
+        # after the guard, a malformed task would short-circuit through
+        # ``_transition_to_error`` and bypass the cooldown that
+        # ``_check_rate_limit`` is responsible for enforcing.
         if not await self._check_rate_limit(proactive_coder=coder_name):
             await self._save_current_run_record("rate_limit")
             return
-
-        self.log_event(f"[CODING] [{coder_name}] Starting PLANNED PR.")
 
         target_branch = (
             self.state.current_task.branch if self.state.current_task else None
@@ -104,25 +137,93 @@ class CodingMixin:
             )
             return
 
-        breach_dir, breach_run_id = self._breach_env()
-        breach_flag: dict[str, bool] = {"breached": False}
+        try:
+            coder_kwargs = await self._prepare_coder_invocation(
+                coder_name, plugin
+            )
+        except CoderUnavailable:
+            return
 
-        heartbeat = asyncio.create_task(self._publish_while_waiting("CODING"))
+        result = await self._run_coder_with_supervision(
+            coder_name,
+            plugin,
+            coder_kwargs,
+            target_branch=target_branch,
+            current_pr_id=current_pr_id,
+        )
+        if result is None:
+            return
+
+        code, stdout, stderr = result
+        await self._post_coder_resolution(
+            coder_name,
+            code,
+            stdout,
+            stderr,
+            target_branch=target_branch,
+            current_pr_id=current_pr_id,
+        )
+
+    async def _prepare_coder_invocation(
+        self,
+        coder_name: str,
+        plugin: CoderPlugin,
+    ) -> dict[str, Any]:
+        """Allocate breach env, build kwargs.
+
+        Returns the kwargs dict ready to pass to ``plugin.run_planned_pr``.
+        Allocates the breach env via ``_breach_env`` and stores it on
+        ``self`` so ``_run_coder_with_supervision`` can wire monitors and
+        teardown without re-creating it.
+
+        Auth refresh, run-record start, the rate-limit gate, and the
+        branch guard all happen in ``handle_coding`` before this helper
+        so the selector sees fresh statuses, the branch-guard ERROR path
+        still records run telemetry, and an active rate-limit window
+        keeps the runner PAUSED instead of falling through to the ERROR
+        transition.
+        """
+        self.log_event(f"[CODING] [{coder_name}] Starting PLANNED PR.")
+
+        breach_dir, breach_run_id = self._breach_env()
+        self._current_breach_dir = breach_dir
+        self._current_breach_run_id = breach_run_id
+
         plugin_run_kwargs = plugin.build_run_kwargs(
             daemon_config=self.app_config.daemon,
             breach_dir=breach_dir,
             breach_run_id=breach_run_id,
         )
-        coder_kwargs: dict[str, object] = {
+        return {
             **plugin_run_kwargs,
             "timeout": self.app_config.daemon.planned_pr_timeout_sec,
             "on_process_start": self._track_current_coder_process,
         }
+
+    async def _run_coder_with_supervision(
+        self,
+        coder_name: str,
+        plugin: CoderPlugin,
+        coder_kwargs: dict[str, Any],
+        *,
+        target_branch: str,
+        current_pr_id: str | None,
+    ) -> tuple[int, str, str] | None:
+        """Run the coder subprocess under stop and breach supervision.
+
+        Returns ``(code, stdout, stderr)`` on normal completion. Returns
+        ``None`` when the run was either cancelled by an explicit user
+        stop (state moved to PAUSED) or aborted by an in-flight rate-limit
+        breach detected during or shortly after the subprocess (state
+        moved to PAUSED, run record saved as ``"rate_limit"``).
+        """
+        breach_dir = self._current_breach_dir
+        breach_run_id = self._current_breach_run_id
+        breach_flag: dict[str, bool] = {"breached": False}
+
+        heartbeat = asyncio.create_task(self._publish_while_waiting("CODING"))
         cli_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
-            plugin.run_planned_pr(
-                self.repo_path,
-                **coder_kwargs,
-            )
+            plugin.run_planned_pr(self.repo_path, **coder_kwargs)
         )
         breach_monitor: asyncio.Task[None] | None = None
         if plugin.supports_breach_lifecycle:
@@ -142,34 +243,12 @@ class CodingMixin:
                 self.state.error_message = None
                 await self._save_current_run_record("error")
                 self.log_event("[CODING] CODING aborted: user stop requested.")
-                return
+                return None
             if not breach_flag["breached"]:
                 raise
-            # Record the PR if Claude already created one before cancellation,
-            # so it enters WATCH/auto-merge flow after pause expiry.
-            # Retry up to 3 times — PR list visibility is eventually consistent.
-            if target_branch:
-                for _attempt in range(3):
-                    try:
-                        prs = gh_prs.get_open_prs(
-                            self.owner_repo,
-                            allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
-                        )
-                        match = next(
-                            (pr for pr in prs if pr.branch == target_branch),
-                            None,
-                        )
-                        if match:
-                            self.state.current_pr = match
-                            self.log_event(
-                                f"[CODING] Recorded PR #{match.number} "
-                                f"before breach-cancel pause."
-                            )
-                            break
-                    except Exception:
-                        pass  # best-effort; the pause is still correct
-                    if _attempt < 2:
-                        await asyncio.sleep(5)
+            await self._record_pre_pause_pr(
+                target_branch, "before breach-cancel pause"
+            )
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
             await self._save_current_run_record("rate_limit")
@@ -177,7 +256,7 @@ class CodingMixin:
                 f"[CODING] CODING aborted: in-flight rate limit breach, "
                 f"paused until {self.state.rate_limited_until}."
             )
-            return
+            return None
         finally:
             stop_monitor.cancel()
             if breach_monitor is not None:
@@ -187,32 +266,11 @@ class CodingMixin:
             if plugin.supports_breach_lifecycle:
                 self._check_late_breach(breach_dir, breach_run_id, breach_flag)
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
+
         if breach_flag["breached"]:
-            # Record the PR if the coder already created one, so it is not
-            # orphaned while the runner is paused.
-            # Retry up to 3 times — PR list visibility is eventually consistent.
-            if target_branch:
-                for _attempt in range(3):
-                    try:
-                        prs = gh_prs.get_open_prs(
-                            self.owner_repo,
-                            allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
-                        )
-                        match = next(
-                            (pr for pr in prs if pr.branch == target_branch),
-                            None,
-                        )
-                        if match:
-                            self.state.current_pr = match
-                            self.log_event(
-                                f"[CODING] Recorded PR #{match.number} "
-                                f"before late-breach pause."
-                            )
-                            break
-                    except Exception:
-                        pass  # best-effort; the pause is still correct
-                    if _attempt < 2:
-                        await asyncio.sleep(5)
+            await self._record_pre_pause_pr(
+                target_branch, "before late-breach pause"
+            )
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
             await self._save_current_run_record("rate_limit")
@@ -220,8 +278,59 @@ class CodingMixin:
                 f"[CODING] CODING paused: late in-flight rate limit breach, "
                 f"paused until {self.state.rate_limited_until}."
             )
-            return
+            return None
+        return (code, stdout, stderr)
 
+    async def _record_pre_pause_pr(
+        self,
+        target_branch: str,
+        log_suffix: str,
+    ) -> None:
+        """Best-effort: record a PR opened before a breach-induced pause.
+
+        PR list visibility is eventually consistent, so retry up to 3
+        times. Failures are silently ignored — the pause is still correct
+        without the PR record, and the runner picks up the PR on the next
+        cycle once the rate-limit window clears.
+        """
+        for attempt in range(3):
+            try:
+                prs = gh_prs.get_open_prs(
+                    self.owner_repo,
+                    allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+                )
+                match = next(
+                    (pr for pr in prs if pr.branch == target_branch),
+                    None,
+                )
+                if match:
+                    self.state.current_pr = match
+                    self.log_event(
+                        f"[CODING] Recorded PR #{match.number} {log_suffix}."
+                    )
+                    return
+            except Exception:
+                pass  # best-effort; the pause is still correct
+            if attempt < 2:
+                await asyncio.sleep(5)
+
+    async def _post_coder_resolution(
+        self,
+        coder_name: str,
+        code: int,
+        stdout: str,
+        stderr: str,
+        *,
+        target_branch: str,
+        current_pr_id: str | None,
+    ) -> None:
+        """CLI log save, exit classification, PR lookup, WATCH handoff.
+
+        Either transitions to WATCH (PR found or daemon-created) or
+        returns after a state transition to PAUSED, ERROR, or HUNG via
+        the appropriate primitive (``_transition_to_error``,
+        ``_diagnose_exit_zero_no_pr``).
+        """
         async def pause_for_stop_if_requested() -> bool:
             if self._stop_requested:
                 requested = True
@@ -244,7 +353,9 @@ class CodingMixin:
             self.log_event("[CODING] CODING aborted: user stop requested.")
             return True
 
-        await self._save_cli_log(stdout, stderr, f"PLANNED PR output [{coder_name}]")
+        await self._save_cli_log(
+            stdout, stderr, f"PLANNED PR output [{coder_name}]"
+        )
         if not await pause_for_stop_if_requested():
             await self._refresh_user_paused_from_redis()
             if self.state.user_paused:
@@ -277,9 +388,7 @@ class CodingMixin:
         # still reflects the pre-create state. Invalidate before polling
         # so the first ``get_open_prs`` REST fallback returns a fresh 200
         # instead of a 304-cached page that omits the new PR.
-        gh_cache._invalidate_etag_cache(
-            f"repos/{self.owner_repo}/pulls"
-        )
+        gh_cache._invalidate_etag_cache(f"repos/{self.owner_repo}/pulls")
         candidate = None
         for attempt in range(3):
             if await pause_for_stop_if_requested():
