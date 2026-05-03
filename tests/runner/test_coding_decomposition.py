@@ -2,8 +2,9 @@
 
 Verifies the three async helpers extracted from ``handle_coding``:
 
-- ``_prepare_coder_invocation``: auth refresh, rate-limit check, run
-  record start, breach env allocation, kwargs build.
+- ``_prepare_coder_invocation``: rate-limit check, breach env
+  allocation, kwargs build. (Auth refresh and run-record start happen
+  in ``handle_coding`` before this helper.)
 - ``_run_coder_with_supervision``: subprocess plus stop and breach
   monitors; resolves user-stop and breach pauses.
 - ``_post_coder_resolution``: CLI log save, exit classification, PR
@@ -345,3 +346,41 @@ def test_handle_coding_refreshes_auth_before_selecting_coder(
     asyncio.run(runner.handle_coding())
 
     assert order == ["refresh", "select", "prepare"]
+
+
+def test_handle_coding_records_run_for_missing_branch_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The missing-branch ERROR transition must persist a run record.
+
+    ``_transition_to_error`` calls ``_save_current_run_record("error")``,
+    which is a no-op when no record is active. Pre-decomposition the
+    branch guard ran AFTER ``_start_current_run_record`` so this path
+    produced telemetry; the helper extraction moved the guard ahead of
+    the start call and silently dropped the record. Verify that
+    ``_start_current_run_record`` runs before the guard so the malformed-
+    task path still saves with ``exit_reason="error"``.
+    """
+    h._patch_subprocess(monkeypatch)
+    runner = h._make_runner()
+    # No ``branch=`` to trigger the missing-branch guard.
+    runner.state.current_task = QueueTask(
+        pr_id="PR-700",
+        title="missing branch",
+        status=TaskStatus.TODO,
+    )
+
+    saved: list[tuple[str, Any]] = []
+
+    async def fake_metrics_save(record: Any) -> None:
+        saved.append((record.exit_reason, record))
+
+    monkeypatch.setattr(runner._metrics_store, "save", fake_metrics_save)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner._current_run_record is not None
+    assert runner._current_run_record.exit_reason == "error"
+    assert [reason for reason, _ in saved] == ["error"]
+    assert saved[0][1].task_id == "PR-700"

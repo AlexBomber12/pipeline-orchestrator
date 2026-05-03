@@ -82,10 +82,11 @@ class CodingMixin:
 
         Reads top-down as a state-machine flow with three phases:
 
-        1. ``_prepare_coder_invocation`` — rate-limit check, run record
-           start, breach env allocation, kwargs build. Auth refresh
-           happens before ``_get_coder`` so the selector sees fresh
-           statuses.
+        1. ``_prepare_coder_invocation`` — rate-limit check, breach env
+           allocation, kwargs build. Auth refresh happens before
+           ``_get_coder`` so the selector sees fresh statuses, and
+           ``_start_current_run_record`` runs before the branch guard so
+           the missing-branch ERROR transition still emits run telemetry.
         2. ``_run_coder_with_supervision`` — subprocess plus stop and
            breach monitors; resolves user-stop and breach pauses.
         3. ``_post_coder_resolution`` — CLI log save, exit classification,
@@ -102,6 +103,16 @@ class CodingMixin:
         # pick an ineligible coder that no later refresh can undo.
         await self._refresh_auth_status_cache()
         coder_name, plugin = self._get_coder()
+
+        # Start the run record before the branch guard so a malformed
+        # task (no Branch:) still produces error telemetry — otherwise
+        # the ``_save_current_run_record("error")`` inside
+        # ``_transition_to_error`` would no-op against an absent record
+        # and the missing-branch path would silently lose its run.
+        plugin_run_kwargs = plugin.build_run_kwargs(
+            daemon_config=self.app_config.daemon,
+        )
+        self._start_current_run_record(coder_name, plugin_run_kwargs["model"])
 
         target_branch = (
             self.state.current_task.branch if self.state.current_task else None
@@ -146,7 +157,7 @@ class CodingMixin:
         coder_name: str,
         plugin: CoderPlugin,
     ) -> dict[str, Any]:
-        """Start run record, check rate limit, allocate breach env, build kwargs.
+        """Check rate limit, allocate breach env, build kwargs.
 
         Returns the kwargs dict ready to pass to ``plugin.run_planned_pr``.
         Allocates the breach env via ``_breach_env`` and stores it on
@@ -155,15 +166,10 @@ class CodingMixin:
         the rate-limit check blocks invocation; in that case the runner
         state has already been moved to PAUSED and the run record saved.
 
-        Auth refresh happens in ``handle_coding`` before ``_get_coder`` so
-        the selector can act on fresh statuses; running it here would be
-        too late to re-select on stale credentials.
+        Auth refresh and run-record start happen in ``handle_coding``
+        before this helper so the selector sees fresh statuses and the
+        branch-guard ERROR path still records run telemetry.
         """
-        plugin_run_kwargs = plugin.build_run_kwargs(
-            daemon_config=self.app_config.daemon,
-        )
-        model = plugin_run_kwargs["model"]
-        self._start_current_run_record(coder_name, model)
         if not await self._check_rate_limit(proactive_coder=coder_name):
             await self._save_current_run_record("rate_limit")
             raise CoderUnavailable("rate_limit")
