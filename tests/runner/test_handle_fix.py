@@ -3464,6 +3464,62 @@ def test_codex_review_not_reposted_when_author_already_requested_review(
     assert any("PR author already requested review for this head" in e["event"] for e in runner.state.history)
 
 
+def test_codex_review_falls_back_to_pr_created_at_when_commit_date_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-239: when the commit-detail endpoint has not yet propagated and
+    ``head_commit_date`` is empty, the dedup gate must fall back to the
+    PR's own ``created_at`` instead of silently disabling itself. Any
+    ``@codex review`` posted after PR creation is a valid trigger for a
+    just-opened PR, so the daemon's safety-net post should still
+    suppress."""
+    posted: list[tuple[str, int, str]] = []
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    pr_created_at = "2026-05-03T03:10:30Z"
+    captured_after_iso: list[str | None] = []
+
+    def fake_has_recent(
+        repo: str,
+        number: int,
+        pr_author: str,
+        within_minutes: int = 5,
+        after_iso: str | None = None,
+    ) -> bool:
+        captured_after_iso.append(after_iso)
+        return after_iso == pr_created_at
+
+    runner = h._make_runner()
+
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
+    monkeypatch.setattr(
+        "src.github.prs.get_pr_metadata",
+        lambda repo, number: {
+            "author": "alice",
+            "head_sha": "head-1",
+            "head_commit_date": "",
+            "pr_created_at": pr_created_at,
+        },
+    )
+    monkeypatch.setattr(
+        "src.github.comments.has_recent_codex_review_request",
+        fake_has_recent,
+    )
+    monkeypatch.setattr(
+        git_ops_module,
+        "_git",
+        lambda *args, **kwargs: h._FakeCompletedProcess(args=list(args), stdout="head-1\n", returncode=0),
+    )
+    runner.state.current_pr = PRInfo(number=42, branch="pr-42", push_count=1)
+
+    assert runner._post_codex_review(42) is True
+    assert posted == []
+    assert captured_after_iso == [pr_created_at]
+    assert any("PR author already requested review for this head" in e["event"] for e in runner.state.history)
+
+
 def test_codex_review_result_returns_retry_at_for_author_dedup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -139,6 +139,16 @@ class HungMixin:
                 head_commit_date = str(
                     metadata.get("head_commit_date") or ""
                 )
+                if not head_commit_date:
+                    # Defense in depth: when the commit-detail endpoint
+                    # has not yet propagated for a fresh push, fall back
+                    # to the PR's own created_at. Any @codex review
+                    # comment posted after PR creation is a valid
+                    # trigger; missing head_commit_date should not
+                    # silently disable dedup. PR-239.
+                    head_commit_date = str(
+                        metadata.get("pr_created_at") or ""
+                    )
         except Exception as exc:
             self.log_event(
                 f"[INFRA] Warning: failed to load PR metadata for "

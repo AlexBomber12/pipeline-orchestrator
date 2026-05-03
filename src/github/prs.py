@@ -379,13 +379,22 @@ def get_pr_head_commit_iso(repo: str, pr_number: int) -> str:
 
 
 def get_pr_metadata(repo: str, pr_number: int) -> dict:
-    """Fetch PR author, head SHA, and head commit date in 1-2 API calls.
+    """Fetch PR author, head SHA, head commit date, and PR creation time.
 
     Replaces separate ``get_pr_author`` + ``get_pr_head_commit_iso`` calls.
-    Returns ``{"author": str, "head_sha": str, "head_commit_date": str}``.
+    Returns ``{"author": str, "head_sha": str, "head_commit_date": str,
+    "pr_created_at": str}``. ``pr_created_at`` is the PR's own ``created_at``
+    timestamp, used by dedup callers as a defensive fallback when the
+    commit-detail endpoint has not yet propagated for a fresh push and
+    ``head_commit_date`` is empty.
     """
 
-    empty = {"author": "", "head_sha": "", "head_commit_date": ""}
+    empty = {
+        "author": "",
+        "head_sha": "",
+        "head_commit_date": "",
+        "pr_created_at": "",
+    }
     try:
         pr_payload = cache._etag_get(f"repos/{repo}/pulls/{pr_number}")
     except RuntimeError:
@@ -402,10 +411,17 @@ def get_pr_metadata(repo: str, pr_number: int) -> dict:
         except RuntimeError:
             pass
 
+    pr_created_at = ""
+    if isinstance(pr_payload, dict):
+        raw_created = pr_payload.get("created_at")
+        if isinstance(raw_created, str):
+            pr_created_at = raw_created.strip()
+
     return {
         "author": author,
         "head_sha": head_sha,
         "head_commit_date": head_commit_date,
+        "pr_created_at": pr_created_at,
     }
 
 
