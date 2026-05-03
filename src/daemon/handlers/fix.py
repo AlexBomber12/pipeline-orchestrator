@@ -6,44 +6,26 @@ import asyncio
 import contextlib
 import logging
 import subprocess
-import time
 from datetime import datetime, timezone
 
 from src.branch_context import BranchContext
-from src.daemon import git_ops
+from src.daemon import (
+    fix_codex_trigger,
+    fix_escalation,
+    fix_push_verify,
+    fix_supervision,
+    git_ops,
+)
 from src.daemon.handlers.breach import BreachMixin
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
 from src.github import comments as gh_comments
 from src.github import gh_runner
-from src.github import prs as gh_prs
 from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus
 from src.retry import retry_transient
 
 logger = logging.getLogger(__name__)
 
 _FIX_CI_LOG_TRUNCATE_CHARS = 5000
-_ESCALATE_MARKER_PREFIX = "ESCALATE:"
-_ESCALATE_EMPTY_REASON = "(no reason provided)"
-
-
-def _parse_escalate_marker(stdout: str) -> str | None:
-    """Return the coder-supplied ESCALATE reason, or ``None``.
-
-    The marker is recognized only when the LAST non-empty line of
-    ``stdout`` starts with the literal prefix ``"ESCALATE:"`` at
-    column 0 (strict case-sensitive match — variants like
-    ``escalate:``, ``ESCALATED:``, or an indented ``"  ESCALATE:"``
-    do not trigger). An empty reason (``"ESCALATE:"`` alone, or only
-    trailing whitespace) is returned as the empty string so the caller
-    can substitute a placeholder rather than crash.
-    """
-    for line in reversed(stdout.splitlines()):
-        if not line.strip():
-            continue
-        if line.startswith(_ESCALATE_MARKER_PREFIX):
-            return line[len(_ESCALATE_MARKER_PREFIX):].strip()
-        return None
-    return None
 
 
 def _fetch_failed_ci_logs(repo: str, branch: str) -> str | None:
@@ -105,247 +87,39 @@ class FixMixin(BreachMixin):
         target: asyncio.Task,  # type: ignore[type-arg]
         idle_flag: dict[str, bool],
     ) -> None:
-        """Cancel *target* if no new push is detected within *idle_limit* seconds."""
-        primed = False
-        try:
-            await asyncio.to_thread(
-                gh_prs.get_branch_last_push_time,
-                self.owner_repo, pr_number,
-            )
-            primed = True
-        except gh_prs.GitHubPollError:
-            pass
-
-        poll_interval = min(60, idle_limit)
-        now = time.monotonic()
-        head_age = await asyncio.to_thread(
-            gh_prs.get_last_push_age_seconds,
-            self.owner_repo, pr_number,
+        """Thin wrapper — see ``fix_supervision.monitor_fix_idle``."""
+        await fix_supervision.monitor_fix_idle(
+            self, pr_number, idle_limit, target, idle_flag
         )
-        if head_age is not None:
-            backdate = min(head_age, idle_limit - poll_interval)
-            last_known_push = now - max(0.0, backdate)
-        else:
-            last_known_push = now
-        while True:
-            await asyncio.sleep(poll_interval)
-            try:
-                latest_push_at = await asyncio.to_thread(
-                    gh_prs.get_branch_last_push_time,
-                    self.owner_repo, pr_number,
-                )
-                if not primed:
-                    primed = True
-                    if latest_push_at is not None:
-                        last_known_push = time.monotonic()
-            except gh_prs.GitHubPollError:
-                self.log_event(
-                    "[FIX] GitHub API poll failed, preserving deadline."
-                )
-                latest_push_at = None
-            if latest_push_at is not None and latest_push_at > last_known_push:
-                last_known_push = latest_push_at
-                self.log_event(
-                    f"[FIX] [{self.state.coder or 'coder'}] pushed, "
-                    f"resetting idle timer."
-                )
-            elapsed = time.monotonic() - last_known_push
-            if elapsed >= idle_limit:
-                self.log_event(
-                    f"[FIX] idle timeout ({idle_limit}s since last push), "
-                    f"killing."
-                )
-                idle_flag["timed_out"] = True
-                target.cancel()
-                return
 
     def _ensure_escalated_label(
         self, pr_number: int, label_create_log_prefix: str
     ) -> bool:
-        """Create (idempotent) and apply the ``escalated`` label.
+        """Thin wrapper over ``fix_escalation.ensure_escalated_label``.
 
-        Both ``gh`` calls soft-fail with ``log_event``: the in-memory
-        ``is_escalated`` flag remains the load-bearing signal, and the
-        label is a best-effort hint for ``get_open_prs`` rehydration
-        after a daemon restart. ``label_create_log_prefix`` keeps the
-        existing log strings stable so callers (no-push deadlock vs.
-        coder-initiated ESCALATE) remain distinguishable in history.
-
-        Returns ``True`` when ``pr edit --add-label`` succeeded and the
-        ``escalated`` label is therefore visible to ``get_open_prs``,
-        ``False`` when the apply step failed. Callers that park the
-        runner in a state which depends on label-state for durability
-        (e.g. coder-initiated ESCALATE → IDLE, where
-        ``_preserve_fix_iteration_count`` rehydrates ``is_escalated``
-        from labels on the next IDLE refresh) check this return to
-        downgrade to a parking state that does not.
+        Kept as a method because ``runner._escalate_to_hung`` calls it via
+        ``self._ensure_escalated_label(...)`` and existing tests still
+        invoke ``runner._ensure_escalated_label(...)`` directly.
         """
-        try:
-            gh_runner.run_gh(
-                [
-                    "label",
-                    "create",
-                    "escalated",
-                    "--color",
-                    "B60205",
-                    "--description",
-                    "Daemon escalated, manual review required",
-                ],
-                repo=self.owner_repo,
-            )
-        except Exception as exc:
-            self.log_event(
-                f"[FIX] {label_create_log_prefix} label create skipped: {exc}."
-            )
-        try:
-            gh_runner.run_gh(
-                ["pr", "edit", str(pr_number), "--add-label", "escalated"],
-                repo=self.owner_repo,
-            )
-            return True
-        except Exception as exc:
-            self.log_event(
-                f"[FIX] Warning: failed to apply escalated label to PR "
-                f"#{pr_number}: {exc}."
-            )
-            return False
+        return fix_escalation.ensure_escalated_label(
+            self, pr_number, label_create_log_prefix
+        )
 
     async def _escalate_fix_no_push_deadlock(self, current_pr: PRInfo) -> None:
-        """Park the PR in HUNG after consecutive no-push FIX cycles.
-
-        Thin wrapper over ``_escalate_to_hung``: posts a deadlock
-        comment with a fix.py-specific failure-log prefix, resets the
-        no-push counter, then delegates state transition / label apply
-        / is_escalated bookkeeping to the primitive. ``error_message``
-        is cleared because HUNG itself is the parking signal.
-        """
-        count = current_pr.no_push_fix_count
-        pr_number = current_pr.number
-        message = (
-            f"FIX deadlock: {count} consecutive no-push FIX cycles on PR "
-            f"#{pr_number}. Coder unable to identify actionable fix. "
-            "Manual review required."
-        )
-        try:
-            gh_comments.post_comment(self.owner_repo, pr_number, message)
-        except Exception as exc:
-            self.log_event(
-                f"[FIX] Warning: failed to post FIX deadlock comment on PR "
-                f"#{pr_number}: {exc}."
-            )
-        current_pr.no_push_fix_count = 0
-        await self._escalate_to_hung(
-            message,
-            error_message_override=None,
-            label_create_log_prefix="FIX no-push",
-        )
+        """Thin wrapper — see ``fix_escalation.escalate_fix_no_push_deadlock``."""
+        await fix_escalation.escalate_fix_no_push_deadlock(self, current_pr)
 
     async def _escalate_fix_coder_initiated(
         self, current_pr: PRInfo, reason: str
     ) -> None:
-        """Park the PR after the coder emits an ESCALATE marker.
-
-        Posts a fix.py-specific failure-log comment and then routes
-        state via ``_escalate_to_hung``. On label-apply success the
-        runner parks in ``IDLE`` so the next refresh rehydrates
-        ``is_escalated`` from the GitHub label. On label-apply
-        failure ``HUNG`` is used so the in-memory flag stays the
-        load-bearing parking signal during a GitHub outage (Codex P1
-        on PR #228).
-        """
-        pr_number = current_pr.number
-        clean_reason = reason.strip() or _ESCALATE_EMPTY_REASON
-        comment = (
-            f"Coder explicitly escalated this PR. Reason: {clean_reason}. "
-            "Manual review required."
-        )
-        try:
-            gh_comments.post_comment(self.owner_repo, pr_number, comment)
-        except Exception as exc:
-            self.log_event(
-                f"[FIX] Warning: failed to post FIX coder ESCALATE comment "
-                f"on PR #{pr_number}: {exc}."
-            )
-        label_applied = self._ensure_escalated_label(
-            pr_number, "FIX coder ESCALATE"
-        )
-        if label_applied:
-            await self._escalate_to_hung(
-                f"FIX coder ESCALATE on PR #{pr_number}: {clean_reason}. "
-                "Moving to IDLE.",
-                target_state=PipelineState.IDLE,
-                error_message_override=None,
-                apply_escalated_label=False,
-            )
-            return
-        await self._escalate_to_hung(
-            f"FIX coder ESCALATE on PR #{pr_number}: failed to apply "
-            f"`escalated` label. Reason: {clean_reason}. Manual "
-            "review required.",
-            apply_escalated_label=False,
+        """Thin wrapper — see ``fix_escalation.escalate_fix_coder_initiated``."""
+        await fix_escalation.escalate_fix_coder_initiated(
+            self, current_pr, reason
         )
 
     async def _escalate_fix_iteration_cap(self, current_pr: PRInfo) -> None:
-        """Escalate the PR after the FIX iteration cap is reached.
-
-        The comment-post and ``pr edit --add-label`` failure paths
-        route to ``ERROR`` (durable parking signal for daemon-driven
-        escalation, distinct from the coder-initiated ``HUNG``
-        fallback). The success path delegates to ``_escalate_to_hung``
-        for the IDLE transition + ``[ESCALATE]`` log + publish.
-        """
-        count = current_pr.fix_iteration_count
-        fix_iteration_cap = self.app_config.daemon.fix_iteration_cap
-        pr_number = current_pr.number
-        comment = (
-            "@AlexBomber12 FIX iteration cap reached "
-            f"({count}/{fix_iteration_cap}). Escalating for manual review."
-        )
-        try:
-            gh_comments.post_comment(self.owner_repo, pr_number, comment)
-        except Exception as exc:
-            await self._transition_to_error(
-                f"post_comment failed: {exc}",
-                save_run_record_as=None,
-                publish=False,
-                log_prefix="[FIX]",
-            )
-            return
-        try:
-            gh_runner.run_gh(
-                [
-                    "label",
-                    "create",
-                    "escalated",
-                    "--color",
-                    "B60205",
-                    "--description",
-                    "Daemon escalated, manual review required",
-                ],
-                repo=self.owner_repo,
-            )
-        except Exception as exc:
-            self.log_event(f"[FIX] FIX cap label create skipped: {exc}.")
-        try:
-            gh_runner.run_gh(
-                ["pr", "edit", str(pr_number), "--add-label", "escalated"],
-                repo=self.owner_repo,
-            )
-        except Exception as exc:
-            await self._transition_to_error(
-                f"pr edit failed: {exc}",
-                save_run_record_as=None,
-                publish=False,
-                log_prefix="[FIX]",
-            )
-            return
-        await self._escalate_to_hung(
-            f"FIX cap reached ({count}/{fix_iteration_cap}) on PR "
-            f"#{pr_number}: escalated, moving to IDLE.",
-            target_state=PipelineState.IDLE,
-            error_message_override=None,
-            apply_escalated_label=False,
-        )
+        """Thin wrapper — see ``fix_escalation.escalate_fix_iteration_cap``."""
+        await fix_escalation.escalate_fix_iteration_cap(self, current_pr)
 
     async def _poll_github_during_fix(
         self,
@@ -353,55 +127,10 @@ class FixMixin(BreachMixin):
         target: asyncio.Task,  # type: ignore[type-arg]
         terminal_flag: dict[str, str | None],
     ) -> None:
-        """Watch the PR for an external MERGED/CLOSED while FIX is in flight.
-
-        Polls ``gh_prs.pr_state`` every
-        ``app_config.daemon.fix_poll_interval_sec`` seconds. When a
-        terminal state is observed, records it in ``terminal_flag``,
-        terminates the active coder subprocess (SIGTERM with grace
-        before SIGKILL via ``_terminate_current_coder``) and cancels
-        ``target`` so the awaiting handler observes the cancellation.
-
-        Inherits PR-163 GitHub API budget awareness: when the cached
-        budget is below the pause threshold, this iteration is skipped
-        rather than spending quota on observability polling.
-
-        Transient ``gh pr view`` failures are logged once per failure
-        and the loop continues — observability must never crash the
-        daemon. Cancellation (the FIX cycle finished normally) exits
-        cleanly via the standard ``CancelledError`` propagation.
-        """
-        poll_interval = self.app_config.daemon.fix_poll_interval_sec
-        while True:
-            await asyncio.sleep(poll_interval)
-            if self._github_api_budget_paused():
-                continue
-            try:
-                state_info = await asyncio.to_thread(
-                    gh_prs.pr_state, self.owner_repo, pr_number
-                )
-            except Exception as exc:
-                self.log_event(
-                    f"[FIX] GitHub poll for PR #{pr_number} failed: {exc}."
-                )
-                continue
-            if state_info is None:
-                self.log_event(
-                    f"[FIX] GitHub poll for PR #{pr_number} returned no "
-                    f"data."
-                )
-                continue
-            state = (state_info.get("state") or "").upper()
-            if state not in {"MERGED", "CLOSED"}:
-                continue
-            terminal_flag["state"] = state
-            self.log_event(
-                f"[FIX] PR #{pr_number} reached terminal state {state} "
-                f"during FIX, requesting coder termination."
-            )
-            await self._terminate_current_coder()
-            target.cancel()
-            return
+        """Thin wrapper — see ``fix_supervision.poll_github_during_fix``."""
+        await fix_supervision.poll_github_during_fix(
+            self, pr_number, target, terminal_flag
+        )
 
     def _verify_pushes_since(
         self,
@@ -411,76 +140,14 @@ class FixMixin(BreachMixin):
         *,
         context: str,
     ) -> bool | None:
-        """Verify that ``head_after`` reached ``origin/{branch}``.
-
-        Returns ``True`` when origin contains ``head_after`` (either
-        equal to it or fast-forwarded past it), ``False`` when origin
-        is still at ``last_known_sha`` (no push happened), and ``None``
-        when the verification itself could not run (fetch / rev-parse /
-        merge-base failure). Callers decide whether ``None`` should
-        be treated as a hard failure (stop-cancel path: skip
-        bookkeeping) or as fail-open (normal-exit path: proceed
-        optimistically) — this helper only reports what it observed.
-
-        ``context`` is appended to the log lines emitted on git
-        failures so the same helper can serve both call sites without
-        the event log losing the distinguishing prefix
-        (``"after FIX stop"`` vs ``"after FIX exit"``).
-        """
-        try:
-            git_ops._git(
-                self.repo_path,
-                "fetch",
-                "--prune",
-                "origin",
-                f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
-                timeout=60,
-            )
-        except (
-            subprocess.CalledProcessError,
-            subprocess.TimeoutExpired,
-            OSError,
-        ) as exc:
-            self.log_event(f"[FIX] fetch {branch} failed {context}: {exc}.")
-            return None
-        try:
-            remote_head = git_ops._git(
-                self.repo_path,
-                "rev-parse",
-                f"origin/{branch}",
-            ).stdout.strip()
-        except (
-            subprocess.CalledProcessError,
-            subprocess.TimeoutExpired,
-            OSError,
-        ) as exc:
-            self.log_event(
-                f"[FIX] rev-parse origin/{branch} failed {context}: {exc}."
-            )
-            return None
-        if (
-            last_known_sha
-            and head_after != last_known_sha
-            and remote_head == last_known_sha
-        ):
-            return False
-        if remote_head == head_after:
-            return True
-        try:
-            is_ancestor = git_ops._git(
-                self.repo_path,
-                "merge-base",
-                "--is-ancestor",
-                head_after,
-                remote_head,
-                check=False,
-            )
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            self.log_event(
-                f"[FIX] merge-base ancestry check failed {context}: {exc}."
-            )
-            return None
-        return is_ancestor.returncode == 0
+        """Thin wrapper — see ``fix_push_verify.verify_pushes_since``."""
+        return fix_push_verify.verify_pushes_since(
+            self,
+            branch,
+            last_known_sha,
+            head_after,
+            context=context,
+        )
 
     def _github_api_budget_paused(self) -> bool:
         """Return ``True`` when the cached GH API budget is below pause threshold."""
@@ -500,82 +167,18 @@ class FixMixin(BreachMixin):
         target: asyncio.Task,  # type: ignore[type-arg]
         terminal_flag: dict[str, str | None],
     ) -> asyncio.Task[None] | None:
-        """Spawn the polling task that runs concurrently with the coder.
-
-        Returns the polling task so the caller can cancel it when the
-        coder exits normally (try/finally). Returns ``None`` when no
-        live PR number is available so the polling logic only engages
-        for real PRs (not the initial coding cycle that has not yet
-        produced one).
-        """
-        if pr_number <= 0:
-            return None
-        return asyncio.create_task(
-            self._poll_github_during_fix(pr_number, target, terminal_flag)
+        """Thin wrapper — see ``fix_supervision.run_coder_with_polling``."""
+        return fix_supervision.run_coder_with_polling(
+            self, pr_number, target, terminal_flag
         )
 
     async def _handle_external_terminal_pr_state(
         self, terminal_state: str
     ) -> None:
-        """Transition the runner when an external MERGED/CLOSED is observed.
-
-        On ``MERGED``: reset the FIX recovery counters on the active PR
-        (so the next PR does not inherit a stale streak), mark the
-        queue task DONE if applicable, drop ``current_pr`` /
-        ``current_task``, and return to ``IDLE``.
-
-        On ``CLOSED``: park in ``HUNG`` so a human can resolve.
-        """
-        pr = self.state.current_pr
-        pr_number_str = f"#{pr.number}" if pr is not None else ""
-        if terminal_state == "MERGED":
-            if pr is not None:
-                pr.no_push_fix_count = 0
-                pr.fix_iteration_count = 0
-            self.log_event(
-                f"[FIX] PR {pr_number_str} merged externally during FIX, "
-                f"returning to IDLE."
-            )
-            await self._save_current_run_record("success_merged")
-            self._current_run_record = None
-            try:
-                self._mark_queue_done()
-            except Exception as exc:
-                # ``_mark_queue_done`` sets ``pending_queue_sync_branch``
-                # *before* its fragile git/GitHub ops, and that marker is
-                # the guard that prevents ``handle_idle`` from
-                # redispatching a stale ``DOING`` task before queue-sync
-                # actually resolves. Log the failure for visibility but
-                # preserve the marker so ``_resolve_pending_queue_sync``
-                # owns the retry / timeout (Codex P2 round-2 + P1 round-3
-                # on PR #223: surface the failure but do not nullify the
-                # guard).
-                self.log_event(
-                    "[FIX] Warning: _mark_queue_done failed during "
-                    f"external-merge cleanup: {exc}; "
-                    "pending_queue_sync_branch preserved so handle_idle "
-                    "resolves via _resolve_pending_queue_sync."
-                )
-            self.state.current_task = None
-            self._reset_runner_local_task_counters()
-            self.state.state = PipelineState.IDLE
-            await self.publish_state()
-            return
-        # CLOSED
-        self.log_event(
-            f"[FIX] PR {pr_number_str} closed externally during FIX, "
-            f"transitioning to HUNG."
+        """Thin wrapper — see ``fix_supervision.handle_external_terminal_pr_state``."""
+        await fix_supervision.handle_external_terminal_pr_state(
+            self, terminal_state
         )
-        # Finalize the run record before parking in HUNG. Otherwise the
-        # next ``handle_hung`` tick will move the runner to IDLE and
-        # clear ``current_task`` while ``ended_at`` / ``exit_reason``
-        # are still unset, leaving incomplete metrics for the closed
-        # PR (Codex P2 follow-up on PR #223).
-        await self._save_current_run_record("closed_unmerged")
-        self._current_run_record = None
-        self.state.error_message = None
-        self.state.state = PipelineState.HUNG
-        await self.publish_state()
 
     async def _build_fix_feedback_context(
         self, current_pr: PRInfo
@@ -787,27 +390,12 @@ class FixMixin(BreachMixin):
                     except Exception:
                         head_now = ""
                     if head_before and head_now and head_before != head_now:
-                        if self._should_skip_codex_review_post(
-                            self.state.current_pr.number
+                        if not await fix_codex_trigger.maybe_post_codex_review_after_push(
+                            self,
+                            self.state.current_pr.number,
+                            "after breach-cancel fix push; manual review "
+                            "trigger required",
                         ):
-                            self.log_event(
-                                "[FIX] Codex auto-trigger detected, "
-                                "skipping duplicate @codex review post."
-                            )
-                        elif not self._post_codex_review(
-                            self.state.current_pr.number
-                        ):
-                            await self._transition_to_error(
-                                (
-                                    f"Failed to post @codex review on PR "
-                                    f"#{self.state.current_pr.number} after "
-                                    "breach-cancel fix push; manual review "
-                                    "trigger required"
-                                ),
-                                save_run_record_as=None,
-                                publish=False,
-                                log_prefix="[FIX]",
-                            )
                             return
                 self.state.state = PipelineState.PAUSED
                 self.state.error_message = None
@@ -853,27 +441,12 @@ class FixMixin(BreachMixin):
                 except Exception:
                     head_now = ""
                 if head_before and head_now and head_before != head_now:
-                    if self._should_skip_codex_review_post(
-                        self.state.current_pr.number
+                    if not await fix_codex_trigger.maybe_post_codex_review_after_push(
+                        self,
+                        self.state.current_pr.number,
+                        "after late-breach fix push; manual review "
+                        "trigger required",
                     ):
-                        self.log_event(
-                            "[FIX] Codex auto-trigger detected, skipping "
-                            "duplicate @codex review post."
-                        )
-                    elif not self._post_codex_review(
-                        self.state.current_pr.number
-                    ):
-                        await self._transition_to_error(
-                            (
-                                f"Failed to post @codex review on PR "
-                                f"#{self.state.current_pr.number} after "
-                                "late-breach fix push; manual review "
-                                "trigger required"
-                            ),
-                            save_run_record_as=None,
-                            publish=False,
-                            log_prefix="[FIX]",
-                        )
                         return
             self.state.state = PipelineState.PAUSED
             self.state.error_message = None
@@ -958,25 +531,11 @@ class FixMixin(BreachMixin):
 
             self.log_event(f"[FIX] Fix pushed, iteration #{iteration}.")
             if self.state.current_pr is not None:
-                if self._should_skip_codex_review_post(
-                    self.state.current_pr.number
+                if not await fix_codex_trigger.maybe_post_codex_review_after_push(
+                    self,
+                    self.state.current_pr.number,
+                    failure_detail,
                 ):
-                    self.log_event(
-                        "[FIX] Codex auto-trigger detected, skipping "
-                        "duplicate @codex review post."
-                    )
-                elif not self._post_codex_review(
-                    self.state.current_pr.number
-                ):
-                    await self._transition_to_error(
-                        (
-                            f"Failed to post @codex review on PR "
-                            f"#{self.state.current_pr.number} {failure_detail}"
-                        ),
-                        save_run_record_as=None,
-                        publish=False,
-                        log_prefix="[FIX]",
-                    )
                     return False
             return True
 
@@ -1001,7 +560,7 @@ class FixMixin(BreachMixin):
             return
         await self._save_cli_log(stdout, stderr, f"FIX FEEDBACK output [{coder_name}]")
         await capture_stop_requested_after_exit()
-        escalate_reason = _parse_escalate_marker(stdout)
+        escalate_reason = fix_escalation.parse_escalate_marker(stdout)
         if escalate_reason is not None and self.state.current_pr is not None:
             # Coder semantic circuit breaker (PR-166): an explicit
             # self-report wins over the regular push/return-code flow.
