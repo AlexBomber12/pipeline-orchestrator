@@ -24,6 +24,44 @@ TEMPLATES_DIR = Path(__file__).resolve().parent.parent.parent / "templates"
 _GITIGNORE_ENTRIES = ("artifacts/", "tasks/QUEUE.md")
 _COMMIT_MESSAGE = "chore: initialize pipeline orchestrator structure"
 
+# OBS-AX (PR-242). User-authored CLAUDE.md content competes with AGENTS.md
+# as Claude Code's system prompt and causes the coder to HUNG with
+# "PLANNED PR alone isn't enough context" on first task pick. The
+# scaffolder rewrites CLAUDE.md to a canonical redirect on every onboarding
+# pass so the coder always picks AGENTS.md as the source of truth.
+_CLAUDE_MD_CANONICAL = "Read and follow AGENTS.md in this repository.\n"
+
+_SKILL_MD_REL_PATH = ".claude/skills/orch-context/SKILL.md"
+
+_SKILL_MD_CANONICAL = """\
+---
+name: orch-context
+description: >-
+  Use when working in a pipeline-orchestrator-managed repository.
+  Routes Claude to the canonical orchestrator rules in AGENTS.md
+  and the active task definition under tasks/PR-*.md.
+---
+
+# Pipeline orchestrator context
+
+This repository is managed by the pipeline-orchestrator daemon. The
+canonical rules for AI coders working here live in `AGENTS.md` at the
+repository root. Read it fully before generating code or opening PRs.
+
+When the daemon dispatches a PLANNED PR task, the active task file
+lives at `tasks/PR-XXX.md` and is identified by `tasks/QUEUE.md`,
+which is auto-generated from task headers and git state. Read the
+task file fully before starting; do not drift from its scope.
+
+For new task spec generation, follow the schema in
+`docs/TASK_SCHEMA.md` from the orchestrator repo (or the canonical
+schema documentation provided by the orchestrator's MCP server when
+that ships).
+
+The dashboard at `https://orchestrator.lan` shows live state and the
+event log; reference it when reasoning about recent runs.
+"""
+
 # Timeouts for git subprocess calls, mirroring the limits used elsewhere
 # in the daemon (see ``PipelineRunner``). Without an explicit timeout a
 # stalled network operation or an auth prompt during the first-clone
@@ -40,6 +78,76 @@ def _copy_template(src_name: str, dest: Path, executable: bool = False) -> None:
     shutil.copyfile(TEMPLATES_DIR / src_name, dest)
     if executable:
         dest.chmod(0o755)
+
+
+def _ensure_canonical_file(
+    repo_path: Path, rel_path: str, canonical_content: str
+) -> bool:
+    """Write ``canonical_content`` to ``repo_path/rel_path`` when content differs.
+
+    Returns ``True`` when a write occurred (file created or overwritten),
+    ``False`` when the existing content already matched. Idempotent:
+    repeated calls do not create commit churn for already-onboarded repos.
+    PR-242: existing files are overwritten unconditionally so user-authored
+    CLAUDE.md content cannot compete with AGENTS.md as Claude Code's
+    system prompt.
+    """
+    target = repo_path / rel_path
+    if target.exists():
+        try:
+            existing = target.read_text(encoding="utf-8")
+        except OSError:
+            existing = None
+        if existing == canonical_content:
+            return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(canonical_content, encoding="utf-8")
+    return True
+
+
+def _gitignored_paths(repo_path: str, paths: list[str]) -> set[str]:
+    """Return the subset of ``paths`` that match a gitignore rule.
+
+    Used to keep the scaffolder out of the ``git add -f`` corner: when an
+    existing repo gitignores a path the scaffolder wants to place (for
+    example ``.claude/`` covering ``.claude/skills/orch-context/SKILL.md``),
+    staging it would fail under ``check=True`` and abort onboarding. By
+    skipping ignored paths from the stage list the file still lands on
+    disk for local Claude Code use, but it is not committed.
+
+    Errors and timeouts are treated as "no paths ignored" so a probe
+    failure cannot itself block scaffolding.
+    """
+    if not paths:
+        return set()
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "--", *paths],
+            capture_output=True,
+            text=True,
+            cwd=repo_path,
+            check=False,
+            timeout=_LOCAL_GIT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logger.warning(
+            "scaffold_repo: git check-ignore timed out (%s); assuming no "
+            "paths ignored",
+            exc.cmd,
+        )
+        return set()
+    # rc=0: at least one path matched; rc=1: no paths matched. Anything
+    # else (notably 128 for fatal errors) is unexpected — log and fall
+    # back to the no-ignore assumption rather than aborting scaffolding.
+    if result.returncode not in (0, 1):
+        logger.warning(
+            "scaffold_repo: git check-ignore failed (rc=%s, stderr=%s); "
+            "assuming no paths ignored",
+            result.returncode,
+            (result.stderr or "").strip(),
+        )
+        return set()
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
 def _run_git(
@@ -255,14 +363,20 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
     repo = Path(repo_path)
     created: list[str] = []
 
+    # AGENTS.md must exist before the canonical CLAUDE.md redirect lands —
+    # otherwise CLAUDE-only repos end up pointing at a file that does not
+    # exist, and the coder loses the intended instruction source on first
+    # task pick. The previous behaviour preserved a "CLAUDE-only" snapshot,
+    # but with the canonical redirect overwriting CLAUDE.md the redirect's
+    # target must always be present.
     agents = repo / "AGENTS.md"
-    claude = repo / "CLAUDE.md"
-    if not agents.exists() and not claude.exists():
+    if not agents.exists():
         _copy_template("AGENTS.md", agents)
         created.append("AGENTS.md")
-    if not claude.exists():
-        _copy_template("CLAUDE.md", claude)
+    if _ensure_canonical_file(repo, "CLAUDE.md", _CLAUDE_MD_CANONICAL):
         created.append("CLAUDE.md")
+    if _ensure_canonical_file(repo, _SKILL_MD_REL_PATH, _SKILL_MD_CANONICAL):
+        created.append(_SKILL_MD_REL_PATH)
 
     tasks_dir = repo / "tasks"
     if not tasks_dir.exists():
@@ -321,10 +435,22 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
     # is created on disk for read consumers (dashboard, recovery) but is
     # gitignored too (PR-181) — the daemon regenerates it deterministically
     # each IDLE cycle, so committing it would just create push noise.
-    to_stage = [
+    candidate_paths = [
         path for path in created
         if not path.endswith("/") and path not in _GITIGNORE_ENTRIES
     ]
+    # Drop paths the repo's own .gitignore would block. Without this filter
+    # ``git add`` would fail for repos that ignore ``.claude/`` (or similar
+    # patterns covering scaffolded files), aborting onboarding mid-cycle.
+    # AGENTS.md forbids ``git add -f`` and gitignored-stage workarounds, so
+    # an ignored scaffold path stays on disk for local use only.
+    ignored = _gitignored_paths(repo_path, candidate_paths)
+    if ignored:
+        logger.info(
+            "scaffold_repo skipping gitignored paths: %s",
+            ", ".join(sorted(ignored)),
+        )
+    to_stage = [path for path in candidate_paths if path not in ignored]
     committed_new_files = False
 
     if to_stage:

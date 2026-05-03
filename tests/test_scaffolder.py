@@ -42,6 +42,9 @@ def _patch_git(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         calls.append(cmd)
+        if cmd[:2] == ["git", "check-ignore"]:
+            # Default: nothing in the patched git is gitignored.
+            return _FakeCompletedProcess(args=cmd, returncode=1)
         if cmd[:3] == ["git", "rev-parse", "--verify"]:
             ref = cmd[-1]
             if ref.startswith("refs/remotes/origin/"):
@@ -73,7 +76,10 @@ def _init_scaffolded_repo(tmp_path: Path) -> Path:
     """Create a repo with the baseline scaffolding already present."""
     repo = _init_empty_repo(tmp_path)
     (repo / "AGENTS.md").write_text("# AGENTS\n")
-    (repo / "CLAUDE.md").write_text("Read and follow AGENTS.md in this repository.\n")
+    (repo / "CLAUDE.md").write_text(scaffolder._CLAUDE_MD_CANONICAL)
+    skill = repo / ".claude" / "skills" / "orch-context" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(scaffolder._SKILL_MD_CANONICAL)
     (repo / "tasks").mkdir()
     (repo / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
     (repo / "scripts").mkdir()
@@ -194,19 +200,145 @@ def test_scaffold_repo_preserves_existing_agents(
     assert "AGENTS.md" not in actions
 
 
-def test_scaffold_repo_accepts_claude_md_as_agents(
+def test_scaffold_repo_backfills_agents_when_only_claude_md_exists(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """CLAUDE.md is accepted in place of AGENTS.md (either satisfies the
-    runbook)."""
+    """A repo with CLAUDE.md but no AGENTS.md must gain AGENTS.md so the
+    canonical CLAUDE.md redirect points at a real file. Skipping the
+    backfill (the prior PR-242 behaviour) left CLAUDE.md saying "Read
+    AGENTS.md" while AGENTS.md did not exist on disk, breaking the
+    coder's first task pick.
+    """
     repo = _init_empty_repo(tmp_path)
     (repo / "CLAUDE.md").write_text("# Project rules\n")
     _patch_git(monkeypatch)
 
     actions = scaffolder.scaffold_repo(str(repo), "main")
 
-    assert not (repo / "AGENTS.md").exists()
-    assert "AGENTS.md" not in actions
+    assert (repo / "AGENTS.md").exists()
+    assert "AGENTS.md" in actions
+    # CLAUDE.md was overwritten to the canonical redirect.
+    assert (repo / "CLAUDE.md").read_text() == scaffolder._CLAUDE_MD_CANONICAL
+
+
+def test_scaffold_repo_stages_all_when_check_ignore_times_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``git check-ignore`` timeout must NOT abort scaffolding; the
+    scaffolder falls back to "assume no paths ignored" so the cycle can
+    still publish AGENTS.md, ci.sh, and friends. Aborting on a probe
+    timeout would leave the runner unable to onboard a repo whose git
+    is briefly under lock contention.
+    """
+    repo = _init_empty_repo(tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        if cmd[:2] == ["git", "check-ignore"]:
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            ref = cmd[-1]
+            if ref.startswith("refs/remotes/origin/"):
+                return _FakeCompletedProcess(args=cmd, returncode=1)
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+
+    scaffolder.scaffold_repo(str(repo), "main")
+
+    add_cmds = [cmd for cmd in calls if cmd[:2] == ["git", "add"]]
+    assert len(add_cmds) == 1
+    staged = add_cmds[0][2:]
+    # The fall-back assumption is "nothing ignored", so SKILL.md is
+    # staged alongside the rest. The point of the test is that the
+    # scaffolder did not abort.
+    assert scaffolder._SKILL_MD_REL_PATH in staged
+
+
+def test_scaffold_repo_stages_all_when_check_ignore_fails_with_unexpected_rc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-{0,1} exit from ``git check-ignore`` (e.g. rc=128 for a
+    fatal error) is treated as 'cannot decide' and falls back to
+    'no paths ignored', so a transient git failure cannot abort
+    onboarding.
+    """
+    repo = _init_empty_repo(tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        if cmd[:2] == ["git", "check-ignore"]:
+            return _FakeCompletedProcess(
+                args=cmd, returncode=128, stderr="fatal: bad index"
+            )
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            ref = cmd[-1]
+            if ref.startswith("refs/remotes/origin/"):
+                return _FakeCompletedProcess(args=cmd, returncode=1)
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+
+    scaffolder.scaffold_repo(str(repo), "main")
+
+    add_cmds = [cmd for cmd in calls if cmd[:2] == ["git", "add"]]
+    assert len(add_cmds) == 1
+    staged = add_cmds[0][2:]
+    assert "AGENTS.md" in staged
+
+
+def test_scaffold_repo_skips_staging_gitignored_skill_md(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the repo gitignores ``.claude/`` (a common pattern), the
+    scaffolder must place SKILL.md on disk for local Claude Code use
+    but skip it from ``git add``. Staging a gitignored path under
+    ``check=True`` would fail and abort onboarding entirely.
+    """
+    repo = _init_empty_repo(tmp_path)
+    (repo / ".gitignore").write_text(".claude/\n")
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        if cmd[:2] == ["git", "check-ignore"]:
+            paths = cmd[cmd.index("--") + 1:]
+            ignored = [p for p in paths if p.startswith(".claude/")]
+            return _FakeCompletedProcess(
+                args=cmd,
+                returncode=0 if ignored else 1,
+                stdout="\n".join(ignored) + ("\n" if ignored else ""),
+            )
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            ref = cmd[-1]
+            if ref.startswith("refs/remotes/origin/"):
+                return _FakeCompletedProcess(args=cmd, returncode=1)
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+
+    actions = scaffolder.scaffold_repo(str(repo), "main")
+
+    # SKILL.md was placed on disk for local use and reported in actions.
+    skill_rel = scaffolder._SKILL_MD_REL_PATH
+    assert (repo / skill_rel).exists()
+    assert skill_rel in actions
+
+    # But it was NOT included in `git add`.
+    add_cmds = [cmd for cmd in calls if cmd[:2] == ["git", "add"]]
+    assert len(add_cmds) == 1, "scaffolder should still stage the other files"
+    staged = add_cmds[0][2:]
+    assert skill_rel not in staged
+    # Non-ignored paths still got staged so the rest of the scaffolding
+    # commit lands.
+    assert "AGENTS.md" in staged
+    assert "scripts/ci.sh" in staged
 
 
 def test_ensure_claude_md_returns_false_for_missing_repo(tmp_path: Path) -> None:
@@ -381,7 +513,10 @@ def test_scaffold_repo_skips_commit_when_fully_provisioned(
     """
     repo = _init_empty_repo(tmp_path)
     (repo / "AGENTS.md").write_text("# AGENTS\n")
-    (repo / "CLAUDE.md").write_text("Read and follow AGENTS.md in this repository.\n")
+    (repo / "CLAUDE.md").write_text(scaffolder._CLAUDE_MD_CANONICAL)
+    skill = repo / ".claude" / "skills" / "orch-context" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(scaffolder._SKILL_MD_CANONICAL)
     (repo / "tasks").mkdir()
     (repo / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
     (repo / "scripts").mkdir()
@@ -418,7 +553,10 @@ def test_scaffold_repo_skips_git_when_only_artifacts_dir_missing(
     """
     repo = _init_empty_repo(tmp_path)
     (repo / "AGENTS.md").write_text("# AGENTS\n")
-    (repo / "CLAUDE.md").write_text("Read and follow AGENTS.md in this repository.\n")
+    (repo / "CLAUDE.md").write_text(scaffolder._CLAUDE_MD_CANONICAL)
+    skill = repo / ".claude" / "skills" / "orch-context" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(scaffolder._SKILL_MD_CANONICAL)
     (repo / "tasks").mkdir()
     (repo / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
     (repo / "scripts").mkdir()
@@ -477,6 +615,8 @@ def test_scaffold_repo_propagates_git_push_failure(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         if cmd[:2] == ["git", "push"]:
             raise subprocess.CalledProcessError(1, cmd, stderr="push denied")
+        if cmd[:2] == ["git", "check-ignore"]:
+            return _FakeCompletedProcess(args=cmd, returncode=1)
         if cmd[:3] == ["git", "rev-parse", "--verify"]:
             ref = cmd[-1]
             if ref.startswith("refs/remotes/origin/"):
@@ -504,6 +644,8 @@ def test_scaffold_repo_sets_timeouts_on_every_git_call(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         captured.append((cmd, kwargs))
+        if cmd[:2] == ["git", "check-ignore"]:
+            return _FakeCompletedProcess(args=cmd, returncode=1)
         if cmd[:3] == ["git", "rev-parse", "--verify"]:
             ref = cmd[-1]
             if ref.startswith("refs/remotes/origin/"):
@@ -565,6 +707,8 @@ def test_scaffold_repo_handles_unborn_head(
         if cmd[:2] == ["git", "commit"]:
             committed["done"] = True
             return _FakeCompletedProcess(args=cmd)
+        if cmd[:2] == ["git", "check-ignore"]:
+            return _FakeCompletedProcess(args=cmd, returncode=1)
         if cmd[:3] == ["git", "rev-parse", "--verify"]:
             ref = cmd[-1]
             if ref.startswith("refs/remotes/origin/"):
@@ -743,7 +887,10 @@ def test_scaffold_repo_retries_stranded_push_with_no_new_commit(
     # Fully provision the repo locally — this is what the filesystem
     # looks like after a successful local commit whose push timed out.
     (repo / "AGENTS.md").write_text("# AGENTS\n")
-    (repo / "CLAUDE.md").write_text("Read and follow AGENTS.md in this repository.\n")
+    (repo / "CLAUDE.md").write_text(scaffolder._CLAUDE_MD_CANONICAL)
+    skill = repo / ".claude" / "skills" / "orch-context" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(scaffolder._SKILL_MD_CANONICAL)
     (repo / "tasks").mkdir()
     (repo / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
     (repo / "scripts").mkdir()
@@ -792,6 +939,8 @@ def test_scaffold_repo_reraises_git_commit_failure(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         if cmd[:2] == ["git", "commit"]:
             raise subprocess.CalledProcessError(1, cmd, stderr="commit blocked")
+        if cmd[:2] == ["git", "check-ignore"]:
+            return _FakeCompletedProcess(args=cmd, returncode=1)
         if cmd[:3] == ["git", "rev-parse", "--verify"]:
             ref = cmd[-1]
             if ref.startswith("refs/remotes/origin/"):
@@ -813,6 +962,8 @@ def test_scaffold_repo_reraises_git_commit_timeout(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         if cmd[:2] == ["git", "commit"]:
             raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+        if cmd[:2] == ["git", "check-ignore"]:
+            return _FakeCompletedProcess(args=cmd, returncode=1)
         if cmd[:3] == ["git", "rev-parse", "--verify"]:
             ref = cmd[-1]
             if ref.startswith("refs/remotes/origin/"):
@@ -838,6 +989,8 @@ def test_scaffold_repo_propagates_git_push_timeout(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         if cmd[:2] == ["git", "push"]:
             raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+        if cmd[:2] == ["git", "check-ignore"]:
+            return _FakeCompletedProcess(args=cmd, returncode=1)
         if cmd[:3] == ["git", "rev-parse", "--verify"]:
             ref = cmd[-1]
             if ref.startswith("refs/remotes/origin/"):
