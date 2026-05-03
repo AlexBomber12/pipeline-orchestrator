@@ -312,9 +312,13 @@ class HungMixin:
                     "@codex review",
                 )
             except Exception as exc:
-                self.state.state = PipelineState.ERROR
-                self.state.error_message = f"post_comment failed: {exc}"
-                self.log_event(f"[ESCALATE] {exc}.")
+                await self._transition_to_error(
+                    f"post_comment failed: {exc}",
+                    log_prefix="[ESCALATE]",
+                    log_message=str(exc),
+                    save_run_record_as=None,
+                    publish=False,
+                )
                 return
             current_pr.last_activity = datetime.now(timezone.utc)
             self.state.state = PipelineState.WATCH

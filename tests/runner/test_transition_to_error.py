@@ -137,6 +137,43 @@ def test_transition_to_error_passes_exit_reason_to_run_record() -> None:
     assert save_calls == ["rate_limit"]
 
 
+def test_no_inline_error_writes_outside_primitive():
+    """Enforce the PR-219b global invariant repaired by PR-237.
+
+    After PR-237 ships, no module under src/daemon/ should write
+    ``state.state = PipelineState.ERROR`` directly. All ERROR
+    transitions go through ``_transition_to_error``.
+
+    The primitive itself contains the only legitimate inline write
+    and is whitelisted by file path.
+    """
+    import pathlib
+    import re
+
+    daemon_root = pathlib.Path("src/daemon")
+    pattern = re.compile(r"self\.state\.state\s*=\s*PipelineState\.ERROR")
+    primitive_file = daemon_root / "runner.py"
+    primitive_marker = "async def _transition_to_error"
+
+    offenders: list[str] = []
+    for path in daemon_root.rglob("*.py"):
+        text = path.read_text()
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if not pattern.search(line):
+                continue
+            if path == primitive_file:
+                # Whitelist the primitive itself (single legitimate write).
+                preceding = "\n".join(text.splitlines()[: lineno])
+                if primitive_marker in preceding:
+                    continue
+            offenders.append(f"{path}:{lineno}: {line.strip()}")
+
+    assert not offenders, (
+        "Direct ERROR writes found outside _transition_to_error:\n"
+        + "\n".join(offenders)
+    )
+
+
 def test_transition_to_error_finalizes_active_run_record() -> None:
     """When a run record is active, the primitive finalises it via the store."""
     runner = h._make_runner()

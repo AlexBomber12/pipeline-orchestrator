@@ -1636,10 +1636,13 @@ class PipelineRunner(
         try:
             await self.ensure_repo_cloned()
         except RuntimeError as exc:
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = str(exc)
-            self.log_event(f"[INFRA] ensure_repo_cloned failed: {exc}.")
-            await self.publish_state()
+            await self._transition_to_error(
+                str(exc),
+                log_prefix="[INFRA]",
+                log_message=f"ensure_repo_cloned failed: {exc}",
+                save_run_record_as=None,
+                publish=True,
+            )
             return
 
         if not await self._check_github_api_budget():
