@@ -703,15 +703,49 @@ def test_put_daemon_updates_boolean_fields(empty_config: Path) -> None:
 
 
 def test_put_daemon_updates_exploration_epsilon(empty_config: Path) -> None:
+    """PR-233: form posts percent (0-50); server stores fraction (0.0-0.5)."""
     with TestClient(app) as client:
         response = client.put(
             "/settings/daemon",
-            data={"exploration_epsilon": "0.25"},
+            data={"exploration_epsilon": "10"},
         )
 
     assert response.status_code == 200
     cfg = load_config(str(empty_config))
-    assert cfg.daemon.exploration_epsilon == 0.25
+    assert cfg.daemon.exploration_epsilon == 0.10
+
+
+def test_settings_daemon_renders_alternative_coder_label(
+    empty_config: Path,
+) -> None:
+    """PR-233: the operator-facing label replaces the implementation name."""
+    with TestClient(app) as client:
+        response = client.get("/settings")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "Try alternative coder (%)" in body
+    # The implementation name must not surface as a visible label.
+    assert ">exploration_epsilon<" not in body
+
+
+def test_settings_daemon_input_displays_percent_value(
+    empty_config: Path,
+) -> None:
+    """PR-233: stored fraction renders as integer percent in the input."""
+    with TestClient(app) as client:
+        client.put(
+            "/settings/daemon",
+            data={"exploration_epsilon": "10"},
+        )
+        response = client.get("/settings")
+
+    assert response.status_code == 200
+    body = response.text
+    assert re.search(
+        r'name="exploration_epsilon"[^>]*value="10"',
+        body,
+    )
 
 
 def test_put_daemon_updates_optional_timeout_fields(empty_config: Path) -> None:
@@ -876,7 +910,7 @@ def test_put_daemon_invalid_exploration_epsilon_returns_422_html(
     with TestClient(app) as client:
         response = client.put(
             "/settings/daemon",
-            data={"exploration_epsilon": "0.75"},
+            data={"exploration_epsilon": "75"},
         )
 
     assert response.status_code == 422
@@ -977,15 +1011,15 @@ def test_put_daemon_rejects_values_above_maximums(empty_config: Path) -> None:
             "/settings/daemon",
             data={"rate_limit_weekly_pause_percent": "101"},
         )
-        float_response = client.put(
+        epsilon_response = client.put(
             "/settings/daemon",
-            data={"exploration_epsilon": "0.51"},
+            data={"exploration_epsilon": "51"},
         )
 
     assert int_response.status_code == 422
     assert "at most 100" in int_response.text
-    assert float_response.status_code == 422
-    assert "at most 0.5" in float_response.text
+    assert epsilon_response.status_code == 422
+    assert "at most 50" in epsilon_response.text
 
 
 def test_put_daemon_rejects_invalid_and_too_small_exploration_epsilon(
@@ -998,13 +1032,13 @@ def test_put_daemon_rejects_invalid_and_too_small_exploration_epsilon(
         )
         too_small = client.put(
             "/settings/daemon",
-            data={"exploration_epsilon": "-0.1"},
+            data={"exploration_epsilon": "-1"},
         )
 
     assert invalid.status_code == 422
-    assert "must be a number" in invalid.text
+    assert "must be an integer" in invalid.text
     assert too_small.status_code == 422
-    assert "at least 0.0" in too_small.text
+    assert "at least 0" in too_small.text
 
 
 def test_put_daemon_does_not_probe_auth_status(
@@ -1516,7 +1550,7 @@ def test_settings_daemon_renders_hints_for_all_fields(empty_config: Path) -> Non
         "Switch to another eligible coder when the preferred one is unavailable.",
         "Re-post the review trigger when a PR times out waiting for Codex.",
         "Use the coder to diagnose ERROR before generic recovery kicks in.",
-        "Chance from 0 to 0.5 to try a different eligible coder for comparison data.",
+        "Percent (0-50) of runs that use a different eligible coder for comparison data.",
     ]
     for hint_text in hints:
         assert hint_text in body, f"Missing hint: {hint_text}"
