@@ -10,6 +10,7 @@ state when Redis has nothing yet.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
@@ -119,8 +120,11 @@ async def get_all_repo_states(
         from src.web import app as _app
 
         config_path = _app.CONFIG_PATH
-    cfg = load_config(config_path)
-    states: list[RepoState] = []
+
+    # Synchronous YAML read offloaded to a thread so the event loop
+    # stays responsive during config inspection. PR-240.
+    cfg = await asyncio.to_thread(load_config, config_path)
+
     redis_available = redis_client is not None
     redis_warning: str | None = None
 
@@ -131,23 +135,31 @@ async def get_all_repo_states(
             redis_available = False
             redis_warning = "Redis connection lost"
 
-    for repo in cfg.repositories:
-        name = repo_slug_from_url(repo.url)
-        state: RepoState | None = None
+    repos = list(cfg.repositories)
 
+    async def _resolve(repo: RepoConfig):
+        name = repo_slug_from_url(repo.url)
         if redis_available:
             state, warning = await _get_repo_state_safe(
                 redis_client, name, repo.url
             )
-            if warning == "Redis unavailable":
-                redis_available = False
-                redis_warning = "Redis connection lost"
+            return name, repo.url, state, warning
+        return name, repo.url, None, None
 
+    # Run per-repo lookups concurrently. asyncio.gather preserves
+    # order so the returned states list matches cfg.repositories
+    # ordering. PR-240.
+    results = await asyncio.gather(*[_resolve(r) for r in repos])
+
+    states: list[RepoState] = []
+    for name, repo_url, state, warning in results:
+        if warning == "Redis unavailable":
+            redis_available = False
+            redis_warning = "Redis connection lost"
         if state is None:
-            state = _default_repo_state(name, repo.url)
+            state = _default_repo_state(name, repo_url)
             state.state = PipelineState.PREFLIGHT
             state.error_message = "Redis unavailable — state unknown"
-
         states.append(state)
 
     return states, redis_warning
