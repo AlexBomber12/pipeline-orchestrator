@@ -144,16 +144,33 @@ def test_no_inline_error_writes_outside_primitive():
     ``state.state = PipelineState.ERROR`` directly. All ERROR
     transitions go through ``_transition_to_error``.
 
-    The primitive itself contains the only legitimate inline write
-    and is whitelisted by file path.
+    The primitive's own body contains the single legitimate inline
+    write; the whitelist is scoped to that body's line range, not the
+    whole file, so future regressions in ``runner.py`` outside the
+    primitive still surface here.
     """
+    import ast
     import pathlib
     import re
 
     daemon_root = pathlib.Path("src/daemon")
     pattern = re.compile(r"self\.state\.state\s*=\s*PipelineState\.ERROR")
     primitive_file = daemon_root / "runner.py"
-    primitive_marker = "async def _transition_to_error"
+    primitive_name = "_transition_to_error"
+
+    primitive_text = primitive_file.read_text()
+    primitive_tree = ast.parse(primitive_text)
+    primitive_ranges: list[tuple[int, int]] = [
+        (node.lineno, node.end_lineno or node.lineno)
+        for node in ast.walk(primitive_tree)
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        and node.name == primitive_name
+    ]
+    assert len(primitive_ranges) == 1, (
+        f"Expected exactly one definition of {primitive_name} in "
+        f"{primitive_file}, found {len(primitive_ranges)}"
+    )
+    primitive_start, primitive_end = primitive_ranges[0]
 
     offenders: list[str] = []
     for path in daemon_root.rglob("*.py"):
@@ -161,11 +178,11 @@ def test_no_inline_error_writes_outside_primitive():
         for lineno, line in enumerate(text.splitlines(), start=1):
             if not pattern.search(line):
                 continue
-            if path == primitive_file:
-                # Whitelist the primitive itself (single legitimate write).
-                preceding = "\n".join(text.splitlines()[: lineno])
-                if primitive_marker in preceding:
-                    continue
+            if (
+                path == primitive_file
+                and primitive_start <= lineno <= primitive_end
+            ):
+                continue
             offenders.append(f"{path}:{lineno}: {line.strip()}")
 
     assert not offenders, (
