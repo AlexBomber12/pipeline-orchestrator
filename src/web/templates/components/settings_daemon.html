@@ -158,19 +158,19 @@
                 </span>
             </label>
             <label class="flex flex-col gap-1 text-sm cursor-pointer">
-                <span class="text-gray-400">Exploration epsilon</span>
+                <span class="text-gray-400" title="Probability the daemon selects a different eligible coder than the configured one for variety/comparison data. 0% = always use the configured coder. 50% = roughly half the runs use the alternative.">Try alternative coder (%)</span>
                 <input type="number"
                        name="exploration_epsilon"
-                       value="{{ daemon.exploration_epsilon }}"
+                       value="{{ (daemon.exploration_epsilon * 100) | round | int }}"
                        min="0"
-                       max="0.5"
-                       step="0.01"
+                       max="50"
+                       step="1"
                        class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
                        hx-put="/settings/daemon"
                        hx-trigger="change"
                        hx-target="#settings-daemon"
                        hx-swap="innerHTML">
-                <span class="text-xs text-gray-500">Chance from 0 to 0.5 to try a different eligible coder for comparison data.</span>
+                <span class="text-xs text-gray-500">Percent (0-50) of runs that use a different eligible coder for comparison data.</span>
             </label>
         </div>
     </section>

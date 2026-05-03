@@ -325,7 +325,7 @@ def test_put_settings_daemon_writes_config_sets_dirty_publishes_wake_for_all_rep
         client.app.state.redis = fake
         response = client.put(
             "/settings/daemon",
-            data={"exploration_epsilon": "0.25"},
+            data={"exploration_epsilon": "25"},
         )
 
     assert response.status_code == 200
@@ -385,7 +385,7 @@ def test_config_watcher_still_serves_as_fallback_after_settings_daemon_put(
             client.app.state.redis = fake
             response = client.put(
                 "/settings/daemon",
-                data={"exploration_epsilon": "0.4"},
+                data={"exploration_epsilon": "40"},
             )
         assert response.status_code == 200
         # The synchronous dirty flag is already in place; the watcher's

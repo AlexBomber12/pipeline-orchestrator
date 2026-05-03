@@ -61,23 +61,6 @@ def _coerce_int(
     return parsed
 
 
-def _coerce_float(
-    value: str,
-    field: str,
-    min_value: float | None = None,
-    max_value: float | None = None,
-) -> float:
-    try:
-        parsed = float(value.strip())
-    except ValueError as exc:
-        raise ValueError(f"{field} must be a number") from exc
-    if min_value is not None and parsed < min_value:
-        raise ValueError(f"{field} must be at least {min_value}")
-    if max_value is not None and parsed > max_value:
-        raise ValueError(f"{field} must be at most {max_value}")
-    return parsed
-
-
 def _build_coder_rows(
     config: AppConfig, auth: dict[str, dict[str, str]]
 ) -> list[dict[str, Any]]:
@@ -339,12 +322,13 @@ async def put_settings_daemon(
             exploration_epsilon is not None
             and exploration_epsilon != ""
         ):
-            updates["exploration_epsilon"] = _coerce_float(
+            percent = _coerce_int(
                 exploration_epsilon,
                 "exploration_epsilon",
-                min_value=0.0,
-                max_value=0.5,
+                min_value=0,
+                max_value=50,
             )
+            updates["exploration_epsilon"] = percent / 100.0
         if (
             rate_limit_session_pause_percent is not None
             and rate_limit_session_pause_percent != ""
