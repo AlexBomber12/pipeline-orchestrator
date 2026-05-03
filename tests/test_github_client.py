@@ -2231,7 +2231,6 @@ def test_get_pr_metadata_single_call(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result["author"] == "alice"
     assert result["head_sha"] == "abc123"
     assert result["head_commit_date"] == "2026-04-15T12:00:00Z"
-    assert result["pr_created_at"] == ""
     assert len(invocations) == 2
 
 
@@ -2246,12 +2245,7 @@ def test_get_pr_metadata_returns_empty_on_error(
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     result = get_pr_metadata("owner/name", 42)
-    assert result == {
-        "author": "",
-        "head_sha": "",
-        "head_commit_date": "",
-        "pr_created_at": "",
-    }
+    assert result == {"author": "", "head_sha": "", "head_commit_date": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -2849,7 +2843,6 @@ def test_get_pr_metadata_returns_empty_on_invalid_json_string(
         "author": "",
         "head_sha": "",
         "head_commit_date": "",
-        "pr_created_at": "",
     }
 
 
@@ -2865,7 +2858,6 @@ def test_get_pr_metadata_parses_json_string_without_commit_lookup(
         "author": "alice",
         "head_sha": "",
         "head_commit_date": "",
-        "pr_created_at": "",
     }
 
 
@@ -2878,7 +2870,6 @@ def test_get_pr_metadata_returns_empty_on_non_mapping_payload(
         "author": "",
         "head_sha": "",
         "head_commit_date": "",
-        "pr_created_at": "",
     }
 
 
@@ -2896,7 +2887,6 @@ def test_get_pr_metadata_ignores_commit_date_error(
         "author": "alice",
         "head_sha": "abc123",
         "head_commit_date": "",
-        "pr_created_at": "",
     }
 
 
@@ -4840,36 +4830,4 @@ def test_get_pr_metadata_extracts_nested_user_and_head(
         "author": "alice",
         "head_sha": "abc123",
         "head_commit_date": "2026-04-15T12:00:00Z",
-        "pr_created_at": "",
-    }
-
-
-def test_get_pr_metadata_includes_pr_created_at(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """PR-239: get_pr_metadata exposes the PR's own ``created_at`` so
-    callers can use it as a defense-in-depth dedup anchor when the
-    commit-detail endpoint has not yet propagated for a fresh push and
-    ``head_commit_date`` would otherwise be empty."""
-    pr_body = (
-        '{"user": {"login": "alice"}, "head": {"sha": "abc123"}, '
-        '"created_at": "2026-05-03T03:10:30Z"}'
-    )
-    commit_body = '{"commit": {"committer": {"date": "2026-05-03T03:10:42Z"}}}'
-
-    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        path = next((a for a in cmd if a.startswith("repos/")), "")
-        if "/pulls/" in path:
-            return _FakeCompletedProcess(stdout=_build_include_response(pr_body, etag='W/"p2"'))
-        if "/commits/" in path:
-            return _FakeCompletedProcess(stdout=_build_include_response(commit_body, etag='W/"c2"'))
-        return _FakeCompletedProcess(stdout="")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    assert get_pr_metadata("owner/name", 42) == {
-        "author": "alice",
-        "head_sha": "abc123",
-        "head_commit_date": "2026-05-03T03:10:42Z",
-        "pr_created_at": "2026-05-03T03:10:30Z",
     }
