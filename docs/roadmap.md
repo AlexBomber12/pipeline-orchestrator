@@ -2,7 +2,7 @@
 
 Живой документ. Обновляется после каждой merge'нутой волны и после каждой chat-session.
 
-Последнее обновление: 2026-05-02 (major cleanup pass: deleted Active investigations + broken Work Modes blocks 528 lines, replaced with compact Lessons learned appendix; collapsed Implementation Audit summary to 5 lines; rewrote Risks section for current Sprint 13/14; rewrote Open questions reflecting today's strategic confirmations; demoted Multi-tier agent to Vision E; sprint nomenclature unified Sprint 12-17. Strategic confirmations today: License Apache 2.0 ASAP actionable (current LICENSE is MIT, not AGPL as memory implied), Vision A Sprint 17+, SQLite migration before Thompson, PR-FUTURE-7 eliminate QUEUE.md confirmed, PR-FUTURE-4 tier scaffolder after Sprint 13 OBS-AX, Telegram bot Vision D Sprint 17+. OBS-BI Path A locked. OBS-BG codex non-determinism explicitly NOT added (operator deliberate choice; defense-in-depth via existing pre-merge sync re-trigger). Sprint 14 expanded with OBS-BK + OBS-BL + OBS-BM totaling 9-11 PRs ~27h. Earlier session work: OBS-BE expanded scope, Cancellation policy v1, v1.1 refinements, Vision C companion app, Vision D conversational morning triage 4-stage gating, throughput baseline corrected to 25-30 PR/day. File reduced from 2790 to ~2200 lines).
+Последнее обновление: 2026-05-02 (MCP server design decisions resolved: Q1 storage = filesystem only, all documents in git in orchestrator repo, no SQLite for MCP (SQLite migration remains separately scheduled for Sprint 17 metrics scope only); Q2 AGENTS.md conflict detection = combo (onboarding-time scan Sprint 13 + inline scan during validate_task_spec Sprint 14 + periodic scan at daemon sync Sprint 14, all using deterministic pattern-match in v1, LLM-based grey area detection deferred to v2); Q3 LLM editing policy for managed repo = advisory in SKILL.md v1 Sprint 13 + pre-commit hook enforcement v2 Sprint 15+. MCP section now in architectural decisions state, implementation pending Sprint 13 spec generation. Earlier same-day work: major cleanup pass, sprint nomenclature unified Sprint 12-17, OBS-BE expanded scope, Cancellation policy v1 with v1.1 refinements, Vision C companion app, Vision D conversational morning triage 4-stage gating, Sprint 14 expanded with OBS-BK + OBS-BL + OBS-BM. Throughput baseline 25-30 PR/day. License Apache 2.0 ASAP confirmed Sprint 13).
 
 Предыдущие: 2026-05-01 (PR-180..PR-207 shipped, все 28 PR merged. Multi-repo isolation audit complete, parallel run_cycle in main loop deployed. Foundation Sprint 36 PR specs generated for PR-208..PR-236 batch, internal architecture cleanup. Architectural future work section added for post-Foundation: AGENTS template scope, per-repo config, onboarding wizard, CI script generator MICRO PR. Onboarding of megaraid-dashboard и sms-gateway-v2 actively in progress; reconciled AGENTS.md files prepared, scripts/ci.sh manual creation required pre-onboarding due to scaffolder stub trap), 2026-04-29 (full roadmap rewrite на основе Implementation Audit), 2026-04-28 (sigkill recovery test multi-race resolved via PR-228/PR-232/PR-234/PR-236; production daemon deployed on fresh main; GraphQL quota burn analyzed; onboarding test subjects identified), 2026-04-27 (OBS-AA test pollution v1 misdiagnosis + v2 docker-exec fix; OBS-Y premature merge; Multi-tier agent direction; OBS-Z Codex EYES race), 2026-04-26 (Sprint F1.0 + PR-156/157 + PR-158/159 merged; Variant D direction; Development model & Layer 2 substrate observations), 2026-04-24 (after code audit zip __27__).
 
@@ -295,6 +295,167 @@ Wave 5 cumulative including existing OBS-AW + OBS-BB + OBS-BC: approximately 1.5
 - **OBS-BB:** FIX no-push deadlock recovery. Adjacent stuck-state work.
 - **OBS-BC:** CI infra-failure classification. Determines retry vs ESCALATED vs CANCELED for INFRA trigger category.
 - **Vision C (Orchestrator Companion App):** future `SignalSource` implementation candidate. Design hook in this section's Layer 3 keeps companion-app integration mechanically simple when product surface expands.
+
+---
+
+## MCP server as bar for agents (architectural decision, 2026-05-02)
+
+Architectural decision recorded 2026-05-02. Three core design questions resolved (storage filesystem-only, conflict detection combo, LLM editing advisory v1). Implementation pending Sprint 13 spec generation. NO PR specs generated yet.
+
+### Origin of the discussion
+
+Operator observed 2026-05-02 that another Claude session generated 56 task specs for megaraid-dashboard repo, of which 3 were rejected by the existing validator (`src/queue_parser.py:parse_task_header` + `validate_queue`). Failures were schema violations: `Depends on: all P1 merged` (natural language, expected `none|PR-XXX(,PR-XXX)*`), creative filenames `Pr 008`, `Pr migrate 01` (expected `PR-XXX.md`). 5% error rate is tolerable but indicates systemic class: LLM-generators with TASK_SCHEMA.md context still produce non-conformant output. Validator catches but post-hoc; generator does not self-correct.
+
+Initial framings explored and discarded as костыли:
+- Pre-upload linter (catches but does not prevent generation drift)
+- Template-based generation (reduces variance but does not eliminate)
+- Schema-as-program / schema-as-conversation (architectural overkill)
+
+Operator pivot: the right primitive is a **feedback loop** that lets the generator validate during generation, not afterward. Right tool is **MCP server** (Model Context Protocol). Operator metaphor: "MCP - это бар для агентов, куда они всегда могут прийти сами." Tools standing on the wall, agents come pull what they need.
+
+### What MCP changes architecturally
+
+Today scaffolder = file copy strategy (push model). Templates dumped into managed repos at onboarding, drift inevitable as schema evolves. Fix in template requires manual re-scaffold of all managed repos.
+
+MCP changes to pull model. Managed repos hold minimum (one-line CLAUDE.md redirect, one .claude/skills/SKILL.md tied to MCP tools). Schema, validators, templates, presets all live on MCP server. LLM in any repo session connects, asks for fresh content. Schema evolves in one place, automatic across all clients. Zero re-scaffold.
+
+### Tool surface (initial sketch, not final)
+
+Validation:
+- `validate_task_spec(content) -> {valid, errors}` - wraps `parse_task_header` + `validate_queue`
+- `get_task_schema() -> markdown` - returns canonical TASK_SCHEMA.md content
+
+Onboarding:
+- `get_agents_md_template(repo_slug) -> markdown` - wraps existing `src/onboarding/agents_md_template.py:daemon_managed_content`
+- `get_claude_md_redirect() -> string` - returns canonical "Read and follow AGENTS.md..." text
+- `onboard_repo(name, genre, ...) -> instructions` - interactive wizard: detect ci.sh exists, AGENTS.md present, branch protections, return ordered next steps
+
+Spec authoring helpers:
+- `lint_spec(content) -> suggestions` - beyond schema validity (e.g. references unknown PR, missing success criteria, paths don't exist)
+- `suggest_next_pr_number(repo) -> int` - auto-allocates next free slot, prevents PR numbering rule violations
+
+Project state (Sprint 14+ scope, not v1):
+- `get_active_tasks(repo) -> list` - replaces parsing QUEUE.md text by shim
+- `get_done_metrics(repo, since) -> records` - for Vision D digest, for DONE-row inline display
+- `get_repo_status(name) -> {state, current_pr, presence}` - same data dashboard sees
+
+### v1 minimal viable tool set (what ships first)
+
+Only enough to solve immediate problem (5% broken specs) plus structural primitives:
+- `validate_task_spec(content)`
+- `get_task_schema()`
+- `get_agents_md_template(repo_slug)`
+- `suggest_next_pr_number(repo)`
+
+Other tools deferred to Sprint 14+ when actual usage patterns inform priorities.
+
+### Per-repo footprint after MCP shift
+
+Each managed repo holds only:
+- `AGENTS.md` - top-level user-authored prose + daemon-managed sections wrapped in HTML markers (PR-192a/b/c framework, already shipped)
+- `CLAUDE.md` - single line "Read and follow AGENTS.md in this repository." (OBS-AX fix, Sprint 13)
+- `.claude/skills/orch-context/SKILL.md` - instruction for Claude to use MCP tools when generating task specs
+- `scripts/ci.sh` - repo-specific (not template)
+- `tasks/` directory with PR-*.md files - repo's own queue
+
+What is NEVER copied to managed repos:
+- TASK_SCHEMA.md (retrieved via `get_task_schema` MCP tool on demand)
+- Validator code (lives only in MCP server)
+- Onboarding checklists, coder priors, presets
+
+This collapses scaffolder template logic from ~600 lines to ~20 lines (just placement of three files: CLAUDE.md, SKILL.md, optionally AGENTS.md scaffold for new repos).
+
+### Design decisions confirmed 2026-05-02
+
+- **Transport:** HTTP on `localhost:5173` (or other port). FastMCP supports HTTP and stdio; HTTP simpler for docker-service deployment, works with WSL2 (localhost bridges between Windows host and WSL2 container).
+- **Deployment:** docker compose service alongside daemon, web, redis. One more service in stack. `docker compose up mcp` starts it.
+- **Schema versioning:** not implemented v1. `get_task_schema()` returns latest. Version bumps only when migration story emerges.
+- **Network reach:** self-hosted scope only for foreseeable future. Operator + laptop + home server in same network. WSL2 self-host works via localhost. Multi-tenant / cloud reach is Vision territory.
+- **CODER_PRIORS.md placement:** stays in orchestrator repo (not exposed via MCP). It is orchestrator-internal selector data, not cross-repo invariant.
+
+### Resolved 2026-05-02 (was open questions, now decisions)
+
+**Storage layer: filesystem only, no SQLite for MCP.**
+
+All MCP-served documents live in git as plain files in orchestrator repo:
+- `docs/TASK_SCHEMA.md` (read by `get_task_schema` tool)
+- `src/onboarding/agents_md_template.py` (read by `get_agents_md_template` tool)
+- `docs/CODER_PRIORS.md` (orchestrator-internal, not MCP-served)
+- Any future templates / presets ship as files in orchestrator repo
+
+To update schema: edit `docs/TASK_SCHEMA.md`, commit via standard PR workflow, deploy stack (`docker compose up -d --build`). Git history preserved, code review preserved, rollback via git revert. No admin UI to maintain, no DB schema migrations to coordinate, no backup story to design.
+
+SQLite migration remains scheduled for Sprint 17 territory **before Thompson Sampling**, but its scope is **metrics only** (Scenario A from memory item #25): long-term RunRecord aggregation for posterior stability. MCP server is independent of that migration.
+
+**AGENTS.md conflict detection: combo with pattern-matching first pass.**
+
+Three layers stacked:
+
+1. **Onboarding-time scan (Sprint 13).** When `onboard_repo` MCP tool runs against a target repo, server reads existing AGENTS.md (if any), runs pattern check for known anti-patterns ("draft PR", "force push", "skip CI", "use --force", etc.), surfaces conflicts as operator-readable list. Operator must resolve before onboarding completes. No automatic merge.
+
+2. **Inline scan during spec generation (Sprint 14).** `validate_task_spec(content, target_repo)` extends to also run conflict check on target_repo's AGENTS.md. Cached by AGENTS.md hash: if AGENTS.md unchanged since last clean scan, skip re-check. Pattern-match only in v1 (deterministic, fast). LLM-based open-ended detection deferred to v2 if false-negative rate proves problematic.
+
+3. **Periodic scan (Sprint 14).** Daemon at AGENTS.md sync time (when daemon overwrites managed sections) re-runs conflict check on user-authored regions. New conflict surfaces on dashboard event log + halts new CODING for that repo until operator triages. Existing in-flight PRs continue.
+
+Pattern check in v1 is a list of regex / substring rules: `r"\bdraft\b.*\bPR\b"`, `r"--draft"`, `r"force.{0,5}push"`, `r"skip\s+CI"`. Each matches a known anti-pattern. Deterministic, no LLM call, no API cost. List grows as new anti-patterns identified.
+
+LLM-based grey area scan (v2 candidate) would catch semantic conflicts (e.g. user prose says "always require human review for refactor PRs" while orchestrator template implies coder can self-merge after CI green). Pattern-match misses this. v2 only if v1 misses things in production.
+
+**LLM editing policy: advisory v1 + pre-commit hook v2.**
+
+v1 (Sprint 13): SKILL.md content placed in `.claude/skills/orch-context/` of each managed repo includes:
+
+```
+## Editing AGENTS.md
+
+You may edit user-authored sections (outside HTML markers) when explicitly
+asked by the operator. You must NEVER edit content between
+<!-- BEGIN: orchestrator-managed --> and <!-- END: orchestrator-managed -->
+markers; these are owned by the daemon and will be overwritten on next
+sync. If you believe orchestrator-managed content needs to change, do not
+edit it directly: instead inform the operator that the daemon-side
+template (in pipeline-orchestrator repo) needs update.
+```
+
+Advisory only. LLM may ignore, but daemon's next sync cycle restores managed sections. Self-healing through regeneration.
+
+v2 (Sprint 15+): pre-commit hook in managed repos. Triggered on `git commit`. Reads AGENTS.md, computes hash of managed-marker region, compares against last-synced hash stored in `.git/hooks/orch-managed-hash`. If differs, refuses commit with message "managed section modified, run `orch sync agents` to reset".
+
+Hook installation by scaffolder during onboarding. Operator can disable per-repo via `.git/hooks/orch-managed-hash.disable` flag if intentional override needed.
+
+Brutal alternative considered and rejected: read-only file mode (`chmod -w AGENTS.md`). Too disruptive for operators editing user-authored region in same file.
+
+### Roadmap impact (if MCP path is taken)
+
+Several PR-FUTURE items collapse into MCP tool implementations rather than separate projects:
+
+| PR-FUTURE item | After MCP becomes |
+|---|---|
+| PR-FUTURE-1 (AGENTS.md template scope cleanup) | `get_agents_md_template(genre)` MCP tool, schema lives server-side |
+| PR-FUTURE-2 (per-repo config inheritance) | `get_repo_config(name)` MCP tool, daemon owns config |
+| PR-FUTURE-3 (onboarding wizard UI) | `onboard_repo` MCP tool + thin web wrapper |
+| PR-FUTURE-4 (AI-driven scaffold) | sequence of MCP calls in one Claude conversation, not separate code |
+| PR-FUTURE-7 (eliminate QUEUE.md) | `get_active_tasks` MCP tool, shim consumes via MCP not file parse |
+
+This is a significant simplification of post-Sprint-16 architectural plan. Several "future PRs" become "MCP tools added in Sprint 13-15 as needed."
+
+### Sprint 13 batch implication (proposed, not committed)
+
+If MCP path taken, Sprint 13 would reshape:
+
+- MCP server core (FastMCP service, validate_task_spec + get_task_schema + get_agents_md_template + suggest_next_pr_number tools, docker compose service entry) - 1 PR ~3-4h
+- OBS-AX scaffolder simplification (replace template-copy logic with placement of CLAUDE.md redirect + SKILL.md pointing at MCP, instead of bundling TASK_SCHEMA.md and validator into managed repos) - 1 PR ~2h
+- OBS-AY UI freeze fix - unchanged, 2-3 PRs ~5h
+- License Apache 2.0 switch - unchanged, 1 PR ~1h
+
+Total revised Sprint 13: 5-6 PRs / ~11-12 daemon-hours (was 4-5 PRs / ~8 daemon-hours). Increment of ~3-4 hours buys substantial architectural simplification downstream.
+
+### What remains open
+
+- Final tool list for Sprint 14+ phases (depends on actual usage patterns of v1 tools)
+- Whether to ship MCP server in Sprint 13 alongside other batch items, or split into Sprint 13.5 if Sprint 13 scope creep concerns arise
+
+This section will be updated when Sprint 13 specs are written and shipped.
 
 ---
 
