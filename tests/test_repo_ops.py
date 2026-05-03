@@ -68,9 +68,16 @@ class _Runner(repo_ops.RepoOpsMixin):
         self.name = "demo"
         self.events: list[str] = []
         self._crashed_task_pr_ids: set[str] = set()
+        self._recovered_task_pr_ids: set[str] = set()
+        self._recovered_persist_calls: list[frozenset[str]] = []
 
     def log_event(self, message: str) -> None:
         self.events.append(message)
+
+    async def _persist_recovered_task_pr_ids(self) -> None:
+        self._recovered_persist_calls.append(
+            frozenset(self._recovered_task_pr_ids)
+        )
 
 
 def _run(coro: Any) -> Any:
@@ -885,6 +892,38 @@ def test_process_pending_uploads_clears_crashed_pr_ids_on_reupload(
 
     assert _run(runner.process_pending_uploads()) is True
     assert runner._crashed_task_pr_ids == {"PR-999"}
+
+
+def test_process_pending_uploads_clears_recovered_pr_ids_on_reupload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """PR-247 follow-up: Re-uploading a task file the operator canceled
+    via the HUNG recover button is the user's signal to retry. The
+    recovered-pr-ids set must be cleared for any uploaded PR-id so the
+    next IDLE cycle no longer forces it CANCELED, mirroring the PR-186
+    contract for the crashed-pr-ids set. Other recovered entries that
+    were not re-uploaded must remain intact."""
+    runner = _Runner(tmp_path)
+    runner._recovered_task_pr_ids.update({"PR-001", "PR-999"})
+    Path(runner.repo_path).mkdir(parents=True)
+    staging = tmp_path / "uploads" / "demo"
+    staging.mkdir(parents=True)
+    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
+    key = f"upload:{runner.name}:pending"
+    manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
+    runner.redis.store[key] = manifest
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
+    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
+    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
+
+    assert _run(runner.process_pending_uploads()) is True
+    assert runner._recovered_task_pr_ids == {"PR-999"}
+    # PR-247 follow-up: the trimmed recovered-task set must be persisted
+    # so a daemon restart immediately after upload does not rehydrate
+    # the stale set from Redis and re-cancel the freshly retried task.
+    assert runner._recovered_persist_calls == [frozenset({"PR-999"})]
 
 
 def test_process_pending_uploads_clears_canceled_queue_rows_on_reupload(

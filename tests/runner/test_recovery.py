@@ -455,6 +455,116 @@ def test_select_next_task_from_dag_preserves_doing_for_crashed_task_with_visible
     assert "PR-001" not in runner._crashed_task_pr_ids
 
 
+def test_select_next_task_from_dag_cancels_recovered_task_with_visible_pr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """PR-247 follow-up: HUNG recover button records the trapped task in
+    ``_recovered_task_pr_ids`` and the IDLE selector must force CANCELED
+    even when the still-open PR derives the task back to DOING. Without
+    the unconditional override the next IDLE cycle would reattach the
+    runner to WATCH on the same stuck PR — defeating the recover button.
+    Distinct from ``_crashed_task_pr_ids`` whose semantics intentionally
+    discard on DOING (a stale-API artifact worth honoring)."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Trapped task\n\n"
+        "Branch: pr-001-trapped\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+    (tasks_dir / "PR-002.md").write_text(
+        "# PR-002: Healthy follow-up\n\n"
+        "Branch: pr-002-healthy\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = [
+        PRInfo(number=42, branch="pr-001-trapped", pr_id="PR-001"),
+    ]
+    runner._idle_merged_prs = []
+    runner._recovered_task_pr_ids.add("PR-001")
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-002"
+    assert task.status == TaskStatus.TODO
+    assert runner._idle_dag_statuses == {
+        "PR-001": TaskStatus.CANCELED,
+        "PR-002": TaskStatus.TODO,
+    }
+    assert "PR-001" in runner._recovered_task_pr_ids
+    queue_md = runner._generate_queue_md(
+        runner._idle_dag_headers,
+        runner._idle_dag_statuses,
+    )
+    assert "## PR-001" in queue_md
+    assert "- Status: CANCELED" in queue_md
+
+
+def test_select_next_task_from_dag_clears_recovered_flag_when_done(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A recovered task that ends up DONE (e.g. the PR was merged after
+    the operator hit recover) must clear the recovered flag so the task
+    is not perpetually marked CANCELED in the regenerated QUEUE.md."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Recovered but later merged\n\n"
+        "Branch: pr-001-merged\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: {"PR-001"})
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+    runner._recovered_task_pr_ids.add("PR-001")
+
+    asyncio.run(runner._select_next_task_from_dag())
+
+    assert runner._idle_dag_statuses == {"PR-001": TaskStatus.DONE}
+    assert "PR-001" not in runner._recovered_task_pr_ids
+
+
 def test_select_next_task_from_dag_clears_crashed_flag_when_done(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -494,6 +604,193 @@ def test_select_next_task_from_dag_clears_crashed_flag_when_done(
 
     assert runner._idle_dag_statuses == {"PR-001": TaskStatus.DONE}
     assert "PR-001" not in runner._crashed_task_pr_ids
+
+
+def test_recover_state_hydrates_recovered_task_pr_ids_from_redis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-247 follow-up: ``recover_state`` must hydrate
+    ``_recovered_task_pr_ids`` from Redis on startup. Without this the
+    operator-recovery marker is purely process-local and a daemon
+    restart between the recover click and the user's task re-upload
+    would lose the marker; ``recover_state`` would rehydrate the
+    QUEUE.md ``CANCELED`` row into ``_crashed_task_pr_ids`` instead,
+    and the IDLE selector would discard the stricter override on the
+    still-open PR re-deriving DOING — reattaching the runner to WATCH
+    on the same stuck PR. Hydrating from Redis preserves the
+    ``_recovered_task_pr_ids`` override across restarts so the abandon
+    contract holds."""
+    import json
+
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [],
+    )
+
+    runner = h._make_runner()
+    runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
+    asyncio.run(
+        runner.redis.set(
+            f"recovered_tasks:{runner.name}",
+            json.dumps(["PR-100", "PR-200"]),
+        )
+    )
+
+    asyncio.run(runner.recover_state())
+
+    assert runner._recovered_task_pr_ids == {"PR-100", "PR-200"}
+
+
+def test_persist_recovered_task_pr_ids_deletes_key_when_set_is_empty(
+) -> None:
+    """An empty in-memory set must clear the persisted snapshot — leaving
+    a stale snapshot would re-cancel the just-retried task on the next
+    daemon restart."""
+    runner = h._make_runner()
+    asyncio.run(runner.redis.set(f"recovered_tasks:{runner.name}", "[]"))
+
+    asyncio.run(runner._persist_recovered_task_pr_ids())
+
+    assert f"recovered_tasks:{runner.name}" not in runner.redis.store
+
+
+def test_persist_recovered_task_pr_ids_swallows_redis_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Redis write failure must not crash the recovery transition. The
+    in-memory state still reflects the operator's intent; only the
+    cross-restart guarantee is forfeited for that one failure."""
+    runner = h._make_runner()
+    runner._recovered_task_pr_ids.add("PR-001")
+
+    async def _boom_set(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("redis down")
+
+    monkeypatch.setattr(runner.redis, "set", _boom_set)
+
+    asyncio.run(runner._persist_recovered_task_pr_ids())
+
+    assert runner._recovered_task_pr_ids == {"PR-001"}
+
+
+def test_load_recovered_task_pr_ids_ignores_corrupt_payload(
+) -> None:
+    """A corrupt JSON payload in Redis must be tolerated; we cannot let a
+    bad snapshot block startup recovery. The in-memory set stays empty
+    and the next persist write rebuilds the snapshot cleanly."""
+    runner = h._make_runner()
+    asyncio.run(
+        runner.redis.set(f"recovered_tasks:{runner.name}", "{not-json")
+    )
+
+    asyncio.run(runner._load_recovered_task_pr_ids())
+
+    assert runner._recovered_task_pr_ids == set()
+
+
+def test_recover_state_doing_task_in_recovered_set_stays_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-247 follow-up: a DOING entry in QUEUE.md whose PR-ID is in the
+    persisted operator-recovered set must NOT be re-attached to WATCH
+    even when a matching open PR is visible. The IDLE cycle that would
+    have rewritten the row to CANCELED never ran (or its snapshot was
+    not yet visible), so the row still reads DOING. Without this
+    bypass, ``recover_state`` would dutifully reattach the runner to
+    WATCH on the stuck PR — defeating the recover button across
+    restarts. The IDLE selector's stricter override surfaces CANCELED
+    on the next cycle."""
+    import json
+
+    task = QueueTask(
+        pr_id="PR-100",
+        title="Operator-abandoned mid-CODING",
+        status=TaskStatus.DOING,
+        branch="pr-100-stuck",
+    )
+
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [PRInfo(number=42, branch="pr-100-stuck")],
+    )
+
+    runner = h._make_runner()
+    runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    asyncio.run(
+        runner.redis.set(
+            f"recovered_tasks:{runner.name}",
+            json.dumps(["PR-100"]),
+        )
+    )
+
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.current_pr is None
+    assert "PR-100" in runner._recovered_task_pr_ids
+    # PR-186 crashed-task path must NOT have run for this entry; the
+    # stronger recovered override owns it.
+    assert "PR-100" not in runner._crashed_task_pr_ids
+    assert any(
+        "Operator-recovered task PR-100 still DOING in queue" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_recover_state_records_pending_queue_sync_before_recovered_doing_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-247 follow-up: when both an operator-recovered DOING task and an
+    open ``queue-done-*`` queue-sync PR exist at startup, the queue-sync
+    marker MUST be recorded before recovery exits IDLE for the recovered
+    task. ``handle_idle`` gates dispatch on
+    ``state.pending_queue_sync_branch``; without this ordering the daemon
+    would resume dispatching new work while the queue-sync PR is still
+    open, regressing the prior contract that pending sync is recorded
+    before any DOING-path early return."""
+    import json
+    from datetime import datetime, timezone
+
+    task = QueueTask(
+        pr_id="PR-100",
+        title="Operator-abandoned mid-CODING",
+        status=TaskStatus.DOING,
+        branch="pr-100-stuck",
+    )
+    sync_started_at = datetime(2026, 4, 19, 12, 0, tzinfo=timezone.utc)
+    pending_sync = PRInfo(
+        number=301,
+        branch="queue-done-20260419",
+        last_activity=sync_started_at,
+    )
+
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [
+            PRInfo(number=42, branch="pr-100-stuck"),
+            pending_sync,
+        ],
+    )
+
+    runner = h._make_runner()
+    runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    asyncio.run(
+        runner.redis.set(
+            f"recovered_tasks:{runner.name}",
+            json.dumps(["PR-100"]),
+        )
+    )
+
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.pending_queue_sync_branch == "queue-done-20260419"
+    assert runner.state.pending_queue_sync_started_at == sync_started_at
 
 
 def test_dirty_tree_auto_recovery_after_3_cycles(

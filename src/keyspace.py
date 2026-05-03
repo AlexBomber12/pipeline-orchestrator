@@ -30,6 +30,34 @@ def control_config_dirty(repo_name: str) -> str:
     return f"control:{repo_name}:config_dirty"
 
 
+def control_recover(repo_name: str) -> str:
+    """One-shot recovery signal written by the web layer for HUNG repos.
+
+    The HUNG handler reads-and-clears this key to exit HUNG and return to
+    IDLE without waiting for the operator to merge or close the parked PR
+    (PR-247).
+    """
+    return f"control:{repo_name}:recover"
+
+
+def recovered_tasks(repo_name: str) -> str:
+    """Persisted PR-IDs the operator abandoned via the HUNG recover button.
+
+    JSON-encoded sorted list of PR-IDs. The daemon hydrates the
+    in-memory ``_recovered_task_pr_ids`` set from this key in
+    ``recover_state`` and adds to it from
+    ``_perform_operator_recovery``; ``process_pending_uploads`` removes
+    any uploaded PR-IDs and rewrites the snapshot. Without this
+    persistence a daemon restart between the recover click and the
+    user's task re-upload would lose the marker, ``recover_state`` would
+    rehydrate the CANCELED row into ``_crashed_task_pr_ids`` instead,
+    and the IDLE selector would discard the override on the still-open
+    PR deriving back to ``DOING`` — defeating the recover button's
+    "abandon until re-upload" contract (PR-247 follow-up).
+    """
+    return f"recovered_tasks:{repo_name}"
+
+
 def upload_pending(repo_name: str) -> str:
     """Key for the pending-upload manifest consumed by the daemon."""
     return f"upload:{repo_name}:pending"

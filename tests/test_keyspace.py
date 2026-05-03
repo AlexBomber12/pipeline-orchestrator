@@ -32,6 +32,14 @@ def test_control_config_dirty_format() -> None:
     )
 
 
+def test_control_recover_format() -> None:
+    assert keyspace.control_recover("alpha") == "control:alpha:recover"
+    assert (
+        keyspace.control_recover("owner__repo")
+        == "control:owner__repo:recover"
+    )
+
+
 def test_upload_pending_format() -> None:
     assert keyspace.upload_pending("alpha") == "upload:alpha:pending"
     assert keyspace.upload_pending("owner__repo") == "upload:owner__repo:pending"

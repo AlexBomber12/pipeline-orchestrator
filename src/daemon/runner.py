@@ -86,6 +86,7 @@ from src.keyspace import (
     control_config_dirty,
     control_stop,
     pipeline_state,
+    recovered_tasks,
     upload_pending,
 )
 from src.metrics import MetricsStore, RunRecord
@@ -287,6 +288,12 @@ class PipelineRunner(
         # task is not re-picked into a crash loop. Cleared when the user
         # re-uploads the task file.
         self._crashed_task_pr_ids: set[str] = set()
+        # PR-247 follow-up: Tasks the operator explicitly canceled via the
+        # HUNG recover button. Distinct from ``_crashed_task_pr_ids``
+        # because this set must NOT be discarded when the task derives
+        # back to ``DOING`` from a still-open PR — that PR is the stuck
+        # work item the operator just abandoned. Cleared on task re-upload.
+        self._recovered_task_pr_ids: set[str] = set()
         self._user_pause_logged = False
         self._pending_repo_config: RepoConfig | None = None
         self._pending_app_config: AppConfig | None = None
@@ -1153,6 +1160,67 @@ class PipelineRunner(
         except Exception:
             return
         self.state.user_paused = persisted.user_paused
+
+    async def _persist_recovered_task_pr_ids(self) -> None:
+        """Snapshot ``_recovered_task_pr_ids`` to Redis (best-effort).
+
+        PR-247 follow-up: the operator-recovery contract is "abandon
+        the trapped task until the user re-uploads the task file." A
+        daemon restart between the recover click and the re-upload
+        would otherwise lose the in-memory marker; ``recover_state``
+        would then read the CANCELED row from QUEUE.md, rehydrate it
+        into ``_crashed_task_pr_ids`` (whose IDLE-selector override
+        intentionally discards on a still-open PR re-deriving DOING),
+        and reattach the runner to WATCH on the same stuck PR. Storing
+        the set in Redis lets ``recover_state`` hydrate the stricter
+        ``_recovered_task_pr_ids`` override across restarts so the
+        abandon contract holds.
+
+        Best-effort: a Redis failure here logs but does not raise. The
+        in-memory transition still completes; only the cross-restart
+        guarantee is forfeited for that one failure, and the next
+        recover/upload write will retry the snapshot.
+        """
+        key = recovered_tasks(self.name)
+        try:
+            if self._recovered_task_pr_ids:
+                payload = json.dumps(sorted(self._recovered_task_pr_ids))
+                await self.redis.set(key, payload)
+            else:
+                await self.redis.delete(key)
+        except Exception as exc:
+            logger.warning(
+                "%s: failed to persist recovered_task_pr_ids: %s",
+                self.name, exc,
+            )
+
+    async def _load_recovered_task_pr_ids(self) -> None:
+        """Hydrate ``_recovered_task_pr_ids`` from Redis on startup.
+
+        Called by ``recover_state`` before the queue rehydrate so the
+        IDLE selector's stricter ``_recovered_task_pr_ids`` override
+        applies to PR-IDs the operator abandoned in a prior daemon
+        lifetime (PR-247 follow-up).
+        """
+        key = recovered_tasks(self.name)
+        try:
+            raw = await self.redis.get(key)
+        except Exception as exc:
+            logger.warning(
+                "%s: failed to load recovered_task_pr_ids: %s",
+                self.name, exc,
+            )
+            return
+        if not raw:
+            return
+        try:
+            loaded = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if isinstance(loaded, list):
+            self._recovered_task_pr_ids.update(
+                str(pr_id) for pr_id in loaded if isinstance(pr_id, str)
+            )
 
     async def _pop_stop_request(self) -> bool:
         """Return True when a pending stop control signal exists."""

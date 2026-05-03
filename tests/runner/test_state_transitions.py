@@ -1675,6 +1675,201 @@ def test_handle_hung_transitions_to_idle_when_pr_resolved(
     assert runner.state.current_task is None
 
 
+def test_handle_hung_consumes_operator_recovery_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-247: a one-shot ``control:{name}:recover`` flag transitions the
+    runner from HUNG back to IDLE without nudging the reviewer or checking
+    the upstream PR state."""
+    gh_calls: list[object] = []
+    posted: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(
+        "src.github.gh_runner.run_gh",
+        lambda *a, **kw: gh_calls.append((a, kw)) or {"state": "OPEN"},
+    )
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(number=42, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="parked", status=TaskStatus.DOING
+    )
+    runner._error_skip_active = True
+    runner._idle_dispatch_deferred = True
+
+    asyncio.run(runner.redis.set(f"control:{runner.name}:recover", "1"))
+    asyncio.run(runner.handle_hung())
+
+    # Recovery short-circuits the @codex review and PR-state probe paths.
+    assert posted == []
+    assert gh_calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.current_pr is None
+    assert runner.state.error_message is None
+    assert runner._error_skip_active is False
+    assert runner._idle_dispatch_deferred is False
+    # Flag is consumed (read-and-clear).
+    assert f"control:{runner.name}:recover" not in runner.redis.store
+    # Trapped task is recorded so the next IDLE cycle does not re-derive
+    # it as DOING from the still-open PR and reattach to WATCH.
+    assert "PR-001" in runner._recovered_task_pr_ids
+    # Operator-visible event records the recovery cause.
+    assert any(
+        "[RECOVERY] Operator-initiated recovery from HUNG" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_handle_hung_runs_normal_path_when_no_recovery_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the recover flag, ``handle_hung`` falls through to the
+    @codex review fallback exactly as before PR-247."""
+    posted: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(
+        "src.github.gh_runner.run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(number=99, branch="pr-099")
+
+    asyncio.run(runner.handle_hung())
+
+    assert posted == [(runner.owner_repo, 99, "@codex review")]
+    assert runner.state.state == PipelineState.WATCH
+
+
+def test_handle_hung_recovery_signal_getdel_atomicity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The recover flag's read-and-clear is atomic via Redis GETDEL.
+
+    A non-atomic read-then-delete can leave a stale recover key when
+    delete fails, which would trigger an unintended auto-recovery on a
+    later, unrelated HUNG state inside the TTL window. Verifies the
+    handler invokes ``getdel`` (the atomic primitive) and does not fall
+    back to a separate ``delete`` call."""
+    monkeypatch.setattr(
+        "src.github.gh_runner.run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(number=11, branch="pr-011")
+
+    asyncio.run(runner.redis.set(f"control:{runner.name}:recover", "1"))
+
+    getdel_calls: list[str] = []
+    original_getdel = runner.redis.getdel
+
+    async def _tracking_getdel(key: str) -> str | None:
+        getdel_calls.append(key)
+        return await original_getdel(key)
+
+    async def _forbidden_delete(_key: str) -> int:
+        raise AssertionError(
+            "handle_hung must use atomic getdel, not a separate delete"
+        )
+
+    monkeypatch.setattr(runner.redis, "getdel", _tracking_getdel)
+    monkeypatch.setattr(runner.redis, "delete", _forbidden_delete)
+
+    asyncio.run(runner.handle_hung())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert getdel_calls == [f"control:{runner.name}:recover"]
+    assert f"control:{runner.name}:recover" not in runner.redis.store
+
+
+def test_handle_hung_persists_recovered_task_pr_ids_to_redis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-247 follow-up: ``_perform_operator_recovery`` must snapshot the
+    in-memory ``_recovered_task_pr_ids`` set to Redis. Without this, a
+    daemon restart between the recover click and the user's task re-
+    upload would lose the marker; ``recover_state`` would rehydrate the
+    QUEUE.md ``CANCELED`` row into ``_crashed_task_pr_ids`` instead, and
+    the IDLE selector would discard the stricter override on the still-
+    open PR re-deriving DOING — reattaching the runner to WATCH on the
+    same stuck PR. Persisting the set lets the next recover_state cycle
+    hydrate the stronger ``_recovered_task_pr_ids`` override across
+    restarts so the abandon contract holds."""
+    monkeypatch.setattr(
+        "src.github.gh_runner.run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda *a, **kw: None,
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(number=42, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="parked", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.redis.set(f"control:{runner.name}:recover", "1"))
+    asyncio.run(runner.handle_hung())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert "PR-001" in runner._recovered_task_pr_ids
+    raw = runner.redis.store.get(f"recovered_tasks:{runner.name}")
+    assert raw is not None, (
+        "operator recovery must snapshot _recovered_task_pr_ids to Redis"
+    )
+    import json as _json
+    assert _json.loads(raw) == ["PR-001"]
+
+
+def test_handle_hung_recovery_signal_getdel_failure_falls_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``getdel`` Redis error must fail closed: stay HUNG, do not
+    invent a recovery transition the operator did not request."""
+    posted: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(
+        "src.github.gh_runner.run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.HUNG
+    runner.state.current_pr = PRInfo(number=11, branch="pr-011")
+
+    async def _boom_getdel(_key: str) -> str | None:
+        raise RuntimeError("redis down")
+
+    monkeypatch.setattr(runner.redis, "getdel", _boom_getdel)
+
+    asyncio.run(runner.handle_hung())
+
+    # Falls through to the @codex review path -> WATCH (default fallback).
+    assert runner.state.state == PipelineState.WATCH
+    assert posted == [(runner.owner_repo, 11, "@codex review")]
+
+
 def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None:
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
