@@ -181,6 +181,19 @@ def test_settings_nav_link_present_on_dashboard(empty_config: Path) -> None:
     assert 'href="/settings"' in response.text
 
 
+def test_settings_page_styles_dark_select_options(empty_config: Path) -> None:
+    """Dark theme must style native <select> option dropdowns so they don't
+    fall back to the OS default (e.g. white-on-black on macOS Chrome)."""
+    with TestClient(app) as client:
+        response = client.get("/settings")
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'html[data-theme="dark"] select option' in body
+    assert 'html[data-theme="dark"] select option:checked' in body
+    assert 'html[data-theme="dark"] select option:hover' in body
+
+
 def test_settings_partial_returns_fragment(one_repo_config: Path) -> None:
     with TestClient(app) as client:
         response = client.get("/partials/settings/repo-list")

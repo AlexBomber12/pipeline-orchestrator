@@ -423,6 +423,23 @@
             border-color: rgb(var(--neutral-rgb) / 0.3);
             color: var(--text-3);
         }
+
+        /* PR-232: dark-theme select option styling. Native <option> styling has
+           limited cross-browser support; Firefox on Linux may ignore these
+           rules. Chrome and Safari honor them. */
+        html[data-theme="dark"] select option {
+            background-color: #1f2937;
+            color: #e5e7eb;
+        }
+
+        html[data-theme="dark"] select option:checked {
+            background-color: #374151;
+            color: #ffffff;
+        }
+
+        html[data-theme="dark"] select option:hover {
+            background-color: #374151;
+        }
     </style>
 </head>
 <body class="bg-surface-1 text-gray-200 min-h-screen">
