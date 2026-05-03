@@ -1951,7 +1951,7 @@ def test_get_pr_author_returns_empty_on_oserror(
 def test_has_recent_codex_review_request_respects_after_iso(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Comments created at or before ``after_iso`` must not count as
+    """Comments created strictly before ``after_iso`` must not count as
     duplicates. This is what lets the daemon re-request a review for a
     new commit even when its own prior trigger for an earlier commit is
     still within the time window and shares the PR author login."""
@@ -1983,6 +1983,45 @@ def test_has_recent_codex_review_request_respects_after_iso(
             after_iso=just_now,
         )
         is False
+    )
+
+
+def test_has_recent_codex_review_request_counts_same_second(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-239 regression: a comment created in the same UTC second as
+    ``after_iso`` must count as a valid trigger. GitHub timestamps are
+    second-granular, so a coder posting ``@codex review`` within one
+    second of pushing the head commit produces an equal stringified
+    timestamp; ``<=`` would have skipped it and the daemon would have
+    posted a duplicate trigger."""
+    import json as _json
+
+    same_second = _iso_utc_now_minus(30)
+    pages = [
+        [
+            {
+                "user": {"login": "same-user"},
+                "body": "@codex review",
+                "created_at": same_second,
+            }
+        ]
+    ]
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(stdout=_json.dumps(pages))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        has_recent_codex_review_request(
+            "owner/name",
+            42,
+            pr_author="same-user",
+            within_minutes=5,
+            after_iso=same_second,
+        )
+        is True
     )
 
 

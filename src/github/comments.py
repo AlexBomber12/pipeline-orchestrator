@@ -131,7 +131,13 @@ def get_recent_codex_review_request_time(
         if "@codex review" not in (c.get("body") or "").lower():
             continue
         created_raw = c.get("created_at") or ""
-        if after_iso and (not created_raw or created_raw <= after_iso):
+        # Strict-less-than (not <=) lets same-second comments count. GitHub
+        # ISO-8601 timestamps are second-granularity; a coder posting
+        # ``@codex review`` within one second of pushing the commit produces
+        # equal stringified timestamps. PR-239 fixed the regression where
+        # same-second comments were skipped from dedup and daemon posted a
+        # duplicate trigger.
+        if after_iso and (not created_raw or created_raw < after_iso):
             continue
         created = gh_runner._parse_iso(created_raw)
         if created is None:
