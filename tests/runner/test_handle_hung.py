@@ -310,3 +310,141 @@ def test_codex_review_post_failure_does_not_increment_counter(
     # Counter is unchanged: the cap accounts only for *successful* nudges,
     # so a transient gh outage cannot accelerate escalation.
     assert pr.watch_retrigger_count == 1
+
+
+def test_hung_refresh_resets_counter_on_fresh_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real GH event between WATCH and HUNG resets the counter via in-HUNG refresh.
+
+    ``handle_watch`` zeroes ``watch_retrigger_count`` only while it is
+    the active handler. If a Codex comment / push lands after the WATCH
+    timeout escalation but before the next HUNG cycle, the counter
+    would otherwise still be at the pre-event value and the cap could
+    false-escalate an active PR. The refresh inside ``handle_hung``
+    must reset on a signature change.
+    """
+    posted: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+    monkeypatch.setattr(
+        "src.github.gh_runner.run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
+    fresh_pr = PRInfo(
+        number=99,
+        branch="pr-099",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [fresh_pr],
+    )
+
+    runner = h._make_runner()
+    runner.app_config.daemon.watch_retrigger_cap = 3
+    runner.state.state = PipelineState.HUNG
+    pr = PRInfo(
+        number=99,
+        branch="pr-099",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.EYES,
+        watch_retrigger_count=2,
+    )
+    runner.state.current_pr = pr
+
+    asyncio.run(runner.handle_hung())
+
+    # Cap would have escalated at 2->3; the signature change resets to 0
+    # first, so this cycle posts and increments to 1 instead.
+    assert posted == [(runner.owner_repo, 99, "@codex review")]
+    assert runner.state.state == PipelineState.WATCH
+    assert pr.is_escalated is False
+    assert pr.watch_retrigger_count == 1
+
+
+def test_hung_refresh_no_signature_change_still_escalates_at_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the refresh shows no fresh activity, the cap still fires."""
+    posted: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+    gh_calls = _patch_label_calls(monkeypatch)
+    same_pr = PRInfo(
+        number=99,
+        branch="pr-099",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.EYES,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [same_pr],
+    )
+
+    runner = h._make_runner()
+    runner.app_config.daemon.watch_retrigger_cap = 3
+    runner.state.state = PipelineState.HUNG
+    pr = PRInfo(
+        number=99,
+        branch="pr-099",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.EYES,
+        watch_retrigger_count=2,
+    )
+    runner.state.current_pr = pr
+
+    asyncio.run(runner.handle_hung())
+
+    # Identical signature -> no reset -> cap fires as before.
+    assert posted == []
+    assert runner.state.state == PipelineState.HUNG
+    assert pr.is_escalated is True
+    assert ["pr", "edit", "99", "--add-label", "escalated"] in gh_calls
+
+
+def test_hung_refresh_failure_stays_hung(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``get_open_prs`` failure during the cap-check refresh fail-safes to HUNG.
+
+    Without the fail-safe, a transient GH API blip could silently
+    short-circuit the activity check, leaving the original code path
+    free to false-escalate an active PR.
+    """
+    posted: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: posted.append((repo, number, body)),
+    )
+    monkeypatch.setattr(
+        "src.github.gh_runner.run_gh",
+        lambda *a, **kw: {"state": "OPEN"},
+    )
+
+    def boom(repo: str, **kw: Any) -> list[PRInfo]:
+        raise RuntimeError("gh down")
+
+    monkeypatch.setattr("src.github.prs.get_open_prs", boom)
+
+    runner = h._make_runner()
+    runner.app_config.daemon.watch_retrigger_cap = 3
+    runner.state.state = PipelineState.HUNG
+    pr = PRInfo(number=99, branch="pr-099", watch_retrigger_count=2)
+    runner.state.current_pr = pr
+
+    asyncio.run(runner.handle_hung())
+
+    assert posted == []
+    assert runner.state.state == PipelineState.HUNG
+    assert pr.is_escalated is False
+    assert pr.watch_retrigger_count == 2
+    assert any(
+        "failed to refresh PR activity for cap check" in entry["event"]
+        for entry in runner.state.history
+    )

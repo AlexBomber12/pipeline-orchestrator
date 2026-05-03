@@ -382,6 +382,38 @@ class HungMixin:
             # forever. ``watch_retrigger_count`` resets on fresh review
             # activity in handle_watch, so genuine progress always
             # restores the full budget; only stuck cycles trip the cap.
+            #
+            # Re-check PR activity here too: ``handle_watch`` only resets
+            # the counter while it is the active handler, so a fresh
+            # event arriving between the WATCH-timeout escalation and
+            # this HUNG cycle would otherwise leave the counter stale
+            # and false-escalate an active PR. Compare a fresh fetch
+            # against ``current_pr`` (which holds the last WATCH-fetched
+            # snapshot) and reset on a real change. Fail-safe: any
+            # refresh error stays HUNG instead of escalating.
+            try:
+                prs_now = gh_prs.get_open_prs(
+                    self.owner_repo,
+                    allow_merge_without_checks=(
+                        self.repo_config.allow_merge_without_checks
+                    ),
+                )
+            except Exception as exc:
+                self.log_event(
+                    f"[ESCALATE] hung: failed to refresh PR activity "
+                    f"for cap check: {exc}; staying HUNG."
+                )
+                return
+            found_now = next(
+                (p for p in prs_now if p.number == current_pr.number),
+                None,
+            )
+            if found_now is not None and (
+                found_now.review_status != current_pr.review_status
+                or found_now.ci_status != current_pr.ci_status
+                or found_now.last_activity != current_pr.last_activity
+            ):
+                current_pr.watch_retrigger_count = 0
             cap = self.app_config.daemon.watch_retrigger_cap
             next_count = current_pr.watch_retrigger_count + 1
             if next_count >= cap:
