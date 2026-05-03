@@ -82,8 +82,10 @@ class CodingMixin:
 
         Reads top-down as a state-machine flow with three phases:
 
-        1. ``_prepare_coder_invocation`` — auth refresh, rate-limit check,
-           run record start, breach env allocation, kwargs build.
+        1. ``_prepare_coder_invocation`` — rate-limit check, run record
+           start, breach env allocation, kwargs build. Auth refresh
+           happens before ``_get_coder`` so the selector sees fresh
+           statuses.
         2. ``_run_coder_with_supervision`` — subprocess plus stop and
            breach monitors; resolves user-stop and breach pauses.
         3. ``_post_coder_resolution`` — CLI log save, exit classification,
@@ -95,6 +97,10 @@ class CodingMixin:
             if self.state.current_task is not None
             else None
         )
+        # Refresh auth before _get_coder so the selector sees fresh
+        # statuses; selecting first would let a stale/empty auth cache
+        # pick an ineligible coder that no later refresh can undo.
+        await self._refresh_auth_status_cache()
         coder_name, plugin = self._get_coder()
 
         target_branch = (
@@ -140,7 +146,7 @@ class CodingMixin:
         coder_name: str,
         plugin: CoderPlugin,
     ) -> dict[str, Any]:
-        """Refresh auth, start run record, check rate limit, build kwargs.
+        """Start run record, check rate limit, allocate breach env, build kwargs.
 
         Returns the kwargs dict ready to pass to ``plugin.run_planned_pr``.
         Allocates the breach env via ``_breach_env`` and stores it on
@@ -148,8 +154,11 @@ class CodingMixin:
         teardown without re-creating it. Raises ``CoderUnavailable`` if
         the rate-limit check blocks invocation; in that case the runner
         state has already been moved to PAUSED and the run record saved.
+
+        Auth refresh happens in ``handle_coding`` before ``_get_coder`` so
+        the selector can act on fresh statuses; running it here would be
+        too late to re-select on stale credentials.
         """
-        await self._refresh_auth_status_cache()
         plugin_run_kwargs = plugin.build_run_kwargs(
             daemon_config=self.app_config.daemon,
         )

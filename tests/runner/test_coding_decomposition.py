@@ -305,3 +305,43 @@ def test_post_coder_resolution_routes_to_diagnose_on_no_pr(
     )
 
     assert diagnose_calls == [("pr-001", coder_name)]
+
+
+# ---------- handle_coding ordering ----------
+
+
+def test_handle_coding_refreshes_auth_before_selecting_coder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``handle_coding`` must refresh the auth-status cache before calling
+    ``_get_coder``. ``_select_coder`` reads ``self._auth_status_cache``, so
+    selecting first against an empty/stale cache could pick an ineligible
+    coder that no later refresh can undo within this run."""
+    runner = _runner_with_task(monkeypatch)
+    runner._auth_status_cache = {}
+    runner._auth_status_cache_expires_at = None
+
+    order: list[str] = []
+
+    async def fake_refresh() -> None:
+        order.append("refresh")
+
+    original_get_coder = runner._get_coder
+
+    def spy_get_coder(*args: Any, **kwargs: Any):
+        order.append("select")
+        return original_get_coder(*args, **kwargs)
+
+    async def stop_after_prepare(coder_name: str, plugin) -> dict[str, Any]:
+        order.append("prepare")
+        raise CoderUnavailable("test-stop")
+
+    monkeypatch.setattr(runner, "_refresh_auth_status_cache", fake_refresh)
+    monkeypatch.setattr(runner, "_get_coder", spy_get_coder)
+    monkeypatch.setattr(
+        runner, "_prepare_coder_invocation", stop_after_prepare
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert order == ["refresh", "select", "prepare"]
