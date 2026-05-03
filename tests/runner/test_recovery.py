@@ -455,6 +455,116 @@ def test_select_next_task_from_dag_preserves_doing_for_crashed_task_with_visible
     assert "PR-001" not in runner._crashed_task_pr_ids
 
 
+def test_select_next_task_from_dag_cancels_recovered_task_with_visible_pr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """PR-247 follow-up: HUNG recover button records the trapped task in
+    ``_recovered_task_pr_ids`` and the IDLE selector must force CANCELED
+    even when the still-open PR derives the task back to DOING. Without
+    the unconditional override the next IDLE cycle would reattach the
+    runner to WATCH on the same stuck PR — defeating the recover button.
+    Distinct from ``_crashed_task_pr_ids`` whose semantics intentionally
+    discard on DOING (a stale-API artifact worth honoring)."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Trapped task\n\n"
+        "Branch: pr-001-trapped\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+    (tasks_dir / "PR-002.md").write_text(
+        "# PR-002: Healthy follow-up\n\n"
+        "Branch: pr-002-healthy\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = [
+        PRInfo(number=42, branch="pr-001-trapped", pr_id="PR-001"),
+    ]
+    runner._idle_merged_prs = []
+    runner._recovered_task_pr_ids.add("PR-001")
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-002"
+    assert task.status == TaskStatus.TODO
+    assert runner._idle_dag_statuses == {
+        "PR-001": TaskStatus.CANCELED,
+        "PR-002": TaskStatus.TODO,
+    }
+    assert "PR-001" in runner._recovered_task_pr_ids
+    queue_md = runner._generate_queue_md(
+        runner._idle_dag_headers,
+        runner._idle_dag_statuses,
+    )
+    assert "## PR-001" in queue_md
+    assert "- Status: CANCELED" in queue_md
+
+
+def test_select_next_task_from_dag_clears_recovered_flag_when_done(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A recovered task that ends up DONE (e.g. the PR was merged after
+    the operator hit recover) must clear the recovered flag so the task
+    is not perpetually marked CANCELED in the regenerated QUEUE.md."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Recovered but later merged\n\n"
+        "Branch: pr-001-merged\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: {"PR-001"})
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+    runner._recovered_task_pr_ids.add("PR-001")
+
+    asyncio.run(runner._select_next_task_from_dag())
+
+    assert runner._idle_dag_statuses == {"PR-001": TaskStatus.DONE}
+    assert "PR-001" not in runner._recovered_task_pr_ids
+
+
 def test_select_next_task_from_dag_clears_crashed_flag_when_done(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

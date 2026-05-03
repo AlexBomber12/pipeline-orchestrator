@@ -1715,6 +1715,9 @@ def test_handle_hung_consumes_operator_recovery_signal(
     assert runner._idle_dispatch_deferred is False
     # Flag is consumed (read-and-clear).
     assert f"control:{runner.name}:recover" not in runner.redis.store
+    # Trapped task is recorded so the next IDLE cycle does not re-derive
+    # it as DOING from the still-open PR and reattach to WATCH.
+    assert "PR-001" in runner._recovered_task_pr_ids
     # Operator-visible event records the recovery cause.
     assert any(
         "[RECOVERY] Operator-initiated recovery from HUNG" in entry["event"]
@@ -1747,13 +1750,16 @@ def test_handle_hung_runs_normal_path_when_no_recovery_signal(
     assert runner.state.state == PipelineState.WATCH
 
 
-def test_handle_hung_recovery_signal_delete_failure_still_recovers(
+def test_handle_hung_recovery_signal_getdel_atomicity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failure clearing the recover flag must not block the recovery —
-    the daemon proceeds with the IDLE transition and the next tick will
-    consume any leftover flag (idempotent because state will be IDLE,
-    not HUNG)."""
+    """The recover flag's read-and-clear is atomic via Redis GETDEL.
+
+    A non-atomic read-then-delete can leave a stale recover key when
+    delete fails, which would trigger an unintended auto-recovery on a
+    later, unrelated HUNG state inside the TTL window. Verifies the
+    handler invokes ``getdel`` (the atomic primitive) and does not fall
+    back to a separate ``delete`` call."""
     monkeypatch.setattr(
         "src.github.gh_runner.run_gh",
         lambda *a, **kw: {"state": "OPEN"},
@@ -1769,21 +1775,33 @@ def test_handle_hung_recovery_signal_delete_failure_still_recovers(
 
     asyncio.run(runner.redis.set(f"control:{runner.name}:recover", "1"))
 
-    async def _boom_delete(_key: str) -> int:
-        raise RuntimeError("delete down")
+    getdel_calls: list[str] = []
+    original_getdel = runner.redis.getdel
 
-    monkeypatch.setattr(runner.redis, "delete", _boom_delete)
+    async def _tracking_getdel(key: str) -> str | None:
+        getdel_calls.append(key)
+        return await original_getdel(key)
+
+    async def _forbidden_delete(_key: str) -> int:
+        raise AssertionError(
+            "handle_hung must use atomic getdel, not a separate delete"
+        )
+
+    monkeypatch.setattr(runner.redis, "getdel", _tracking_getdel)
+    monkeypatch.setattr(runner.redis, "delete", _forbidden_delete)
 
     asyncio.run(runner.handle_hung())
 
     assert runner.state.state == PipelineState.IDLE
+    assert getdel_calls == [f"control:{runner.name}:recover"]
+    assert f"control:{runner.name}:recover" not in runner.redis.store
 
 
-def test_handle_hung_recovery_signal_redis_failure_falls_through(
+def test_handle_hung_recovery_signal_getdel_failure_falls_through(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A Redis read failure on the recover key must not invent a recovery
-    transition — fail closed and continue with the normal HUNG path."""
+    """A ``getdel`` Redis error must fail closed: stay HUNG, do not
+    invent a recovery transition the operator did not request."""
     posted: list[tuple[str, int, str]] = []
     monkeypatch.setattr(
         "src.github.gh_runner.run_gh",
@@ -1796,17 +1814,18 @@ def test_handle_hung_recovery_signal_redis_failure_falls_through(
 
     runner = h._make_runner()
     runner.state.state = PipelineState.HUNG
-    runner.state.current_pr = PRInfo(number=7, branch="pr-007")
+    runner.state.current_pr = PRInfo(number=11, branch="pr-011")
 
-    async def _boom_get(_key: str) -> str | None:
+    async def _boom_getdel(_key: str) -> str | None:
         raise RuntimeError("redis down")
 
-    monkeypatch.setattr(runner.redis, "get", _boom_get)
+    monkeypatch.setattr(runner.redis, "getdel", _boom_getdel)
 
     asyncio.run(runner.handle_hung())
 
+    # Falls through to the @codex review path -> WATCH (default fallback).
     assert runner.state.state == PipelineState.WATCH
-    assert posted == [(runner.owner_repo, 7, "@codex review")]
+    assert posted == [(runner.owner_repo, 11, "@codex review")]
 
 
 def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None:

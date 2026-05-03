@@ -249,25 +249,27 @@ class HungMixin:
         return success
 
     async def _check_operator_recovery_signal(self) -> bool:
-        """Read-and-clear the one-shot recover flag set by the web layer.
+        """Atomically read-and-clear the one-shot recover flag.
 
-        Fails closed (returns ``False``) on any Redis error so a transient
-        outage cannot manufacture a recovery transition the operator did
-        not request. The flag carries a short TTL on the web side so a
-        stale signal cannot strand around for hours.
+        Uses Redis ``GETDEL`` so the read and the clear share a single
+        round-trip: the daemon never observes a recovery signal whose
+        clearing has not also succeeded. A non-atomic ``get`` then
+        ``delete`` could leave a stale ``control:{repo}:recover`` key
+        in place if the delete failed, then trigger an unintended
+        auto-recovery on a later, unrelated HUNG state inside the
+        web-side TTL window.
+
+        Fails closed (returns ``False``) on any Redis error so a
+        transient outage cannot manufacture a recovery transition the
+        operator did not request. The flag carries a short TTL on the
+        web side so a stale signal cannot strand around for hours.
         """
         key = control_recover(self.name)
         try:
-            raw = await self.redis.get(key)
+            raw = await self.redis.getdel(key)
         except Exception:
             return False
-        if not raw:
-            return False
-        try:
-            await self.redis.delete(key)
-        except Exception:
-            pass
-        return True
+        return bool(raw)
 
     async def _perform_operator_recovery(self) -> None:
         """Exit HUNG to IDLE on operator request (PR-247).
@@ -278,11 +280,23 @@ class HungMixin:
         hook releases ``current_pr`` and ``error_message`` when
         ``current_task`` flips to None, so we do not need to clear them
         explicitly here.
+
+        Records the trapped task in ``_recovered_task_pr_ids`` before
+        clearing it. Without this, the next ``handle_idle`` cycle would
+        re-derive the same task as ``DOING`` from the still-open PR
+        (``find_matching_open_pr`` matches by branch) and immediately
+        reattach the runner to ``WATCH`` — defeating the recover
+        button. The IDLE selector consults the set and forces
+        ``CANCELED``; the user's task re-upload clears it (matching the
+        PR-186 ``_crashed_task_pr_ids`` retry contract).
         """
         current_pr = self.state.current_pr
         pr_label = (
             f"PR #{current_pr.number}" if current_pr is not None else "no PR"
         )
+        current_task = self.state.current_task
+        if current_task is not None:
+            self._recovered_task_pr_ids.add(current_task.pr_id)
         self.log_event(
             f"[RECOVERY] Operator-initiated recovery from HUNG ({pr_label}) "
             f"-> IDLE."

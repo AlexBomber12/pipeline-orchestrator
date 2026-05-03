@@ -100,6 +100,10 @@ class _FakeRedis:
             return 1
         return 0
 
+    async def getdel(self, key: str) -> str | None:
+        self.deleted.append(key)
+        return self.store.pop(key, None)
+
     async def renamenx(self, old: str, new: str) -> int:
         if old not in self.store or new in self.store:
             return 0

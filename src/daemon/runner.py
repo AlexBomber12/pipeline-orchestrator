@@ -287,6 +287,12 @@ class PipelineRunner(
         # task is not re-picked into a crash loop. Cleared when the user
         # re-uploads the task file.
         self._crashed_task_pr_ids: set[str] = set()
+        # PR-247 follow-up: Tasks the operator explicitly canceled via the
+        # HUNG recover button. Distinct from ``_crashed_task_pr_ids``
+        # because this set must NOT be discarded when the task derives
+        # back to ``DOING`` from a still-open PR — that PR is the stuck
+        # work item the operator just abandoned. Cleared on task re-upload.
+        self._recovered_task_pr_ids: set[str] = set()
         self._user_pause_logged = False
         self._pending_repo_config: RepoConfig | None = None
         self._pending_app_config: AppConfig | None = None

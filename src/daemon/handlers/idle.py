@@ -324,6 +324,25 @@ class IdleMixin:
                     crashed_task_pr_ids.discard(pr_id)
                     continue
                 statuses[pr_id] = TaskStatus.CANCELED
+            # PR-247 follow-up: Operator-initiated HUNG recovery records
+            # the trapped task in ``_recovered_task_pr_ids``. Force its
+            # status to CANCELED unconditionally (except DONE — a real
+            # merge wins) so the still-open PR cannot re-derive DOING and
+            # bounce the runner back into WATCH on the same stuck work
+            # item. This is intentionally stronger than the PR-186
+            # crashed-task override above: there the open PR may be a
+            # stale-API artifact worth honoring; here it is the trapped
+            # PR the operator just abandoned.
+            recovered_task_pr_ids = getattr(
+                self, "_recovered_task_pr_ids", set()
+            )
+            for pr_id in list(statuses.keys()):
+                if pr_id not in recovered_task_pr_ids:
+                    continue
+                if statuses[pr_id] == TaskStatus.DONE:
+                    recovered_task_pr_ids.discard(pr_id)
+                    continue
+                statuses[pr_id] = TaskStatus.CANCELED
             eligible = get_eligible_tasks(dag_headers, statuses)
             stopped_eligible = [
                 header
