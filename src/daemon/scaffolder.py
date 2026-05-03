@@ -105,6 +105,51 @@ def _ensure_canonical_file(
     return True
 
 
+def _gitignored_paths(repo_path: str, paths: list[str]) -> set[str]:
+    """Return the subset of ``paths`` that match a gitignore rule.
+
+    Used to keep the scaffolder out of the ``git add -f`` corner: when an
+    existing repo gitignores a path the scaffolder wants to place (for
+    example ``.claude/`` covering ``.claude/skills/orch-context/SKILL.md``),
+    staging it would fail under ``check=True`` and abort onboarding. By
+    skipping ignored paths from the stage list the file still lands on
+    disk for local Claude Code use, but it is not committed.
+
+    Errors and timeouts are treated as "no paths ignored" so a probe
+    failure cannot itself block scaffolding.
+    """
+    if not paths:
+        return set()
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "--", *paths],
+            capture_output=True,
+            text=True,
+            cwd=repo_path,
+            check=False,
+            timeout=_LOCAL_GIT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logger.warning(
+            "scaffold_repo: git check-ignore timed out (%s); assuming no "
+            "paths ignored",
+            exc.cmd,
+        )
+        return set()
+    # rc=0: at least one path matched; rc=1: no paths matched. Anything
+    # else (notably 128 for fatal errors) is unexpected — log and fall
+    # back to the no-ignore assumption rather than aborting scaffolding.
+    if result.returncode not in (0, 1):
+        logger.warning(
+            "scaffold_repo: git check-ignore failed (rc=%s, stderr=%s); "
+            "assuming no paths ignored",
+            result.returncode,
+            (result.stderr or "").strip(),
+        )
+        return set()
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
 def _run_git(
     repo_path: str,
     *args: str,
@@ -318,13 +363,14 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
     repo = Path(repo_path)
     created: list[str] = []
 
+    # AGENTS.md must exist before the canonical CLAUDE.md redirect lands —
+    # otherwise CLAUDE-only repos end up pointing at a file that does not
+    # exist, and the coder loses the intended instruction source on first
+    # task pick. The previous behaviour preserved a "CLAUDE-only" snapshot,
+    # but with the canonical redirect overwriting CLAUDE.md the redirect's
+    # target must always be present.
     agents = repo / "AGENTS.md"
-    # Snapshot CLAUDE.md presence before _ensure_canonical_file overwrites
-    # it: AGENTS.md backfill must respect the original "repo already had a
-    # CLAUDE.md" semantics so existing CLAUDE.md-only repos don't grow a
-    # second AGENTS.md file alongside the redirect.
-    claude_existed = (repo / "CLAUDE.md").exists()
-    if not agents.exists() and not claude_existed:
+    if not agents.exists():
         _copy_template("AGENTS.md", agents)
         created.append("AGENTS.md")
     if _ensure_canonical_file(repo, "CLAUDE.md", _CLAUDE_MD_CANONICAL):
@@ -389,10 +435,22 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
     # is created on disk for read consumers (dashboard, recovery) but is
     # gitignored too (PR-181) — the daemon regenerates it deterministically
     # each IDLE cycle, so committing it would just create push noise.
-    to_stage = [
+    candidate_paths = [
         path for path in created
         if not path.endswith("/") and path not in _GITIGNORE_ENTRIES
     ]
+    # Drop paths the repo's own .gitignore would block. Without this filter
+    # ``git add`` would fail for repos that ignore ``.claude/`` (or similar
+    # patterns covering scaffolded files), aborting onboarding mid-cycle.
+    # AGENTS.md forbids ``git add -f`` and gitignored-stage workarounds, so
+    # an ignored scaffold path stays on disk for local use only.
+    ignored = _gitignored_paths(repo_path, candidate_paths)
+    if ignored:
+        logger.info(
+            "scaffold_repo skipping gitignored paths: %s",
+            ", ".join(sorted(ignored)),
+        )
+    to_stage = [path for path in candidate_paths if path not in ignored]
     committed_new_files = False
 
     if to_stage:
