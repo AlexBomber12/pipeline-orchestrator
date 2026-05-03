@@ -635,7 +635,8 @@
                 setFavicon(normalFavicon);
             }
 
-            setInterval(checkAlerts, 10000);
+            const checkAlertsIntervalId = setInterval(checkAlerts, 10000);
+            window.addEventListener('beforeunload', () => clearInterval(checkAlertsIntervalId));
             checkAlerts();
         })();
     </script>
