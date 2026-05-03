@@ -73,6 +73,11 @@ class PRInfo(BaseModel):
     observed_head_shas: set[str] = Field(default_factory=set)
     fix_iteration_count: int = 0
     no_push_fix_count: int = 0
+    # OBS-BL (PR-249): WATCH<->HUNG retrigger cycles counted to cap
+    # ``daemon.watch_retrigger_cap`` runaway codex-silent loops where
+    # ``handle_hung`` would otherwise post ``@codex review`` and reset
+    # WATCH indefinitely. Reset on fresh review activity.
+    watch_retrigger_count: int = 0
     url: str = ""
     last_activity: datetime | None = None
     is_escalated: bool = False

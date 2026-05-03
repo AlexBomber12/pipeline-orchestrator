@@ -144,6 +144,13 @@ class WatchMixin:
                 "no_push_fix_count": current_pr.no_push_fix_count,
                 "observed_head_shas": merged_shas,
                 "push_count": merged_push_count,
+                # Preserve OBS-BL (PR-249) counter across the GitHub-fetched
+                # PR refresh. ``_observe_watch_event_signature`` has already
+                # zeroed ``current_pr.watch_retrigger_count`` if a fresh
+                # event arrived this cycle, so reading it here naturally
+                # resets the new ``found`` on real progress and preserves
+                # the count when the PR is still stuck.
+                "watch_retrigger_count": current_pr.watch_retrigger_count,
             }
         )
         self.state.current_pr = found
@@ -270,6 +277,12 @@ class WatchMixin:
         self._watch_last_event_signature = signature
         if prior is not None and prior != signature:
             self._watch_last_event_at = datetime.now(timezone.utc)
+            # OBS-BL (PR-249): a real GitHub event = "make progress";
+            # zero the WATCH<->HUNG retrigger cap counter so genuine
+            # codex activity always restores the full retry budget.
+            current_pr = self.state.current_pr
+            if current_pr is not None:
+                current_pr.watch_retrigger_count = 0
 
     def _has_new_codex_feedback_since_last_push(self) -> FeedbackCheckResult:
         """Check whether Codex posted any comment after ``self._last_push_at``.

@@ -376,6 +376,28 @@ class HungMixin:
             self.app_config.daemon.hung_fallback_codex_review
             and current_pr is not None
         ):
+            # OBS-BL (PR-249): cap the WATCH<->HUNG retrigger cycle so a
+            # codex-silent loop (auto-trigger drop, infrastructure
+            # outage, model unavailable) cannot burn operator API budget
+            # forever. ``watch_retrigger_count`` resets on fresh review
+            # activity in handle_watch, so genuine progress always
+            # restores the full budget; only stuck cycles trip the cap.
+            cap = self.app_config.daemon.watch_retrigger_cap
+            next_count = current_pr.watch_retrigger_count + 1
+            if next_count >= cap:
+                await self._escalate_to_hung(
+                    f"watch_retrigger_cap_reached: {next_count} cycles "
+                    f"with no fresh review activity",
+                    apply_escalated_label=True,
+                    set_pr_escalated_flag=True,
+                    label_create_log_prefix="watch retrigger cap",
+                    log_message=(
+                        f"PR #{current_pr.number} watch_retrigger cap "
+                        f"reached ({next_count}/{cap}); escalating "
+                        f"instead of resetting WATCH."
+                    ),
+                )
+                return
             try:
                 gh_comments.post_comment(
                     self.owner_repo,
@@ -391,6 +413,7 @@ class HungMixin:
                     publish=False,
                 )
                 return
+            current_pr.watch_retrigger_count = next_count
             current_pr.last_activity = datetime.now(timezone.utc)
             self.state.state = PipelineState.WATCH
             self.log_event("[ESCALATE] posted @codex review -> WATCH.")
