@@ -109,7 +109,7 @@ class _FakePipeline:
         self.commands: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
 
     async def get(self, key: str) -> str | None:
-        return self.redis.store.get(key)
+        return await self.redis.get(key)
 
     def multi(self) -> None:
         return None
@@ -1150,6 +1150,135 @@ def test_recover_endpoint_succeeds_when_publish_wake_fails(
         "publish_wake failed for example__alpha" in rec.getMessage()
         for rec in caplog.records
     )
+
+
+def test_recover_endpoint_uses_atomic_check_and_set(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The HUNG-state check and the recover-flag write must execute inside
+    a single ``WATCH``/``MULTI`` transaction on the pipeline-state key.
+
+    Without the atomic guard, a daemon cycle could move the repo out of
+    HUNG between the check and the write — the endpoint would still return
+    200 and leave a recover flag that a later, unrelated HUNG episode
+    would consume within the 5-minute TTL, causing an unexpected
+    auto-recovery. This test pins the contract that the SET is queued
+    inside the same transaction that watches ``pipeline:{name}``.
+    """
+    transaction_calls: list[dict[str, object]] = []
+
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.HUNG,
+    )
+
+    class _SpyRedis(_FakeRedis):
+        async def transaction(
+            self,
+            func,
+            *watches: str,
+            value_from_callable: bool = False,
+            **kwargs: object,
+        ):
+            pipe = _FakePipeline(self)
+            func_value = func(pipe)
+            if asyncio.iscoroutine(func_value):
+                func_value = await func_value
+            transaction_calls.append(
+                {
+                    "watches": watches,
+                    "queued": list(pipe.commands),
+                }
+            )
+            exec_value = await pipe.execute()
+            if value_from_callable:
+                return func_value
+            return exec_value
+
+    fake = _SpyRedis({"pipeline:example__alpha": stored.model_dump_json()})
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/recover")
+
+    assert response.status_code == 200
+    assert len(transaction_calls) == 1
+    call = transaction_calls[0]
+    assert call["watches"] == ("pipeline:example__alpha",)
+    queued = [
+        (cmd, args) for cmd, args, _kw in call["queued"]
+    ]
+    assert ("set", ("control:example__alpha:recover", "1")) in queued
+
+
+def test_recover_endpoint_aborts_when_state_changes_during_transaction(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Race: a daemon cycle moves the repo out of HUNG between the
+    endpoint's ``WATCH`` and the ``EXEC``.
+
+    redis-py's ``Redis.transaction(...)`` retries the callback on
+    ``WatchError``; on the retry the callback re-reads the state via the
+    pipeline, finds it is no longer HUNG, and aborts with 400. No flag
+    must be written and no wake event must be published.
+    """
+    hung = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.HUNG,
+    )
+    idle = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+    )
+
+    class _RaceRedis(_FakeRedis):
+        """Models redis-py's retry behavior on ``WatchError``.
+
+        In real Redis, a watched key changing between ``WATCH`` and
+        ``EXEC`` causes ``EXEC`` to fail; redis-py re-invokes the
+        callback against the new value. We collapse both observations
+        into the single callback invocation here by serving the
+        post-race value the first time the callback reads the watched
+        key. The endpoint must therefore observe the state change on
+        its very first ``pipe.get`` and abort with 400.
+        """
+
+        async def transaction(
+            self,
+            func,
+            *watches: str,
+            value_from_callable: bool = False,
+            **kwargs: object,
+        ):
+            for key in watches:
+                if key in self.store:
+                    self.store[key] = idle.model_dump_json()
+            pipe = _FakePipeline(self)
+            func_value = func(pipe)
+            if asyncio.iscoroutine(func_value):
+                func_value = await func_value
+            exec_value = await pipe.execute()
+            if value_from_callable:
+                return func_value
+            return exec_value
+
+    fake = _RaceRedis({"pipeline:example__alpha": hung.model_dump_json()})
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/recover")
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"] == "recovery_only_from_hung"
+    assert body["current_state"] == PipelineState.IDLE.value
+    assert "control:example__alpha:recover" not in fake.store
+    assert fake.published == []
 
 
 @pytest.mark.parametrize(
