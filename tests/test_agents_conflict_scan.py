@@ -203,6 +203,22 @@ def test_force_push_feature_branch_inline_comment_about_main_not_flagged():
     assert "force_push_main" not in types
 
 
+def test_force_push_feature_branch_separatorless_prose_about_main_not_flagged():
+    """Prose continuation without a separator must not let the scanner
+    walk through several whitespace-delimited prose words into a later
+    sentence-ending mention of ``main``. The walk caps at five
+    intermediate arg tokens, so the seven prose-and-arg tokens between
+    ``git push`` and ``main.`` keep this benign feature-branch push
+    out of the force-push-to-main bucket."""
+    body = (
+        "git push --force-with-lease origin feature/foo "
+        "then open PR to main."
+    )
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" not in types
+
+
 def test_force_push_main_alt_detected():
     body = "Operator may force-push to main as a last resort."
     violations = scan_for_conflicts(body)

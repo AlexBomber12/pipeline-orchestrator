@@ -37,20 +37,27 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         # command itself, treating the args as whitespace-separated
         # tokens that contain no command-terminator chars (``,;|&#``).
         # ``#`` starts a shell comment, so anything after it is prose,
-        # not a refspec. That ties the ``main`` match to the actual
-        # push refspec, so prose after a separator -- e.g.
+        # not a refspec. The walks are bounded to at most 5 intermediate
+        # arg tokens so that prose continuations such as
+        # ``... feature/foo then open PR to main.`` cannot trickle the
+        # ``main`` match past the actual command arg list, while still
+        # tolerating realistic flag-heavy invocations such as
+        # ``--no-verify --force --tags --set-upstream origin main``
+        # (5 tokens before ``main``). Combined with the existing
+        # separator terminators, this keeps prose mentions of ``main``
+        # on the same line from being flagged when the command
+        # genuinely targets a feature branch -- e.g.
         # ``git push --force-with-lease origin feature/foo, then PR to main``
         # or
-        # ``git push --force-with-lease origin feature/foo # PR to main``
-        # -- is not flagged. The standard arm requires both a
-        # ``--force``/``-f`` flag token AND a refspec token whose
-        # destination resolves to ``main`` (whitespace-bounded
-        # ``main`` or ``refs/heads/main``, optionally prefixed by
-        # ``<src>:``). The ``--force`` token excludes
-        # ``--force-if-includes`` (alone a no-op) but still matches
-        # ``--force`` and ``--force-with-lease[=ref]``. The plus-prefix
-        # arm catches ``+<refspec>`` targeting ``main``, which
-        # ``git push -h`` documents as equivalent force behavior.
+        # ``git push --force-with-lease origin feature/foo # PR to main``.
+        # The standard arm requires both a ``--force``/``-f`` flag
+        # token AND a refspec token whose destination resolves to
+        # ``main`` (whitespace-bounded ``main`` or ``refs/heads/main``,
+        # optionally prefixed by ``<src>:``). The ``--force`` token
+        # excludes ``--force-if-includes`` (alone a no-op) but still
+        # matches ``--force`` and ``--force-with-lease[=ref]``. The
+        # plus-prefix arm catches ``+<refspec>`` targeting ``main``,
+        # which ``git push -h`` documents as equivalent force behavior.
         re.compile(
             r"\bgit push\b"
             r"(?:"
@@ -58,13 +65,13 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
             # refspec token, in any order, both within the command's
             # arg list.
             r"(?="
-            r"(?:[ \t]+[^\s,;|&#]+)*?"
+            r"(?:[ \t]+[^\s,;|&#]+){0,5}?"
             r"[ \t]+"
             r"(?:--force(?:-with-lease(?:=[^\s,;|&#]*)?)?|-f)"
             r"(?![\w-])"
             r")"
             r"(?="
-            r"(?:[ \t]+[^\s,;|&#]+)*?"
+            r"(?:[ \t]+[^\s,;|&#]+){0,5}?"
             r"[ \t]+"
             r"(?:[^\s:,;|&#]+:)?(?:refs/heads/)?main"
             r"(?![\w/:-])"
@@ -72,7 +79,7 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
             r"|"
             # Plus-prefix force form: +<refspec> with dst=main.
             r"(?="
-            r"(?:[ \t]+[^\s,;|&#]+)*?"
+            r"(?:[ \t]+[^\s,;|&#]+){0,5}?"
             r"[ \t]+"
             r"\+(?:[^\s:,;|&#]+:)?(?:refs/heads/)?main"
             r"(?![\w/:-])"
