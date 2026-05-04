@@ -3171,8 +3171,28 @@ def test_map_rest_ci_status_failure_from_commit_status_only() -> None:
 
 
 def test_map_rest_ci_status_action_required_treated_as_failure() -> None:
-    """``action_required`` is a check-run failure conclusion in REST."""
-    assert _map_rest_ci_status_to_enum([{"conclusion": "action_required"}], {}) == CIStatus.FAILURE
+    """``action_required`` is a check-run failure conclusion in REST.
+
+    PR-251 (OBS-BC) refines ``action_required`` to INFRA_FAILURE when it
+    is the *only* failing signal, since the conclusion typically means
+    the workflow boot pre-flight failed (GitHub App permissions, etc.)
+    rather than a code-level bug. Combined with a logic-class failing
+    run, the rollup still resolves to FAILURE.
+    """
+    assert (
+        _map_rest_ci_status_to_enum([{"conclusion": "action_required"}], {})
+        == CIStatus.INFRA_FAILURE
+    )
+    assert (
+        _map_rest_ci_status_to_enum(
+            [
+                {"conclusion": "action_required"},
+                {"conclusion": "failure"},
+            ],
+            {},
+        )
+        == CIStatus.FAILURE
+    )
 
 
 def test_map_rest_ci_status_success_requires_all_states_success_like() -> None:

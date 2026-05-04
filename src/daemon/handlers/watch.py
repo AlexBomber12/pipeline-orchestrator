@@ -14,12 +14,19 @@ from src.github import cache as gh_cache
 from src.github import checks as gh_checks
 from src.github import gh_runner
 from src.github import prs as gh_prs
+from src.keyspace import ci_infra_retried
 from src.models import CIStatus, FeedbackCheckResult, PipelineState, ReviewStatus
 
 logger = logging.getLogger(__name__)
 _STALE_RETRIGGER_DEBOUNCE = timedelta(hours=1)
 _CODEX_BOT_ERROR_RETRIGGER_COOLDOWN = timedelta(minutes=5)
 _CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
+# PR-251: TTL for the per-(repo, pr, head_sha) infra-retry marker. Keys
+# self-expire so abandoned PRs (closed, merged, force-pushed) don't
+# accumulate state in Redis. A week is far longer than any single
+# head_sha is in flight, so the TTL never races a still-relevant retry
+# decision but does reclaim space for closed PRs.
+_CI_INFRA_RETRIED_TTL_SECONDS = 7 * 24 * 60 * 60
 # Substring patterns matching known chatgpt-codex-connector[bot] error
 # comments. When the bot fails its own review and posts one of these,
 # review_status stays as EYES and the WATCH timeout would otherwise burn
@@ -182,7 +189,11 @@ class WatchMixin:
             return
         # Fork (cross-repo) PRs can't be fixed locally.
         if found.is_cross_repository:
-            if ci == CIStatus.FAILURE or review == ReviewStatus.CHANGES_REQUESTED:
+            if (
+                ci == CIStatus.FAILURE
+                or ci == CIStatus.INFRA_FAILURE
+                or review == ReviewStatus.CHANGES_REQUESTED
+            ):
                 self.log_event(
                     f"[WATCH] PR #{found.number} fork PR cannot be "
                     f"auto-fixed (review={review.value}, ci={ci.value}); "
@@ -190,6 +201,31 @@ class WatchMixin:
                 )
         elif ci == CIStatus.FAILURE:
             await self.handle_fix()
+            return
+        elif ci == CIStatus.INFRA_FAILURE:
+            # PR-251 (OBS-BC): a single infra-class failure (cancelled
+            # / action_required / stale conclusion, or known infra
+            # annotation keyword) earns one workflow rerun per
+            # ``head_sha``. A second INFRA_FAILURE classification on the
+            # same SHA means the rerun also failed — treat as a real
+            # logic FAILURE and route to FIX so the coder can act on it.
+            if await self._infra_retry_attempted(found.number, found.head_sha):
+                self.log_event(
+                    f"[WATCH] PR #{found.number} CI INFRA_FAILURE "
+                    f"persisted after retry; routing to FIX as "
+                    f"effective FAILURE."
+                )
+                await self.handle_fix()
+                return
+            self.log_event(
+                f"[WATCH] PR #{found.number} CI INFRA_FAILURE "
+                f"detected; retrying workflow once before routing to "
+                f"FIX."
+            )
+            self._retry_failed_workflow(found.number, found.head_sha)
+            await self._mark_infra_retry_attempted(
+                found.number, found.head_sha
+            )
             return
         elif review == ReviewStatus.CHANGES_REQUESTED:
             result = self._has_new_codex_feedback_since_last_push()
@@ -495,3 +531,88 @@ class WatchMixin:
         if success:
             self.state.last_codex_retrigger_at = datetime.now(timezone.utc)
         return posted
+
+    async def _infra_retry_attempted(
+        self, pr_number: int, head_sha: str
+    ) -> bool:
+        """Return whether WATCH already re-ran the workflow for ``head_sha``.
+
+        PR-251 (OBS-BC). Without ``redis`` or ``head_sha`` we conservatively
+        report ``True`` so the caller routes straight to FIX rather than
+        looping retries against a missing tracker. The marker key has a
+        TTL of ``_CI_INFRA_RETRIED_TTL_SECONDS`` so closed/abandoned PRs
+        don't accumulate state.
+        """
+        if self.redis is None or not head_sha:
+            return True
+        key = ci_infra_retried(self.owner_repo, pr_number, head_sha)
+        existing = await self.redis.get(key)
+        return existing is not None
+
+    async def _mark_infra_retry_attempted(
+        self, pr_number: int, head_sha: str
+    ) -> None:
+        """Record that WATCH issued the one-shot infra retry for ``head_sha``."""
+        if self.redis is None or not head_sha:
+            return
+        key = ci_infra_retried(self.owner_repo, pr_number, head_sha)
+        await self.redis.set(key, "1", ex=_CI_INFRA_RETRIED_TTL_SECONDS)
+
+    def _retry_failed_workflow(self, pr_number: int, head_sha: str) -> bool:
+        """Re-run the failed jobs of the latest workflow run on ``head_sha``.
+
+        PR-251 (OBS-BC). Returns ``True`` when ``gh run rerun --failed``
+        was issued; ``False`` when no run was found or the call failed.
+        Failures are logged and swallowed: the caller still marks the
+        infra-retry attempted so a transient ``gh`` outage does not loop.
+        """
+        if not head_sha:
+            return False
+        try:
+            runs = gh_runner.run_gh(
+                [
+                    "run",
+                    "list",
+                    "--commit",
+                    head_sha,
+                    "--limit",
+                    "1",
+                    "--json",
+                    "databaseId",
+                ],
+                repo=self.owner_repo,
+            )
+        except RuntimeError as exc:
+            self.log_event(
+                f"[WATCH] PR #{pr_number} infra retry skipped — "
+                f"could not list workflow runs: {exc}."
+            )
+            return False
+        if not isinstance(runs, list) or not runs:
+            self.log_event(
+                f"[WATCH] PR #{pr_number} infra retry skipped — no "
+                f"workflow run found for sha {head_sha[:7]}."
+            )
+            return False
+        first = runs[0]
+        if not isinstance(first, dict):
+            return False
+        run_id = first.get("databaseId")
+        if not run_id:
+            return False
+        try:
+            gh_runner.run_gh(
+                ["run", "rerun", "--failed", str(run_id)],
+                repo=self.owner_repo,
+            )
+        except RuntimeError as exc:
+            self.log_event(
+                f"[WATCH] PR #{pr_number} infra retry rerun failed for "
+                f"run {run_id}: {exc}."
+            )
+            return False
+        self.log_event(
+            f"[WATCH] PR #{pr_number} infra retry: re-ran failed jobs "
+            f"of workflow run {run_id} on sha {head_sha[:7]}."
+        )
+        return True

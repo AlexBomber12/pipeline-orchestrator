@@ -2468,3 +2468,277 @@ def test_check_budget_no_skip_when_state_is_watch() -> None:
     assert decisions == [True] * 5
     assert runner._github_api_slowdown_cycle == 0
     assert runner._github_api_slowdown_attempts == 5
+
+
+def _patch_infra_failure_pr(
+    monkeypatch: pytest.MonkeyPatch,
+    pr_number: int = 77,
+    head_sha: str = "feedface",
+) -> PRInfo:
+    """Wire ``get_open_prs`` and ``_fetch_ci_status_rest`` so WATCH sees
+    a single infra-class failing check-run. Returns the polled PR so the
+    caller can also seed ``runner.state.current_pr`` with the same PR
+    number/branch."""
+    pr = PRInfo(
+        number=pr_number,
+        branch=f"pr-{pr_number:03d}",
+        ci_status=CIStatus.INFRA_FAILURE,
+        review_status=ReviewStatus.PENDING,
+        head_sha=head_sha,
+        last_activity=datetime.now(timezone.utc),
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    # ``_maybe_reclassify_stuck_pending`` always calls this; return an
+    # infra-class payload so it doesn't accidentally flip the result.
+    monkeypatch.setattr(
+        "src.github.checks._fetch_ci_status_rest",
+        lambda repo, sha: ([{"conclusion": "cancelled"}], {}, True),
+    )
+    return pr
+
+
+def test_first_infra_failure_retries_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251: a fresh INFRA_FAILURE on a head_sha triggers ``gh run rerun
+    --failed`` once; ``handle_fix`` is NOT invoked, the infra-retry
+    marker is written to Redis, and a log line records the retry."""
+    pr = _patch_infra_failure_pr(monkeypatch)
+
+    gh_calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        gh_calls.append(list(args))
+        if args[:2] == ["run", "list"]:
+            return [{"databaseId": 9876}]
+        if args[:2] == ["run", "rerun"]:
+            return ""
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+
+    fix_calls: list[None] = []
+
+    async def fake_handle_fix(self: Any) -> None:
+        fix_calls.append(None)
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "handle_fix", fake_handle_fix)
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    asyncio.run(runner.handle_watch())
+
+    assert fix_calls == []
+    # Both list and rerun calls were issued.
+    assert ["run", "list", "--commit", pr.head_sha, "--limit", "1", "--json", "databaseId"] in gh_calls
+    assert ["run", "rerun", "--failed", "9876"] in gh_calls
+    # Retry marker is in Redis.
+    from src.keyspace import ci_infra_retried as _ci_infra_retried_key
+
+    key = _ci_infra_retried_key(runner.owner_repo, pr.number, pr.head_sha)
+    assert asyncio.run(runner.redis.get(key)) == "1"
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "INFRA_FAILURE detected" in history
+    assert "infra retry: re-ran failed jobs" in history
+
+
+def test_second_infra_failure_routes_to_fix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251: a second INFRA_FAILURE classification on the same head_sha
+    (the prior retry didn't help) routes WATCH straight through
+    ``handle_fix`` without issuing another ``gh run rerun``."""
+    pr = _patch_infra_failure_pr(monkeypatch, pr_number=78, head_sha="d00df00d")
+
+    gh_calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        gh_calls.append(list(args))
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+
+    fix_calls: list[None] = []
+
+    async def fake_handle_fix(self: Any) -> None:
+        fix_calls.append(None)
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "handle_fix", fake_handle_fix)
+
+    runner = h._make_runner()
+    # Pre-seed the marker as if a previous WATCH cycle already retried.
+    from src.keyspace import ci_infra_retried as _ci_infra_retried_key
+
+    key = _ci_infra_retried_key(runner.owner_repo, pr.number, pr.head_sha)
+    asyncio.run(runner.redis.set(key, "1"))
+
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    asyncio.run(runner.handle_watch())
+
+    assert fix_calls == [None]
+    # No workflow rerun calls were made — straight to FIX.
+    assert all(args[:2] != ["run", "rerun"] for args in gh_calls)
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "INFRA_FAILURE persisted after retry" in history
+
+
+def test_infra_failure_on_fork_pr_logs_no_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251: fork PRs cannot be auto-fixed; INFRA_FAILURE on a fork
+    falls through to the manual-wait log without issuing a rerun."""
+    pr = PRInfo(
+        number=79,
+        branch="pr-079",
+        ci_status=CIStatus.INFRA_FAILURE,
+        review_status=ReviewStatus.PENDING,
+        head_sha="cafed00d",
+        last_activity=datetime.now(timezone.utc),
+        is_cross_repository=True,
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    monkeypatch.setattr(
+        "src.github.checks._fetch_ci_status_rest",
+        lambda repo, sha: ([{"conclusion": "cancelled"}], {}, True),
+    )
+
+    gh_calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        gh_calls.append(list(args))
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+
+    fix_calls: list[None] = []
+
+    async def fake_handle_fix(self: Any) -> None:
+        fix_calls.append(None)
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "handle_fix", fake_handle_fix)
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    asyncio.run(runner.handle_watch())
+
+    assert fix_calls == []
+    assert all(args[:2] != ["run", "rerun"] for args in gh_calls)
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "fork PR cannot be auto-fixed" in history
+    assert "ci=INFRA_FAILURE" in history
+
+
+def test_infra_retry_attempted_returns_true_when_redis_or_sha_missing() -> None:
+    """PR-251: helpers conservatively report ``attempted=True`` when state
+    cannot be persisted, so the caller routes straight to FIX rather
+    than re-running the workflow forever against a missing tracker."""
+    runner = h._make_runner()
+    assert asyncio.run(runner._infra_retry_attempted(11, "")) is True
+    runner.redis = None  # type: ignore[assignment]
+    assert asyncio.run(runner._infra_retry_attempted(11, "abc")) is True
+
+
+def test_mark_infra_retry_attempted_noops_when_redis_or_sha_missing() -> None:
+    """PR-251: marking is a no-op without ``redis`` or ``head_sha``; the
+    Redis double records no writes."""
+    runner = h._make_runner()
+    asyncio.run(runner._mark_infra_retry_attempted(11, ""))
+    assert runner.redis.writes == []
+    runner.redis = None  # type: ignore[assignment]
+    asyncio.run(runner._mark_infra_retry_attempted(11, "abc"))
+
+
+def test_retry_failed_workflow_short_circuits_without_head_sha() -> None:
+    """PR-251: an empty ``head_sha`` returns ``False`` with no ``gh`` call."""
+    runner = h._make_runner()
+    assert runner._retry_failed_workflow(11, "") is False
+
+
+def test_retry_failed_workflow_handles_run_list_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251: a ``RuntimeError`` from ``gh run list`` is logged and
+    returns ``False``."""
+    runner = h._make_runner()
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        raise RuntimeError("API rate limit exceeded")
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+    assert runner._retry_failed_workflow(11, "abc1234") is False
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "could not list workflow runs" in history
+
+
+def test_retry_failed_workflow_handles_malformed_run_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251: ``gh run list`` returning a non-dict entry or missing
+    ``databaseId`` returns ``False`` without invoking ``rerun``."""
+    runner = h._make_runner()
+    sequences: list[Any] = [["not-a-dict"], [{}]]
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        return sequences.pop(0)
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+    assert runner._retry_failed_workflow(11, "abc1234") is False
+    assert runner._retry_failed_workflow(11, "abc1234") is False
+
+
+def test_retry_failed_workflow_handles_rerun_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251: a ``RuntimeError`` from ``gh run rerun`` is logged and
+    returns ``False``."""
+    runner = h._make_runner()
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        if args[:2] == ["run", "list"]:
+            return [{"databaseId": 555}]
+        raise RuntimeError("permission denied")
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+    assert runner._retry_failed_workflow(11, "abc1234") is False
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "infra retry rerun failed" in history
+
+
+def test_retry_failed_workflow_handles_no_run_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251: when ``gh run list`` returns no matching workflow, the
+    retry helper logs and returns ``False``; the marker is still written
+    by the caller so the next cycle routes to FIX."""
+    pr = _patch_infra_failure_pr(monkeypatch, pr_number=80, head_sha="11223344")
+
+    monkeypatch.setattr(
+        watch_module.gh_runner,
+        "run_gh",
+        lambda args, repo=None, **kw: [],
+    )
+
+    fix_calls: list[None] = []
+
+    async def fake_handle_fix(self: Any) -> None:
+        fix_calls.append(None)
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "handle_fix", fake_handle_fix)
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    asyncio.run(runner.handle_watch())
+
+    # First cycle: no rerun was issued (no run found), but the marker
+    # is written so a second cycle goes straight to FIX.
+    assert fix_calls == []
+    from src.keyspace import ci_infra_retried as _ci_infra_retried_key
+
+    key = _ci_infra_retried_key(runner.owner_repo, pr.number, pr.head_sha)
+    assert asyncio.run(runner.redis.get(key)) == "1"
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "no workflow run found" in history

@@ -50,8 +50,67 @@ _REST_CI_FAILURE_STATES = {
     "CANCELLED",
     "TIMED_OUT",
     "ACTION_REQUIRED",
+    # PR-251: ``stale`` is a GitHub Actions check-run conclusion meaning
+    # the run is no longer relevant (workflow re-dispatched after a
+    # newer push, or GitHub itself dropped the result). It must count
+    # toward the failure rollup so ``_is_infra_failure`` can route it
+    # through the INFRA_FAILURE retry path; otherwise a stale-only set
+    # of check-runs would be silently classified ``PENDING``.
+    "STALE",
 }
 _REST_CI_SUCCESS_STATES = {"SUCCESS", "COMPLETED", "NEUTRAL", "SKIPPED"}
+
+# PR-251 (OBS-BC): conclusions that indicate an infrastructure-class
+# failure rather than a logic failure. ``cancelled`` is unusual without
+# operator intervention (workflow runner crash, abort), ``action_required``
+# means the workflow boot pre-flight failed (GitHub App not installed,
+# permissions missing), and ``stale`` means GitHub itself decided the
+# run is no longer relevant.
+_INFRA_CONCLUSION_STATES = {"CANCELLED", "ACTION_REQUIRED", "STALE"}
+
+# PR-251 (OBS-BC): annotation message substrings that flag an
+# infrastructure-class failure even when the conclusion itself looks
+# logic-class (``failure``). The list is empirical and conservative —
+# under-classifying (treating ambiguous as logic FAILURE and routing to
+# FIX) is far safer than over-classifying (skipping a real bug as
+# infra). Match is case-insensitive against the annotation ``message``
+# field.
+_INFRA_ANNOTATION_KEYWORDS = (
+    "runner offline",
+    "could not pull image",
+    "no space left on device",
+    "operation timed out",
+    "infrastructure error",
+    "we had a problem communicating with the server",
+)
+
+
+def _is_infra_failure(check_run: dict) -> bool:
+    """Return ``True`` iff a failing check-run's signals look infra-class.
+
+    PR-251 (OBS-BC). Caller already filtered ``check_run`` down to runs
+    whose conclusion/status maps to ``_REST_CI_FAILURE_STATES``; this
+    helper decides whether the failure is an infrastructure flake
+    (worth retrying once) versus a real logic failure (route to FIX).
+
+    Two signals are checked, both case-insensitive:
+    - ``conclusion`` in ``_INFRA_CONCLUSION_STATES``
+    - any annotation ``message`` containing an
+      ``_INFRA_ANNOTATION_KEYWORDS`` substring
+    """
+    conclusion = (check_run.get("conclusion") or "").upper()
+    if conclusion in _INFRA_CONCLUSION_STATES:
+        return True
+    annotations = check_run.get("annotations") or []
+    if not isinstance(annotations, list):
+        return False
+    for ann in annotations:
+        if not isinstance(ann, dict):
+            continue
+        msg = (ann.get("message") or "").lower()
+        if any(kw in msg for kw in _INFRA_ANNOTATION_KEYWORDS):
+            return True
+    return False
 
 
 def clear_ci_status_cache() -> None:
@@ -198,19 +257,40 @@ def _map_rest_ci_status_to_enum(
         return CIStatus.SUCCESS if empty_is_success else CIStatus.PENDING
 
     states: list[str] = []
+    failing_runs: list[dict] = []
     for run in check_runs:
         if not isinstance(run, dict):
             continue
         value = run.get("conclusion") or run.get("status")
-        if value:
-            states.append(str(value).upper())
+        if not value:
+            continue
+        upper = str(value).upper()
+        states.append(upper)
+        if upper in _REST_CI_FAILURE_STATES:
+            failing_runs.append(run)
 
-    if statuses and isinstance(combined_state, str) and combined_state:
-        states.append(combined_state.upper())
+    combined_state_upper = (
+        combined_state.upper() if isinstance(combined_state, str) and combined_state else ""
+    )
+    if statuses and combined_state_upper:
+        states.append(combined_state_upper)
 
     if not states:
         return CIStatus.PENDING
     if any(s in _REST_CI_FAILURE_STATES for s in states):
+        # PR-251 (OBS-BC): when every failing check-run is infra-class,
+        # surface ``INFRA_FAILURE`` so WATCH can rerun the workflow
+        # once before consuming a coder FIX iteration. A combined
+        # commit-status failure (legacy GitHub status API) cannot
+        # carry annotations, so it dominates as logic FAILURE — better
+        # to under-classify infra than to skip a real bug.
+        combined_status_failed = combined_state_upper in _REST_CI_FAILURE_STATES
+        if (
+            failing_runs
+            and not combined_status_failed
+            and all(_is_infra_failure(run) for run in failing_runs)
+        ):
+            return CIStatus.INFRA_FAILURE
         return CIStatus.FAILURE
     if all(s in _REST_CI_SUCCESS_STATES for s in states):
         return CIStatus.SUCCESS
