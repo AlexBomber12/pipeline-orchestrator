@@ -301,13 +301,21 @@ async def _redis_server_time(redis_client: Any) -> float | None:
     Production ``redis.asyncio`` clients expose ``time()`` returning
     ``(seconds, microseconds)``; the in-test ``_FakeRedis`` does not, in
     which case we fall back to ``time.time()`` at the call site.
+
+    Errors from ``time()`` itself (ACL denial, transient command failure,
+    connection drop) are also treated as "unsupported" so the caller's
+    local-time fallback in :func:`_resolve_now_seconds` engages instead
+    of the exception propagating up through WATCH and aborting the cycle.
     """
     time_fn = getattr(redis_client, "time", None)
     if time_fn is None:
         return None
-    result = time_fn()
-    if hasattr(result, "__await__"):
-        result = await result
+    try:
+        result = time_fn()
+        if hasattr(result, "__await__"):
+            result = await result
+    except Exception:
+        return None
     if not isinstance(result, (tuple, list)) or len(result) < 2:
         return None
     seconds = float(result[0])
@@ -347,6 +355,15 @@ async def classify_ci_status_with_age(
         fetch_ok=fetch_ok,
     )
     if raw_status != CIStatus.PENDING:
+        await _clear_pending_tracker(redis_client, repo, pr_number, head_sha)
+        return raw_status, None
+    if not fetch_ok:
+        # Both REST calls failed: the PENDING above is the
+        # ``empty_is_success=False`` default, not an observation that CI
+        # is actually pending. Counting outage/rate-limit windows toward
+        # ``stuck_pending`` would route WATCH into ``handle_fix`` on a
+        # PR whose CI state we genuinely cannot read. Drop any prior
+        # anchor so the window restarts fresh once visibility resumes.
         await _clear_pending_tracker(redis_client, repo, pr_number, head_sha)
         return raw_status, None
     if redis_client is None or not head_sha or pending_max_seconds <= 0:

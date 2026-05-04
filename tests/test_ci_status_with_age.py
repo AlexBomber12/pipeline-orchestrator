@@ -497,3 +497,96 @@ def test_resolve_now_seconds_prefers_redis_server_time() -> None:
     redis = _FakeRedisWithServerTime(server_time=1_700_000_500.5)
     result = asyncio.run(checks._resolve_now_seconds(redis))
     assert result == pytest.approx(1_700_000_500.5)
+
+
+def test_classify_short_circuits_when_fetch_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``fetch_ok=False`` must not age into ``stuck_pending``.
+
+    When both REST calls fail, ``_map_rest_ci_status_to_enum`` returns
+    PENDING for repos that require checks. That PENDING is the
+    ``empty_is_success=False`` default, not an observation. The wrapper
+    must short-circuit so prolonged GitHub outages or rate-limit
+    windows do not get reclassified as ``CIStatus.FAILURE``.
+    """
+    redis = _FakeRedis()
+    base = 1_700_000_000.0
+    key = _pending_tracker_key("octo/repo", 7, "sha-aaa")
+    redis.store[key] = str(base)
+    monkeypatch.setattr(checks.time, "time", lambda: base + 60 * 60)
+
+    status, reason = asyncio.run(
+        classify_ci_status_with_age(
+            "octo/repo",
+            7,
+            "sha-aaa",
+            redis,
+            pending_max_seconds=1800,
+            runs_payload=[],
+            statuses_payload={},
+            fetch_ok=False,
+        )
+    )
+
+    assert status == CIStatus.PENDING
+    assert reason is None
+    # Anchor must be cleared so the window restarts cleanly when the
+    # outage clears, rather than aging from the pre-outage timestamp.
+    assert key not in redis.store
+    assert key in redis.deleted
+
+
+def test_classify_short_circuits_when_fetch_failed_no_prior_anchor() -> None:
+    """``fetch_ok=False`` with no prior anchor still returns PENDING with no reason
+    and does not write a new anchor.
+    """
+    redis = _FakeRedis()
+    status, reason = asyncio.run(
+        classify_ci_status_with_age(
+            "octo/repo",
+            7,
+            "sha-aaa",
+            redis,
+            pending_max_seconds=1800,
+            runs_payload=[],
+            statuses_payload={},
+            fetch_ok=False,
+        )
+    )
+    assert status == CIStatus.PENDING
+    assert reason is None
+    assert _pending_tracker_key("octo/repo", 7, "sha-aaa") not in redis.store
+    assert redis.set_calls == []
+
+
+def test_redis_server_time_returns_none_when_time_fn_raises() -> None:
+    """An exception from ``time()`` (ACL denial, transient error) yields ``None``
+    so the caller's local-time fallback engages instead of crashing WATCH.
+    """
+
+    class _RaisingAsyncRedis:
+        async def time(self) -> tuple[int, int]:
+            raise RuntimeError("NOPERM time")
+
+    assert asyncio.run(checks._redis_server_time(_RaisingAsyncRedis())) is None
+
+    class _RaisingSyncRedis:
+        def time(self) -> tuple[int, int]:
+            raise RuntimeError("connection lost")
+
+    assert asyncio.run(checks._redis_server_time(_RaisingSyncRedis())) is None
+
+
+def test_resolve_now_seconds_falls_back_when_time_fn_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_resolve_now_seconds`` returns local time when Redis ``time()`` raises."""
+
+    class _RaisingRedis:
+        async def time(self) -> tuple[int, int]:
+            raise RuntimeError("NOPERM time")
+
+    monkeypatch.setattr(checks.time, "time", lambda: 1_700_000_777.0)
+    result = asyncio.run(checks._resolve_now_seconds(_RaisingRedis()))
+    assert result == pytest.approx(1_700_000_777.0)
