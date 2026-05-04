@@ -9,16 +9,24 @@ mutation routes (pause/resume/stop/coder) live in
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal
+from typing import Any, AsyncIterator, Literal
 
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from src.cancellation import list_recent_cancellations
+from src.cancellation.availability import (
+    ActiveHoursSource,
+    HeartbeatSource,
+    ManualOverrideSource,
+    is_operator_available,
+)
 from src.coders import build_coder_registry
 from src.config import AppConfig, RepoConfig, load_config
 from src.daemon.github_rate_limit import (
@@ -27,12 +35,19 @@ from src.daemon.github_rate_limit import (
     read_rest_budget,
     recent_cycle_burns,
 )
+from src.events.sse import format_sse_comment, format_sse_event
 from src.keyspace import cli_log_latest
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
 from src.utils import repo_slug_from_url
 from src.web.services.coder import _effective_coder_name
 from src.web.services.repo_state import _find_repo_config_by_name
+
+AVAILABILITY_CHANNEL = "orchestrator:availability:changed"
+AVAILABILITY_OVERRIDE_KEY = "operator_override"
+AVAILABILITY_VALID_STATES = ("AVAILABLE", "AWAY", "AUTO")
+AVAILABILITY_SSE_KEEPALIVE_SECONDS = 15.0
+AVAILABILITY_SSE_POLL_INTERVAL_SECONDS = 0.1
 
 router = APIRouter()
 
@@ -799,6 +814,184 @@ async def api_alerts(request: Request) -> JSONResponse:
     )
     count = sum(1 for s in states if s.state in _ALERT_STATES)
     return JSONResponse({"has_alerts": count > 0, "count": count})
+
+
+async def _availability_sources(
+    redis_client: Any, cfg: AppConfig
+) -> list[Any]:
+    """Build the canonical SignalSource list that drives the chip composition.
+
+    Mirrors the daemon-side composition so the dashboard verdict stays in
+    lock-step with the source of truth: ManualOverrideSource first (so an
+    explicit operator decision wins), then the heartbeat sentinel, then
+    the active-hours window.
+    """
+    return [
+        ManualOverrideSource(redis_client=redis_client),
+        HeartbeatSource(redis_client=redis_client),
+        ActiveHoursSource(
+            start_hour=cfg.daemon.operator_active_hours_start,
+            end_hour=cfg.daemon.operator_active_hours_end,
+            timezone_name=cfg.daemon.operator_timezone,
+        ),
+    ]
+
+
+async def _read_manual_override(redis_client: Any) -> str:
+    """Return the raw ``operator_override`` value as the chip's manual label.
+
+    UI distinguishes AUTO (compose-only) from explicit AVAILABLE/AWAY so
+    the operator can see whether their click stuck. Redis errors collapse
+    to AUTO so a transient outage cannot misrepresent the override as
+    pinned.
+    """
+    if redis_client is None:
+        return "AUTO"
+    try:
+        raw = await redis_client.get(AVAILABILITY_OVERRIDE_KEY)
+    except Exception:
+        return "AUTO"
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    if raw in ("AVAILABLE", "AWAY"):
+        return raw
+    return "AUTO"
+
+
+@router.get("/api/availability")
+async def api_availability_get(request: Request) -> JSONResponse:
+    """Return the composed availability state plus the raw manual override.
+
+    The chip reads both: ``composed_state`` drives the dot color, and
+    ``manual_override`` drives the label and the click-cycle next state
+    so AUTO renders distinctly from a pinned AVAILABLE/AWAY even when
+    they happen to compose the same way.
+    """
+    redis_client = getattr(request.app.state, "redis", None)
+    cfg = load_config(_app.CONFIG_PATH)
+    sources = await _availability_sources(redis_client, cfg)
+    composed = await is_operator_available(sources)
+    manual_override = await _read_manual_override(redis_client)
+    return JSONResponse(
+        {
+            "composed_state": composed.value,
+            "manual_override": manual_override,
+        }
+    )
+
+
+@router.post("/api/availability/{state}")
+async def api_availability_set(state: str, request: Request) -> JSONResponse:
+    """Set the manual override and publish a wake on the global channel.
+
+    POST not GET because the next-state semantics depend on current
+    state — the chip cycles AUTO → AVAILABLE → AWAY → AUTO — so this is
+    a non-idempotent RPC-style call rather than a fetch.
+    """
+    if state not in AVAILABILITY_VALID_STATES:
+        return JSONResponse({"error": "invalid_state"}, status_code=400)
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return JSONResponse(
+            {"error": "redis_unavailable"}, status_code=503
+        )
+    if state == "AUTO":
+        await redis_client.delete(AVAILABILITY_OVERRIDE_KEY)
+    else:
+        await redis_client.set(AVAILABILITY_OVERRIDE_KEY, state)
+    # Wake all open dashboard tabs so the chip syncs without a reload.
+    await redis_client.publish(AVAILABILITY_CHANNEL, state)
+    return JSONResponse({"manual_override": state})
+
+
+@router.get("/api/availability/events")
+async def api_availability_events(request: Request) -> Response:
+    """SSE stream that wakes connected chips on availability changes.
+
+    Subscribes once to ``orchestrator:availability:changed`` and forwards
+    every published value as an ``availability_changed`` event. Falls
+    back to keepalive comments so intermediaries do not idle the
+    connection out. Returns 503 when Redis is not configured so the
+    chip's own 60s polling safety net keeps the UI fresh.
+    """
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return Response("Redis unavailable", status_code=503)
+    pubsub = redis_client.pubsub()
+    try:
+        await pubsub.subscribe(AVAILABILITY_CHANNEL)
+    except Exception:
+        try:
+            await pubsub.aclose()
+        except Exception:
+            pass
+        return Response("Redis unavailable", status_code=503)
+
+    async def _stream() -> AsyncIterator[bytes]:
+        try:
+            last_keepalive = asyncio.get_running_loop().time()
+            while True:
+                if await _is_request_disconnected(request):
+                    return
+                try:
+                    message = await pubsub.get_message(
+                        ignore_subscribe_messages=True,
+                        timeout=AVAILABILITY_SSE_POLL_INTERVAL_SECONDS,
+                    )
+                except Exception:
+                    return
+                if message is not None:
+                    data = message.get("data")
+                    if isinstance(data, bytes):
+                        data = data.decode("utf-8")
+                    if isinstance(data, str):
+                        payload = json.dumps(
+                            {
+                                "type": "availability_changed",
+                                "manual_override": data,
+                            }
+                        )
+                        yield format_sse_event(payload)
+                        last_keepalive = asyncio.get_running_loop().time()
+                        continue
+                now = asyncio.get_running_loop().time()
+                if now - last_keepalive >= AVAILABILITY_SSE_KEEPALIVE_SECONDS:
+                    yield format_sse_comment("keepalive")
+                    last_keepalive = now
+        finally:
+            try:
+                await pubsub.unsubscribe(AVAILABILITY_CHANNEL)
+            except Exception:
+                pass
+            try:
+                await pubsub.aclose()
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _is_request_disconnected(request: Request) -> bool:
+    """Best-effort check for client disconnect compatible with TestClient.
+
+    ``Request.is_disconnected`` returns a coroutine in real ASGI but the
+    TestClient may surface a sync False; fall through to ``False`` so the
+    SSE generator does not block on an attribute that does not exist.
+    """
+    checker = getattr(request, "is_disconnected", None)
+    if checker is None:
+        return False
+    result = checker()
+    if asyncio.iscoroutine(result):
+        return bool(await result)
+    return bool(result)
 
 
 @router.get("/api/repos/{name}/events")
