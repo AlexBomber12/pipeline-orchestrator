@@ -825,16 +825,27 @@ async def _availability_sources(
     lock-step with the source of truth: ManualOverrideSource first (so an
     explicit operator decision wins), then the heartbeat sentinel, then
     the active-hours window.
+
+    Redis-backed sources are omitted entirely when ``redis_client`` is
+    ``None``. Including them in that case would make every query() raise
+    inside ``is_operator_available``, flipping ``any_failed`` true and
+    biasing the verdict to AVAILABLE — which would misreport the operator
+    as available during off-hours whenever Redis is unavailable. Skipping
+    them lets ``ActiveHoursSource`` compose alone from the actually
+    available signal.
     """
-    return [
-        ManualOverrideSource(redis_client=redis_client),
-        HeartbeatSource(redis_client=redis_client),
+    sources: list[Any] = []
+    if redis_client is not None:
+        sources.append(ManualOverrideSource(redis_client=redis_client))
+        sources.append(HeartbeatSource(redis_client=redis_client))
+    sources.append(
         ActiveHoursSource(
             start_hour=cfg.daemon.operator_active_hours_start,
             end_hour=cfg.daemon.operator_active_hours_end,
             timezone_name=cfg.daemon.operator_timezone,
-        ),
-    ]
+        )
+    )
+    return sources
 
 
 async def _read_manual_override(redis_client: Any) -> str:
@@ -887,6 +898,11 @@ async def api_availability_set(state: str, request: Request) -> JSONResponse:
     POST not GET because the next-state semantics depend on current
     state — the chip cycles AUTO → AVAILABLE → AWAY → AUTO — so this is
     a non-idempotent RPC-style call rather than a fetch.
+
+    Redis runtime errors during the write/publish (timeout, connection
+    drop, pool exhaustion) collapse to a 503 so the chip surfaces the
+    outage with the same status code as the redis-missing branch rather
+    than bubbling a 500 that would break click handling.
     """
     if state not in AVAILABILITY_VALID_STATES:
         return JSONResponse({"error": "invalid_state"}, status_code=400)
@@ -895,12 +911,17 @@ async def api_availability_set(state: str, request: Request) -> JSONResponse:
         return JSONResponse(
             {"error": "redis_unavailable"}, status_code=503
         )
-    if state == "AUTO":
-        await redis_client.delete(AVAILABILITY_OVERRIDE_KEY)
-    else:
-        await redis_client.set(AVAILABILITY_OVERRIDE_KEY, state)
-    # Wake all open dashboard tabs so the chip syncs without a reload.
-    await redis_client.publish(AVAILABILITY_CHANNEL, state)
+    try:
+        if state == "AUTO":
+            await redis_client.delete(AVAILABILITY_OVERRIDE_KEY)
+        else:
+            await redis_client.set(AVAILABILITY_OVERRIDE_KEY, state)
+        # Wake all open dashboard tabs so the chip syncs without a reload.
+        await redis_client.publish(AVAILABILITY_CHANNEL, state)
+    except Exception:
+        return JSONResponse(
+            {"error": "redis_unavailable"}, status_code=503
+        )
     return JSONResponse({"manual_override": state})
 
 

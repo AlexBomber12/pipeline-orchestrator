@@ -214,6 +214,28 @@ def test_post_returns_503_when_redis_missing(
     assert resp.status_code == 503
 
 
+@pytest.mark.parametrize("failing_op", ["set", "delete", "publish"])
+def test_post_returns_503_when_redis_write_fails(
+    availability_client, failing_op: str
+) -> None:
+    """A runtime Redis failure (timeout, connection drop, pool exhaustion)
+    during the override write or wake publish must collapse to 503 — the
+    same status code the redis-missing branch returns — instead of
+    bubbling a 500 that would break click handling."""
+    client, redis = availability_client
+
+    async def boom(*_args, **_kwargs):
+        raise RuntimeError("redis connection lost")
+
+    setattr(redis, failing_op, boom)
+    state = "AUTO" if failing_op == "delete" else "AVAILABLE"
+
+    resp = client.post(f"/api/availability/{state}")
+
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "redis_unavailable"}
+
+
 # ---------------------------------------------------------------------------
 # SSE stream
 # ---------------------------------------------------------------------------
@@ -478,6 +500,56 @@ async def test_availability_sources_compose_three_signal_sources() -> None:
         HeartbeatSource,
         ActiveHoursSource,
     ]
+
+
+async def test_availability_sources_skip_redis_backed_when_redis_missing() -> None:
+    """When ``redis_client`` is None, the Redis-backed sources must be
+    omitted entirely. Including them would make every query() raise inside
+    ``is_operator_available``, flip ``any_failed`` true, and bias the
+    verdict to AVAILABLE — misreporting the operator as available during
+    off-hours whenever Redis is down. ``ActiveHoursSource`` should compose
+    the verdict alone instead."""
+    from src.cancellation.availability import ActiveHoursSource
+    from src.config import load_config
+
+    cfg = load_config(web_app.CONFIG_PATH)
+    sources = await dashboard_routes._availability_sources(None, cfg)
+
+    assert [type(s) for s in sources] == [ActiveHoursSource]
+
+
+async def test_get_reports_active_hours_when_redis_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end version of the P2 fix: with Redis absent and the
+    ``ActiveHoursSource`` reporting AWAY, the composed verdict must be
+    AWAY rather than the failure-safe AVAILABLE bias that would fire if
+    Redis-backed sources were left in the source list and raised."""
+    if hasattr(web_app.app.state, "redis"):
+        monkeypatch.delattr(web_app.app.state, "redis", raising=False)
+
+    class _AwayActiveHours:
+        name = "active_hours"
+
+        async def query(self):
+            return AvailabilityState.AWAY
+
+    async def fake_sources(redis_client, cfg):
+        # Mirror the real selector's redis-missing branch so the test
+        # fails if a future change re-introduces redis-backed sources here.
+        assert redis_client is None
+        return [_AwayActiveHours()]
+
+    monkeypatch.setattr(dashboard_routes, "_availability_sources", fake_sources)
+
+    client = TestClient(web_app.app)
+    resp = client.get("/api/availability")
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "composed_state": "AWAY",
+        "manual_override": "AUTO",
+    }
 
 
 async def test_sse_stream_decodes_bytes_payload(
