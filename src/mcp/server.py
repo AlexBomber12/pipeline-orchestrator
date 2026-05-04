@@ -16,7 +16,7 @@ from mcp.server.fastmcp import FastMCP
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("pipeline-orchestrator")
+mcp = FastMCP("pipeline-orchestrator", host="0.0.0.0", port=5173)
 
 
 @mcp.tool()
@@ -39,7 +39,7 @@ def main() -> None:  # pragma: no cover - exercised only when running the server
     """Run the MCP server with HTTP transport on port 5173."""
     logging.basicConfig(level=logging.INFO)
     logger.info("Starting MCP server on 0.0.0.0:5173")
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=5173)
+    mcp.run(transport="streamable-http")
 
 
 if __name__ == "__main__":  # pragma: no cover
