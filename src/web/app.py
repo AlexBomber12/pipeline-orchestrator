@@ -285,6 +285,7 @@ app = FastAPI(title="Pipeline Orchestrator", lifespan=lifespan)
 
 
 _OPERATOR_HEARTBEAT_MUTATION_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_TRUSTED_OPERATOR_FETCH_SITES = frozenset({"same-origin", "same-site"})
 
 
 def _is_operator_driven_request(request) -> bool:
@@ -298,8 +299,14 @@ def _is_operator_driven_request(request) -> bool:
       exposes these, and they require explicit operator action.
     * ``HX-Request: true`` — set by HTMX, only present when the
       dashboard's own JS is the caller.
-    * ``Sec-Fetch-Site`` — sent by modern browsers on every navigation
-      and fetch; absent on plain ``curl``/``kube-probe``/Prometheus.
+    * ``Sec-Fetch-Site: same-origin`` or ``same-site`` — sent by modern
+      browsers when the navigation/fetch originated within the dashboard
+      itself. ``cross-site`` (third-party embed) and ``none`` (direct
+      address-bar navigation, bookmark, automated tools spoofing the
+      header) are rejected: neither implies the operator is actively
+      using the dashboard, and accepting them would let an embedded
+      page or a curl probe pin ``operator_heartbeat`` alive and defeat
+      off-hours AWAY.
 
     HEAD/OPTIONS (probes, CORS preflight) are excluded, and a bare GET
     without browser headers is rejected so a load balancer hitting
@@ -314,7 +321,7 @@ def _is_operator_driven_request(request) -> bool:
     headers = request.headers
     if headers.get("hx-request") is not None:
         return True
-    if headers.get("sec-fetch-site") is not None:
+    if headers.get("sec-fetch-site") in _TRUSTED_OPERATOR_FETCH_SITES:
         return True
     return False
 
@@ -330,9 +337,10 @@ async def operator_heartbeat_middleware(request, call_next):
     expire after the TTL. We instead refresh on any successful 2xx
     response that :func:`_is_operator_driven_request` classifies as
     operator-driven — explicit mutations, HTMX polls from the dashboard,
-    or any modern-browser GET. Automated GET pollers and health checks
-    (no ``HX-Request``/``Sec-Fetch-Site``) are skipped so they cannot
-    pin the key alive when no operator is present.
+    or a same-origin/same-site browser GET. Automated GET pollers,
+    health checks, third-party embeds (``cross-site``), and direct
+    address-bar navigations (``none``) are skipped so they cannot pin
+    the key alive when no operator is present.
 
     Best-effort: a Redis outage must not break the request, so all
     storage errors are swallowed.

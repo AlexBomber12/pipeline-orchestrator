@@ -4043,18 +4043,47 @@ def test_heartbeat_middleware_refreshes_on_htmx_get() -> None:
     ]
 
 
-def test_heartbeat_middleware_refreshes_on_browser_navigation_get() -> None:
-    """Browser navigation GET (Sec-Fetch-Site present) counts as operator."""
+@pytest.mark.parametrize("fetch_site", ["same-origin", "same-site"])
+def test_heartbeat_middleware_refreshes_on_trusted_fetch_site_get(
+    fetch_site: str,
+) -> None:
+    """Browser GET with trusted Sec-Fetch-Site counts as operator.
+
+    Only ``same-origin``/``same-site`` are accepted: those imply the
+    request originated from within the dashboard itself.
+    """
     redis_client = _RecordingRedis()
     _run_heartbeat(
         method="GET",
         status_code=200,
         redis_client=redis_client,
-        headers={"sec-fetch-site": "same-origin"},
+        headers={"sec-fetch-site": fetch_site},
     )
     assert redis_client.set_calls == [
         ("operator_heartbeat", "1", {"ex": 300})
     ]
+
+
+@pytest.mark.parametrize("fetch_site", ["cross-site", "none", "unknown", ""])
+def test_heartbeat_middleware_skips_untrusted_fetch_site_get(
+    fetch_site: str,
+) -> None:
+    """Untrusted Sec-Fetch-Site values must not refresh the heartbeat.
+
+    ``cross-site`` = embedded by a third-party page; ``none`` = direct
+    address-bar navigation or a curl probe spoofing the header; any
+    unexpected value is treated the same way. None of these imply the
+    operator is actively using the dashboard, so they must not pin
+    ``operator_heartbeat`` alive and defeat off-hours AWAY behavior.
+    """
+    redis_client = _RecordingRedis()
+    _run_heartbeat(
+        method="GET",
+        status_code=200,
+        redis_client=redis_client,
+        headers={"sec-fetch-site": fetch_site},
+    )
+    assert redis_client.set_calls == []
 
 
 def test_heartbeat_middleware_skips_unattributed_get() -> None:
