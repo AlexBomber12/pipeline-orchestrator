@@ -113,6 +113,52 @@ def _is_infra_failure(check_run: dict) -> bool:
     return False
 
 
+def _maybe_hydrate_annotations(repo: str, check_run: dict) -> None:
+    """Populate ``check_run['annotations']`` from ``annotations_url``.
+
+    PR-251 (OBS-BC). The ``GET /repos/{repo}/commits/{sha}/check-runs``
+    response carries ``annotations_count`` and ``annotations_url`` but
+    not the annotation messages themselves; ``_is_infra_failure``
+    matches keywords against ``annotation['message']``, so without this
+    hydration the keyword path never fires on real REST payloads.
+
+    Hydration is gated to keep the extra REST calls bounded:
+
+    - skip when ``annotations`` is already present (test fixtures
+      pre-populate the field; double-fetching would mask their intent),
+    - skip when the run already concludes with an infra-class state
+      (``cancelled`` / ``action_required`` / ``stale`` — those classify
+      as infra without consulting the message text),
+    - skip when the run is not in a failure-like state (annotations on
+      passing runs are not consulted by the classifier),
+    - skip when ``annotations_count`` is missing or zero.
+
+    Failures of the annotation fetch are swallowed: leaving the field
+    empty causes ``_is_infra_failure`` to return ``False``, which
+    surfaces the run as logic FAILURE — the safe default.
+    """
+    if "annotations" in check_run:
+        return
+    conclusion = (check_run.get("conclusion") or "").upper()
+    if conclusion in _INFRA_CONCLUSION_STATES:
+        return
+    if conclusion not in _REST_CI_FAILURE_STATES:
+        return
+    count = check_run.get("annotations_count")
+    if not isinstance(count, int) or count <= 0:
+        return
+    check_run_id = check_run.get("id")
+    if not isinstance(check_run_id, int):
+        return
+    path = f"repos/{repo}/check-runs/{check_run_id}/annotations"
+    try:
+        annotations = cache._gh_api_paginated(path)
+    except RuntimeError:
+        return
+    if isinstance(annotations, list):
+        check_run["annotations"] = annotations
+
+
 def clear_ci_status_cache() -> None:
     """Clear the REST CI status cache (used in tests)."""
     _ci_status_cache.clear()
@@ -177,6 +223,18 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
             runs = page.get("check_runs")
             if isinstance(runs, list):
                 check_runs.extend(r for r in runs if isinstance(r, dict))
+
+    # PR-251 (OBS-BC): GitHub's check-runs REST payload exposes only
+    # ``annotations_count`` + ``annotations_url`` — not the annotation
+    # ``message`` strings the infra classifier inspects. Hydrate the
+    # ``annotations`` field on each failing check-run that has at least
+    # one annotation and a non-infra conclusion (infra-class conclusions
+    # like ``cancelled`` already classify without needing the message
+    # text). Without this step ``_is_infra_failure`` would never see
+    # annotation messages on real REST payloads and would mis-route
+    # failures whose only infra signal is an annotation keyword.
+    for run in check_runs:
+        _maybe_hydrate_annotations(repo, run)
 
     status_path = f"repos/{repo}/commits/{sha}/status"
     status_ok = False

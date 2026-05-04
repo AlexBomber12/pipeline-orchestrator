@@ -27,6 +27,25 @@ _CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
 # head_sha is in flight, so the TTL never races a still-relevant retry
 # decision but does reclaim space for closed PRs.
 _CI_INFRA_RETRIED_TTL_SECONDS = 7 * 24 * 60 * 60
+# PR-251: ``gh run list`` returns the recent run history for a SHA in
+# reverse-chronological order. ``--status`` accepts only a single value
+# and several distinct conclusions (failure, cancelled, action_required,
+# stale, timed_out, startup_failure) are all "failing" for our purposes,
+# so we pull a window and filter client-side instead of issuing one
+# query per status. ``gh run rerun --failed <run_id>`` is a no-op when
+# the targeted run succeeded; without the filter, a successful
+# re-dispatch occupying the latest slot would burn the one-shot retry
+# budget without re-running the actual infra failure.
+_FAILING_RUN_CONCLUSIONS = frozenset(
+    {
+        "failure",
+        "cancelled",
+        "action_required",
+        "stale",
+        "timed_out",
+        "startup_failure",
+    }
+)
 # Substring patterns matching known chatgpt-codex-connector[bot] error
 # comments. When the bot fails its own review and posts one of these,
 # review_status stays as EYES and the WATCH timeout would otherwise burn
@@ -215,6 +234,12 @@ class WatchMixin:
                     f"persisted after retry; routing to FIX as "
                     f"effective FAILURE."
                 )
+                # Downgrade in-memory ci_status to FAILURE so the FIX
+                # prompt builder injects CI logs (it gates that section
+                # on ``ci_status == CIStatus.FAILURE``); leaving it as
+                # INFRA_FAILURE would drop the very logs the coder
+                # needs for the effective-failure handoff.
+                found.ci_status = CIStatus.FAILURE
                 await self.handle_fix()
                 return
             self.log_event(
@@ -559,12 +584,23 @@ class WatchMixin:
         await self.redis.set(key, "1", ex=_CI_INFRA_RETRIED_TTL_SECONDS)
 
     def _retry_failed_workflow(self, pr_number: int, head_sha: str) -> bool:
-        """Re-run the failed jobs of the latest workflow run on ``head_sha``.
+        """Re-run the failed jobs of the latest failing workflow run on ``head_sha``.
 
         PR-251 (OBS-BC). Returns ``True`` when ``gh run rerun --failed``
         was issued; ``False`` when no run was found or the call failed.
         Failures are logged and swallowed: the caller still marks the
         infra-retry attempted so a transient ``gh`` outage does not loop.
+
+        ``gh run list`` returns runs in reverse-chronological order and
+        a single ``head_sha`` can carry several runs (re-dispatch, matrix
+        jobs, multiple workflows). The newest run is not necessarily the
+        failing one — a successful re-dispatch can sit ahead of the
+        failure that triggered INFRA_FAILURE classification, in which
+        case ``gh run rerun --failed`` against the success no-ops and
+        the WATCH cycle still consumes its one-shot retry budget. We
+        therefore fetch a window of recent runs and pick the most
+        recent one whose ``conclusion`` is in
+        ``_FAILING_RUN_CONCLUSIONS``.
         """
         if not head_sha:
             return False
@@ -576,9 +612,9 @@ class WatchMixin:
                     "--commit",
                     head_sha,
                     "--limit",
-                    "1",
+                    "20",
                     "--json",
-                    "databaseId",
+                    "databaseId,conclusion,status",
                 ],
                 repo=self.owner_repo,
             )
@@ -594,8 +630,21 @@ class WatchMixin:
                 f"workflow run found for sha {head_sha[:7]}."
             )
             return False
-        first = runs[0]
-        if not isinstance(first, dict):
+        first = next(
+            (
+                r for r in runs
+                if isinstance(r, dict)
+                and str(r.get("conclusion") or "").lower()
+                in _FAILING_RUN_CONCLUSIONS
+            ),
+            None,
+        )
+        if first is None:
+            self.log_event(
+                f"[WATCH] PR #{pr_number} infra retry skipped — no "
+                f"failing workflow run found for sha {head_sha[:7]} "
+                f"among {len(runs)} recent runs."
+            )
             return False
         run_id = first.get("databaseId")
         if not run_id:

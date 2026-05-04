@@ -2510,7 +2510,7 @@ def test_first_infra_failure_retries_workflow(
     def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
         gh_calls.append(list(args))
         if args[:2] == ["run", "list"]:
-            return [{"databaseId": 9876}]
+            return [{"databaseId": 9876, "conclusion": "failure", "status": "completed"}]
         if args[:2] == ["run", "rerun"]:
             return ""
         return ""
@@ -2530,8 +2530,13 @@ def test_first_infra_failure_retries_workflow(
     asyncio.run(runner.handle_watch())
 
     assert fix_calls == []
-    # Both list and rerun calls were issued.
-    assert ["run", "list", "--commit", pr.head_sha, "--limit", "1", "--json", "databaseId"] in gh_calls
+    # Both list and rerun calls were issued. PR-251 follow-up: the list
+    # query pulls a window (limit 20) and selects on conclusion so a
+    # successful re-dispatch on the same SHA cannot occupy the slot.
+    assert [
+        "run", "list", "--commit", pr.head_sha,
+        "--limit", "20", "--json", "databaseId,conclusion,status",
+    ] in gh_calls
     assert ["run", "rerun", "--failed", "9876"] in gh_calls
     # Retry marker is in Redis.
     from src.keyspace import ci_infra_retried as _ci_infra_retried_key
@@ -2582,6 +2587,13 @@ def test_second_infra_failure_routes_to_fix(
     assert all(args[:2] != ["run", "rerun"] for args in gh_calls)
     history = " ".join(entry.get("event", "") for entry in runner.state.history)
     assert "INFRA_FAILURE persisted after retry" in history
+    # PR-251 follow-up: ``handle_fix`` reads ``ci_status`` to decide
+    # whether to inject CI logs into the FIX prompt; the persisted-INFRA
+    # path must downgrade to FAILURE before invoking it so the coder
+    # actually receives the failure logs the daemon promised in the
+    # "effective FAILURE" log line.
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.ci_status == CIStatus.FAILURE
 
 
 def test_infra_failure_on_fork_pr_logs_no_retry(
@@ -2676,10 +2688,14 @@ def test_retry_failed_workflow_handles_run_list_error(
 def test_retry_failed_workflow_handles_malformed_run_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """PR-251: ``gh run list`` returning a non-dict entry or missing
-    ``databaseId`` returns ``False`` without invoking ``rerun``."""
+    """PR-251: ``gh run list`` returning a non-dict entry or a failing
+    entry missing ``databaseId`` returns ``False`` without invoking
+    ``rerun``."""
     runner = h._make_runner()
-    sequences: list[Any] = [["not-a-dict"], [{}]]
+    sequences: list[Any] = [
+        ["not-a-dict"],
+        [{"conclusion": "failure"}],
+    ]
 
     def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
         return sequences.pop(0)
@@ -2698,13 +2714,67 @@ def test_retry_failed_workflow_handles_rerun_error(
 
     def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
         if args[:2] == ["run", "list"]:
-            return [{"databaseId": 555}]
+            return [{"databaseId": 555, "conclusion": "failure", "status": "completed"}]
         raise RuntimeError("permission denied")
 
     monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
     assert runner._retry_failed_workflow(11, "abc1234") is False
     history = " ".join(entry.get("event", "") for entry in runner.state.history)
     assert "infra retry rerun failed" in history
+
+
+def test_retry_failed_workflow_picks_failing_run_over_succeeded_redispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: ``gh run list`` returns runs newest-first, and
+    a successful re-dispatch can sit ahead of the failure that drove the
+    INFRA_FAILURE classification. The retry must select the failing run
+    so ``gh run rerun --failed`` doesn't no-op against the success.
+    """
+    runner = h._make_runner()
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        calls.append(list(args))
+        if args[:2] == ["run", "list"]:
+            return [
+                {"databaseId": 1, "conclusion": "success", "status": "completed"},
+                {"databaseId": 2, "conclusion": "failure", "status": "completed"},
+            ]
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+
+    assert runner._retry_failed_workflow(11, "abc1234") is True
+    rerun_calls = [c for c in calls if c[:2] == ["run", "rerun"]]
+    assert rerun_calls == [["run", "rerun", "--failed", "2"]]
+
+
+def test_retry_failed_workflow_skips_when_only_success_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: if no failing run exists in the list response
+    the retry helper logs and returns ``False`` without calling
+    ``gh run rerun``.
+    """
+    runner = h._make_runner()
+    rerun_calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        if args[:2] == ["run", "list"]:
+            return [
+                {"databaseId": 1, "conclusion": "success", "status": "completed"},
+                {"databaseId": 2, "conclusion": "neutral", "status": "completed"},
+            ]
+        if args[:2] == ["run", "rerun"]:
+            rerun_calls.append(list(args))
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+    assert runner._retry_failed_workflow(11, "abc1234") is False
+    assert rerun_calls == []
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "no failing workflow run found" in history
 
 
 def test_retry_failed_workflow_handles_no_run_found(

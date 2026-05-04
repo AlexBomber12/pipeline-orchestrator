@@ -7,7 +7,15 @@ in ``tests/runner/test_handle_watch.py``.
 
 from __future__ import annotations
 
-from src.github.checks import _is_infra_failure, _map_rest_ci_status_to_enum
+from typing import Any
+
+import pytest
+
+from src.github.checks import (
+    _is_infra_failure,
+    _map_rest_ci_status_to_enum,
+    _maybe_hydrate_annotations,
+)
 from src.models import CIStatus
 
 
@@ -115,3 +123,67 @@ def test_is_infra_failure_handles_malformed_annotations() -> None:
 def test_is_infra_failure_uppercase_conclusion() -> None:
     """``CANCELLED`` (uppercase) is matched as infra by the predicate."""
     assert _is_infra_failure({"conclusion": "CANCELLED"}) is True
+
+
+def test_maybe_hydrate_annotations_skips_when_already_populated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: a pre-populated ``annotations`` field is left
+    untouched (test fixtures inject the field directly; hydration would
+    otherwise mask their intent)."""
+    calls: list[str] = []
+
+    def fake_paginated(path: str) -> Any:
+        calls.append(path)
+        return []
+
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
+    run = {
+        "id": 1,
+        "conclusion": "failure",
+        "annotations_count": 3,
+        "annotations": [{"message": "preset"}],
+    }
+    _maybe_hydrate_annotations("owner/name", run)
+    assert run["annotations"] == [{"message": "preset"}]
+    assert calls == []
+
+
+def test_maybe_hydrate_annotations_skips_when_count_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: a check-run without ``annotations_count`` (or
+    a zero count) does not trigger an annotations REST call."""
+    calls: list[str] = []
+
+    def fake_paginated(path: str) -> Any:
+        calls.append(path)
+        return []
+
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
+    run_no_count = {"id": 5, "conclusion": "failure"}
+    _maybe_hydrate_annotations("owner/name", run_no_count)
+    assert "annotations" not in run_no_count
+    run_zero = {"id": 5, "conclusion": "failure", "annotations_count": 0}
+    _maybe_hydrate_annotations("owner/name", run_zero)
+    assert "annotations" not in run_zero
+    assert calls == []
+
+
+def test_maybe_hydrate_annotations_skips_when_id_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: a failing check-run without an integer ``id``
+    can't have its annotations endpoint addressed; hydration must
+    no-op rather than guess at a path."""
+    calls: list[str] = []
+
+    def fake_paginated(path: str) -> Any:
+        calls.append(path)
+        return []
+
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
+    run = {"conclusion": "failure", "annotations_count": 1}
+    _maybe_hydrate_annotations("owner/name", run)
+    assert "annotations" not in run
+    assert calls == []

@@ -3539,6 +3539,172 @@ def test_fetch_ci_status_rest_skips_non_dict_pages(
     assert check_runs == [{"conclusion": "success"}]
 
 
+def test_fetch_ci_status_rest_hydrates_annotations_for_failing_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: ``GET /commits/{sha}/check-runs`` returns
+    ``annotations_count`` + ``annotations_url`` but never the annotation
+    messages. ``_fetch_ci_status_rest`` must follow ``annotations_url``
+    (constructed from the check-run id) so ``_is_infra_failure``'s
+    keyword path runs against real REST payloads.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        calls.append(list(args))
+        joined = " ".join(args)
+        if "check-runs" in joined and "annotations" in joined:
+            return [
+                [
+                    {
+                        "message": "Runner offline; could not start the job.",
+                        "annotation_level": "failure",
+                    }
+                ]
+            ]
+        if "check-runs" in joined:
+            return [
+                {
+                    "check_runs": [
+                        {
+                            "id": 42,
+                            "conclusion": "failure",
+                            "annotations_count": 1,
+                            "annotations_url": (
+                                "https://api.github.com/repos/owner/name/"
+                                "check-runs/42/annotations"
+                            ),
+                        }
+                    ]
+                }
+            ]
+        return {"state": "success", "statuses": []}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    check_runs, _, _ = _fetch_ci_status_rest("owner/name", "abc123")
+    assert len(check_runs) == 1
+    annotations = check_runs[0].get("annotations")
+    assert isinstance(annotations, list)
+    assert annotations and "Runner offline" in annotations[0]["message"]
+    # The hydration step must have queried the per-check-run annotations
+    # endpoint constructed from ``id`` (not blindly hitting the
+    # ``annotations_url`` host string).
+    assert any(
+        "repos/owner/name/check-runs/42/annotations" in a
+        for c in calls
+        for a in c
+    )
+
+
+def test_fetch_ci_status_rest_skips_annotation_hydration_for_passing_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: hydration is gated to failing non-infra
+    conclusions so passing builds don't pay the extra REST round-trip."""
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        calls.append(list(args))
+        if any("check-runs" in a for a in args):
+            return [
+                {
+                    "check_runs": [
+                        {
+                            "id": 7,
+                            "conclusion": "success",
+                            "annotations_count": 3,
+                            "annotations_url": (
+                                "https://api.github.com/repos/owner/name/"
+                                "check-runs/7/annotations"
+                            ),
+                        }
+                    ]
+                }
+            ]
+        return {"state": "success", "statuses": []}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    check_runs, _, _ = _fetch_ci_status_rest("owner/name", "abc123")
+    assert "annotations" not in check_runs[0]
+    assert all("annotations" not in a for c in calls for a in c)
+
+
+def test_fetch_ci_status_rest_skips_hydration_for_infra_conclusion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: ``cancelled`` already classifies as infra by
+    conclusion alone; no need to spend a REST call hydrating
+    annotations the classifier won't consult."""
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        calls.append(list(args))
+        if any("check-runs" in a for a in args):
+            return [
+                {
+                    "check_runs": [
+                        {
+                            "id": 9,
+                            "conclusion": "cancelled",
+                            "annotations_count": 2,
+                            "annotations_url": (
+                                "https://api.github.com/repos/owner/name/"
+                                "check-runs/9/annotations"
+                            ),
+                        }
+                    ]
+                }
+            ]
+        return {"state": "pending", "statuses": []}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    check_runs, _, _ = _fetch_ci_status_rest("owner/name", "abc123")
+    assert "annotations" not in check_runs[0]
+    assert all("annotations" not in a for c in calls for a in c)
+
+
+def test_fetch_ci_status_rest_hydration_swallows_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: a transient failure hitting the annotations
+    endpoint must not propagate; the check-run is left without
+    ``annotations`` so the classifier falls back to ``FAILURE`` (the
+    safe default), and the rest of the CI fetch still succeeds.
+    """
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        joined = " ".join(args)
+        if "check-runs" in joined and "annotations" in joined:
+            raise RuntimeError("HTTP 503")
+        if "check-runs" in joined:
+            return [
+                {
+                    "check_runs": [
+                        {
+                            "id": 11,
+                            "conclusion": "failure",
+                            "annotations_count": 1,
+                            "annotations_url": (
+                                "https://api.github.com/repos/owner/name/"
+                                "check-runs/11/annotations"
+                            ),
+                        }
+                    ]
+                }
+            ]
+        return {"state": "success", "statuses": []}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
+
+    check_runs, _, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
+    assert "annotations" not in check_runs[0]
+    assert fetch_ok is True
+
+
 def test_fetch_ci_status_rest_caches_per_repo_sha(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
