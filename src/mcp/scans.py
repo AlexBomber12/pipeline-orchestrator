@@ -27,7 +27,35 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
     ),
     (
         "draft_pr_text",
-        re.compile(r"\bcreate (a |the )?draft PR\b", re.IGNORECASE),
+        # Match ``create [a|the] draft PR`` only when NOT immediately
+        # preceded by a negation. Phrases like ``do not create a draft
+        # PR`` restate the AGENTS.md rule and must not be flagged as a
+        # violation. Each lookbehind is fixed-width (Python's ``re``
+        # requires it), so common negations are listed individually.
+        # Both straight (``'``) and typographic (``’``) apostrophes
+        # are accepted.
+        re.compile(
+            r"(?<!do not )"
+            r"(?<!don't )"
+            r"(?<!don’t )"
+            r"(?<!cannot )"
+            r"(?<!can not )"
+            r"(?<!can't )"
+            r"(?<!can’t )"
+            r"(?<!never )"
+            r"(?<!must not )"
+            r"(?<!mustn't )"
+            r"(?<!mustn’t )"
+            r"(?<!will not )"
+            r"(?<!won't )"
+            r"(?<!won’t )"
+            r"(?<!should not )"
+            r"(?<!shouldn't )"
+            r"(?<!shouldn’t )"
+            r"(?<!avoid )"
+            r"\bcreate (a |the )?draft PR\b",
+            re.IGNORECASE,
+        ),
         "AGENTS.md prohibits opening PRs in draft state. PR-196.",
     ),
     (
@@ -55,11 +83,18 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         # The standard arm requires both a ``--force``/``-f`` flag
         # token AND a refspec token whose destination resolves to
         # ``main`` (whitespace-bounded ``main`` or ``refs/heads/main``,
-        # optionally prefixed by ``<src>:``). The ``--force`` token
-        # excludes ``--force-if-includes`` (alone a no-op) but still
-        # matches ``--force`` and ``--force-with-lease[=ref]``. The
-        # plus-prefix arm catches ``+<refspec>`` targeting ``main``,
-        # which ``git push -h`` documents as equivalent force behavior.
+        # optionally prefixed by ``<src>:``). The ``main`` token
+        # boundary rejects ``[\w/:-]`` AND a ``.`` followed by a word
+        # char, so dot-suffixed branches like ``main.old`` or
+        # ``main.fix`` are treated as distinct branches and not
+        # flagged. ``main.`` at sentence end (``.`` followed by space
+        # or EOS) still matches, preserving the v1 trade-off where
+        # don't-do-this commentary may be flagged. The ``--force``
+        # token excludes ``--force-if-includes`` (alone a no-op) but
+        # still matches ``--force`` and ``--force-with-lease[=ref]``.
+        # The plus-prefix arm catches ``+<refspec>`` targeting
+        # ``main``, which ``git push -h`` documents as equivalent
+        # force behavior.
         re.compile(
             r"\bgit push\b"
             r"(?:"
@@ -76,7 +111,7 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
             r"(?:[ \t]+[^\s,;|&#]+)*?"
             r"[ \t]+"
             r"(?:[^\s:,;|&#]+:)?(?:refs/heads/)?main"
-            r"(?![\w/:-])"
+            r"(?![\w/:-]|\.\w)"
             r")"
             r"|"
             # Plus-prefix force form: +<refspec> with dst=main.
@@ -84,7 +119,7 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
             r"(?:[ \t]+[^\s,;|&#]+)*?"
             r"[ \t]+"
             r"\+(?:[^\s:,;|&#]+:)?(?:refs/heads/)?main"
-            r"(?![\w/:-])"
+            r"(?![\w/:-]|\.\w)"
             r")"
             r")",
             re.IGNORECASE,

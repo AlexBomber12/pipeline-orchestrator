@@ -46,6 +46,47 @@ def test_draft_pr_text_detected():
     assert "draft_pr_text" in types
 
 
+def test_draft_pr_text_negated_do_not_not_flagged():
+    """``Do not create a draft PR`` restates the AGENTS.md rule and
+    must not be flagged. Prior to this fix the regex matched any
+    ``create ... draft PR`` phrase regardless of context, rejecting
+    valid task specs that documented the rule in negative form."""
+    body = "Do not create a draft PR — open it ready."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_text" not in types
+
+
+def test_draft_pr_text_negated_dont_not_flagged():
+    body = "Don't create a draft PR even when iterating."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_text" not in types
+
+
+def test_draft_pr_text_negated_never_not_flagged():
+    body = "Never create a draft PR; PRs must be ready."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_text" not in types
+
+
+def test_draft_pr_text_negated_must_not_not_flagged():
+    body = "Coders must not create a draft PR."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_text" not in types
+
+
+def test_draft_pr_text_negated_typographic_apostrophe_not_flagged():
+    """Smart-quote apostrophe (``’``) in ``don’t`` must also
+    suppress the match."""
+    body = "Don’t create a draft PR while iterating."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_text" not in types
+
+
 def test_force_push_main_detected():
     body = "If history diverges, run git push --force origin main."
     violations = scan_for_conflicts(body)
@@ -96,6 +137,35 @@ def test_force_push_main_dashed_branch_with_main_substring_not_flagged():
     """``release-main-2026`` contains ``main`` between dashes; not the
     protected branch."""
     body = "git push -f origin release-main-2026"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" not in types
+
+
+def test_force_push_main_dot_suffix_branch_not_flagged():
+    """``main.old`` is a distinct branch from the protected ``main``;
+    a force-push to ``main.old`` must not be flagged. Prior to this
+    fix the boundary class did not include ``.``-then-word-char, so
+    dot-suffixed branch names were treated as the protected ``main``
+    branch."""
+    body = "git push --force origin main.old"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" not in types
+
+
+def test_force_push_main_dot_suffix_branch_short_flag_not_flagged():
+    """Same as above but with ``-f`` short flag."""
+    body = "git push -f origin main.fix"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" not in types
+
+
+def test_force_push_main_dot_suffix_branch_plus_form_not_flagged():
+    """``+main.old`` is the plus-prefix force form on a distinct
+    branch; must not be flagged."""
+    body = "git push origin +main.old"
     violations = scan_for_conflicts(body)
     types = {v.violation_type for v in violations}
     assert "force_push_main" not in types
