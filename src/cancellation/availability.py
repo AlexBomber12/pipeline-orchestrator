@@ -93,6 +93,12 @@ class HeartbeatSource:
 class ActiveHoursSource:
     """Config-tunable active hours window per timezone.
 
+    Supports overnight (wrap-around) windows: when ``start_hour`` is
+    greater than ``end_hour`` the window is interpreted as "from start
+    through midnight to end" (e.g. ``22..6`` covers hours 22, 23, 0..5)
+    rather than collapsing to AWAY for every hour. An equal start and
+    end is a zero-width window and reports AWAY.
+
     Configuration errors (e.g. an invalid timezone) propagate so
     :func:`is_operator_available` can record a source failure and apply
     the failure-safe bias rather than silently deferring.
@@ -105,10 +111,14 @@ class ActiveHoursSource:
 
     async def query(self) -> AvailabilityState | None:
         tz = ZoneInfo(self.timezone_name)
-        now = datetime.now(tz=tz)
-        if self.start_hour <= now.hour < self.end_hour:
-            return AvailabilityState.AVAILABLE
-        return AvailabilityState.AWAY
+        hour = datetime.now(tz=tz).hour
+        if self.start_hour < self.end_hour:
+            in_window = self.start_hour <= hour < self.end_hour
+        elif self.start_hour > self.end_hour:
+            in_window = hour >= self.start_hour or hour < self.end_hour
+        else:
+            in_window = False
+        return AvailabilityState.AVAILABLE if in_window else AvailabilityState.AWAY
 
 
 async def is_operator_available(

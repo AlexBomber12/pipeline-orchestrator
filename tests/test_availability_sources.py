@@ -155,6 +155,51 @@ async def test_active_hours_invalid_timezone_propagates() -> None:
         await source.query()
 
 
+async def test_active_hours_overnight_window_late_evening_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wrap-around window 22..6 must report AVAILABLE at 23:00.
+
+    DaemonConfig accepts ``start_hour > end_hour``; without wrap-around
+    handling the simple ``start <= h < end`` check would collapse to
+    AWAY for every hour and silently keep availability off.
+    """
+    fixed = datetime.fromisoformat("2026-05-04T23:30:00+02:00")
+    monkeypatch.setattr(availability_module, "datetime", _FixedNowDatetime(fixed))
+    source = ActiveHoursSource(start_hour=22, end_hour=6, timezone_name="Europe/Rome")
+    assert await source.query() is AvailabilityState.AVAILABLE
+
+
+async def test_active_hours_overnight_window_early_morning_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wrap-around window 22..6 must still cover post-midnight hours."""
+    fixed = datetime.fromisoformat("2026-05-04T02:00:00+02:00")
+    monkeypatch.setattr(availability_module, "datetime", _FixedNowDatetime(fixed))
+    source = ActiveHoursSource(start_hour=22, end_hour=6, timezone_name="Europe/Rome")
+    assert await source.query() is AvailabilityState.AVAILABLE
+
+
+async def test_active_hours_overnight_window_midday_away(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wrap-around window 22..6 must report AWAY during the daytime gap."""
+    fixed = datetime.fromisoformat("2026-05-04T12:00:00+02:00")
+    monkeypatch.setattr(availability_module, "datetime", _FixedNowDatetime(fixed))
+    source = ActiveHoursSource(start_hour=22, end_hour=6, timezone_name="Europe/Rome")
+    assert await source.query() is AvailabilityState.AWAY
+
+
+async def test_active_hours_zero_width_window_is_away(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Equal start and end hours is a zero-width window and reports AWAY."""
+    fixed = datetime.fromisoformat("2026-05-04T09:00:00+02:00")
+    monkeypatch.setattr(availability_module, "datetime", _FixedNowDatetime(fixed))
+    source = ActiveHoursSource(start_hour=9, end_hour=9, timezone_name="Europe/Rome")
+    assert await source.query() is AvailabilityState.AWAY
+
+
 # ---------------------------------------------------------------------------
 # is_operator_available composition
 # ---------------------------------------------------------------------------
