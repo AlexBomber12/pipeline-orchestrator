@@ -8,6 +8,7 @@ Mixin methods:
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 from src.github import cache as gh_cache
@@ -27,42 +28,15 @@ _CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
 # head_sha is in flight, so the TTL never races a still-relevant retry
 # decision but does reclaim space for closed PRs.
 _CI_INFRA_RETRIED_TTL_SECONDS = 7 * 24 * 60 * 60
-# PR-251: ``gh run list`` returns the recent run history for a SHA in
-# reverse-chronological order. ``--status`` accepts only a single value
-# and several distinct conclusions (failure, cancelled, action_required,
-# stale, timed_out, startup_failure) are all "failing" for our purposes,
-# so we pull a window and filter client-side instead of issuing one
-# query per status. ``gh run rerun --failed <run_id>`` is a no-op when
-# the targeted run succeeded; without the filter, a successful
-# re-dispatch occupying the latest slot would burn the one-shot retry
-# budget without re-running the actual infra failure. The same set is
-# matched against both ``conclusion`` and ``status`` because ``gh run
-# list`` exposes values like ``startup_failure`` in the ``status`` set
-# and may leave ``conclusion`` empty for them — checking only
-# ``conclusion`` would miss the failing run.
-_FAILING_RUN_CONCLUSIONS = frozenset(
-    {
-        "failure",
-        "cancelled",
-        "action_required",
-        "stale",
-        "timed_out",
-        "startup_failure",
-    }
-)
-# PR-251 follow-up: restrict the rerun candidate set to PR-triggered
-# workflow events. A single ``head_sha`` is regularly shared with
-# unrelated workflow runs (a ``push`` event on the branch, a
-# ``schedule`` run that picked up the same commit, a manual
-# ``workflow_dispatch``); those runs are not part of the PR check
-# rollup that drove the INFRA_FAILURE classification, and rerunning
-# them is at best wasted budget and at worst a destructive side effect
-# in another workflow. ``gh run list`` only accepts a single
-# ``--event`` value, but we want both ``pull_request`` and
-# ``pull_request_target`` (security-sensitive workflows in many repos
-# use the latter), so we filter on the ``event`` JSON field
-# client-side after fetching the windowed list.
-_PR_TRIGGERED_EVENTS = frozenset({"pull_request", "pull_request_target"})
+# PR-251 follow-up: regex for extracting the GitHub Actions workflow run
+# ID from a check-run ``details_url``. The canonical format is
+# ``https://github.com/{owner}/{repo}/actions/runs/{run_id}/job/{job_id}``;
+# matching only ``/actions/runs/<digits>`` keeps the parser robust if
+# GitHub appends query parameters or trims the ``/job/...`` suffix in
+# future API revisions. Non-Actions check runs (custom GitHub Apps)
+# carry a different URL shape, do not match, and are silently skipped
+# — we cannot rerun them with ``gh run rerun --failed`` regardless.
+_DETAILS_URL_RUN_RE = re.compile(r"/actions/runs/(\d+)")
 # Substring patterns matching known chatgpt-codex-connector[bot] error
 # comments. When the bot fails its own review and posts one of these,
 # review_status stays as EYES and the WATCH timeout would otherwise burn
@@ -601,110 +575,97 @@ class WatchMixin:
         await self.redis.set(key, "1", ex=_CI_INFRA_RETRIED_TTL_SECONDS)
 
     def _retry_failed_workflow(self, pr_number: int, head_sha: str) -> bool:
-        """Re-run the failed jobs of the latest failing workflow run on ``head_sha``.
+        """Re-run the failed jobs of failing workflow runs attached to ``head_sha``.
 
-        PR-251 (OBS-BC). Returns ``True`` when ``gh run rerun --failed``
-        was issued; ``False`` when no run was found or the call failed.
-        Failures are logged and swallowed: the caller still marks the
-        infra-retry attempted so a transient ``gh`` outage does not loop.
+        PR-251 (OBS-BC). Returns ``True`` when at least one ``gh run
+        rerun --failed`` succeeded; ``False`` when no failing check-run
+        was found, no Actions workflow run IDs could be extracted, or
+        every rerun call failed. The caller marks the infra-retry
+        attempted unconditionally so a transient ``gh`` outage does not
+        loop the WATCH cycle.
 
-        ``gh run list`` returns runs in reverse-chronological order and
-        a single ``head_sha`` can carry several runs (re-dispatch, matrix
-        jobs, multiple workflows). The newest run is not necessarily the
-        failing one — a successful re-dispatch can sit ahead of the
-        failure that triggered INFRA_FAILURE classification, in which
-        case ``gh run rerun --failed`` against the success no-ops and
-        the WATCH cycle still consumes its one-shot retry budget. We
-        therefore fetch a window of recent runs and pick the most
-        recent one whose ``conclusion`` or ``status`` is in
-        ``_FAILING_RUN_CONCLUSIONS``. ``status`` is consulted because
-        ``gh run list`` exposes values like ``startup_failure`` in the
-        status set and may leave ``conclusion`` empty for them; matching
-        only on ``conclusion`` would miss the failing run, log "no
-        failing workflow run found", and still consume the one-shot
-        retry marker — routing WATCH to FIX without actually retrying.
+        Workflow run IDs are derived from the per-commit ``check-runs``
+        REST payload (``GET /repos/{repo}/commits/{sha}/check-runs``)
+        rather than ``gh run list --commit``. The check-runs endpoint is
+        keyed to the actual head SHA the daemon already tracks, so it
+        surfaces every failing job regardless of the trigger event;
+        ``gh run list --commit`` keys on the ``workflow_run.head_sha``
+        field, which for ``pull_request`` events can point at the
+        synthetic merge commit instead of ``pull_request.head.sha`` and
+        therefore returns nothing for the most common PR workflow
+        configuration. Driving the rerun off the same check-runs that
+        produced the INFRA_FAILURE classification also guarantees we
+        only rerun jobs the WATCH gate actually saw fail — no risk of
+        firing an unrelated ``push``/``schedule`` workflow that shares
+        the SHA but never appeared in the check rollup.
 
-        The candidate set is further filtered to PR-triggered events
-        (``pull_request`` / ``pull_request_target``). A ``push``,
-        ``schedule``, or ``workflow_dispatch`` run that happens to
-        share the SHA is not part of the PR check rollup and must not
-        be rerun: doing so would re-trigger an unrelated workflow,
-        still mark the one-shot infra retry as spent, and route WATCH
-        to FIX without actually retrying the failing PR checks.
+        Each failing check-run's ``details_url`` (canonical shape
+        ``.../actions/runs/{run_id}/job/{job_id}``) is parsed to extract
+        the workflow run ID; non-Actions check runs (custom GitHub
+        Apps) match a different URL shape, fall through, and are
+        skipped. Run IDs are deduplicated so a workflow with several
+        failing matrix jobs receives a single ``gh run rerun --failed``
+        call.
         """
         if not head_sha:
             return False
-        try:
-            runs = gh_runner.run_gh(
-                [
-                    "run",
-                    "list",
-                    "--commit",
-                    head_sha,
-                    "--limit",
-                    "20",
-                    "--json",
-                    "databaseId,conclusion,status,event",
-                ],
-                repo=self.owner_repo,
-            )
-        except RuntimeError as exc:
-            self.log_event(
-                f"[WATCH] PR #{pr_number} infra retry skipped — "
-                f"could not list workflow runs: {exc}."
-            )
-            return False
-        if not isinstance(runs, list) or not runs:
-            self.log_event(
-                f"[WATCH] PR #{pr_number} infra retry skipped — no "
-                f"workflow run found for sha {head_sha[:7]}."
-            )
-            return False
-        pr_runs = [
-            r for r in runs
-            if isinstance(r, dict)
-            and str(r.get("event") or "").lower() in _PR_TRIGGERED_EVENTS
-        ]
-        if not pr_runs:
-            self.log_event(
-                f"[WATCH] PR #{pr_number} infra retry skipped — no "
-                f"PR-triggered workflow run found for sha {head_sha[:7]} "
-                f"among {len(runs)} recent runs."
-            )
-            return False
-        first = next(
-            (
-                r for r in pr_runs
-                if str(r.get("conclusion") or "").lower()
-                in _FAILING_RUN_CONCLUSIONS
-                or str(r.get("status") or "").lower()
-                in _FAILING_RUN_CONCLUSIONS
-            ),
-            None,
+        check_runs, _statuses, _fetch_ok = gh_checks._fetch_ci_status_rest(
+            self.owner_repo, head_sha
         )
-        if first is None:
+        failing_runs = [
+            run
+            for run in check_runs
+            if isinstance(run, dict)
+            and (
+                str(run.get("conclusion") or "").upper()
+                in gh_checks._REST_CI_FAILURE_STATES
+                or str(run.get("status") or "").upper()
+                in gh_checks._REST_CI_FAILURE_STATES
+            )
+        ]
+        if not failing_runs:
             self.log_event(
                 f"[WATCH] PR #{pr_number} infra retry skipped — no "
-                f"failing workflow run found for sha {head_sha[:7]} "
-                f"among {len(pr_runs)} PR-triggered runs."
+                f"failing check-run found for sha {head_sha[:7]}."
             )
             return False
-        run_id = first.get("databaseId")
-        if not run_id:
-            return False
-        try:
-            gh_runner.run_gh(
-                ["run", "rerun", "--failed", str(run_id)],
-                repo=self.owner_repo,
-            )
-        except RuntimeError as exc:
+        run_ids: list[int] = []
+        seen: set[int] = set()
+        for run in failing_runs:
+            url = run.get("details_url") or run.get("html_url") or ""
+            match = _DETAILS_URL_RUN_RE.search(str(url))
+            if not match:
+                continue
+            run_id = int(match.group(1))
+            if run_id in seen:
+                continue
+            seen.add(run_id)
+            run_ids.append(run_id)
+        if not run_ids:
             self.log_event(
-                f"[WATCH] PR #{pr_number} infra retry rerun failed for "
-                f"run {run_id}: {exc}."
+                f"[WATCH] PR #{pr_number} infra retry skipped — failing "
+                f"check-runs on sha {head_sha[:7]} have no Actions "
+                f"workflow run ID in details_url."
             )
+            return False
+        rerun_count = 0
+        for run_id in run_ids:
+            try:
+                gh_runner.run_gh(
+                    ["run", "rerun", "--failed", str(run_id)],
+                    repo=self.owner_repo,
+                )
+            except RuntimeError as exc:
+                self.log_event(
+                    f"[WATCH] PR #{pr_number} infra retry rerun failed "
+                    f"for run {run_id}: {exc}."
+                )
+                continue
+            rerun_count += 1
+        if rerun_count == 0:
             return False
         self.log_event(
             f"[WATCH] PR #{pr_number} infra retry: re-ran failed jobs "
-            f"of workflow run {run_id} on sha {head_sha[:7]}."
+            f"of {rerun_count} workflow run(s) on sha {head_sha[:7]}."
         )
         return True
