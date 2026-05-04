@@ -52,6 +52,15 @@ services:
       PYTHONUNBUFFERED: "1"
     restart: unless-stopped
 
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    env_file: .cloudflared.env
+    mem_limit: 256m
+    restart: unless-stopped
+    depends_on:
+      - mcp
+
   redis:
     image: redis:7-alpine
     mem_limit: 1g
