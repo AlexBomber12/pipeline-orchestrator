@@ -1,0 +1,13 @@
+{% from "components/cancellation_card.html" import cancellation_card %}
+{# Rendered into the collapsible "Recent cancellations" block on the
+   per-repo detail page. Server-rendered list (no client polling): the
+   data backs operator review, not real-time monitoring, so the lazy
+   ``hx-trigger="revealed"`` fetch in repo.html is the only refresh
+   path until the section is closed and reopened. #}
+<div class="cancellation-list mt-3">
+    {% if causes %}
+    {% for cause in causes %}{{ cancellation_card(cause) }}{% endfor %}
+    {% else %}
+    <p class="text-sm text-gray-500 italic">No cancellations recorded in the last 7 days.</p>
+    {% endif %}
+</div>

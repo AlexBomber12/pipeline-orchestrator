@@ -1,0 +1,62 @@
+{# Cancellation cause card — renders one CancellationCause from
+   src.cancellation.storage. Per-category branches degrade gracefully
+   when an older record is missing payload fields (PR-253 added some
+   fields after PR-252 shipped), so guards on each subfield avoid
+   KeyError on legacy entries. #}
+{% macro cancellation_card(cause) %}
+<article class="cancellation-card category-{{ cause.category | lower }}">
+    <header class="cancellation-header">
+        <span class="category-badge">{{ cause.category }}</span>
+        <span class="task-id font-mono">{{ cause.task_id }}</span>
+        <time class="cancellation-time font-mono"
+              datetime="{{ cause.created_at }}"
+              data-ts="{{ cause.created_at }}">{{ cause.created_at }}</time>
+    </header>
+    <div class="cancellation-payload">
+        {% if cause.category == 'CRASH' %}
+            {% if cause.payload.get('exit_code') is not none %}
+            <div>Exit: <span class="font-mono">{{ cause.payload.get('exit_code') }}</span></div>
+            {% endif %}
+            {% if cause.payload.get('error_message') %}
+            <pre class="cancellation-stderr">{{ cause.payload.get('error_message') }}</pre>
+            {% endif %}
+        {% elif cause.category == 'ESCALATE' %}
+            {% if cause.payload.get('reason_text') %}
+            <div class="cancellation-reason">{{ cause.payload.get('reason_text') }}</div>
+            {% endif %}
+        {% elif cause.category == 'TIMEOUT' %}
+            {% if cause.payload.get('limit_type') %}
+            <div>Limit: <span class="font-mono">{{ cause.payload.get('limit_type') }}</span></div>
+            {% endif %}
+            {% if cause.payload.get('duration_elapsed_sec') is not none %}
+            <div>Elapsed: <span class="font-mono">{{ cause.payload.get('duration_elapsed_sec') }}s</span></div>
+            {% endif %}
+            {% if cause.payload.get('active_phase') %}
+            <div>Phase: <span class="font-mono">{{ cause.payload.get('active_phase') }}</span></div>
+            {% endif %}
+        {% elif cause.category == 'INFRA' %}
+            {% if cause.payload.get('subsystem') %}
+            <div>Subsystem: <span class="font-mono">{{ cause.payload.get('subsystem') }}</span></div>
+            {% endif %}
+            {% if cause.payload.get('retry_count') is not none %}
+            <div>Retries: <span class="font-mono">{{ cause.payload.get('retry_count') }}</span></div>
+            {% endif %}
+            {% if cause.payload.get('last_attempt_iso') %}
+            <div>Last attempt:
+                <time class="font-mono"
+                      datetime="{{ cause.payload.get('last_attempt_iso') }}"
+                      data-ts="{{ cause.payload.get('last_attempt_iso') }}">{{ cause.payload.get('last_attempt_iso') }}</time>
+            </div>
+            {% endif %}
+        {% elif cause.category == 'OPERATOR_RECOVERY' %}
+            <div>Manual recovery via dashboard</div>
+        {% elif cause.category == 'NO_PUSH_DEADLOCK' %}
+            {% if cause.payload.get('attempts') is not none %}
+            <div>FIX iteration produced no push for <span class="font-mono">{{ cause.payload.get('attempts') }}</span> cycles</div>
+            {% else %}
+            <div>FIX iteration produced no push across consecutive cycles</div>
+            {% endif %}
+        {% endif %}
+    </div>
+</article>
+{% endmacro %}

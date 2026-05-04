@@ -18,6 +18,7 @@ import redis.asyncio as aioredis
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
+from src.cancellation import list_recent_cancellations
 from src.coders import build_coder_registry
 from src.config import AppConfig, RepoConfig, load_config
 from src.daemon.github_rate_limit import (
@@ -38,6 +39,8 @@ router = APIRouter()
 _HISTORY_LIMIT = 100
 _METRICS_PANEL_LIMIT = 20
 _METRICS_SCAN_LIMIT = 100
+_CANCELLATIONS_WINDOW_DAYS = 7
+_CANCELLATIONS_MAX = 50
 
 _ACTIVE_RUN_STATES = {
     PipelineState.CODING,
@@ -817,6 +820,25 @@ async def api_repo_events(name: str, request: Request) -> Response:
     )
 
 
+@router.get("/api/cancellations/{repo}")
+async def api_cancellations(repo: str, request: Request) -> JSONResponse:
+    """Return recent cancellation causes for a repo (last 7 days, max 50).
+
+    Closes the OBS-BE expanded loop: PR-252 stored the cause, PR-253 wired
+    detection writes, this endpoint surfaces them so the dashboard can
+    render structured "what happened" cards instead of leaving operators
+    to read Redis by hand.
+    """
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return JSONResponse([])
+    since = datetime.now(timezone.utc) - timedelta(
+        days=_CANCELLATIONS_WINDOW_DAYS
+    )
+    causes = await list_recent_cancellations(redis_client, repo, since)
+    return JSONResponse([asdict(c) for c in causes[:_CANCELLATIONS_MAX]])
+
+
 @router.get("/partials/redis-banner", response_class=HTMLResponse)
 async def partial_redis_banner(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
@@ -1015,6 +1037,36 @@ async def repo_cli_log(request: Request, name: str) -> HTMLResponse:
     return HTMLResponse(
         f'<pre class="bg-black text-green-400 font-mono text-xs p-4'
         f' overflow-auto max-h-96 rounded">{escaped}</pre>'
+    )
+
+
+@router.get(
+    "/partials/repo/{name}/cancellations",
+    response_class=HTMLResponse,
+)
+async def partial_repo_cancellations(
+    name: str, request: Request
+) -> HTMLResponse:
+    """Render recent cancellation cards into the lazy-loaded section.
+
+    The ``<details>`` wrapper in repo.html triggers this fetch on the
+    first reveal; closing and reopening the section refetches. The
+    cancellation surface is operator-review, not real-time, so no SSE
+    wake or periodic poll is needed for v1 (PR-254 implementation note).
+    """
+    redis_client = getattr(request.app.state, "redis", None)
+    causes: list = []
+    if redis_client is not None:
+        since = datetime.now(timezone.utc) - timedelta(
+            days=_CANCELLATIONS_WINDOW_DAYS
+        )
+        causes = (await list_recent_cancellations(redis_client, name, since))[
+            :_CANCELLATIONS_MAX
+        ]
+    return _app.templates.TemplateResponse(
+        request,
+        "components/cancellation_history.html",
+        {"causes": causes},
     )
 
 

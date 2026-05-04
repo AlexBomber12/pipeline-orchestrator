@@ -43,6 +43,18 @@
 
 <details class="mt-4">
     <summary class="secondary-interactive text-sm text-gray-400 cursor-pointer">
+        Recent cancellations
+    </summary>
+    {# Operator-review surface (last 7 days, capped at 50). Lazy-loaded
+       on first reveal; no polling — re-open the section to refetch. #}
+    <div hx-get="/partials/repo/{{ repo.name }}/cancellations"
+         hx-trigger="revealed"
+         hx-swap="innerHTML">
+    </div>
+</details>
+
+<details class="mt-4">
+    <summary class="secondary-interactive text-sm text-gray-400 cursor-pointer">
         Coder log
     </summary>
     {# Keep the periodic poll alongside SSE: state_change fires only on
