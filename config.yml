@@ -55,6 +55,13 @@ daemon:
   # GitHub Actions "queued/in_progress forever" failure mode where the
   # runner died and no terminal state ever arrives.
   ci_pending_max_min: 30
+  # PR-255: Operator availability window for the Cancellation policy
+  # SignalSource composition. Outside the window the ActiveHoursSource
+  # reports AWAY so downstream consumers can defer speculative coder
+  # work overnight. Hours are inclusive-start, exclusive-end.
+  operator_active_hours_start: 9
+  operator_active_hours_end: 21
+  operator_timezone: Europe/Rome
   # PR-231: Anthropic OAuth beta header. Required for current API tier.
   # NOTE: Anthropic periodically rotates beta headers. If auth breaks after
   # an Anthropic announcement, re-verify this value matches the current

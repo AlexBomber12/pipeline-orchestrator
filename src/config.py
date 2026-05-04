@@ -152,6 +152,9 @@ class DaemonConfig(BaseModel):
     watch_fast_poll_interval_sec: int = Field(default=45, ge=1)
     watch_retrigger_cap: int = Field(default=3, ge=1)
     ci_pending_max_min: int = Field(default=30, ge=1)
+    operator_active_hours_start: int = Field(default=9, ge=0, le=23)
+    operator_active_hours_end: int = Field(default=21, ge=1, le=24)
+    operator_timezone: str = "Europe/Rome"
 
 
 class WebConfig(BaseModel):

@@ -41,3 +41,12 @@ daemon:
   # for fast-CI repos to surface stuck workflows sooner; higher for
   # repos whose tests legitimately take longer than the default 30min.
   ci_pending_max_min: 30
+
+  # PR-255: Cancellation-policy operator-availability window. The
+  # ActiveHoursSource reports AVAILABLE within
+  # ``[operator_active_hours_start, operator_active_hours_end)`` in the
+  # configured ``operator_timezone`` and AWAY outside it. Tune to match
+  # your operator's working hours.
+  operator_active_hours_start: 9
+  operator_active_hours_end: 21
+  operator_timezone: Europe/Rome

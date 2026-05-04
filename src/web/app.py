@@ -282,6 +282,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Pipeline Orchestrator", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def operator_heartbeat_middleware(request, call_next):
+    """Refresh ``operator_heartbeat`` Redis key on each dashboard request.
+
+    Powers the ``HeartbeatSource`` half of the Cancellation-policy
+    availability composition (PR-255). Best-effort: a Redis outage must
+    not break the request, so all storage errors are swallowed.
+    """
+    response = await call_next(request)
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is not None:
+        try:
+            await redis_client.set("operator_heartbeat", "1", ex=300)
+        except Exception:
+            pass
+    return response
+
+
 app.include_router(_dashboard_routes.router)
 app.include_router(_repo_control_routes.router)
 app.include_router(_settings_routes.router)
