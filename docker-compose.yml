@@ -55,6 +55,8 @@ services:
   cloudflared:
     image: cloudflare/cloudflared:latest
     command: tunnel --no-autoupdate run
+    profiles:
+      - cloudflared
     env_file:
       - path: .cloudflared.env
         required: false

@@ -8,7 +8,7 @@ The wrapper script is `scripts/test-e2e.sh`. It brings up the test stack on port
 
 ## 2. Prerequisites
 
-- Docker and Docker Compose v2. Verify with `docker compose version` and confirm a v2.x line.
+- Docker and Docker Compose v2.24 or newer. Verify with `docker compose version`.
 - Python 3.12 in the active virtualenv where pytest will run.
 - `gh` CLI authenticated with `repo` scope. Verify `gh auth status` exits 0 and the listed account has access to `AlexBomber12/pipeline-orchestrator-testbed`.
 - Test dependencies and Playwright browsers: `pip install -r requirements-test.txt` then `playwright install chromium`.
