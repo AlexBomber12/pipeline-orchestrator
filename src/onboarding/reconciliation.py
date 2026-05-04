@@ -16,8 +16,10 @@ guaranteed to match what would actually be written.
 from __future__ import annotations
 
 import difflib
+from collections.abc import Callable
 from pathlib import Path
 
+from src.mcp.scans import scan_for_conflicts
 from src.onboarding.agents_md_template import daemon_managed_content
 from src.onboarding.markdown_sections import apply_managed_regions
 
@@ -41,8 +43,60 @@ def _unified_diff_text(before: str, after: str, label: str) -> str:
     return "".join(diff)
 
 
+def _scan_existing_task_specs(
+    repo_path: Path,
+    log_event_fn: Callable[[str], None],
+) -> int:
+    """Scan all ``tasks/PR-*.md`` files for AGENTS.md anti-patterns.
+
+    Returns the number of files that contain at least one violation.
+    Each individual violation emits one ``[AGENTS-SCAN]`` event via
+    ``log_event_fn``; a trailing summary event is emitted when the count
+    is non-zero so operators can spot drift in the dashboard event log
+    without scrolling. Used at AGENTS.md reconciliation time to catch
+    drift between rules and pre-existing task specs that were never
+    re-validated by the inline MCP scanner from PR-259. PR-260.
+    """
+    tasks_dir = repo_path / "tasks"
+    if not tasks_dir.is_dir():
+        return 0
+
+    files_with_violations = 0
+    for spec_file in sorted(tasks_dir.glob("PR-*.md")):
+        try:
+            body = spec_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        except UnicodeError as exc:
+            log_event_fn(
+                f"[AGENTS-SCAN] Skipping {spec_file.name}: non-UTF-8 "
+                f"content ({exc})."
+            )
+            continue
+        violations = scan_for_conflicts(body)
+        if not violations:
+            continue
+        files_with_violations += 1
+        for v in violations:
+            log_event_fn(
+                f"[AGENTS-SCAN] {spec_file.name}: {v.violation_type} "
+                f'violates rule "{v.rule}" - line excerpt: '
+                f"{v.line_excerpt!r}"
+            )
+    if files_with_violations > 0:
+        log_event_fn(
+            f"[AGENTS-SCAN] {files_with_violations} task spec file(s) "
+            f"in {repo_path}/tasks/ contain AGENTS.md anti-pattern "
+            f"violations. Operator review recommended."
+        )
+    return files_with_violations
+
+
 def reconcile_agents_md(
-    file_path: str | Path, *, dry_run: bool = True
+    file_path: str | Path,
+    *,
+    dry_run: bool = True,
+    log_event_fn: Callable[[str], None] | None = None,
 ) -> tuple[str, str]:
     """Reconcile daemon-managed sections in an AGENTS.md file.
 
@@ -58,6 +112,15 @@ def reconcile_agents_md(
     ``dry_run`` is False the proposed content is written to
     ``file_path``; parent directories are created as needed so onboarding
     a brand-new repo path does not require a separate mkdir step.
+
+    When ``log_event_fn`` is provided, after the rewrite finishes
+    :func:`_scan_existing_task_specs` runs against ``<file_path>.parent``
+    and emits ``[AGENTS-SCAN]`` events for every pre-existing task spec
+    that violates an AGENTS.md anti-pattern. The hook is opt-in so the
+    web preview/apply endpoints (which have no event-log target)
+    continue to behave exactly as before; daemon-side callers that own
+    a per-repo log function pass it through to surface drift between
+    AGENTS.md and historical specs. PR-260.
     """
     path = Path(file_path)
     try:
@@ -71,5 +134,8 @@ def reconcile_agents_md(
     if not dry_run:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(after)
+
+    if log_event_fn is not None:
+        _scan_existing_task_specs(path.parent, log_event_fn)
 
     return after, diff
