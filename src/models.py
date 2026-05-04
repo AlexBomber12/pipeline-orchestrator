@@ -71,6 +71,11 @@ class PRInfo(BaseModel):
     # silently shrink the dashboard "Pushes" reading too — each push that
     # the daemon actually witnessed stays counted.
     observed_head_shas: set[str] = Field(default_factory=set)
+    # Current head SHA of the PR's source branch. Recorded so handlers
+    # can key per-SHA Redis state (e.g. PR-250's stuck-PENDING tracker)
+    # without re-fetching PR metadata. Empty string when the upstream
+    # ``gh`` payload omitted the SHA.
+    head_sha: str = ""
     fix_iteration_count: int = 0
     no_push_fix_count: int = 0
     # OBS-BL (PR-249): WATCH<->HUNG retrigger cycles counted to cap

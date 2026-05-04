@@ -11,6 +11,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from src.github import cache as gh_cache
+from src.github import checks as gh_checks
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.models import CIStatus, FeedbackCheckResult, PipelineState, ReviewStatus
@@ -163,6 +164,7 @@ class WatchMixin:
         ):
             self._rehydrate_last_push_at(found)
 
+        await self._maybe_reclassify_stuck_pending(found)
         ci = found.ci_status
         review = found.review_status
         review_allows_merge = review == ReviewStatus.APPROVED or (
@@ -252,6 +254,47 @@ class WatchMixin:
                 f"(review={review.value}, ci={ci.value}, "
                 f"{elapsed_min:.0f}/{timeout_min}m)."
             )
+
+    async def _maybe_reclassify_stuck_pending(self, found: object) -> None:
+        """Upgrade ``found.ci_status`` to FAILURE when CI has been PENDING too long.
+
+        PR-250 (OBS-BM): GitHub Actions occasionally registers a check-run
+        as ``queued`` or ``in_progress`` and never publishes a terminal
+        state. WATCH would otherwise poll forever; instead we track the
+        first-seen-PENDING timestamp per ``head_sha`` in Redis and, once
+        ``daemon.ci_pending_max_min`` minutes have elapsed on the same
+        SHA, rewrite the in-memory ``ci_status`` to FAILURE so the
+        existing FAILURE branch routes through ``handle_fix``. The raw
+        REST classifier is left untouched — only the daemon-side view
+        of CI is affected.
+        """
+        head_sha = getattr(found, "head_sha", "") or ""
+        if not head_sha:
+            return
+        pending_max_seconds = self.app_config.daemon.ci_pending_max_min * 60
+        runs_payload, statuses_payload, fetch_ok = (
+            gh_checks._fetch_ci_status_rest(self.owner_repo, head_sha)
+        )
+        reclassified, reason = await gh_checks.classify_ci_status_with_age(
+            self.owner_repo,
+            found.number,
+            head_sha,
+            self.redis,
+            pending_max_seconds,
+            runs_payload,
+            statuses_payload,
+            empty_is_success=self.repo_config.allow_merge_without_checks,
+            fetch_ok=fetch_ok,
+        )
+        if reason != "stuck_pending":
+            return
+        age_min = pending_max_seconds // 60
+        sha_short = head_sha[:7]
+        self.log_event(
+            f"[WATCH] PR #{found.number} CI reclassified PENDING -> FAILURE "
+            f"(stuck_pending: {age_min}min on sha {sha_short})."
+        )
+        found.ci_status = reclassified
 
     def _observe_watch_event_signature(self, found: object) -> None:
         """Update ``_watch_last_event_at`` when polled PR signature changes.
