@@ -50,6 +50,19 @@ _FAILING_RUN_CONCLUSIONS = frozenset(
         "startup_failure",
     }
 )
+# PR-251 follow-up: restrict the rerun candidate set to PR-triggered
+# workflow events. A single ``head_sha`` is regularly shared with
+# unrelated workflow runs (a ``push`` event on the branch, a
+# ``schedule`` run that picked up the same commit, a manual
+# ``workflow_dispatch``); those runs are not part of the PR check
+# rollup that drove the INFRA_FAILURE classification, and rerunning
+# them is at best wasted budget and at worst a destructive side effect
+# in another workflow. ``gh run list`` only accepts a single
+# ``--event`` value, but we want both ``pull_request`` and
+# ``pull_request_target`` (security-sensitive workflows in many repos
+# use the latter), so we filter on the ``event`` JSON field
+# client-side after fetching the windowed list.
+_PR_TRIGGERED_EVENTS = frozenset({"pull_request", "pull_request_target"})
 # Substring patterns matching known chatgpt-codex-connector[bot] error
 # comments. When the bot fails its own review and posts one of these,
 # review_status stays as EYES and the WATCH timeout would otherwise burn
@@ -610,6 +623,14 @@ class WatchMixin:
         only on ``conclusion`` would miss the failing run, log "no
         failing workflow run found", and still consume the one-shot
         retry marker — routing WATCH to FIX without actually retrying.
+
+        The candidate set is further filtered to PR-triggered events
+        (``pull_request`` / ``pull_request_target``). A ``push``,
+        ``schedule``, or ``workflow_dispatch`` run that happens to
+        share the SHA is not part of the PR check rollup and must not
+        be rerun: doing so would re-trigger an unrelated workflow,
+        still mark the one-shot infra retry as spent, and route WATCH
+        to FIX without actually retrying the failing PR checks.
         """
         if not head_sha:
             return False
@@ -623,7 +644,7 @@ class WatchMixin:
                     "--limit",
                     "20",
                     "--json",
-                    "databaseId,conclusion,status",
+                    "databaseId,conclusion,status,event",
                 ],
                 repo=self.owner_repo,
             )
@@ -639,16 +660,25 @@ class WatchMixin:
                 f"workflow run found for sha {head_sha[:7]}."
             )
             return False
+        pr_runs = [
+            r for r in runs
+            if isinstance(r, dict)
+            and str(r.get("event") or "").lower() in _PR_TRIGGERED_EVENTS
+        ]
+        if not pr_runs:
+            self.log_event(
+                f"[WATCH] PR #{pr_number} infra retry skipped — no "
+                f"PR-triggered workflow run found for sha {head_sha[:7]} "
+                f"among {len(runs)} recent runs."
+            )
+            return False
         first = next(
             (
-                r for r in runs
-                if isinstance(r, dict)
-                and (
-                    str(r.get("conclusion") or "").lower()
-                    in _FAILING_RUN_CONCLUSIONS
-                    or str(r.get("status") or "").lower()
-                    in _FAILING_RUN_CONCLUSIONS
-                )
+                r for r in pr_runs
+                if str(r.get("conclusion") or "").lower()
+                in _FAILING_RUN_CONCLUSIONS
+                or str(r.get("status") or "").lower()
+                in _FAILING_RUN_CONCLUSIONS
             ),
             None,
         )
@@ -656,7 +686,7 @@ class WatchMixin:
             self.log_event(
                 f"[WATCH] PR #{pr_number} infra retry skipped — no "
                 f"failing workflow run found for sha {head_sha[:7]} "
-                f"among {len(runs)} recent runs."
+                f"among {len(pr_runs)} PR-triggered runs."
             )
             return False
         run_id = first.get("databaseId")

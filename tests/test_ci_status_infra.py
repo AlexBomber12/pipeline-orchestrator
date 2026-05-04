@@ -133,11 +133,11 @@ def test_maybe_hydrate_annotations_skips_when_already_populated(
     otherwise mask their intent)."""
     calls: list[str] = []
 
-    def fake_paginated(path: str) -> Any:
-        calls.append(path)
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        calls.append(" ".join(args))
         return []
 
-    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     run = {
         "id": 1,
         "conclusion": "failure",
@@ -156,11 +156,11 @@ def test_maybe_hydrate_annotations_skips_when_count_missing(
     a zero count) does not trigger an annotations REST call."""
     calls: list[str] = []
 
-    def fake_paginated(path: str) -> Any:
-        calls.append(path)
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        calls.append(" ".join(args))
         return []
 
-    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     run_no_count = {"id": 5, "conclusion": "failure"}
     _maybe_hydrate_annotations("owner/name", run_no_count)
     assert "annotations" not in run_no_count
@@ -178,12 +178,42 @@ def test_maybe_hydrate_annotations_skips_when_id_missing(
     no-op rather than guess at a path."""
     calls: list[str] = []
 
-    def fake_paginated(path: str) -> Any:
-        calls.append(path)
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        calls.append(" ".join(args))
         return []
 
-    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     run = {"conclusion": "failure", "annotations_count": 1}
     _maybe_hydrate_annotations("owner/name", run)
     assert "annotations" not in run
     assert calls == []
+
+
+def test_maybe_hydrate_annotations_bounds_to_single_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: the annotations endpoint is paginated and a
+    large lint/test run can have many pages. Hydration must not walk
+    every page on every WATCH cycle — a single bounded ``per_page``
+    fetch is enough to detect any infra keyword. This test fails if the
+    helper ever reverts to ``--paginate``/``--slurp``.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        calls.append(list(args))
+        return [{"message": "Runner offline; could not start the job."}]
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+    run = {"id": 99, "conclusion": "failure", "annotations_count": 500}
+    _maybe_hydrate_annotations("owner/name", run)
+    assert len(calls) == 1
+    only_call = calls[0]
+    assert "--paginate" not in only_call
+    assert "--slurp" not in only_call
+    # ``per_page=`` is embedded in the path argument so the worst case
+    # is one page regardless of the underlying ``annotations_count``.
+    assert any("per_page=" in arg for arg in only_call)
+    assert run["annotations"] == [
+        {"message": "Runner offline; could not start the job."}
+    ]

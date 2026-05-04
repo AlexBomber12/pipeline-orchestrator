@@ -2510,7 +2510,14 @@ def test_first_infra_failure_retries_workflow(
     def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
         gh_calls.append(list(args))
         if args[:2] == ["run", "list"]:
-            return [{"databaseId": 9876, "conclusion": "failure", "status": "completed"}]
+            return [
+                {
+                    "databaseId": 9876,
+                    "conclusion": "failure",
+                    "status": "completed",
+                    "event": "pull_request",
+                }
+            ]
         if args[:2] == ["run", "rerun"]:
             return ""
         return ""
@@ -2531,11 +2538,12 @@ def test_first_infra_failure_retries_workflow(
 
     assert fix_calls == []
     # Both list and rerun calls were issued. PR-251 follow-up: the list
-    # query pulls a window (limit 20) and selects on conclusion so a
-    # successful re-dispatch on the same SHA cannot occupy the slot.
+    # query pulls a window (limit 20) and selects on conclusion + event
+    # so a successful re-dispatch (same SHA) or an unrelated push run
+    # cannot occupy the slot.
     assert [
         "run", "list", "--commit", pr.head_sha,
-        "--limit", "20", "--json", "databaseId,conclusion,status",
+        "--limit", "20", "--json", "databaseId,conclusion,status,event",
     ] in gh_calls
     assert ["run", "rerun", "--failed", "9876"] in gh_calls
     # Retry marker is in Redis.
@@ -2694,7 +2702,7 @@ def test_retry_failed_workflow_handles_malformed_run_payload(
     runner = h._make_runner()
     sequences: list[Any] = [
         ["not-a-dict"],
-        [{"conclusion": "failure"}],
+        [{"conclusion": "failure", "event": "pull_request"}],
     ]
 
     def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
@@ -2714,7 +2722,14 @@ def test_retry_failed_workflow_handles_rerun_error(
 
     def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
         if args[:2] == ["run", "list"]:
-            return [{"databaseId": 555, "conclusion": "failure", "status": "completed"}]
+            return [
+                {
+                    "databaseId": 555,
+                    "conclusion": "failure",
+                    "status": "completed",
+                    "event": "pull_request",
+                }
+            ]
         raise RuntimeError("permission denied")
 
     monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
@@ -2738,8 +2753,18 @@ def test_retry_failed_workflow_picks_failing_run_over_succeeded_redispatch(
         calls.append(list(args))
         if args[:2] == ["run", "list"]:
             return [
-                {"databaseId": 1, "conclusion": "success", "status": "completed"},
-                {"databaseId": 2, "conclusion": "failure", "status": "completed"},
+                {
+                    "databaseId": 1,
+                    "conclusion": "success",
+                    "status": "completed",
+                    "event": "pull_request",
+                },
+                {
+                    "databaseId": 2,
+                    "conclusion": "failure",
+                    "status": "completed",
+                    "event": "pull_request",
+                },
             ]
         return ""
 
@@ -2763,8 +2788,18 @@ def test_retry_failed_workflow_skips_when_only_success_runs(
     def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
         if args[:2] == ["run", "list"]:
             return [
-                {"databaseId": 1, "conclusion": "success", "status": "completed"},
-                {"databaseId": 2, "conclusion": "neutral", "status": "completed"},
+                {
+                    "databaseId": 1,
+                    "conclusion": "success",
+                    "status": "completed",
+                    "event": "pull_request",
+                },
+                {
+                    "databaseId": 2,
+                    "conclusion": "neutral",
+                    "status": "completed",
+                    "event": "pull_request",
+                },
             ]
         if args[:2] == ["run", "rerun"]:
             rerun_calls.append(list(args))
@@ -2793,7 +2828,12 @@ def test_retry_failed_workflow_matches_failing_status_with_empty_conclusion(
         calls.append(list(args))
         if args[:2] == ["run", "list"]:
             return [
-                {"databaseId": 7, "conclusion": None, "status": "startup_failure"},
+                {
+                    "databaseId": 7,
+                    "conclusion": None,
+                    "status": "startup_failure",
+                    "event": "pull_request",
+                },
             ]
         return ""
 
@@ -2802,6 +2842,149 @@ def test_retry_failed_workflow_matches_failing_status_with_empty_conclusion(
     assert runner._retry_failed_workflow(11, "abc1234") is True
     rerun_calls = [c for c in calls if c[:2] == ["run", "rerun"]]
     assert rerun_calls == [["run", "rerun", "--failed", "7"]]
+
+
+def test_retry_failed_workflow_skips_non_pr_event_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: ``gh run list`` filters by SHA only; a
+    ``push``/``schedule``/``workflow_dispatch`` run that happens to
+    share the SHA must not be selected for ``gh run rerun --failed``.
+    Otherwise WATCH triggers an unrelated workflow, marks the one-shot
+    infra retry as spent, and routes to FIX without re-running the
+    failing PR checks.
+    """
+    runner = h._make_runner()
+    rerun_calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        if args[:2] == ["run", "list"]:
+            return [
+                {
+                    "databaseId": 100,
+                    "conclusion": "failure",
+                    "status": "completed",
+                    "event": "push",
+                },
+                {
+                    "databaseId": 101,
+                    "conclusion": "failure",
+                    "status": "completed",
+                    "event": "schedule",
+                },
+                {
+                    "databaseId": 102,
+                    "conclusion": "failure",
+                    "status": "completed",
+                    "event": "workflow_dispatch",
+                },
+            ]
+        if args[:2] == ["run", "rerun"]:
+            rerun_calls.append(list(args))
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+    assert runner._retry_failed_workflow(11, "abc1234") is False
+    assert rerun_calls == []
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "no PR-triggered workflow run found" in history
+
+
+def test_retry_failed_workflow_picks_pr_event_run_over_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: when both PR and push events share a SHA, the
+    retry helper must select the PR-triggered run. The PR check rollup
+    that drove INFRA_FAILURE references the ``pull_request`` workflow,
+    not the push run.
+    """
+    runner = h._make_runner()
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        calls.append(list(args))
+        if args[:2] == ["run", "list"]:
+            return [
+                {
+                    "databaseId": 200,
+                    "conclusion": "failure",
+                    "status": "completed",
+                    "event": "push",
+                },
+                {
+                    "databaseId": 201,
+                    "conclusion": "failure",
+                    "status": "completed",
+                    "event": "pull_request",
+                },
+            ]
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+    assert runner._retry_failed_workflow(11, "abc1234") is True
+    rerun_calls = [c for c in calls if c[:2] == ["run", "rerun"]]
+    assert rerun_calls == [["run", "rerun", "--failed", "201"]]
+
+
+def test_retry_failed_workflow_includes_pull_request_target_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: ``pull_request_target`` is a valid PR-triggered
+    event used by security-sensitive workflows; it must be eligible for
+    rerun even though it's not literally ``pull_request``.
+    """
+    runner = h._make_runner()
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        calls.append(list(args))
+        if args[:2] == ["run", "list"]:
+            return [
+                {
+                    "databaseId": 300,
+                    "conclusion": "failure",
+                    "status": "completed",
+                    "event": "pull_request_target",
+                },
+            ]
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+    assert runner._retry_failed_workflow(11, "abc1234") is True
+    rerun_calls = [c for c in calls if c[:2] == ["run", "rerun"]]
+    assert rerun_calls == [["run", "rerun", "--failed", "300"]]
+
+
+def test_retry_failed_workflow_run_list_includes_event_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: the ``--json`` field set must include ``event``
+    so the client-side filter can scope to PR-triggered runs. Without
+    this field every run looks like a non-PR event and the retry
+    silently no-ops.
+    """
+    runner = h._make_runner()
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        calls.append(list(args))
+        if args[:2] == ["run", "list"]:
+            return [
+                {
+                    "databaseId": 400,
+                    "conclusion": "failure",
+                    "status": "completed",
+                    "event": "pull_request",
+                },
+            ]
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+    runner._retry_failed_workflow(11, "abc1234")
+    list_call = next(c for c in calls if c[:2] == ["run", "list"])
+    json_idx = list_call.index("--json")
+    fields = list_call[json_idx + 1].split(",")
+    assert "event" in fields
 
 
 def test_retry_failed_workflow_handles_no_run_found(

@@ -11,7 +11,7 @@ import json
 import time
 from typing import Any
 
-from src.github import cache
+from src.github import cache, gh_runner
 from src.models import CIStatus
 from src.retry import retry_transient
 
@@ -84,6 +84,17 @@ _INFRA_ANNOTATION_KEYWORDS = (
     "we had a problem communicating with the server",
 )
 
+# PR-251 follow-up: hard cap on annotations fetched per failing
+# check-run when hydrating for the infra-keyword scan. The classifier
+# only needs *any* matching message, not the full set, and the
+# annotations endpoint is paginated (``per_page`` max 100). Pulling
+# every page on a large lint/test run can issue many REST calls per
+# WATCH cycle for every failing run on every open PR, which quickly
+# exhausts the GitHub REST budget. A single page of 50 messages
+# captures any realistic infra annotation while keeping the worst case
+# at one extra REST call per failing non-infra-conclusion check-run.
+_ANNOTATION_HYDRATION_PER_PAGE = 50
+
 
 def _is_infra_failure(check_run: dict) -> bool:
     """Return ``True`` iff a failing check-run's signals look infra-class.
@@ -133,6 +144,14 @@ def _maybe_hydrate_annotations(repo: str, check_run: dict) -> None:
       passing runs are not consulted by the classifier),
     - skip when ``annotations_count`` is missing or zero.
 
+    Only the first ``_ANNOTATION_HYDRATION_PER_PAGE`` annotations are
+    fetched (a single non-paginated REST call) instead of walking every
+    page. ``_is_infra_failure`` only needs to detect that *any*
+    annotation matches an infra keyword; for a large lint/test run
+    with hundreds of annotations, paginating every cycle would
+    multiply REST traffic by the number of failing runs and exhaust
+    the budget for unrelated WATCH cycles.
+
     Failures of the annotation fetch are swallowed: leaving the field
     empty causes ``_is_infra_failure`` to return ``False``, which
     surfaces the run as logic FAILURE — the safe default.
@@ -150,13 +169,19 @@ def _maybe_hydrate_annotations(repo: str, check_run: dict) -> None:
     check_run_id = check_run.get("id")
     if not isinstance(check_run_id, int):
         return
-    path = f"repos/{repo}/check-runs/{check_run_id}/annotations"
+    path = (
+        f"repos/{repo}/check-runs/{check_run_id}/annotations"
+        f"?per_page={_ANNOTATION_HYDRATION_PER_PAGE}"
+    )
     try:
-        annotations = cache._gh_api_paginated(path)
+        raw = retry_transient(
+            lambda: gh_runner.run_gh(["api", path]),
+            operation_name=f"gh api {path}",
+        )
     except RuntimeError:
         return
-    if isinstance(annotations, list):
-        check_run["annotations"] = annotations
+    if isinstance(raw, list):
+        check_run["annotations"] = [a for a in raw if isinstance(a, dict)]
 
 
 def clear_ci_status_cache() -> None:

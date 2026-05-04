@@ -3555,12 +3555,10 @@ def test_fetch_ci_status_rest_hydrates_annotations_for_failing_run(
         joined = " ".join(args)
         if "check-runs" in joined and "annotations" in joined:
             return [
-                [
-                    {
-                        "message": "Runner offline; could not start the job.",
-                        "annotation_level": "failure",
-                    }
-                ]
+                {
+                    "message": "Runner offline; could not start the job.",
+                    "annotation_level": "failure",
+                }
             ]
         if "check-runs" in joined:
             return [
@@ -3589,12 +3587,21 @@ def test_fetch_ci_status_rest_hydrates_annotations_for_failing_run(
     assert annotations and "Runner offline" in annotations[0]["message"]
     # The hydration step must have queried the per-check-run annotations
     # endpoint constructed from ``id`` (not blindly hitting the
-    # ``annotations_url`` host string).
-    assert any(
-        "repos/owner/name/check-runs/42/annotations" in a
-        for c in calls
-        for a in c
-    )
+    # ``annotations_url`` host string), and must bound the page size so
+    # large lint/test runs don't paginate every WATCH cycle.
+    annotation_calls = [
+        c for c in calls
+        if any(
+            "check-runs/42/annotations" in a and "per_page=" in a
+            for a in c
+        )
+    ]
+    assert annotation_calls, "expected a bounded annotations fetch"
+    # Single non-paginated call (no ``--paginate``/``--slurp``) so the
+    # worst case is one extra REST request per failing check-run.
+    for call in annotation_calls:
+        assert "--paginate" not in call
+        assert "--slurp" not in call
 
 
 def test_fetch_ci_status_rest_skips_annotation_hydration_for_passing_runs(
