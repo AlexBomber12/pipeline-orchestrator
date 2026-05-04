@@ -284,20 +284,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="Pipeline Orchestrator", lifespan=lifespan)
 
 
-_OPERATOR_HEARTBEAT_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_OPERATOR_HEARTBEAT_METHODS = frozenset(
+    {"GET", "POST", "PUT", "PATCH", "DELETE"}
+)
 
 
 @app.middleware("http")
 async def operator_heartbeat_middleware(request, call_next):
-    """Refresh ``operator_heartbeat`` Redis key on real operator actions.
+    """Refresh ``operator_heartbeat`` Redis key on operator dashboard traffic.
 
     Powers the ``HeartbeatSource`` half of the Cancellation-policy
-    availability composition (PR-255). Only mutating methods
-    (POST/PUT/PATCH/DELETE) returning a 2xx response refresh the key —
-    GET-based polling (``/api/states``, ``/partials/*``, SSE streams,
-    health probes) and failed requests must not mark the operator as
-    available, otherwise off-hours background traffic would pin the key
-    alive and undermine AWAY behavior. Best-effort: a Redis outage must
+    availability composition (PR-255). The dashboard is GET-dominated
+    (main page, ``/api/*`` polling, ``/partials/*``), so restricting
+    refresh to mutating methods would let an actively-watching operator
+    expire after the TTL — violating the ``HeartbeatSource`` contract
+    that "presence = AVAILABLE". Refresh on any successful 2xx response
+    to GET/POST/PUT/PATCH/DELETE; HEAD/OPTIONS (probes, CORS preflight)
+    and non-2xx responses are skipped. Best-effort: a Redis outage must
     not break the request, so all storage errors are swallowed.
     """
     response = await call_next(request)

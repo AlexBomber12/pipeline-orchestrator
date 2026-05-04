@@ -216,3 +216,30 @@ async def test_composition_failure_safe_when_all_raise() -> None:
         _StaticSource("active_hours", raises=True),
     ]
     assert await is_operator_available(sources) is AvailabilityState.AVAILABLE
+
+
+async def test_composition_failure_overrides_away_signal() -> None:
+    """A source raising must not let another source's AWAY win.
+
+    If Redis is down (manual + heartbeat raise) while ActiveHoursSource
+    legitimately returns AWAY, returning AWAY would pause coder work
+    because of an observability outage. Failure-safe policy requires
+    AVAILABLE in this case.
+    """
+    sources = [
+        _StaticSource("manual_override", raises=True),
+        _StaticSource("heartbeat", raises=True),
+        _StaticSource("active_hours", AvailabilityState.AWAY),
+    ]
+    assert await is_operator_available(sources) is AvailabilityState.AVAILABLE
+
+
+async def test_composition_manual_override_still_wins_when_other_source_raises() -> (
+    None
+):
+    """Failure-safe must not override an explicit operator manual decision."""
+    sources = [
+        _StaticSource("manual_override", AvailabilityState.AWAY),
+        _StaticSource("heartbeat", raises=True),
+    ]
+    assert await is_operator_available(sources) is AvailabilityState.AWAY

@@ -4018,13 +4018,23 @@ def test_heartbeat_middleware_refreshes_on_other_mutating_methods(
     assert len(redis_client.set_calls) == 1
 
 
-@pytest.mark.parametrize("method", ["GET", "HEAD", "OPTIONS"])
-def test_heartbeat_middleware_skips_get_polling_traffic(method: str) -> None:
-    """GET/HEAD/OPTIONS = polling, probes, page loads — must not refresh.
+def test_heartbeat_middleware_refreshes_on_get_dashboard_traffic() -> None:
+    """GET = main page + HTMX polls — operator-presence signal.
 
-    These can be triggered by HTMX auto-poll, SSE clients, health probes,
-    and stray requests that have nothing to do with operator presence.
+    The dashboard is GET-dominated; restricting refresh to mutating
+    methods would let an actively-watching operator expire after the
+    TTL, breaking the ``HeartbeatSource`` contract.
     """
+    redis_client = _RecordingRedis()
+    _run_heartbeat(method="GET", status_code=200, redis_client=redis_client)
+    assert redis_client.set_calls == [
+        ("operator_heartbeat", "1", {"ex": 300})
+    ]
+
+
+@pytest.mark.parametrize("method", ["HEAD", "OPTIONS"])
+def test_heartbeat_middleware_skips_probe_methods(method: str) -> None:
+    """HEAD/OPTIONS = probes and CORS preflight — not operator presence."""
     redis_client = _RecordingRedis()
     _run_heartbeat(method=method, status_code=200, redis_client=redis_client)
     assert redis_client.set_calls == []

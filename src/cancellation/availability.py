@@ -116,6 +116,8 @@ async def is_operator_available(
     - ManualOverrideSource takes precedence over all others (operator
       explicit will).
     - Among the rest, AVAILABLE wins if any source says AVAILABLE.
+    - If any source raised, bias to AVAILABLE so an observability outage
+      cannot let a single AWAY signal pause work (failure-safe).
     - Otherwise AWAY if any source says AWAY.
     - Default AVAILABLE (failure-safe).
 
@@ -123,12 +125,14 @@ async def is_operator_available(
     """
     manual_verdict: AvailabilityState | None = None
     other_verdicts: list[AvailabilityState] = []
+    any_failed = False
 
     for source in sources:
         try:
             verdict = await source.query()
         except Exception:
-            verdict = None
+            any_failed = True
+            continue
         if verdict is None:
             continue
         if source.name == "manual_override":
@@ -139,6 +143,8 @@ async def is_operator_available(
     if manual_verdict is not None:
         return manual_verdict
     if AvailabilityState.AVAILABLE in other_verdicts:
+        return AvailabilityState.AVAILABLE
+    if any_failed:
         return AvailabilityState.AVAILABLE
     if AvailabilityState.AWAY in other_verdicts:
         return AvailabilityState.AWAY
