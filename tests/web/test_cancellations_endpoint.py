@@ -285,6 +285,46 @@ def test_partial_endpoint_no_redis_renders_empty_state(
     assert sentinel["called"] is False
 
 
+def test_endpoint_returns_empty_when_redis_read_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Redis attached at startup but raising at request time degrades to ``[]``
+    rather than bubbling up as a 500."""
+
+    async def boom(redis_client, repo_slug, since):
+        raise ConnectionError("redis unreachable")
+
+    monkeypatch.setattr(dashboard_routes, "list_recent_cancellations", boom)
+
+    with TestClient(web_app.app) as client:
+        # Replace the lifespan-attached client with a sentinel so the
+        # ``redis_client is None`` short-circuit doesn't hide the raise.
+        monkeypatch.setattr(web_app.app.state, "redis", object())
+        resp = client.get("/api/cancellations/example__repo")
+
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_partial_endpoint_renders_empty_state_when_redis_read_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The HTML partial falls back to the empty state on Redis read errors,
+    keeping the HTMX swap target stable."""
+
+    async def boom(redis_client, repo_slug, since):
+        raise ConnectionError("redis unreachable")
+
+    monkeypatch.setattr(dashboard_routes, "list_recent_cancellations", boom)
+
+    with TestClient(web_app.app) as client:
+        monkeypatch.setattr(web_app.app.state, "redis", object())
+        resp = client.get("/partials/repo/example__repo/cancellations")
+
+    assert resp.status_code == 200
+    assert "No cancellations recorded in the last 7 days." in resp.text
+
+
 def test_partial_endpoint_renders_legacy_records_without_payload_fields(
     cancellations_client,
 ) -> None:

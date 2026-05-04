@@ -835,7 +835,12 @@ async def api_cancellations(repo: str, request: Request) -> JSONResponse:
     since = datetime.now(timezone.utc) - timedelta(
         days=_CANCELLATIONS_WINDOW_DAYS
     )
-    causes = await list_recent_cancellations(redis_client, repo, since)
+    try:
+        causes = await list_recent_cancellations(redis_client, repo, since)
+    except Exception:
+        # Degrade gracefully when Redis is configured but unreachable at
+        # request time, matching the redis_client-is-None branch above.
+        return JSONResponse([])
     return JSONResponse([asdict(c) for c in causes[:_CANCELLATIONS_MAX]])
 
 
@@ -1060,9 +1065,14 @@ async def partial_repo_cancellations(
         since = datetime.now(timezone.utc) - timedelta(
             days=_CANCELLATIONS_WINDOW_DAYS
         )
-        causes = (await list_recent_cancellations(redis_client, name, since))[
-            :_CANCELLATIONS_MAX
-        ]
+        try:
+            causes = (
+                await list_recent_cancellations(redis_client, name, since)
+            )[:_CANCELLATIONS_MAX]
+        except Exception:
+            # Redis temporarily unreachable: render the empty-state placeholder
+            # so the HTMX swap target stays stable instead of 5xx-ing the panel.
+            causes = []
     return _app.templates.TemplateResponse(
         request,
         "components/cancellation_history.html",
