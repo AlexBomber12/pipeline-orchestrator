@@ -32,33 +32,48 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
     ),
     (
         "force_push_main",
-        # Detect ``git push`` lines that force-push to ``main`` via
-        # either documented form: the ``--force``/``-f`` flag (any
-        # argument order) OR a leading ``+`` on the refspec, which
-        # ``git push -h`` documents as equivalent force behavior
-        # (e.g. ``+HEAD:main`` or ``+main``). Both arms require the
-        # destination of a refspec token to actually resolve to
-        # ``main`` (whitespace-bounded ``main`` or ``refs/heads/main``,
-        # optionally prefixed by ``<src>:``), so unrelated branch
-        # names that merely contain the substring ``main`` (e.g.
-        # ``feature/main-fix``) are not flagged.
+        # Detect ``git push`` lines that force-push to ``main``. Both
+        # arms walk only the tokens that belong to the ``git push``
+        # command itself, treating the args as whitespace-separated
+        # tokens that contain no command-terminator chars (``,;|&``).
+        # That ties the ``main`` match to the actual push refspec, so
+        # prose after a separator -- e.g.
+        # ``git push --force-with-lease origin feature/foo, then PR to main``
+        # -- is not flagged. The standard arm requires both a
+        # ``--force``/``-f`` flag token AND a refspec token whose
+        # destination resolves to ``main`` (whitespace-bounded
+        # ``main`` or ``refs/heads/main``, optionally prefixed by
+        # ``<src>:``). The ``--force`` token excludes
+        # ``--force-if-includes`` (alone a no-op) but still matches
+        # ``--force`` and ``--force-with-lease[=ref]``. The plus-prefix
+        # arm catches ``+<refspec>`` targeting ``main``, which
+        # ``git push -h`` documents as equivalent force behavior.
         re.compile(
             r"\bgit push\b"
             r"(?:"
-            # Force-flag form (``--force`` / ``-f``) plus a refspec
-            # whose dst resolves to ``main``. ``(?<!\S)`` and
-            # ``(?![\w/:-])`` keep the token whitespace-bounded so
-            # substrings inside ``feature/main-fix``, ``-main-``,
-            # or ``main:other`` are not matched. The ``--force`` arm
-            # uses a negative lookahead to exclude ``--force-if-includes``,
-            # which by itself is a no-op (it only takes effect when
-            # combined with ``--force-with-lease``); ``--force`` and
-            # ``--force-with-lease`` are still matched.
-            r"(?=[^\n]*(?:--force(?!-if-includes\b)\b|(?<!\S)-f(?!\S)))"
-            r"(?=[^\n]*(?<!\S)(?:[^\s:]+:)?(?:refs/heads/)?main(?![\w/:-]))"
+            # Standard force-flag form: --force/-f token AND main
+            # refspec token, in any order, both within the command's
+            # arg list.
+            r"(?="
+            r"(?:[ \t]+[^\s,;|&]+)*?"
+            r"[ \t]+"
+            r"(?:--force(?:-with-lease(?:=[^\s,;|&]*)?)?|-f)"
+            r"(?![\w-])"
+            r")"
+            r"(?="
+            r"(?:[ \t]+[^\s,;|&]+)*?"
+            r"[ \t]+"
+            r"(?:[^\s:,;|&]+:)?(?:refs/heads/)?main"
+            r"(?![\w/:-])"
+            r")"
             r"|"
-            # Plus-prefix force form: ``+<refspec>`` targeting main.
-            r"(?=[^\n]*(?<!\S)\+(?:[^\s:]+:)?(?:refs/heads/)?main(?![\w/:-]))"
+            # Plus-prefix force form: +<refspec> with dst=main.
+            r"(?="
+            r"(?:[ \t]+[^\s,;|&]+)*?"
+            r"[ \t]+"
+            r"\+(?:[^\s:,;|&]+:)?(?:refs/heads/)?main"
+            r"(?![\w/:-])"
+            r")"
             r")",
             re.IGNORECASE,
         ),

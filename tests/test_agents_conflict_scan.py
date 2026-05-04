@@ -177,6 +177,19 @@ def test_force_push_main_force_with_lease_detected():
     assert "force_push_main" in types
 
 
+def test_force_push_feature_branch_then_prose_about_main_not_flagged():
+    """``main`` mentioned in prose after the push command (separated
+    by a comma) is not part of the refspec, so a feature-branch
+    force-push must not be flagged."""
+    body = (
+        "git push --force-with-lease origin feature/foo, "
+        "then open a PR to main."
+    )
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" not in types
+
+
 def test_force_push_main_alt_detected():
     body = "Operator may force-push to main as a last resort."
     violations = scan_for_conflicts(body)
