@@ -73,6 +73,7 @@ class _FakeRedis:
         self.store: dict[str, str] = {}
         self.deleted: list[str] = []
         self.lists: dict[str, list[str]] = {}
+        self.zsets: dict[str, dict[str, float]] = {}
 
     async def set(
         self,
@@ -99,6 +100,15 @@ class _FakeRedis:
             del self.store[key]
             return 1
         return 0
+
+    async def zrem(self, key: str, *members: str) -> int:
+        bucket = self.zsets.setdefault(key, {})
+        removed = 0
+        for member in members:
+            if member in bucket:
+                del bucket[member]
+                removed += 1
+        return removed
 
     async def getdel(self, key: str) -> str | None:
         self.deleted.append(key)

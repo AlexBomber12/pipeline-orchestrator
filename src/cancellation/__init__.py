@@ -12,6 +12,7 @@ from src.cancellation.storage import (
     TTL_SECONDS,
     CancellationCause,
     cause_key,
+    delete_cancellation_cause,
     get_cancellation_cause,
     index_key,
     list_recent_cancellations,
@@ -21,6 +22,20 @@ from src.cancellation.storage import (
 logger = logging.getLogger(__name__)
 
 _RETRY_EXHAUSTION_RE = re.compile(r"failed after (\d+) attempts")
+
+# Tail-truncate the CRASH payload error_message so a multi-megabyte
+# stderr blob never lands in Redis with a 30-day TTL. Tail because the
+# error tends to be at the end of the captured stream.
+CRASH_PAYLOAD_MESSAGE_MAX = 2000
+
+
+def truncate_for_payload(
+    message: str, *, max_chars: int = CRASH_PAYLOAD_MESSAGE_MAX
+) -> str:
+    """Return ``message`` tail-truncated to fit in a cancellation payload."""
+    if len(message) <= max_chars:
+        return message
+    return f"[truncated]\n{message[-max_chars:]}"
 
 
 async def safe_record_cancellation_cause(
@@ -46,6 +61,34 @@ async def safe_record_cancellation_cause(
         msg = (
             f"[ERROR] Failed to record cancellation cause "
             f"({cause.category}): {exc} - continuing without storage."
+        )
+        if log is not None:
+            log(msg)
+        else:
+            logger.warning(msg)
+
+
+async def safe_delete_cancellation_cause(
+    redis_client: Any,
+    repo_slug: str,
+    task_id: str,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> None:
+    """Best-effort wrapper around ``delete_cancellation_cause``.
+
+    Used when ``handle_error`` decides to retry (ERROR -> IDLE): the
+    previously-recorded cause is no longer accurate because the task
+    will continue, so the record must be cleared to avoid corrupting
+    cancellation reporting if the task later succeeds. A Redis outage
+    during cleanup must never block the IDLE transition.
+    """
+    try:
+        await delete_cancellation_cause(redis_client, repo_slug, task_id)
+    except Exception as exc:
+        msg = (
+            f"[ERROR] Failed to clear cancellation cause for {task_id}: "
+            f"{exc} - continuing without cleanup."
         )
         if log is not None:
             log(msg)
@@ -83,13 +126,17 @@ def classify_infra_exception(
 
 __all__ = [
     "CATEGORIES",
+    "CRASH_PAYLOAD_MESSAGE_MAX",
     "TTL_SECONDS",
     "CancellationCause",
     "cause_key",
     "classify_infra_exception",
+    "delete_cancellation_cause",
     "get_cancellation_cause",
     "index_key",
     "list_recent_cancellations",
     "record_cancellation_cause",
+    "safe_delete_cancellation_cause",
     "safe_record_cancellation_cause",
+    "truncate_for_payload",
 ]

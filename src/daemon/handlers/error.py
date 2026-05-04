@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from enum import Enum
 
 from src.branch_context import BranchContext
+from src.cancellation import safe_delete_cancellation_cause
 from src.daemon import git_ops
 from src.diagnosis import parse_diagnosis
 from src.models import PipelineState
@@ -139,6 +140,23 @@ class ErrorMixin:
             "[BRANCH] handle_error: %s",
             BranchContext.from_runner(self).log_summary(),
         )
+        # The cancellation cause was written by the prior _transition_to_error
+        # call. Any IDLE-for-retry path below means the task continues, so
+        # the previously recorded cause must be cleared — otherwise a later
+        # success leaves a stale CRASH/INFRA/TIMEOUT record under the same
+        # task_id for the 30-day TTL.
+        retry_task = self.state.current_task
+        retry_task_id = retry_task.pr_id if retry_task is not None else None
+
+        async def _clear_cause_for_retry() -> None:
+            if retry_task_id is not None:
+                await safe_delete_cancellation_cause(
+                    self.redis,
+                    self.name,
+                    retry_task_id,
+                    log=self.log_event,
+                )
+
         if _is_infra_error(context):
             self._error_skip_context = None
             self._error_skip_policy.reset(self)
@@ -148,6 +166,7 @@ class ErrorMixin:
                 f"[ERROR] Infra error detected, skipping AI diagnosis and "
                 f"transitioning to IDLE for retry: {truncated}."
             )
+            await _clear_cause_for_retry()
             self.state.state = PipelineState.IDLE
             await self.publish_state()
             return
@@ -160,6 +179,7 @@ class ErrorMixin:
                 "[ERROR] Skipping AI diagnosis for rate-limit error, "
                 "transitioning to IDLE for retry."
             )
+            await _clear_cause_for_retry()
             self.state.state = PipelineState.IDLE
             await self.publish_state()
             return
@@ -171,6 +191,7 @@ class ErrorMixin:
                 "[ERROR] Skipping AI diagnosis for timeout error, "
                 "transitioning to IDLE for retry."
             )
+            await _clear_cause_for_retry()
             self.state.state = PipelineState.IDLE
             await self.publish_state()
             return
@@ -213,6 +234,7 @@ class ErrorMixin:
                 f"[ERROR] Skipping AI diagnosis: "
                 f"{coder_name.capitalize()} rate limited."
             )
+            await _clear_cause_for_retry()
             self.state.state = PipelineState.IDLE
             self.state.error_message = None
             self._error_diagnose_policy.reset(self)
@@ -411,6 +433,7 @@ class ErrorMixin:
             self.state.state = PipelineState.IDLE
             self.log_event("[ERROR] diagnose_error: SKIP -> IDLE.")
         elif verdict == "FIX":
+            await _clear_cause_for_retry()
             self.state.error_message = None
             self.state.state = PipelineState.IDLE
             self._error_diagnose_policy.reset(self)

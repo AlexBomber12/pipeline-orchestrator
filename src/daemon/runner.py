@@ -37,6 +37,7 @@ from redis.exceptions import RedisError
 from src.cancellation import (
     CancellationCause,
     safe_record_cancellation_cause,
+    truncate_for_payload,
 )
 from src.coder_registry import CoderPlugin, CoderRegistry
 from src.coders import build_coder_registry
@@ -1049,7 +1050,7 @@ class PipelineRunner(
         if task is not None:
             cause = cancellation_cause or CancellationCause(
                 category="CRASH",
-                payload={"error_message": message},
+                payload={"error_message": truncate_for_payload(message)},
             )
             await safe_record_cancellation_cause(
                 self.redis,

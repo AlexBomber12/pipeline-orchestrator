@@ -14,12 +14,19 @@ from typing import Any
 import pytest
 
 from src.cancellation import (
+    CRASH_PAYLOAD_MESSAGE_MAX,
     CancellationCause,
+    cause_key,
     classify_infra_exception,
+    delete_cancellation_cause,
+    index_key,
+    safe_delete_cancellation_cause,
     safe_record_cancellation_cause,
+    truncate_for_payload,
 )
 from src.daemon import runner as runner_module
 from src.daemon.handlers import coding as coding_module
+from src.daemon.handlers import error as error_module
 from src.daemon.handlers import fix as fix_module
 from src.daemon.handlers import fix as fix_handler_module
 from src.daemon.handlers.coding import CodingMixin
@@ -83,6 +90,21 @@ class _FakeRedisWithPipeline:
 
     def pipeline(self) -> _FakePipeline:
         return _FakePipeline(self)
+
+    async def delete(self, key: str) -> int:
+        if key in self.values:
+            del self.values[key]
+            return 1
+        return 0
+
+    async def zrem(self, key: str, *members: str) -> int:
+        bucket = self.zsets.setdefault(key, {})
+        removed = 0
+        for member in members:
+            if member in bucket:
+                del bucket[member]
+                removed += 1
+        return removed
 
 
 def _captured_safe_record(monkeypatch: pytest.MonkeyPatch) -> list[CancellationCause]:
@@ -361,3 +383,233 @@ def test_fix_handler_imports_cause_helpers() -> None:
     """Smoke test: fix.py wires the same cancellation symbols."""
     assert fix_module.CancellationCause is CancellationCause
     assert fix_module.safe_record_cancellation_cause is not None
+
+
+def test_delete_cancellation_cause_drops_key_and_index() -> None:
+    """The storage primitive removes both the cause key and its index entry."""
+    redis = _FakeRedisWithPipeline()
+    redis.values[cause_key("alpha", "PR-300")] = "{}"
+    redis.zsets[index_key("alpha")] = {"PR-300": 1.0, "PR-301": 2.0}
+
+    asyncio.run(delete_cancellation_cause(redis, "alpha", "PR-300"))
+
+    assert cause_key("alpha", "PR-300") not in redis.values
+    assert "PR-300" not in redis.zsets[index_key("alpha")]
+    # Sibling task entries are untouched.
+    assert redis.zsets[index_key("alpha")]["PR-301"] == 2.0
+
+
+def test_safe_delete_cancellation_cause_swallows_redis_failure() -> None:
+    """A Redis outage during cleanup must log but never raise."""
+
+    class _BoomRedis:
+        async def delete(self, key: str) -> int:
+            raise RuntimeError("redis down")
+
+        async def zrem(self, key: str, *members: str) -> int:
+            return 0
+
+    logged: list[str] = []
+    asyncio.run(
+        safe_delete_cancellation_cause(
+            _BoomRedis(), "alpha", "PR-302", log=logged.append,
+        )
+    )
+
+    assert any(
+        "Failed to clear cancellation cause for PR-302" in line
+        for line in logged
+    )
+
+
+def test_safe_delete_cancellation_cause_falls_back_to_module_logger(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Without a log callback, failures fall through to the module logger."""
+
+    class _BoomRedis:
+        async def delete(self, key: str) -> int:
+            raise RuntimeError("redis bus")
+
+        async def zrem(self, key: str, *members: str) -> int:
+            return 0
+
+    with caplog.at_level("WARNING", logger="src.cancellation"):
+        asyncio.run(
+            safe_delete_cancellation_cause(_BoomRedis(), "alpha", "PR-303")
+        )
+
+    assert any(
+        "Failed to clear cancellation cause for PR-303" in record.message
+        for record in caplog.records
+    )
+
+
+def test_truncate_for_payload_keeps_short_messages_intact() -> None:
+    assert truncate_for_payload("short") == "short"
+
+
+def test_truncate_for_payload_tail_truncates_long_messages() -> None:
+    body = "abcdef" + "x" * 10_000 + "TAIL"
+    truncated = truncate_for_payload(body)
+    # The tail (where stderr's actionable content typically lives) is kept;
+    # the head and surplus middle are discarded.
+    assert truncated.endswith("TAIL")
+    assert truncated.startswith("[truncated]\n")
+    assert len(truncated) <= len("[truncated]\n") + CRASH_PAYLOAD_MESSAGE_MAX
+
+
+def test_transition_to_error_truncates_default_crash_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Huge stderr-like messages must not be persisted unbounded into Redis."""
+    captured = _captured_safe_record(monkeypatch)
+    runner = h._make_runner()
+    _stub_runner_publish_and_save(runner)
+    runner.state.current_task = _doing_task("PR-303")
+
+    huge = "starthead" + "y" * 50_000 + "ENDTAIL"
+    asyncio.run(runner._transition_to_error(huge))
+
+    assert len(captured) == 1
+    cause = captured[0]
+    assert cause.category == "CRASH"
+    payload_message = cause.payload["error_message"]
+    assert len(payload_message) <= len("[truncated]\n") + CRASH_PAYLOAD_MESSAGE_MAX
+    assert payload_message.endswith("ENDTAIL")
+    # The original error_message on state.state is intact — only the
+    # persisted cancellation payload is bounded (Codex P2 on PR-253).
+    assert runner.state.error_message == huge
+
+
+def test_transition_to_error_does_not_truncate_override_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit cancellation_cause is persisted as-is."""
+    captured = _captured_safe_record(monkeypatch)
+    runner = h._make_runner()
+    _stub_runner_publish_and_save(runner)
+    runner.state.current_task = _doing_task("PR-304")
+
+    override = CancellationCause(
+        category="TIMEOUT",
+        payload={"limit_type": "fix_idle", "extra": "x" * 9000},
+    )
+    asyncio.run(
+        runner._transition_to_error("doesn't matter", cancellation_cause=override)
+    )
+
+    assert captured == [override]
+    # Caller's payload survives intact — truncation only applies to the
+    # default CRASH payload built by _transition_to_error itself.
+    assert len(captured[0].payload["extra"]) == 9000
+
+
+def _make_clear_cause_runner(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, list[str]]:
+    """Make a runner stubbed enough to exercise handle_error IDLE-retry paths."""
+    deleted: list[str] = []
+
+    async def fake_safe_delete(
+        redis_client: Any,
+        repo_slug: str,
+        task_id: str,
+        *,
+        log: Any = None,
+    ) -> None:
+        deleted.append(task_id)
+
+    # error.py imported the symbol into its namespace; patch it there so
+    # the bound reference inside handle_error resolves to the fake.
+    monkeypatch.setattr(
+        error_module, "safe_delete_cancellation_cause", fake_safe_delete
+    )
+    runner = h._make_runner()
+    _stub_runner_publish_and_save(runner)
+    runner.state.current_task = _doing_task("PR-310")
+    runner.state.state = PipelineState.ERROR
+    return runner, deleted
+
+
+def test_handle_error_clears_cause_on_infra_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, deleted = _make_clear_cause_runner(monkeypatch)
+    runner.state.error_message = "git fetch origin main: connection reset"
+
+    asyncio.run(runner.handle_error())
+
+    assert deleted == ["PR-310"]
+    assert runner.state.state == PipelineState.IDLE
+
+
+def test_handle_error_clears_cause_on_rate_limit_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, deleted = _make_clear_cause_runner(monkeypatch)
+    runner.state.error_message = "rate limit exceeded (429)"
+
+    asyncio.run(runner.handle_error())
+
+    assert deleted == ["PR-310"]
+    assert runner.state.state == PipelineState.IDLE
+
+
+def test_handle_error_clears_cause_on_timeout_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, deleted = _make_clear_cause_runner(monkeypatch)
+    runner.state.error_message = "operation timeout after 600s"
+
+    asyncio.run(runner.handle_error())
+
+    assert deleted == ["PR-310"]
+    assert runner.state.state == PipelineState.IDLE
+
+
+def test_handle_error_skips_cleanup_when_no_current_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry path with no current_task has no cause to clear."""
+    runner, deleted = _make_clear_cause_runner(monkeypatch)
+    runner.state.current_task = None
+    runner.state.error_message = "git fetch origin main: connection reset"
+
+    asyncio.run(runner.handle_error())
+
+    assert deleted == []
+    assert runner.state.state == PipelineState.IDLE
+
+
+def test_handle_error_cleanup_swallows_redis_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Redis outage during cleanup must not block the IDLE retry transition."""
+
+    class _BoomRedis:
+        async def delete(self, key: str) -> int:
+            raise RuntimeError("redis down")
+
+        async def zrem(self, key: str, *members: str) -> int:
+            return 0
+
+    runner = h._make_runner()
+    runner.redis = _BoomRedis()  # type: ignore[assignment]
+    _stub_runner_publish_and_save(runner)
+    runner.state.current_task = _doing_task("PR-311")
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "git fetch origin main: connection reset"
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert any(
+        "Failed to clear cancellation cause for PR-311" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_error_handler_imports_safe_delete() -> None:
+    """Smoke test: error.py wires the cleanup helper for retry paths."""
+    from src.cancellation import safe_delete_cancellation_cause as sdcc
+
+    assert error_module.safe_delete_cancellation_cause is sdcc
