@@ -31,6 +31,16 @@ _REPOS_ROOT = Path("/data/repos")
 # like PR-219a) is optional.
 _PR_FILENAME = re.compile(r"^PR-(\d+)[a-z]?\.md$")
 
+# Mirrors ``_REPO_SLUG_PATTERN`` in ``src/web/routes/onboarding.py``. A
+# slug must start with an alphanumeric, contain only ``[A-Za-z0-9_.-]``
+# on each side of the ``__`` separator, and contain no path separators.
+# Anchoring on a leading alphanumeric implicitly rejects ``.`` and
+# ``..`` traversal segments while still accepting otherwise valid names
+# that happen to contain a ``..`` substring (e.g. ``owner__foo..bar``).
+_REPO_SLUG_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9_.-]*__[A-Za-z0-9][A-Za-z0-9_.-]*$"
+)
+
 
 @mcp.tool()
 def validate_task_spec(content: str) -> dict:
@@ -86,11 +96,11 @@ def suggest_next_pr_number(repo: str) -> int:
         directory does not exist or contains no PR files.
 
     Raises:
-        ValueError: if ``repo`` contains path separators or
-            traversal sequences. Defensive against malformed input
-            even though the docker mount is read-only.
+        ValueError: if ``repo`` does not match the canonical
+            ``owner__repo`` slug pattern. Defensive against malformed
+            input even though the docker mount is read-only.
     """
-    if "/" in repo or ".." in repo or "\\" in repo:
+    if not _REPO_SLUG_PATTERN.fullmatch(repo):
         raise ValueError(f"Invalid repo slug: {repo!r}")
 
     tasks_dir = _REPOS_ROOT / repo / "tasks"

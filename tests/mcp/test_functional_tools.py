@@ -160,6 +160,27 @@ def test_suggest_next_pr_number_rejects_path_traversal(tmp_path):
         suggest_next_pr_number("owner/repo")
     with pytest.raises(ValueError, match="Invalid repo slug"):
         suggest_next_pr_number("owner\\repo")
+    with pytest.raises(ValueError, match="Invalid repo slug"):
+        suggest_next_pr_number("..")
+
+
+def test_suggest_next_pr_number_accepts_dotted_slug(tmp_path):
+    """Slugs matching the onboarding regex must be accepted.
+
+    The onboarding validator (``src/web/routes/onboarding.py``) allows
+    ``[A-Za-z0-9_.-]`` on each side of ``__``, so ``owner__foo..bar``
+    is a configured-repo slug; the MCP tool must not reject it just
+    because the substring ``..`` appears.
+    """
+    from src.mcp.tools import functional
+
+    fake_root = tmp_path / "data" / "repos"
+    tasks = fake_root / "owner__foo..bar" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "PR-007.md").write_text("# stub")
+
+    with patch.object(functional, "_REPOS_ROOT", fake_root):
+        assert functional.suggest_next_pr_number("owner__foo..bar") == 8
 
 
 def test_functional_tools_registered_with_mcp_server():
