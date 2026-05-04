@@ -3,10 +3,24 @@
    per-repo detail page. Server-rendered list (no client polling): the
    data backs operator review, not real-time monitoring, so the htmx
    ``toggle[target.open]`` fetch in repo.html refires each time the
-   section is re-opened — that is the only refresh path. #}
+   section is re-opened — that is the only refresh path.
+
+   PR-257: causes carry an injected ``dependents_count`` attribute and
+   are sorted descending by it so canceled roots blocking the most
+   downstream work surface first; a "Blocks N task(s)" badge follows
+   each card with a positive count. The default of zero applies when
+   the canceled task has no dependents (or when QUEUE.md was unreadable
+   and the closure could not be computed). #}
 <div class="cancellation-list mt-3">
     {% if causes %}
-    {% for cause in causes %}{{ cancellation_card(cause) }}{% endfor %}
+    {% for cause in causes | sort(attribute='dependents_count', reverse=True) %}
+        {{ cancellation_card(cause) }}
+        {% if cause.dependents_count and cause.dependents_count > 0 %}
+        <div class="dependents-badge mt-1 text-xs text-amber-300/80">
+            Blocks {{ cause.dependents_count }} task(s)
+        </div>
+        {% endif %}
+    {% endfor %}
     {% else %}
     <p class="text-sm text-gray-500 italic">No cancellations recorded in the last 7 days.</p>
     {% endif %}
