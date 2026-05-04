@@ -828,7 +828,14 @@ async def api_cancellations(repo: str, request: Request) -> JSONResponse:
     detection writes, this endpoint surfaces them so the dashboard can
     render structured "what happened" cards instead of leaving operators
     to read Redis by hand.
+
+    Gated on ``config.yml``: ``cancellation_index:*`` keys live up to 30
+    days, so a repo removed (or mistyped) would otherwise surface stale
+    cards from its post-removal window. Reading a repo absent from the
+    config returns ``[]``, mirroring the redis-None short-circuit.
     """
+    if _find_repo_config_by_name(load_config(_app.CONFIG_PATH), repo) is None:
+        return JSONResponse([])
     redis_client = getattr(request.app.state, "redis", None)
     if redis_client is None:
         return JSONResponse([])
@@ -1058,10 +1065,18 @@ async def partial_repo_cancellations(
     first reveal; closing and reopening the section refetches. The
     cancellation surface is operator-review, not real-time, so no SSE
     wake or periodic poll is needed for v1 (PR-254 implementation note).
+
+    Gated on ``config.yml`` for the same reason as ``api_cancellations``
+    above: stale ``cancellation_index:*`` keys (TTL up to 30 days) must
+    not resurface as cards for repos that were removed from the config.
     """
     redis_client = getattr(request.app.state, "redis", None)
     causes: list = []
-    if redis_client is not None:
+    repo_configured = (
+        _find_repo_config_by_name(load_config(_app.CONFIG_PATH), name)
+        is not None
+    )
+    if repo_configured and redis_client is not None:
         since = datetime.now(timezone.utc) - timedelta(
             days=_CANCELLATIONS_WINDOW_DAYS
         )

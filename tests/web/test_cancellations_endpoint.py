@@ -43,6 +43,10 @@ def cancellations_client(monkeypatch: pytest.MonkeyPatch):
     The fake records the ``since`` argument the route passed in so tests
     can assert the 7-day window trims older entries at the source rather
     than only at serialization.
+
+    Also stubs ``_find_repo_config_by_name`` to treat ``example__repo`` as
+    configured so the route's config-gate (introduced after PR-254 review
+    feedback) does not short-circuit before the storage seam is hit.
     """
     fake_causes: list[CancellationCause] = []
     captured: dict = {}
@@ -59,6 +63,11 @@ def cancellations_client(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(
         dashboard_routes, "list_recent_cancellations", fake_list
+    )
+    monkeypatch.setattr(
+        dashboard_routes,
+        "_find_repo_config_by_name",
+        lambda config, name: object() if name == "example__repo" else None,
     )
 
     with TestClient(web_app.app) as client:
@@ -162,6 +171,11 @@ def test_endpoint_empty_when_no_redis(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(
         dashboard_routes, "list_recent_cancellations", fake_list
+    )
+    monkeypatch.setattr(
+        dashboard_routes,
+        "_find_repo_config_by_name",
+        lambda config, name: object() if name == "example__repo" else None,
     )
 
     if hasattr(web_app.app.state, "redis"):
@@ -273,6 +287,11 @@ def test_partial_endpoint_no_redis_renders_empty_state(
     monkeypatch.setattr(
         dashboard_routes, "list_recent_cancellations", fake_list
     )
+    monkeypatch.setattr(
+        dashboard_routes,
+        "_find_repo_config_by_name",
+        lambda config, name: object() if name == "example__repo" else None,
+    )
 
     if hasattr(web_app.app.state, "redis"):
         monkeypatch.delattr(web_app.app.state, "redis", raising=False)
@@ -295,6 +314,11 @@ def test_endpoint_returns_empty_when_redis_read_raises(
         raise ConnectionError("redis unreachable")
 
     monkeypatch.setattr(dashboard_routes, "list_recent_cancellations", boom)
+    monkeypatch.setattr(
+        dashboard_routes,
+        "_find_repo_config_by_name",
+        lambda config, name: object() if name == "example__repo" else None,
+    )
 
     with TestClient(web_app.app) as client:
         # Replace the lifespan-attached client with a sentinel so the
@@ -316,6 +340,11 @@ def test_partial_endpoint_renders_empty_state_when_redis_read_raises(
         raise ConnectionError("redis unreachable")
 
     monkeypatch.setattr(dashboard_routes, "list_recent_cancellations", boom)
+    monkeypatch.setattr(
+        dashboard_routes,
+        "_find_repo_config_by_name",
+        lambda config, name: object() if name == "example__repo" else None,
+    )
 
     with TestClient(web_app.app) as client:
         monkeypatch.setattr(web_app.app.state, "redis", object())
@@ -347,3 +376,50 @@ def test_partial_endpoint_renders_legacy_records_without_payload_fields(
     assert "PR-LEGACY-ESC" in body
     # NO_PUSH_DEADLOCK falls back to the no-attempts message.
     assert "no push across consecutive cycles" in body
+
+
+def test_endpoint_short_circuits_when_repo_not_in_config(
+    cancellations_client,
+) -> None:
+    """A slug missing from ``config.yml`` must not reach storage.
+
+    Guards against stale ``cancellation_index:*`` keys (TTL up to 30 days)
+    resurfacing for repos that were removed or mistyped, matching the
+    config-gate other repo endpoints already enforce.
+    """
+    client, causes, captured = cancellations_client
+    now = datetime.now(timezone.utc)
+    causes[:] = [
+        _make_cause(
+            "PR-1",
+            created_at=(now - timedelta(hours=1)).isoformat(),
+        ),
+    ]
+
+    resp = client.get("/api/cancellations/removed__repo")
+
+    assert resp.status_code == 200
+    assert resp.json() == []
+    assert "repo_slug" not in captured
+
+
+def test_partial_endpoint_short_circuits_when_repo_not_in_config(
+    cancellations_client,
+) -> None:
+    """The HTML partial renders the empty placeholder for unconfigured
+    repo slugs rather than reading Redis directly."""
+    client, causes, captured = cancellations_client
+    now = datetime.now(timezone.utc)
+    causes[:] = [
+        _make_cause(
+            "PR-STALE",
+            created_at=(now - timedelta(hours=1)).isoformat(),
+        ),
+    ]
+
+    resp = client.get("/partials/repo/removed__repo/cancellations")
+
+    assert resp.status_code == 200
+    assert "No cancellations recorded in the last 7 days." in resp.text
+    assert "PR-STALE" not in resp.text
+    assert "repo_slug" not in captured
