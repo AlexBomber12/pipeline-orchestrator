@@ -53,6 +53,35 @@ def test_force_push_main_detected():
     assert "force_push_main" in types
 
 
+def test_force_push_main_detected_force_after_main():
+    body = "Recovery: git push origin main --force when needed."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" in types
+
+
+def test_force_push_main_detected_short_flag_before_main():
+    body = "Run git push -f origin main to overwrite history."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" in types
+
+
+def test_force_push_main_detected_short_flag_after_main():
+    body = "Run git push origin main -f when in doubt."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" in types
+
+
+def test_force_push_main_short_flag_requires_standalone_token():
+    """``-foo`` must not satisfy the ``-f`` arm of the alternation."""
+    body = "git push --some-flag=-foo origin main"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" not in types
+
+
 def test_force_push_main_alt_detected():
     body = "Operator may force-push to main as a last resort."
     violations = scan_for_conflicts(body)

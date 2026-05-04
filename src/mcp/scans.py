@@ -32,7 +32,18 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
     ),
     (
         "force_push_main",
-        re.compile(r"\bgit push[^\n]*--force[^\n]*\bmain\b", re.IGNORECASE),
+        # Order-agnostic match: detect ``git push`` lines that name
+        # ``main`` AND carry either ``--force`` or the ``-f`` shorthand
+        # (``git push -h`` documents ``-f, --[no-]force`` as equivalent),
+        # in either argument order. The ``-f`` arm uses
+        # ``(?<!\S)``/``(?!\S)`` so it only matches the standalone flag,
+        # not substrings inside words like ``-foo``.
+        re.compile(
+            r"\bgit push\b"
+            r"(?=[^\n]*\bmain\b)"
+            r"(?=[^\n]*(?:--force\b|(?<!\S)-f(?!\S)))",
+            re.IGNORECASE,
+        ),
         "AGENTS.md forbids force-push to main.",
     ),
     (
