@@ -505,6 +505,54 @@ def test_transition_to_error_does_not_truncate_override_cause(
     assert len(captured[0].payload["extra"]) == 9000
 
 
+def test_transition_to_error_preserves_existing_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First-cause-wins: a later _transition_to_error must not overwrite."""
+    captured = _captured_safe_record(monkeypatch)
+    runner = h._make_runner()
+    _stub_runner_publish_and_save(runner)
+    runner.state.current_task = _doing_task("PR-320")
+
+    prior = CancellationCause(
+        category="ESCALATE",
+        payload={"reason_text": "first failure"},
+        created_at="2026-05-04T08:00:00+00:00",
+        task_id="PR-320",
+        repo_slug=runner.name,
+    )
+    runner.redis.store[cause_key(runner.name, "PR-320")] = prior.to_redis()
+
+    asyncio.run(runner._transition_to_error("transient retry CRASH"))
+
+    assert captured == [], (
+        "later _transition_to_error must not overwrite first cause"
+    )
+
+
+def test_transition_to_error_writes_when_redis_read_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Read-side failure must not silently drop the cause write."""
+    captured = _captured_safe_record(monkeypatch)
+
+    async def boom(
+        redis_client: Any, repo_slug: str, task_id: str
+    ) -> CancellationCause | None:
+        raise RuntimeError("redis read down")
+
+    monkeypatch.setattr(runner_module, "get_cancellation_cause", boom)
+
+    runner = h._make_runner()
+    _stub_runner_publish_and_save(runner)
+    runner.state.current_task = _doing_task("PR-321")
+
+    asyncio.run(runner._transition_to_error("subprocess crashed"))
+
+    assert len(captured) == 1
+    assert captured[0].category == "CRASH"
+
+
 def _make_clear_cause_runner(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, list[str]]:
     """Make a runner stubbed enough to exercise handle_error IDLE-retry paths."""
     deleted: list[str] = []
