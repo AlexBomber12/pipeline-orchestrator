@@ -145,72 +145,54 @@ def test_dirty_tree_recovery_composes_with_crashed_task_marker(
 
 
 # ---------------------------------------------------------------------------
-# Test 2 — no-push deadlock + HUNG fallback blocked by ``is_escalated``
+# Test 2 — no-push deadlock cancels the task and returns to IDLE (PR-258)
 # ---------------------------------------------------------------------------
 
 
-def test_no_push_escalation_blocks_codex_review_fallback_in_hung(
+def test_no_push_escalation_cancels_task_and_returns_to_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No-push deadlock parks in HUNG and the fallback stays parked.
-
-    ``_escalate_fix_no_push_deadlock`` is responsible for two
-    coordinated effects: the immediate transition to HUNG, and setting
-    ``current_pr.is_escalated=True`` so the next ``handle_hung`` cycle
-    refuses to fire the ``@codex review`` fallback. Without that
-    second step, the fallback would bounce the runner back through
-    WATCH and immediately re-enter the FIX loop the deadlock counter
-    just stopped — which is exactly the regression the
-    ``is_escalated`` in-memory flag was added to prevent.
+    """PR-258 (OBS-BB) replaces the prior HUNG transition with a
+    cancellation policy v1 transition: write a ``NO_PUSH_DEADLOCK``
+    cause, mark the task CANCELED via ``_recovered_task_pr_ids``, and
+    return to IDLE so the daemon picks up the next pickable task.
     """
-    posted: list[tuple[str, int, str]] = []
-    gh_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "src.github.gh_runner.run_gh", lambda cmd, **kwargs: ""
+    )
+
+    recorded: list[tuple[str, str, str]] = []
+
+    async def fake_record(redis_client, repo_slug, task_id, cause):
+        recorded.append((repo_slug, task_id, cause.category))
 
     monkeypatch.setattr(
-        "src.github.comments.post_comment",
-        lambda repo, number, body: posted.append((repo, number, body)),
-    )
-    monkeypatch.setattr(
-        "src.github.gh_runner.run_gh",
-        lambda cmd, **kwargs: gh_calls.append(cmd) or "",
+        "src.cancellation.record_cancellation_cause", fake_record
     )
 
     runner = h._make_runner()
     pr = PRInfo(number=400, branch="pr-400-feedback", no_push_fix_count=3)
     runner.state.state = PipelineState.FIX
+    runner.state.current_task = QueueTask(
+        pr_id="PR-400",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-400-feedback",
+    )
     runner.state.current_pr = pr
 
     asyncio.run(runner._escalate_fix_no_push_deadlock(pr))
 
-    expected_message = (
-        "FIX deadlock: 3 consecutive no-push FIX cycles on PR #400. "
-        "Coder unable to identify actionable fix. Manual review required."
-    )
-    assert runner.state.state == PipelineState.HUNG
-    assert pr.is_escalated is True
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.current_pr is None
     assert pr.no_push_fix_count == 0
-    assert posted == [(runner.owner_repo, 400, expected_message)]
-    assert ["pr", "edit", "400", "--add-label", "escalated"] in gh_calls
-    assert any(e["event"] == f"[ESCALATE] {expected_message}" for e in runner.state.history)
-
-    review_posts: list[tuple[str, int, str]] = []
-
-    def record_or_fail(repo: str, number: int, body: str) -> None:
-        review_posts.append((repo, number, body))
-
-    monkeypatch.setattr("src.github.comments.post_comment", record_or_fail)
-    monkeypatch.setattr(
-        "src.github.gh_runner.run_gh",
-        lambda cmd, **kwargs: {"state": "OPEN"},
-    )
-
-    asyncio.run(runner.handle_hung())
-
-    assert runner.state.state == PipelineState.HUNG
-    assert pr.is_escalated is True
-    assert review_posts == []
+    assert "PR-400" in runner._recovered_task_pr_ids
+    assert recorded == [(runner.name, "PR-400", "NO_PUSH_DEADLOCK")]
     assert any(
-        "PR #400 escalated; staying HUNG, skipping @codex review fallback." in e["event"] for e in runner.state.history
+        "PR #400 no-push deadlock after 3 attempts; canceling task"
+        in e["event"]
+        for e in runner.state.history
     )
 
 

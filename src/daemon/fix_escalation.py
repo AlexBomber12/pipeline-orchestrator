@@ -13,6 +13,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from src.cancellation import (
+    CancellationCause,
+    safe_record_cancellation_cause,
+)
 from src.github import comments as gh_comments
 from src.github import gh_runner
 from src.models import PipelineState, PRInfo
@@ -92,37 +96,97 @@ def ensure_escalated_label(
         return False
 
 
+def apply_canceled_label(runner: "PipelineRunner", pr_number: int) -> None:
+    """Best-effort: ensure ``canceled`` label exists and apply it to ``pr_number``.
+
+    Mirrors ``ensure_escalated_label`` but for the PR-258 cancellation
+    surface: a ``canceled`` label gives operators a GitHub-side hint
+    that the daemon surrendered the task with a structured cause. Both
+    ``gh`` calls soft-fail with ``log_event`` so a GitHub outage never
+    blocks the IDLE transition.
+    """
+    try:
+        gh_runner.run_gh(
+            [
+                "label",
+                "create",
+                "canceled",
+                "--color",
+                "B60205",
+                "--description",
+                "Daemon canceled this task; manual recovery required",
+            ],
+            repo=runner.owner_repo,
+        )
+    except Exception as exc:
+        runner.log_event(
+            f"[FIX] FIX no-push canceled label create skipped: {exc}."
+        )
+    try:
+        gh_runner.run_gh(
+            ["pr", "edit", str(pr_number), "--add-label", "canceled"],
+            repo=runner.owner_repo,
+        )
+    except Exception as exc:
+        runner.log_event(
+            f"[FIX] Warning: failed to apply canceled label to PR "
+            f"#{pr_number}: {exc}."
+        )
+
+
 async def escalate_fix_no_push_deadlock(
     runner: "PipelineRunner", current_pr: PRInfo
 ) -> None:
-    """Park the PR in HUNG after consecutive no-push FIX cycles.
+    """Cancel the task via Cancellation policy after a no-push deadlock.
 
-    Thin wrapper over ``_escalate_to_hung``: posts a deadlock comment with
-    a fix.py-specific failure-log prefix, resets the no-push counter, then
-    delegates state transition / label apply / is_escalated bookkeeping to
-    the primitive. ``error_message`` is cleared because HUNG itself is the
-    parking signal.
+    PR-258 (OBS-BB) replaces the prior HUNG transition with a cancellation
+    policy v1 transition: write a ``NO_PUSH_DEADLOCK`` cause to Redis,
+    apply the ``canceled`` label to the PR, mark the task CANCELED for the
+    next IDLE cycle, and return to IDLE so the daemon picks up the next
+    pickable task. Looping retrigger via HUNG/WATCH wastes coder budget
+    when the missing artifact is a fix push (not a Codex review), so the
+    cleaner signal is a structured surrender of the task.
     """
-    count = current_pr.no_push_fix_count
+    attempts = current_pr.no_push_fix_count
     pr_number = current_pr.number
-    message = (
-        f"FIX deadlock: {count} consecutive no-push FIX cycles on PR "
-        f"#{pr_number}. Coder unable to identify actionable fix. "
-        "Manual review required."
+    runner.log_event(
+        f"[FIX] PR #{pr_number} no-push deadlock after {attempts} "
+        "attempts; canceling task with cause preserved."
     )
-    try:
-        gh_comments.post_comment(runner.owner_repo, pr_number, message)
-    except Exception as exc:
-        runner.log_event(
-            f"[FIX] Warning: failed to post FIX deadlock comment on PR "
-            f"#{pr_number}: {exc}."
-        )
+
+    current_task = runner.state.current_task
+    task_id = (
+        current_task.pr_id
+        if current_task is not None
+        else f"pr_{pr_number}"
+    )
+    cause = CancellationCause(
+        category="NO_PUSH_DEADLOCK",
+        payload={
+            "attempts": attempts,
+            "pr_number": pr_number,
+            "head_sha": current_pr.head_sha or "",
+        },
+    )
+    await safe_record_cancellation_cause(
+        runner.redis,
+        runner.name,
+        task_id,
+        cause,
+        log=runner.log_event,
+    )
+
+    apply_canceled_label(runner, pr_number)
+
     current_pr.no_push_fix_count = 0
-    await runner._escalate_to_hung(
-        message,
-        error_message_override=None,
-        label_create_log_prefix="FIX no-push",
-    )
+    if current_task is not None:
+        runner._recovered_task_pr_ids.add(current_task.pr_id)
+        await runner._persist_recovered_task_pr_ids()
+
+    runner.state.current_task = None
+    runner._reset_runner_local_task_counters()
+    runner.state.state = PipelineState.IDLE
+    await runner.publish_state()
 
 
 async def escalate_fix_coder_initiated(
