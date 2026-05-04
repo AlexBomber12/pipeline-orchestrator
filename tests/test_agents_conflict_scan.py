@@ -368,6 +368,88 @@ def test_no_verify_detected():
     assert "no_verify_commit" in types
 
 
+def test_draft_pr_flag_negated_do_not_not_flagged():
+    """``Do not run gh pr create --draft`` restates the AGENTS.md
+    rule -- with a verb (``run``) between the negation and the
+    command -- and must not be flagged. Prior to this fix command
+    patterns matched the literal ``gh pr create --draft`` regardless
+    of context, rejecting compliant specs that documented the rule
+    in negative form."""
+    body = "Do not run gh pr create --draft when iterating."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_flag" not in types
+
+
+def test_draft_pr_flag_negated_never_not_flagged():
+    body = "Never invoke gh pr create --draft on this repo."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_flag" not in types
+
+
+def test_no_verify_negated_never_use_not_flagged():
+    """``Never use git commit --no-verify`` restates the AGENTS.md
+    rule -- with a verb (``use``) between the negation and the
+    command -- and must not be flagged."""
+    body = "Never use git commit --no-verify in this repo."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "no_verify_commit" not in types
+
+
+def test_no_verify_negated_do_not_not_flagged():
+    body = "Do not run git commit --no-verify; the hook is mandatory."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "no_verify_commit" not in types
+
+
+def test_force_push_main_negated_not_flagged():
+    """``Do not run git push --force origin main`` restates the
+    AGENTS.md rule and must not be flagged."""
+    body = "Do not run git push --force origin main."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" not in types
+
+
+def test_force_push_main_alt_negated_not_flagged():
+    """``Never force-push to main`` restates the AGENTS.md rule and
+    must not be flagged. The prose pattern previously fired on any
+    ``force-push ... main`` mention regardless of negation."""
+    body = "Never force-push to main."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main_alt" not in types
+
+
+def test_auto_merge_dirty_negated_not_flagged():
+    """``Do not configure auto-merge with failing checks`` restates
+    the AGENTS.md rule and must not be flagged."""
+    body = "Do not configure auto-merge even when checks are failing."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "auto_merge_dirty" not in types
+
+
+def test_negation_in_previous_clause_does_not_suppress():
+    """A negation in a PRIOR clause (separated by ``.``) must not
+    suppress a subsequent positive instruction. The clause boundary
+    confines the negation lookup, so ``Do not skip CI. Run skip CI
+    when forced.`` flags the second occurrence."""
+    body = "Do not skip CI. Skip CI when CI is broken."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    # First occurrence is suppressed (Do not skip CI); second is not.
+    assert "skip_ci" in types
+    # Exactly one violation, not two.
+    skip_ci_count = sum(
+        1 for v in violations if v.violation_type == "skip_ci"
+    )
+    assert skip_ci_count == 1
+
+
 def test_skip_ci_detected():
     body = "We can skip CI for this trivial change."
     violations = scan_for_conflicts(body)

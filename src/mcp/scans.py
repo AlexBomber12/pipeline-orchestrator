@@ -19,6 +19,60 @@ class ConflictViolation:
     rule: str  # AGENTS.md rule reference
 
 
+# Negation phrases that, when present in the same clause as a match,
+# turn the match from a violation into policy-affirming prose. Lines
+# such as ``Do not run gh pr create --draft`` or ``Never use git
+# commit --no-verify`` restate the AGENTS.md rule and must not be
+# flagged. Both straight (``'``) and typographic (``’``) apostrophes
+# are accepted. Each phrase is anchored on a word boundary so the
+# regex matches whole words, not substrings (e.g. ``don't`` matches
+# but ``redon't`` would not).
+_NEGATION_CONTEXT = re.compile(
+    r"\b(?:"
+    r"do not|don't|don’t|"
+    r"cannot|can not|can't|can’t|"
+    r"never|"
+    r"must not|mustn't|mustn’t|"
+    r"will not|won't|won’t|"
+    r"should not|shouldn't|shouldn’t|"
+    r"avoid"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Clause boundaries for the negation-window check. ``.;!?:`` are
+# sentence/clause punctuation; ``\n`` is the physical line break.
+# A negation must appear in the clause that contains the match -- not
+# in a previous clause -- so that a sentence like ``Step 1: do not
+# skip CI. Step 2: skip CI when forced.`` flags the second occurrence
+# while suppressing the first.
+_CLAUSE_BOUNDARIES = ".;!?:\n"
+
+
+def _is_negated(text: str, match_start: int) -> bool:
+    """Return True if a negation phrase precedes ``match_start`` in
+    the same clause, indicating the matched command/phrase is being
+    prohibited rather than instructed.
+
+    The clause is the slice of ``text`` between the closest preceding
+    clause boundary (``.;!?:\\n``) and ``match_start``. When no
+    boundary is found, the clause starts at the beginning of the
+    text. Examples that suppress detection:
+
+    - ``Do not run gh pr create --draft`` (verb between negation and
+      command)
+    - ``Never use git commit --no-verify``
+    - ``Coders must not skip CI``
+
+    Without this check, command-based regex patterns flag the literal
+    command even when the surrounding prose explicitly forbids it,
+    rejecting compliant specs that document the AGENTS.md rule.
+    """
+    clause_start = max(text.rfind(c, 0, match_start) for c in _CLAUSE_BOUNDARIES)
+    clause_start = clause_start + 1 if clause_start >= 0 else 0
+    return _NEGATION_CONTEXT.search(text, clause_start, match_start) is not None
+
+
 _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
     (
         "draft_pr_flag",
@@ -27,35 +81,15 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
     ),
     (
         "draft_pr_text",
-        # Match ``create [a|the] draft PR`` only when NOT immediately
-        # preceded by a negation. Phrases like ``do not create a draft
-        # PR`` restate the AGENTS.md rule and must not be flagged as a
-        # violation. Each lookbehind is fixed-width (Python's ``re``
-        # requires it), so common negations are listed individually.
-        # Both straight (``'``) and typographic (``’``) apostrophes
-        # are accepted.
-        re.compile(
-            r"(?<!do not )"
-            r"(?<!don't )"
-            r"(?<!don’t )"
-            r"(?<!cannot )"
-            r"(?<!can not )"
-            r"(?<!can't )"
-            r"(?<!can’t )"
-            r"(?<!never )"
-            r"(?<!must not )"
-            r"(?<!mustn't )"
-            r"(?<!mustn’t )"
-            r"(?<!will not )"
-            r"(?<!won't )"
-            r"(?<!won’t )"
-            r"(?<!should not )"
-            r"(?<!shouldn't )"
-            r"(?<!shouldn’t )"
-            r"(?<!avoid )"
-            r"\bcreate (a |the )?draft PR\b",
-            re.IGNORECASE,
-        ),
+        # Match ``create [a|the] draft PR``. Negated forms such as
+        # ``do not create a draft PR`` are suppressed by the unified
+        # ``_is_negated`` check in ``scan_for_conflicts``, which scans
+        # the enclosing clause for a negation phrase rather than only
+        # the token immediately before the match. Centralising the
+        # negation handling there means a verb between negation and
+        # match (``Coders should never create a draft PR``) is
+        # recognised, which fixed-width lookbehinds cannot do.
+        re.compile(r"\bcreate (a |the )?draft PR\b", re.IGNORECASE),
         "AGENTS.md prohibits opening PRs in draft state. PR-196.",
     ),
     (
@@ -155,43 +189,17 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
     ),
     (
         "skip_ci",
-        # Match ``skip CI`` / ``bypass CI`` / ``ignore CI`` only when
-        # they are NOT immediately preceded by a negation. Negations
-        # such as ``do not skip CI`` or ``never skip CI`` restate the
-        # AGENTS.md rule and must not be flagged as a violation. Each
-        # alternative below is a fixed-width negative lookbehind --
-        # Python's stdlib ``re`` requires fixed widths, so the common
-        # negation phrases are listed individually instead of being
-        # collapsed into a variable-width alternation. Both straight
-        # (``'``) and typographic (``’``) apostrophes are
-        # accepted.
-        # The ``(?<!\[)`` lookbehind also excludes the bracketed
-        # marker forms ``[skip ci]`` / ``[ci skip]`` -- those belong
-        # to ``skip_ci_commit_msg`` and would otherwise produce a
-        # duplicate finding here, including for compliant specs that
-        # document the prohibition (e.g. ``Do not use [skip ci]
-        # markers``).
+        # Match ``skip CI`` / ``bypass CI`` / ``ignore CI``. Negated
+        # prose such as ``do not skip CI`` or ``never bypass CI`` is
+        # suppressed by the unified ``_is_negated`` check in
+        # ``scan_for_conflicts``. The ``(?<!\[)`` lookbehind here is
+        # NOT about negation -- it excludes the bracketed marker
+        # forms ``[skip ci]`` / ``[ci skip]`` so that the literal
+        # marker only fires the ``skip_ci_commit_msg`` rule, never a
+        # duplicate ``skip_ci`` finding for the same offending
+        # substring (e.g. ``Title: Refactor stub [skip ci]``).
         re.compile(
-            r"(?<!do not )"
-            r"(?<!don't )"
-            r"(?<!don’t )"
-            r"(?<!cannot )"
-            r"(?<!can not )"
-            r"(?<!can't )"
-            r"(?<!can’t )"
-            r"(?<!never )"
-            r"(?<!must not )"
-            r"(?<!mustn't )"
-            r"(?<!mustn’t )"
-            r"(?<!will not )"
-            r"(?<!won't )"
-            r"(?<!won’t )"
-            r"(?<!should not )"
-            r"(?<!shouldn't )"
-            r"(?<!shouldn’t )"
-            r"(?<!avoid )"
-            r"(?<!\[)"
-            r"\b(?:skip|bypass|ignore) CI\b",
+            r"(?<!\[)\b(?:skip|bypass|ignore) CI\b",
             re.IGNORECASE,
         ),
         "AGENTS.md requires green CI before merge.",
@@ -220,6 +228,13 @@ def scan_for_conflicts(task_spec_body: str) -> list[ConflictViolation]:
     Continuations are collapsed before matching, then each pattern
     runs against the full normalized body via ``finditer``.
 
+    Matches whose enclosing clause begins with a negation phrase
+    (``Do not run gh pr create --draft``, ``Never use git commit
+    --no-verify``) are suppressed by ``_is_negated`` so prose that
+    restates an AGENTS.md prohibition is not itself flagged as a
+    violation. The check applies uniformly to every pattern, since
+    every anti-pattern can appear in policy-affirming form.
+
     Empty list when no violations found. Each match captures the
     violation type and an 80-char excerpt of the offending line for
     operator context; for a continued command, the excerpt is the
@@ -232,6 +247,8 @@ def scan_for_conflicts(task_spec_body: str) -> list[ConflictViolation]:
     violations: list[ConflictViolation] = []
     for vtype, pattern, rule in _ANTI_PATTERNS:
         for match in pattern.finditer(normalized):
+            if _is_negated(normalized, match.start()):
+                continue
             line_start = normalized.rfind("\n", 0, match.start()) + 1
             line_end = normalized.find("\n", match.start())
             if line_end == -1:
