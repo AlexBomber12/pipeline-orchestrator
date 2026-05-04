@@ -853,6 +853,17 @@
                 } catch (_error) {}
             }
 
+            // Serialize override updates so rapid repeat clicks reach
+            // Redis in click order. Two concurrent POSTs would otherwise
+            // race in the network/server stack: the older request can
+            // be applied after the newer one, leaving Redis in a stale
+            // state, and the trailing ``refresh()`` then pulls that
+            // stale state back into the chip. Chaining each click onto
+            // the previous tail enforces "one in flight at a time" and
+            // also defers ``refresh()`` until after the queued POST so
+            // it always reads the newest server-side value.
+            let pendingChain = Promise.resolve();
+
             async function cycleState() {
                 const current = chip.dataset.manual || 'AUTO';
                 const next = cycle[current] || 'AUTO';
@@ -871,10 +882,12 @@
                 chip.setAttribute('aria-label', 'Operator availability: ' + next);
                 const label = chip.querySelector('.label');
                 if (label) label.textContent = next;
-                try {
-                    await fetch('/api/availability/' + next, {method: 'POST'});
-                } catch (_error) {}
-                refresh();
+                pendingChain = pendingChain.then(async () => {
+                    try {
+                        await fetch('/api/availability/' + next, {method: 'POST'});
+                    } catch (_error) {}
+                    await refresh();
+                });
             }
 
             chip.addEventListener('click', cycleState);
