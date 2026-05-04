@@ -160,6 +160,23 @@ def test_force_push_main_refspec_plus_dst_not_main_ignored():
     assert "force_push_main" not in types
 
 
+def test_force_push_main_force_if_includes_alone_not_flagged():
+    """``--force-if-includes`` alone is a no-op (only meaningful with
+    ``--force-with-lease``); it must not satisfy the ``--force`` arm."""
+    body = "git push --force-if-includes origin main"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" not in types
+
+
+def test_force_push_main_force_with_lease_detected():
+    """``--force-with-lease`` is still a force-push and must be flagged."""
+    body = "git push --force-with-lease origin main"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" in types
+
+
 def test_force_push_main_alt_detected():
     body = "Operator may force-push to main as a last resort."
     violations = scan_for_conflicts(body)

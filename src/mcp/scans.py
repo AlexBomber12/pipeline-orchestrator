@@ -49,8 +49,12 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
             # whose dst resolves to ``main``. ``(?<!\S)`` and
             # ``(?![\w/:-])`` keep the token whitespace-bounded so
             # substrings inside ``feature/main-fix``, ``-main-``,
-            # or ``main:other`` are not matched.
-            r"(?=[^\n]*(?:--force\b|(?<!\S)-f(?!\S)))"
+            # or ``main:other`` are not matched. The ``--force`` arm
+            # uses a negative lookahead to exclude ``--force-if-includes``,
+            # which by itself is a no-op (it only takes effect when
+            # combined with ``--force-with-lease``); ``--force`` and
+            # ``--force-with-lease`` are still matched.
+            r"(?=[^\n]*(?:--force(?!-if-includes\b)\b|(?<!\S)-f(?!\S)))"
             r"(?=[^\n]*(?<!\S)(?:[^\s:]+:)?(?:refs/heads/)?main(?![\w/:-]))"
             r"|"
             # Plus-prefix force form: ``+<refspec>`` targeting main.
