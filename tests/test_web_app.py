@@ -3938,3 +3938,113 @@ def test_route_module_entry_point_registers_all_routes(route_module: str) -> Non
         f"{route_module} as entry point produced different routes than baseline: "
         f"missing={baseline - paths}, extra={paths - baseline}"
     )
+
+
+# ---------------------------------------------------------------------------
+# operator_heartbeat_middleware (PR-255)
+# ---------------------------------------------------------------------------
+
+
+class _MiddlewareApp:
+    """Minimal stand-in for a Starlette ``app`` exposing ``state.redis``."""
+
+    def __init__(self, redis_client: object | None) -> None:
+        self.state = type("_State", (), {"redis": redis_client})()
+
+
+class _MiddlewareRequest:
+    """Minimal Request shape consumed by ``operator_heartbeat_middleware``."""
+
+    def __init__(self, method: str, redis_client: object | None) -> None:
+        self.method = method
+        self.app = _MiddlewareApp(redis_client)
+
+
+class _MiddlewareResponse:
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+
+
+class _RecordingRedis:
+    """Captures ``set`` calls so tests can assert when (not) refreshed."""
+
+    def __init__(self) -> None:
+        self.set_calls: list[tuple[str, str, dict[str, object]]] = []
+
+    async def set(self, key: str, value: str, **kwargs: object) -> None:
+        self.set_calls.append((key, value, dict(kwargs)))
+
+
+class _BoomSetRedis:
+    async def set(self, key: str, value: str, **_kwargs: object) -> None:
+        raise RuntimeError("redis is down")
+
+
+def _run_heartbeat(
+    *,
+    method: str,
+    status_code: int,
+    redis_client: object | None,
+) -> _MiddlewareResponse:
+    """Invoke the middleware with synthesized request/call_next."""
+
+    request = _MiddlewareRequest(method, redis_client)
+    response = _MiddlewareResponse(status_code)
+
+    async def call_next(_req: _MiddlewareRequest) -> _MiddlewareResponse:
+        return response
+
+    returned = asyncio.run(
+        web_app.operator_heartbeat_middleware(request, call_next)
+    )
+    assert returned is response
+    return returned
+
+
+def test_heartbeat_middleware_refreshes_on_successful_mutation() -> None:
+    redis_client = _RecordingRedis()
+    _run_heartbeat(method="POST", status_code=200, redis_client=redis_client)
+    assert redis_client.set_calls == [
+        ("operator_heartbeat", "1", {"ex": 300})
+    ]
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
+def test_heartbeat_middleware_refreshes_on_other_mutating_methods(
+    method: str,
+) -> None:
+    redis_client = _RecordingRedis()
+    _run_heartbeat(method=method, status_code=204, redis_client=redis_client)
+    assert len(redis_client.set_calls) == 1
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD", "OPTIONS"])
+def test_heartbeat_middleware_skips_get_polling_traffic(method: str) -> None:
+    """GET/HEAD/OPTIONS = polling, probes, page loads — must not refresh.
+
+    These can be triggered by HTMX auto-poll, SSE clients, health probes,
+    and stray requests that have nothing to do with operator presence.
+    """
+    redis_client = _RecordingRedis()
+    _run_heartbeat(method=method, status_code=200, redis_client=redis_client)
+    assert redis_client.set_calls == []
+
+
+@pytest.mark.parametrize("status", [301, 302, 400, 401, 403, 404, 500, 503])
+def test_heartbeat_middleware_skips_non_2xx_responses(status: int) -> None:
+    """Failed/redirected mutations must not pin the heartbeat key alive."""
+    redis_client = _RecordingRedis()
+    _run_heartbeat(method="POST", status_code=status, redis_client=redis_client)
+    assert redis_client.set_calls == []
+
+
+def test_heartbeat_middleware_no_op_when_redis_missing() -> None:
+    """Lifespan runs before requests, but a torn-down state must not crash."""
+    _run_heartbeat(method="POST", status_code=200, redis_client=None)
+
+
+def test_heartbeat_middleware_swallows_redis_failure() -> None:
+    """Redis outage must not break the underlying request."""
+    _run_heartbeat(
+        method="POST", status_code=200, redis_client=_BoomSetRedis()
+    )

@@ -72,6 +72,9 @@ _DAEMON_FIELDS = {
     "watch_fast_poll_interval_sec",
     "watch_retrigger_cap",
     "ci_pending_max_min",
+    "operator_active_hours_start",
+    "operator_active_hours_end",
+    "operator_timezone",
 }
 
 _DAEMON_ENV_OVERRIDES = {
