@@ -9,10 +9,16 @@ from __future__ import annotations
 
 import json
 import time
+from typing import Any
 
 from src.github import cache
 from src.models import CIStatus
 from src.retry import retry_transient
+
+
+def _pending_tracker_key(repo: str, pr_number: int, head_sha: str) -> str:
+    """Return the Redis key for the per-(repo, pr, sha) PENDING tracker."""
+    return f"ci_pending_start:{repo}:{pr_number}:{head_sha}"
 
 _CI_STATUS_CACHE_TTL_SECONDS = 15.0
 
@@ -209,3 +215,174 @@ def _map_rest_ci_status_to_enum(
     if all(s in _REST_CI_SUCCESS_STATES for s in states):
         return CIStatus.SUCCESS
     return CIStatus.PENDING
+
+
+async def _clear_pending_tracker(
+    redis_client: Any, repo: str, pr_number: int, head_sha: str
+) -> None:
+    """Drop the stuck-PENDING tracker key for ``(repo, pr_number, head_sha)``.
+
+    Called whenever the raw CI status leaves PENDING so a later regression
+    back into PENDING (rare but possible when GitHub republishes a stale
+    check) restarts the age clock from zero rather than re-using the
+    original first-seen timestamp.
+    """
+    if redis_client is None or not head_sha:
+        return
+    await redis_client.delete(_pending_tracker_key(repo, pr_number, head_sha))
+
+
+async def _get_or_set_pending_first_seen(
+    redis_client: Any,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    pending_max_seconds: int,
+    now_seconds: float | None = None,
+) -> float:
+    """Return the first-seen-PENDING timestamp for ``head_sha``, writing it on first call.
+
+    Uses ``SET NX`` so concurrent WATCH cycles across runners agree on a
+    single anchor. The TTL is ``pending_max_seconds * 2`` so an abandoned
+    tracker (PR closed before the threshold fires) self-expires from
+    Redis without manual cleanup. The first-seen value uses Redis
+    server time when available so daemon clock skew between restarts
+    does not invalidate an in-flight window.
+
+    ``now_seconds`` lets the caller share a single clock reading between
+    the first-seen write and a subsequent age comparison; when omitted
+    the helper resolves it via :func:`_resolve_now_seconds` (Redis
+    server time with local fallback).
+    """
+    key = _pending_tracker_key(repo, pr_number, head_sha)
+    raw = await redis_client.get(key)
+    if raw is not None:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+
+    if now_seconds is None:
+        now_seconds = await _resolve_now_seconds(redis_client)
+
+    ttl = max(1, pending_max_seconds * 2)
+    await redis_client.set(key, str(now_seconds), nx=True, ex=ttl)
+
+    # Re-read to honor a racing writer that won the SET NX.
+    raw_after = await redis_client.get(key)
+    if raw_after is not None:
+        try:
+            return float(raw_after)
+        except (TypeError, ValueError):
+            return now_seconds
+    return now_seconds
+
+
+async def _resolve_now_seconds(redis_client: Any) -> float:
+    """Return current wall-clock seconds from Redis when available, else local.
+
+    Centralizes the "Redis server time with local fallback" choice so the
+    first-seen write and the later age comparison both come from the same
+    source within a single classification call. Without this, daemon
+    clock skew (NTP step or drift relative to Redis) would make
+    ``age_seconds = local_now - redis_first_seen`` non-deterministic
+    across hosts and restarts: too large would trigger ``stuck_pending``
+    early, negative would prevent reclassification entirely.
+    """
+    redis_now = await _redis_server_time(redis_client)
+    if redis_now is not None:
+        return redis_now
+    return time.time()
+
+
+async def _redis_server_time(redis_client: Any) -> float | None:
+    """Return Redis server-side wall-clock seconds, or ``None`` if unsupported.
+
+    Production ``redis.asyncio`` clients expose ``time()`` returning
+    ``(seconds, microseconds)``; the in-test ``_FakeRedis`` does not, in
+    which case we fall back to ``time.time()`` at the call site.
+
+    Errors from ``time()`` itself (ACL denial, transient command failure,
+    connection drop) are also treated as "unsupported" so the caller's
+    local-time fallback in :func:`_resolve_now_seconds` engages instead
+    of the exception propagating up through WATCH and aborting the cycle.
+    """
+    time_fn = getattr(redis_client, "time", None)
+    if time_fn is None:
+        return None
+    try:
+        result = time_fn()
+        if hasattr(result, "__await__"):
+            result = await result
+    except Exception:
+        return None
+    if not isinstance(result, (tuple, list)) or len(result) < 2:
+        return None
+    seconds = float(result[0])
+    microseconds = float(result[1])
+    return seconds + microseconds / 1_000_000
+
+
+async def classify_ci_status_with_age(
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    redis_client: Any,
+    pending_max_seconds: int,
+    runs_payload: list[dict],
+    statuses_payload: dict,
+    *,
+    empty_is_success: bool = False,
+    fetch_ok: bool = True,
+) -> tuple[CIStatus, str | None]:
+    """Augment :func:`_map_rest_ci_status_to_enum` with stuck-PENDING reclassification.
+
+    Returns ``(status, reclassification_reason)``. When the raw status is
+    PENDING for longer than ``pending_max_seconds`` on the same
+    ``head_sha``, returns ``(CIStatus.FAILURE, "stuck_pending")``;
+    otherwise returns the raw status with reason ``None``. The
+    first-seen-PENDING timestamp is tracked per ``head_sha`` in Redis so
+    a fresh push naturally resets the clock, and the tracker is cleared
+    whenever the raw status leaves PENDING so a transient regression
+    back into PENDING starts a new window.
+
+    PR-250.
+    """
+    raw_status = _map_rest_ci_status_to_enum(
+        runs_payload,
+        statuses_payload,
+        empty_is_success=empty_is_success,
+        fetch_ok=fetch_ok,
+    )
+    if raw_status != CIStatus.PENDING:
+        await _clear_pending_tracker(redis_client, repo, pr_number, head_sha)
+        return raw_status, None
+    if not fetch_ok:
+        # Both REST calls failed: the PENDING above is the
+        # ``empty_is_success=False`` default, not an observation that CI
+        # is actually pending. Counting outage/rate-limit windows toward
+        # ``stuck_pending`` would route WATCH into ``handle_fix`` on a
+        # PR whose CI state we genuinely cannot read. Drop any prior
+        # anchor so the window restarts fresh once visibility resumes.
+        await _clear_pending_tracker(redis_client, repo, pr_number, head_sha)
+        return raw_status, None
+    if redis_client is None or not head_sha or pending_max_seconds <= 0:
+        return raw_status, None
+
+    # Resolve "now" once and pass it down so the first-seen write and
+    # the age comparison share a single clock source. Mixing Redis time
+    # for first_seen with local time.time() here makes age_seconds
+    # unstable under NTP steps or daemon-vs-Redis clock skew.
+    now_seconds = await _resolve_now_seconds(redis_client)
+    first_seen = await _get_or_set_pending_first_seen(
+        redis_client,
+        repo,
+        pr_number,
+        head_sha,
+        pending_max_seconds,
+        now_seconds=now_seconds,
+    )
+    age_seconds = now_seconds - first_seen
+    if age_seconds >= pending_max_seconds:
+        return CIStatus.FAILURE, "stuck_pending"
+    return raw_status, None

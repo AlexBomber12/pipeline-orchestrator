@@ -35,3 +35,9 @@ daemon:
   # spending API budget on a stuck review. Set lower (e.g. 2) to page
   # operators sooner; higher to ride out longer outages.
   watch_retrigger_cap: 3
+
+  # PR-250 OBS-BM: reclassify a CI check-run that has been PENDING on
+  # the same head SHA for this many minutes as effective FAILURE. Lower
+  # for fast-CI repos to surface stuck workflows sooner; higher for
+  # repos whose tests legitimately take longer than the default 30min.
+  ci_pending_max_min: 30

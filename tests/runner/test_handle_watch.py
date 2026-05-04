@@ -396,6 +396,105 @@ def test_handle_watch_ci_failure_triggers_fix(
     assert runner.state.current_pr.push_count == 1
 
 
+def test_handle_watch_reclassified_pending_routes_to_fix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-250: stuck-PENDING reclassification routes WATCH through handle_fix.
+
+    The PR's raw CI status is PENDING, but the Redis tracker shows the
+    same head_sha has been PENDING longer than ``ci_pending_max_min``
+    minutes. ``classify_ci_status_with_age`` reclassifies as FAILURE,
+    a ``stuck_pending`` event is logged, and ``handle_fix`` is invoked.
+    """
+    from src.github import checks as gh_checks
+
+    h._patch_subprocess(monkeypatch)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        head_sha="cafef00d",
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    monkeypatch.setattr(
+        "src.github.checks._fetch_ci_status_rest",
+        lambda repo, sha: ([{"status": "in_progress"}], {}, True),
+    )
+
+    fix_calls: list[None] = []
+
+    async def fake_handle_fix(self: Any) -> None:
+        fix_calls.append(None)
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "handle_fix", fake_handle_fix)
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: None,
+    )
+
+    runner = h._make_runner()
+    runner.app_config.daemon.ci_pending_max_min = 30
+    fixed_first_seen = 1_700_000_000.0
+    key = gh_checks._pending_tracker_key(runner.owner_repo, 42, "cafef00d")
+    asyncio.run(runner.redis.set(key, str(fixed_first_seen)))
+    monkeypatch.setattr(
+        gh_checks.time, "time", lambda: fixed_first_seen + 60 * 60
+    )
+
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=42, branch="pr-042")
+    asyncio.run(runner.handle_watch())
+
+    assert fix_calls == [None]
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.ci_status == CIStatus.FAILURE
+    history_events = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "stuck_pending" in history_events
+    assert "reclassified PENDING -> FAILURE" in history_events
+
+
+def test_handle_watch_pending_within_threshold_does_not_reclassify(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-250: PENDING freshness short of ``ci_pending_max_min`` stays PENDING."""
+    from src.github import checks as gh_checks
+
+    h._patch_subprocess(monkeypatch)
+    pr = PRInfo(
+        number=43,
+        branch="pr-043",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        head_sha="deadbeef",
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    monkeypatch.setattr(
+        "src.github.checks._fetch_ci_status_rest",
+        lambda repo, sha: ([{"status": "in_progress"}], {}, True),
+    )
+
+    runner = h._make_runner()
+    runner.app_config.daemon.ci_pending_max_min = 30
+    fixed_first_seen = 1_700_000_000.0
+    key = gh_checks._pending_tracker_key(runner.owner_repo, 43, "deadbeef")
+    asyncio.run(runner.redis.set(key, str(fixed_first_seen)))
+    # 5 min elapsed, threshold is 30 — wrapper returns PENDING with no reason.
+    monkeypatch.setattr(
+        gh_checks.time, "time", lambda: fixed_first_seen + 5 * 60
+    )
+
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=43, branch="pr-043")
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.ci_status == CIStatus.PENDING
+    history_events = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "stuck_pending" not in history_events
+    assert "reclassified" not in history_events
+
+
 def test_handle_watch_timeout_sets_hung(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

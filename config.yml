@@ -50,6 +50,11 @@ daemon:
   # to HUNG with the ``escalated`` label instead of looping. Default 3 =
   # ride out genuine codex hiccups before paging the operator.
   watch_retrigger_cap: 3
+  # PR-250 OBS-BM: reclassify CI as FAILURE once a check-run has been
+  # PENDING on the same head SHA for this many minutes. Catches the
+  # GitHub Actions "queued/in_progress forever" failure mode where the
+  # runner died and no terminal state ever arrives.
+  ci_pending_max_min: 30
   # PR-231: Anthropic OAuth beta header. Required for current API tier.
   # NOTE: Anthropic periodically rotates beta headers. If auth breaks after
   # an Anthropic announcement, re-verify this value matches the current
