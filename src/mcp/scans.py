@@ -83,24 +83,37 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         # The standard arm requires both a ``--force``/``-f`` flag
         # token AND a refspec token whose destination resolves to
         # ``main`` (whitespace-bounded ``main`` or ``refs/heads/main``,
-        # optionally prefixed by ``<src>:``). The ``main`` token
-        # boundary rejects ``[\w/:-]`` AND a ``.`` followed by a word
-        # char, so dot-suffixed branches like ``main.old`` or
-        # ``main.fix`` are treated as distinct branches and not
-        # flagged. ``main.`` at sentence end (``.`` followed by space
-        # or EOS) still matches, preserving the v1 trade-off where
-        # don't-do-this commentary may be flagged. The ``--force``
-        # token excludes ``--force-if-includes`` (alone a no-op) but
-        # still matches ``--force`` and ``--force-with-lease[=ref]``.
-        # The plus-prefix arm catches ``+<refspec>`` targeting
-        # ``main``, which ``git push -h`` documents as equivalent
-        # force behavior.
+        # optionally prefixed by ``<src>:``). ``git push`` syntax is
+        # ``git push [<repository> [<refspec>...]]``, so the first
+        # non-flag positional token is the remote name and only
+        # subsequent positionals are refspecs. The standard arm
+        # therefore requires a non-flag positional token (the remote)
+        # to appear before the ``main`` refspec; this prevents
+        # ``git push --force main feature/foo`` -- which targets
+        # ``feature/foo`` on a remote named ``main`` -- from being
+        # flagged. The plus-prefix arm does not need this guard
+        # because remote names cannot start with ``+``, so any
+        # ``+<refspec>`` token is unambiguously a refspec. The
+        # ``main`` token boundary rejects ``[\w/:-]`` AND a ``.``
+        # followed by a word char, so dot-suffixed branches like
+        # ``main.old`` or ``main.fix`` are treated as distinct
+        # branches and not flagged. ``main.`` at sentence end (``.``
+        # followed by space or EOS) still matches, preserving the v1
+        # trade-off where don't-do-this commentary may be flagged.
+        # The ``--force`` token excludes ``--force-if-includes``
+        # (alone a no-op) but still matches ``--force`` and
+        # ``--force-with-lease[=ref]``. The plus-prefix arm catches
+        # ``+<refspec>`` targeting ``main``, which ``git push -h``
+        # documents as equivalent force behavior.
         re.compile(
             r"\bgit push\b"
             r"(?:"
             # Standard force-flag form: --force/-f token AND main
             # refspec token, in any order, both within the command's
-            # arg list.
+            # arg list. The main refspec token must be preceded by
+            # at least one non-flag, non-plus-prefix token (the
+            # remote name) so that a remote literally named ``main``
+            # cannot be misread as the protected branch.
             r"(?="
             r"(?:[ \t]+[^\s,;|&#]+)*?"
             r"[ \t]+"
@@ -109,12 +122,16 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
             r")"
             r"(?="
             r"(?:[ \t]+[^\s,;|&#]+)*?"
+            r"[ \t]+(?![-+])[^\s,;|&#]+"
+            r"(?:[ \t]+[^\s,;|&#]+)*?"
             r"[ \t]+"
             r"(?:[^\s:,;|&#]+:)?(?:refs/heads/)?main"
             r"(?![\w/:-]|\.\w)"
             r")"
             r"|"
-            # Plus-prefix force form: +<refspec> with dst=main.
+            # Plus-prefix force form: +<refspec> with dst=main. The
+            # ``+`` prefix is unambiguous since remote names cannot
+            # start with ``+``, so no remote-name guard is needed.
             r"(?="
             r"(?:[ \t]+[^\s,;|&#]+)*?"
             r"[ \t]+"

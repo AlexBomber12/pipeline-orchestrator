@@ -307,6 +307,53 @@ def test_force_push_feature_branch_separatorless_prose_flagged_as_false_positive
     assert "force_push_main" in types
 
 
+def test_force_push_main_remote_named_main_not_flagged():
+    """``git push --force main feature/foo`` pushes ``feature/foo`` to
+    a remote named ``main``; the destination branch is ``feature/foo``,
+    not the protected ``main`` branch. ``git push`` syntax is
+    ``git push [<repository> [<refspec>...]]``, so the first non-flag
+    positional is the remote name and only subsequent positionals are
+    refspecs. Repos whose remote is named ``main`` (instead of the
+    default ``origin``) must not have compliant specs rejected by the
+    scanner."""
+    body = "git push --force main feature/foo"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" not in types
+
+
+def test_force_push_main_remote_named_main_short_flag_not_flagged():
+    """Same as above, with the ``-f`` short flag."""
+    body = "git push -f main feature/foo"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" not in types
+
+
+def test_force_push_main_remote_named_main_no_refspec_not_flagged():
+    """``git push --force main`` (no explicit refspec) targets a
+    remote named ``main``; the destination branch is the upstream of
+    the current branch, which cannot be determined from the spec.
+    Per the v1 trade-off the scanner does not flag this case,
+    otherwise valid specs that push to a main-named remote would be
+    rejected outright."""
+    body = "git push --force main"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" not in types
+
+
+def test_force_push_main_remote_and_refspec_both_main_flagged():
+    """``git push --force main main`` -- first ``main`` is the remote
+    name, second ``main`` is the refspec targeting the protected
+    branch. The destination IS ``main``, so the scanner must still
+    flag this."""
+    body = "git push --force main main"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" in types
+
+
 def test_force_push_main_alt_detected():
     body = "Operator may force-push to main as a last resort."
     violations = scan_for_conflicts(body)
