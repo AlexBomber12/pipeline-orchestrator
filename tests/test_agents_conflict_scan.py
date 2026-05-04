@@ -392,11 +392,27 @@ def test_skip_ci_negated_typographic_apostrophe_not_flagged():
     assert "skip_ci" not in types
 
 
+def test_skip_ci_bracketed_marker_not_flagged_as_skip_ci():
+    """``[skip ci]`` is the bracketed marker form already covered by
+    ``skip_ci_commit_msg``. The plain-language ``skip_ci`` pattern must
+    NOT also fire on it, otherwise compliant specs that document the
+    prohibition (e.g. ``Do not use [skip ci] markers``) produce a
+    duplicate finding and ``validate_task_spec`` returns valid=False
+    for prose that restates the rule."""
+    body = "Do not use [skip ci] markers in commit messages."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "skip_ci" not in types
+
+
 def test_skip_ci_marker_detected():
     body = "Title: Refactor stub [skip ci]"
     violations = scan_for_conflicts(body)
     types = {v.violation_type for v in violations}
     assert "skip_ci_commit_msg" in types
+    # Bracketed marker must NOT also fire ``skip_ci``; that would be a
+    # duplicate finding for the same offending substring.
+    assert "skip_ci" not in types
 
 
 def test_ci_skip_marker_detected():

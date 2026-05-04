@@ -148,6 +148,12 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         # collapsed into a variable-width alternation. Both straight
         # (``'``) and typographic (``’``) apostrophes are
         # accepted.
+        # The ``(?<!\[)`` lookbehind also excludes the bracketed
+        # marker forms ``[skip ci]`` / ``[ci skip]`` -- those belong
+        # to ``skip_ci_commit_msg`` and would otherwise produce a
+        # duplicate finding here, including for compliant specs that
+        # document the prohibition (e.g. ``Do not use [skip ci]
+        # markers``).
         re.compile(
             r"(?<!do not )"
             r"(?<!don't )"
@@ -167,6 +173,7 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
             r"(?<!shouldn't )"
             r"(?<!shouldn’t )"
             r"(?<!avoid )"
+            r"(?<!\[)"
             r"\b(?:skip|bypass|ignore) CI\b",
             re.IGNORECASE,
         ),
