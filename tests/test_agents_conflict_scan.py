@@ -572,6 +572,21 @@ def test_draft_pr_avoid_purpose_clause_flagged():
     assert "draft_pr_flag" in types
 
 
+def test_skip_ci_nearest_negation_governs_match_not_first():
+    """``Don't forget to run tests and do not skip CI`` contains two
+    negations: the leading ``Don't ... forget to`` is a double-negative
+    re-asserting ``run tests``, while the trailing ``do not`` directly
+    prohibits ``skip CI``. The scanner must use the NEAREST negation
+    (``do not``) when evaluating the inverter check, not the first
+    (``Don't``); otherwise the leading inverter cancels the later
+    prohibition and a compliant spec is rejected as a false
+    positive."""
+    body = "Don't forget to run tests and do not skip CI."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "skip_ci" not in types
+
+
 def test_skip_ci_detected():
     body = "We can skip CI for this trivial change."
     violations = scan_for_conflicts(body)

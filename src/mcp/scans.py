@@ -87,14 +87,24 @@ def _is_negated(text: str, match_start: int) -> bool:
     ``can not`` in ``If tests can not pass quickly, skip CI ...``)
     would suppress a real violation.
 
+    The check uses the NEAREST negation to the match (the rightmost
+    negation in the sub-clause), not the first. ``Don't forget to run
+    tests and do not skip CI`` contains two negations; the leading
+    ``Don't ... forget to`` is a double-negative that re-asserts ``run
+    tests``, while the trailing ``do not`` directly prohibits ``skip
+    CI``. Examining only the first negation would let the leading
+    inverter cancel a later, real prohibition and produce a false
+    positive on a compliant spec.
+
     A bare lexical negation is not enough: a verb-of-omission inverter
     (``forget to``, ``fail to``, ``neglect to``, ``hesitate to``,
-    ``refuse to``) between the negation and the match flips the
-    semantics back into an instruction. ``Don't forget to skip CI``
-    contains ``Don't`` but is NOT a prohibition of ``skip CI``; the
-    inverter forces the spec to actively require the violating
+    ``refuse to``) between the nearest negation and the match flips
+    the semantics back into an instruction. ``Don't forget to skip
+    CI`` contains ``Don't`` but is NOT a prohibition of ``skip CI``;
+    the inverter forces the spec to actively require the violating
     action. The check therefore returns True only when a negation is
-    present AND no inverter sits between it and the match.
+    present AND no inverter sits between the nearest negation and the
+    match.
 
     Examples that suppress detection (real prohibitions):
 
@@ -102,6 +112,8 @@ def _is_negated(text: str, match_start: int) -> bool:
       command, no comma between them)
     - ``Never use git commit --no-verify``
     - ``Coders must not skip CI``
+    - ``Don't forget to run tests and do not skip CI`` (nearest
+      negation governs the match)
 
     Examples that do NOT suppress (double-negative instructions):
 
@@ -117,10 +129,11 @@ def _is_negated(text: str, match_start: int) -> bool:
     """
     clause_start = max(text.rfind(c, 0, match_start) for c in _CLAUSE_BOUNDARIES)
     clause_start = clause_start + 1 if clause_start >= 0 else 0
-    negation = _NEGATION_CONTEXT.search(text, clause_start, match_start)
-    if negation is None:
+    negations = list(_NEGATION_CONTEXT.finditer(text, clause_start, match_start))
+    if not negations:
         return False
-    if _DOUBLE_NEGATIVE_INVERTER.search(text, negation.end(), match_start):
+    nearest = negations[-1]
+    if _DOUBLE_NEGATIVE_INVERTER.search(text, nearest.end(), match_start):
         return False
     return True
 
