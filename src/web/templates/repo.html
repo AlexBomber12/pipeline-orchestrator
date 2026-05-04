@@ -43,6 +43,21 @@
 
 <details class="mt-4">
     <summary class="secondary-interactive text-sm text-gray-400 cursor-pointer">
+        Recent cancellations
+    </summary>
+    {# Operator-review surface (last 7 days, capped at 50). Fetched
+       on every open of the <details> via the toggle event filtered to
+       the opened state, so closing and re-opening the section refetches
+       (htmx `revealed` fires only once per element, which would leave
+       stale cards visible during incident review). No polling. #}
+    <div hx-get="/partials/repo/{{ repo.name }}/cancellations"
+         hx-trigger="toggle[target.open] from:closest details"
+         hx-swap="innerHTML">
+    </div>
+</details>
+
+<details class="mt-4">
+    <summary class="secondary-interactive text-sm text-gray-400 cursor-pointer">
         Coder log
     </summary>
     {# Keep the periodic poll alongside SSE: state_change fires only on

@@ -102,6 +102,12 @@
             --hung: #a78bfa;
             --log-bg: #020617;
             --log-fg: #4ade80;
+            --cause-crash: #fb923c;
+            --cause-escalate: #f87171;
+            --cause-timeout: #fbbf24;
+            --cause-infra: #60a5fa;
+            --cause-operator: #9ca3af;
+            --cause-deadlock: #a78bfa;
         }
 
         html[data-theme="light"] {
@@ -125,6 +131,12 @@
             --hung: #7c3aed;
             --log-bg: #e2e8f0;
             --log-fg: #166534;
+            --cause-crash: #c2410c;
+            --cause-escalate: #dc2626;
+            --cause-timeout: #b45309;
+            --cause-infra: #1d4ed8;
+            --cause-operator: #475569;
+            --cause-deadlock: #7c3aed;
         }
 
         html {
@@ -422,6 +434,124 @@
             background-color: rgb(var(--neutral-rgb) / 0.12);
             border-color: rgb(var(--neutral-rgb) / 0.3);
             color: var(--text-3);
+        }
+
+        /* PR-254: cancellation cards on the per-repo detail page. Color
+           tokens are defined per-theme so the left border, badge, and
+           label all share the category color and remain readable in
+           both light and dark themes. */
+        .cancellation-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .cancellation-card {
+            border: 1px solid var(--border-soft);
+            border-left-width: 3px;
+            border-radius: 6px;
+            background-color: var(--bg-1);
+            padding: 10px 12px;
+            font-size: 13px;
+        }
+
+        .cancellation-header {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: baseline;
+            gap: 8px;
+            margin-bottom: 6px;
+        }
+
+        .cancellation-header .category-badge {
+            font-family: 'JetBrains Mono', ui-monospace, monospace;
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            padding: 2px 6px;
+            border-radius: 4px;
+            border: 1px solid currentColor;
+            background-color: color-mix(in srgb, currentColor 12%, transparent);
+        }
+
+        .cancellation-header .task-id {
+            font-size: 12px;
+            color: var(--text-1);
+        }
+
+        .cancellation-header .cancellation-time {
+            margin-left: auto;
+            font-size: 11px;
+            color: var(--text-3);
+        }
+
+        .cancellation-payload {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            color: var(--text-2);
+        }
+
+        .cancellation-payload .cancellation-stderr {
+            margin-top: 4px;
+            padding: 6px 8px;
+            border-radius: 4px;
+            background-color: var(--log-bg);
+            color: var(--log-fg);
+            font-family: 'JetBrains Mono', ui-monospace, monospace;
+            font-size: 11px;
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 8rem;
+            overflow-y: auto;
+        }
+
+        .cancellation-payload .cancellation-reason {
+            color: var(--text-1);
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .cancellation-card.category-crash {
+            border-left-color: var(--cause-crash);
+        }
+        .cancellation-card.category-crash .category-badge {
+            color: var(--cause-crash);
+        }
+
+        .cancellation-card.category-escalate {
+            border-left-color: var(--cause-escalate);
+        }
+        .cancellation-card.category-escalate .category-badge {
+            color: var(--cause-escalate);
+        }
+
+        .cancellation-card.category-timeout {
+            border-left-color: var(--cause-timeout);
+        }
+        .cancellation-card.category-timeout .category-badge {
+            color: var(--cause-timeout);
+        }
+
+        .cancellation-card.category-infra {
+            border-left-color: var(--cause-infra);
+        }
+        .cancellation-card.category-infra .category-badge {
+            color: var(--cause-infra);
+        }
+
+        .cancellation-card.category-operator_recovery {
+            border-left-color: var(--cause-operator);
+        }
+        .cancellation-card.category-operator_recovery .category-badge {
+            color: var(--cause-operator);
+        }
+
+        .cancellation-card.category-no_push_deadlock {
+            border-left-color: var(--cause-deadlock);
+        }
+        .cancellation-card.category-no_push_deadlock .category-badge {
+            color: var(--cause-deadlock);
         }
 
         /* PR-232: dark-theme select option styling. Native <option> styling has
