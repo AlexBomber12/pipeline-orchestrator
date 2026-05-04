@@ -5560,3 +5560,117 @@ def test_handle_idle_swallows_unicode_error_in_agents_md(
     assert any(
         "non-UTF-8" in event for event in scan_events
     ), scan_events
+
+
+def test_handle_idle_suppresses_unchanged_agents_scan_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A repeated drift fingerprint must not emit fresh ``[AGENTS-SCAN]``
+    events on every IDLE pass. ``log_event``'s consecutive-event dedup
+    only collapses adjacent identical entries; other ``[INFRA]`` events
+    interleave between scans so without a per-cycle fingerprint cache
+    the same warnings would refill the 100-entry history cap and push
+    out newer operational signals.
+    """
+    h._patch_subprocess(monkeypatch)
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-077.md").write_text(
+        "# PR-077: Old spec\n\nSkip CI on this branch.\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs", lambda repo, **kw: []
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+
+    asyncio.run(runner.handle_idle())
+    first_pass_scan = [
+        entry["event"]
+        for entry in runner.state.history
+        if entry["event"].startswith("[AGENTS-SCAN]")
+    ]
+    assert any(
+        "PR-077.md" in event and "skip_ci" in event
+        for event in first_pass_scan
+    ), first_pass_scan
+
+    asyncio.run(runner.handle_idle())
+    second_pass_scan = [
+        entry["event"]
+        for entry in runner.state.history
+        if entry["event"].startswith("[AGENTS-SCAN]")
+    ]
+    assert second_pass_scan == first_pass_scan, (
+        "Identical drift on a second IDLE pass must not append new "
+        "[AGENTS-SCAN] entries to history; cycle-to-cycle suppression "
+        "is required to keep the 100-entry cap from rotating out fresh "
+        "operational signals."
+    )
+
+
+def test_handle_idle_re_emits_agents_scan_when_drift_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """When the set of violations changes between cycles, the scan must
+    re-emit so operators see the new state. Suppression keys on the full
+    event fingerprint, so any change in violation type, file, or count
+    surfaces immediately.
+    """
+    h._patch_subprocess(monkeypatch)
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    spec = tasks_dir / "PR-088.md"
+    spec.write_text(
+        "# PR-088: Old spec\n\nSkip CI on this branch.\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs", lambda repo, **kw: []
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+
+    asyncio.run(runner.handle_idle())
+    history_after_first = len([
+        entry for entry in runner.state.history
+        if entry["event"].startswith("[AGENTS-SCAN]")
+    ])
+
+    spec.write_text(
+        "# PR-088: Old spec\n\nRun git commit --no-verify to skip hooks.\n",
+        encoding="utf-8",
+    )
+    asyncio.run(runner.handle_idle())
+
+    scan_events = [
+        entry["event"]
+        for entry in runner.state.history
+        if entry["event"].startswith("[AGENTS-SCAN]")
+    ]
+    assert len(scan_events) > history_after_first
+    assert any(
+        "PR-088.md" in event and "no_verify_commit" in event
+        for event in scan_events
+    ), scan_events

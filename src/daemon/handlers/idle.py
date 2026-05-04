@@ -144,11 +144,18 @@ class IdleMixin:
         Dry-run keeps the working tree clean (AGENTS.md is tracked in
         target repos and operator-driven via ``/onboarding/apply``);
         the scan still fires because the hook is gated only on
-        ``log_event_fn``. Threading ``self.log_event`` makes findings
-        land in the same per-repo event stream operators read in the
-        dashboard, where ``log_event``'s consecutive-event dedup
-        collapses repeated drift signals into a single counter so
-        per-cycle invocation does not flood history.
+        ``log_event_fn``.
+
+        Output is buffered and fingerprinted across cycles before
+        reaching ``self.log_event``. ``log_event``'s built-in dedup
+        only collapses *consecutive* identical entries, but other
+        ``[INFRA]`` events fire between scans on every cycle, so
+        identical drift findings would otherwise re-emit each pass and
+        push newer operational signals out of the 100-entry history
+        cap. Caching the fingerprint and flushing only when it changes
+        keeps the operator-visible warning fresh on first appearance
+        and on every change of state, while staying silent when
+        nothing moved.
 
         Failures in this scan must never block dispatch: a malformed
         AGENTS.md (operator-introduced bad managed markers) raises
@@ -158,31 +165,43 @@ class IdleMixin:
         (``Path.read_text`` decodes with the platform default and
         raises ``UnicodeDecodeError`` on bad encodings). All three are
         surfaced as a single ``[AGENTS-SCAN]`` event and swallowed so
-        the rest of IDLE proceeds normally.
+        the rest of IDLE proceeds normally; they participate in the
+        same fingerprint so a stuck error does not repeat each cycle.
         """
         agents_path = Path(self.repo_path) / "AGENTS.md"
+        pending: list[str] = []
         try:
             reconcile_agents_md(
                 agents_path,
                 dry_run=True,
-                log_event_fn=self.log_event,
+                log_event_fn=pending.append,
             )
         except MarkerError as exc:
-            self.log_event(
+            pending.append(
                 f"[AGENTS-SCAN] Skipping drift scan: malformed managed "
                 f"markers in {agents_path}: {exc}."
             )
         except OSError as exc:
-            self.log_event(
+            pending.append(
                 f"[AGENTS-SCAN] Skipping drift scan: failed to read "
                 f"{agents_path}: {exc}."
             )
         except UnicodeError as exc:
-            self.log_event(
+            pending.append(
                 f"[AGENTS-SCAN] Skipping drift scan: non-UTF-8 content "
                 f"in {agents_path} or {Path(self.repo_path) / 'tasks'}: "
                 f"{exc}."
             )
+
+        fingerprint = tuple(pending)
+        last_fingerprint = getattr(
+            self, "_last_agents_scan_fingerprint", None,
+        )
+        if fingerprint == last_fingerprint:
+            return
+        self._last_agents_scan_fingerprint = fingerprint
+        for event in pending:
+            self.log_event(event)
 
     @staticmethod
     def _validate_task_file_header_match(task_file: Path, header_pr_id: str) -> None:
