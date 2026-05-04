@@ -32,16 +32,29 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
     ),
     (
         "force_push_main",
-        # Order-agnostic match: detect ``git push`` lines that name
-        # ``main`` AND carry either ``--force`` or the ``-f`` shorthand
-        # (``git push -h`` documents ``-f, --[no-]force`` as equivalent),
-        # in either argument order. The ``-f`` arm uses
-        # ``(?<!\S)``/``(?!\S)`` so it only matches the standalone flag,
-        # not substrings inside words like ``-foo``.
+        # Detect ``git push`` lines that target ``main`` via either
+        # documented force form: the ``--force``/``-f`` flag (in any
+        # argument order) OR a leading ``+`` on the refspec, which
+        # ``git push -h`` documents as equivalent force behavior
+        # (e.g. ``+HEAD:main`` or ``+main``). The ``-f`` and ``+``
+        # arms use ``(?<!\S)``/``(?!\S)`` so they match standalone
+        # tokens, not substrings inside words like ``-foo``.
         re.compile(
             r"\bgit push\b"
+            r"(?:"
             r"(?=[^\n]*\bmain\b)"
-            r"(?=[^\n]*(?:--force\b|(?<!\S)-f(?!\S)))",
+            r"(?=[^\n]*(?:--force\b|(?<!\S)-f(?!\S)))"
+            r"|"
+            # Refspec form: split by colon presence so the dst (right
+            # of ``:``) is the side required to end in ``main``. The
+            # no-colon arm forbids a trailing ``:`` so ``+main:other``
+            # (dst is ``other``) is not falsely flagged.
+            r"(?=[^\n]*(?<!\S)\+(?:"
+            r"[^\s:]+:(?:refs/heads/)?main\b"
+            r"|"
+            r"(?:refs/heads/)?main\b(?!:)"
+            r"))"
+            r")",
             re.IGNORECASE,
         ),
         "AGENTS.md forbids force-push to main.",

@@ -82,6 +82,38 @@ def test_force_push_main_short_flag_requires_standalone_token():
     assert "force_push_main" not in types
 
 
+def test_force_push_main_refspec_plus_with_dst_main():
+    """``+HEAD:main`` is a force-push per ``git push -h``."""
+    body = "Recovery: git push origin +HEAD:main when histories diverge."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" in types
+
+
+def test_force_push_main_refspec_plus_main_shorthand():
+    """``+main`` (no colon) is shorthand force-push to main."""
+    body = "git push origin +main"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" in types
+
+
+def test_force_push_main_refspec_plus_full_ref():
+    """``+refs/heads/main`` resolves to dst ``main``."""
+    body = "git push origin +refs/heads/main"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" in types
+
+
+def test_force_push_main_refspec_plus_dst_not_main_ignored():
+    """``+main:other`` updates ``other``, not ``main`` - do not flag."""
+    body = "git push origin +main:other"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" not in types
+
+
 def test_force_push_main_alt_detected():
     body = "Operator may force-push to main as a last resort."
     violations = scan_for_conflicts(body)
