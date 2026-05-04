@@ -7,6 +7,11 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from src.cancellation.blocked_set import (
+    TaskNode,
+    compute_blocked_set,
+    compute_dependents_count,
+)
 from src.cancellation.storage import (
     CATEGORIES,
     TTL_SECONDS,
@@ -129,8 +134,11 @@ __all__ = [
     "CRASH_PAYLOAD_MESSAGE_MAX",
     "TTL_SECONDS",
     "CancellationCause",
+    "TaskNode",
     "cause_key",
     "classify_infra_exception",
+    "compute_blocked_set",
+    "compute_dependents_count",
     "delete_cancellation_cause",
     "get_cancellation_cause",
     "index_key",

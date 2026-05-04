@@ -12,12 +12,19 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 
 import redis.asyncio as aioredis
 
+from src.cancellation.blocked_set import (
+    TaskNode,
+    compute_blocked_set,
+    compute_dependents_count,
+)
 from src.config import AppConfig, RepoConfig, load_config
 from src.keyspace import pipeline_state
-from src.models import PipelineState, RepoState
+from src.models import PipelineState, RepoState, TaskStatus
+from src.queue_parser import parse_queue
 from src.utils import repo_slug_from_url
 
 
@@ -163,3 +170,89 @@ async def get_all_repo_states(
         states.append(state)
 
     return states, redis_warning
+
+
+def build_repo_task_nodes(
+    repos_dir: str,
+    repo_name: str,
+    *,
+    extra_canceled_ids: set[str] | None = None,
+) -> list[TaskNode]:
+    """Return ``TaskNode`` list for a repo's ``tasks/QUEUE.md``.
+
+    Each ``QueueTask`` becomes a ``TaskNode`` with ``is_canceled`` set
+    when the task's ``TaskStatus`` is ``CANCELED`` or its id appears in
+    ``extra_canceled_ids`` — the latter lets callers fold in cancellation
+    cause records from Redis whose ``task_id`` may not (yet) carry the
+    ``CANCELED`` status in QUEUE.md. Task ids that exist only in
+    ``extra_canceled_ids`` are appended as canceled root nodes with no
+    ``depends_on`` so the closure walk can still find them.
+
+    Returns an empty list when QUEUE.md is missing or unreadable —
+    rendering the dashboard cancellation surface must not 5xx because
+    of a transient parse failure.
+    """
+    queue_path = Path(repos_dir) / repo_name / "tasks" / "QUEUE.md"
+    try:
+        queued = parse_queue(str(queue_path))
+    except (OSError, UnicodeDecodeError):
+        return []
+    extras = set(extra_canceled_ids or ())
+    nodes: list[TaskNode] = []
+    seen: set[str] = set()
+    for task in queued:
+        is_canceled = (
+            task.status == TaskStatus.CANCELED or task.pr_id in extras
+        )
+        nodes.append(
+            TaskNode(
+                task_id=task.pr_id,
+                depends_on=list(task.depends_on),
+                is_canceled=is_canceled,
+            )
+        )
+        seen.add(task.pr_id)
+    for extra_id in extras - seen:
+        nodes.append(
+            TaskNode(task_id=extra_id, depends_on=[], is_canceled=True)
+        )
+    return nodes
+
+
+def compute_repo_dependents_count(
+    repos_dir: str,
+    repo_name: str,
+    canceled_task_ids: set[str],
+) -> dict[str, int]:
+    """Return ``{canceled_task_id: dependents_count}`` for a repo.
+
+    Builds the repo's task graph from QUEUE.md (folding in
+    ``canceled_task_ids`` so cancellation causes recorded in Redis are
+    treated as canceled roots even when QUEUE.md has not yet caught up)
+    and runs the dependents-count helper. Empty result when QUEUE.md is
+    missing or has no tasks that depend on a canceled root.
+    """
+    nodes = build_repo_task_nodes(
+        repos_dir, repo_name, extra_canceled_ids=canceled_task_ids
+    )
+    if not nodes:
+        return {}
+    return compute_dependents_count(nodes)
+
+
+def compute_repo_blocked_set(
+    repos_dir: str,
+    repo_name: str,
+    canceled_task_ids: set[str] | None = None,
+) -> dict[str, str]:
+    """Return ``{blocked_task_id: blocking_canceled_root_id}`` for a repo.
+
+    Mirrors :func:`compute_repo_dependents_count` but exposes the
+    blocked-task → root mapping used by per-task ``Blocked by`` chips.
+    """
+    nodes = build_repo_task_nodes(
+        repos_dir, repo_name, extra_canceled_ids=canceled_task_ids
+    )
+    if not nodes:
+        return {}
+    return compute_blocked_set(nodes)

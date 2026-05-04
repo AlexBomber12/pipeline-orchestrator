@@ -41,7 +41,10 @@ from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
 from src.utils import repo_slug_from_url
 from src.web.services.coder import _effective_coder_name
-from src.web.services.repo_state import _find_repo_config_by_name
+from src.web.services.repo_state import (
+    _find_repo_config_by_name,
+    compute_repo_dependents_count,
+)
 
 AVAILABILITY_CHANNEL = "orchestrator:availability:changed"
 AVAILABILITY_OVERRIDE_KEY = "operator_override"
@@ -1044,6 +1047,27 @@ async def api_repo_events(name: str, request: Request) -> Response:
     )
 
 
+def _augment_causes_with_dependents(
+    repo: str, causes: list
+) -> list[dict[str, Any]]:
+    """Return ``causes`` as dicts with a ``dependents_count`` field attached.
+
+    PR-257: each cause carries the count of QUEUE.md tasks transitively
+    blocked by its ``task_id`` so the dashboard can sort canceled roots
+    by downstream-blast radius. Computation is best-effort: a missing
+    or unreadable QUEUE.md degrades to zero counts rather than failing
+    the surfacing of the cards themselves.
+    """
+    canceled_ids = {c.task_id for c in causes}
+    counts = compute_repo_dependents_count(_app.REPOS_DIR, repo, canceled_ids)
+    augmented: list[dict[str, Any]] = []
+    for cause in causes:
+        record = asdict(cause)
+        record["dependents_count"] = counts.get(cause.task_id, 0)
+        augmented.append(record)
+    return augmented
+
+
 @router.get("/api/cancellations/{repo}")
 async def api_cancellations(repo: str, request: Request) -> JSONResponse:
     """Return recent cancellation causes for a repo (last 7 days, max 50).
@@ -1057,6 +1081,10 @@ async def api_cancellations(repo: str, request: Request) -> JSONResponse:
     days, so a repo removed (or mistyped) would otherwise surface stale
     cards from its post-removal window. Reading a repo absent from the
     config returns ``[]``, mirroring the redis-None short-circuit.
+
+    Each entry carries a ``dependents_count`` field (PR-257) reflecting
+    the number of QUEUE.md tasks transitively blocked by the canceled
+    root, so clients can prioritize the highest-blast-radius cards.
     """
     if _find_repo_config_by_name(load_config(_app.CONFIG_PATH), repo) is None:
         return JSONResponse([])
@@ -1072,7 +1100,9 @@ async def api_cancellations(repo: str, request: Request) -> JSONResponse:
         # Degrade gracefully when Redis is configured but unreachable at
         # request time, matching the redis_client-is-None branch above.
         return JSONResponse([])
-    return JSONResponse([asdict(c) for c in causes[:_CANCELLATIONS_MAX]])
+    return JSONResponse(
+        _augment_causes_with_dependents(repo, causes[:_CANCELLATIONS_MAX])
+    )
 
 
 @router.get("/partials/redis-banner", response_class=HTMLResponse)
@@ -1312,10 +1342,13 @@ async def partial_repo_cancellations(
             # Redis temporarily unreachable: render the empty-state placeholder
             # so the HTMX swap target stays stable instead of 5xx-ing the panel.
             causes = []
+    augmented = (
+        _augment_causes_with_dependents(name, causes) if causes else []
+    )
     return _app.templates.TemplateResponse(
         request,
         "components/cancellation_history.html",
-        {"causes": causes},
+        {"causes": augmented},
     )
 
 
