@@ -2777,6 +2777,33 @@ def test_retry_failed_workflow_skips_when_only_success_runs(
     assert "no failing workflow run found" in history
 
 
+def test_retry_failed_workflow_matches_failing_status_with_empty_conclusion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: ``gh run list`` exposes values like
+    ``startup_failure`` in the ``status`` set and may leave
+    ``conclusion`` empty for those runs. The predicate must match on
+    ``status`` too — otherwise WATCH consumes its one-shot retry marker
+    without ever calling ``gh run rerun``.
+    """
+    runner = h._make_runner()
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        calls.append(list(args))
+        if args[:2] == ["run", "list"]:
+            return [
+                {"databaseId": 7, "conclusion": None, "status": "startup_failure"},
+            ]
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+
+    assert runner._retry_failed_workflow(11, "abc1234") is True
+    rerun_calls = [c for c in calls if c[:2] == ["run", "rerun"]]
+    assert rerun_calls == [["run", "rerun", "--failed", "7"]]
+
+
 def test_retry_failed_workflow_handles_no_run_found(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

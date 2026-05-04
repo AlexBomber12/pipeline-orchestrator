@@ -35,7 +35,11 @@ _CI_INFRA_RETRIED_TTL_SECONDS = 7 * 24 * 60 * 60
 # query per status. ``gh run rerun --failed <run_id>`` is a no-op when
 # the targeted run succeeded; without the filter, a successful
 # re-dispatch occupying the latest slot would burn the one-shot retry
-# budget without re-running the actual infra failure.
+# budget without re-running the actual infra failure. The same set is
+# matched against both ``conclusion`` and ``status`` because ``gh run
+# list`` exposes values like ``startup_failure`` in the ``status`` set
+# and may leave ``conclusion`` empty for them — checking only
+# ``conclusion`` would miss the failing run.
 _FAILING_RUN_CONCLUSIONS = frozenset(
     {
         "failure",
@@ -599,8 +603,13 @@ class WatchMixin:
         case ``gh run rerun --failed`` against the success no-ops and
         the WATCH cycle still consumes its one-shot retry budget. We
         therefore fetch a window of recent runs and pick the most
-        recent one whose ``conclusion`` is in
-        ``_FAILING_RUN_CONCLUSIONS``.
+        recent one whose ``conclusion`` or ``status`` is in
+        ``_FAILING_RUN_CONCLUSIONS``. ``status`` is consulted because
+        ``gh run list`` exposes values like ``startup_failure`` in the
+        status set and may leave ``conclusion`` empty for them; matching
+        only on ``conclusion`` would miss the failing run, log "no
+        failing workflow run found", and still consume the one-shot
+        retry marker — routing WATCH to FIX without actually retrying.
         """
         if not head_sha:
             return False
@@ -634,8 +643,12 @@ class WatchMixin:
             (
                 r for r in runs
                 if isinstance(r, dict)
-                and str(r.get("conclusion") or "").lower()
-                in _FAILING_RUN_CONCLUSIONS
+                and (
+                    str(r.get("conclusion") or "").lower()
+                    in _FAILING_RUN_CONCLUSIONS
+                    or str(r.get("status") or "").lower()
+                    in _FAILING_RUN_CONCLUSIONS
+                )
             ),
             None,
         )
