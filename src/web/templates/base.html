@@ -856,6 +856,21 @@
             async function cycleState() {
                 const current = chip.dataset.manual || 'AUTO';
                 const next = cycle[current] || 'AUTO';
+                // Advance the dataset (and label) optimistically BEFORE the
+                // POST so a second click that lands while the first request
+                // is still in flight sees the updated `current` and
+                // continues the cycle (AUTO → AVAILABLE → AWAY → AUTO).
+                // Without this the click handler would re-read the stale
+                // `data-manual`, recompute the same `next`, and send a
+                // duplicate transition. The dot color (data-composed)
+                // stays at the last server-composed verdict until
+                // ``refresh()`` reconciles; if the POST fails, ``refresh``
+                // pulls the server's actual override back so the local
+                // optimistic update gets reverted.
+                chip.dataset.manual = next;
+                chip.setAttribute('aria-label', 'Operator availability: ' + next);
+                const label = chip.querySelector('.label');
+                if (label) label.textContent = next;
                 try {
                     await fetch('/api/availability/' + next, {method: 'POST'});
                 } catch (_error) {}

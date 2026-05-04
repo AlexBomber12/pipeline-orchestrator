@@ -899,10 +899,15 @@ async def api_availability_set(state: str, request: Request) -> JSONResponse:
     state — the chip cycles AUTO → AVAILABLE → AWAY → AUTO — so this is
     a non-idempotent RPC-style call rather than a fetch.
 
-    Redis runtime errors during the write/publish (timeout, connection
-    drop, pool exhaustion) collapse to a 503 so the chip surfaces the
-    outage with the same status code as the redis-missing branch rather
-    than bubbling a 500 that would break click handling.
+    Override write failures (set/delete) collapse to 503 so the chip
+    surfaces the outage with the same status code as the redis-missing
+    branch rather than bubbling a 500 that would break click handling.
+    Wake fan-out (publish) is best-effort: the override is already
+    persisted by the time we get there, so a publish failure must NOT
+    flip the response to 503 — that would tell the chip the click
+    failed, prompting a retry that drives an unintended extra state
+    transition while the 60s poll safety net would have synced other
+    tabs anyway.
     """
     if state not in AVAILABILITY_VALID_STATES:
         return JSONResponse({"error": "invalid_state"}, status_code=400)
@@ -916,12 +921,17 @@ async def api_availability_set(state: str, request: Request) -> JSONResponse:
             await redis_client.delete(AVAILABILITY_OVERRIDE_KEY)
         else:
             await redis_client.set(AVAILABILITY_OVERRIDE_KEY, state)
-        # Wake all open dashboard tabs so the chip syncs without a reload.
-        await redis_client.publish(AVAILABILITY_CHANNEL, state)
     except Exception:
         return JSONResponse(
             {"error": "redis_unavailable"}, status_code=503
         )
+    # Wake all open dashboard tabs so the chip syncs without a reload.
+    # A failure here is decoupled from the override write outcome — see
+    # docstring — so swallow it and let the 60s poll converge.
+    try:
+        await redis_client.publish(AVAILABILITY_CHANNEL, state)
+    except Exception:
+        pass
     return JSONResponse({"manual_override": state})
 
 

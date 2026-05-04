@@ -214,14 +214,16 @@ def test_post_returns_503_when_redis_missing(
     assert resp.status_code == 503
 
 
-@pytest.mark.parametrize("failing_op", ["set", "delete", "publish"])
+@pytest.mark.parametrize("failing_op", ["set", "delete"])
 def test_post_returns_503_when_redis_write_fails(
     availability_client, failing_op: str
 ) -> None:
     """A runtime Redis failure (timeout, connection drop, pool exhaustion)
-    during the override write or wake publish must collapse to 503 — the
-    same status code the redis-missing branch returns — instead of
-    bubbling a 500 that would break click handling."""
+    during the override WRITE must collapse to 503 — the same status code
+    the redis-missing branch returns — instead of bubbling a 500 that
+    would break click handling. The wake publish is decoupled and tested
+    separately because it must NOT flip the response to 503 once the
+    write has already landed."""
     client, redis = availability_client
 
     async def boom(*_args, **_kwargs):
@@ -234,6 +236,29 @@ def test_post_returns_503_when_redis_write_fails(
 
     assert resp.status_code == 503
     assert resp.json() == {"error": "redis_unavailable"}
+
+
+def test_post_succeeds_when_publish_fails_after_write(
+    availability_client,
+) -> None:
+    """A wake publish failure on a successful override write must NOT
+    surface as 503. The override is already persisted in Redis at that
+    point, so reporting the click as failed would prompt the chip to
+    retry and drive an extra unintended state transition; meanwhile the
+    60s poll safety net keeps other tabs in sync without the wake."""
+    client, redis = availability_client
+
+    async def boom_publish(*_args, **_kwargs):
+        raise RuntimeError("redis connection lost")
+
+    redis.publish = boom_publish  # type: ignore[assignment]
+
+    resp = client.post("/api/availability/AVAILABLE")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"manual_override": "AVAILABLE"}
+    # Override write landed even though wake fan-out failed.
+    assert redis.store["operator_override"] == "AVAILABLE"
 
 
 # ---------------------------------------------------------------------------
