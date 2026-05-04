@@ -32,7 +32,7 @@ def healthcheck() -> dict[str, str]:
 # Tool module imports MUST happen after the ``mcp`` instance is created
 # so the ``@mcp.tool()`` decorators can register against it. Keep these
 # imports at module level so registration fires at server startup.
-from src.mcp.tools import readonly  # noqa: E402, F401
+from src.mcp.tools import functional, readonly  # noqa: E402, F401
 
 
 def main() -> None:  # pragma: no cover - exercised only when running the server
