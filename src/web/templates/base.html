@@ -570,6 +570,49 @@
         html[data-theme="dark"] select option:hover {
             background-color: #374151;
         }
+
+        /* PR-256: Human Availability chip in the dashboard top bar.
+           3-state (AUTO/AVAILABLE/AWAY) with the dot color reflecting
+           the composed verdict and the label reflecting the manual
+           override. Click cycles through states. */
+        .availability-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: 999px;
+            border: 1px solid var(--border-strong);
+            background-color: rgb(var(--bg-2-rgb) / 1);
+            color: var(--text-1);
+            font-family: 'JetBrains Mono', ui-monospace, monospace;
+            font-size: 11px;
+            font-weight: 500;
+            line-height: 1.4;
+            cursor: pointer;
+            user-select: none;
+            transition: border-color 150ms ease, background-color 150ms ease;
+        }
+
+        .availability-chip:hover {
+            border-color: rgb(var(--accent-rgb) / 0.5);
+        }
+
+        .availability-chip .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: rgb(var(--neutral-rgb) / 1);
+        }
+
+        .availability-chip[data-composed="AVAILABLE"] .dot {
+            background-color: var(--ok);
+            box-shadow: 0 0 6px 0 var(--ok);
+        }
+
+        .availability-chip[data-composed="AWAY"] .dot {
+            background-color: var(--fail);
+            box-shadow: 0 0 6px 0 var(--fail);
+        }
     </style>
 </head>
 <body class="bg-surface-1 text-gray-200 min-h-screen">
@@ -590,6 +633,17 @@
                    class="text-sm font-medium secondary-interactive {% if title == 'Settings' %}text-accent{% else %}text-gray-400{% endif %}">
                     Settings
                 </a>
+                <button
+                    id="availability-chip"
+                    type="button"
+                    class="availability-chip"
+                    data-composed="AVAILABLE"
+                    data-manual="AUTO"
+                    title="Click to cycle: AUTO → AVAILABLE → AWAY"
+                    aria-label="Operator availability: AUTO">
+                    <span class="dot" aria-hidden="true"></span>
+                    <span class="label">AUTO</span>
+                </button>
                 <button
                     id="theme-toggle"
                     type="button"
@@ -766,6 +820,101 @@
             const checkAlertsIntervalId = setInterval(checkAlerts, 10000);
             window.addEventListener('beforeunload', () => clearInterval(checkAlertsIntervalId));
             checkAlerts();
+        })();
+    </script>
+
+    <script>
+        // PR-256: Human Availability chip. 3-state cycle AUTO → AVAILABLE
+        // → AWAY → AUTO; ``data-composed`` drives the dot color (composed
+        // verdict from server-side sources) while ``data-manual`` drives
+        // the label and click-cycle next state so AUTO renders distinctly
+        // from a pinned override that happens to resolve identically.
+        (function () {
+            const chip = document.getElementById('availability-chip');
+            if (!chip) return;
+            const cycle = {AUTO: 'AVAILABLE', AVAILABLE: 'AWAY', AWAY: 'AUTO'};
+
+            function applyState(data) {
+                if (!data || typeof data !== 'object') return;
+                const composed = data.composed_state || 'AVAILABLE';
+                const manual = data.manual_override || 'AUTO';
+                chip.dataset.composed = composed;
+                chip.dataset.manual = manual;
+                chip.setAttribute('aria-label', 'Operator availability: ' + manual);
+                const label = chip.querySelector('.label');
+                if (label) label.textContent = manual;
+            }
+
+            async function refresh() {
+                try {
+                    const resp = await fetch('/api/availability');
+                    if (!resp.ok) return;
+                    applyState(await resp.json());
+                } catch (_error) {}
+            }
+
+            // Serialize override updates so rapid repeat clicks reach
+            // Redis in click order. Two concurrent POSTs would otherwise
+            // race in the network/server stack: the older request can
+            // be applied after the newer one, leaving Redis in a stale
+            // state, and the trailing ``refresh()`` then pulls that
+            // stale state back into the chip. Chaining each click onto
+            // the previous tail enforces "one in flight at a time" and
+            // also defers ``refresh()`` until after the queued POST so
+            // it always reads the newest server-side value.
+            let pendingChain = Promise.resolve();
+
+            async function cycleState() {
+                const current = chip.dataset.manual || 'AUTO';
+                const next = cycle[current] || 'AUTO';
+                // Advance the dataset (and label) optimistically BEFORE the
+                // POST so a second click that lands while the first request
+                // is still in flight sees the updated `current` and
+                // continues the cycle (AUTO → AVAILABLE → AWAY → AUTO).
+                // Without this the click handler would re-read the stale
+                // `data-manual`, recompute the same `next`, and send a
+                // duplicate transition. The dot color (data-composed)
+                // stays at the last server-composed verdict until
+                // ``refresh()`` reconciles; if the POST fails, ``refresh``
+                // pulls the server's actual override back so the local
+                // optimistic update gets reverted.
+                chip.dataset.manual = next;
+                chip.setAttribute('aria-label', 'Operator availability: ' + next);
+                const label = chip.querySelector('.label');
+                if (label) label.textContent = next;
+                pendingChain = pendingChain.then(async () => {
+                    try {
+                        await fetch('/api/availability/' + next, {method: 'POST'});
+                    } catch (_error) {}
+                    await refresh();
+                });
+            }
+
+            chip.addEventListener('click', cycleState);
+
+            // 60s polling is the safety net: SSE wake fires immediately on
+            // operator clicks, but heartbeat expiry and active-hours rollover
+            // happen silently and need a periodic re-fetch to surface.
+            const intervalId = setInterval(refresh, 60000);
+            window.addEventListener('beforeunload', function () {
+                clearInterval(intervalId);
+                if (window._availabilitySource) {
+                    try { window._availabilitySource.close(); } catch (_e) {}
+                }
+            });
+
+            // SSE wake on availability change so all tabs sync without
+            // waiting for the 60s poll. ``EventSource`` reconnects on its
+            // own when the stream drops, so no manual retry loop is needed.
+            try {
+                const source = new EventSource('/api/availability/events');
+                window._availabilitySource = source;
+                source.addEventListener('availability_changed', function () {
+                    refresh();
+                });
+            } catch (_error) {}
+
+            refresh();
         })();
     </script>
 </body>
