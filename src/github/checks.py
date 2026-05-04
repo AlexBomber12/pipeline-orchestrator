@@ -238,6 +238,7 @@ async def _get_or_set_pending_first_seen(
     pr_number: int,
     head_sha: str,
     pending_max_seconds: int,
+    now_seconds: float | None = None,
 ) -> float:
     """Return the first-seen-PENDING timestamp for ``head_sha``, writing it on first call.
 
@@ -247,6 +248,11 @@ async def _get_or_set_pending_first_seen(
     Redis without manual cleanup. The first-seen value uses Redis
     server time when available so daemon clock skew between restarts
     does not invalidate an in-flight window.
+
+    ``now_seconds`` lets the caller share a single clock reading between
+    the first-seen write and a subsequent age comparison; when omitted
+    the helper resolves it via :func:`_resolve_now_seconds` (Redis
+    server time with local fallback).
     """
     key = _pending_tracker_key(repo, pr_number, head_sha)
     raw = await redis_client.get(key)
@@ -256,9 +262,8 @@ async def _get_or_set_pending_first_seen(
         except (TypeError, ValueError):
             pass
 
-    now_seconds = await _redis_server_time(redis_client)
     if now_seconds is None:
-        now_seconds = time.time()
+        now_seconds = await _resolve_now_seconds(redis_client)
 
     ttl = max(1, pending_max_seconds * 2)
     await redis_client.set(key, str(now_seconds), nx=True, ex=ttl)
@@ -271,6 +276,23 @@ async def _get_or_set_pending_first_seen(
         except (TypeError, ValueError):
             return now_seconds
     return now_seconds
+
+
+async def _resolve_now_seconds(redis_client: Any) -> float:
+    """Return current wall-clock seconds from Redis when available, else local.
+
+    Centralizes the "Redis server time with local fallback" choice so the
+    first-seen write and the later age comparison both come from the same
+    source within a single classification call. Without this, daemon
+    clock skew (NTP step or drift relative to Redis) would make
+    ``age_seconds = local_now - redis_first_seen`` non-deterministic
+    across hosts and restarts: too large would trigger ``stuck_pending``
+    early, negative would prevent reclassification entirely.
+    """
+    redis_now = await _redis_server_time(redis_client)
+    if redis_now is not None:
+        return redis_now
+    return time.time()
 
 
 async def _redis_server_time(redis_client: Any) -> float | None:
@@ -330,10 +352,20 @@ async def classify_ci_status_with_age(
     if redis_client is None or not head_sha or pending_max_seconds <= 0:
         return raw_status, None
 
+    # Resolve "now" once and pass it down so the first-seen write and
+    # the age comparison share a single clock source. Mixing Redis time
+    # for first_seen with local time.time() here makes age_seconds
+    # unstable under NTP steps or daemon-vs-Redis clock skew.
+    now_seconds = await _resolve_now_seconds(redis_client)
     first_seen = await _get_or_set_pending_first_seen(
-        redis_client, repo, pr_number, head_sha, pending_max_seconds
+        redis_client,
+        repo,
+        pr_number,
+        head_sha,
+        pending_max_seconds,
+        now_seconds=now_seconds,
     )
-    age_seconds = time.time() - first_seen
+    age_seconds = now_seconds - first_seen
     if age_seconds >= pending_max_seconds:
         return CIStatus.FAILURE, "stuck_pending"
     return raw_status, None

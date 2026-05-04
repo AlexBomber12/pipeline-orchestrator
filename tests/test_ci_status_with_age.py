@@ -389,3 +389,111 @@ def test_redis_server_time_accepts_sync_time_method() -> None:
 
     result = asyncio.run(checks._redis_server_time(_SyncTimeRedis()))
     assert result == pytest.approx(1_700_000_500.75)
+
+
+def test_classify_uses_redis_time_for_age_when_clock_skewed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Age computation must not mix Redis-time first-seen with local-time now.
+
+    Simulates a daemon whose local clock is skewed -1h relative to Redis.
+    First-seen is written from Redis at T=base; the next call's Redis
+    time advances by 35min so the window is genuinely exceeded. If the
+    age compared local-time-now against Redis-time-first-seen, the
+    daemon-side delta would be ~ -25min and never trigger; the wrapper
+    must instead read "now" from Redis to stay deterministic.
+    """
+    base = 1_700_000_000.0
+    redis = _FakeRedisWithServerTime(server_time=base)
+    runs, statuses = _runs_pending()
+    monkeypatch.setattr(checks.time, "time", lambda: base - 3600)
+
+    status_initial, reason_initial = asyncio.run(
+        classify_ci_status_with_age(
+            "octo/repo",
+            7,
+            "sha-aaa",
+            redis,
+            pending_max_seconds=1800,
+            runs_payload=runs,
+            statuses_payload=statuses,
+        )
+    )
+    assert status_initial == CIStatus.PENDING
+    assert reason_initial is None
+
+    redis._server_time = base + 35 * 60
+    status_after, reason_after = asyncio.run(
+        classify_ci_status_with_age(
+            "octo/repo",
+            7,
+            "sha-aaa",
+            redis,
+            pending_max_seconds=1800,
+            runs_payload=runs,
+            statuses_payload=statuses,
+        )
+    )
+    assert status_after == CIStatus.FAILURE
+    assert reason_after == "stuck_pending"
+
+
+def test_classify_does_not_misfire_under_local_clock_step_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local clock stepped backward must not yield a negative-age regression.
+
+    Without a shared clock source, ``age = local_now - redis_first_seen``
+    can go negative if the daemon's local clock is set behind Redis,
+    permanently preventing reclassification. The wrapper resolves
+    "now" from Redis so the age stays monotonic on the same SHA.
+    """
+    base = 1_700_000_000.0
+    redis = _FakeRedisWithServerTime(server_time=base)
+    runs, statuses = _runs_pending()
+    monkeypatch.setattr(checks.time, "time", lambda: base + 10_000)
+
+    status_initial, _ = asyncio.run(
+        classify_ci_status_with_age(
+            "octo/repo",
+            7,
+            "sha-aaa",
+            redis,
+            pending_max_seconds=1800,
+            runs_payload=runs,
+            statuses_payload=statuses,
+        )
+    )
+    assert status_initial == CIStatus.PENDING
+
+    monkeypatch.setattr(checks.time, "time", lambda: base - 5000)
+    redis._server_time = base + 40 * 60
+    status_after, reason_after = asyncio.run(
+        classify_ci_status_with_age(
+            "octo/repo",
+            7,
+            "sha-aaa",
+            redis,
+            pending_max_seconds=1800,
+            runs_payload=runs,
+            statuses_payload=statuses,
+        )
+    )
+    assert status_after == CIStatus.FAILURE
+    assert reason_after == "stuck_pending"
+
+
+def test_resolve_now_seconds_falls_back_to_local_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When Redis lacks ``time()``, ``_resolve_now_seconds`` returns local time."""
+    monkeypatch.setattr(checks.time, "time", lambda: 1_700_000_000.0)
+    result = asyncio.run(checks._resolve_now_seconds(_FakeRedis()))
+    assert result == pytest.approx(1_700_000_000.0)
+
+
+def test_resolve_now_seconds_prefers_redis_server_time() -> None:
+    """When Redis exposes ``time()``, ``_resolve_now_seconds`` returns it."""
+    redis = _FakeRedisWithServerTime(server_time=1_700_000_500.5)
+    result = asyncio.run(checks._resolve_now_seconds(redis))
+    assert result == pytest.approx(1_700_000_500.5)
