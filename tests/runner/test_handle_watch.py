@@ -7,6 +7,7 @@ tests/test_runner.py and are referenced via the ``h`` alias.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -2468,3 +2469,629 @@ def test_check_budget_no_skip_when_state_is_watch() -> None:
     assert decisions == [True] * 5
     assert runner._github_api_slowdown_cycle == 0
     assert runner._github_api_slowdown_attempts == 5
+
+
+def _patch_infra_failure_pr(
+    monkeypatch: pytest.MonkeyPatch,
+    pr_number: int = 77,
+    head_sha: str = "feedface",
+    *,
+    check_runs: list[dict] | None = None,
+) -> PRInfo:
+    """Wire ``get_open_prs`` and ``_fetch_ci_status_rest`` so WATCH sees
+    a single infra-class failing check-run. Returns the polled PR so the
+    caller can also seed ``runner.state.current_pr`` with the same PR
+    number/branch.
+
+    ``check_runs`` defaults to a single ``cancelled`` Actions check-run
+    whose ``details_url`` carries workflow run ID ``9876``; this matches
+    the run ID asserted by the WATCH integration test below. Pass
+    ``check_runs=[]`` to drive the "no failing check-run" branch.
+    """
+    pr = PRInfo(
+        number=pr_number,
+        branch=f"pr-{pr_number:03d}",
+        ci_status=CIStatus.INFRA_FAILURE,
+        review_status=ReviewStatus.PENDING,
+        head_sha=head_sha,
+        last_activity=datetime.now(timezone.utc),
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    if check_runs is None:
+        check_runs = [
+            {
+                "conclusion": "cancelled",
+                "details_url": (
+                    "https://github.com/example/repo/actions/runs/9876/"
+                    "job/12345"
+                ),
+            }
+        ]
+    # ``_maybe_reclassify_stuck_pending`` and ``_retry_failed_workflow``
+    # both call this; the cached payload feeds the retry helper too.
+    monkeypatch.setattr(
+        "src.github.checks._fetch_ci_status_rest",
+        lambda repo, sha: (list(check_runs), {}, True),
+    )
+    return pr
+
+
+def test_first_infra_failure_retries_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251: a fresh INFRA_FAILURE on a head_sha triggers ``gh run rerun
+    --failed`` once; ``handle_fix`` is NOT invoked, the infra-retry
+    marker is written to Redis, and a log line records the retry."""
+    pr = _patch_infra_failure_pr(monkeypatch)
+
+    gh_calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        gh_calls.append(list(args))
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+
+    fix_calls: list[None] = []
+
+    async def fake_handle_fix(self: Any) -> None:
+        fix_calls.append(None)
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "handle_fix", fake_handle_fix)
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    asyncio.run(runner.handle_watch())
+
+    assert fix_calls == []
+    # PR-251 follow-up: workflow run ID is parsed from the failing
+    # check-run's ``details_url`` (Actions job URL). No ``gh run list``
+    # call is issued — that endpoint mis-keys ``pull_request`` runs to
+    # the merge commit and would silently miss the failing PR run.
+    assert all(args[:2] != ["run", "list"] for args in gh_calls)
+    assert ["run", "rerun", "--failed", "9876"] in gh_calls
+    # Retry marker is in Redis. PR-251 follow-up: the marker now stores
+    # the wall-clock rerun timestamp (float seconds) so a grace window
+    # can be applied before the next cycle treats INFRA_FAILURE as
+    # "persistent". Older "1" markers are treated as
+    # ``(exists, elapsed)`` for backwards compatibility, but new
+    # writes always carry a numeric value.
+    from src.keyspace import ci_infra_retried as _ci_infra_retried_key
+
+    key = _ci_infra_retried_key(runner.owner_repo, pr.number, pr.head_sha)
+    raw = asyncio.run(runner.redis.get(key))
+    assert raw is not None
+    marker_ts = float(raw)
+    assert marker_ts > 0
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "INFRA_FAILURE detected" in history
+    assert "infra retry: re-ran failed jobs" in history
+
+
+def test_second_infra_failure_routes_to_fix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251: a second INFRA_FAILURE classification on the same head_sha
+    (the prior retry didn't help) routes WATCH straight through
+    ``handle_fix`` without issuing another ``gh run rerun``."""
+    pr = _patch_infra_failure_pr(monkeypatch, pr_number=78, head_sha="d00df00d")
+
+    gh_calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        gh_calls.append(list(args))
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+
+    fix_calls: list[None] = []
+
+    async def fake_handle_fix(self: Any) -> None:
+        fix_calls.append(None)
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "handle_fix", fake_handle_fix)
+
+    runner = h._make_runner()
+    # Pre-seed the marker with a wall-clock timestamp older than the
+    # grace window so the next cycle treats the retry as "elapsed
+    # enough to escalate." A legacy "1" marker would also work (it's
+    # treated as elapsed for backwards compatibility) but the realistic
+    # daemon write-path stores a timestamp.
+    from src.keyspace import ci_infra_retried as _ci_infra_retried_key
+
+    key = _ci_infra_retried_key(runner.owner_repo, pr.number, pr.head_sha)
+    stale_marker_ts = (
+        time.time() - watch_module._INFRA_RETRY_GRACE_SECONDS - 1.0
+    )
+    asyncio.run(runner.redis.set(key, str(stale_marker_ts)))
+
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    asyncio.run(runner.handle_watch())
+
+    assert fix_calls == [None]
+    # No workflow rerun calls were made — straight to FIX.
+    assert all(args[:2] != ["run", "rerun"] for args in gh_calls)
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "INFRA_FAILURE persisted after retry" in history
+    # PR-251 follow-up: ``handle_fix`` reads ``ci_status`` to decide
+    # whether to inject CI logs into the FIX prompt; the persisted-INFRA
+    # path must downgrade to FAILURE before invoking it so the coder
+    # actually receives the failure logs the daemon promised in the
+    # "effective FAILURE" log line.
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.ci_status == CIStatus.FAILURE
+
+
+def test_infra_failure_on_fork_pr_logs_no_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251: fork PRs cannot be auto-fixed; INFRA_FAILURE on a fork
+    falls through to the manual-wait log without issuing a rerun."""
+    pr = PRInfo(
+        number=79,
+        branch="pr-079",
+        ci_status=CIStatus.INFRA_FAILURE,
+        review_status=ReviewStatus.PENDING,
+        head_sha="cafed00d",
+        last_activity=datetime.now(timezone.utc),
+        is_cross_repository=True,
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    monkeypatch.setattr(
+        "src.github.checks._fetch_ci_status_rest",
+        lambda repo, sha: ([{"conclusion": "cancelled"}], {}, True),
+    )
+
+    gh_calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        gh_calls.append(list(args))
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+
+    fix_calls: list[None] = []
+
+    async def fake_handle_fix(self: Any) -> None:
+        fix_calls.append(None)
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "handle_fix", fake_handle_fix)
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    asyncio.run(runner.handle_watch())
+
+    assert fix_calls == []
+    assert all(args[:2] != ["run", "rerun"] for args in gh_calls)
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "fork PR cannot be auto-fixed" in history
+    assert "ci=INFRA_FAILURE" in history
+
+
+def test_infra_retry_attempted_returns_true_when_redis_or_sha_missing() -> None:
+    """PR-251: helpers conservatively report ``(True, True)`` when state
+    cannot be persisted, so the caller routes straight to FIX rather
+    than re-running the workflow forever against a missing tracker."""
+    runner = h._make_runner()
+    assert asyncio.run(runner._infra_retry_attempted(11, "")) == (True, True)
+    runner.redis = None  # type: ignore[assignment]
+    assert asyncio.run(runner._infra_retry_attempted(11, "abc")) == (True, True)
+
+
+def test_infra_retry_attempted_returns_false_when_marker_absent() -> None:
+    """PR-251 follow-up: with redis available but no marker, both flags are
+    False so the caller proceeds to issue the rerun + write the marker."""
+    runner = h._make_runner()
+    assert asyncio.run(runner._infra_retry_attempted(11, "abc")) == (False, False)
+
+
+def test_infra_retry_attempted_within_grace_window_returns_marker_only() -> None:
+    """PR-251 follow-up: a marker written less than
+    ``_INFRA_RETRY_GRACE_SECONDS`` ago reports ``(True, False)`` so the
+    WATCH cycle stays put while the cached pre-rerun CI payload is
+    still in play (CI cache TTL is 15s; e2e config polls every 2s)."""
+    runner = h._make_runner()
+    from src.keyspace import ci_infra_retried as _ci_infra_retried_key
+
+    key = _ci_infra_retried_key(runner.owner_repo, 11, "abc")
+    asyncio.run(runner.redis.set(key, str(time.time())))
+    marker_exists, grace_elapsed = asyncio.run(
+        runner._infra_retry_attempted(11, "abc")
+    )
+    assert marker_exists is True
+    assert grace_elapsed is False
+
+
+def test_infra_retry_attempted_handles_legacy_marker_value() -> None:
+    """PR-251 follow-up: legacy markers written by an older daemon
+    (value ``"1"``) parse as float ``1.0`` — a timestamp at the unix
+    epoch — so the elapsed comparison naturally returns
+    ``(True, True)``. This preserves the prior single-bit semantics
+    so an in-flight upgrade can't get stuck in WATCH on a sha that
+    already exhausted its retry budget."""
+    runner = h._make_runner()
+    from src.keyspace import ci_infra_retried as _ci_infra_retried_key
+
+    key = _ci_infra_retried_key(runner.owner_repo, 11, "abc")
+    asyncio.run(runner.redis.set(key, "1"))
+    assert asyncio.run(runner._infra_retry_attempted(11, "abc")) == (True, True)
+
+
+def test_infra_retry_attempted_handles_corrupted_marker_value() -> None:
+    """PR-251 follow-up: a non-numeric marker (Redis corruption or
+    operator override) cannot be parsed as a timestamp; the helper
+    treats it as ``(True, True)`` so the caller routes to FIX rather
+    than crashing the WATCH cycle on the bad value."""
+    runner = h._make_runner()
+    from src.keyspace import ci_infra_retried as _ci_infra_retried_key
+
+    key = _ci_infra_retried_key(runner.owner_repo, 11, "abc")
+    asyncio.run(runner.redis.set(key, "not-a-number"))
+    assert asyncio.run(runner._infra_retry_attempted(11, "abc")) == (True, True)
+
+
+def test_infra_failure_within_grace_window_stays_in_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up (review fix): when the marker exists but the
+    grace window has not elapsed, WATCH must NOT escalate to FIX and
+    must NOT issue another rerun. This prevents fast-cadence pollers
+    (e2e config polls every 2s, well below the 15s CI cache TTL) from
+    routing to ``handle_fix`` based on the pre-rerun cached payload."""
+    pr = _patch_infra_failure_pr(monkeypatch, pr_number=81, head_sha="beadface")
+
+    gh_calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        gh_calls.append(list(args))
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+
+    fix_calls: list[None] = []
+
+    async def fake_handle_fix(self: Any) -> None:
+        fix_calls.append(None)
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "handle_fix", fake_handle_fix)
+
+    runner = h._make_runner()
+    # Marker was written "just now" (well within the grace window).
+    from src.keyspace import ci_infra_retried as _ci_infra_retried_key
+
+    key = _ci_infra_retried_key(runner.owner_repo, pr.number, pr.head_sha)
+    asyncio.run(runner.redis.set(key, str(time.time())))
+
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    asyncio.run(runner.handle_watch())
+
+    # Did NOT escalate to FIX, did NOT issue another rerun.
+    assert fix_calls == []
+    assert all(args[:2] != ["run", "rerun"] for args in gh_calls)
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "within retry grace window" in history
+    # ci_status must remain INFRA_FAILURE — the downgrade to FAILURE
+    # only happens on the persisted-after-retry path.
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.ci_status == CIStatus.INFRA_FAILURE
+
+
+def test_mark_infra_retry_attempted_noops_when_redis_or_sha_missing() -> None:
+    """PR-251: marking is a no-op without ``redis`` or ``head_sha``; the
+    Redis double records no writes."""
+    runner = h._make_runner()
+    asyncio.run(runner._mark_infra_retry_attempted(11, ""))
+    assert runner.redis.writes == []
+    runner.redis = None  # type: ignore[assignment]
+    asyncio.run(runner._mark_infra_retry_attempted(11, "abc"))
+
+
+def _patch_check_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    check_runs: list[dict],
+) -> None:
+    """Replace ``_fetch_ci_status_rest`` with a stub returning ``check_runs``.
+
+    PR-251 follow-up: ``_retry_failed_workflow`` reads check-runs (not
+    ``gh run list``) to find Actions workflow run IDs. Tests that
+    exercise the helper directly install this stub so the helper sees
+    the desired failing-check-run shape.
+    """
+    monkeypatch.setattr(
+        "src.github.checks._fetch_ci_status_rest",
+        lambda repo, sha: (list(check_runs), {}, True),
+    )
+
+
+def _actions_url(run_id: int, job_id: int = 1) -> str:
+    """Return a canonical GitHub Actions check-run ``details_url``."""
+    return (
+        f"https://github.com/example/repo/actions/runs/{run_id}/job/{job_id}"
+    )
+
+
+def test_retry_failed_workflow_short_circuits_without_head_sha() -> None:
+    """PR-251: an empty ``head_sha`` returns ``False`` with no fetch."""
+    runner = h._make_runner()
+    assert runner._retry_failed_workflow(11, "") is False
+
+
+def test_retry_failed_workflow_handles_no_failing_check_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: when the cached check-runs payload has no
+    failing entries (transient race against the classifier), the helper
+    logs and returns ``False`` without issuing ``gh run rerun``."""
+    runner = h._make_runner()
+    _patch_check_runs(monkeypatch, [])
+    rerun_calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        rerun_calls.append(list(args))
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+
+    assert runner._retry_failed_workflow(11, "abc1234") is False
+    assert rerun_calls == []
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "no failing check-run found" in history
+
+
+def test_retry_failed_workflow_skips_check_runs_without_actions_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: a failing check-run from a non-Actions GitHub
+    App carries a ``details_url`` outside the ``/actions/runs/<id>``
+    shape; the helper cannot rerun it via ``gh run rerun --failed`` and
+    must skip rather than crash."""
+    runner = h._make_runner()
+    _patch_check_runs(
+        monkeypatch,
+        [
+            {
+                "conclusion": "cancelled",
+                "details_url": "https://example.com/custom-app/check/42",
+            }
+        ],
+    )
+    rerun_calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        rerun_calls.append(list(args))
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+
+    assert runner._retry_failed_workflow(11, "abc1234") is False
+    assert rerun_calls == []
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "no Actions workflow run ID" in history
+
+
+def test_retry_failed_workflow_handles_rerun_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251: when every ``gh run rerun --failed`` call raises, the
+    helper logs the failure and returns ``False`` without crashing."""
+    runner = h._make_runner()
+    _patch_check_runs(
+        monkeypatch,
+        [
+            {"conclusion": "cancelled", "details_url": _actions_url(555)},
+        ],
+    )
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        raise RuntimeError("permission denied")
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+    assert runner._retry_failed_workflow(11, "abc1234") is False
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "infra retry rerun failed" in history
+
+
+def test_retry_failed_workflow_extracts_run_id_from_details_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: the workflow run ID is parsed from the failing
+    check-run's ``details_url``. This is the only reliable selection
+    path for ``pull_request`` workflows — ``gh run list --commit``
+    keys on ``workflow_run.head_sha`` which for PR events points at
+    the synthetic merge commit, not at ``pull_request.head.sha`` the
+    daemon tracks.
+    """
+    runner = h._make_runner()
+    _patch_check_runs(
+        monkeypatch,
+        [
+            {"conclusion": "cancelled", "details_url": _actions_url(9876, 12345)},
+        ],
+    )
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        calls.append(list(args))
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+    assert runner._retry_failed_workflow(11, "abc1234") is True
+    assert calls == [["run", "rerun", "--failed", "9876"]]
+
+
+def test_retry_failed_workflow_dedupes_jobs_in_same_workflow_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: a workflow with several failing matrix jobs
+    posts one check-run per job, all sharing the same ``run_id`` in
+    ``details_url``. ``gh run rerun --failed <run_id>`` operates on the
+    whole run, so the helper must dedupe the run IDs before calling.
+    """
+    runner = h._make_runner()
+    _patch_check_runs(
+        monkeypatch,
+        [
+            {"conclusion": "cancelled", "details_url": _actions_url(700, 1)},
+            {"conclusion": "failure", "details_url": _actions_url(700, 2)},
+            {"conclusion": "stale", "details_url": _actions_url(800, 3)},
+        ],
+    )
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        calls.append(list(args))
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+    assert runner._retry_failed_workflow(11, "abc1234") is True
+    assert calls == [
+        ["run", "rerun", "--failed", "700"],
+        ["run", "rerun", "--failed", "800"],
+    ]
+
+
+def test_retry_failed_workflow_skips_succeeding_check_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: only failing check-runs feed the rerun set;
+    the helper must not invoke ``gh run rerun`` against runs whose
+    conclusion is ``success`` or ``neutral`` (e.g. a re-dispatch that
+    superseded the failure that drove the INFRA_FAILURE classification).
+    """
+    runner = h._make_runner()
+    _patch_check_runs(
+        monkeypatch,
+        [
+            {"conclusion": "success", "details_url": _actions_url(1)},
+            {"conclusion": "neutral", "details_url": _actions_url(2)},
+            {"conclusion": "skipped", "details_url": _actions_url(3)},
+        ],
+    )
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        calls.append(list(args))
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+    assert runner._retry_failed_workflow(11, "abc1234") is False
+    assert calls == []
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "no failing check-run found" in history
+
+
+def test_retry_failed_workflow_matches_failing_status_with_empty_conclusion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: when a check-run carries an empty
+    ``conclusion`` (e.g. an in-flight job that GitHub reports with only
+    ``status``), a failure-class ``status`` value still selects the run
+    for rerun. Without this branch the WATCH cycle would consume its
+    one-shot retry marker without ever calling ``gh run rerun``.
+    """
+    runner = h._make_runner()
+    _patch_check_runs(
+        monkeypatch,
+        [
+            {
+                "conclusion": None,
+                "status": "failed",
+                "details_url": _actions_url(7),
+            },
+        ],
+    )
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        calls.append(list(args))
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+    assert runner._retry_failed_workflow(11, "abc1234") is True
+    assert calls == [["run", "rerun", "--failed", "7"]]
+
+
+def test_retry_failed_workflow_partial_rerun_failure_returns_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up: when several workflow runs need rerunning and
+    one of the calls fails, the helper logs that failure but reports
+    success as long as at least one rerun went through — partial
+    progress is still progress against the one-shot retry budget.
+    """
+    runner = h._make_runner()
+    _patch_check_runs(
+        monkeypatch,
+        [
+            {"conclusion": "cancelled", "details_url": _actions_url(900)},
+            {"conclusion": "stale", "details_url": _actions_url(901)},
+        ],
+    )
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        calls.append(list(args))
+        if args == ["run", "rerun", "--failed", "900"]:
+            raise RuntimeError("transient")
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+    assert runner._retry_failed_workflow(11, "abc1234") is True
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "infra retry rerun failed" in history
+    assert "infra retry: re-ran failed jobs" in history
+
+
+def test_retry_failed_workflow_handles_no_run_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251: when the failing check-runs carry no Actions workflow
+    run IDs (non-Actions GitHub Apps only), the retry helper logs and
+    returns ``False``; the marker is still written by the caller so the
+    next cycle routes to FIX."""
+    pr = _patch_infra_failure_pr(
+        monkeypatch,
+        pr_number=80,
+        head_sha="11223344",
+        check_runs=[
+            {
+                "conclusion": "cancelled",
+                "details_url": "https://example.com/custom-app/check/1",
+            }
+        ],
+    )
+
+    monkeypatch.setattr(
+        watch_module.gh_runner,
+        "run_gh",
+        lambda args, repo=None, **kw: "",
+    )
+
+    fix_calls: list[None] = []
+
+    async def fake_handle_fix(self: Any) -> None:
+        fix_calls.append(None)
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "handle_fix", fake_handle_fix)
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    asyncio.run(runner.handle_watch())
+
+    # First cycle: no rerun was issued (no run found), but the marker
+    # is written (with a timestamp) so a later cycle — once the grace
+    # window has elapsed — goes straight to FIX.
+    assert fix_calls == []
+    from src.keyspace import ci_infra_retried as _ci_infra_retried_key
+
+    key = _ci_infra_retried_key(runner.owner_repo, pr.number, pr.head_sha)
+    raw = asyncio.run(runner.redis.get(key))
+    assert raw is not None
+    assert float(raw) > 0
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "no Actions workflow run ID" in history

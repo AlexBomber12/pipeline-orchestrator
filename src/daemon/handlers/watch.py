@@ -8,18 +8,51 @@ Mixin methods:
 from __future__ import annotations
 
 import logging
+import re
+import time
 from datetime import datetime, timedelta, timezone
 
 from src.github import cache as gh_cache
 from src.github import checks as gh_checks
 from src.github import gh_runner
 from src.github import prs as gh_prs
+from src.keyspace import ci_infra_retried
 from src.models import CIStatus, FeedbackCheckResult, PipelineState, ReviewStatus
 
 logger = logging.getLogger(__name__)
 _STALE_RETRIGGER_DEBOUNCE = timedelta(hours=1)
 _CODEX_BOT_ERROR_RETRIGGER_COOLDOWN = timedelta(minutes=5)
 _CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
+# PR-251: TTL for the per-(repo, pr, head_sha) infra-retry marker. Keys
+# self-expire so abandoned PRs (closed, merged, force-pushed) don't
+# accumulate state in Redis. A week is far longer than any single
+# head_sha is in flight, so the TTL never races a still-relevant retry
+# decision but does reclaim space for closed PRs.
+_CI_INFRA_RETRIED_TTL_SECONDS = 7 * 24 * 60 * 60
+# PR-251 follow-up: grace window applied between writing the infra-retry
+# marker (immediately after ``gh run rerun --failed``) and treating a
+# subsequent INFRA_FAILURE classification as "persistent" enough to
+# escalate to FIX. The CI status fetch is cached for
+# ``_CI_STATUS_CACHE_TTL_SECONDS`` (15s); on fast WATCH cadences (the
+# e2e config polls every 2s) the next cycle can still read the
+# pre-rerun cached payload, see the marker, and route to ``handle_fix``
+# before GitHub has reported any new check-run state. The grace window
+# must be larger than the cache TTL plus enough slack for GitHub to
+# acknowledge the rerun and emit fresh check-runs; 60s gives roughly
+# four cache-miss refetches at the 15s TTL, after which any persisting
+# INFRA_FAILURE genuinely reflects a post-rerun observation. The grace
+# is bounded by the marker TTL above, so closed/abandoned PRs cannot
+# accumulate state.
+_INFRA_RETRY_GRACE_SECONDS = 60.0
+# PR-251 follow-up: regex for extracting the GitHub Actions workflow run
+# ID from a check-run ``details_url``. The canonical format is
+# ``https://github.com/{owner}/{repo}/actions/runs/{run_id}/job/{job_id}``;
+# matching only ``/actions/runs/<digits>`` keeps the parser robust if
+# GitHub appends query parameters or trims the ``/job/...`` suffix in
+# future API revisions. Non-Actions check runs (custom GitHub Apps)
+# carry a different URL shape, do not match, and are silently skipped
+# — we cannot rerun them with ``gh run rerun --failed`` regardless.
+_DETAILS_URL_RUN_RE = re.compile(r"/actions/runs/(\d+)")
 # Substring patterns matching known chatgpt-codex-connector[bot] error
 # comments. When the bot fails its own review and posts one of these,
 # review_status stays as EYES and the WATCH timeout would otherwise burn
@@ -182,7 +215,11 @@ class WatchMixin:
             return
         # Fork (cross-repo) PRs can't be fixed locally.
         if found.is_cross_repository:
-            if ci == CIStatus.FAILURE or review == ReviewStatus.CHANGES_REQUESTED:
+            if (
+                ci == CIStatus.FAILURE
+                or ci == CIStatus.INFRA_FAILURE
+                or review == ReviewStatus.CHANGES_REQUESTED
+            ):
                 self.log_event(
                     f"[WATCH] PR #{found.number} fork PR cannot be "
                     f"auto-fixed (review={review.value}, ci={ci.value}); "
@@ -190,6 +227,53 @@ class WatchMixin:
                 )
         elif ci == CIStatus.FAILURE:
             await self.handle_fix()
+            return
+        elif ci == CIStatus.INFRA_FAILURE:
+            # PR-251 (OBS-BC): a single infra-class failure (cancelled
+            # / action_required / stale conclusion, or known infra
+            # annotation keyword) earns one workflow rerun per
+            # ``head_sha``. A second INFRA_FAILURE classification on the
+            # same SHA means the rerun also failed — treat as a real
+            # logic FAILURE and route to FIX so the coder can act on it.
+            #
+            # PR-251 follow-up: the marker is gated by
+            # ``_INFRA_RETRY_GRACE_SECONDS`` so the cached pre-rerun CI
+            # payload (TTL 15s) cannot trigger FIX escalation before
+            # GitHub has reported any post-rerun state. While the grace
+            # window is in flight WATCH stays put and re-polls.
+            marker_exists, grace_elapsed = await self._infra_retry_attempted(
+                found.number, found.head_sha
+            )
+            if marker_exists and grace_elapsed:
+                self.log_event(
+                    f"[WATCH] PR #{found.number} CI INFRA_FAILURE "
+                    f"persisted after retry; routing to FIX as "
+                    f"effective FAILURE."
+                )
+                # Downgrade in-memory ci_status to FAILURE so the FIX
+                # prompt builder injects CI logs (it gates that section
+                # on ``ci_status == CIStatus.FAILURE``); leaving it as
+                # INFRA_FAILURE would drop the very logs the coder
+                # needs for the effective-failure handoff.
+                found.ci_status = CIStatus.FAILURE
+                await self.handle_fix()
+                return
+            if marker_exists:
+                self.log_event(
+                    f"[WATCH] PR #{found.number} CI INFRA_FAILURE "
+                    f"observed within retry grace window; awaiting "
+                    f"fresh post-rerun status."
+                )
+                return
+            self.log_event(
+                f"[WATCH] PR #{found.number} CI INFRA_FAILURE "
+                f"detected; retrying workflow once before routing to "
+                f"FIX."
+            )
+            self._retry_failed_workflow(found.number, found.head_sha)
+            await self._mark_infra_retry_attempted(
+                found.number, found.head_sha
+            )
             return
         elif review == ReviewStatus.CHANGES_REQUESTED:
             result = self._has_new_codex_feedback_since_last_push()
@@ -495,3 +579,150 @@ class WatchMixin:
         if success:
             self.state.last_codex_retrigger_at = datetime.now(timezone.utc)
         return posted
+
+    async def _infra_retry_attempted(
+        self, pr_number: int, head_sha: str
+    ) -> tuple[bool, bool]:
+        """Return ``(marker_exists, grace_elapsed)`` for the infra-retry marker.
+
+        PR-251 (OBS-BC) + follow-up. The marker stores the wall-clock
+        timestamp at which WATCH issued ``gh run rerun --failed`` for
+        ``head_sha``; ``grace_elapsed`` is ``True`` only after
+        ``_INFRA_RETRY_GRACE_SECONDS`` have passed since that
+        timestamp, ensuring that an immediate re-poll on a fast WATCH
+        cadence cannot escalate to FIX while the CI fetch is still
+        serving the pre-rerun cached payload.
+
+        Without ``redis`` or ``head_sha`` we conservatively report
+        ``(True, True)`` so the caller routes straight to FIX rather than
+        looping retries against a missing tracker. Legacy markers written
+        before the timestamp format (value ``"1"``) are also treated as
+        ``(True, True)`` — they came from a prior daemon version where
+        the grace window did not exist, and we cannot recover the
+        original rerun time.
+        """
+        if self.redis is None or not head_sha:
+            return True, True
+        key = ci_infra_retried(self.owner_repo, pr_number, head_sha)
+        existing = await self.redis.get(key)
+        if existing is None:
+            return False, False
+        try:
+            marker_ts = float(existing)
+        except (TypeError, ValueError):
+            return True, True
+        elapsed = time.time() - marker_ts
+        return True, elapsed >= _INFRA_RETRY_GRACE_SECONDS
+
+    async def _mark_infra_retry_attempted(
+        self, pr_number: int, head_sha: str
+    ) -> None:
+        """Record that WATCH issued the one-shot infra retry for ``head_sha``.
+
+        Stores the current wall-clock timestamp so :meth:`_infra_retry_attempted`
+        can apply ``_INFRA_RETRY_GRACE_SECONDS`` before reporting the
+        retry as "elapsed enough to escalate" — see that helper's
+        docstring for the rationale.
+        """
+        if self.redis is None or not head_sha:
+            return
+        key = ci_infra_retried(self.owner_repo, pr_number, head_sha)
+        await self.redis.set(
+            key, str(time.time()), ex=_CI_INFRA_RETRIED_TTL_SECONDS
+        )
+
+    def _retry_failed_workflow(self, pr_number: int, head_sha: str) -> bool:
+        """Re-run the failed jobs of failing workflow runs attached to ``head_sha``.
+
+        PR-251 (OBS-BC). Returns ``True`` when at least one ``gh run
+        rerun --failed`` succeeded; ``False`` when no failing check-run
+        was found, no Actions workflow run IDs could be extracted, or
+        every rerun call failed. The caller marks the infra-retry
+        attempted unconditionally so a transient ``gh`` outage does not
+        loop the WATCH cycle.
+
+        Workflow run IDs are derived from the per-commit ``check-runs``
+        REST payload (``GET /repos/{repo}/commits/{sha}/check-runs``)
+        rather than ``gh run list --commit``. The check-runs endpoint is
+        keyed to the actual head SHA the daemon already tracks, so it
+        surfaces every failing job regardless of the trigger event;
+        ``gh run list --commit`` keys on the ``workflow_run.head_sha``
+        field, which for ``pull_request`` events can point at the
+        synthetic merge commit instead of ``pull_request.head.sha`` and
+        therefore returns nothing for the most common PR workflow
+        configuration. Driving the rerun off the same check-runs that
+        produced the INFRA_FAILURE classification also guarantees we
+        only rerun jobs the WATCH gate actually saw fail — no risk of
+        firing an unrelated ``push``/``schedule`` workflow that shares
+        the SHA but never appeared in the check rollup.
+
+        Each failing check-run's ``details_url`` (canonical shape
+        ``.../actions/runs/{run_id}/job/{job_id}``) is parsed to extract
+        the workflow run ID; non-Actions check runs (custom GitHub
+        Apps) match a different URL shape, fall through, and are
+        skipped. Run IDs are deduplicated so a workflow with several
+        failing matrix jobs receives a single ``gh run rerun --failed``
+        call.
+        """
+        if not head_sha:
+            return False
+        check_runs, _statuses, _fetch_ok = gh_checks._fetch_ci_status_rest(
+            self.owner_repo, head_sha
+        )
+        failing_runs = [
+            run
+            for run in check_runs
+            if isinstance(run, dict)
+            and (
+                str(run.get("conclusion") or "").upper()
+                in gh_checks._REST_CI_FAILURE_STATES
+                or str(run.get("status") or "").upper()
+                in gh_checks._REST_CI_FAILURE_STATES
+            )
+        ]
+        if not failing_runs:
+            self.log_event(
+                f"[WATCH] PR #{pr_number} infra retry skipped — no "
+                f"failing check-run found for sha {head_sha[:7]}."
+            )
+            return False
+        run_ids: list[int] = []
+        seen: set[int] = set()
+        for run in failing_runs:
+            url = run.get("details_url") or run.get("html_url") or ""
+            match = _DETAILS_URL_RUN_RE.search(str(url))
+            if not match:
+                continue
+            run_id = int(match.group(1))
+            if run_id in seen:
+                continue
+            seen.add(run_id)
+            run_ids.append(run_id)
+        if not run_ids:
+            self.log_event(
+                f"[WATCH] PR #{pr_number} infra retry skipped — failing "
+                f"check-runs on sha {head_sha[:7]} have no Actions "
+                f"workflow run ID in details_url."
+            )
+            return False
+        rerun_count = 0
+        for run_id in run_ids:
+            try:
+                gh_runner.run_gh(
+                    ["run", "rerun", "--failed", str(run_id)],
+                    repo=self.owner_repo,
+                )
+            except RuntimeError as exc:
+                self.log_event(
+                    f"[WATCH] PR #{pr_number} infra retry rerun failed "
+                    f"for run {run_id}: {exc}."
+                )
+                continue
+            rerun_count += 1
+        if rerun_count == 0:
+            return False
+        self.log_event(
+            f"[WATCH] PR #{pr_number} infra retry: re-ran failed jobs "
+            f"of {rerun_count} workflow run(s) on sha {head_sha[:7]}."
+        )
+        return True

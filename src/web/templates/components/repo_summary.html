@@ -7,9 +7,10 @@
    stays mounted and keeps its user-selected filter. #}
 {% import "components/_repo_state_styles.html" as repo_state %}
 {% set ci_styles = {
-    'SUCCESS': {'dot': 'bg-ok',   'pulse': false, 'label': 'success'},
-    'FAILURE': {'dot': 'bg-fail', 'pulse': false, 'label': 'failure'},
-    'PENDING': {'dot': 'bg-warn', 'pulse': true,  'label': 'pending'},
+    'SUCCESS':       {'dot': 'bg-ok',   'pulse': false, 'label': 'success'},
+    'FAILURE':       {'dot': 'bg-fail', 'pulse': false, 'label': 'failure'},
+    'PENDING':       {'dot': 'bg-warn', 'pulse': true,  'label': 'pending'},
+    'INFRA_FAILURE': {'dot': 'bg-fail', 'pulse': false, 'label': 'infra failure'},
 } %}
 {% set review_emoji = {
     'APPROVED':          '👍',

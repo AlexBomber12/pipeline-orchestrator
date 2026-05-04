@@ -39,6 +39,13 @@ class CIStatus(str, Enum):
     PENDING = "PENDING"
     SUCCESS = "SUCCESS"
     FAILURE = "FAILURE"
+    # PR-251 (OBS-BC): all failing check-runs match infrastructure-class
+    # signals (cancelled / action_required / stale conclusion, or
+    # ``runner offline`` / ``could not pull image`` annotation keywords).
+    # WATCH retries the workflow once per ``head_sha`` before falling
+    # back to ``handle_fix`` so the coder never burns FIX iterations on
+    # a problem that has no code change to make.
+    INFRA_FAILURE = "INFRA_FAILURE"
 
 
 class FeedbackCheckResult(str, Enum):

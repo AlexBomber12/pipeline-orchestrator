@@ -78,6 +78,17 @@ def cli_log_history(repo_name: str, timestamp: str) -> str:
     return f"cli_log:{repo_name}:{timestamp}"
 
 
+def ci_infra_retried(repo_name: str, pr_number: int, head_sha: str) -> str:
+    """Per-(repo, pr, head_sha) marker that the WATCH handler has already
+    re-run the failed workflow once after CI was classified
+    ``CIStatus.INFRA_FAILURE``. Subsequent INFRA_FAILURE classifications
+    on the same SHA route to ``handle_fix`` instead of triggering another
+    rerun, so a persistent infra-class failure does not loop forever
+    (PR-251 / OBS-BC).
+    """
+    return f"ci_infra_retried:{repo_name}:{pr_number}:{head_sha}"
+
+
 def repo_events_channel(repo_name: str) -> str:
     """PubSub channel for repo-scoped operator-visible events."""
     return f"repo-events:{repo_name}"

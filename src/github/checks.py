@@ -11,7 +11,7 @@ import json
 import time
 from typing import Any
 
-from src.github import cache
+from src.github import cache, gh_runner
 from src.models import CIStatus
 from src.retry import retry_transient
 
@@ -50,8 +50,138 @@ _REST_CI_FAILURE_STATES = {
     "CANCELLED",
     "TIMED_OUT",
     "ACTION_REQUIRED",
+    # PR-251: ``stale`` is a GitHub Actions check-run conclusion meaning
+    # the run is no longer relevant (workflow re-dispatched after a
+    # newer push, or GitHub itself dropped the result). It must count
+    # toward the failure rollup so ``_is_infra_failure`` can route it
+    # through the INFRA_FAILURE retry path; otherwise a stale-only set
+    # of check-runs would be silently classified ``PENDING``.
+    "STALE",
 }
 _REST_CI_SUCCESS_STATES = {"SUCCESS", "COMPLETED", "NEUTRAL", "SKIPPED"}
+
+# PR-251 (OBS-BC): conclusions that indicate an infrastructure-class
+# failure rather than a logic failure. ``cancelled`` is unusual without
+# operator intervention (workflow runner crash, abort), ``action_required``
+# means the workflow boot pre-flight failed (GitHub App not installed,
+# permissions missing), and ``stale`` means GitHub itself decided the
+# run is no longer relevant.
+_INFRA_CONCLUSION_STATES = {"CANCELLED", "ACTION_REQUIRED", "STALE"}
+
+# PR-251 (OBS-BC): annotation message substrings that flag an
+# infrastructure-class failure even when the conclusion itself looks
+# logic-class (``failure``). The list is empirical and conservative —
+# under-classifying (treating ambiguous as logic FAILURE and routing to
+# FIX) is far safer than over-classifying (skipping a real bug as
+# infra). Match is case-insensitive against the annotation ``message``
+# field.
+_INFRA_ANNOTATION_KEYWORDS = (
+    "runner offline",
+    "could not pull image",
+    "no space left on device",
+    "operation timed out",
+    "infrastructure error",
+    "we had a problem communicating with the server",
+)
+
+# PR-251 follow-up: hard cap on annotations fetched per failing
+# check-run when hydrating for the infra-keyword scan. The classifier
+# only needs *any* matching message, not the full set, and the
+# annotations endpoint is paginated (``per_page`` max 100). Pulling
+# every page on a large lint/test run can issue many REST calls per
+# WATCH cycle for every failing run on every open PR, which quickly
+# exhausts the GitHub REST budget. A single page of 50 messages
+# captures any realistic infra annotation while keeping the worst case
+# at one extra REST call per failing non-infra-conclusion check-run.
+_ANNOTATION_HYDRATION_PER_PAGE = 50
+
+
+def _is_infra_failure(check_run: dict) -> bool:
+    """Return ``True`` iff a failing check-run's signals look infra-class.
+
+    PR-251 (OBS-BC). Caller already filtered ``check_run`` down to runs
+    whose conclusion/status maps to ``_REST_CI_FAILURE_STATES``; this
+    helper decides whether the failure is an infrastructure flake
+    (worth retrying once) versus a real logic failure (route to FIX).
+
+    Two signals are checked, both case-insensitive:
+    - ``conclusion`` in ``_INFRA_CONCLUSION_STATES``
+    - any annotation ``message`` containing an
+      ``_INFRA_ANNOTATION_KEYWORDS`` substring
+    """
+    conclusion = (check_run.get("conclusion") or "").upper()
+    if conclusion in _INFRA_CONCLUSION_STATES:
+        return True
+    annotations = check_run.get("annotations") or []
+    if not isinstance(annotations, list):
+        return False
+    for ann in annotations:
+        if not isinstance(ann, dict):
+            continue
+        msg = (ann.get("message") or "").lower()
+        if any(kw in msg for kw in _INFRA_ANNOTATION_KEYWORDS):
+            return True
+    return False
+
+
+def _maybe_hydrate_annotations(repo: str, check_run: dict) -> None:
+    """Populate ``check_run['annotations']`` from ``annotations_url``.
+
+    PR-251 (OBS-BC). The ``GET /repos/{repo}/commits/{sha}/check-runs``
+    response carries ``annotations_count`` and ``annotations_url`` but
+    not the annotation messages themselves; ``_is_infra_failure``
+    matches keywords against ``annotation['message']``, so without this
+    hydration the keyword path never fires on real REST payloads.
+
+    Hydration is gated to keep the extra REST calls bounded:
+
+    - skip when ``annotations`` is already present (test fixtures
+      pre-populate the field; double-fetching would mask their intent),
+    - skip when the run already concludes with an infra-class state
+      (``cancelled`` / ``action_required`` / ``stale`` — those classify
+      as infra without consulting the message text),
+    - skip when the run is not in a failure-like state (annotations on
+      passing runs are not consulted by the classifier),
+    - skip when ``annotations_count`` is missing or zero.
+
+    Only the first ``_ANNOTATION_HYDRATION_PER_PAGE`` annotations are
+    fetched (a single non-paginated REST call) instead of walking every
+    page. ``_is_infra_failure`` only needs to detect that *any*
+    annotation matches an infra keyword; for a large lint/test run
+    with hundreds of annotations, paginating every cycle would
+    multiply REST traffic by the number of failing runs and exhaust
+    the budget for unrelated WATCH cycles.
+
+    Failures of the annotation fetch are swallowed: leaving the field
+    empty causes ``_is_infra_failure`` to return ``False``, which
+    surfaces the run as logic FAILURE — the safe default.
+    """
+    if "annotations" in check_run:
+        return
+    conclusion = (check_run.get("conclusion") or "").upper()
+    if conclusion in _INFRA_CONCLUSION_STATES:
+        return
+    if conclusion not in _REST_CI_FAILURE_STATES:
+        return
+    count = check_run.get("annotations_count")
+    if not isinstance(count, int) or count <= 0:
+        return
+    check_run_id = check_run.get("id")
+    if not isinstance(check_run_id, int):
+        return
+    path = (
+        f"repos/{repo}/check-runs/{check_run_id}/annotations"
+        f"?per_page={_ANNOTATION_HYDRATION_PER_PAGE}"
+    )
+    try:
+        raw = retry_transient(
+            lambda: gh_runner.run_gh(["api", path]),
+            operation_name=f"gh api {path}",
+        )
+    except RuntimeError:
+        return
+    if isinstance(raw, list):
+        check_run["annotations"] = [a for a in raw if isinstance(a, dict)]
 
 
 def clear_ci_status_cache() -> None:
@@ -118,6 +248,18 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
             runs = page.get("check_runs")
             if isinstance(runs, list):
                 check_runs.extend(r for r in runs if isinstance(r, dict))
+
+    # PR-251 (OBS-BC): GitHub's check-runs REST payload exposes only
+    # ``annotations_count`` + ``annotations_url`` — not the annotation
+    # ``message`` strings the infra classifier inspects. Hydrate the
+    # ``annotations`` field on each failing check-run that has at least
+    # one annotation and a non-infra conclusion (infra-class conclusions
+    # like ``cancelled`` already classify without needing the message
+    # text). Without this step ``_is_infra_failure`` would never see
+    # annotation messages on real REST payloads and would mis-route
+    # failures whose only infra signal is an annotation keyword.
+    for run in check_runs:
+        _maybe_hydrate_annotations(repo, run)
 
     status_path = f"repos/{repo}/commits/{sha}/status"
     status_ok = False
@@ -198,19 +340,40 @@ def _map_rest_ci_status_to_enum(
         return CIStatus.SUCCESS if empty_is_success else CIStatus.PENDING
 
     states: list[str] = []
+    failing_runs: list[dict] = []
     for run in check_runs:
         if not isinstance(run, dict):
             continue
         value = run.get("conclusion") or run.get("status")
-        if value:
-            states.append(str(value).upper())
+        if not value:
+            continue
+        upper = str(value).upper()
+        states.append(upper)
+        if upper in _REST_CI_FAILURE_STATES:
+            failing_runs.append(run)
 
-    if statuses and isinstance(combined_state, str) and combined_state:
-        states.append(combined_state.upper())
+    combined_state_upper = (
+        combined_state.upper() if isinstance(combined_state, str) and combined_state else ""
+    )
+    if statuses and combined_state_upper:
+        states.append(combined_state_upper)
 
     if not states:
         return CIStatus.PENDING
     if any(s in _REST_CI_FAILURE_STATES for s in states):
+        # PR-251 (OBS-BC): when every failing check-run is infra-class,
+        # surface ``INFRA_FAILURE`` so WATCH can rerun the workflow
+        # once before consuming a coder FIX iteration. A combined
+        # commit-status failure (legacy GitHub status API) cannot
+        # carry annotations, so it dominates as logic FAILURE — better
+        # to under-classify infra than to skip a real bug.
+        combined_status_failed = combined_state_upper in _REST_CI_FAILURE_STATES
+        if (
+            failing_runs
+            and not combined_status_failed
+            and all(_is_infra_failure(run) for run in failing_runs)
+        ):
+            return CIStatus.INFRA_FAILURE
         return CIStatus.FAILURE
     if all(s in _REST_CI_SUCCESS_STATES for s in states):
         return CIStatus.SUCCESS
