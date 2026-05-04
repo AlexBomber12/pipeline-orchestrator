@@ -1,9 +1,9 @@
 {% from "components/cancellation_card.html" import cancellation_card %}
 {# Rendered into the collapsible "Recent cancellations" block on the
    per-repo detail page. Server-rendered list (no client polling): the
-   data backs operator review, not real-time monitoring, so the lazy
-   ``hx-trigger="revealed"`` fetch in repo.html is the only refresh
-   path until the section is closed and reopened. #}
+   data backs operator review, not real-time monitoring, so the htmx
+   ``toggle[target.open]`` fetch in repo.html refires each time the
+   section is re-opened — that is the only refresh path. #}
 <div class="cancellation-list mt-3">
     {% if causes %}
     {% for cause in causes %}{{ cancellation_card(cause) }}{% endfor %}
