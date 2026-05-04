@@ -34,6 +34,12 @@ from typing import Any
 import redis.asyncio as aioredis
 from redis.exceptions import RedisError
 
+from src.cancellation import (
+    CancellationCause,
+    get_cancellation_cause,
+    safe_record_cancellation_cause,
+    truncate_for_payload,
+)
 from src.coder_registry import CoderPlugin, CoderRegistry
 from src.coders import build_coder_registry
 from src.config import AppConfig, CoderType, RepoConfig, load_config
@@ -1013,6 +1019,7 @@ class PipelineRunner(
         publish: bool = True,
         log_prefix: str = "[ERROR]",
         log_message: str | None = None,
+        cancellation_cause: CancellationCause | None = None,
     ) -> None:
         """Atomic transition to ERROR with consistent telemetry.
 
@@ -1027,6 +1034,19 @@ class PipelineRunner(
         (e.g. ``watch.py``'s ``[WATCH] {exc}.`` vs. its more verbose
         ``error_message``). Defaults to ``message`` so the common case
         keeps a one-line callsite.
+
+        ``cancellation_cause`` (PR-253) overrides the default CRASH cause
+        record written to Redis. Callers that already classified the
+        failure as TIMEOUT or INFRA pass the structured cause directly so
+        the dashboard surfaces the specific category. The write is
+        best-effort — Redis errors never block the ERROR transition.
+
+        First-cause-wins (PR-253 fix): if a cause is already recorded for
+        this ``task_id``, do not overwrite it. Retry-heavy flows
+        (ERROR → IDLE → retry → ERROR) would otherwise replace the
+        original failure category, corrupting OBS-BE attribution. The
+        matching delete in ``handle_error`` clears the slot when a retry
+        succeeds, so the next genuine failure can record again.
         """
         self.state.state = PipelineState.ERROR
         self.state.error_message = message
@@ -1034,6 +1054,27 @@ class PipelineRunner(
         self.log_event(f"{log_prefix} {log_body}.")
         if save_run_record_as:
             await self._save_current_run_record(save_run_record_as)
+        task = self.state.current_task
+        if task is not None:
+            existing: CancellationCause | None
+            try:
+                existing = await get_cancellation_cause(
+                    self.redis, self.name, task.pr_id
+                )
+            except Exception:
+                existing = None
+            if existing is None:
+                cause = cancellation_cause or CancellationCause(
+                    category="CRASH",
+                    payload={"error_message": truncate_for_payload(message)},
+                )
+                await safe_record_cancellation_cause(
+                    self.redis,
+                    self.name,
+                    task.pr_id,
+                    cause,
+                    log=self.log_event,
+                )
         if publish:
             await self.publish_state()
 

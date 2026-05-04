@@ -86,6 +86,21 @@ async def get_cancellation_cause(
     return CancellationCause.from_redis(raw)
 
 
+async def delete_cancellation_cause(
+    redis_client: Any,
+    repo_slug: str,
+    task_id: str,
+) -> None:
+    """Drop a previously-recorded cause and its index entry.
+
+    Called when a task transitions out of ERROR back to IDLE for retry,
+    so a later success does not leave a stale CRASH/INFRA/TIMEOUT record
+    in Redis for the 30-day TTL window.
+    """
+    await redis_client.delete(cause_key(repo_slug, task_id))
+    await redis_client.zrem(index_key(repo_slug), task_id)
+
+
 async def list_recent_cancellations(
     redis_client: Any,
     repo_slug: str,

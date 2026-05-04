@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 from src.branch_context import BranchContext
+from src.cancellation import CancellationCause, classify_infra_exception
 from src.coder_registry import CoderPlugin
 from src.daemon import git_ops
 from src.daemon.handlers import CoderUnavailable
@@ -403,6 +405,7 @@ class CodingMixin:
                     f"get_open_prs failed: {exc}",
                     publish=False,
                     log_prefix="[CODING]",
+                    cancellation_cause=classify_infra_exception(exc),
                 )
                 return
             candidate = next(
@@ -585,6 +588,20 @@ class CodingMixin:
                 # cannot confirm its visibility. Degrade to ERROR (which
                 # the daemon retries) rather than HUNG (manual park) so a
                 # transient read outage does not strand the task.
+                infra_cause = classify_infra_exception(last_list_exc)
+                if infra_cause is None:
+                    infra_cause = CancellationCause(
+                        category="INFRA",
+                        payload={
+                            "subsystem": "gh_api",
+                            "retry_count": 3,
+                            "last_attempt_iso": datetime.now(
+                                timezone.utc
+                            ).isoformat(),
+                            "error_class": type(last_list_exc).__name__,
+                            "error_message": str(last_list_exc)[:500],
+                        },
+                    )
                 await self._transition_to_error(
                     (
                         f"[{coder_name}] Daemon-created PR list failed after "
@@ -592,6 +609,7 @@ class CodingMixin:
                     ),
                     publish=False,
                     log_prefix="[CODING]",
+                    cancellation_cause=infra_cause,
                 )
             else:
                 message = (

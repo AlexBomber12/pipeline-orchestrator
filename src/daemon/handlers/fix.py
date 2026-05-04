@@ -9,6 +9,10 @@ import subprocess
 from datetime import datetime, timezone
 
 from src.branch_context import BranchContext
+from src.cancellation import (
+    CancellationCause,
+    safe_record_cancellation_cause,
+)
 from src.daemon import (
     fix_codex_trigger,
     fix_escalation,
@@ -553,6 +557,14 @@ class FixMixin(BreachMixin):
                 save_run_record_as=None,
                 publish=False,
                 log_prefix="[FIX]",
+                cancellation_cause=CancellationCause(
+                    category="TIMEOUT",
+                    payload={
+                        "limit_type": "fix_idle",
+                        "duration_elapsed_sec": idle_limit,
+                        "active_phase": PipelineState.FIX.value,
+                    },
+                ),
             )
             await self._save_cli_log("", "", "FIX idle timeout")
             if await pause_for_stop_after_bookkeeping():
@@ -568,6 +580,17 @@ class FixMixin(BreachMixin):
             # ESCALATE is not a no-push success — it is a deliberate
             # bail-out and should not feed the deadlock counter.
             no_push_policy.reset(self.state.current_pr)
+            if self.state.current_task is not None:
+                await safe_record_cancellation_cause(
+                    self.redis,
+                    self.name,
+                    self.state.current_task.pr_id,
+                    CancellationCause(
+                        category="ESCALATE",
+                        payload={"reason_text": escalate_reason},
+                    ),
+                    log=self.log_event,
+                )
             await self._escalate_fix_coder_initiated(
                 self.state.current_pr, escalate_reason
             )
