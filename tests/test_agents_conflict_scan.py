@@ -450,6 +450,45 @@ def test_negation_in_previous_clause_does_not_suppress():
     assert skip_ci_count == 1
 
 
+def test_unrelated_negation_in_prior_subclause_does_not_suppress():
+    """A negation that grammatically belongs to a prior sub-clause
+    (separated from the match by a comma) must not suppress the
+    match. ``If tests can not pass quickly, skip CI for this change.``
+    contains ``can not``, but it negates ``pass quickly``, not the
+    matched ``skip CI`` instruction; the scanner must still flag the
+    real violation. Prior to this fix the negation lookup walked back
+    to the closest sentence-level boundary and treated the entire
+    comma-spanning sentence as a single clause, so any unrelated
+    negation in an introductory sub-clause silently suppressed every
+    pattern."""
+    body = "If tests can not pass quickly, skip CI for this change."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "skip_ci" in types
+
+
+def test_unrelated_negation_in_prior_subclause_force_push_not_suppressed():
+    """Same shape as the ``skip_ci`` case but for the ``force_push_main``
+    pattern: an unrelated negation in an introductory sub-clause must
+    not suppress a real force-push to main."""
+    body = (
+        "If you do not have a clean tree, "
+        "git push --force origin main to recover."
+    )
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" in types
+
+
+def test_unrelated_negation_in_prior_subclause_draft_pr_not_suppressed():
+    """Same shape but for the ``draft_pr_text`` pattern: ``don't``
+    governs ``forget``, not ``create a draft PR``."""
+    body = "If you don't forget the title, create a draft PR for review."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_text" in types
+
+
 def test_skip_ci_detected():
     body = "We can skip CI for this trivial change."
     violations = scan_for_conflicts(body)

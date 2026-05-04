@@ -41,26 +41,34 @@ _NEGATION_CONTEXT = re.compile(
 )
 
 # Clause boundaries for the negation-window check. ``.;!?:`` are
-# sentence/clause punctuation; ``\n`` is the physical line break.
-# A negation must appear in the clause that contains the match -- not
-# in a previous clause -- so that a sentence like ``Step 1: do not
-# skip CI. Step 2: skip CI when forced.`` flags the second occurrence
-# while suppressing the first.
-_CLAUSE_BOUNDARIES = ".;!?:\n"
+# sentence/clause punctuation; ``,`` separates a sub-clause (e.g. an
+# introductory ``If X,`` from the main clause); ``\n`` is the physical
+# line break. A negation must appear in the sub-clause that contains
+# the match -- not in a previous (sub-)clause -- so that a sentence
+# like ``If tests can not pass quickly, skip CI for this change.``
+# flags ``skip CI`` (the ``can not`` negates ``pass quickly``, not the
+# matched instruction), and ``Step 1: do not skip CI. Step 2: skip CI
+# when forced.`` flags the second occurrence while suppressing the
+# first.
+_CLAUSE_BOUNDARIES = ".,;!?:\n"
 
 
 def _is_negated(text: str, match_start: int) -> bool:
     """Return True if a negation phrase precedes ``match_start`` in
-    the same clause, indicating the matched command/phrase is being
-    prohibited rather than instructed.
+    the same sub-clause, indicating the matched command/phrase is
+    being prohibited rather than instructed.
 
-    The clause is the slice of ``text`` between the closest preceding
-    clause boundary (``.;!?:\\n``) and ``match_start``. When no
-    boundary is found, the clause starts at the beginning of the
-    text. Examples that suppress detection:
+    The sub-clause is the slice of ``text`` between the closest
+    preceding clause boundary (``.,;!?:\\n``) and ``match_start``.
+    When no boundary is found, the sub-clause starts at the beginning
+    of the text. Including ``,`` in the boundary set scopes the lookup
+    to the comma-delimited segment that actually governs the match;
+    without it, an unrelated negation in a separate sub-clause (e.g.
+    ``can not`` in ``If tests can not pass quickly, skip CI ...``)
+    would suppress a real violation. Examples that suppress detection:
 
     - ``Do not run gh pr create --draft`` (verb between negation and
-      command)
+      command, no comma between them)
     - ``Never use git commit --no-verify``
     - ``Coders must not skip CI``
 
