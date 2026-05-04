@@ -44,7 +44,7 @@ services:
     user: "1000:1000"
     mem_limit: 1g
     ports:
-      - "${MCP_PORT:-5173}:5173"
+      - "127.0.0.1:${MCP_PORT:-5173}:5173"
     volumes:
       - .:/app:ro
       - ./data/repos:/data/repos:ro
