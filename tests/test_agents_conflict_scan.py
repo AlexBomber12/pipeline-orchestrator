@@ -82,6 +82,52 @@ def test_force_push_main_short_flag_requires_standalone_token():
     assert "force_push_main" not in types
 
 
+def test_force_push_main_branch_substring_main_not_flagged():
+    """``feature/main-fix`` shares the substring ``main`` but is a
+    distinct branch; the force flag must not mark it as targeting
+    the protected ``main`` branch."""
+    body = "git push --force origin feature/main-fix"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" not in types
+
+
+def test_force_push_main_dashed_branch_with_main_substring_not_flagged():
+    """``release-main-2026`` contains ``main`` between dashes; not the
+    protected branch."""
+    body = "git push -f origin release-main-2026"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" not in types
+
+
+def test_force_push_main_src_main_dst_other_not_flagged():
+    """``main:other`` pushes ``main`` to ``other`` — destination is
+    ``other``, not main. Already covered for the ``+`` form; verify
+    the ``--force`` form too."""
+    body = "git push --force origin main:other"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" not in types
+
+
+def test_force_push_main_full_ref_with_force_flag_detected():
+    """``--force ... refs/heads/main`` resolves to dst ``main``."""
+    body = "git push --force origin refs/heads/main"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" in types
+
+
+def test_force_push_main_two_sided_refspec_detected():
+    """``master:main`` pushes master TO main — destination is the
+    protected branch."""
+    body = "git push --force origin master:main"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" in types
+
+
 def test_force_push_main_refspec_plus_with_dst_main():
     """``+HEAD:main`` is a force-push per ``git push -h``."""
     body = "Recovery: git push origin +HEAD:main when histories diverge."

@@ -32,28 +32,29 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
     ),
     (
         "force_push_main",
-        # Detect ``git push`` lines that target ``main`` via either
-        # documented force form: the ``--force``/``-f`` flag (in any
+        # Detect ``git push`` lines that force-push to ``main`` via
+        # either documented form: the ``--force``/``-f`` flag (any
         # argument order) OR a leading ``+`` on the refspec, which
         # ``git push -h`` documents as equivalent force behavior
-        # (e.g. ``+HEAD:main`` or ``+main``). The ``-f`` and ``+``
-        # arms use ``(?<!\S)``/``(?!\S)`` so they match standalone
-        # tokens, not substrings inside words like ``-foo``.
+        # (e.g. ``+HEAD:main`` or ``+main``). Both arms require the
+        # destination of a refspec token to actually resolve to
+        # ``main`` (whitespace-bounded ``main`` or ``refs/heads/main``,
+        # optionally prefixed by ``<src>:``), so unrelated branch
+        # names that merely contain the substring ``main`` (e.g.
+        # ``feature/main-fix``) are not flagged.
         re.compile(
             r"\bgit push\b"
             r"(?:"
-            r"(?=[^\n]*\bmain\b)"
+            # Force-flag form (``--force`` / ``-f``) plus a refspec
+            # whose dst resolves to ``main``. ``(?<!\S)`` and
+            # ``(?![\w/:-])`` keep the token whitespace-bounded so
+            # substrings inside ``feature/main-fix``, ``-main-``,
+            # or ``main:other`` are not matched.
             r"(?=[^\n]*(?:--force\b|(?<!\S)-f(?!\S)))"
+            r"(?=[^\n]*(?<!\S)(?:[^\s:]+:)?(?:refs/heads/)?main(?![\w/:-]))"
             r"|"
-            # Refspec form: split by colon presence so the dst (right
-            # of ``:``) is the side required to end in ``main``. The
-            # no-colon arm forbids a trailing ``:`` so ``+main:other``
-            # (dst is ``other``) is not falsely flagged.
-            r"(?=[^\n]*(?<!\S)\+(?:"
-            r"[^\s:]+:(?:refs/heads/)?main\b"
-            r"|"
-            r"(?:refs/heads/)?main\b(?!:)"
-            r"))"
+            # Plus-prefix force form: ``+<refspec>`` targeting main.
+            r"(?=[^\n]*(?<!\S)\+(?:[^\s:]+:)?(?:refs/heads/)?main(?![\w/:-]))"
             r")",
             re.IGNORECASE,
         ),
