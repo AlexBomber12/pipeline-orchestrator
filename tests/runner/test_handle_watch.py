@@ -7,6 +7,7 @@ tests/test_runner.py and are referenced via the ``h`` alias.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -2550,11 +2551,19 @@ def test_first_infra_failure_retries_workflow(
     # the merge commit and would silently miss the failing PR run.
     assert all(args[:2] != ["run", "list"] for args in gh_calls)
     assert ["run", "rerun", "--failed", "9876"] in gh_calls
-    # Retry marker is in Redis.
+    # Retry marker is in Redis. PR-251 follow-up: the marker now stores
+    # the wall-clock rerun timestamp (float seconds) so a grace window
+    # can be applied before the next cycle treats INFRA_FAILURE as
+    # "persistent". Older "1" markers are treated as
+    # ``(exists, elapsed)`` for backwards compatibility, but new
+    # writes always carry a numeric value.
     from src.keyspace import ci_infra_retried as _ci_infra_retried_key
 
     key = _ci_infra_retried_key(runner.owner_repo, pr.number, pr.head_sha)
-    assert asyncio.run(runner.redis.get(key)) == "1"
+    raw = asyncio.run(runner.redis.get(key))
+    assert raw is not None
+    marker_ts = float(raw)
+    assert marker_ts > 0
     history = " ".join(entry.get("event", "") for entry in runner.state.history)
     assert "INFRA_FAILURE detected" in history
     assert "infra retry: re-ran failed jobs" in history
@@ -2584,11 +2593,18 @@ def test_second_infra_failure_routes_to_fix(
     monkeypatch.setattr(runner_module.PipelineRunner, "handle_fix", fake_handle_fix)
 
     runner = h._make_runner()
-    # Pre-seed the marker as if a previous WATCH cycle already retried.
+    # Pre-seed the marker with a wall-clock timestamp older than the
+    # grace window so the next cycle treats the retry as "elapsed
+    # enough to escalate." A legacy "1" marker would also work (it's
+    # treated as elapsed for backwards compatibility) but the realistic
+    # daemon write-path stores a timestamp.
     from src.keyspace import ci_infra_retried as _ci_infra_retried_key
 
     key = _ci_infra_retried_key(runner.owner_repo, pr.number, pr.head_sha)
-    asyncio.run(runner.redis.set(key, "1"))
+    stale_marker_ts = (
+        time.time() - watch_module._INFRA_RETRY_GRACE_SECONDS - 1.0
+    )
+    asyncio.run(runner.redis.set(key, str(stale_marker_ts)))
 
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
@@ -2656,13 +2672,112 @@ def test_infra_failure_on_fork_pr_logs_no_retry(
 
 
 def test_infra_retry_attempted_returns_true_when_redis_or_sha_missing() -> None:
-    """PR-251: helpers conservatively report ``attempted=True`` when state
+    """PR-251: helpers conservatively report ``(True, True)`` when state
     cannot be persisted, so the caller routes straight to FIX rather
     than re-running the workflow forever against a missing tracker."""
     runner = h._make_runner()
-    assert asyncio.run(runner._infra_retry_attempted(11, "")) is True
+    assert asyncio.run(runner._infra_retry_attempted(11, "")) == (True, True)
     runner.redis = None  # type: ignore[assignment]
-    assert asyncio.run(runner._infra_retry_attempted(11, "abc")) is True
+    assert asyncio.run(runner._infra_retry_attempted(11, "abc")) == (True, True)
+
+
+def test_infra_retry_attempted_returns_false_when_marker_absent() -> None:
+    """PR-251 follow-up: with redis available but no marker, both flags are
+    False so the caller proceeds to issue the rerun + write the marker."""
+    runner = h._make_runner()
+    assert asyncio.run(runner._infra_retry_attempted(11, "abc")) == (False, False)
+
+
+def test_infra_retry_attempted_within_grace_window_returns_marker_only() -> None:
+    """PR-251 follow-up: a marker written less than
+    ``_INFRA_RETRY_GRACE_SECONDS`` ago reports ``(True, False)`` so the
+    WATCH cycle stays put while the cached pre-rerun CI payload is
+    still in play (CI cache TTL is 15s; e2e config polls every 2s)."""
+    runner = h._make_runner()
+    from src.keyspace import ci_infra_retried as _ci_infra_retried_key
+
+    key = _ci_infra_retried_key(runner.owner_repo, 11, "abc")
+    asyncio.run(runner.redis.set(key, str(time.time())))
+    marker_exists, grace_elapsed = asyncio.run(
+        runner._infra_retry_attempted(11, "abc")
+    )
+    assert marker_exists is True
+    assert grace_elapsed is False
+
+
+def test_infra_retry_attempted_handles_legacy_marker_value() -> None:
+    """PR-251 follow-up: legacy markers written by an older daemon
+    (value ``"1"``) parse as float ``1.0`` — a timestamp at the unix
+    epoch — so the elapsed comparison naturally returns
+    ``(True, True)``. This preserves the prior single-bit semantics
+    so an in-flight upgrade can't get stuck in WATCH on a sha that
+    already exhausted its retry budget."""
+    runner = h._make_runner()
+    from src.keyspace import ci_infra_retried as _ci_infra_retried_key
+
+    key = _ci_infra_retried_key(runner.owner_repo, 11, "abc")
+    asyncio.run(runner.redis.set(key, "1"))
+    assert asyncio.run(runner._infra_retry_attempted(11, "abc")) == (True, True)
+
+
+def test_infra_retry_attempted_handles_corrupted_marker_value() -> None:
+    """PR-251 follow-up: a non-numeric marker (Redis corruption or
+    operator override) cannot be parsed as a timestamp; the helper
+    treats it as ``(True, True)`` so the caller routes to FIX rather
+    than crashing the WATCH cycle on the bad value."""
+    runner = h._make_runner()
+    from src.keyspace import ci_infra_retried as _ci_infra_retried_key
+
+    key = _ci_infra_retried_key(runner.owner_repo, 11, "abc")
+    asyncio.run(runner.redis.set(key, "not-a-number"))
+    assert asyncio.run(runner._infra_retry_attempted(11, "abc")) == (True, True)
+
+
+def test_infra_failure_within_grace_window_stays_in_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-251 follow-up (review fix): when the marker exists but the
+    grace window has not elapsed, WATCH must NOT escalate to FIX and
+    must NOT issue another rerun. This prevents fast-cadence pollers
+    (e2e config polls every 2s, well below the 15s CI cache TTL) from
+    routing to ``handle_fix`` based on the pre-rerun cached payload."""
+    pr = _patch_infra_failure_pr(monkeypatch, pr_number=81, head_sha="beadface")
+
+    gh_calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **kwargs: Any) -> Any:
+        gh_calls.append(list(args))
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+
+    fix_calls: list[None] = []
+
+    async def fake_handle_fix(self: Any) -> None:
+        fix_calls.append(None)
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "handle_fix", fake_handle_fix)
+
+    runner = h._make_runner()
+    # Marker was written "just now" (well within the grace window).
+    from src.keyspace import ci_infra_retried as _ci_infra_retried_key
+
+    key = _ci_infra_retried_key(runner.owner_repo, pr.number, pr.head_sha)
+    asyncio.run(runner.redis.set(key, str(time.time())))
+
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    asyncio.run(runner.handle_watch())
+
+    # Did NOT escalate to FIX, did NOT issue another rerun.
+    assert fix_calls == []
+    assert all(args[:2] != ["run", "rerun"] for args in gh_calls)
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "within retry grace window" in history
+    # ci_status must remain INFRA_FAILURE — the downgrade to FAILURE
+    # only happens on the persisted-after-retry path.
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.ci_status == CIStatus.INFRA_FAILURE
 
 
 def test_mark_infra_retry_attempted_noops_when_redis_or_sha_missing() -> None:
@@ -2969,11 +3084,14 @@ def test_retry_failed_workflow_handles_no_run_found(
     asyncio.run(runner.handle_watch())
 
     # First cycle: no rerun was issued (no run found), but the marker
-    # is written so a second cycle goes straight to FIX.
+    # is written (with a timestamp) so a later cycle — once the grace
+    # window has elapsed — goes straight to FIX.
     assert fix_calls == []
     from src.keyspace import ci_infra_retried as _ci_infra_retried_key
 
     key = _ci_infra_retried_key(runner.owner_repo, pr.number, pr.head_sha)
-    assert asyncio.run(runner.redis.get(key)) == "1"
+    raw = asyncio.run(runner.redis.get(key))
+    assert raw is not None
+    assert float(raw) > 0
     history = " ".join(entry.get("event", "") for entry in runner.state.history)
     assert "no Actions workflow run ID" in history

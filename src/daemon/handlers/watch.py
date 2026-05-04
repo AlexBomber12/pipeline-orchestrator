@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 from src.github import cache as gh_cache
@@ -28,6 +29,21 @@ _CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
 # head_sha is in flight, so the TTL never races a still-relevant retry
 # decision but does reclaim space for closed PRs.
 _CI_INFRA_RETRIED_TTL_SECONDS = 7 * 24 * 60 * 60
+# PR-251 follow-up: grace window applied between writing the infra-retry
+# marker (immediately after ``gh run rerun --failed``) and treating a
+# subsequent INFRA_FAILURE classification as "persistent" enough to
+# escalate to FIX. The CI status fetch is cached for
+# ``_CI_STATUS_CACHE_TTL_SECONDS`` (15s); on fast WATCH cadences (the
+# e2e config polls every 2s) the next cycle can still read the
+# pre-rerun cached payload, see the marker, and route to ``handle_fix``
+# before GitHub has reported any new check-run state. The grace window
+# must be larger than the cache TTL plus enough slack for GitHub to
+# acknowledge the rerun and emit fresh check-runs; 60s gives roughly
+# four cache-miss refetches at the 15s TTL, after which any persisting
+# INFRA_FAILURE genuinely reflects a post-rerun observation. The grace
+# is bounded by the marker TTL above, so closed/abandoned PRs cannot
+# accumulate state.
+_INFRA_RETRY_GRACE_SECONDS = 60.0
 # PR-251 follow-up: regex for extracting the GitHub Actions workflow run
 # ID from a check-run ``details_url``. The canonical format is
 # ``https://github.com/{owner}/{repo}/actions/runs/{run_id}/job/{job_id}``;
@@ -219,7 +235,16 @@ class WatchMixin:
             # ``head_sha``. A second INFRA_FAILURE classification on the
             # same SHA means the rerun also failed — treat as a real
             # logic FAILURE and route to FIX so the coder can act on it.
-            if await self._infra_retry_attempted(found.number, found.head_sha):
+            #
+            # PR-251 follow-up: the marker is gated by
+            # ``_INFRA_RETRY_GRACE_SECONDS`` so the cached pre-rerun CI
+            # payload (TTL 15s) cannot trigger FIX escalation before
+            # GitHub has reported any post-rerun state. While the grace
+            # window is in flight WATCH stays put and re-polls.
+            marker_exists, grace_elapsed = await self._infra_retry_attempted(
+                found.number, found.head_sha
+            )
+            if marker_exists and grace_elapsed:
                 self.log_event(
                     f"[WATCH] PR #{found.number} CI INFRA_FAILURE "
                     f"persisted after retry; routing to FIX as "
@@ -232,6 +257,13 @@ class WatchMixin:
                 # needs for the effective-failure handoff.
                 found.ci_status = CIStatus.FAILURE
                 await self.handle_fix()
+                return
+            if marker_exists:
+                self.log_event(
+                    f"[WATCH] PR #{found.number} CI INFRA_FAILURE "
+                    f"observed within retry grace window; awaiting "
+                    f"fresh post-rerun status."
+                )
                 return
             self.log_event(
                 f"[WATCH] PR #{found.number} CI INFRA_FAILURE "
@@ -550,29 +582,54 @@ class WatchMixin:
 
     async def _infra_retry_attempted(
         self, pr_number: int, head_sha: str
-    ) -> bool:
-        """Return whether WATCH already re-ran the workflow for ``head_sha``.
+    ) -> tuple[bool, bool]:
+        """Return ``(marker_exists, grace_elapsed)`` for the infra-retry marker.
 
-        PR-251 (OBS-BC). Without ``redis`` or ``head_sha`` we conservatively
-        report ``True`` so the caller routes straight to FIX rather than
-        looping retries against a missing tracker. The marker key has a
-        TTL of ``_CI_INFRA_RETRIED_TTL_SECONDS`` so closed/abandoned PRs
-        don't accumulate state.
+        PR-251 (OBS-BC) + follow-up. The marker stores the wall-clock
+        timestamp at which WATCH issued ``gh run rerun --failed`` for
+        ``head_sha``; ``grace_elapsed`` is ``True`` only after
+        ``_INFRA_RETRY_GRACE_SECONDS`` have passed since that
+        timestamp, ensuring that an immediate re-poll on a fast WATCH
+        cadence cannot escalate to FIX while the CI fetch is still
+        serving the pre-rerun cached payload.
+
+        Without ``redis`` or ``head_sha`` we conservatively report
+        ``(True, True)`` so the caller routes straight to FIX rather than
+        looping retries against a missing tracker. Legacy markers written
+        before the timestamp format (value ``"1"``) are also treated as
+        ``(True, True)`` — they came from a prior daemon version where
+        the grace window did not exist, and we cannot recover the
+        original rerun time.
         """
         if self.redis is None or not head_sha:
-            return True
+            return True, True
         key = ci_infra_retried(self.owner_repo, pr_number, head_sha)
         existing = await self.redis.get(key)
-        return existing is not None
+        if existing is None:
+            return False, False
+        try:
+            marker_ts = float(existing)
+        except (TypeError, ValueError):
+            return True, True
+        elapsed = time.time() - marker_ts
+        return True, elapsed >= _INFRA_RETRY_GRACE_SECONDS
 
     async def _mark_infra_retry_attempted(
         self, pr_number: int, head_sha: str
     ) -> None:
-        """Record that WATCH issued the one-shot infra retry for ``head_sha``."""
+        """Record that WATCH issued the one-shot infra retry for ``head_sha``.
+
+        Stores the current wall-clock timestamp so :meth:`_infra_retry_attempted`
+        can apply ``_INFRA_RETRY_GRACE_SECONDS`` before reporting the
+        retry as "elapsed enough to escalate" — see that helper's
+        docstring for the rationale.
+        """
         if self.redis is None or not head_sha:
             return
         key = ci_infra_retried(self.owner_repo, pr_number, head_sha)
-        await self.redis.set(key, "1", ex=_CI_INFRA_RETRIED_TTL_SECONDS)
+        await self.redis.set(
+            key, str(time.time()), ex=_CI_INFRA_RETRIED_TTL_SECONDS
+        )
 
     def _retry_failed_workflow(self, pr_number: int, head_sha: str) -> bool:
         """Re-run the failed jobs of failing workflow runs attached to ``head_sha``.
