@@ -153,9 +153,12 @@ class IdleMixin:
         Failures in this scan must never block dispatch: a malformed
         AGENTS.md (operator-introduced bad managed markers) raises
         ``MarkerError`` from ``apply_managed_regions``; ``OSError``
-        covers transient filesystem hiccups. Both are surfaced as a
-        single ``[AGENTS-SCAN]`` event and swallowed so the rest of
-        IDLE proceeds normally.
+        covers transient filesystem hiccups; ``UnicodeError`` covers
+        AGENTS.md or a ``tasks/PR-*.md`` containing non-UTF-8 bytes
+        (``Path.read_text`` decodes with the platform default and
+        raises ``UnicodeDecodeError`` on bad encodings). All three are
+        surfaced as a single ``[AGENTS-SCAN]`` event and swallowed so
+        the rest of IDLE proceeds normally.
         """
         agents_path = Path(self.repo_path) / "AGENTS.md"
         try:
@@ -173,6 +176,12 @@ class IdleMixin:
             self.log_event(
                 f"[AGENTS-SCAN] Skipping drift scan: failed to read "
                 f"{agents_path}: {exc}."
+            )
+        except UnicodeError as exc:
+            self.log_event(
+                f"[AGENTS-SCAN] Skipping drift scan: non-UTF-8 content "
+                f"in {agents_path} or {Path(self.repo_path) / 'tasks'}: "
+                f"{exc}."
             )
 
     @staticmethod

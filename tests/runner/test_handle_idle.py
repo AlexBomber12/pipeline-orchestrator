@@ -5517,3 +5517,46 @@ def test_handle_idle_swallows_marker_error_in_agents_md(
     assert any(
         "malformed managed markers" in event for event in scan_events
     ), scan_events
+
+
+def test_handle_idle_swallows_unicode_error_in_agents_md(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Non-UTF-8 bytes in AGENTS.md must not crash IDLE.
+
+    ``Path.read_text`` decodes with the platform default, so an
+    AGENTS.md (or task spec) authored on a non-UTF-8 host raises
+    ``UnicodeDecodeError`` (a ``UnicodeError``). Without a guard this
+    escapes ``reconcile_agents_md`` and aborts ``handle_idle``, which
+    blocks task dispatch even though the periodic scan is intended to
+    be non-blocking. Pin the catch and the warning shape so a future
+    refactor cannot regress the IDLE cycle on a malformed encoding.
+    """
+    h._patch_subprocess(monkeypatch)
+
+    (tmp_path / "AGENTS.md").write_bytes(b"\xff\xfe\xfd not utf-8\n")
+
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs", lambda repo, **kw: []
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.IDLE
+    scan_events = [
+        entry["event"]
+        for entry in runner.state.history
+        if entry["event"].startswith("[AGENTS-SCAN]")
+    ]
+    assert any(
+        "non-UTF-8" in event for event in scan_events
+    ), scan_events

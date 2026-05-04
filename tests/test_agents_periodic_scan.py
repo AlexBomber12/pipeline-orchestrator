@@ -105,6 +105,29 @@ def test_unreadable_file_skipped(
     assert not any("PR-030.md" in e for e in events)
 
 
+def test_non_utf8_spec_file_skipped_with_warning(tmp_path: Path) -> None:
+    """A spec file containing non-UTF-8 bytes must not abort the scan.
+    The offending file is skipped with a per-file ``[AGENTS-SCAN]``
+    warning so the operator can locate it; remaining specs are still
+    scanned for anti-patterns."""
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-040.md").write_bytes(b"# spec\n\n\xff\xfe not utf-8\n")
+    _write_spec(tmp_path, "PR-041.md", "Skip CI for this one.\n")
+    _write_spec(tmp_path, "PR-042.md", "# clean\n")
+    events: list[str] = []
+    count = _scan_existing_task_specs(tmp_path, events.append)
+
+    assert count == 1
+    assert any(
+        "PR-040.md" in e and "non-UTF-8" in e for e in events
+    ), events
+    assert any(
+        "PR-041.md" in e and "skip_ci" in e for e in events
+    ), events
+    assert not any("PR-042.md" in e for e in events)
+
+
 def test_files_iterated_in_sorted_order(tmp_path: Path) -> None:
     """Lexicographic order on filename keeps the event-log stream stable
     across runs; otherwise ``Path.glob`` insertion order would vary by

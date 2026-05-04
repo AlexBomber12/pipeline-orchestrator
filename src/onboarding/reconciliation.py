@@ -67,6 +67,12 @@ def _scan_existing_task_specs(
             body = spec_file.read_text(encoding="utf-8")
         except OSError:
             continue
+        except UnicodeError as exc:
+            log_event_fn(
+                f"[AGENTS-SCAN] Skipping {spec_file.name}: non-UTF-8 "
+                f"content ({exc})."
+            )
+            continue
         violations = scan_for_conflicts(body)
         if not violations:
             continue
