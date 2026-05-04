@@ -13,6 +13,7 @@ import re
 import tempfile
 from pathlib import Path
 
+from src.mcp.scans import scan_for_conflicts
 from src.mcp.server import mcp
 from src.queue_parser import (
     QueueValidationError,
@@ -57,10 +58,21 @@ def validate_task_spec(content: str) -> dict:
             ``- Depends on:``, ``- Priority:``, ``- Coder:``).
 
     Returns:
-        ``{"valid": True}`` if the spec parses without error.
-        ``{"valid": False, "errors": [<message>, ...]}`` when the
-        parser raises ``QueueValidationError``. The error list
-        contains one or more strings describing each violation.
+        A dict with four keys:
+
+        - ``valid``: ``True`` when the spec parses cleanly AND no
+          AGENTS.md anti-pattern violations were detected.
+        - ``errors``: legacy alias of ``schema_errors`` retained for
+          MCP clients written against the PR-246 shape, which read
+          ``result["errors"]`` directly. Always present (empty list
+          when the spec parses cleanly) so legacy callers do not
+          ``KeyError`` on the success path either.
+        - ``schema_errors``: list of strings from
+          ``QueueValidationError.issues`` when the parser rejects
+          the spec; empty list otherwise.
+        - ``agents_violations``: list of dicts (``type``, ``excerpt``,
+          ``rule``) for each AGENTS.md anti-pattern matched in the
+          spec body; empty list otherwise. PR-259.
     """
     # parse_task_header reads from disk; round-trip through a temp file
     # so the wrapper stays in src/mcp/ without modifying queue_parser.
@@ -69,13 +81,30 @@ def validate_task_spec(content: str) -> dict:
     ) as tmp:
         tmp.write(content)
         tmp_path = Path(tmp.name)
+    schema_errors: list[str] = []
     try:
         parse_task_header(tmp_path)
     except QueueValidationError as exc:
-        return {"valid": False, "errors": list(exc.issues)}
+        schema_errors = list(exc.issues)
     finally:
         tmp_path.unlink(missing_ok=True)
-    return {"valid": True}
+
+    violations = scan_for_conflicts(content)
+    return {
+        "valid": not schema_errors and not violations,
+        # ``errors`` is a backward-compat alias of ``schema_errors``
+        # for PR-246 callers; both list the same diagnostics.
+        "errors": schema_errors,
+        "schema_errors": schema_errors,
+        "agents_violations": [
+            {
+                "type": v.violation_type,
+                "excerpt": v.line_excerpt,
+                "rule": v.rule,
+            }
+            for v in violations
+        ],
+    }
 
 
 @mcp.tool()
