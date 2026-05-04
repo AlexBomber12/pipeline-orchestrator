@@ -28,7 +28,11 @@ def test_validate_task_spec_accepts_valid_content():
     from src.mcp.tools.functional import validate_task_spec
 
     result = validate_task_spec(_VALID_SPEC)
-    assert result == {"valid": True}
+    assert result == {
+        "valid": True,
+        "schema_errors": [],
+        "agents_violations": [],
+    }
 
 
 def test_validate_task_spec_rejects_missing_branch_field():
@@ -37,7 +41,7 @@ def test_validate_task_spec_rejects_missing_branch_field():
     bad = _VALID_SPEC.replace("Branch: pr-999-example\n", "")
     result = validate_task_spec(bad)
     assert result["valid"] is False
-    assert len(result["errors"]) >= 1
+    assert len(result["schema_errors"]) >= 1
 
 
 def test_validate_task_spec_rejects_unknown_type():
@@ -46,7 +50,10 @@ def test_validate_task_spec_rejects_unknown_type():
     bad = _VALID_SPEC.replace("- Type: refactor", "- Type: nonsense")
     result = validate_task_spec(bad)
     assert result["valid"] is False
-    assert any("type" in e.lower() or "nonsense" in e.lower() for e in result["errors"])
+    assert any(
+        "type" in e.lower() or "nonsense" in e.lower()
+        for e in result["schema_errors"]
+    )
 
 
 def test_validate_task_spec_rejects_freeform_depends_on():
@@ -70,7 +77,11 @@ def test_validate_task_spec_accepts_synonym_for_type():
 
     spec = _VALID_SPEC.replace("- Type: refactor", "- Type: bug")
     result = validate_task_spec(spec)
-    assert result == {"valid": True}
+    assert result == {
+        "valid": True,
+        "schema_errors": [],
+        "agents_violations": [],
+    }
 
 
 # ---- suggest_next_pr_number ----
