@@ -27,6 +27,13 @@ class ConflictViolation:
 # are accepted. Each phrase is anchored on a word boundary so the
 # regex matches whole words, not substrings (e.g. ``don't`` matches
 # but ``redon't`` would not).
+#
+# ``avoid`` is intentionally NOT in this list. It does not reliably
+# negate the matched command/phrase: ``Avoid merge conflicts by
+# running gh pr create --draft`` and ``To avoid delays, skip CI``
+# both contain ``avoid`` but instruct the operator to perform the
+# violating action. Treating ``avoid`` as a negation token would
+# produce silent false negatives in the core safety scan.
 _NEGATION_CONTEXT = re.compile(
     r"\b(?:"
     r"do not|don't|don’t|"
@@ -34,8 +41,7 @@ _NEGATION_CONTEXT = re.compile(
     r"never|"
     r"must not|mustn't|mustn’t|"
     r"will not|won't|won’t|"
-    r"should not|shouldn't|shouldn’t|"
-    r"avoid"
+    r"should not|shouldn't|shouldn’t"
     r")\b",
     re.IGNORECASE,
 )

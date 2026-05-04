@@ -549,6 +549,29 @@ def test_skip_ci_negation_with_unrelated_forget_does_not_fire():
     assert "skip_ci" not in types
 
 
+def test_skip_ci_avoid_purpose_clause_flagged():
+    """``To avoid delays, skip CI`` instructs the operator to skip CI;
+    ``avoid`` governs ``delays``, not ``skip CI``. ``avoid`` is not a
+    reliable negation token and must not suppress the match, otherwise
+    a compliant-looking purpose clause silently lets a real violation
+    pass ``validate_task_spec``."""
+    body = "To avoid delays, skip CI on trivial changes."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "skip_ci" in types
+
+
+def test_draft_pr_avoid_purpose_clause_flagged():
+    """``Avoid merge conflicts by running gh pr create --draft``
+    instructs the operator to open a draft PR; ``avoid`` governs
+    ``merge conflicts``, not the command. The scanner must still flag
+    the draft-PR violation."""
+    body = "Avoid merge conflicts by running gh pr create --draft."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_flag" in types
+
+
 def test_skip_ci_detected():
     body = "We can skip CI for this trivial change."
     violations = scan_for_conflicts(body)
