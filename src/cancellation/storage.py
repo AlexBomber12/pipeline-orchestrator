@@ -71,6 +71,7 @@ async def record_cancellation_cause(
     pipe.set(cause_key(repo_slug, task_id), serialized, ex=TTL_SECONDS)
     pipe.zadd(index_key(repo_slug), {task_id: score})
     pipe.zremrangebyscore(index_key(repo_slug), "-inf", f"({expiry_cutoff}")
+    pipe.expire(index_key(repo_slug), TTL_SECONDS)
     await pipe.execute()
 
 
@@ -107,5 +108,5 @@ async def list_recent_cancellations(
             causes.append(cause)
     if stale:
         await redis_client.zrem(index_key(repo_slug), *stale)
-    causes.sort(key=lambda c: c.created_at, reverse=True)
+    causes.sort(key=lambda c: datetime.fromisoformat(c.created_at), reverse=True)
     return causes

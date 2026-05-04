@@ -36,6 +36,10 @@ class _FakePipeline:
         self._ops.append(("zremrangebyscore", key, min_score, max_score))
         return self
 
+    def expire(self, key: str, seconds: int) -> "_FakePipeline":
+        self._ops.append(("expire", key, seconds))
+        return self
+
     async def execute(self) -> list:
         results = []
         for op in self._ops:
@@ -53,6 +57,13 @@ class _FakePipeline:
             elif op[0] == "zremrangebyscore":
                 _, key, min_score, max_score = op
                 results.append(self._store._zremrangebyscore(key, min_score, max_score))
+            elif op[0] == "expire":
+                _, key, seconds = op
+                if key in self._store.zsets or key in self._store.values:
+                    self._store.ttls[key] = seconds
+                    results.append(True)
+                else:
+                    results.append(False)
         self._ops.clear()
         return results
 
@@ -289,6 +300,41 @@ async def test_record_prunes_index_entries_older_than_ttl() -> None:
     bucket = redis.zsets[index_key("alpha")]
     assert "PR-EXPIRED" not in bucket
     assert "PR-FRESH" in bucket
+
+
+async def test_list_recent_orders_by_parsed_timestamp_across_offsets() -> None:
+    redis = _FakeRedis()
+    # Same UTC instant, expressed with different offsets — string sort would
+    # misorder these even though Redis scores rank them correctly.
+    earlier_utc = "2026-05-04T12:00:00+00:00"  # 12:00 UTC
+    later_minus5 = "2026-05-04T08:30:00-05:00"  # 13:30 UTC
+    await record_cancellation_cause(
+        redis,
+        "alpha",
+        "PR-EARLY",
+        CancellationCause(category="CRASH", created_at=earlier_utc),
+    )
+    await record_cancellation_cause(
+        redis,
+        "alpha",
+        "PR-LATER",
+        CancellationCause(category="CRASH", created_at=later_minus5),
+    )
+
+    since = datetime(2026, 5, 4, tzinfo=timezone.utc)
+    recent = await list_recent_cancellations(redis, "alpha", since)
+    assert [c.task_id for c in recent] == ["PR-LATER", "PR-EARLY"]
+
+
+async def test_record_sets_ttl_on_index_key() -> None:
+    redis = _FakeRedis()
+    await record_cancellation_cause(
+        redis,
+        "alpha",
+        "PR-TTL",
+        CancellationCause(category="INFRA"),
+    )
+    assert redis.ttls[index_key("alpha")] == TTL_SECONDS
 
 
 async def test_list_recent_decodes_bytes_task_ids() -> None:
