@@ -52,11 +52,25 @@ _NEGATION_CONTEXT = re.compile(
 # first.
 _CLAUSE_BOUNDARIES = ".,;!?:\n"
 
+# Double-negative inverters that flip a lexical negation back into a
+# positive instruction. ``Don't forget to skip CI`` and ``Never fail
+# to run gh pr create --draft`` contain a negation token but the
+# verb-of-omission ("forget", "fail", "neglect", "hesitate", "refuse"
+# followed by ``to``) cancels the prohibition: the surrounding prose
+# is *requiring* the matched action, not forbidding it. When such an
+# inverter sits between the negation phrase and the match, the
+# negation must NOT suppress the violation -- otherwise lexical
+# negation is silently equated with semantic prohibition and a
+# conflicting task spec passes ``validate_task_spec``.
+_DOUBLE_NEGATIVE_INVERTER = re.compile(
+    r"\b(?:forget|fail|neglect|hesitate|refuse)\s+to\b",
+    re.IGNORECASE,
+)
+
 
 def _is_negated(text: str, match_start: int) -> bool:
-    """Return True if a negation phrase precedes ``match_start`` in
-    the same sub-clause, indicating the matched command/phrase is
-    being prohibited rather than instructed.
+    """Return True if a negation phrase semantically prohibits the
+    matched command/phrase at ``match_start``.
 
     The sub-clause is the slice of ``text`` between the closest
     preceding clause boundary (``.,;!?:\\n``) and ``match_start``.
@@ -65,20 +79,44 @@ def _is_negated(text: str, match_start: int) -> bool:
     to the comma-delimited segment that actually governs the match;
     without it, an unrelated negation in a separate sub-clause (e.g.
     ``can not`` in ``If tests can not pass quickly, skip CI ...``)
-    would suppress a real violation. Examples that suppress detection:
+    would suppress a real violation.
+
+    A bare lexical negation is not enough: a verb-of-omission inverter
+    (``forget to``, ``fail to``, ``neglect to``, ``hesitate to``,
+    ``refuse to``) between the negation and the match flips the
+    semantics back into an instruction. ``Don't forget to skip CI``
+    contains ``Don't`` but is NOT a prohibition of ``skip CI``; the
+    inverter forces the spec to actively require the violating
+    action. The check therefore returns True only when a negation is
+    present AND no inverter sits between it and the match.
+
+    Examples that suppress detection (real prohibitions):
 
     - ``Do not run gh pr create --draft`` (verb between negation and
       command, no comma between them)
     - ``Never use git commit --no-verify``
     - ``Coders must not skip CI``
 
+    Examples that do NOT suppress (double-negative instructions):
+
+    - ``Don't forget to skip CI``
+    - ``Never fail to run gh pr create --draft``
+
     Without this check, command-based regex patterns flag the literal
     command even when the surrounding prose explicitly forbids it,
-    rejecting compliant specs that document the AGENTS.md rule.
+    rejecting compliant specs that document the AGENTS.md rule; with
+    only the lexical-negation half of the check, double-negative
+    instructions silently pass validation despite restating a
+    violation.
     """
     clause_start = max(text.rfind(c, 0, match_start) for c in _CLAUSE_BOUNDARIES)
     clause_start = clause_start + 1 if clause_start >= 0 else 0
-    return _NEGATION_CONTEXT.search(text, clause_start, match_start) is not None
+    negation = _NEGATION_CONTEXT.search(text, clause_start, match_start)
+    if negation is None:
+        return False
+    if _DOUBLE_NEGATIVE_INVERTER.search(text, negation.end(), match_start):
+        return False
+    return True
 
 
 _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [

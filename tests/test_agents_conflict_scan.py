@@ -489,6 +489,66 @@ def test_unrelated_negation_in_prior_subclause_draft_pr_not_suppressed():
     assert "draft_pr_text" in types
 
 
+def test_skip_ci_double_negative_dont_forget_to_flagged():
+    """``Don't forget to skip CI`` contains a lexical negation but the
+    inverter ``forget to`` flips the semantics: the spec is requiring
+    the violation. Prior to this fix the bare negation suppressed the
+    match and a conflicting spec passed ``validate_task_spec``."""
+    body = "Don't forget to skip CI on trivial changes."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "skip_ci" in types
+
+
+def test_draft_pr_flag_double_negative_never_fail_to_flagged():
+    """``Never fail to run gh pr create --draft`` is a double-negative
+    instruction requiring the AGENTS.md violation. The inverter
+    ``fail to`` cancels ``Never`` and the violation must be flagged."""
+    body = "Never fail to run gh pr create --draft on this branch."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_flag" in types
+
+
+def test_force_push_main_double_negative_dont_forget_flagged():
+    """``Don't forget to git push --force origin main`` requires the
+    force-push despite the leading ``Don't``."""
+    body = "Don't forget to git push --force origin main when stuck."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" in types
+
+
+def test_no_verify_double_negative_must_not_neglect_to_flagged():
+    """``Coders must not neglect to run git commit --no-verify`` is a
+    double-negative instruction requiring the violation. ``neglect to``
+    cancels ``must not``."""
+    body = "Coders must not neglect to run git commit --no-verify."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "no_verify_commit" in types
+
+
+def test_draft_pr_text_double_negative_dont_hesitate_flagged():
+    """``Don't hesitate to create a draft PR`` requires creating a
+    draft PR — the inverter ``hesitate to`` flips the negation."""
+    body = "Don't hesitate to create a draft PR while iterating."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_text" in types
+
+
+def test_skip_ci_negation_with_unrelated_forget_does_not_fire():
+    """``forget`` without ``to`` is not the inverter pattern. ``Do
+    not skip CI; I won't forget that rule.`` keeps the suppression on
+    the first sub-clause because no inverter sits between ``Do not``
+    and ``skip CI``."""
+    body = "Do not skip CI under any circumstances."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "skip_ci" not in types
+
+
 def test_skip_ci_detected():
     body = "We can skip CI for this trivial change."
     violations = scan_for_conflicts(body)
