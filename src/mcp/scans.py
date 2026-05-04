@@ -35,10 +35,13 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         # Detect ``git push`` lines that force-push to ``main``. Both
         # arms walk only the tokens that belong to the ``git push``
         # command itself, treating the args as whitespace-separated
-        # tokens that contain no command-terminator chars (``,;|&``).
-        # That ties the ``main`` match to the actual push refspec, so
-        # prose after a separator -- e.g.
+        # tokens that contain no command-terminator chars (``,;|&#``).
+        # ``#`` starts a shell comment, so anything after it is prose,
+        # not a refspec. That ties the ``main`` match to the actual
+        # push refspec, so prose after a separator -- e.g.
         # ``git push --force-with-lease origin feature/foo, then PR to main``
+        # or
+        # ``git push --force-with-lease origin feature/foo # PR to main``
         # -- is not flagged. The standard arm requires both a
         # ``--force``/``-f`` flag token AND a refspec token whose
         # destination resolves to ``main`` (whitespace-bounded
@@ -55,23 +58,23 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
             # refspec token, in any order, both within the command's
             # arg list.
             r"(?="
-            r"(?:[ \t]+[^\s,;|&]+)*?"
+            r"(?:[ \t]+[^\s,;|&#]+)*?"
             r"[ \t]+"
-            r"(?:--force(?:-with-lease(?:=[^\s,;|&]*)?)?|-f)"
+            r"(?:--force(?:-with-lease(?:=[^\s,;|&#]*)?)?|-f)"
             r"(?![\w-])"
             r")"
             r"(?="
-            r"(?:[ \t]+[^\s,;|&]+)*?"
+            r"(?:[ \t]+[^\s,;|&#]+)*?"
             r"[ \t]+"
-            r"(?:[^\s:,;|&]+:)?(?:refs/heads/)?main"
+            r"(?:[^\s:,;|&#]+:)?(?:refs/heads/)?main"
             r"(?![\w/:-])"
             r")"
             r"|"
             # Plus-prefix force form: +<refspec> with dst=main.
             r"(?="
-            r"(?:[ \t]+[^\s,;|&]+)*?"
+            r"(?:[ \t]+[^\s,;|&#]+)*?"
             r"[ \t]+"
-            r"\+(?:[^\s:,;|&]+:)?(?:refs/heads/)?main"
+            r"\+(?:[^\s:,;|&#]+:)?(?:refs/heads/)?main"
             r"(?![\w/:-])"
             r")"
             r")",

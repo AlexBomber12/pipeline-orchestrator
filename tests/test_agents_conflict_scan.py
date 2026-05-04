@@ -190,6 +190,19 @@ def test_force_push_feature_branch_then_prose_about_main_not_flagged():
     assert "force_push_main" not in types
 
 
+def test_force_push_feature_branch_inline_comment_about_main_not_flagged():
+    """``#`` opens a shell comment, so ``main`` after it is prose, not
+    part of the refspec; a feature-branch force-push followed by an
+    inline comment that mentions ``main`` must not be flagged."""
+    body = (
+        "git push --force-with-lease origin feature/foo "
+        "# then open PR to main"
+    )
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" not in types
+
+
 def test_force_push_main_alt_detected():
     body = "Operator may force-push to main as a last resort."
     violations = scan_for_conflicts(body)
