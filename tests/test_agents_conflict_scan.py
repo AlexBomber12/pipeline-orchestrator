@@ -203,20 +203,38 @@ def test_force_push_feature_branch_inline_comment_about_main_not_flagged():
     assert "force_push_main" not in types
 
 
-def test_force_push_feature_branch_separatorless_prose_about_main_not_flagged():
-    """Prose continuation without a separator must not let the scanner
-    walk through several whitespace-delimited prose words into a later
-    sentence-ending mention of ``main``. The walk caps at five
-    intermediate arg tokens, so the seven prose-and-arg tokens between
-    ``git push`` and ``main.`` keep this benign feature-branch push
-    out of the force-push-to-main bucket."""
+def test_force_push_main_detected_with_many_flags_before_refspec():
+    """A force-push to ``main`` with six or more flag tokens before the
+    refspec must still be flagged. Prior to this PR the scanner walked
+    at most five intermediate arg tokens, which let real-world
+    flag-heavy invocations slip past detection. The cap is removed so
+    flag stuffing no longer bypasses the guardrail."""
+    body = (
+        "git push --force --set-upstream --atomic --follow-tags "
+        "--verbose --quiet origin main"
+    )
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" in types
+
+
+def test_force_push_feature_branch_separatorless_prose_flagged_as_false_positive():
+    """Prose continuation without a sentence separator (``,``, ``;``,
+    ``|``, ``&``, or a ``#`` shell comment) is flagged as a false
+    positive. The scanner unbounded its arg-token walk so flag-heavy
+    real force-pushes cannot bypass detection; the trade-off is that
+    a benign feature-branch push followed by separator-less prose
+    that ends with ``main.`` will be flagged. Per the task spec's v1
+    notes, false positives on don't-do-this commentary are
+    acceptable -- the operator dismisses them -- while a force-push
+    to main slipping past the scanner is not."""
     body = (
         "git push --force-with-lease origin feature/foo "
         "then open PR to main."
     )
     violations = scan_for_conflicts(body)
     types = {v.violation_type for v in violations}
-    assert "force_push_main" not in types
+    assert "force_push_main" in types
 
 
 def test_force_push_main_alt_detected():
@@ -238,6 +256,70 @@ def test_skip_ci_detected():
     violations = scan_for_conflicts(body)
     types = {v.violation_type for v in violations}
     assert "skip_ci" in types
+
+
+def test_skip_ci_negated_do_not_not_flagged():
+    """``Do not skip CI`` restates the AGENTS.md rule -- it must not
+    be flagged as a violation. Prior to this PR the regex matched
+    any ``skip CI`` regardless of context, which rejected valid
+    task specs that documented the rule in negative form."""
+    body = "Do not skip CI under any circumstances."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "skip_ci" not in types
+
+
+def test_skip_ci_negated_dont_not_flagged():
+    body = "Don't skip CI even on trivial changes."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "skip_ci" not in types
+
+
+def test_skip_ci_negated_never_not_flagged():
+    body = "Never skip CI on this branch."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "skip_ci" not in types
+
+
+def test_skip_ci_negated_cannot_not_flagged():
+    body = "You cannot skip CI; the daemon enforces it."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "skip_ci" not in types
+
+
+def test_skip_ci_negated_must_not_not_flagged():
+    body = "Coders must not skip CI before opening a PR."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "skip_ci" not in types
+
+
+def test_skip_ci_negated_should_not_not_flagged():
+    body = "Reviewers should not skip CI even when in a hurry."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "skip_ci" not in types
+
+
+def test_skip_ci_negated_bypass_form_not_flagged():
+    """Negation lookbehinds apply to all three verbs (skip / bypass /
+    ignore), not just ``skip``."""
+    body = "Do not bypass CI by retrying the failed run."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "skip_ci" not in types
+
+
+def test_skip_ci_negated_typographic_apostrophe_not_flagged():
+    """Smart-quote apostrophe (``’``) in ``don’t`` must also
+    suppress the match."""
+    body = "Don’t skip CI under any circumstances."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "skip_ci" not in types
 
 
 def test_skip_ci_marker_detected():

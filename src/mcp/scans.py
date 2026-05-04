@@ -37,19 +37,21 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         # command itself, treating the args as whitespace-separated
         # tokens that contain no command-terminator chars (``,;|&#``).
         # ``#`` starts a shell comment, so anything after it is prose,
-        # not a refspec. The walks are bounded to at most 5 intermediate
-        # arg tokens so that prose continuations such as
-        # ``... feature/foo then open PR to main.`` cannot trickle the
-        # ``main`` match past the actual command arg list, while still
-        # tolerating realistic flag-heavy invocations such as
-        # ``--no-verify --force --tags --set-upstream origin main``
-        # (5 tokens before ``main``). Combined with the existing
-        # separator terminators, this keeps prose mentions of ``main``
-        # on the same line from being flagged when the command
-        # genuinely targets a feature branch -- e.g.
-        # ``git push --force-with-lease origin feature/foo, then PR to main``
-        # or
-        # ``git push --force-with-lease origin feature/foo # PR to main``.
+        # not a refspec. The walks are unbounded so that flag-heavy
+        # invocations -- e.g. ``git push --force --set-upstream
+        # --atomic --follow-tags --verbose origin main`` -- cannot
+        # bypass detection by stuffing more flags between ``git push``
+        # and the ``main`` refspec. The trade-off is that a
+        # separator-less prose continuation such as
+        # ``git push --force-with-lease origin feature/foo then open
+        # PR to main.`` will be flagged as a false positive; per the
+        # task spec's v1 trade-off, false positives on don't-do-this
+        # commentary are acceptable -- the operator dismisses them --
+        # while a force-push to main slipping past the scanner is
+        # not. Sentence punctuation is therefore expected to be
+        # written as ``,``, ``;``, ``|``, ``&``, or ``#`` (a shell
+        # comment) when prose follows the command on the same line,
+        # which the existing comma/comment cases continue to honor.
         # The standard arm requires both a ``--force``/``-f`` flag
         # token AND a refspec token whose destination resolves to
         # ``main`` (whitespace-bounded ``main`` or ``refs/heads/main``,
@@ -65,13 +67,13 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
             # refspec token, in any order, both within the command's
             # arg list.
             r"(?="
-            r"(?:[ \t]+[^\s,;|&#]+){0,5}?"
+            r"(?:[ \t]+[^\s,;|&#]+)*?"
             r"[ \t]+"
             r"(?:--force(?:-with-lease(?:=[^\s,;|&#]*)?)?|-f)"
             r"(?![\w-])"
             r")"
             r"(?="
-            r"(?:[ \t]+[^\s,;|&#]+){0,5}?"
+            r"(?:[ \t]+[^\s,;|&#]+)*?"
             r"[ \t]+"
             r"(?:[^\s:,;|&#]+:)?(?:refs/heads/)?main"
             r"(?![\w/:-])"
@@ -79,7 +81,7 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
             r"|"
             # Plus-prefix force form: +<refspec> with dst=main.
             r"(?="
-            r"(?:[ \t]+[^\s,;|&#]+){0,5}?"
+            r"(?:[ \t]+[^\s,;|&#]+)*?"
             r"[ \t]+"
             r"\+(?:[^\s:,;|&#]+:)?(?:refs/heads/)?main"
             r"(?![\w/:-])"
@@ -101,7 +103,38 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
     ),
     (
         "skip_ci",
-        re.compile(r"\b(skip|bypass|ignore) CI\b", re.IGNORECASE),
+        # Match ``skip CI`` / ``bypass CI`` / ``ignore CI`` only when
+        # they are NOT immediately preceded by a negation. Negations
+        # such as ``do not skip CI`` or ``never skip CI`` restate the
+        # AGENTS.md rule and must not be flagged as a violation. Each
+        # alternative below is a fixed-width negative lookbehind --
+        # Python's stdlib ``re`` requires fixed widths, so the common
+        # negation phrases are listed individually instead of being
+        # collapsed into a variable-width alternation. Both straight
+        # (``'``) and typographic (``’``) apostrophes are
+        # accepted.
+        re.compile(
+            r"(?<!do not )"
+            r"(?<!don't )"
+            r"(?<!don’t )"
+            r"(?<!cannot )"
+            r"(?<!can not )"
+            r"(?<!can't )"
+            r"(?<!can’t )"
+            r"(?<!never )"
+            r"(?<!must not )"
+            r"(?<!mustn't )"
+            r"(?<!mustn’t )"
+            r"(?<!will not )"
+            r"(?<!won't )"
+            r"(?<!won’t )"
+            r"(?<!should not )"
+            r"(?<!shouldn't )"
+            r"(?<!shouldn’t )"
+            r"(?<!avoid )"
+            r"\b(?:skip|bypass|ignore) CI\b",
+            re.IGNORECASE,
+        ),
         "AGENTS.md requires green CI before merge.",
     ),
     (
