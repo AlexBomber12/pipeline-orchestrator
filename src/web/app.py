@@ -282,6 +282,83 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Pipeline Orchestrator", lifespan=lifespan)
+
+
+_OPERATOR_HEARTBEAT_MUTATION_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_TRUSTED_OPERATOR_FETCH_SITES = frozenset({"same-origin", "same-site"})
+
+
+def _is_operator_driven_request(request) -> bool:
+    """True iff the request carries a signal that an operator browser drove it.
+
+    The repo has no formal auth, so we filter automated traffic
+    (health checks, scrape pollers, ``curl`` probes) by requiring at
+    least one indicator that a browser session is in the loop:
+
+    * Mutating methods (POST/PUT/PATCH/DELETE) — only the dashboard
+      exposes these, and they require explicit operator action.
+    * ``HX-Request: true`` — set by HTMX, only present when the
+      dashboard's own JS is the caller.
+    * ``Sec-Fetch-Site: same-origin`` or ``same-site`` — sent by modern
+      browsers when the navigation/fetch originated within the dashboard
+      itself. ``cross-site`` (third-party embed) and ``none`` (direct
+      address-bar navigation, bookmark, automated tools spoofing the
+      header) are rejected: neither implies the operator is actively
+      using the dashboard, and accepting them would let an embedded
+      page or a curl probe pin ``operator_heartbeat`` alive and defeat
+      off-hours AWAY.
+
+    HEAD/OPTIONS (probes, CORS preflight) are excluded, and a bare GET
+    without browser headers is rejected so a load balancer hitting
+    ``/api/states`` cannot keep the heartbeat key alive when no
+    operator is present.
+    """
+    method = request.method
+    if method in _OPERATOR_HEARTBEAT_MUTATION_METHODS:
+        return True
+    if method != "GET":
+        return False
+    headers = request.headers
+    if headers.get("hx-request") is not None:
+        return True
+    if headers.get("sec-fetch-site") in _TRUSTED_OPERATOR_FETCH_SITES:
+        return True
+    return False
+
+
+@app.middleware("http")
+async def operator_heartbeat_middleware(request, call_next):
+    """Refresh ``operator_heartbeat`` Redis key on operator dashboard traffic.
+
+    Powers the ``HeartbeatSource`` half of the Cancellation-policy
+    availability composition (PR-255). The dashboard is GET-dominated
+    (main page, ``/api/*`` polling, ``/partials/*``), so restricting
+    refresh to mutating methods would let an actively-watching operator
+    expire after the TTL. We instead refresh on any successful 2xx
+    response that :func:`_is_operator_driven_request` classifies as
+    operator-driven — explicit mutations, HTMX polls from the dashboard,
+    or a same-origin/same-site browser GET. Automated GET pollers,
+    health checks, third-party embeds (``cross-site``), and direct
+    address-bar navigations (``none``) are skipped so they cannot pin
+    the key alive when no operator is present.
+
+    Best-effort: a Redis outage must not break the request, so all
+    storage errors are swallowed.
+    """
+    response = await call_next(request)
+    if not _is_operator_driven_request(request):
+        return response
+    if not (200 <= response.status_code < 300):
+        return response
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is not None:
+        try:
+            await redis_client.set("operator_heartbeat", "1", ex=300)
+        except Exception:
+            pass
+    return response
+
+
 app.include_router(_dashboard_routes.router)
 app.include_router(_repo_control_routes.router)
 app.include_router(_settings_routes.router)

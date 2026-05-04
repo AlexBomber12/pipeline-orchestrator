@@ -1252,7 +1252,8 @@ def test_upload_merge_pending_manifest_and_ignore_scan_errors(
             return None
 
         async def set(self, key: str, value: str, **kwargs: object) -> None:
-            self.manifest = value
+            if key == "upload:example__alpha:pending":
+                self.manifest = value
 
         async def scan_iter(self, match: str):
             yield b"upload:active:pending"

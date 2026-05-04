@@ -3938,3 +3938,199 @@ def test_route_module_entry_point_registers_all_routes(route_module: str) -> Non
         f"{route_module} as entry point produced different routes than baseline: "
         f"missing={baseline - paths}, extra={paths - baseline}"
     )
+
+
+# ---------------------------------------------------------------------------
+# operator_heartbeat_middleware (PR-255)
+# ---------------------------------------------------------------------------
+
+
+class _MiddlewareApp:
+    """Minimal stand-in for a Starlette ``app`` exposing ``state.redis``."""
+
+    def __init__(self, redis_client: object | None) -> None:
+        self.state = type("_State", (), {"redis": redis_client})()
+
+
+class _MiddlewareRequest:
+    """Minimal Request shape consumed by ``operator_heartbeat_middleware``."""
+
+    def __init__(
+        self,
+        method: str,
+        redis_client: object | None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.method = method
+        self.app = _MiddlewareApp(redis_client)
+        self.headers = headers or {}
+
+
+class _MiddlewareResponse:
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+
+
+class _RecordingRedis:
+    """Captures ``set`` calls so tests can assert when (not) refreshed."""
+
+    def __init__(self) -> None:
+        self.set_calls: list[tuple[str, str, dict[str, object]]] = []
+
+    async def set(self, key: str, value: str, **kwargs: object) -> None:
+        self.set_calls.append((key, value, dict(kwargs)))
+
+
+class _BoomSetRedis:
+    async def set(self, key: str, value: str, **_kwargs: object) -> None:
+        raise RuntimeError("redis is down")
+
+
+def _run_heartbeat(
+    *,
+    method: str,
+    status_code: int,
+    redis_client: object | None,
+    headers: dict[str, str] | None = None,
+) -> _MiddlewareResponse:
+    """Invoke the middleware with synthesized request/call_next."""
+
+    request = _MiddlewareRequest(method, redis_client, headers=headers)
+    response = _MiddlewareResponse(status_code)
+
+    async def call_next(_req: _MiddlewareRequest) -> _MiddlewareResponse:
+        return response
+
+    returned = asyncio.run(
+        web_app.operator_heartbeat_middleware(request, call_next)
+    )
+    assert returned is response
+    return returned
+
+
+def test_heartbeat_middleware_refreshes_on_successful_mutation() -> None:
+    redis_client = _RecordingRedis()
+    _run_heartbeat(method="POST", status_code=200, redis_client=redis_client)
+    assert redis_client.set_calls == [
+        ("operator_heartbeat", "1", {"ex": 300})
+    ]
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
+def test_heartbeat_middleware_refreshes_on_other_mutating_methods(
+    method: str,
+) -> None:
+    redis_client = _RecordingRedis()
+    _run_heartbeat(method=method, status_code=204, redis_client=redis_client)
+    assert len(redis_client.set_calls) == 1
+
+
+def test_heartbeat_middleware_refreshes_on_htmx_get() -> None:
+    """HTMX-driven GET = operator dashboard polling.
+
+    The dashboard is GET-dominated; HTMX polls carry ``HX-Request: true``
+    and must keep the heartbeat fresh while the operator watches.
+    """
+    redis_client = _RecordingRedis()
+    _run_heartbeat(
+        method="GET",
+        status_code=200,
+        redis_client=redis_client,
+        headers={"hx-request": "true"},
+    )
+    assert redis_client.set_calls == [
+        ("operator_heartbeat", "1", {"ex": 300})
+    ]
+
+
+@pytest.mark.parametrize("fetch_site", ["same-origin", "same-site"])
+def test_heartbeat_middleware_refreshes_on_trusted_fetch_site_get(
+    fetch_site: str,
+) -> None:
+    """Browser GET with trusted Sec-Fetch-Site counts as operator.
+
+    Only ``same-origin``/``same-site`` are accepted: those imply the
+    request originated from within the dashboard itself.
+    """
+    redis_client = _RecordingRedis()
+    _run_heartbeat(
+        method="GET",
+        status_code=200,
+        redis_client=redis_client,
+        headers={"sec-fetch-site": fetch_site},
+    )
+    assert redis_client.set_calls == [
+        ("operator_heartbeat", "1", {"ex": 300})
+    ]
+
+
+@pytest.mark.parametrize("fetch_site", ["cross-site", "none", "unknown", ""])
+def test_heartbeat_middleware_skips_untrusted_fetch_site_get(
+    fetch_site: str,
+) -> None:
+    """Untrusted Sec-Fetch-Site values must not refresh the heartbeat.
+
+    ``cross-site`` = embedded by a third-party page; ``none`` = direct
+    address-bar navigation or a curl probe spoofing the header; any
+    unexpected value is treated the same way. None of these imply the
+    operator is actively using the dashboard, so they must not pin
+    ``operator_heartbeat`` alive and defeat off-hours AWAY behavior.
+    """
+    redis_client = _RecordingRedis()
+    _run_heartbeat(
+        method="GET",
+        status_code=200,
+        redis_client=redis_client,
+        headers={"sec-fetch-site": fetch_site},
+    )
+    assert redis_client.set_calls == []
+
+
+def test_heartbeat_middleware_skips_unattributed_get() -> None:
+    """Bare GET (no HX-Request, no Sec-Fetch-*) = automated polling.
+
+    Health checks, ``curl`` probes, and load-balancer pings must not
+    pin the heartbeat key alive when no operator is present —
+    otherwise ``HeartbeatSource`` would falsely report AVAILABLE
+    during off-hours.
+    """
+    redis_client = _RecordingRedis()
+    _run_heartbeat(method="GET", status_code=200, redis_client=redis_client)
+    assert redis_client.set_calls == []
+
+
+@pytest.mark.parametrize("method", ["HEAD", "OPTIONS"])
+def test_heartbeat_middleware_skips_probe_methods(method: str) -> None:
+    """HEAD/OPTIONS = probes and CORS preflight — not operator presence.
+
+    Browser-style headers must not rescue these methods; CORS preflight
+    sends ``Sec-Fetch-Mode: cors`` but is still not operator presence.
+    """
+    redis_client = _RecordingRedis()
+    _run_heartbeat(
+        method=method,
+        status_code=200,
+        redis_client=redis_client,
+        headers={"sec-fetch-site": "same-origin"},
+    )
+    assert redis_client.set_calls == []
+
+
+@pytest.mark.parametrize("status", [301, 302, 400, 401, 403, 404, 500, 503])
+def test_heartbeat_middleware_skips_non_2xx_responses(status: int) -> None:
+    """Failed/redirected mutations must not pin the heartbeat key alive."""
+    redis_client = _RecordingRedis()
+    _run_heartbeat(method="POST", status_code=status, redis_client=redis_client)
+    assert redis_client.set_calls == []
+
+
+def test_heartbeat_middleware_no_op_when_redis_missing() -> None:
+    """Lifespan runs before requests, but a torn-down state must not crash."""
+    _run_heartbeat(method="POST", status_code=200, redis_client=None)
+
+
+def test_heartbeat_middleware_swallows_redis_failure() -> None:
+    """Redis outage must not break the underlying request."""
+    _run_heartbeat(
+        method="POST", status_code=200, redis_client=_BoomSetRedis()
+    )

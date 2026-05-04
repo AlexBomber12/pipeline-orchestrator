@@ -507,6 +507,35 @@ def test_update_daemon_config_rejects_unknown_field(tmp_path: Path) -> None:
         update_daemon_config(str(path), bogus=True)
 
 
+def test_update_daemon_config_accepts_operator_availability_fields(
+    tmp_path: Path,
+) -> None:
+    """PR-255 active-hours fields must be tunable via update_daemon_config().
+
+    The heartbeat composition reads ``operator_active_hours_*`` and
+    ``operator_timezone`` from ``DaemonConfig``. If these aren't on the
+    update allowlist, settings/API mutations raise ``ValueError`` and
+    operators are forced to hand-edit YAML.
+    """
+    path = tmp_path / "config.yml"
+    save_config(AppConfig(), str(path))
+
+    cfg = update_daemon_config(
+        str(path),
+        operator_active_hours_start=8,
+        operator_active_hours_end=20,
+        operator_timezone="America/New_York",
+    )
+    assert cfg.daemon.operator_active_hours_start == 8
+    assert cfg.daemon.operator_active_hours_end == 20
+    assert cfg.daemon.operator_timezone == "America/New_York"
+
+    reloaded = load_config(str(path))
+    assert reloaded.daemon.operator_active_hours_start == 8
+    assert reloaded.daemon.operator_active_hours_end == 20
+    assert reloaded.daemon.operator_timezone == "America/New_York"
+
+
 def test_update_daemon_config_validates_patch_types(tmp_path: Path) -> None:
     """Malformed daemon patches must raise and leave config.yml untouched."""
     path = tmp_path / "config.yml"
