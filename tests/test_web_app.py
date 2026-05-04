@@ -1742,6 +1742,75 @@ def test_repo_summary_error_fragment_keeps_divs_balanced(
     assert rendered.count("<div") == rendered.count("</div>")
 
 
+def test_repo_summary_renders_infra_failure_distinctly_from_pending(
+    two_repo_config: Path,
+) -> None:
+    now = datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc)
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.WATCH,
+        current_task=QueueTask(
+            pr_id="PR-099",
+            title="Sample",
+            status=TaskStatus.DOING,
+        ),
+        current_pr=PRInfo(
+            number=42,
+            branch="pr-099-sample",
+            ci_status=CIStatus.INFRA_FAILURE,
+            review_status=ReviewStatus.PENDING,
+        ),
+        last_updated=now,
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+
+    context = asyncio.run(web_app._repo_template_context("example__alpha", fake))
+    rendered = web_app.templates.get_template(
+        "components/repo_summary.html"
+    ).render(context)
+
+    assert "infra failure" in rendered
+    assert "bg-fail" in rendered
+    ci_block = rendered.split(">CI<", 1)[1].split("</dd>", 1)[0]
+    assert "pending" not in ci_block
+    assert "pulse-dot" not in ci_block
+
+
+def test_repo_cards_render_infra_failure_distinctly_from_pending(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc)
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.WATCH,
+        current_pr=PRInfo(
+            number=42,
+            branch="pr-099-sample",
+            ci_status=CIStatus.INFRA_FAILURE,
+            review_status=ReviewStatus.PENDING,
+            url="https://github.com/example/alpha/pull/42",
+        ),
+        last_updated=now,
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
+
+    with TestClient(app) as client:
+        response = client.get("/partials/repo-list")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "CI infra failure" in body
+    pr_row_marker = '<a href="https://github.com/example/alpha/pull/42"'
+    assert pr_row_marker in body
+    pr_row = body.split(pr_row_marker, 1)[1].split("</div>", 1)[0]
+    assert "CI pending" not in pr_row
+    assert "bg-fail" in pr_row
+    assert "pulse-dot" not in pr_row
+
+
 def _metrics_record(
     run_id: str,
     *,

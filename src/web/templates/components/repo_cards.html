@@ -4,9 +4,10 @@
 {% set init_messages = ['Waiting for daemon to initialize', 'State decode failed', 'Redis unavailable — state unknown'] %}
 
 {% set ci_styles = {
-    'PENDING': {'dot': 'bg-warn', 'pulse': true, 'label': 'CI pending'},
-    'SUCCESS': {'dot': 'bg-ok',   'pulse': false, 'label': 'CI passed'},
-    'FAILURE': {'dot': 'bg-fail', 'pulse': false, 'label': 'CI failed'},
+    'PENDING':       {'dot': 'bg-warn', 'pulse': true,  'label': 'CI pending'},
+    'SUCCESS':       {'dot': 'bg-ok',   'pulse': false, 'label': 'CI passed'},
+    'FAILURE':       {'dot': 'bg-fail', 'pulse': false, 'label': 'CI failed'},
+    'INFRA_FAILURE': {'dot': 'bg-fail', 'pulse': false, 'label': 'CI infra failure'},
 } %}
 
 {% set review_emojis = {
