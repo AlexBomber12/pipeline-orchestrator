@@ -58,10 +58,15 @@ def validate_task_spec(content: str) -> dict:
             ``- Depends on:``, ``- Priority:``, ``- Coder:``).
 
     Returns:
-        A dict with three keys:
+        A dict with four keys:
 
         - ``valid``: ``True`` when the spec parses cleanly AND no
           AGENTS.md anti-pattern violations were detected.
+        - ``errors``: legacy alias of ``schema_errors`` retained for
+          MCP clients written against the PR-246 shape, which read
+          ``result["errors"]`` directly. Always present (empty list
+          when the spec parses cleanly) so legacy callers do not
+          ``KeyError`` on the success path either.
         - ``schema_errors``: list of strings from
           ``QueueValidationError.issues`` when the parser rejects
           the spec; empty list otherwise.
@@ -87,6 +92,9 @@ def validate_task_spec(content: str) -> dict:
     violations = scan_for_conflicts(content)
     return {
         "valid": not schema_errors and not violations,
+        # ``errors`` is a backward-compat alias of ``schema_errors``
+        # for PR-246 callers; both list the same diagnostics.
+        "errors": schema_errors,
         "schema_errors": schema_errors,
         "agents_violations": [
             {

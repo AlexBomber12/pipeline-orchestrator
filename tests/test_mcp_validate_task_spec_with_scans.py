@@ -72,3 +72,23 @@ def test_violation_dict_shape():
     assert result["agents_violations"]
     entry = result["agents_violations"][0]
     assert set(entry.keys()) == {"type", "excerpt", "rule"}
+
+
+def test_legacy_errors_key_aliases_schema_errors():
+    """PR-246 callers read ``result['errors']``; PR-259 must keep it.
+
+    The key is always present (empty list on success) so legacy code
+    that does ``result['errors']`` does not ``KeyError`` on the happy
+    path; on failure it carries the same diagnostics as
+    ``schema_errors``.
+    """
+    from src.mcp.tools.functional import validate_task_spec
+
+    ok = validate_task_spec(_VALID_SPEC)
+    assert ok["errors"] == []
+    assert ok["errors"] == ok["schema_errors"]
+
+    bad = _VALID_SPEC.replace("- Type: feature", "- Type: nonsense")
+    failed = validate_task_spec(bad)
+    assert failed["errors"]
+    assert failed["errors"] == failed["schema_errors"]

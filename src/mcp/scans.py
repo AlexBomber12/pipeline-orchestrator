@@ -122,20 +122,34 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
 def scan_for_conflicts(task_spec_body: str) -> list[ConflictViolation]:
     """Return list of detected AGENTS.md anti-pattern violations.
 
+    The body is scanned as a whole rather than per physical line, so
+    forbidden commands cannot evade detection by inserting a shell
+    line continuation (``\\<newline>``) between flag and refspec.
+    Continuations are collapsed before matching, then each pattern
+    runs against the full normalized body via ``finditer``.
+
     Empty list when no violations found. Each match captures the
     violation type and an 80-char excerpt of the offending line for
-    operator context.
+    operator context; for a continued command, the excerpt is the
+    joined logical line that the shell would actually execute.
     """
+    # Collapse shell line continuations so a multi-line command such
+    # as ``git push --force \<newline>    origin main`` matches the
+    # same patterns as its single-line equivalent.
+    normalized = re.sub(r"\\\n[ \t]*", " ", task_spec_body)
     violations: list[ConflictViolation] = []
-    for line in task_spec_body.splitlines():
-        for vtype, pattern, rule in _ANTI_PATTERNS:
-            if pattern.search(line):
-                excerpt = line.strip()[:80]
-                violations.append(
-                    ConflictViolation(
-                        violation_type=vtype,
-                        line_excerpt=excerpt,
-                        rule=rule,
-                    )
+    for vtype, pattern, rule in _ANTI_PATTERNS:
+        for match in pattern.finditer(normalized):
+            line_start = normalized.rfind("\n", 0, match.start()) + 1
+            line_end = normalized.find("\n", match.start())
+            if line_end == -1:
+                line_end = len(normalized)
+            excerpt = normalized[line_start:line_end].strip()[:80]
+            violations.append(
+                ConflictViolation(
+                    violation_type=vtype,
+                    line_excerpt=excerpt,
+                    rule=rule,
                 )
+            )
     return violations

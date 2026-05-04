@@ -30,6 +30,7 @@ def test_validate_task_spec_accepts_valid_content():
     result = validate_task_spec(_VALID_SPEC)
     assert result == {
         "valid": True,
+        "errors": [],
         "schema_errors": [],
         "agents_violations": [],
     }
@@ -79,6 +80,7 @@ def test_validate_task_spec_accepts_synonym_for_type():
     result = validate_task_spec(spec)
     assert result == {
         "valid": True,
+        "errors": [],
         "schema_errors": [],
         "agents_violations": [],
     }

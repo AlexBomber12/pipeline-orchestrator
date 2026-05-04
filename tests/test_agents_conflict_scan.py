@@ -295,3 +295,29 @@ def test_violation_carries_rule_reference():
     for v in violations:
         assert v.rule
         assert isinstance(v.rule, str)
+
+
+def test_force_push_main_detected_across_shell_continuation():
+    """``\\<newline>`` shell continuation must not let a force-push to
+    main escape detection by splitting the flag and refspec across
+    physical lines."""
+    body = "git push --force \\\n    origin main\n"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "force_push_main" in types
+
+
+def test_draft_pr_flag_detected_across_shell_continuation():
+    """Draft-PR flag split across a shell continuation must still match."""
+    body = "gh pr create \\\n    --draft --title wip\n"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_flag" in types
+
+
+def test_no_verify_detected_across_shell_continuation():
+    """``--no-verify`` on a continued ``git commit`` must still match."""
+    body = "git commit -m 'fix' \\\n    --no-verify\n"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "no_verify_commit" in types
