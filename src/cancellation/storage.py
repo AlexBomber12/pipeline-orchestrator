@@ -62,15 +62,15 @@ async def record_cancellation_cause(
     """Persist a cancellation cause for later UI surfacing."""
     if not cause.created_at:
         cause.created_at = datetime.now(timezone.utc).isoformat()
-    if not cause.task_id:
-        cause.task_id = task_id
-    if not cause.repo_slug:
-        cause.repo_slug = repo_slug
+    cause.task_id = task_id
+    cause.repo_slug = repo_slug
     serialized = cause.to_redis()
     score = datetime.fromisoformat(cause.created_at).timestamp()
+    expiry_cutoff = datetime.now(timezone.utc).timestamp() - TTL_SECONDS
     pipe = redis_client.pipeline()
     pipe.set(cause_key(repo_slug, task_id), serialized, ex=TTL_SECONDS)
     pipe.zadd(index_key(repo_slug), {task_id: score})
+    pipe.zremrangebyscore(index_key(repo_slug), "-inf", f"({expiry_cutoff}")
     await pipe.execute()
 
 
@@ -96,11 +96,16 @@ async def list_recent_cancellations(
         index_key(repo_slug), since_ts, "+inf"
     )
     causes: list[CancellationCause] = []
+    stale: list[str] = []
     for tid in task_ids or []:
         if isinstance(tid, bytes):
             tid = tid.decode("utf-8")
         cause = await get_cancellation_cause(redis_client, repo_slug, tid)
-        if cause is not None:
+        if cause is None:
+            stale.append(tid)
+        else:
             causes.append(cause)
+    if stale:
+        await redis_client.zrem(index_key(repo_slug), *stale)
     causes.sort(key=lambda c: c.created_at, reverse=True)
     return causes

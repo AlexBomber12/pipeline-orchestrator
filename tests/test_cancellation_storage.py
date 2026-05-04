@@ -32,6 +32,10 @@ class _FakePipeline:
         self._ops.append(("zadd", key, dict(mapping)))
         return self
 
+    def zremrangebyscore(self, key: str, min_score, max_score) -> "_FakePipeline":
+        self._ops.append(("zremrangebyscore", key, min_score, max_score))
+        return self
+
     async def execute(self) -> list:
         results = []
         for op in self._ops:
@@ -46,6 +50,9 @@ class _FakePipeline:
                 bucket = self._store.zsets.setdefault(key, {})
                 bucket.update(mapping)
                 results.append(len(mapping))
+            elif op[0] == "zremrangebyscore":
+                _, key, min_score, max_score = op
+                results.append(self._store._zremrangebyscore(key, min_score, max_score))
         self._ops.clear()
         return results
 
@@ -72,6 +79,39 @@ class _FakeRedis:
         items = [tid for tid, score in bucket.items() if lower <= score <= upper]
         items.sort(key=lambda tid: bucket[tid])
         return items
+
+    async def zrem(self, key: str, *members: str) -> int:
+        bucket = self.zsets.get(key, {})
+        removed = 0
+        for member in members:
+            if member in bucket:
+                del bucket[member]
+                removed += 1
+        return removed
+
+    def _zremrangebyscore(self, key: str, min_score, max_score) -> int:
+        bucket = self.zsets.get(key)
+        if not bucket:
+            return 0
+        lower, lower_excl = self._parse_bound(min_score, default=float("-inf"))
+        upper, upper_excl = self._parse_bound(max_score, default=float("inf"))
+        to_remove = [
+            tid
+            for tid, score in bucket.items()
+            if (score > lower if lower_excl else score >= lower)
+            and (score < upper if upper_excl else score <= upper)
+        ]
+        for tid in to_remove:
+            del bucket[tid]
+        return len(to_remove)
+
+    @staticmethod
+    def _parse_bound(value, default: float) -> tuple[float, bool]:
+        if value in ("-inf", "+inf"):
+            return float(value), False
+        if isinstance(value, str) and value.startswith("("):
+            return float(value[1:]), True
+        return float(value), False
 
 
 def test_categories_cover_expected_set() -> None:
@@ -136,6 +176,25 @@ async def test_record_fills_missing_metadata() -> None:
     datetime.fromisoformat(stored.created_at)
 
 
+async def test_record_overrides_stale_identifiers_in_payload() -> None:
+    redis = _FakeRedis()
+    cause = CancellationCause(
+        category="CRASH",
+        created_at="2026-05-04T08:00:00+00:00",
+        task_id="PR-OLD",
+        repo_slug="old-repo",
+    )
+    await record_cancellation_cause(redis, "new-repo", "PR-NEW", cause)
+
+    stored = await get_cancellation_cause(redis, "new-repo", "PR-NEW")
+    assert stored is not None
+    assert stored.task_id == "PR-NEW"
+    assert stored.repo_slug == "new-repo"
+    # Caller's object is also coerced to match the key arguments.
+    assert cause.task_id == "PR-NEW"
+    assert cause.repo_slug == "new-repo"
+
+
 async def test_missing_key_returns_none() -> None:
     redis = _FakeRedis()
     assert await get_cancellation_cause(redis, "alpha", "PR-404") is None
@@ -195,7 +254,7 @@ async def test_list_recent_returns_empty_when_no_index() -> None:
     assert await list_recent_cancellations(redis, "ghost", since) == []
 
 
-async def test_list_recent_skips_expired_payloads() -> None:
+async def test_list_recent_skips_expired_payloads_and_prunes_index() -> None:
     redis = _FakeRedis()
     created = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
     await record_cancellation_cause(
@@ -210,6 +269,26 @@ async def test_list_recent_skips_expired_payloads() -> None:
         redis, "alpha", created - timedelta(hours=1)
     )
     assert recent == []
+    # Stale member must be removed from the index so list work stays bounded.
+    assert "PR-700" not in redis.zsets.get(index_key("alpha"), {})
+
+
+async def test_record_prunes_index_entries_older_than_ttl() -> None:
+    redis = _FakeRedis()
+    now = datetime.now(timezone.utc)
+    ancient_ts = (now - timedelta(seconds=TTL_SECONDS + 3600)).timestamp()
+    redis.zsets[index_key("alpha")] = {"PR-EXPIRED": ancient_ts}
+
+    await record_cancellation_cause(
+        redis,
+        "alpha",
+        "PR-FRESH",
+        CancellationCause(category="INFRA", created_at=now.isoformat()),
+    )
+
+    bucket = redis.zsets[index_key("alpha")]
+    assert "PR-EXPIRED" not in bucket
+    assert "PR-FRESH" in bucket
 
 
 async def test_list_recent_decodes_bytes_task_ids() -> None:
