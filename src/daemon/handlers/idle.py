@@ -17,6 +17,8 @@ from pathlib import Path
 from src.dag import get_eligible_tasks
 from src.github import prs as gh_prs
 from src.models import PipelineState, QueueTask, TaskStatus
+from src.onboarding.markdown_sections import MarkerError
+from src.onboarding.reconciliation import reconcile_agents_md
 from src.queue_parser import (
     QueueValidationError,
     TaskHeader,
@@ -132,6 +134,46 @@ class IdleMixin:
         queue_path.parent.mkdir(parents=True, exist_ok=True)
         queue_path.write_text(content, encoding="utf-8")
         return True
+
+    def _scan_task_specs_for_agents_md_drift(self) -> None:
+        """Run the AGENTS.md anti-pattern scan over ``tasks/PR-*.md``.
+
+        PR-260: hooks ``reconcile_agents_md`` into the IDLE cycle in
+        dry-run mode so the per-spec scan in
+        ``_scan_existing_task_specs`` actually reaches production.
+        Dry-run keeps the working tree clean (AGENTS.md is tracked in
+        target repos and operator-driven via ``/onboarding/apply``);
+        the scan still fires because the hook is gated only on
+        ``log_event_fn``. Threading ``self.log_event`` makes findings
+        land in the same per-repo event stream operators read in the
+        dashboard, where ``log_event``'s consecutive-event dedup
+        collapses repeated drift signals into a single counter so
+        per-cycle invocation does not flood history.
+
+        Failures in this scan must never block dispatch: a malformed
+        AGENTS.md (operator-introduced bad managed markers) raises
+        ``MarkerError`` from ``apply_managed_regions``; ``OSError``
+        covers transient filesystem hiccups. Both are surfaced as a
+        single ``[AGENTS-SCAN]`` event and swallowed so the rest of
+        IDLE proceeds normally.
+        """
+        agents_path = Path(self.repo_path) / "AGENTS.md"
+        try:
+            reconcile_agents_md(
+                agents_path,
+                dry_run=True,
+                log_event_fn=self.log_event,
+            )
+        except MarkerError as exc:
+            self.log_event(
+                f"[AGENTS-SCAN] Skipping drift scan: malformed managed "
+                f"markers in {agents_path}: {exc}."
+            )
+        except OSError as exc:
+            self.log_event(
+                f"[AGENTS-SCAN] Skipping drift scan: failed to read "
+                f"{agents_path}: {exc}."
+            )
 
     @staticmethod
     def _validate_task_file_header_match(task_file: Path, header_pr_id: str) -> None:
@@ -728,6 +770,8 @@ class IdleMixin:
                 log_prefix="[INFRA]",
             )
             return
+
+        self._scan_task_specs_for_agents_md_drift()
 
         upload_result = await self.process_pending_uploads()
         if upload_result is None:

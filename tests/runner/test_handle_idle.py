@@ -5338,3 +5338,182 @@ def test_run_cycle_pending_upload_retries_keep_polling_fast(
 
     assert intervals == [60, 60, 60, 60, 60]
     assert runner._idle_streak == 0
+
+
+def test_handle_idle_emits_agents_scan_events_when_specs_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The IDLE handler must invoke ``reconcile_agents_md`` with the
+    runner's ``log_event`` so the PR-260 drift scan reaches production.
+
+    Regression for the PR-260 review feedback: the scan was wired into
+    ``reconcile_agents_md`` but no daemon caller passed ``log_event_fn``,
+    so violations were detected only by tests, never by the daemon.
+    Pinning the IDLE-cycle invocation guarantees that pre-existing task
+    specs containing AGENTS.md anti-patterns surface in the dashboard
+    event log.
+    """
+    h._patch_subprocess(monkeypatch)
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-007.md").write_text(
+        "# PR-007: Old spec\n\nSkip CI on this branch.\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs", lambda repo, **kw: []
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    asyncio.run(runner.handle_idle())
+
+    scan_events = [
+        entry["event"]
+        for entry in runner.state.history
+        if entry["event"].startswith("[AGENTS-SCAN]")
+    ]
+    assert any(
+        "PR-007.md" in event and "skip_ci" in event for event in scan_events
+    ), scan_events
+    assert not (tmp_path / "AGENTS.md").exists(), (
+        "dry_run=True means the daemon must not materialize AGENTS.md "
+        "in the working tree on every IDLE cycle"
+    )
+
+
+def test_handle_idle_clean_tasks_dir_emits_no_agents_scan_events(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Silent on clean: the per-cycle scan must not flood the event log
+    when no specs drift. ``_scan_existing_task_specs`` already enforces
+    this contract; this test pins it through the IDLE call site so a
+    future refactor cannot accidentally start logging summary events on
+    every cycle."""
+    h._patch_subprocess(monkeypatch)
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-008.md").write_text(
+        "# PR-008: Clean spec\n\nNo anti-patterns here.\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs", lambda repo, **kw: []
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    asyncio.run(runner.handle_idle())
+
+    scan_events = [
+        entry["event"]
+        for entry in runner.state.history
+        if entry["event"].startswith("[AGENTS-SCAN]")
+    ]
+    assert scan_events == []
+
+
+def test_handle_idle_swallows_os_error_in_agents_md_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Filesystem read errors on AGENTS.md must not crash IDLE.
+
+    A directory left in place of AGENTS.md (network filesystem glitch,
+    operator misstep, container volume mount mishap) makes
+    ``Path.read_text`` raise ``IsADirectoryError`` (an ``OSError``
+    subclass). The IDLE handler must catch it, surface a single
+    explanatory event, and proceed with task selection so an unusual
+    on-disk shape does not silently halt dispatch.
+    """
+    h._patch_subprocess(monkeypatch)
+
+    (tmp_path / "AGENTS.md").mkdir()
+
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs", lambda repo, **kw: []
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.IDLE
+    scan_events = [
+        entry["event"]
+        for entry in runner.state.history
+        if entry["event"].startswith("[AGENTS-SCAN]")
+    ]
+    assert any(
+        "failed to read" in event for event in scan_events
+    ), scan_events
+
+
+def test_handle_idle_swallows_marker_error_in_agents_md(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Malformed managed markers in AGENTS.md must not crash IDLE.
+
+    Operators can hand-edit AGENTS.md and accidentally break the
+    managed-region markers. The IDLE handler must catch the resulting
+    ``MarkerError`` from ``reconcile_agents_md``, surface a single
+    explanatory event, and proceed with task selection so dispatch is
+    not gated on a cosmetic markdown mistake.
+    """
+    h._patch_subprocess(monkeypatch)
+
+    (tmp_path / "AGENTS.md").write_text(
+        "<!-- pipeline-orchestrator: managed BEGIN section_a -->\n"
+        "body\n"
+        "<!-- pipeline-orchestrator: managed BEGIN section_b -->\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs", lambda repo, **kw: []
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.IDLE
+    scan_events = [
+        entry["event"]
+        for entry in runner.state.history
+        if entry["event"].startswith("[AGENTS-SCAN]")
+    ]
+    assert any(
+        "malformed managed markers" in event for event in scan_events
+    ), scan_events
