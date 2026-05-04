@@ -3955,9 +3955,15 @@ class _MiddlewareApp:
 class _MiddlewareRequest:
     """Minimal Request shape consumed by ``operator_heartbeat_middleware``."""
 
-    def __init__(self, method: str, redis_client: object | None) -> None:
+    def __init__(
+        self,
+        method: str,
+        redis_client: object | None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.method = method
         self.app = _MiddlewareApp(redis_client)
+        self.headers = headers or {}
 
 
 class _MiddlewareResponse:
@@ -3985,10 +3991,11 @@ def _run_heartbeat(
     method: str,
     status_code: int,
     redis_client: object | None,
+    headers: dict[str, str] | None = None,
 ) -> _MiddlewareResponse:
     """Invoke the middleware with synthesized request/call_next."""
 
-    request = _MiddlewareRequest(method, redis_client)
+    request = _MiddlewareRequest(method, redis_client, headers=headers)
     response = _MiddlewareResponse(status_code)
 
     async def call_next(_req: _MiddlewareRequest) -> _MiddlewareResponse:
@@ -4018,25 +4025,65 @@ def test_heartbeat_middleware_refreshes_on_other_mutating_methods(
     assert len(redis_client.set_calls) == 1
 
 
-def test_heartbeat_middleware_refreshes_on_get_dashboard_traffic() -> None:
-    """GET = main page + HTMX polls — operator-presence signal.
+def test_heartbeat_middleware_refreshes_on_htmx_get() -> None:
+    """HTMX-driven GET = operator dashboard polling.
 
-    The dashboard is GET-dominated; restricting refresh to mutating
-    methods would let an actively-watching operator expire after the
-    TTL, breaking the ``HeartbeatSource`` contract.
+    The dashboard is GET-dominated; HTMX polls carry ``HX-Request: true``
+    and must keep the heartbeat fresh while the operator watches.
     """
     redis_client = _RecordingRedis()
-    _run_heartbeat(method="GET", status_code=200, redis_client=redis_client)
+    _run_heartbeat(
+        method="GET",
+        status_code=200,
+        redis_client=redis_client,
+        headers={"hx-request": "true"},
+    )
     assert redis_client.set_calls == [
         ("operator_heartbeat", "1", {"ex": 300})
     ]
 
 
+def test_heartbeat_middleware_refreshes_on_browser_navigation_get() -> None:
+    """Browser navigation GET (Sec-Fetch-Site present) counts as operator."""
+    redis_client = _RecordingRedis()
+    _run_heartbeat(
+        method="GET",
+        status_code=200,
+        redis_client=redis_client,
+        headers={"sec-fetch-site": "same-origin"},
+    )
+    assert redis_client.set_calls == [
+        ("operator_heartbeat", "1", {"ex": 300})
+    ]
+
+
+def test_heartbeat_middleware_skips_unattributed_get() -> None:
+    """Bare GET (no HX-Request, no Sec-Fetch-*) = automated polling.
+
+    Health checks, ``curl`` probes, and load-balancer pings must not
+    pin the heartbeat key alive when no operator is present —
+    otherwise ``HeartbeatSource`` would falsely report AVAILABLE
+    during off-hours.
+    """
+    redis_client = _RecordingRedis()
+    _run_heartbeat(method="GET", status_code=200, redis_client=redis_client)
+    assert redis_client.set_calls == []
+
+
 @pytest.mark.parametrize("method", ["HEAD", "OPTIONS"])
 def test_heartbeat_middleware_skips_probe_methods(method: str) -> None:
-    """HEAD/OPTIONS = probes and CORS preflight — not operator presence."""
+    """HEAD/OPTIONS = probes and CORS preflight — not operator presence.
+
+    Browser-style headers must not rescue these methods; CORS preflight
+    sends ``Sec-Fetch-Mode: cors`` but is still not operator presence.
+    """
     redis_client = _RecordingRedis()
-    _run_heartbeat(method=method, status_code=200, redis_client=redis_client)
+    _run_heartbeat(
+        method=method,
+        status_code=200,
+        redis_client=redis_client,
+        headers={"sec-fetch-site": "same-origin"},
+    )
     assert redis_client.set_calls == []
 
 

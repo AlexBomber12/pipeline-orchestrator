@@ -284,9 +284,39 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="Pipeline Orchestrator", lifespan=lifespan)
 
 
-_OPERATOR_HEARTBEAT_METHODS = frozenset(
-    {"GET", "POST", "PUT", "PATCH", "DELETE"}
-)
+_OPERATOR_HEARTBEAT_MUTATION_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _is_operator_driven_request(request) -> bool:
+    """True iff the request carries a signal that an operator browser drove it.
+
+    The repo has no formal auth, so we filter automated traffic
+    (health checks, scrape pollers, ``curl`` probes) by requiring at
+    least one indicator that a browser session is in the loop:
+
+    * Mutating methods (POST/PUT/PATCH/DELETE) — only the dashboard
+      exposes these, and they require explicit operator action.
+    * ``HX-Request: true`` — set by HTMX, only present when the
+      dashboard's own JS is the caller.
+    * ``Sec-Fetch-Site`` — sent by modern browsers on every navigation
+      and fetch; absent on plain ``curl``/``kube-probe``/Prometheus.
+
+    HEAD/OPTIONS (probes, CORS preflight) are excluded, and a bare GET
+    without browser headers is rejected so a load balancer hitting
+    ``/api/states`` cannot keep the heartbeat key alive when no
+    operator is present.
+    """
+    method = request.method
+    if method in _OPERATOR_HEARTBEAT_MUTATION_METHODS:
+        return True
+    if method != "GET":
+        return False
+    headers = request.headers
+    if headers.get("hx-request") is not None:
+        return True
+    if headers.get("sec-fetch-site") is not None:
+        return True
+    return False
 
 
 @app.middleware("http")
@@ -297,14 +327,18 @@ async def operator_heartbeat_middleware(request, call_next):
     availability composition (PR-255). The dashboard is GET-dominated
     (main page, ``/api/*`` polling, ``/partials/*``), so restricting
     refresh to mutating methods would let an actively-watching operator
-    expire after the TTL — violating the ``HeartbeatSource`` contract
-    that "presence = AVAILABLE". Refresh on any successful 2xx response
-    to GET/POST/PUT/PATCH/DELETE; HEAD/OPTIONS (probes, CORS preflight)
-    and non-2xx responses are skipped. Best-effort: a Redis outage must
-    not break the request, so all storage errors are swallowed.
+    expire after the TTL. We instead refresh on any successful 2xx
+    response that :func:`_is_operator_driven_request` classifies as
+    operator-driven — explicit mutations, HTMX polls from the dashboard,
+    or any modern-browser GET. Automated GET pollers and health checks
+    (no ``HX-Request``/``Sec-Fetch-Site``) are skipped so they cannot
+    pin the key alive when no operator is present.
+
+    Best-effort: a Redis outage must not break the request, so all
+    storage errors are swallowed.
     """
     response = await call_next(request)
-    if request.method not in _OPERATOR_HEARTBEAT_METHODS:
+    if not _is_operator_driven_request(request):
         return response
     if not (200 <= response.status_code < 300):
         return response

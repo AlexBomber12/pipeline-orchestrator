@@ -89,9 +89,17 @@ async def test_manual_override_missing_returns_none() -> None:
     assert await source.query() is None
 
 
-async def test_manual_override_redis_failure_returns_none() -> None:
+async def test_manual_override_redis_failure_propagates() -> None:
+    """Source must NOT swallow Redis errors.
+
+    The composition's failure-safe bias depends on
+    :func:`is_operator_available` observing the exception; a swallowed
+    error would leave ``any_failed`` false and let an ``AWAY`` from
+    another source win during a Redis outage.
+    """
     source = ManualOverrideSource(redis_client=_FakeRedis(raise_on_get=True))
-    assert await source.query() is None
+    with pytest.raises(RuntimeError, match="boom"):
+        await source.query()
 
 
 async def test_manual_override_decodes_bytes_payload() -> None:
@@ -114,9 +122,11 @@ async def test_heartbeat_absent_returns_none() -> None:
     assert await source.query() is None
 
 
-async def test_heartbeat_redis_failure_returns_none() -> None:
+async def test_heartbeat_redis_failure_propagates() -> None:
+    """Source must NOT swallow Redis errors (see manual_override rationale)."""
     source = HeartbeatSource(redis_client=_FakeRedis(raise_on_exists=True))
-    assert await source.query() is None
+    with pytest.raises(RuntimeError, match="boom"):
+        await source.query()
 
 
 # ---------------------------------------------------------------------------
@@ -138,9 +148,11 @@ async def test_active_hours_outside_window(monkeypatch: pytest.MonkeyPatch) -> N
     assert await source.query() is AvailabilityState.AWAY
 
 
-async def test_active_hours_invalid_timezone_returns_none() -> None:
+async def test_active_hours_invalid_timezone_propagates() -> None:
+    """Bad timezone is a config failure - propagate so composition records it."""
     source = ActiveHoursSource(timezone_name="Not/A/Real/Zone")
-    assert await source.query() is None
+    with pytest.raises(Exception):
+        await source.query()
 
 
 # ---------------------------------------------------------------------------
@@ -243,3 +255,25 @@ async def test_composition_manual_override_still_wins_when_other_source_raises()
         _StaticSource("heartbeat", raises=True),
     ]
     assert await is_operator_available(sources) is AvailabilityState.AWAY
+
+
+async def test_composition_real_sources_off_hours_redis_down_stays_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end failure-safe: off-hours + Redis down must stay AVAILABLE.
+
+    Wires the real ``ManualOverrideSource``/``HeartbeatSource``
+    against a fake Redis that raises, plus a real ``ActiveHoursSource``
+    forced into the off-hours window. Without source-failure
+    propagation, ``ActiveHoursSource``'s AWAY would win and incorrectly
+    pause work during a Redis outage.
+    """
+    fixed = datetime.fromisoformat("2026-05-04T03:00:00+02:00")
+    monkeypatch.setattr(availability_module, "datetime", _FixedNowDatetime(fixed))
+    failing_redis = _FakeRedis(raise_on_get=True, raise_on_exists=True)
+    sources = [
+        ManualOverrideSource(redis_client=failing_redis),
+        HeartbeatSource(redis_client=failing_redis),
+        ActiveHoursSource(start_hour=9, end_hour=21, timezone_name="Europe/Rome"),
+    ]
+    assert await is_operator_available(sources) is AvailabilityState.AVAILABLE

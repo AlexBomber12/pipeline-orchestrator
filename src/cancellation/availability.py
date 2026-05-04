@@ -45,16 +45,17 @@ class ManualOverrideSource:
     - "AVAILABLE" -> AvailabilityState.AVAILABLE
     - "AWAY" -> AvailabilityState.AWAY
     - "AUTO" or missing -> None (defer)
+
+    Redis errors are not swallowed: they propagate so
+    :func:`is_operator_available` can record a source failure and apply
+    the failure-safe bias.
     """
 
     redis_client: Any = None
     name: str = "manual_override"
 
     async def query(self) -> AvailabilityState | None:
-        try:
-            raw = await self.redis_client.get("operator_override")
-        except Exception:
-            return None
+        raw = await self.redis_client.get("operator_override")
         if raw is None:
             return None
         if isinstance(raw, bytes):
@@ -71,25 +72,31 @@ class HeartbeatSource:
     """Dashboard visit heartbeat with TTL.
 
     Reads ``operator_heartbeat`` Redis key (set by dashboard middleware
-    on each authenticated request, TTL N minutes). Present = AVAILABLE,
+    on operator-driven requests, TTL N minutes). Present = AVAILABLE,
     absent = None (defer rather than declaring AWAY, since absence
     could be legitimate AVAILABLE-but-not-clicking).
+
+    Redis errors are not swallowed: they propagate so
+    :func:`is_operator_available` can record a source failure and apply
+    the failure-safe bias.
     """
 
     redis_client: Any = None
     name: str = "heartbeat"
 
     async def query(self) -> AvailabilityState | None:
-        try:
-            present = await self.redis_client.exists("operator_heartbeat")
-        except Exception:
-            return None
+        present = await self.redis_client.exists("operator_heartbeat")
         return AvailabilityState.AVAILABLE if present else None
 
 
 @dataclass
 class ActiveHoursSource:
-    """Config-tunable active hours window per timezone."""
+    """Config-tunable active hours window per timezone.
+
+    Configuration errors (e.g. an invalid timezone) propagate so
+    :func:`is_operator_available` can record a source failure and apply
+    the failure-safe bias rather than silently deferring.
+    """
 
     start_hour: int = 9
     end_hour: int = 21
@@ -97,14 +104,11 @@ class ActiveHoursSource:
     name: str = "active_hours"
 
     async def query(self) -> AvailabilityState | None:
-        try:
-            tz = ZoneInfo(self.timezone_name)
-            now = datetime.now(tz=tz)
-            if self.start_hour <= now.hour < self.end_hour:
-                return AvailabilityState.AVAILABLE
-            return AvailabilityState.AWAY
-        except Exception:
-            return None
+        tz = ZoneInfo(self.timezone_name)
+        now = datetime.now(tz=tz)
+        if self.start_hour <= now.hour < self.end_hour:
+            return AvailabilityState.AVAILABLE
+        return AvailabilityState.AWAY
 
 
 async def is_operator_available(
