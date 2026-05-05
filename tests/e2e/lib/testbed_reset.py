@@ -283,6 +283,62 @@ def clear_testbed_redis_state(slug: str) -> int:
         ) from exc
 
 
+def read_recovered_task_pr_ids(slug: str) -> set[str]:
+    """Read ``recovered_tasks:{slug}`` from the test stack's redis.
+
+    Returns the persisted set as ``set[str]``. Returns an empty set when
+    the key is missing (the runner deletes the key once the in-memory
+    set becomes empty per ``runner.py:_persist_recovered_task_pr_ids``).
+    Raises ``RuntimeError`` on any redis-cli failure or on JSON that
+    does not decode to a list of strings — callers rely on the helper
+    to surface a corrupted snapshot rather than mask it as "empty".
+    """
+    base_cmd = [
+        "docker",
+        "compose",
+        "-f",
+        TESTBED_COMPOSE_FILE,
+        "exec",
+        "-T",
+        "redis-test",
+        "redis-cli",
+        "GET",
+        f"recovered_tasks:{slug}",
+    ]
+    try:
+        result = subprocess.run(
+            base_cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"read_recovered_task_pr_ids: redis GET failed: {exc}") from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            "read_recovered_task_pr_ids: redis GET failed "
+            f"(rc={result.returncode}): "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+    raw = result.stdout.strip()
+    if not raw:
+        return set()
+    import json
+
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"read_recovered_task_pr_ids: invalid JSON: {raw!r}"
+        ) from exc
+    if not isinstance(decoded, list) or not all(isinstance(item, str) for item in decoded):
+        raise RuntimeError(
+            f"read_recovered_task_pr_ids: expected JSON list of strings, got {decoded!r}"
+        )
+    return set(decoded)
+
+
 def reset_testbed_full(slug: str) -> dict:
     """Full reset: close PRs, delete branches, wipe tasks/. Returns counts dict.
 
