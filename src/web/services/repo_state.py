@@ -23,7 +23,7 @@ from src.cancellation.blocked_set import (
 )
 from src.config import AppConfig, RepoConfig, load_config
 from src.keyspace import pipeline_state
-from src.models import PipelineState, RepoState, TaskStatus
+from src.models import PipelineState, QueueTask, RepoState, TaskStatus
 from src.queue_parser import parse_queue
 from src.utils import repo_slug_from_url
 
@@ -100,6 +100,30 @@ async def get_repo_state(
         return state
 
     return _default_repo_state(name, url)
+
+
+async def load_current_queue(
+    repo_name: str,
+    redis_client: aioredis.Redis | None = None,
+) -> list[QueueTask] | None:
+    """Return the Redis-backed queue snapshot for ``repo_name`` if present."""
+    if redis_client is None:
+        from src.web import app as _app
+
+        redis_client = getattr(_app.app.state, "redis", None)
+    if redis_client is None:
+        return None
+    try:
+        raw = await redis_client.get(pipeline_state(repo_name))
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        state = RepoState.model_validate_json(raw)
+    except Exception:
+        return None
+    return state.current_queue
 
 
 def _find_repo_config_by_name(

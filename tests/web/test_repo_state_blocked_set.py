@@ -5,6 +5,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from src.models import PipelineState, QueueTask, RepoState, TaskStatus
+from src.web import app as web_app
+from src.web.routes.repo_control import _resolve_repo_task_path
 from src.web.services.repo_state import (
     build_repo_task_nodes,
     compute_repo_blocked_set,
@@ -143,3 +148,53 @@ def test_unreadable_queue_returns_empty(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(rs, "parse_queue", boom)
     nodes = build_repo_task_nodes(str(tmp_path), "broken__repo")
     assert nodes == []
+
+
+class _SnapshotRedis:
+    def __init__(self, state: RepoState) -> None:
+        self._payload = state.model_dump_json()
+
+    async def get(self, key: str) -> str | None:
+        if key == "pipeline:owner__repo":
+            return self._payload
+        return None
+
+
+@pytest.mark.asyncio
+async def test_resolve_repo_task_path_uses_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = tmp_path / "owner__repo"
+    tasks_dir = repo_root / "tasks"
+    tasks_dir.mkdir(parents=True)
+    default_path = tasks_dir / "PR-099.md"
+    custom_path = tasks_dir / "custom-name.md"
+    default_path.write_text("# default\n", encoding="utf-8")
+    custom_path.write_text("# custom\n", encoding="utf-8")
+    (tasks_dir / "QUEUE.md").write_text(
+        "# Task Queue\n\n"
+        "## PR-099: Disk mapping\n"
+        "- Status: TODO\n"
+        "- Tasks file: tasks/PR-099.md\n",
+        encoding="utf-8",
+    )
+    state = RepoState(
+        url="https://github.com/owner/repo.git",
+        name="owner__repo",
+        state=PipelineState.IDLE,
+        current_queue=[
+            QueueTask(
+                pr_id="PR-099",
+                title="Snapshot mapping",
+                status=TaskStatus.TODO,
+                task_file="tasks/custom-name.md",
+            )
+        ],
+    )
+    monkeypatch.setattr(web_app, "REPOS_DIR", str(tmp_path))
+    monkeypatch.setattr(web_app.app.state, "redis", _SnapshotRedis(state))
+
+    resolved = await _resolve_repo_task_path("owner__repo", "PR-099")
+
+    assert resolved == (custom_path.resolve(), "tasks/custom-name.md")
