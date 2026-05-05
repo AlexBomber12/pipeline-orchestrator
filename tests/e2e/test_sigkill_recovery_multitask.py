@@ -1,0 +1,366 @@
+"""Multi-task variant of the SIGKILL-recovery e2e (PR-258d).
+
+PR-186 established that a SIGKILL during CODING (before the coder pushes
+a branch) recovers to IDLE with the in-flight task auto-CANCELED rather
+than rebooting into a CODING loop on the same crashed task. The single-
+task case is already pinned by ``tests/e2e/test_sigkill_recovery.py``.
+This test exercises the multi-task variant so the upcoming PR-266
+recovery refactor (header-driven queue derivation replacing the legacy
+``tasks/QUEUE.md`` probe) has a load-bearing integration anchor: a
+post-recovery queue that mis-orders TODOs, mis-handles ``depends_on``
+edges across a CANCELED root, or fails to feed the IDLE selector
+correctly will fail this test rather than silently land.
+
+The queue mix is:
+
+* PR-A — priority 1, no deps.
+* PR-B — priority 2, no deps.
+* PR-C — priority 2, ``Depends on: PR-A``.
+* PR-D — priority 3, no deps.
+
+PR-A wins the initial CODING dispatch (priority 1 sorts ahead of every
+sibling). After SIGKILL-then-recover, PR-A becomes CANCELED. The
+production ``depends_on`` policy treats CANCELED as **not DONE**, so
+PR-C remains BLOCKED (TODO but not eligible) and the next dispatch is
+PR-B (priority 2 with no unmet deps). The test asserts both ends:
+
+1. The dashboard's ``/repos/{slug}/tasks`` fragment reports PR-A under
+   ``canceled`` and the remaining tasks under ``todo`` (or ``doing`` if
+   the daemon already advanced).
+2. After the slow shim exits and ``success`` takes over, the daemon
+   dispatches PR-B — not PR-A (would mean re-entry on the crashed task)
+   and not PR-C (would mean CANCELED unblocked dependents, contradicting
+   ``src/dag.py:get_eligible_tasks``).
+
+A regression in the recovery code that mis-derives the post-CANCEL
+queue (drops a TODO, mis-orders priority, treats CANCELED as DONE)
+fails one of those two assertions.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import subprocess
+import time
+
+import requests
+
+from tests.e2e.lib.coder_shim import coder_shim
+
+DAEMON_CONTAINER = "pipeline-orchestrator-daemon-test"
+COMPOSE_FILE = "docker-compose.test.yml"
+
+RECOVERY_DEADLINE_SEC = 120
+DISPATCH_DEADLINE_SEC = 30
+
+
+def _is_daemon_running() -> str:
+    result = subprocess.run(
+        [
+            "docker",
+            "inspect",
+            "--format",
+            "{{.State.Running}}",
+            DAEMON_CONTAINER,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    return result.stdout.strip()
+
+
+def _daemon_exit_code() -> int:
+    result = subprocess.run(
+        [
+            "docker",
+            "inspect",
+            "--format",
+            "{{.State.ExitCode}}",
+            DAEMON_CONTAINER,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    return int(result.stdout.strip())
+
+
+def _fetch_tasks_panel(dashboard_url: str, slug: str) -> tuple[int, str]:
+    response = requests.get(
+        f"{dashboard_url}/repos/{slug}/tasks", timeout=10
+    )
+    return response.status_code, response.text
+
+
+def _task_status_from_html(html: str, pr_id: str) -> str | None:
+    """Return the bucket that ``pr_id`` lives in inside the tasks panel.
+
+    The fragment renders each task into a ``<div id="task-content-{status}-{pr_id}">``
+    inside its status section (see
+    ``src/web/templates/components/tasks_panel.html``). The id is the
+    most stable hook into the rendered HTML — no class name, ARIA role,
+    or text changes will move it. Missing pr_id returns ``None``.
+    """
+    for status in ("doing", "todo", "canceled", "done"):
+        marker = f'task-content-{status}-{pr_id}'
+        if marker in html:
+            return status
+    return None
+
+
+def test_sigkill_during_coding_with_multitask_queue_recovers_and_progresses(
+    dashboard_url,
+    testbed_slug,
+    wait_for_state,
+    get_state,
+    upload_zip,
+    make_task_zip_multi,
+    reset_testbed,
+):
+    try:
+        wait_for_state(["IDLE"], timeout_sec=30)
+    except TimeoutError as exc:
+        raise AssertionError(
+            f"test stack did not reach IDLE before test start: {exc}"
+        ) from exc
+
+    base = int(time.time())
+    pr_a_int, pr_b_int, pr_c_int, pr_d_int = (
+        base, base + 1, base + 2, base + 3
+    )
+    pr_a_id = f"PR-{pr_a_int}"
+    pr_b_id = f"PR-{pr_b_int}"
+    pr_c_id = f"PR-{pr_c_int}"
+    pr_d_id = f"PR-{pr_d_int}"
+
+    with coder_shim("slow"):
+        zip_path = make_task_zip_multi(
+            [
+                (pr_a_int, "e2e-multitask-recovery-root", [], 1),
+                (pr_b_int, "e2e-multitask-recovery-sibling", [], 2),
+                (pr_c_int, "e2e-multitask-recovery-dep", [pr_a_id], 2),
+                (pr_d_int, "e2e-multitask-recovery-tail", [], 3),
+            ],
+            coder="any",
+        )
+        status = upload_zip(zip_path)
+        assert status in (200, 201), f"upload failed with status {status}"
+
+        # Priority 1 wins the dispatch race deterministically per
+        # ``src/dag.py:get_eligible_tasks``: sort key is
+        # ``(priority, _pr_sort_key(pr_id))``, and PR-A is the only
+        # priority-1 task in the upload. Capture the entry once we see
+        # PR-A in CODING so the freshness-gate threshold below is
+        # anchored to the pre-kill state, not to a stale snapshot from
+        # the previous test run.
+        deadline = time.monotonic() + 60
+        pre_kill_entry: dict | None = None
+        last_state = None
+        last_task_pr_id = None
+        while time.monotonic() < deadline:
+            entry = get_state()
+            if entry is not None:
+                last_state = entry.get("state")
+                task = entry.get("current_task") or {}
+                last_task_pr_id = task.get("pr_id")
+                if last_state == "CODING" and last_task_pr_id == pr_a_id:
+                    pre_kill_entry = entry
+                    break
+            time.sleep(1)
+        assert pre_kill_entry is not None, (
+            f"daemon did not enter CODING on {pr_a_id!r} within 60s; "
+            f"last_state={last_state!r}, last_task_pr_id={last_task_pr_id!r}"
+        )
+        pre_kill_last_updated = pre_kill_entry.get("last_updated")
+        assert pre_kill_last_updated, (
+            f"pre-kill CODING state has no last_updated: {pre_kill_entry!r}"
+        )
+        pre_kill_ts = dt.datetime.fromisoformat(pre_kill_last_updated)
+
+        # The slow shim sleeps 30s after ``git_setup_branch`` and before
+        # any commit/push, so SIGKILL here is the canonical "before push"
+        # crash that PR-186 codifies. The shim is a child of the daemon
+        # process, so SIGKILL terminates both — no orphan can race
+        # teardown to push a branch and re-create PR state.
+        subprocess.run(
+            ["docker", "kill", "--signal=KILL", DAEMON_CONTAINER],
+            check=True,
+            timeout=10,
+        )
+
+        try:
+            running = _is_daemon_running()
+            assert running == "false", (
+                f"daemon container still reports Running={running!r} "
+                f"after SIGKILL"
+            )
+            exit_code = _daemon_exit_code()
+            assert exit_code == 137, (
+                f"daemon container exit code was {exit_code}, "
+                f"expected 137 (128 + SIGKILL)"
+            )
+        finally:
+            subprocess.run(
+                [
+                    "docker", "compose", "-f", COMPOSE_FILE,
+                    "up", "-d", "daemon-test",
+                ],
+                check=True,
+                timeout=60,
+            )
+
+        deadline = time.monotonic() + 30
+        running_again = "false"
+        while time.monotonic() < deadline:
+            running_again = _is_daemon_running()
+            if running_again == "true":
+                break
+            time.sleep(1)
+        assert running_again == "true", (
+            f"daemon-test did not return to Running=true within 30s "
+            f"after restart; last value was {running_again!r}"
+        )
+
+        # PR-186 contract: a DOING task with no matching open PR after a
+        # crash is the SIGKILL/OOM signature; recovery marks the task
+        # CANCELED and parks the runner in IDLE rather than re-running
+        # CODING. The freshness gate (ts > pre_kill_ts) rejects the
+        # pre-kill snapshot Redis still holds before the new daemon
+        # publishes its first state. ``current_task is None`` rejects
+        # any half-published intermediate state from the new daemon
+        # before recovery completes.
+        recovered: dict | None = None
+        last_seen_state = None
+        last_seen_ts: dt.datetime | None = None
+        last_seen_current_task: object = "<unset>"
+        deadline = time.monotonic() + RECOVERY_DEADLINE_SEC
+        while time.monotonic() < deadline:
+            entry = get_state()
+            if entry is not None:
+                last_seen_state = entry.get("state")
+                last_seen_current_task = entry.get("current_task")
+                last_updated = entry.get("last_updated")
+                ts: dt.datetime | None = None
+                if last_updated:
+                    try:
+                        ts = dt.datetime.fromisoformat(last_updated)
+                    except ValueError:
+                        ts = None
+                last_seen_ts = ts
+                if (
+                    ts is not None
+                    and ts > pre_kill_ts
+                    and last_seen_state == "IDLE"
+                    and last_seen_current_task is None
+                ):
+                    recovered = entry
+                    break
+            time.sleep(1)
+        assert recovered is not None, (
+            f"daemon did not quiesce in IDLE within "
+            f"{RECOVERY_DEADLINE_SEC}s after restart; "
+            f"last_seen_state={last_seen_state!r}, "
+            f"last_seen_current_task={last_seen_current_task!r}, "
+            f"last_seen_last_updated="
+            f"{last_seen_ts.isoformat() if last_seen_ts else None!r}, "
+            f"pre_kill_last_updated={pre_kill_ts.isoformat()!r}"
+        )
+
+        # PR-222 appended a ``BranchContext.log_summary()`` suffix to
+        # the cancellation event so an operator can name every branch
+        # surface from a single log entry; assert the prefix rather
+        # than exact equality so the diagnostic context can grow
+        # without breaking the recovery contract this e2e pins.
+        history = recovered.get("history") or []
+        crash_event_prefix = (
+            f"[INFRA] Task {pr_a_id} crashed, marking CANCELED. "
+            "Manually re-upload to retry."
+        )
+        assert any(
+            isinstance(item, dict)
+            and isinstance(item.get("event"), str)
+            and item["event"].startswith(crash_event_prefix)
+            for item in history
+        ), (
+            f"recovered IDLE without crash-mark log entry for {pr_a_id!r}; "
+            f"history={history!r}"
+        )
+
+        # Post-recovery queue derivation. The dashboard fragment is the
+        # operator-visible surface and is stable across the PR-266
+        # migration: pre-PR-263 it is backed by ``tasks/QUEUE.md``,
+        # post-PR-263 by ``RepoState.current_queue``. Either way the
+        # rendered HTML is what an operator inspecting the queue sees.
+        # The CANCELED bucket is the load-bearing assertion: a
+        # regression that drops the CANCEL or mis-derives PR-A's
+        # status would leave it in TODO/DOING. PR-B/C/D may already
+        # have advanced into DOING by the time we read the panel
+        # (the daemon dispatches the next eligible TODO immediately on
+        # the next IDLE tick), so the assertion accepts ``todo`` or
+        # ``doing`` and only excludes ``canceled``.
+        status_code, html = _fetch_tasks_panel(dashboard_url, testbed_slug)
+        assert status_code == 200, (
+            f"GET /repos/{testbed_slug}/tasks returned "
+            f"status_code={status_code}; body[:500]={html[:500]!r}"
+        )
+        assert _task_status_from_html(html, pr_a_id) == "canceled", (
+            f"{pr_a_id!r} not in canceled bucket post-recovery; "
+            f"status={_task_status_from_html(html, pr_a_id)!r}; "
+            f"html[:1500]={html[:1500]!r}"
+        )
+        for sibling in (pr_b_id, pr_c_id, pr_d_id):
+            sibling_status = _task_status_from_html(html, sibling)
+            assert sibling_status in {"todo", "doing"}, (
+                f"{sibling!r} expected to remain TODO (or already DOING) "
+                f"post-recovery; got status={sibling_status!r}; "
+                f"html[:1500]={html[:1500]!r}"
+            )
+
+    # Step 8: switching to ``success`` after the slow context exits
+    # ensures the next CODING dispatch completes cleanly. The contract
+    # under test is independent of the shim — what matters is which PR
+    # the IDLE selector picks. PR-B is the load-bearing answer:
+    #
+    # * PR-A is CANCELED, so re-picking it would mean the recovery
+    #   contract leaked.
+    # * PR-C ``depends_on: PR-A`` and ``get_eligible_tasks`` requires
+    #   the dep to be DONE, not just terminal — CANCELED is NOT DONE
+    #   (see ``src/dag.py``), so PR-C is BLOCKED.
+    # * PR-D is priority 3, sorts behind PR-B's priority 2.
+    #
+    # If a future change makes CANCELED dependencies unblock dependents
+    # (PR-C becomes eligible), this assertion is the canary; the test
+    # owner updates the assertion only after the policy change lands
+    # intentionally.
+    with coder_shim("success"):
+        deadline = time.monotonic() + DISPATCH_DEADLINE_SEC
+        coding_pr_b: dict | None = None
+        last_state = None
+        last_task_pr_id = None
+        while time.monotonic() < deadline:
+            entry = get_state()
+            if entry is not None:
+                last_state = entry.get("state")
+                task = entry.get("current_task") or {}
+                last_task_pr_id = task.get("pr_id")
+                if last_state == "CODING" and last_task_pr_id == pr_b_id:
+                    coding_pr_b = entry
+                    break
+            time.sleep(1)
+        assert coding_pr_b is not None, (
+            f"daemon did not dispatch {pr_b_id!r} within "
+            f"{DISPATCH_DEADLINE_SEC}s of recovery; "
+            f"last_state={last_state!r}, "
+            f"last_task_pr_id={last_task_pr_id!r}"
+        )
+        assert last_task_pr_id != pr_a_id, (
+            f"daemon re-entered CODING on the crashed task {pr_a_id!r}; "
+            f"PR-186 contract violated"
+        )
+        assert last_task_pr_id != pr_c_id, (
+            f"daemon dispatched {pr_c_id!r} whose dep {pr_a_id!r} is "
+            f"CANCELED; production policy requires Depends-on to be DONE"
+        )
