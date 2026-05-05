@@ -11,7 +11,15 @@ daemon:
   review_timeout_min: 2
   auto_fallback: true
   hung_fallback_codex_review: true
-  error_handler_use_ai: false
+  # The mock shim short-circuits the diagnose_error prompt and returns SKIP
+  # without spending CLI quota (see tests/e2e/lib/coder_shim.sh, "FIX, SKIP,
+  # or ESCALATE" branch). Enabling the AI handler in the test config lets
+  # ERROR transitions (e.g. exit_nonzero coder shim in
+  # test_cancellation_cause_crash.py) recover via the SKIP path instead of
+  # parking the runner in ERROR forever and poisoning subsequent e2e tests.
+  # OBS-4 (PR-182) routes infra-class errors past diagnose_error, so the
+  # original quota concern from PR-153c no longer applies.
+  error_handler_use_ai: true
   claude_model: opus
   fix_idle_timeout_sec: 60
   fix_no_push_cap: 3
