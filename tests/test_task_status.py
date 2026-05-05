@@ -229,6 +229,16 @@ def test_resolve_merged_state_api_primary(monkeypatch) -> None:
     assert derive_task_status(header, state, []) == TaskStatus.DONE
 
 
+def test_derive_todo_when_merged_branch_matches_different_pr_id() -> None:
+    status = derive_task_status(
+        _header("pr-999-reused-branch"),
+        _merged_state(branches={"pr-999-reused-branch"}),
+        [],
+    )
+
+    assert status == TaskStatus.TODO
+
+
 def test_resolve_merged_state_git_log_fallback(monkeypatch) -> None:
     header = _header("pr-085-status-from-git")
     logs: list[str] = []

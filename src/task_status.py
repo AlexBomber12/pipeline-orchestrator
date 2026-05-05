@@ -75,7 +75,11 @@ def derive_task_status(
     current_task_pr_id: str | None = None,
 ) -> TaskStatus:
     """Derive task status from git state."""
-    if task_header.branch and task_header.branch in state.merged_branches:
+    if (
+        task_header.branch
+        and task_header.branch in state.merged_branches
+        and _branch_name_matches_task_pr_id(task_header.pr_id, task_header.branch)
+    ):
         return TaskStatus.DONE
     if task_header.pr_id in state.merged_pr_ids:
         return TaskStatus.DONE
@@ -147,6 +151,25 @@ def _branch_matches_task_pr(
     if candidate_pr_id is None:
         return True
     return candidate_pr_id == pr_id
+
+
+def _branch_name_matches_task_pr_id(pr_id: str, branch: str) -> bool:
+    """Return True when a task branch name carries its queue PR id."""
+    branch_name = branch.lower()
+    pr_id_name = pr_id.lower()
+    candidates = {
+        pr_id_name,
+        pr_id_name.replace("_", "-").replace(".", "-"),
+    }
+    return any(
+        branch_name == candidate
+        or (
+            branch_name.startswith(candidate)
+            and branch_name[len(candidate)] in "-_./"
+        )
+        for candidate in candidates
+        if candidate
+    )
 
 
 def get_merged_pr_ids(
