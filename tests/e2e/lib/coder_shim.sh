@@ -119,6 +119,31 @@ run_success() {
     gh pr comment "${pr_url}" --body "@codex review"
 }
 
+run_success_pending_ci() {
+    # Like run_success, but also publishes a pending commit status on the
+    # head SHA before exiting. The status is posted BEFORE the shim
+    # returns, so the daemon's first WATCH poll observes CI=PENDING and
+    # cannot race a green-with-pending-review merge before the test can
+    # post REQUEST_CHANGES. Posted by the testbed App, which already
+    # carries Commit statuses: Write per docs/ci-setup.md.
+    local pr="$1" branch="$2"
+    git_setup_branch "${branch}"
+    write_marker_and_commit "${pr}"
+    safe_push_branch "${branch}"
+    local sha
+    sha="$(git rev-parse HEAD)"
+    local pr_url
+    pr_url="$(ensure_pr_url "${branch}" "${pr}")"
+    if ! gh api -X POST "repos/AlexBomber12/pipeline-orchestrator-testbed/statuses/${sha}" \
+        -f state=pending \
+        -f context=e2e/watch-merge-gate \
+        -f description="e2e gate to block WATCH merge before review post" \
+        >/dev/null 2>&1; then
+        printf 'shim: failed to post pending status on %s; test will likely fail at REQUEST_CHANGES\n' "${sha}" >&2
+    fi
+    gh pr comment "${pr_url}" --body "@codex review"
+}
+
 run_no_pr() {
     local pr="$1" branch="$2"
     git_setup_branch "${branch}"
@@ -265,6 +290,9 @@ main() {
     case "${scenario}" in
         success)
             run_success "${pr}" "${branch}"
+            ;;
+        success_pending_ci)
+            run_success_pending_ci "${pr}" "${branch}"
             ;;
         no_pr)
             run_no_pr "${pr}" "${branch}"

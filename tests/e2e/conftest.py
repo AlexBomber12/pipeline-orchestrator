@@ -1,4 +1,5 @@
 import json
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -289,6 +290,55 @@ def recover_repo():
         return response.status_code, body
 
     return _recover_repo
+
+
+@pytest.fixture
+def post_review():
+    """Post a PR review on the testbed via ``gh api`` and return the review id.
+
+    Generic enough for PR-258d or future review-driven e2e tests; the
+    review is posted under whatever identity the test runs as
+    (developer's gh CLI locally, testbed App in CI). ``event`` accepts
+    GitHub's review events such as ``REQUEST_CHANGES``, ``APPROVE``, or
+    ``COMMENT``.
+    """
+
+    def _post_review(
+        pr_number: int,
+        event: str,
+        body: str,
+        repo: str = "AlexBomber12/pipeline-orchestrator-testbed",
+    ) -> int:
+        result = subprocess.run(
+            [
+                "gh", "api", "-X", "POST",
+                f"repos/{repo}/pulls/{pr_number}/reviews",
+                "-f", f"event={event}",
+                "-f", f"body={body}",
+            ],
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+        if result.returncode != 0:
+            raise AssertionError(
+                f"failed to post {event} review on PR #{pr_number}: "
+                f"rc={result.returncode}, stderr={result.stderr.strip()!r}"
+            )
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            raise AssertionError(
+                f"gh api returned non-JSON for review on PR #{pr_number}: "
+                f"{result.stdout!r}"
+            ) from exc
+        review_id = payload.get("id")
+        if not isinstance(review_id, int):
+            raise AssertionError(
+                f"gh api response missing integer 'id' for review on PR "
+                f"#{pr_number}: {payload!r}"
+            )
+        return review_id
+
+    return _post_review
 
 
 @pytest.fixture
