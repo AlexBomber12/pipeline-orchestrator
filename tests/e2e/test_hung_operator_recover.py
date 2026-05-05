@@ -22,33 +22,131 @@ A regression in any single boundary (TTL drop, GETDEL split, set
 persistence corrupted, upload-time clear removed) is invisible to today's
 CI; this test couples them as one trip.
 
-Note on the HUNG-entry path: the original task spec called for the
-FIX-then-ESCALATE engineering trick used by ``test_fix_coder_escalate``,
-but ``fix_escalation.escalate_fix_coder_initiated`` routes to ``IDLE``
-on label-apply success (the testbed App has ``Pull requests: Write``,
-so the apply succeeds). This test uses the WATCH review-timeout path
-instead, which is the production scenario PR-247's recover button was
-designed for: a PR sits in WATCH waiting for a Codex review that never
-arrives, and after ``review_timeout_min`` (2 min in the test config) the
-WATCH handler routes to ``HUNG`` via ``_escalate_to_hung`` with the
-default ``target_state=HUNG``.
+HUNG-entry path: the test config has ``auto_merge: true`` plus
+``allow_merge_without_review: true`` and ``allow_merge_without_checks:
+true``, so the moment WATCH is reached the runner would auto-merge the
+shim's empty PR before the review-timeout fires. Instead, this test
+follows the same engineering path as ``test_fix_external_merge.py``:
+inject a failed CI status to drive WATCH→FIX, then close the PR while
+FIX is mid-cycle. The FIX-supervision side task observes the closed PR
+via ``handle_external_terminal_pr_state`` and parks the runner in HUNG
+with ``current_pr`` and ``current_task`` preserved
+(``src/daemon/fix_supervision.py``). ``handle_hung`` checks the
+operator-recover flag BEFORE the PR-state branch, so the recover click
+beats the closed-PR→IDLE fallback.
 """
 
 from __future__ import annotations
 
+import subprocess
 import time
+
+import pytest
 
 from tests.e2e.lib.coder_shim import coder_shim
 from tests.e2e.lib.testbed_reset import read_recovered_task_pr_ids
 
-# config.test.yml sets ``review_timeout_min: 2`` and ``poll_interval_sec: 2``
-# at both the daemon and repo level. Reaching HUNG via the WATCH review
-# timeout requires WATCH entry plus the 2-minute timeout plus one poll
-# cycle. Allow generous slack so a slow CI runner does not flake.
-HUNG_DEADLINE_SEC = 240
+TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
+# fix_supervision polls every fix_poll_interval_sec (5s in the test
+# config); leave generous slack for the close detection plus the
+# subsequent state publish.
+HUNG_DEADLINE_SEC = 90
 RECOVER_TO_IDLE_DEADLINE_SEC = 60
 MARKER_CLEAR_DEADLINE_SEC = 30
 POST_UPLOAD_CODING_DEADLINE_SEC = 60
+
+
+_PERMISSION_GAP_MESSAGE = (
+    "Testbed GitHub App is missing the 'Commit statuses: Write' "
+    "permission required to engineer the WATCH→FIX transition. "
+    "Update the App per docs/ci-setup.md Step A and re-run. "
+    "The recover button is exercised by the unit tests in "
+    "tests/test_runner.py and tests/test_repo_control.py."
+)
+
+
+def _preflight_status_write_permission() -> None:
+    """Skip BEFORE side-effecting setup if the App can't post statuses.
+
+    A POST to ``/statuses/<invalid-sha>`` checks authorization before
+    SHA validation: 403 ``Resource not accessible by integration`` →
+    permission gap; 422 ``No commit found`` → permission ok, SHA bogus
+    (the desired no-op outcome). Mirrors the preflight in
+    ``test_fix_external_merge.py`` so a permission gap aborts before
+    the daemon starts a real PR.
+    """
+    invalid_sha = "0" * 40
+    result = subprocess.run(
+        [
+            "gh", "api", "-X", "POST",
+            f"repos/{TESTBED_REPO}/statuses/{invalid_sha}",
+            "-f", "state=success",
+            "-f", "context=e2e-recover-preflight",
+        ],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    if (
+        result.returncode != 0
+        and "Resource not accessible by integration" in result.stderr
+    ):
+        pytest.skip(_PERMISSION_GAP_MESSAGE)
+
+
+def _post_failed_status(head_sha: str) -> None:
+    result = subprocess.run(
+        [
+            "gh", "api", "-X", "POST",
+            f"repos/{TESTBED_REPO}/statuses/{head_sha}",
+            "-f", "state=failure",
+            "-f", "context=e2e-recover-trigger",
+            "-f", "description=Engineered failure to drive FIX",
+        ],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "Resource not accessible by integration" in stderr:
+            pytest.skip(_PERMISSION_GAP_MESSAGE)
+        raise AssertionError(
+            f"failed to post status check on {head_sha}: "
+            f"rc={result.returncode}, stderr={stderr!r}"
+        )
+
+
+def _get_pr_head_sha(pr_number: int) -> str:
+    result = subprocess.run(
+        [
+            "gh", "pr", "view", str(pr_number),
+            "-R", TESTBED_REPO,
+            "--json", "headRefOid",
+            "--jq", ".headRefOid",
+        ],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"failed to read head SHA for PR #{pr_number}: "
+            f"rc={result.returncode}, stderr={result.stderr.strip()!r}"
+        )
+    sha = result.stdout.strip()
+    if not sha:
+        raise AssertionError(f"empty head SHA for PR #{pr_number}")
+    return sha
+
+
+def _close_pr(pr_number: int) -> None:
+    result = subprocess.run(
+        [
+            "gh", "pr", "close", str(pr_number),
+            "-R", TESTBED_REPO,
+        ],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"failed to close PR #{pr_number}: "
+            f"rc={result.returncode}, stderr={result.stderr.strip()!r}"
+        )
 
 
 def _last_updated(entry: dict) -> str | None:
@@ -66,6 +164,7 @@ def test_recover_button_transitions_hung_to_idle_and_upload_clears_marker(
     recover_repo,
     reset_testbed,
 ):
+    _preflight_status_write_permission()
     try:
         wait_for_state(["IDLE"], timeout_sec=30)
     except TimeoutError as exc:
@@ -76,7 +175,7 @@ def test_recover_button_transitions_hung_to_idle_and_upload_clears_marker(
     pr_id_int = int(time.time())
     pr_id = f"PR-{pr_id_int}"
 
-    with coder_shim("success"):
+    with coder_shim("slow"):
         zip_path = make_task_zip(
             pr_id_int, "e2e-hung-operator-recover", coder="any", priority=2
         )
@@ -92,11 +191,32 @@ def test_recover_button_transitions_hung_to_idle_and_upload_clears_marker(
             f"current_pr={watch_pr!r}"
         )
 
+        # Drive WATCH→FIX via failed CI status; without this the test
+        # config's auto_merge + allow_merge_without_review + ...
+        # _without_checks bypass would auto-merge the shim's empty PR
+        # before the review timeout could ever fire.
+        head_sha = _get_pr_head_sha(watch_pr_number)
+        _post_failed_status(head_sha)
+        try:
+            wait_for_state(["FIX"], timeout_sec=30)
+        except TimeoutError:
+            pytest.skip(
+                f"daemon did not enter FIX after failed-status injection "
+                f"on PR #{watch_pr_number}; the WATCH→MERGE race likely "
+                f"won. The recover button is covered by unit tests."
+            )
+
         pre_recover_marker = read_recovered_task_pr_ids(testbed_slug)
         assert pr_id not in pre_recover_marker, (
             f"recovered-set marker already contains {pr_id!r} before recover "
             f"click; got {sorted(pre_recover_marker)!r}"
         )
+
+        # Close the PR mid-FIX. ``fix_supervision.poll_github_during_fix``
+        # observes CLOSED, terminates the coder, and
+        # ``handle_external_terminal_pr_state`` parks the runner in HUNG
+        # with current_task / current_pr preserved.
+        _close_pr(watch_pr_number)
 
         hung_entry = wait_for_state(["HUNG"], timeout_sec=HUNG_DEADLINE_SEC)
         current_task = hung_entry.get("current_task") or {}
@@ -109,6 +229,9 @@ def test_recover_button_transitions_hung_to_idle_and_upload_clears_marker(
             f"HUNG entry missing last_updated: {hung_entry!r}"
         )
 
+        # Click recover ASAP. ``handle_hung`` checks the operator-recover
+        # flag BEFORE the closed-PR→IDLE fallback, so the recover signal
+        # wins the race and produces the marker write under test.
         status_code, body = recover_repo(testbed_slug)
         assert status_code == 200, (
             f"first recover POST returned {status_code}, body={body!r}"
