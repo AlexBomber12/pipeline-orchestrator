@@ -19,11 +19,12 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from src.config import load_config
 from src.keyspace import control_recover, control_stop, pipeline_state
-from src.models import PipelineState, RepoState, TaskStatus
+from src.models import PipelineState, QueueTask, RepoState, TaskStatus
 from src.web.services.coder import _effective_coder_name
 from src.web.services.repo_state import (
     _default_repo_state,
     _find_repo_config_by_name,
+    load_current_queue,
 )
 
 router = APIRouter()
@@ -51,10 +52,48 @@ _CODER_LABELS = {
     "codex": "Codex CLI",
 }
 
+_QueueSource = Literal["snapshot", "fallback_disk"]
+
 
 def _coder_display_name(coder: str) -> str:
     """Return the UI label for a coder selection."""
     return _CODER_LABELS.get(coder, coder)
+
+
+async def _load_current_queue_snapshot(
+    name: str,
+) -> tuple[list[QueueTask] | None, _QueueSource, str | None]:
+    """Return the current queue snapshot and source marker for ``name``."""
+    snapshot = await load_current_queue(name)
+    if snapshot is None:
+        return None, "fallback_disk", None
+
+    redis_client = getattr(_app.app.state, "redis", None)
+    snapshot_at: str | None = None
+    if redis_client is not None:
+        try:
+            raw = await redis_client.get(pipeline_state(name))
+            if raw:
+                state = RepoState.model_validate_json(raw)
+                snapshot_at = state.last_updated.isoformat()
+        except Exception:
+            snapshot_at = None
+    return snapshot, "snapshot", snapshot_at
+
+
+def _queue_json_payload(
+    name: str,
+    tasks: list[QueueTask],
+    *,
+    source: _QueueSource,
+    snapshot_at: str | None,
+) -> dict[str, object]:
+    return {
+        "repo": name,
+        "snapshot_at": snapshot_at,
+        "queue": [task.model_dump(mode="json") for task in tasks],
+        "source": source,
+    }
 
 
 class _RepoStateMutationError(Exception):
@@ -480,19 +519,21 @@ async def list_repo_tasks(request: Request, name: str) -> Response:
             status_code=404,
         )
     queue_path = Path(_app.REPOS_DIR) / name / "tasks" / "QUEUE.md"
-    try:
-        tasks = _app.parse_queue(str(queue_path))
-    except (OSError, UnicodeDecodeError):
-        # A non-UTF-8 or otherwise unreadable QUEUE.md (bad manual edit,
-        # interrupted merge, lost permissions) must not 500 the entire
-        # Tasks panel — return a controlled fragment instead. Use 503 so
-        # the global htmx:beforeSwap hook in base.html swaps the fragment
-        # in (it only enables swap for 404/422/503).
-        return HTMLResponse(
-            '<p class="text-sm italic text-fail">Unable to read'
-            " tasks/QUEUE.md.</p>",
-            status_code=503,
-        )
+    tasks, _source, _snapshot_at = await _load_current_queue_snapshot(name)
+    if tasks is None:
+        try:
+            tasks = _app.parse_queue(str(queue_path))
+        except (OSError, UnicodeDecodeError):
+            # A non-UTF-8 or otherwise unreadable QUEUE.md (bad manual edit,
+            # interrupted merge, lost permissions) must not 500 the entire
+            # Tasks panel — return a controlled fragment instead. Use 503 so
+            # the global htmx:beforeSwap hook in base.html swaps the fragment
+            # in (it only enables swap for 404/422/503).
+            return HTMLResponse(
+                '<p class="text-sm italic text-fail">Unable to read'
+                " tasks/QUEUE.md.</p>",
+                status_code=503,
+            )
     grouped = {
         "doing": [t for t in tasks if t.status == TaskStatus.DOING],
         "todo": [t for t in tasks if t.status == TaskStatus.TODO],
@@ -510,7 +551,39 @@ async def list_repo_tasks(request: Request, name: str) -> Response:
     )
 
 
-def _resolve_repo_task_path(name: str, pr_id: str) -> tuple[Path, str] | None:
+@router.get("/api/repo/{name}/queue", response_class=JSONResponse)
+async def api_repo_queue(name: str) -> Response:
+    """Return the repo's queue snapshot as JSON."""
+    cfg = load_config(_app.CONFIG_PATH)
+    if _find_repo_config_by_name(cfg, name) is None:
+        return JSONResponse({"error": "Repository not found"}, status_code=404)
+
+    tasks, source, snapshot_at = await _load_current_queue_snapshot(name)
+    if tasks is None:
+        queue_path = Path(_app.REPOS_DIR) / name / "tasks" / "QUEUE.md"
+        if not queue_path.is_file():
+            return JSONResponse(
+                {"error": "Unable to read tasks/QUEUE.md"},
+                status_code=503,
+            )
+        try:
+            tasks = _app.parse_queue(str(queue_path))
+        except (OSError, UnicodeDecodeError):
+            return JSONResponse(
+                {"error": "Unable to read tasks/QUEUE.md"},
+                status_code=503,
+            )
+    return JSONResponse(
+        _queue_json_payload(
+            name,
+            tasks,
+            source=source,
+            snapshot_at=snapshot_at,
+        )
+    )
+
+
+async def _resolve_repo_task_path(name: str, pr_id: str) -> tuple[Path, str] | None:
     """Return the on-disk task file for ``pr_id`` honoring queue mappings.
 
     Honors the queue's ``- Tasks file:`` value when present (the runner
@@ -531,13 +604,15 @@ def _resolve_repo_task_path(name: str, pr_id: str) -> tuple[Path, str] | None:
     tasks_dir_resolved = tasks_dir.resolve()
 
     relative_str: str | None = None
-    try:
-        queued_tasks = _app.parse_queue(str(tasks_dir / "QUEUE.md"))
-    except (OSError, UnicodeDecodeError):
-        # A broken QUEUE.md must not block direct lookups by `{pr_id}.md`
-        # — fall through to the default filename so a single malformed
-        # queue file does not also kill task-file viewing.
-        queued_tasks = []
+    queued_tasks, _source, _snapshot_at = await _load_current_queue_snapshot(name)
+    if queued_tasks is None:
+        try:
+            queued_tasks = _app.parse_queue(str(tasks_dir / "QUEUE.md"))
+        except (OSError, UnicodeDecodeError):
+            # A broken QUEUE.md must not block direct lookups by `{pr_id}.md`
+            # — fall through to the default filename so a single malformed
+            # queue file does not also kill task-file viewing.
+            queued_tasks = []
     for task in queued_tasks:
         if task.pr_id == pr_id and task.task_file:
             relative_str = task.task_file
@@ -582,7 +657,7 @@ async def view_repo_task(
             '<p class="text-sm italic text-fail">Repository not found.</p>',
             status_code=404,
         )
-    resolved = _resolve_repo_task_path(name, pr_id)
+    resolved = await _resolve_repo_task_path(name, pr_id)
     if resolved is None:
         return HTMLResponse(
             '<p class="text-sm italic text-gray-500">Task file not found.</p>',

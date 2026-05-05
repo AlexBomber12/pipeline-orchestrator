@@ -114,6 +114,7 @@ def parse_queue_text(
                 "task_file": None,
                 "depends_on": [],
                 "branch": None,
+                "priority": 3,
             }
             continue
 
@@ -151,6 +152,15 @@ def parse_queue_text(
             current["depends_on"] = [
                 dep.strip() for dep in value.split(",") if dep.strip()
             ]
+        elif key == "priority":
+            try:
+                current["priority"] = int(value)
+            except ValueError:
+                if strict:
+                    strict_issues.append(
+                        f"invalid priority {value!r} for {current['pr_id']}"
+                    )
+                current["priority"] = 3
 
     if current is not None:
         tasks.append(_build_task(current))
@@ -483,4 +493,5 @@ def _build_task(data: dict) -> QueueTask:
         task_file=data["task_file"],
         depends_on=data["depends_on"],
         branch=data["branch"],
+        priority=data["priority"],
     )

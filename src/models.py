@@ -61,6 +61,7 @@ class QueueTask(BaseModel):
     task_file: str | None = None
     depends_on: list[str] = Field(default_factory=list)
     branch: str | None = None
+    priority: int = 3
 
 
 class PRInfo(BaseModel):
@@ -163,6 +164,7 @@ class RepoState(BaseModel):
     state: PipelineState = PipelineState.IDLE
     user_paused: bool = False
     current_task: QueueTask | None = None
+    current_queue: list[QueueTask] | None = None
     current_pr: PRInfo | None = None
     error_message: str | None = None
     last_updated: datetime = Field(
