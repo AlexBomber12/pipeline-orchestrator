@@ -194,6 +194,40 @@ def test_graphql_query_and_run_gh_options(monkeypatch: pytest.MonkeyPatch) -> No
     assert captured["kwargs"] == {}
 
 
+def test_graphql_query_string_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> dict[str, object]:
+        captured["args"] = args
+        return {"data": {"repository": {}}}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    assert gh_pr_get_merged_branches(
+        "AlexBomber12/megaraid-dashboard",
+        ["pr-001-foo", "pr-002-bar", "pr-003-baz"],
+    ) == set()
+
+    args = captured["args"]
+    assert isinstance(args, list)
+    query_arg = args[args.index("-f") + 1]
+    assert isinstance(query_arg, str)
+    assert query_arg.startswith("query=")
+    query = query_arg.removeprefix("query=")
+    expected = (
+        "query($owner: String!, $repo: String!, "
+        "$branch0: String!, $branch1: String!, $branch2: String!) "
+        "{ repository(owner: $owner, name: $repo) { "
+        "b0: pullRequests(first: 1, states: MERGED, headRefName: $branch0) "
+        "{ nodes { headRefName mergedAt } } "
+        "b1: pullRequests(first: 1, states: MERGED, headRefName: $branch1) "
+        "{ nodes { headRefName mergedAt } } "
+        "b2: pullRequests(first: 1, states: MERGED, headRefName: $branch2) "
+        "{ nodes { headRefName mergedAt } } } }"
+    )
+    assert query == expected
+
+
 def test_graphql_variables_are_sent_as_raw_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
