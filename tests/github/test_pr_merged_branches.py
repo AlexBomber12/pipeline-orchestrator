@@ -190,7 +190,8 @@ def test_graphql_query_and_run_gh_options(monkeypatch: pytest.MonkeyPatch) -> No
     assert "repo=name" in args
     assert "branch0=feat/a" in args
     assert "branch1=bug-b" in args
-    assert captured["kwargs"] == {"repo": "owner/name"}
+    assert "-R" not in args
+    assert captured["kwargs"] == {}
 
 
 def test_graphql_variables_are_sent_as_raw_fields(
@@ -231,3 +232,40 @@ def test_excludes_closed_not_merged_responses(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     assert gh_pr_get_merged_branches("owner/name", ["closed-not-merged"]) == set()
+
+
+def test_subprocess_invocation_does_not_pass_R_flag_to_gh_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard for the production bug where -R was passed to gh api
+    by mistake. gh api does not accept that flag, gh_runner.run_gh auto-appends
+    it when the repo kwarg is non-None, and this test exercises the real run_gh
+    path mocked at the subprocess boundary rather than at the wrapper to assert
+    the executed argv does not contain -R.
+    """
+    import subprocess
+
+    captured_argv: list[str] = []
+
+    def fake_subprocess_run(
+        cmd: list[str],
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[str]:
+        captured_argv.extend(cmd)
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout='{"data": {"repository": {}}}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(
+        "src.github.gh_runner.subprocess.run",
+        fake_subprocess_run,
+    )
+
+    gh_pr_get_merged_branches("owner/name", ["feat-a"])
+
+    assert "-R" not in captured_argv
+    assert "owner/name" not in captured_argv[captured_argv.index("api") :]
+    assert captured_argv[:3] == ["gh", "api", "graphql"]
