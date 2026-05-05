@@ -183,6 +183,65 @@ def make_task_zip(tmp_path):
 
 
 @pytest.fixture
+def make_task_zip_multi(tmp_path):
+    """Build a single zip containing multiple PR-*.md task files.
+
+    ``tasks`` is a list of ``(pr_id, title_slug, depends_on)`` tuples
+    where ``depends_on`` is a list of ``"PR-N"`` strings (empty for
+    independent tasks). Each entry is rendered with the same body
+    template as ``make_task_zip`` so the only variations are the
+    ``pr_id`` and the ``Depends on:`` line.
+    """
+
+    def _make_task_zip_multi(
+        tasks: list[tuple[int, str, list[str]]],
+        coder: str = "any",
+        priority: int = 2,
+    ) -> Path:
+        if not tasks:
+            raise ValueError("make_task_zip_multi requires at least one task")
+        zip_path = tmp_path / f"PR-multi-{tasks[0][0]}.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for pr_id, title_slug, depends_on in tasks:
+                depends_line = ", ".join(depends_on) if depends_on else "none"
+                body = (
+                    f"# PR-{pr_id}: {title_slug}\n"
+                    "\n"
+                    f"Branch: pr-{pr_id}-{title_slug}\n"
+                    "- Type: feature\n"
+                    "- Complexity: low\n"
+                    f"- Depends on: {depends_line}\n"
+                    f"- Priority: {priority}\n"
+                    f"- Coder: {coder}\n"
+                    "\n"
+                    "## Problem\n"
+                    f"e2e test placeholder for PR-{pr_id}.\n"
+                    "\n"
+                    "## Scope\n"
+                    "Trivial scope. Touch a marker file.\n"
+                    "\n"
+                    "## Files to create\n"
+                    "None.\n"
+                    "\n"
+                    "## Files to touch\n"
+                    "tests/e2e-shim-marker.txt: append a marker line.\n"
+                    "\n"
+                    "## Files NOT to touch\n"
+                    "Anything else.\n"
+                    "\n"
+                    "## Success criteria\n"
+                    "1. The marker file gains one line.\n"
+                )
+                md_name = f"PR-{pr_id}.md"
+                md_path = tmp_path / md_name
+                md_path.write_text(body)
+                zf.write(md_path, arcname=md_name)
+        return zip_path
+
+    return _make_task_zip_multi
+
+
+@pytest.fixture
 def upload_zip():
     def _upload_zip(zip_path: Path, slug: str = TESTBED_SLUG) -> int:
         url = f"{TEST_DASHBOARD_URL}/repos/{slug}/upload-tasks"
