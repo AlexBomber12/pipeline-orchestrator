@@ -75,20 +75,25 @@ def test_coder_crash_records_cancellation_cause_and_propagates(
         status = upload_zip(zip_path)
         assert status in (200, 201), f"upload failed with status {status}"
 
-        # The daemon must select PR-A first (PR-B depends on it). When the
-        # exit_nonzero shim returns non-zero, ``_transition_to_error``
+        # The daemon must select PR-A first (PR-B depends on it). When
+        # the exit_nonzero shim returns non-zero, ``_transition_to_error``
         # records the default ``CancellationCause(category="CRASH")``
         # under ``cancellation:{slug}:PR-A`` (see
         # ``src/daemon/runner.py`` _transition_to_error and
         # ``src/daemon/handlers/coding.py`` for the producing call site).
-        coding_entry = wait_for_state(["CODING"], timeout_sec=60)
-        coding_task = coding_entry.get("current_task") or {}
-        assert coding_task.get("pr_id") == pr_a_id, (
-            f"first CODING was for current_task={coding_task!r}; "
-            f"expected pr_id={pr_a_id!r}"
-        )
-
-        deadline = time.monotonic() + 30
+        # We do NOT gate on observing the transient CODING snapshot:
+        # ``wait_for_state`` polls once per second, and the
+        # IDLE -> CODING -> ERROR transition under the exit_nonzero shim
+        # can be sub-second on a fast runner, which would make the test
+        # flake even when the cancellation-cause behavior is correct.
+        # The cancellation-entry poll below uniquely keys on
+        # ``pr_a_id`` (``_entry_for(payload, pr_a_id)``), so identifying
+        # PR-A as the crashed task is guaranteed by that assertion;
+        # there is no need for a separate ``current_task`` snapshot.
+        # The 90s budget folds together what was previously a 60s wait
+        # for CODING plus a 30s wait for the cause, so the total time
+        # the test will tolerate end-to-end is unchanged.
+        deadline = time.monotonic() + 90
         last_payload: list[dict] = []
         cause_for_a: dict | None = None
         while time.monotonic() < deadline:
@@ -99,7 +104,7 @@ def test_coder_crash_records_cancellation_cause_and_propagates(
             time.sleep(1)
         assert cause_for_a is not None, (
             f"no cancellation cause surfaced for {pr_a_id!r} via "
-            f"/api/cancellations/{testbed_slug} within 30s; "
+            f"/api/cancellations/{testbed_slug} within 90s; "
             f"last payload={last_payload!r}; "
             f"runner state={get_state()!r}"
         )
