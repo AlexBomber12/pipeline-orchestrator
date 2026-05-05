@@ -191,11 +191,14 @@ def make_task_zip_multi(tmp_path):
     where ``depends_on`` is a list of ``"PR-N"`` strings (empty for
     independent tasks). Each entry is rendered with the same body
     template as ``make_task_zip`` so the only variations are the
-    ``pr_id`` and the ``Depends on:`` line.
+    ``pr_id`` and the ``Depends on:`` line. A 4-tuple
+    ``(pr_id, title_slug, depends_on, priority)`` overrides the
+    default ``priority`` for that task only — needed by
+    multi-task tests that exercise priority-ordered dispatch.
     """
 
     def _make_task_zip_multi(
-        tasks: list[tuple[int, str, list[str]]],
+        tasks: list[tuple],
         coder: str = "any",
         priority: int = 2,
     ) -> Path:
@@ -203,7 +206,12 @@ def make_task_zip_multi(tmp_path):
             raise ValueError("make_task_zip_multi requires at least one task")
         zip_path = tmp_path / f"PR-multi-{tasks[0][0]}.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for pr_id, title_slug, depends_on in tasks:
+            for task in tasks:
+                if len(task) == 4:
+                    pr_id, title_slug, depends_on, task_priority = task
+                else:
+                    pr_id, title_slug, depends_on = task
+                    task_priority = priority
                 depends_line = ", ".join(depends_on) if depends_on else "none"
                 body = (
                     f"# PR-{pr_id}: {title_slug}\n"
@@ -212,7 +220,7 @@ def make_task_zip_multi(tmp_path):
                     "- Type: feature\n"
                     "- Complexity: low\n"
                     f"- Depends on: {depends_line}\n"
-                    f"- Priority: {priority}\n"
+                    f"- Priority: {task_priority}\n"
                     f"- Coder: {coder}\n"
                     "\n"
                     "## Problem\n"
