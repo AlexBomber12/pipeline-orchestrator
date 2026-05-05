@@ -146,25 +146,41 @@ def test_coder_crash_records_cancellation_cause_and_propagates(
         # ``current_task`` and routes the runner back to IDLE
         # (``src/daemon/handlers/error.py``). The cause itself is left in
         # place by the SKIP branch — the dashboard surfaces it for the
-        # operator to inspect. Allow up to 60s to absorb the error
-        # handler latency on a busy testbed.
+        # operator to inspect.
+        #
+        # We assert against the durable event log rather than a live
+        # ``state == IDLE and current_task is None`` snapshot: under the
+        # exit_nonzero shim PR-A keeps its DOING status in QUEUE.md, so
+        # the daemon re-picks it on the very next IDLE tick and the IDLE
+        # window between SKIP and the next CODING dispatch is sub-second
+        # — 1 Hz polling will consistently miss it. The
+        # ``[ERROR] diagnose_error: SKIP -> IDLE.`` line emitted by
+        # ``handle_error`` is the durable proof that the SKIP branch ran
+        # (which both clears ``current_task`` and sets state=IDLE), and
+        # ``state.history`` retains it across subsequent transitions.
+        skip_marker = "[ERROR] diagnose_error: SKIP -> IDLE."
         deadline = time.monotonic() + 60
-        idle_entry = None
+        skip_observed = False
         last_state = None
-        last_current_task: object = "<unset>"
+        last_events: list[str] = []
         while time.monotonic() < deadline:
             entry = get_state()
             if entry is not None:
                 last_state = entry.get("state")
-                last_current_task = entry.get("current_task")
-                if last_state == "IDLE" and last_current_task is None:
-                    idle_entry = entry
+                history = entry.get("history") or []
+                last_events = [
+                    item.get("event", "")
+                    for item in history
+                    if isinstance(item, dict)
+                ]
+                if any(skip_marker in event for event in last_events):
+                    skip_observed = True
                     break
             time.sleep(1)
-        assert idle_entry is not None, (
-            f"runner did not return to IDLE with current_task cleared "
-            f"within 60s after the CRASH cause was recorded; "
-            f"last_state={last_state!r}, last_current_task={last_current_task!r}, "
+        assert skip_observed, (
+            f"handle_error did not log {skip_marker!r} within 60s after "
+            f"the CRASH cause was recorded; last_state={last_state!r}, "
+            f"recent events={last_events[-10:]!r}, "
             f"final cancellations="
             f"{_fetch_cancellations(dashboard_url, testbed_slug)!r}"
         )
