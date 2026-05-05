@@ -1,20 +1,27 @@
 from __future__ import annotations
 
+import asyncio
 import subprocess
 from pathlib import Path
 
 import pytest
+from src.daemon.handlers import idle as idle_module
+from src.github import GhPrMergedBranchesUnavailable
 from src.models import PRInfo, QueueTask, TaskStatus
 from src.queue_parser import QueueValidationError, TaskHeader
 from src.task_status import (
+    MergedState,
     _load_legacy_task_header,
     _load_task_header,
+    _resolve_merged_state,
     derive_queue_task_statuses,
     derive_task_status,
     find_matching_merged_pr,
     find_matching_open_pr,
     get_merged_pr_ids,
 )
+
+from tests.runner import _helpers as h
 
 
 def _header(branch: str, pr_id: str = "PR-085") -> TaskHeader:
@@ -30,10 +37,42 @@ def _header(branch: str, pr_id: str = "PR-085") -> TaskHeader:
     )
 
 
+def _merged_state(
+    pr_ids: set[str] | None = None,
+    branches: set[str] | None = None,
+    *,
+    api_available: bool = True,
+) -> MergedState:
+    return MergedState(set(pr_ids or ()), set(branches or ()), api_available)
+
+
+def _write_task_file(
+    tmp_path: Path,
+    pr_id: str,
+    title: str,
+    branch: str,
+    *,
+    depends_on: str = "none",
+    priority: int = 1,
+) -> None:
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(exist_ok=True)
+    (tasks_dir / f"{pr_id}.md").write_text(
+        f"# {pr_id}: {title}\n\n"
+        f"Branch: {branch}\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        f"- Depends on: {depends_on}\n"
+        f"- Priority: {priority}\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+
 def test_derive_done_when_pr_id_is_in_merged_history() -> None:
     status = derive_task_status(
         _header("pr-085-status-from-git"),
-        {"PR-085"},
+        _merged_state({"PR-085"}),
         [],
     )
 
@@ -43,7 +82,7 @@ def test_derive_done_when_pr_id_is_in_merged_history() -> None:
 def test_derive_doing_when_open_pr() -> None:
     status = derive_task_status(
         _header("pr-085-status-from-git"),
-        set(),
+        _merged_state(),
         [
             PRInfo(
                 number=109,
@@ -59,7 +98,7 @@ def test_derive_doing_when_open_pr() -> None:
 def test_derive_doing_when_open_pr_title_loses_queue_prefix() -> None:
     status = derive_task_status(
         _header("pr-085-status-from-git"),
-        set(),
+        _merged_state(),
         [
             PRInfo(
                 number=109,
@@ -75,7 +114,7 @@ def test_derive_doing_when_open_pr_title_loses_queue_prefix() -> None:
 def test_derive_todo_when_neither() -> None:
     status = derive_task_status(
         _header("pr-085-status-from-git"),
-        set(),
+        _merged_state(),
         [],
     )
 
@@ -85,7 +124,7 @@ def test_derive_todo_when_neither() -> None:
 def test_derive_doing_when_current_task_matches_without_open_pr() -> None:
     status = derive_task_status(
         _header("pr-085-status-from-git"),
-        set(),
+        _merged_state(),
         [],
         current_task_pr_id="PR-085",
     )
@@ -96,7 +135,7 @@ def test_derive_doing_when_current_task_matches_without_open_pr() -> None:
 def test_derive_done_when_current_task_matches_but_pr_already_merged() -> None:
     status = derive_task_status(
         _header("pr-085-status-from-git"),
-        {"PR-085"},
+        _merged_state({"PR-085"}),
         [],
         current_task_pr_id="PR-085",
     )
@@ -107,7 +146,7 @@ def test_derive_done_when_current_task_matches_but_pr_already_merged() -> None:
 def test_derive_doing_when_current_task_matches_and_open_pr_exists() -> None:
     status = derive_task_status(
         _header("pr-085-status-from-git"),
-        set(),
+        _merged_state(),
         [
             PRInfo(
                 number=109,
@@ -124,7 +163,7 @@ def test_derive_doing_when_current_task_matches_and_open_pr_exists() -> None:
 def test_derive_todo_when_current_task_pr_id_is_unrelated() -> None:
     status = derive_task_status(
         _header("pr-085-status-from-git", pr_id="PR-085"),
-        set(),
+        _merged_state(),
         [],
         current_task_pr_id="PR-999",
     )
@@ -135,11 +174,270 @@ def test_derive_todo_when_current_task_pr_id_is_unrelated() -> None:
 def test_derive_default_current_task_pr_id_preserves_legacy_todo() -> None:
     status = derive_task_status(
         _header("pr-085-status-from-git"),
-        set(),
+        _merged_state(),
         [],
     )
 
     assert status == TaskStatus.TODO
+
+
+def test_resolve_merged_state_api_primary(monkeypatch) -> None:
+    header = _header("pr-085-status-from-git")
+    seen: dict[str, object] = {}
+
+    def fake_merged_branches(repo: str, branches: set[str]) -> set[str]:
+        seen["repo"] = repo
+        seen["branches"] = set(branches)
+        return {"pr-085-status-from-git"}
+
+    def fake_merged_pr_ids(
+        repo_path: str,
+        base_branch: str,
+        candidate_pr_ids,
+    ) -> set[str]:
+        seen["repo_path"] = repo_path
+        seen["base_branch"] = base_branch
+        seen["candidate_pr_ids"] = set(candidate_pr_ids)
+        return set()
+
+    monkeypatch.setattr(
+        "src.task_status.gh_pr_get_merged_branches",
+        fake_merged_branches,
+    )
+    monkeypatch.setattr(
+        "src.task_status.get_merged_pr_ids",
+        fake_merged_pr_ids,
+    )
+
+    state = _resolve_merged_state(
+        "/repo",
+        "main",
+        "owner/repo",
+        ["PR-085"],
+        [header],
+        log_event=lambda event: None,
+    )
+
+    assert state == _merged_state(branches={"pr-085-status-from-git"})
+    assert seen == {
+        "repo": "owner/repo",
+        "branches": {"pr-085-status-from-git"},
+        "repo_path": "/repo",
+        "base_branch": "main",
+        "candidate_pr_ids": {"PR-085"},
+    }
+    assert derive_task_status(header, state, []) == TaskStatus.DONE
+
+
+def test_resolve_merged_state_git_log_fallback(monkeypatch) -> None:
+    header = _header("pr-085-status-from-git")
+    logs: list[str] = []
+
+    def fake_merged_branches(repo: str, branches: set[str]) -> set[str]:
+        raise GhPrMergedBranchesUnavailable("graphql unavailable")
+
+    monkeypatch.setattr(
+        "src.task_status.gh_pr_get_merged_branches",
+        fake_merged_branches,
+    )
+    monkeypatch.setattr(
+        "src.task_status.get_merged_pr_ids",
+        lambda repo_path, base_branch, candidate_pr_ids: {"PR-085"},
+    )
+
+    state = _resolve_merged_state(
+        "/repo",
+        "main",
+        "owner/repo",
+        ["PR-085"],
+        [header],
+        log_event=logs.append,
+    )
+
+    assert state == _merged_state({"PR-085"}, api_available=False)
+    assert derive_task_status(header, state, []) == TaskStatus.DONE
+    assert logs == [
+        "[INFRA] gh pr list merged-branches probe failed: graphql unavailable"
+    ]
+
+
+def test_resolve_merged_state_both_disagree_branch_wins(monkeypatch) -> None:
+    header = _header("pr-262-megaraid-dashboard", pr_id="PR-262")
+    monkeypatch.setattr(
+        "src.task_status.gh_pr_get_merged_branches",
+        lambda repo, branches: {"pr-262-megaraid-dashboard"},
+    )
+    monkeypatch.setattr(
+        "src.task_status.get_merged_pr_ids",
+        lambda repo_path, base_branch, candidate_pr_ids: set(),
+    )
+
+    state = _resolve_merged_state(
+        "/repo",
+        "main",
+        "owner/repo",
+        ["PR-262"],
+        [header],
+        log_event=lambda event: None,
+    )
+
+    assert derive_task_status(header, state, []) == TaskStatus.DONE
+
+
+def test_resolve_merged_state_both_disagree_pr_id_only(monkeypatch) -> None:
+    header = _header("pr-085-deleted-after-merge")
+    monkeypatch.setattr(
+        "src.task_status.gh_pr_get_merged_branches",
+        lambda repo, branches: set(),
+    )
+    monkeypatch.setattr(
+        "src.task_status.get_merged_pr_ids",
+        lambda repo_path, base_branch, candidate_pr_ids: {"PR-085"},
+    )
+
+    state = _resolve_merged_state(
+        "/repo",
+        "main",
+        "owner/repo",
+        ["PR-085"],
+        [header],
+        log_event=lambda event: None,
+    )
+
+    assert derive_task_status(header, state, []) == TaskStatus.DONE
+
+
+def test_resolve_merged_state_neither_returns_todo(monkeypatch) -> None:
+    header = _header("pr-085-not-merged")
+    monkeypatch.setattr(
+        "src.task_status.gh_pr_get_merged_branches",
+        lambda repo, branches: set(),
+    )
+    monkeypatch.setattr(
+        "src.task_status.get_merged_pr_ids",
+        lambda repo_path, base_branch, candidate_pr_ids: set(),
+    )
+
+    state = _resolve_merged_state(
+        "/repo",
+        "main",
+        "owner/repo",
+        ["PR-085"],
+        [header],
+        log_event=lambda event: None,
+    )
+
+    assert derive_task_status(header, state, []) == TaskStatus.TODO
+
+
+def test_degraded_mode_logs_once(monkeypatch, tmp_path: Path) -> None:
+    for index in range(1, 11):
+        _write_task_file(
+            tmp_path,
+            f"PR-{index:03}",
+            f"Candidate {index}",
+            f"pr-{index:03}-candidate",
+            priority=index % 5 + 1,
+        )
+    seen_candidate_ids: set[str] = set()
+
+    def fake_resolve(
+        repo_path: str,
+        base_branch: str,
+        owner_repo: str,
+        candidate_pr_ids,
+        headers,
+        *,
+        log_event,
+    ) -> MergedState:
+        assert repo_path == str(tmp_path)
+        assert base_branch == "main"
+        assert owner_repo == "octo/demo"
+        seen_candidate_ids.update(candidate_pr_ids)
+        assert len(list(headers)) == 10
+        return _merged_state(api_available=False)
+
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", fake_resolve)
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert seen_candidate_ids == {f"PR-{index:03}" for index in range(1, 11)}
+    degraded_logs = [
+        event["event"]
+        for event in runner.state.history
+        if event["event"].startswith(
+            "[INFRA] Operating without gh API done-check; "
+        )
+    ]
+    assert degraded_logs == [
+        "[INFRA] Operating without gh API done-check; relying on "
+        "git log convention scan only"
+    ]
+
+
+def test_dag_selector_uses_resolved_state(monkeypatch, tmp_path: Path) -> None:
+    _write_task_file(
+        tmp_path,
+        "PR-001",
+        "Merged dependency",
+        "pr-001-merged-dependency",
+    )
+    _write_task_file(
+        tmp_path,
+        "PR-002",
+        "Unblocked follow-up",
+        "pr-002-follow-up",
+        depends_on="PR-001",
+    )
+
+    def fake_resolve(*args, **kwargs) -> MergedState:
+        return _merged_state(branches={"pr-001-merged-dependency"})
+
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", fake_resolve)
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-002"
+    assert runner._idle_dag_statuses == {
+        "PR-001": TaskStatus.DONE,
+        "PR-002": TaskStatus.TODO,
+    }
+
+
+def test_branch_field_empty_falls_back_to_pr_id(monkeypatch) -> None:
+    header = _header("", pr_id="PR-085")
+    seen_branches: list[set[str]] = []
+
+    def fake_merged_branches(repo: str, branches: set[str]) -> set[str]:
+        seen_branches.append(set(branches))
+        return set()
+
+    monkeypatch.setattr(
+        "src.task_status.gh_pr_get_merged_branches",
+        fake_merged_branches,
+    )
+    monkeypatch.setattr(
+        "src.task_status.get_merged_pr_ids",
+        lambda repo_path, base_branch, candidate_pr_ids: {"PR-085"},
+    )
+
+    state = _resolve_merged_state(
+        "/repo",
+        "main",
+        "owner/repo",
+        ["PR-085"],
+        [header],
+        log_event=lambda event: None,
+    )
+
+    assert seen_branches == [set()]
+    assert derive_task_status(header, state, []) == TaskStatus.DONE
 
 
 def test_get_merged_pr_ids(monkeypatch) -> None:
@@ -335,7 +633,7 @@ def test_find_matching_open_pr_allows_cross_repository_pr_with_matching_identity
 def test_derive_done_when_merged_pr_branch_matches_without_queue_prefix() -> None:
     status = derive_task_status(
         _header("pr-085-status-from-git"),
-        set(),
+        _merged_state(),
         [],
         [
             PRInfo(
@@ -619,6 +917,10 @@ def test_derive_queue_task_statuses_does_not_trust_stale_done_queue_status(
         lambda repo_path, base_branch, candidate_pr_ids=None: set(),
     )
     monkeypatch.setattr(
+        "src.task_status.gh_pr_get_merged_branches",
+        lambda repo, branches: set(),
+    )
+    monkeypatch.setattr(
         "src.task_status._load_task_header",
         lambda current_task, repo_path: _header(
             "pr-001-queued-task",
@@ -630,7 +932,9 @@ def test_derive_queue_task_statuses_does_not_trust_stale_done_queue_status(
         [task],
         "/repo",
         "main",
+        "owner/repo",
         set(),
+        log_event=lambda event: None,
     )
 
     assert derived[0].status == TaskStatus.TODO
@@ -651,6 +955,10 @@ def test_derive_queue_task_statuses_marks_done_from_merged_pr_history(
         lambda repo_path, base_branch, candidate_pr_ids=None: {"PR-001"},
     )
     monkeypatch.setattr(
+        "src.task_status.gh_pr_get_merged_branches",
+        lambda repo, branches: set(),
+    )
+    monkeypatch.setattr(
         "src.task_status._load_task_header",
         lambda current_task, repo_path: _header(
             "pr-001-deleted-branch",
@@ -662,7 +970,9 @@ def test_derive_queue_task_statuses_marks_done_from_merged_pr_history(
         [task],
         "/repo",
         "main",
+        "owner/repo",
         set(),
+        log_event=lambda event: None,
     )
 
     assert derived[0].status == TaskStatus.DONE
@@ -676,7 +986,14 @@ def test_derive_queue_task_statuses_skips_merged_probe_when_queue_is_empty(
 
     monkeypatch.setattr("src.task_status.get_merged_pr_ids", _fail_if_called)
 
-    assert derive_queue_task_statuses([], "/repo", "main", set()) == []
+    assert derive_queue_task_statuses(
+        [],
+        "/repo",
+        "main",
+        "owner/repo",
+        set(),
+        log_event=lambda event: None,
+    ) == []
 
 
 def test_derive_queue_task_statuses_rejects_mismatched_task_file_pr_id(
@@ -691,8 +1008,8 @@ def test_derive_queue_task_statuses_rejects_mismatched_task_file_pr_id(
     )
 
     monkeypatch.setattr(
-        "src.task_status.get_merged_pr_ids",
-        lambda repo_path, base_branch, candidate_pr_ids=None: set(),
+        "src.task_status._resolve_merged_state",
+        lambda *args, **kwargs: _merged_state(),
     )
     monkeypatch.setattr(
         "src.task_status._load_task_header",
@@ -707,7 +1024,9 @@ def test_derive_queue_task_statuses_rejects_mismatched_task_file_pr_id(
             [task],
             "/repo",
             "main",
+            "owner/repo",
             set(),
+            log_event=lambda event: None,
         )
 
     assert excinfo.value.issues == [

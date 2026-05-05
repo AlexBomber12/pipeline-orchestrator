@@ -29,10 +29,28 @@ from src.models import (
     TaskStatus,
 )
 from src.queue_parser import QueueValidationError, TaskHeader
+from src.task_status import MergedState
 
 from tests.runner import _helpers as h
 
 claude_cli = claude_plugin_module.claude_cli
+
+
+def _merged_state(
+    pr_ids: set[str] | None = None,
+    branches: set[str] | None = None,
+    *,
+    api_available: bool = True,
+) -> MergedState:
+    return MergedState(set(pr_ids or ()), set(branches or ()), api_available)
+
+
+@pytest.fixture(autouse=True)
+def _default_no_merged_branch_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "src.task_status.gh_pr_get_merged_branches",
+        lambda repo, branches: set(),
+    )
 
 
 def test_handle_idle_no_tasks_leaves_state_idle(
@@ -273,7 +291,7 @@ def test_handle_idle_uses_dag_when_headers_present(
         "derive_queue_task_statuses",
         lambda tasks, repo_path, base_branch, prs, merged_prs=(): tasks,
     )
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: {"PR-001"})
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state({"PR-001"}))
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
@@ -397,7 +415,7 @@ def test_handle_idle_dag_skips_files_without_headers(
         "derive_queue_task_statuses",
         lambda tasks, repo_path, base_branch, prs, merged_prs=(): tasks,
     )
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
@@ -563,7 +581,7 @@ def test_handle_idle_dag_falls_back_when_structured_task_depends_on_legacy_file(
     )
     parse_calls: list[str] = []
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
@@ -647,7 +665,7 @@ def test_handle_idle_dag_falls_back_when_structured_task_depends_on_missing_file
     )
     parse_calls: list[str] = []
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
@@ -715,7 +733,7 @@ def test_handle_idle_keeps_independent_dag_task_when_other_dependency_file_missi
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
@@ -767,13 +785,27 @@ def test_handle_idle_keeps_structured_task_when_legacy_dependency_is_already_don
         encoding="utf-8",
     )
 
-    def fake_get_merged_pr_ids(repo_path: str, base_branch: str, candidate_pr_ids=None) -> set[str]:
+    def fake_resolve_merged_state(
+        repo_path: str,
+        base_branch: str,
+        owner_repo: str,
+        candidate_pr_ids,
+        headers,
+        *,
+        log_event,
+    ) -> MergedState:
         assert repo_path == str(tmp_path)
         assert base_branch == "main"
+        assert owner_repo == "octo/demo"
         assert set(candidate_pr_ids or ()) == {"PR-001", "PR-002"}
-        return {"PR-001"}
+        assert {header.pr_id for header in headers} == {"PR-002"}
+        return _merged_state({"PR-001"})
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", fake_get_merged_pr_ids)
+    monkeypatch.setattr(
+        idle_module,
+        "_resolve_merged_state",
+        fake_resolve_merged_state,
+    )
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
@@ -842,7 +874,7 @@ def test_handle_idle_prefers_legacy_queue_task_over_dag_task(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
@@ -911,7 +943,7 @@ def test_handle_idle_ignores_ghost_legacy_queue_task_without_task_file(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
@@ -984,7 +1016,7 @@ def test_handle_idle_advances_to_real_legacy_after_skipping_ghost(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
@@ -3045,7 +3077,7 @@ def test_select_next_task_from_dag_prefers_doing_task(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
     monkeypatch.setattr(
         idle_module,
         "derive_task_status",
@@ -3090,7 +3122,7 @@ def test_select_next_task_from_dag_marks_current_task_doing_without_open_pr(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
@@ -3153,7 +3185,7 @@ def test_select_next_task_from_dag_skips_user_stopped_current_task(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
@@ -3204,7 +3236,7 @@ def test_select_next_task_from_dag_retries_user_stopped_task_when_only_choice(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
@@ -3251,7 +3283,7 @@ def test_select_next_task_from_dag_watches_user_stopped_task_with_open_pr(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
@@ -3292,7 +3324,7 @@ def test_select_next_task_from_dag_rejects_header_filename_mismatch(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
@@ -4701,7 +4733,7 @@ def test_select_next_task_from_dag_wraps_dag_cycle_errors(
     runner._idle_open_prs = []
     runner._idle_merged_prs = []
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
     monkeypatch.setattr(idle_module, "get_eligible_tasks", h._raise_cycle_detected)
 
     with pytest.raises(QueueValidationError, match="cycle detected"):
@@ -4736,7 +4768,7 @@ def test_select_next_task_from_dag_returns_none_when_nothing_is_eligible(
     runner._idle_open_prs = []
     runner._idle_merged_prs = []
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
     monkeypatch.setattr(
         idle_module,
         "derive_task_status",
@@ -4761,10 +4793,14 @@ def test_select_next_task_from_dag_skips_merged_probe_without_structured_headers
         encoding="utf-8",
     )
 
-    def fail_get_merged_pr_ids(*args, **kwargs):
-        raise AssertionError("get_merged_pr_ids should not be called")
+    def fail_resolve_merged_state(*args, **kwargs):
+        raise AssertionError("_resolve_merged_state should not be called")
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", fail_get_merged_pr_ids)
+    monkeypatch.setattr(
+        idle_module,
+        "_resolve_merged_state",
+        fail_resolve_merged_state,
+    )
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
