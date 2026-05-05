@@ -296,6 +296,41 @@ def test_resolve_merged_state_invalid_branch_falls_back_to_git_log(
     ]
 
 
+def test_resolve_merged_state_timeout_falls_back_to_git_log(
+    monkeypatch,
+) -> None:
+    header = _header("pr-085-status-from-git")
+    logs: list[str] = []
+
+    def fake_merged_branches(repo: str, branches: set[str]) -> set[str]:
+        raise subprocess.TimeoutExpired(cmd=["gh", "api"], timeout=30)
+
+    monkeypatch.setattr(
+        "src.task_status.gh_pr_get_merged_branches",
+        fake_merged_branches,
+    )
+    monkeypatch.setattr(
+        "src.task_status.get_merged_pr_ids",
+        lambda repo_path, base_branch, candidate_pr_ids: {"PR-085"},
+    )
+
+    state = _resolve_merged_state(
+        "/repo",
+        "main",
+        "owner/repo",
+        ["PR-085"],
+        [header],
+        log_event=logs.append,
+    )
+
+    assert state == _merged_state({"PR-085"}, api_available=False)
+    assert derive_task_status(header, state, []) == TaskStatus.DONE
+    assert logs[0].startswith(
+        "[INFRA] gh pr list merged-branches probe failed: "
+        "Command '['gh', 'api']' timed out"
+    )
+
+
 def test_resolve_merged_state_both_disagree_branch_wins(monkeypatch) -> None:
     header = _header("pr-262-megaraid-dashboard", pr_id="PR-262")
     monkeypatch.setattr(
