@@ -27,10 +27,10 @@ from src.queue_parser import (
     parse_task_header,
 )
 from src.task_status import (
+    _resolve_merged_state,
     derive_queue_task_statuses,
     derive_task_status,
     find_matching_open_pr,
-    get_merged_pr_ids,
 )
 
 # Number of consecutive HTTP 304 cycles on get_merged_prs before the IDLE
@@ -320,15 +320,27 @@ class IdleMixin:
         if not headers:
             return None
 
-        merged_pr_ids = get_merged_pr_ids(
+        state = _resolve_merged_state(
             self.repo_path,
             self.repo_config.branch,
+            self.owner_repo,
             {
                 pr_id
                 for header in headers
                 for pr_id in (header.pr_id, *header.depends_on)
             },
+            headers,
+            log_event=self.log_event,
         )
+        if not state.api_available and not getattr(
+            self, "_idle_degraded_done_check_logged", False,
+        ):
+            self.log_event(
+                "[INFRA] Operating without gh API done-check; relying on "
+                "git log convention scan only"
+            )
+            self._idle_degraded_done_check_logged = True
+        merged_pr_ids = state.merged_pr_ids
         headers = self._filter_dag_headers_with_available_dependencies(
             headers,
             skipped_legacy_pr_ids,
@@ -367,7 +379,7 @@ class IdleMixin:
             statuses = {
                 header.pr_id: derive_task_status(
                     header,
-                    merged_pr_ids,
+                    state,
                     open_prs,
                     merged_prs,
                     current_task_pr_id=current_task_pr_id,
@@ -578,19 +590,23 @@ class IdleMixin:
                     tasks,
                     self.repo_path,
                     self.repo_config.branch,
-                    prs,
                 )
                 derive_sig_params = inspect.signature(
                     derive_queue_task_statuses
                 ).parameters
+                if "owner_repo" in derive_sig_params:
+                    derive_args = (*derive_args, self.owner_repo)
+                derive_args = (*derive_args, prs)
                 derive_kwargs: dict[str, object] = {}
+                if "log_event" in derive_sig_params:
+                    derive_kwargs["log_event"] = self.log_event
                 if "current_task_pr_id" in derive_sig_params:
                     derive_kwargs["current_task_pr_id"] = (
                         self.state.current_task.pr_id
                         if self.state.current_task is not None
                         else None
                     )
-                if len(derive_sig_params) >= 5:
+                if "merged_prs" in derive_sig_params:
                     tasks = derive_queue_task_statuses(
                         *derive_args,
                         merged_prs,
@@ -765,6 +781,7 @@ class IdleMixin:
     async def handle_idle(self) -> None:
         """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
         self._error_diagnose_policy.reset(self)
+        self._idle_degraded_done_check_logged = False
         # The 304 streak counts only cycles that actually reached
         # ``get_merged_prs`` and saw HTTP 304. Reset by default so any
         # other outcome — success, non-304 failure, or an early return

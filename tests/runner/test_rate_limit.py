@@ -17,13 +17,12 @@ import pytest
 from src import codex_cli
 from src.coders import claude as claude_plugin_module
 from src.config import CoderType
+from src.daemon import fix_supervision as fix_supervision_module
 from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
 from src.daemon import selector as selector_module
 from src.daemon.handlers import breach as breach_module
 from src.daemon.handlers import coding as coding_module
-from src.daemon import fix_supervision as fix_supervision_module
-from src.daemon.handlers import fix as fix_module
 from src.daemon.handlers import idle as idle_module
 from src.daemon.runner import ErrorCategory, PipelineRunner, _classify_error
 from src.models import (
@@ -39,6 +38,14 @@ from src.models import (
 from tests.runner import _helpers as h
 
 claude_cli = claude_plugin_module.claude_cli
+
+
+@pytest.fixture(autouse=True)
+def _default_no_merged_branch_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "src.task_status.gh_pr_get_merged_branches",
+        lambda repo, branches: set(),
+    )
 
 
 def test_handle_idle_rereads_pause_flag_before_coding_transition(

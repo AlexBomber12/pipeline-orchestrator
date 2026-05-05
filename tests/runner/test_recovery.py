@@ -56,8 +56,19 @@ from src.models import (
     QueueTask,  # noqa: F811
     TaskStatus,  # noqa: F811
 )
+from src.task_status import MergedState
 
 from tests.runner import _helpers as h
+
+
+def _merged_state(
+    pr_ids: set[str] | None = None,
+    branches: set[str] | None = None,
+    *,
+    api_available: bool = True,
+) -> MergedState:
+    return MergedState(set(pr_ids or ()), set(branches or ()), api_available)
+
 
 # ---------------------------------------------------------------------------
 # Test 1 — dirty-tree auto-reset composes with crashed-task marker
@@ -366,7 +377,7 @@ def test_select_next_task_from_dag_skips_crashed_task_marked_canceled(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
@@ -420,7 +431,7 @@ def test_select_next_task_from_dag_preserves_doing_for_crashed_task_with_visible
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
@@ -478,7 +489,7 @@ def test_select_next_task_from_dag_cancels_recovered_task_with_visible_pr(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
@@ -533,7 +544,7 @@ def test_select_next_task_from_dag_clears_recovered_flag_when_done(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: {"PR-001"})
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state({"PR-001"}))
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
@@ -574,7 +585,7 @@ def test_select_next_task_from_dag_clears_crashed_flag_when_done(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(idle_module, "get_merged_pr_ids", lambda *args, **kwargs: {"PR-001"})
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state({"PR-001"}))
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)

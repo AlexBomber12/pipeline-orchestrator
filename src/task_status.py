@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import re
 import subprocess
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
+from src.github import GhPrMergedBranchesUnavailable, gh_pr_get_merged_branches
 from src.github.prs import extract_queue_pr_id
 from src.models import PRInfo, QueueTask, TaskStatus
 from src.queue_parser import (
@@ -26,16 +28,60 @@ _LEGACY_FALLBACK_SUFFIXES = {
 }
 
 
+@dataclass(frozen=True)
+class MergedState:
+    merged_pr_ids: set[str]
+    merged_branches: set[str]
+    api_available: bool
+
+
+def _resolve_merged_state(
+    repo_path: str,
+    base_branch: str,
+    owner_repo: str,
+    candidate_pr_ids: Iterable[str],
+    headers: Iterable[TaskHeader],
+    *,
+    log_event: Callable[[str], None],
+) -> MergedState:
+    candidate_branches = {header.branch for header in headers if header.branch}
+    try:
+        merged_branches = gh_pr_get_merged_branches(owner_repo, candidate_branches)
+        api_available = True
+    except (
+        GhPrMergedBranchesUnavailable,
+        ValueError,
+        subprocess.SubprocessError,
+        OSError,
+    ) as exc:
+        merged_branches = set()
+        api_available = False
+        log_event(f"[INFRA] gh pr list merged-branches probe failed: {exc}")
+
+    merged_pr_ids = get_merged_pr_ids(repo_path, base_branch, candidate_pr_ids)
+    return MergedState(
+        merged_pr_ids=set(merged_pr_ids),
+        merged_branches=set(merged_branches),
+        api_available=api_available,
+    )
+
+
 def derive_task_status(
     task_header: TaskHeader,
-    merged_pr_ids: set[str],
+    state: MergedState,
     open_prs: Iterable[PRInfo],
     merged_prs: Iterable[PRInfo] = (),
     *,
     current_task_pr_id: str | None = None,
 ) -> TaskStatus:
     """Derive task status from git state."""
-    if task_header.pr_id in merged_pr_ids:
+    if (
+        task_header.branch
+        and task_header.branch in state.merged_branches
+        and _branch_name_matches_task_pr_id(task_header.pr_id, task_header.branch)
+    ):
+        return TaskStatus.DONE
+    if task_header.pr_id in state.merged_pr_ids:
         return TaskStatus.DONE
     if (
         find_matching_merged_pr(
@@ -105,6 +151,25 @@ def _branch_matches_task_pr(
     if candidate_pr_id is None:
         return True
     return candidate_pr_id == pr_id
+
+
+def _branch_name_matches_task_pr_id(pr_id: str, branch: str) -> bool:
+    """Return True when a task branch name carries its queue PR id."""
+    branch_name = branch.lower()
+    pr_id_name = pr_id.lower()
+    candidates = {
+        pr_id_name,
+        pr_id_name.replace("_", "-").replace(".", "-"),
+    }
+    return any(
+        branch_name == candidate
+        or (
+            branch_name.startswith(candidate)
+            and branch_name[len(candidate)] in "-_./"
+        )
+        for candidate in candidates
+        if candidate
+    )
 
 
 def get_merged_pr_ids(
@@ -217,9 +282,11 @@ def derive_queue_task_statuses(
     tasks: list[QueueTask],
     repo_path: str,
     base_branch: str,
+    owner_repo: str,
     open_prs: Iterable[PRInfo],
     merged_prs: Iterable[PRInfo] = (),
     *,
+    log_event: Callable[[str], None],
     current_task_pr_id: str | None = None,
 ) -> list[QueueTask]:
     """Return queue tasks with status refreshed from git/GitHub state."""
@@ -228,13 +295,7 @@ def derive_queue_task_statuses(
 
     open_prs = list(open_prs)
     merged_prs = list(merged_prs)
-    merged_pr_ids = get_merged_pr_ids(
-        repo_path,
-        base_branch,
-        (task.pr_id for task in tasks),
-    )
-    derived: list[QueueTask] = []
-
+    loaded_headers: list[tuple[QueueTask, TaskHeader]] = []
     for task in tasks:
         header = _load_task_header(task, repo_path)
         if header.pr_id != task.pr_id:
@@ -245,9 +306,22 @@ def derive_queue_task_statuses(
                     f"does not match queue entry {task.pr_id!r}"
                 ]
             )
+        loaded_headers.append((task, header))
+
+    state = _resolve_merged_state(
+        repo_path,
+        base_branch,
+        owner_repo,
+        (task.pr_id for task in tasks),
+        (header for _, header in loaded_headers),
+        log_event=log_event,
+    )
+    derived: list[QueueTask] = []
+
+    for task, header in loaded_headers:
         status = derive_task_status(
             header,
-            merged_pr_ids,
+            state,
             open_prs,
             merged_prs,
             current_task_pr_id=current_task_pr_id,
