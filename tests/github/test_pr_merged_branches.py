@@ -90,8 +90,8 @@ def test_raises_unavailable_with_original_runtime_error_chained(
     assert exc_info.value.__cause__ is original
 
 
-@pytest.mark.parametrize("branch", ["bad branch", "bad;branch", "$(rm)"])
-def test_rejects_unsafe_branch_names_before_subprocess(
+@pytest.mark.parametrize("branch", ["bad branch", "-bad", "bad..branch", "bad.lock"])
+def test_rejects_invalid_branch_names_before_subprocess(
     monkeypatch: pytest.MonkeyPatch,
     branch: str,
 ) -> None:
@@ -102,6 +102,55 @@ def test_rejects_unsafe_branch_names_before_subprocess(
 
     with pytest.raises(ValueError, match="Invalid branch name"):
         gh_pr_get_merged_branches("owner/name", ["safe-branch", branch])
+
+
+def test_accepts_valid_git_branch_names_with_metacharacters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> dict[str, object]:
+        captured["args"] = args
+        return {
+            "data": {
+                "repository": {
+                    "b0": {
+                        "nodes": [
+                            {
+                                "headRefName": "feat/$user",
+                                "mergedAt": "2026-05-01T12:00:00Z",
+                            }
+                        ]
+                    },
+                    "b1": {
+                        "nodes": [
+                            {
+                                "headRefName": "feat+one",
+                                "mergedAt": "2026-05-01T13:00:00Z",
+                            }
+                        ]
+                    },
+                    "b2": {
+                        "nodes": [
+                            {
+                                "headRefName": "feat;two",
+                                "mergedAt": "2026-05-01T14:00:00Z",
+                            }
+                        ]
+                    },
+                }
+            }
+        }
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    assert gh_pr_get_merged_branches(
+        "owner/name",
+        ["feat/$user", "feat+one", "feat;two"],
+    ) == {"feat/$user", "feat+one", "feat;two"}
+    assert "branch0=feat/$user" in captured["args"]
+    assert "branch1=feat+one" in captured["args"]
+    assert "branch2=feat;two" in captured["args"]
 
 
 def test_graphql_query_and_run_gh_options(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 _QUEUE_PR_ID_RE = re.compile(r"^(PR-[A-Za-z0-9_.-]+):(?:\s|$)")
 _GH_HEAD_QUERY_CHUNK = 20
-_BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+_BRANCH_NAME_RE = re.compile(r"^[^\x00-\x20\x7f~^:?*\\[]+$")
 
 _last_known_sha: dict[str, str] = {}
 _merged_prs_cache: dict[tuple[str, str], tuple[float, list["PRInfo"]]] = {}
@@ -68,7 +68,7 @@ def gh_pr_get_merged_branches(repo: str, branches: Iterable[str]) -> set[str]:
     """Return the input branch names that GitHub reports as merged PR heads."""
     branch_names = list(branches)
     for branch in branch_names:
-        if _BRANCH_NAME_RE.fullmatch(branch) is None:
+        if not _is_valid_branch_name(branch):
             raise ValueError(f"Invalid branch name: {branch!r}")
     if not branch_names:
         return set()
@@ -121,6 +121,21 @@ def gh_pr_get_merged_branches(repo: str, branches: Iterable[str]) -> set[str]:
             ):
                 merged_branches.add(branch)
     return merged_branches
+
+
+def _is_valid_branch_name(branch: str) -> bool:
+    if _BRANCH_NAME_RE.fullmatch(branch) is None:
+        return False
+    if branch.startswith(("-", "/")) or branch.endswith(("/", ".")):
+        return False
+    if ".." in branch or "//" in branch or "@{" in branch:
+        return False
+    return all(
+        part not in {"", ".", ".."}
+        and not part.startswith(".")
+        and not part.endswith(".lock")
+        for part in branch.split("/")
+    )
 
 
 def get_open_prs(
