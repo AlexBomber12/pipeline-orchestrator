@@ -107,7 +107,7 @@ def gh_pr_get_merged_branches(repo: str, branches: Iterable[str]) -> set[str]:
         for index, branch in enumerate(chunk):
             args.extend(["-f", f"branch{index}={branch}"])
         try:
-            raw = gh_runner.run_gh(args, repo=repo)
+            raw = gh_runner.run_gh(args)
         except RuntimeError as exc:
             raise GhPrMergedBranchesUnavailable(
                 f"gh pr merged branch lookup failed: {exc}"
