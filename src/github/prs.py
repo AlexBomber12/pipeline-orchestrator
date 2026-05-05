@@ -73,35 +73,53 @@ def gh_pr_get_merged_branches(repo: str, branches: Iterable[str]) -> set[str]:
     if not branch_names:
         return set()
 
-    requested = set(branch_names)
+    repo_parts = repo.split("/")
+    owner = repo_parts[-2] if len(repo_parts) >= 2 else ""
+    repo_name = repo_parts[-1]
     merged_branches: set[str] = set()
     for offset in range(0, len(branch_names), _GH_HEAD_QUERY_CHUNK):
         chunk = branch_names[offset : offset + _GH_HEAD_QUERY_CHUNK]
-        search = " OR ".join(f"head:{branch}" for branch in chunk)
-        try:
-            raw = gh_runner.run_gh(
-                [
-                    "pr",
-                    "list",
-                    "--state",
-                    "merged",
-                    "--search",
-                    search,
-                    "--json",
-                    "number,headRefName,mergedAt",
-                    "--limit",
-                    "40",
-                ],
-                repo=repo,
+        branch_variables = ", ".join(
+            f"$branch{index}: String!" for index in range(len(chunk))
+        )
+        branch_queries = " ".join(
+            (
+                f"b{index}: pullRequests("
+                f"first: 1, states: MERGED, headRefName: $branch{index}"
+                ") { nodes { headRefName mergedAt } }"
             )
+            for index in range(len(chunk))
+        )
+        query = (
+            f"query($owner: String!, $repo: String!, {branch_variables}) "
+            f"{{ repository(owner: $owner, name: $repo) {{ {branch_queries} }} }}"
+        )
+        args = [
+            "api",
+            "graphql",
+            "-f",
+            f"query={query}",
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"repo={repo_name}",
+        ]
+        for index, branch in enumerate(chunk):
+            args.extend(["-F", f"branch{index}={branch}"])
+        try:
+            raw = gh_runner.run_gh(args, repo=repo)
         except RuntimeError as exc:
             raise GhPrMergedBranchesUnavailable(
                 f"gh pr merged branch lookup failed: {exc}"
             ) from exc
-        for entry in raw:
-            head_ref = entry.get("headRefName")
-            if entry.get("mergedAt") and head_ref in requested:
-                merged_branches.add(head_ref)
+        repository = raw.get("data", {}).get("repository", {})
+        for index, branch in enumerate(chunk):
+            nodes = repository.get(f"b{index}", {}).get("nodes") or []
+            if any(
+                entry.get("headRefName") == branch and entry.get("mergedAt")
+                for entry in nodes
+            ):
+                merged_branches.add(branch)
     return merged_branches
 
 
