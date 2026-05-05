@@ -14,6 +14,7 @@ import logging
 import re
 import subprocess
 import time
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -29,6 +30,8 @@ from src.models import CIStatus, PRInfo
 logger = logging.getLogger(__name__)
 
 _QUEUE_PR_ID_RE = re.compile(r"^(PR-[A-Za-z0-9_.-]+):(?:\s|$)")
+_GH_HEAD_QUERY_CHUNK = 20
+_BRANCH_NAME_RE = re.compile(r"^[^\x00-\x20\x7f~^:?*\\[]+$")
 
 _last_known_sha: dict[str, str] = {}
 _merged_prs_cache: dict[tuple[str, str], tuple[float, list["PRInfo"]]] = {}
@@ -37,6 +40,10 @@ _MERGED_PRS_CACHE_TTL_SECONDS = 60.0
 
 class GitHubPollError(Exception):
     """Raised when a GitHub API poll fails (transient)."""
+
+
+class GhPrMergedBranchesUnavailable(Exception):
+    """Raised when GitHub cannot confirm merged PR branches."""
 
 
 def extract_queue_pr_id(subject: str) -> str | None:
@@ -55,6 +62,80 @@ def clear_merged_prs_cache() -> None:
 def clear_last_known_sha() -> None:
     """Reset SHA tracking state (used in tests)."""
     _last_known_sha.clear()
+
+
+def gh_pr_get_merged_branches(repo: str, branches: Iterable[str]) -> set[str]:
+    """Return the input branch names that GitHub reports as merged PR heads."""
+    branch_names = list(branches)
+    for branch in branch_names:
+        if not _is_valid_branch_name(branch):
+            raise ValueError(f"Invalid branch name: {branch!r}")
+    if not branch_names:
+        return set()
+
+    repo_parts = repo.split("/")
+    owner = repo_parts[-2] if len(repo_parts) >= 2 else ""
+    repo_name = repo_parts[-1]
+    merged_branches: set[str] = set()
+    for offset in range(0, len(branch_names), _GH_HEAD_QUERY_CHUNK):
+        chunk = branch_names[offset : offset + _GH_HEAD_QUERY_CHUNK]
+        branch_variables = ", ".join(
+            f"$branch{index}: String!" for index in range(len(chunk))
+        )
+        branch_queries = " ".join(
+            (
+                f"b{index}: pullRequests("
+                f"first: 1, states: MERGED, headRefName: $branch{index}"
+                ") { nodes { headRefName mergedAt } }"
+            )
+            for index in range(len(chunk))
+        )
+        query = (
+            f"query($owner: String!, $repo: String!, {branch_variables}) "
+            f"{{ repository(owner: $owner, name: $repo) {{ {branch_queries} }} }}"
+        )
+        args = [
+            "api",
+            "graphql",
+            "-f",
+            f"query={query}",
+            "-f",
+            f"owner={owner}",
+            "-f",
+            f"repo={repo_name}",
+        ]
+        for index, branch in enumerate(chunk):
+            args.extend(["-f", f"branch{index}={branch}"])
+        try:
+            raw = gh_runner.run_gh(args, repo=repo)
+        except RuntimeError as exc:
+            raise GhPrMergedBranchesUnavailable(
+                f"gh pr merged branch lookup failed: {exc}"
+            ) from exc
+        repository = raw.get("data", {}).get("repository", {})
+        for index, branch in enumerate(chunk):
+            nodes = repository.get(f"b{index}", {}).get("nodes") or []
+            if any(
+                entry.get("headRefName") == branch and entry.get("mergedAt")
+                for entry in nodes
+            ):
+                merged_branches.add(branch)
+    return merged_branches
+
+
+def _is_valid_branch_name(branch: str) -> bool:
+    if _BRANCH_NAME_RE.fullmatch(branch) is None:
+        return False
+    if branch.startswith(("-", "/")) or branch.endswith(("/", ".")):
+        return False
+    if ".." in branch or "//" in branch or "@{" in branch:
+        return False
+    return all(
+        part not in {"", ".", ".."}
+        and not part.startswith(".")
+        and not part.endswith(".lock")
+        for part in branch.split("/")
+    )
 
 
 def get_open_prs(
