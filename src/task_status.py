@@ -48,7 +48,7 @@ def _resolve_merged_state(
     try:
         merged_branches = gh_pr_get_merged_branches(owner_repo, candidate_branches)
         api_available = True
-    except GhPrMergedBranchesUnavailable as exc:
+    except (GhPrMergedBranchesUnavailable, ValueError) as exc:
         merged_branches = set()
         api_available = False
         log_event(f"[INFRA] gh pr list merged-branches probe failed: {exc}")
