@@ -181,6 +181,27 @@ def test_graphql_query_and_run_gh_options(monkeypatch: pytest.MonkeyPatch) -> No
     assert captured["kwargs"] == {"repo": "owner/name"}
 
 
+def test_graphql_variables_are_sent_as_raw_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> dict[str, object]:
+        captured["args"] = args
+        return {"data": {"repository": {}}}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    assert gh_pr_get_merged_branches("owner/name", ["123", "@topic"]) == set()
+
+    args = captured["args"]
+    assert isinstance(args, list)
+    assert "-F" not in args
+    assert args.count("-f") == 5
+    assert "branch0=123" in args
+    assert "branch1=@topic" in args
+
+
 def test_excludes_closed_not_merged_responses(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run_gh(args: list[str], **kwargs: Any) -> dict[str, object]:
         return {

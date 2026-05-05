@@ -99,13 +99,13 @@ def gh_pr_get_merged_branches(repo: str, branches: Iterable[str]) -> set[str]:
             "graphql",
             "-f",
             f"query={query}",
-            "-F",
+            "-f",
             f"owner={owner}",
-            "-F",
+            "-f",
             f"repo={repo_name}",
         ]
         for index, branch in enumerate(chunk):
-            args.extend(["-F", f"branch{index}={branch}"])
+            args.extend(["-f", f"branch{index}={branch}"])
         try:
             raw = gh_runner.run_gh(args, repo=repo)
         except RuntimeError as exc:
