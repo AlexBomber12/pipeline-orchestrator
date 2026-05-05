@@ -10,9 +10,17 @@ from src.github import GhPrMergedBranchesUnavailable, gh_pr_get_merged_branches
 def test_returns_subset_for_mixed_state_input(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run_gh(args: list[str], **kwargs: Any) -> list[dict[str, object]]:
         return [
-            {"number": 1, "headRefName": "feature/one", "merged": True},
-            {"number": 2, "headRefName": "feature-two", "merged": False},
-            {"number": 3, "headRefName": "bugfix.three", "merged": True},
+            {
+                "number": 1,
+                "headRefName": "feature/one",
+                "mergedAt": "2026-05-01T12:00:00Z",
+            },
+            {"number": 2, "headRefName": "feature-two", "mergedAt": None},
+            {
+                "number": 3,
+                "headRefName": "bugfix.three",
+                "mergedAt": "2026-05-01T13:00:00Z",
+            },
         ]
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
@@ -45,7 +53,8 @@ def test_chunks_long_branch_lists_into_expected_calls(
     branches = [f"branch-{index:02d}" for index in range(50)]
 
     assert gh_pr_get_merged_branches("owner/name", branches) == set()
-    assert [len(search.split()) for search in searches] == [20, 20, 10]
+    assert [search.count("head:") for search in searches] == [20, 20, 10]
+    assert [search.count(" OR ") for search in searches] == [19, 19, 9]
     assert searches[0].split()[0] == "head:branch-00"
     assert searches[2].split()[-1] == "head:branch-49"
 
@@ -98,15 +107,15 @@ def test_search_query_and_run_gh_options(monkeypatch: pytest.MonkeyPatch) -> Non
     assert isinstance(args, list)
     assert args[:2] == ["pr", "list"]
     assert args[args.index("--state") + 1] == "merged"
-    assert args[args.index("--search") + 1] == "head:feat/a head:bug-b"
-    assert args[args.index("--json") + 1] == "number,headRefName,merged"
+    assert args[args.index("--search") + 1] == "head:feat/a OR head:bug-b"
+    assert args[args.index("--json") + 1] == "number,headRefName,mergedAt"
     assert args[args.index("--limit") + 1] == "40"
     assert captured["kwargs"] == {"repo": "owner/name"}
 
 
 def test_excludes_closed_not_merged_responses(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run_gh(args: list[str], **kwargs: Any) -> list[dict[str, object]]:
-        return [{"number": 9, "headRefName": "closed-not-merged", "merged": False}]
+        return [{"number": 9, "headRefName": "closed-not-merged", "mergedAt": None}]
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 

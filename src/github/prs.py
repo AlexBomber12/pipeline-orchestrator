@@ -77,7 +77,7 @@ def gh_pr_get_merged_branches(repo: str, branches: Iterable[str]) -> set[str]:
     merged_branches: set[str] = set()
     for offset in range(0, len(branch_names), _GH_HEAD_QUERY_CHUNK):
         chunk = branch_names[offset : offset + _GH_HEAD_QUERY_CHUNK]
-        search = " ".join(f"head:{branch}" for branch in chunk)
+        search = " OR ".join(f"head:{branch}" for branch in chunk)
         try:
             raw = gh_runner.run_gh(
                 [
@@ -88,7 +88,7 @@ def gh_pr_get_merged_branches(repo: str, branches: Iterable[str]) -> set[str]:
                     "--search",
                     search,
                     "--json",
-                    "number,headRefName,merged",
+                    "number,headRefName,mergedAt",
                     "--limit",
                     "40",
                 ],
@@ -100,7 +100,7 @@ def gh_pr_get_merged_branches(repo: str, branches: Iterable[str]) -> set[str]:
             ) from exc
         for entry in raw:
             head_ref = entry.get("headRefName")
-            if entry.get("merged") is True and head_ref in requested:
+            if entry.get("mergedAt") and head_ref in requested:
                 merged_branches.add(head_ref)
     return merged_branches
 
