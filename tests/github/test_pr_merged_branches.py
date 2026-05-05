@@ -92,7 +92,7 @@ def test_raises_unavailable_with_original_runtime_error_chained(
 
 @pytest.mark.parametrize(
     "branch",
-    ["bad branch", "@", "-bad", "bad..branch", "bad.lock"],
+    ["bad branch", "-bad", "bad..branch", "bad.lock"],
 )
 def test_rejects_invalid_branch_names_before_subprocess(
     monkeypatch: pytest.MonkeyPatch,
@@ -141,6 +141,14 @@ def test_accepts_valid_git_branch_names_with_metacharacters(
                             }
                         ]
                     },
+                    "b3": {
+                        "nodes": [
+                            {
+                                "headRefName": "@",
+                                "mergedAt": "2026-05-01T15:00:00Z",
+                            }
+                        ]
+                    },
                 }
             }
         }
@@ -149,11 +157,12 @@ def test_accepts_valid_git_branch_names_with_metacharacters(
 
     assert gh_pr_get_merged_branches(
         "owner/name",
-        ["feat/$user", "feat+one", "feat;two"],
-    ) == {"feat/$user", "feat+one", "feat;two"}
+        ["feat/$user", "feat+one", "feat;two", "@"],
+    ) == {"feat/$user", "feat+one", "feat;two", "@"}
     assert "branch0=feat/$user" in captured["args"]
     assert "branch1=feat+one" in captured["args"]
     assert "branch2=feat;two" in captured["args"]
+    assert "branch3=@" in captured["args"]
 
 
 def test_graphql_query_and_run_gh_options(monkeypatch: pytest.MonkeyPatch) -> None:

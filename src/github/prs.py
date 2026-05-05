@@ -126,8 +126,6 @@ def gh_pr_get_merged_branches(repo: str, branches: Iterable[str]) -> set[str]:
 def _is_valid_branch_name(branch: str) -> bool:
     if _BRANCH_NAME_RE.fullmatch(branch) is None:
         return False
-    if branch == "@":
-        return False
     if branch.startswith(("-", "/")) or branch.endswith(("/", ".")):
         return False
     if ".." in branch or "//" in branch or "@{" in branch:
