@@ -90,7 +90,10 @@ def test_raises_unavailable_with_original_runtime_error_chained(
     assert exc_info.value.__cause__ is original
 
 
-@pytest.mark.parametrize("branch", ["bad branch", "-bad", "bad..branch", "bad.lock"])
+@pytest.mark.parametrize(
+    "branch",
+    ["bad branch", "@", "-bad", "bad..branch", "bad.lock"],
+)
 def test_rejects_invalid_branch_names_before_subprocess(
     monkeypatch: pytest.MonkeyPatch,
     branch: str,
