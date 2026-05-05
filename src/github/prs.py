@@ -14,6 +14,7 @@ import logging
 import re
 import subprocess
 import time
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -29,6 +30,8 @@ from src.models import CIStatus, PRInfo
 logger = logging.getLogger(__name__)
 
 _QUEUE_PR_ID_RE = re.compile(r"^(PR-[A-Za-z0-9_.-]+):(?:\s|$)")
+_GH_HEAD_QUERY_CHUNK = 20
+_BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 
 _last_known_sha: dict[str, str] = {}
 _merged_prs_cache: dict[tuple[str, str], tuple[float, list["PRInfo"]]] = {}
@@ -37,6 +40,10 @@ _MERGED_PRS_CACHE_TTL_SECONDS = 60.0
 
 class GitHubPollError(Exception):
     """Raised when a GitHub API poll fails (transient)."""
+
+
+class GhPrMergedBranchesUnavailable(Exception):
+    """Raised when GitHub cannot confirm merged PR branches."""
 
 
 def extract_queue_pr_id(subject: str) -> str | None:
@@ -55,6 +62,47 @@ def clear_merged_prs_cache() -> None:
 def clear_last_known_sha() -> None:
     """Reset SHA tracking state (used in tests)."""
     _last_known_sha.clear()
+
+
+def gh_pr_get_merged_branches(repo: str, branches: Iterable[str]) -> set[str]:
+    """Return the input branch names that GitHub reports as merged PR heads."""
+    branch_names = list(branches)
+    for branch in branch_names:
+        if _BRANCH_NAME_RE.fullmatch(branch) is None:
+            raise ValueError(f"Invalid branch name: {branch!r}")
+    if not branch_names:
+        return set()
+
+    requested = set(branch_names)
+    merged_branches: set[str] = set()
+    for offset in range(0, len(branch_names), _GH_HEAD_QUERY_CHUNK):
+        chunk = branch_names[offset : offset + _GH_HEAD_QUERY_CHUNK]
+        search = " ".join(f"head:{branch}" for branch in chunk)
+        try:
+            raw = gh_runner.run_gh(
+                [
+                    "pr",
+                    "list",
+                    "--state",
+                    "merged",
+                    "--search",
+                    search,
+                    "--json",
+                    "number,headRefName,merged",
+                    "--limit",
+                    "40",
+                ],
+                repo=repo,
+            )
+        except RuntimeError as exc:
+            raise GhPrMergedBranchesUnavailable(
+                f"gh pr merged branch lookup failed: {exc}"
+            ) from exc
+        for entry in raw:
+            head_ref = entry.get("headRefName")
+            if entry.get("merged") is True and head_ref in requested:
+                merged_branches.add(head_ref)
+    return merged_branches
 
 
 def get_open_prs(
