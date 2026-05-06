@@ -1373,3 +1373,71 @@ def test_coding_handles_expected_branch_write_error(
     assert runner.state.state == PipelineState.WATCH
     log_entries = [entry["event"] for entry in runner.state.history]
     assert any("expected-branch write failed" in e for e in log_entries)
+
+
+def test_coding_deletes_expected_branch_on_user_stop_pause(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """User-stop pause must still clean up the expected-branch marker.
+
+    ``_run_coder_with_supervision`` returns ``None`` and ``handle_coding``
+    short-circuits before reaching ``_post_coder_resolution``. Without
+    cleanup in a ``finally`` block on the write side, the stale marker
+    persists and the pre-push hook then rejects unrelated pushes from
+    the same worktree.
+    """
+    repo = tmp_path / "repo"
+    (repo / ".git" / "info").mkdir(parents=True)
+    expected_file = repo / ".git" / "info" / "expected-branch"
+
+    runner = _runner_with_repo_path(monkeypatch, repo)
+    _, plugin = runner._get_coder()
+
+    async def fake_run_auto_pr(repo_path: str, **kwargs: Any):
+        # Simulate the stop monitor: mark stop and raise CancelledError so
+        # _run_coder_with_supervision takes the user-stop branch and returns
+        # None.
+        runner._stop_requested = True
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(plugin, "run_auto_pr", fake_run_auto_pr)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert not expected_file.exists()
+
+
+def test_coding_deletes_expected_branch_on_late_breach_pause(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Late in-flight rate-limit breach pause must still clean up the marker.
+
+    The late-breach branch in ``_run_coder_with_supervision`` runs after
+    the coder exits cleanly but flips ``breach_flag["breached"]`` and
+    returns ``None``, bypassing ``_post_coder_resolution``. Cleanup on
+    the write side keeps the worktree's pre-push hook unblocked for
+    subsequent operator activity.
+    """
+    repo = tmp_path / "repo"
+    (repo / ".git" / "info").mkdir(parents=True)
+    expected_file = repo / ".git" / "info" / "expected-branch"
+
+    runner = _runner_with_repo_path(monkeypatch, repo)
+    _, plugin = runner._get_coder()
+
+    async def fake_run_auto_pr(repo_path: str, **kwargs: Any):
+        return (0, "ok", "")
+
+    def fake_check_late_breach(
+        breach_dir: Any, run_id: Any, breach_flag: dict[str, bool]
+    ) -> None:
+        breach_flag["breached"] = True
+
+    monkeypatch.setattr(plugin, "run_auto_pr", fake_run_auto_pr)
+    monkeypatch.setattr(runner, "_check_late_breach", fake_check_late_breach)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert not expected_file.exists()

@@ -225,29 +225,37 @@ class CodingMixin:
             return
 
         self._write_expected_branch(target_branch)
+        # Cleanup belongs in a finally so the marker is removed on every
+        # post-write exit, including the ``result is None`` short-circuits
+        # that ``_run_coder_with_supervision`` uses for user-stop and
+        # rate-limit pause paths. Without it, a stale marker persists in
+        # the worktree and the pre-push hook rejects later operator or
+        # daemon pushes whose HEAD no longer matches the old task branch.
+        try:
+            result = await self._run_coder_with_supervision(
+                coder_name,
+                plugin,
+                coder_kwargs,
+                target_branch=target_branch,
+                current_pr_id=current_pr_id,
+                pr_id=pr_id,
+                task_file=task_file,
+                task_body=task_body,
+            )
+            if result is None:
+                return
 
-        result = await self._run_coder_with_supervision(
-            coder_name,
-            plugin,
-            coder_kwargs,
-            target_branch=target_branch,
-            current_pr_id=current_pr_id,
-            pr_id=pr_id,
-            task_file=task_file,
-            task_body=task_body,
-        )
-        if result is None:
-            return
-
-        code, stdout, stderr = result
-        await self._post_coder_resolution(
-            coder_name,
-            code,
-            stdout,
-            stderr,
-            target_branch=target_branch,
-            current_pr_id=current_pr_id,
-        )
+            code, stdout, stderr = result
+            await self._post_coder_resolution(
+                coder_name,
+                code,
+                stdout,
+                stderr,
+                target_branch=target_branch,
+                current_pr_id=current_pr_id,
+            )
+        finally:
+            self._cleanup_expected_branch()
 
     async def _prepare_coder_invocation(
         self,
@@ -473,9 +481,11 @@ class CodingMixin:
         Either transitions to WATCH (PR found or daemon-created) or
         returns after a state transition to PAUSED, ERROR, or HUNG via
         the appropriate primitive (``_transition_to_error``,
-        ``_diagnose_exit_zero_no_pr``).
+        ``_diagnose_exit_zero_no_pr``). The expected-branch marker is
+        cleaned up in ``handle_coding``'s ``finally`` block so every
+        post-write exit path is covered, including the pause shortcuts
+        in ``_run_coder_with_supervision`` that bypass this method.
         """
-        self._cleanup_expected_branch()
         async def pause_for_stop_if_requested() -> bool:
             if self._stop_requested:
                 requested = True
