@@ -179,9 +179,39 @@ class RepoOpsMixin:
         except OSError as exc:
             raise RuntimeError(f"sync_to_main OS error: {exc}") from exc
 
-    def _origin_queue_md_tracked(self) -> bool:
-        """Transitional stub until PR-267 removes QUEUE.md write callers."""
-        return False
+    def _origin_queue_md_tracked(self) -> bool | None:
+        """Return ``True``/``False`` for tracked-on-origin, ``None`` on probe failure.
+
+        PR-181 untracks ``tasks/QUEUE.md`` in this repo, but managed
+        repos that have not yet adopted that migration still carry the
+        file in tree. ``.gitignore`` does not retroactively untrack
+        files, so the daemon must detect tracked-QUEUE repos and steer
+        clear of the local-write paths that PR-181's design otherwise
+        relies on.
+
+        Tristate on purpose. A transient ``cat-file`` failure (timeout,
+        OSError) is genuinely indeterminate: collapsing it to ``False``
+        would make legacy repos look post-PR-181 and could dirty the
+        worktree on every IDLE or MERGE cycle. Returning ``None`` lets
+        those callers skip their writes conservatively and self-heal on
+        the next cycle.
+
+        A non-zero ``returncode`` (file genuinely absent on origin) is
+        still a definitive ``False``.
+        """
+        branch = self.repo_config.branch
+        try:
+            result = git_ops._git(
+                self.repo_path,
+                "cat-file",
+                "-e",
+                f"origin/{branch}:tasks/QUEUE.md",
+                check=False,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        return result.returncode == 0
 
     _DELETE_IF_UNCHANGED_LUA = """
 if redis.call("get", KEYS[1]) == ARGV[1] then
