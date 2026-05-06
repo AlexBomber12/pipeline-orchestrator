@@ -1,16 +1,13 @@
 """
-DATA-01: Daemon SIGKILL during QUEUE.md regeneration.
+DATA-01: Daemon SIGKILL during task-file handling.
 
-Send SIGKILL to daemon while it is in the middle of writing QUEUE.md.
-After restart, QUEUE.md should be either:
-- fully committed (old valid state) or
-- fully rewritten (new valid state)
-but NOT left half-written (partial file, invalid YAML frontmatter, etc).
+Send SIGKILL to daemon while it is processing an uploaded task.
+After restart, the uploaded PR task file should still be present and
+parseable; the daemon should recover without relying on tasks/QUEUE.md.
 """
 
-import time
 import subprocess
-import pytest
+import time
 
 REPO_DIR = "/home/alexey/pipeline-orchestrator"
 
@@ -25,15 +22,15 @@ def test_data_01_daemon_sigkill_preserves_queue_integrity(
 ):
     """
     Scenario:
-    1. Upload a task to trigger QUEUE regen.
-    2. Send SIGKILL to daemon container process during the regen window.
+    1. Upload a task.
+    2. Send SIGKILL to daemon container process during task handling.
     3. Restart daemon.
-    4. Verify QUEUE.md is parseable and reflects a consistent state.
+    4. Verify the PR-*.md task file is parseable and reflects a consistent state.
     """
     page.goto(testbed_url)
     take_screenshot("01_before")
 
-    # Trigger a QUEUE regen by upload
+    # Trigger task handling by upload.
     zip_path = make_task_zip(pr_num=230, label="data01test")
     response = upload_zip(zip_path)
     assert response.status_code == 200
@@ -64,31 +61,31 @@ def test_data_01_daemon_sigkill_preserves_queue_integrity(
     time.sleep(15)
     take_screenshot("02_after_restart")
 
-    # Verify QUEUE.md is parseable
+    # Verify the uploaded task file is parseable without consulting QUEUE.md.
     result = subprocess.run(
         ["docker", "compose", "exec", "-T", "daemon",
-         "cat", "/data/repos/AlexBomber12__pipeline-orchestrator-testbed/tasks/QUEUE.md"],
+         "cat", "/data/repos/AlexBomber12__pipeline-orchestrator-testbed/tasks/PR-230.md"],
         cwd=REPO_DIR,
         capture_output=True,
         text=True,
         timeout=10,
     )
-    queue_content = result.stdout
+    task_content = result.stdout
 
     # Minimal validity checks:
     # - Not empty
-    # - Contains expected markers (either YAML frontmatter or table headers)
+    # - Contains expected task markers
     # - No half-written lines (no line ending unexpectedly)
-    assert len(queue_content) > 0, "QUEUE.md is empty after SIGKILL"
+    assert len(task_content) > 0, "PR-230.md is empty after SIGKILL"
 
-    # Expected QUEUE.md contains some recognizable content
+    # Expected task file contains some recognizable content.
     has_valid_content = (
-        "PR-" in queue_content  # some PR line
-        or "TODO" in queue_content  # status column
-        or "DONE" in queue_content
+        "PR-230" in task_content
+        or "data01test" in task_content
+        or "Branch:" in task_content
     )
     assert has_valid_content, (
-        f"QUEUE.md content looks invalid. First 500 chars: {queue_content[:500]}"
+        f"PR-230.md content looks invalid. First 500 chars: {task_content[:500]}"
     )
 
     # Verify daemon recovered (state queryable)
@@ -96,7 +93,7 @@ def test_data_01_daemon_sigkill_preserves_queue_integrity(
     assert state is not None, "State unreachable after daemon restart"
     assert state["state"] in ["IDLE", "CODING", "WATCH", "FIX", "MERGE", "HUNG", "ERROR"]
 
-    # Verify git status is clean (no half-committed QUEUE.md)
+    # Verify git status is clean (no half-committed task file)
     result = subprocess.run(
         ["docker", "compose", "exec", "-T", "daemon", "git",
          "-C", "/data/repos/AlexBomber12__pipeline-orchestrator-testbed",

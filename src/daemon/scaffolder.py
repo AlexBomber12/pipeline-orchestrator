@@ -23,7 +23,7 @@ TEMPLATES_DIR = Path(__file__).resolve().parent.parent.parent / "templates"
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "scripts"
 PRE_PUSH_HOOK_INSTALL_SCRIPT = SCRIPTS_DIR / "install-pre-push-hook.sh"
 
-_GITIGNORE_ENTRIES = ("artifacts/", "tasks/QUEUE.md")
+_GITIGNORE_ENTRIES = ("artifacts/", "tasks/QUEUE.md", ".daemon-runtime/")
 _COMMIT_MESSAGE = "chore: initialize pipeline orchestrator structure"
 
 # OBS-AX (PR-242). User-authored CLAUDE.md content competes with AGENTS.md

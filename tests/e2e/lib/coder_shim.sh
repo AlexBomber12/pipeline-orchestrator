@@ -22,40 +22,96 @@ read_scenario() {
 parse_doing_task() {
     # Prints "PR-NUMBER<TAB>BRANCH_NAME" on stdout and exits 0 on success.
     # Returns non-zero when no DOING task is found.
-    # Looks for the first "## PR-XXX: ..." block followed (within 4 lines) by
-    # both "- Status: DOING" and "- Branch: <name>".
-    local queue_file="${REPO_DIR}/tasks/QUEUE.md"
-    if [[ ! -f "${queue_file}" ]]; then
+    # Prefers the daemon's test-only runtime marker and falls back to the
+    # first PR-*.md task file whose header/frontmatter says Status: DOING.
+    # If neither signal exists, fail fast instead of guessing from statusless
+    # uploaded task files.
+    local repo_path="${1:-${REPO_DIR}}"
+    local runtime_file
+    runtime_file="$(_active_pr_runtime_path "${repo_path}")"
+    local pr=""
+    local task_file=""
+    local branch=""
+    if [[ -f "${runtime_file}" ]]; then
+        pr="$(head -n 1 "${runtime_file}" | tr -d '[:space:]')"
+        if [[ -n "${pr}" ]]; then
+            task_file="${repo_path}/tasks/${pr}.md"
+            if [[ -f "${task_file}" ]]; then
+                branch="$(task_branch "${task_file}")"
+                if [[ -n "${branch}" ]]; then
+                    printf '%s\t%s\n' "${pr}" "${branch}"
+                    return 0
+                fi
+            fi
+        fi
+        pr=""
+        task_file=""
+    fi
+
+    local f
+    for f in "${repo_path}"/tasks/PR-*.md; do
+        [[ -f "${f}" ]] || continue
+        if task_status_is_doing "${f}"; then
+            task_file="${f}"
+            break
+        fi
+    done
+    if [[ -z "${task_file}" ]]; then
         return 1
     fi
-    local result
-    result="$(awk '
-        /^## PR-[A-Za-z0-9-]+:/ {
-            match($0, /PR-[A-Za-z0-9-]+/)
-            current = substr($0, RSTART, RLENGTH)
-            status = ""
-            branch = ""
-            for (i = 1; i <= 4; i++) {
-                if ((getline line) <= 0) break
-                if (line ~ /^- Status: /) {
-                    status = line
-                    sub(/^- Status: */, "", status)
-                }
-                if (line ~ /^- Branch: /) {
-                    branch = line
-                    sub(/^- Branch: */, "", branch)
-                }
-            }
-            if (status == "DOING" && branch != "") {
-                printf "%s\t%s\n", current, branch
-                exit 0
+
+    pr="$(task_pr_id "${task_file}")"
+    if [[ -z "${pr}" ]]; then
+        return 1
+    fi
+    branch="$(task_branch "${task_file}")"
+    if [[ -z "${branch}" ]]; then
+        return 1
+    fi
+    printf '%s\t%s\n' "${pr}" "${branch}"
+}
+
+task_pr_id() {
+    local task_file="$1"
+    awk '
+        /^# PR-[A-Za-z0-9_.-]+:/ {
+            match($0, /PR-[A-Za-z0-9_.-]+/)
+            print substr($0, RSTART, RLENGTH)
+            exit 0
+        }
+    ' "${task_file}"
+}
+
+task_branch() {
+    local task_file="$1"
+    awk '
+        /^-? ?Branch:[[:space:]]*/ {
+            sub(/^-? ?Branch:[[:space:]]*/, "")
+            print
+            exit 0
+        }
+    ' "${task_file}"
+}
+
+task_status_is_doing() {
+    local task_file="$1"
+    awk '
+        /^##[[:space:]]/ { exit 1 }
+        /^-? ?Status:[[:space:]]*DOING[[:space:]]*$/ {
+            found = 1
+            exit 0
+        }
+        END {
+            if (!found) {
+                exit 1
             }
         }
-    ' "${queue_file}")"
-    if [[ -z "${result}" ]]; then
-        return 1
-    fi
-    printf '%s\n' "${result}"
+    ' "${task_file}"
+}
+
+_active_pr_runtime_path() {
+    local repo_path="$1"
+    printf '%s/.daemon-runtime/active-pr-id\n' "${repo_path}"
 }
 
 git_setup_branch() {
@@ -276,14 +332,14 @@ main() {
     cd "${REPO_DIR}"
 
     local task_info
-    if ! task_info="$(parse_doing_task)"; then
-        printf 'shim: no DOING task in QUEUE.md, exiting 0\n' >&2
+    if ! task_info="$(parse_doing_task "${REPO_DIR}")"; then
+        printf 'shim: no active PR task, exiting 0\n' >&2
         exit 0
     fi
     local pr branch
     IFS=$'\t' read -r pr branch <<<"${task_info}"
     if [[ -z "${pr}" || -z "${branch}" ]]; then
-        printf 'shim: no DOING task in QUEUE.md, exiting 0\n' >&2
+        printf 'shim: no active PR task, exiting 0\n' >&2
         exit 0
     fi
 
@@ -313,4 +369,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
