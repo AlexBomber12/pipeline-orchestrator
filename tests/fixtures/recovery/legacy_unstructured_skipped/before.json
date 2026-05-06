@@ -1,0 +1,37 @@
+{
+  "tasks": [
+    {
+      "pr_id": "PR-031",
+      "title": "Structured after legacy",
+      "branch": "pr-031-structured",
+      "depends_on": [],
+      "priority": 3,
+      "type": "feature",
+      "complexity": "low"
+    },
+    {
+      "pr_id": "PR-032",
+      "title": "Legacy unstructured",
+      "branch": "pr-032-legacy",
+      "depends_on": [],
+      "priority": 1,
+      "type": "feature",
+      "complexity": "low",
+      "legacy_unstructured": true
+    },
+    {
+      "pr_id": "PR-030",
+      "title": "Structured first",
+      "branch": "pr-030-structured",
+      "depends_on": [],
+      "priority": 1,
+      "type": "feature",
+      "complexity": "low"
+    }
+  ],
+  "open_prs": [],
+  "merged_pr_ids_via_git_log": [],
+  "merged_branches_via_api": [],
+  "crashed_task_pr_ids": [],
+  "recovered_task_pr_ids": []
+}

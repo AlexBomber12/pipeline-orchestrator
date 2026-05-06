@@ -1,0 +1,17 @@
+{
+  "pipeline_state": "IDLE",
+  "current_task_pr_id": null,
+  "current_pr_number": null,
+  "pending_queue_sync_branch": "queue-done-pr-209",
+  "current_queue": [
+    {
+      "pr_id": "PR-210",
+      "title": "Pending queue sync dependency",
+      "status": "TODO",
+      "task_file": "tasks/PR-210.md",
+      "depends_on": [],
+      "branch": "pr-210-pending-sync",
+      "priority": 4
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "pipeline_state": "CANCELED",
+  "current_task_pr_id": null,
+  "current_pr_number": null,
+  "pending_queue_sync_branch": null,
+  "current_queue": [
+    {
+      "pr_id": "PR-220",
+      "title": "Unpushed crash work",
+      "status": "CANCELED",
+      "task_file": "tasks/PR-220.md",
+      "depends_on": [],
+      "branch": "pr-220-unpushed",
+      "priority": 2
+    }
+  ]
+}

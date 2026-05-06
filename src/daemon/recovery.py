@@ -9,6 +9,7 @@ Mixin methods:
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,14 +19,122 @@ from src.daemon import git_ops
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
-from src.queue_parser import QueueValidationError
-from src.task_status import get_merged_pr_ids
+from src.queue_parser import QueueValidationError, parse_task_header
+from src.task_status import (
+    _resolve_merged_state,
+    derive_task_status,
+    get_merged_pr_ids,
+)
 
 logger = logging.getLogger(__name__)
+
+_PR_NUMBER_RE = re.compile(r"^PR-(\d+)(.*)$")
+
+
+def _task_pr_sort_key(pr_id: str) -> tuple[int, int | str, str]:
+    match = _PR_NUMBER_RE.match(pr_id)
+    if match is None:
+        return (1, pr_id, "")
+    return (0, int(match.group(1)), match.group(2))
 
 
 class RecoveryMixin:
     """State recovery on daemon startup."""
+
+    def _parse_tasks_from_headers(self) -> list[QueueTask] | None:
+        """Parse structured task headers into a recovered queue snapshot.
+
+        This is intentionally not wired into ``recover_state`` yet. PR-266a
+        adds the behavior-neutral helper and tests; the production source
+        switch lands in the next PR behind audit-mode comparison.
+        """
+        repo_root = Path(self.repo_path)
+        task_dir = repo_root / "tasks"
+        if not task_dir.is_dir():
+            return None
+
+        headers = []
+        task_files: dict[str, str] = {}
+        for task_file in sorted(task_dir.glob("PR-*.md")):
+            try:
+                header = parse_task_header(task_file)
+            except QueueValidationError as exc:
+                if not (
+                    self._is_missing_task_header_error(exc)
+                    or self._is_legacy_unstructured_task_error(exc)
+                ):
+                    raise
+                continue
+            if header.pr_id != task_file.stem:
+                raise QueueValidationError(
+                    [
+                        f"{task_file}: header PR ID {header.pr_id!r} "
+                        f"does not match task file {task_file.stem!r}"
+                    ]
+                )
+            headers.append(header)
+            task_files[header.pr_id] = task_file.relative_to(repo_root).as_posix()
+
+        if not headers:
+            return None
+
+        merged_state = _resolve_merged_state(
+            self.repo_path,
+            self.repo_config.branch,
+            self.owner_repo,
+            {
+                pr_id
+                for header in headers
+                for pr_id in (header.pr_id, *header.depends_on)
+            },
+            headers,
+            log_event=self.log_event,
+        )
+        open_prs = list(getattr(self, "_idle_open_prs", ()))
+        merged_prs = list(getattr(self, "_idle_merged_prs", ()))
+        current_task_pr_id = (
+            self.state.current_task.pr_id
+            if self.state.current_task is not None
+            else None
+        )
+        stopped_task_pr_ids = set(getattr(self, "_user_stopped_task_pr_ids", set()))
+        if current_task_pr_id in stopped_task_pr_ids:
+            current_task_pr_id = None
+        crashed_task_pr_ids = set(getattr(self, "_crashed_task_pr_ids", set()))
+        recovered_task_pr_ids = set(getattr(self, "_recovered_task_pr_ids", set()))
+
+        tasks: list[QueueTask] = []
+        for header in headers:
+            status = derive_task_status(
+                header,
+                merged_state,
+                open_prs,
+                merged_prs,
+                current_task_pr_id=current_task_pr_id,
+            )
+            if header.pr_id in recovered_task_pr_ids and status != TaskStatus.DONE:
+                status = TaskStatus.CANCELED
+            if (
+                header.pr_id in crashed_task_pr_ids
+                and status in (TaskStatus.TODO, TaskStatus.CANCELED)
+            ):
+                status = TaskStatus.CANCELED
+            tasks.append(
+                QueueTask(
+                    pr_id=header.pr_id,
+                    title=header.title,
+                    status=status,
+                    task_file=task_files[header.pr_id],
+                    depends_on=list(header.depends_on),
+                    branch=header.branch,
+                    priority=header.priority,
+                )
+            )
+
+        return sorted(
+            tasks,
+            key=lambda task: (task.priority, _task_pr_sort_key(task.pr_id)),
+        )
 
     def _drop_ghost_queue_entries(
         self, tasks: list[QueueTask]

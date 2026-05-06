@@ -8,6 +8,9 @@ and the real GitHub rate-limit fetch path.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 from src.daemon.handlers import idle as idle_module
 
@@ -36,3 +39,16 @@ def _disable_github_rate_limit_fetch_by_default(
         "src.github.rate_limit.fetch_rate_limit_buckets",
         lambda: (None, None),
     )
+
+
+@pytest.fixture
+def recovery_golden_cases() -> list[tuple[str, dict, dict]]:
+    fixture_root = (
+        Path(__file__).resolve().parents[1] / "fixtures" / "recovery"
+    )
+    cases: list[tuple[str, dict, dict]] = []
+    for scenario_dir in sorted(path for path in fixture_root.iterdir() if path.is_dir()):
+        before = json.loads((scenario_dir / "before.json").read_text())
+        expected = json.loads((scenario_dir / "expected.json").read_text())
+        cases.append((scenario_dir.name, before, expected))
+    return cases

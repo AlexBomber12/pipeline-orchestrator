@@ -1,0 +1,26 @@
+{
+  "pipeline_state": "IDLE",
+  "current_task_pr_id": null,
+  "current_pr_number": null,
+  "pending_queue_sync_branch": null,
+  "current_queue": [
+    {
+      "pr_id": "PR-030",
+      "title": "Structured first",
+      "status": "TODO",
+      "task_file": "tasks/PR-030.md",
+      "depends_on": [],
+      "branch": "pr-030-structured",
+      "priority": 1
+    },
+    {
+      "pr_id": "PR-031",
+      "title": "Structured after legacy",
+      "status": "TODO",
+      "task_file": "tasks/PR-031.md",
+      "depends_on": [],
+      "branch": "pr-031-structured",
+      "priority": 3
+    }
+  ]
+}

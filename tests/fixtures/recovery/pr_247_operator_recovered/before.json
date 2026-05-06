@@ -1,0 +1,25 @@
+{
+  "tasks": [
+    {
+      "pr_id": "PR-247",
+      "title": "Operator recovered",
+      "branch": "pr-247-operator-recovered",
+      "depends_on": [],
+      "priority": 3,
+      "type": "bugfix",
+      "complexity": "low"
+    }
+  ],
+  "open_prs": [
+    {
+      "number": 247,
+      "branch": "pr-247-operator-recovered",
+      "title": "PR-247: Operator recovered",
+      "pr_id": "PR-247"
+    }
+  ],
+  "merged_pr_ids_via_git_log": [],
+  "merged_branches_via_api": [],
+  "crashed_task_pr_ids": [],
+  "recovered_task_pr_ids": ["PR-247"]
+}
