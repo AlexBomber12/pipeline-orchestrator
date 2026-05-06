@@ -50,6 +50,7 @@ class FakeCoderPlugin:
 
     def __init__(self) -> None:
         self.run_planned_pr_calls: list[dict[str, Any]] = []
+        self.run_auto_pr_calls: list[dict[str, Any]] = []
         self.fix_review_calls: list[dict[str, Any]] = []
         self.diagnose_calls: list[tuple[str, str, str]] = []
 
@@ -58,6 +59,7 @@ class FakeCoderPlugin:
         return (0, "fake stdout", "")
 
     async def run_auto_pr(self, repo_path: str, **kwargs: Any) -> tuple[int, str, str]:
+        self.run_auto_pr_calls.append({"repo_path": repo_path, **kwargs})
         return (0, "fake stdout", "")
 
     async def fix_review(self, repo_path: str, **kwargs: Any) -> tuple[int, str, str]:
@@ -115,7 +117,7 @@ def test_handle_coding_dispatches_to_fake_plugin(
     """``handle_coding`` runs end-to-end against a third coder.
 
     The handler must take whatever kwargs ``plugin.build_run_kwargs``
-    returns and pass them via ``**kwargs`` to ``plugin.run_planned_pr``.
+    returns and pass them via ``**kwargs`` to ``plugin.run_auto_pr``.
     No claude/codex special-case branch may leak Claude or Codex
     kwargs into the call.
     """
@@ -150,8 +152,8 @@ def test_handle_coding_dispatches_to_fake_plugin(
 
     asyncio.run(runner.handle_coding())
 
-    assert len(fake.run_planned_pr_calls) == 1
-    call = fake.run_planned_pr_calls[0]
+    assert len(fake.run_auto_pr_calls) == 1
+    call = fake.run_auto_pr_calls[0]
     # The plugin's build_run_kwargs returned only {"model": "fake-1"};
     # the handler added timeout + on_process_start. Crucially, no
     # breach_dir / breach_run_id / session_threshold / weekly_threshold
@@ -160,6 +162,9 @@ def test_handle_coding_dispatches_to_fake_plugin(
     assert call["model"] == "fake-1"
     assert "timeout" in call
     assert "on_process_start" in call
+    assert "pr_id" in call
+    assert "task_file" in call
+    assert "task_body" in call
     assert "breach_dir" not in call
     assert "breach_run_id" not in call
     assert "session_threshold" not in call
@@ -286,7 +291,7 @@ def test_handle_coding_handler_keys_override_plugin_kwargs(
 
     asyncio.run(runner.handle_coding())
 
-    call = fake.run_planned_pr_calls[0]
+    call = fake.run_auto_pr_calls[0]
     assert call["timeout"] == runner.app_config.daemon.planned_pr_timeout_sec
     assert call["timeout"] != _OverridingPlugin.SENTINEL_TIMEOUT
     assert call["on_process_start"] == runner._track_current_coder_process
@@ -520,10 +525,10 @@ def test_event_log_includes_coder_identity(
 
     h._patch_subprocess(monkeypatch)
 
-    async def fake_run_planned_pr(path: str, **kwargs: object) -> tuple:
+    async def fake_run_planned_pr(path: str, *_args: object, **kwargs: object) -> tuple:
         return (0, "ok", "")
 
-    monkeypatch.setattr(codex_cli, "run_planned_pr_async", fake_run_planned_pr)
+    monkeypatch.setattr(codex_cli, "run_auto_pr_async", fake_run_planned_pr)
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda *a, **kw: [

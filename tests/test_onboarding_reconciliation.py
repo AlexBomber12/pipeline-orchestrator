@@ -114,6 +114,140 @@ def test_dry_run_returns_empty_diff_when_already_reconciled(
 
 
 # ---------------------------------------------------------------------------
+# Legacy unmarked "Quick rules" migration. Pre-PR-271 onboarded repos (and
+# repos freshly scaffolded from the bundled template) carry an unmarked
+# "Quick rules" block; without migration ``apply_managed_regions`` would
+# leave it in place and append a second managed copy at EOF, producing two
+# conflicting copies. The migration strips the legacy block before regions
+# are applied so reconciliation lands a single managed ``quick_rules``
+# section.
+# ---------------------------------------------------------------------------
+
+
+_LEGACY_QUICK_RULES_BLOCK = (
+    "Quick rules\n"
+    "- Always choose a work mode using an exact trigger phrase.\n"
+    "- Never commit secrets.\n"
+    "- Always run the local gate `scripts/ci.sh` until it exits with code 0.\n"
+)
+
+
+def test_legacy_unmarked_quick_rules_is_stripped(tmp_path: Path) -> None:
+    target = tmp_path / "AGENTS.md"
+    target.write_text(
+        "# AGENTS\n\n"
+        "These rules apply to every PR and every task in this repo.\n\n"
+        + _LEGACY_QUICK_RULES_BLOCK
+        + "\n## Some user section\n\nUser content stays.\n"
+    )
+
+    proposed, _ = reconcile_agents_md(target, dry_run=True)
+
+    assert proposed.count("Always choose a work mode") == 0, (
+        "legacy unmarked Quick rules block must be removed"
+    )
+    assert proposed.count(
+        "<!-- pipeline-orchestrator: managed BEGIN quick_rules -->"
+    ) == 1, "exactly one managed quick_rules section must remain"
+    assert "## Some user section" in proposed
+    assert "User content stays." in proposed
+
+
+def test_legacy_unmarked_quick_rules_alongside_existing_markers(
+    tmp_path: Path,
+) -> None:
+    """A repo that already has the managed quick_rules markers AND a stale
+    unmarked legacy block (from an earlier reconcile run before this fix
+    landed) is not left with duplicate Quick rules content."""
+    target = tmp_path / "AGENTS.md"
+    target.write_text(
+        "# AGENTS\n\n"
+        + _LEGACY_QUICK_RULES_BLOCK
+        + "\n<!-- pipeline-orchestrator: managed BEGIN quick_rules -->\n"
+        "## Quick rules\n- existing managed bullet\n"
+        "<!-- pipeline-orchestrator: managed END quick_rules -->\n"
+    )
+
+    proposed, _ = reconcile_agents_md(target, dry_run=True)
+
+    assert "Always choose a work mode" not in proposed, (
+        "legacy bullet must be stripped"
+    )
+    assert proposed.count(
+        "<!-- pipeline-orchestrator: managed BEGIN quick_rules -->"
+    ) == 1, "managed quick_rules must remain a single section"
+
+
+def test_managed_quick_rules_heading_inside_markers_is_preserved(
+    tmp_path: Path,
+) -> None:
+    """The migration must not touch the ``## Quick rules`` heading that
+    lives inside the new managed region — only unmarked legacy blocks."""
+    target = tmp_path / "AGENTS.md"
+    reconcile_agents_md(target, dry_run=False)
+
+    final, _ = reconcile_agents_md(target, dry_run=False)
+
+    assert "## Quick rules" in final, (
+        "managed Quick rules heading must survive a re-reconcile"
+    )
+    assert final.count(
+        "<!-- pipeline-orchestrator: managed BEGIN quick_rules -->"
+    ) == 1
+
+
+def test_user_authored_quick_rules_without_bullets_is_preserved(
+    tmp_path: Path,
+) -> None:
+    """A user-written ``Quick rules`` section that does not match the
+    template form (no dash bullets) is left alone."""
+    target = tmp_path / "AGENTS.md"
+    target.write_text(
+        "# AGENTS\n\n"
+        "Quick rules\n\n"
+        "Read the rules carefully and follow them.\n"
+    )
+
+    proposed, _ = reconcile_agents_md(target, dry_run=True)
+
+    assert "Read the rules carefully and follow them." in proposed
+    assert proposed.count(
+        "<!-- pipeline-orchestrator: managed BEGIN quick_rules -->"
+    ) == 1
+
+
+def test_user_authored_quick_rules_with_bullets_is_preserved(
+    tmp_path: Path,
+) -> None:
+    """A user-authored ``Quick rules`` section that uses the same heading
+    + dash-bullet structure as the legacy template — but whose first
+    bullet is NOT the canonical "Always choose a work mode" signature —
+    must be preserved. Otherwise reconciliation silently deletes user
+    content that happens to share the common Markdown shape."""
+    target = tmp_path / "AGENTS.md"
+    target.write_text(
+        "# AGENTS\n\n"
+        "## Quick rules\n"
+        "- Use the linter before pushing.\n"
+        "- Document new env vars in the README.\n"
+        "- Tag the on-call before merging schema changes.\n"
+        "\n## Other section\n\nOther content.\n"
+    )
+
+    proposed, _ = reconcile_agents_md(target, dry_run=True)
+
+    assert "Use the linter before pushing." in proposed
+    assert "Document new env vars in the README." in proposed
+    assert "Tag the on-call before merging schema changes." in proposed
+    assert "## Other section" in proposed
+    # The managed quick_rules block is still appended, so two "Quick
+    # rules" headings coexist: the user's and the managed one.
+    assert proposed.count(
+        "<!-- pipeline-orchestrator: managed BEGIN quick_rules -->"
+    ) == 1
+
+
+# ---------------------------------------------------------------------------
 # Web endpoint tests
 # ---------------------------------------------------------------------------
 

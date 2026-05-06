@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from src.branch_context import BranchContext
@@ -20,6 +21,45 @@ from src.github import cache as gh_cache
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.models import PipelineState
+
+
+def _resolve_task_file_under_repo(repo_path: str, task_file: str) -> Path:
+    """Resolve ``task_file`` under ``repo_path`` rejecting traversal/escape.
+
+    The queue parser does not validate ``task_file`` paths, so a malicious
+    or mistaken queue entry could otherwise point CODING at an absolute
+    path or a ``..``-prefixed path that escapes the cloned repo and leaks
+    arbitrary host content into the inline ``run_auto_pr`` prompt.
+
+    Raises ``ValueError`` if ``task_file`` is absolute, contains ``..``
+    segments, escapes ``repo_path`` after symlink resolution, or fails to
+    resolve at all (e.g. a symlink loop, which ``Path.resolve`` surfaces
+    as ``RuntimeError``, or a permission/IO error surfaced as ``OSError``).
+    Normalizing those resolver exceptions here keeps the caller's error
+    handling uniform — ``handle_coding`` only has to catch ``ValueError``
+    to route every malformed task path through the controlled
+    ``_transition_to_error`` path instead of letting the exception escape
+    and crash the cycle.
+    """
+    candidate = Path(task_file)
+    if candidate.is_absolute():
+        raise ValueError(f"absolute path not allowed: {task_file!r}")
+    if any(part == ".." for part in candidate.parts):
+        raise ValueError(f"path traversal not allowed: {task_file!r}")
+    try:
+        repo_root = Path(repo_path).resolve()
+        resolved = (repo_root / candidate).resolve()
+    except (RuntimeError, OSError) as exc:
+        raise ValueError(
+            f"cannot resolve task path {task_file!r}: {exc}"
+        ) from exc
+    try:
+        resolved.relative_to(repo_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"path escapes repo root: {task_file!r}"
+        ) from exc
+    return resolved
 
 
 def _local_branch_exists(repo_path: str, branch: str) -> bool:
@@ -139,6 +179,44 @@ class CodingMixin:
             )
             return
 
+        # AUTO PR dispatch: read the task spec inline before invoking the
+        # coder so the daemon supplies the canonical pr_id, task_file, and
+        # task_body explicitly. This replaces the prior PLANNED PR
+        # indirection where the coder discovered its task via QUEUE.md.
+        # Honor ``current_task.task_file`` (parsed from ``tasks/QUEUE.md`` by
+        # IDLE) so a queued entry pointing at a non-default location still
+        # resolves correctly; only fall back to ``tasks/{pr_id}.md`` when
+        # the queue entry omits the path (legacy entries).
+        assert self.state.current_task is not None
+        pr_id = self.state.current_task.pr_id
+        task_file = self.state.current_task.task_file or f"tasks/{pr_id}.md"
+        try:
+            task_body_path = _resolve_task_file_under_repo(
+                self.repo_path, task_file
+            )
+        except ValueError as exc:
+            await self._transition_to_error(
+                f"Invalid task file {task_file!r}: {exc}",
+                publish=False,
+                log_prefix="[CODING]",
+            )
+            return
+        try:
+            task_body = task_body_path.read_text(encoding="utf-8")
+        except (OSError, ValueError) as exc:
+            # ``ValueError`` covers ``UnicodeDecodeError`` (a ``ValueError``
+            # subclass) raised when ``tasks/{pr_id}.md`` contains non-UTF-8
+            # bytes. Treat decode failures the same as I/O failures so the
+            # daemon records a deterministic task-file error and routes
+            # through ``_transition_to_error`` instead of letting the
+            # exception escape and crash ``run_cycle``.
+            await self._transition_to_error(
+                f"Cannot read task file {task_file}: {exc}",
+                publish=False,
+                log_prefix="[CODING]",
+            )
+            return
+
         try:
             coder_kwargs = await self._prepare_coder_invocation(
                 coder_name, plugin
@@ -152,6 +230,9 @@ class CodingMixin:
             coder_kwargs,
             target_branch=target_branch,
             current_pr_id=current_pr_id,
+            pr_id=pr_id,
+            task_file=task_file,
+            task_body=task_body,
         )
         if result is None:
             return
@@ -173,7 +254,7 @@ class CodingMixin:
     ) -> dict[str, Any]:
         """Allocate breach env, build kwargs.
 
-        Returns the kwargs dict ready to pass to ``plugin.run_planned_pr``.
+        Returns the kwargs dict ready to pass to ``plugin.run_auto_pr``.
         Allocates the breach env via ``_breach_env`` and stores it on
         ``self`` so ``_run_coder_with_supervision`` can wire monitors and
         teardown without re-creating it.
@@ -210,6 +291,9 @@ class CodingMixin:
         *,
         target_branch: str,
         current_pr_id: str | None,
+        pr_id: str,
+        task_file: str,
+        task_body: str,
     ) -> tuple[int, str, str] | None:
         """Run the coder subprocess under stop and breach supervision.
 
@@ -225,7 +309,13 @@ class CodingMixin:
 
         heartbeat = asyncio.create_task(self._publish_while_waiting("CODING"))
         cli_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
-            plugin.run_planned_pr(self.repo_path, **coder_kwargs)
+            plugin.run_auto_pr(
+                self.repo_path,
+                pr_id=pr_id,
+                task_file=task_file,
+                task_body=task_body,
+                **coder_kwargs,
+            )
         )
         breach_monitor: asyncio.Task[None] | None = None
         if plugin.supports_breach_lifecycle:

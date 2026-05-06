@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+from pathlib import Path
 from typing import Any
 
 import pytest
+from src.coders import claude as claude_plugin_module
 from src.daemon import git_ops
 from src.daemon.handlers import coding as coding_module
 from src.github import gh_runner
@@ -23,7 +25,7 @@ def _runner(
     post_create_failure_attempts: int = 0,
 ):
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(h.claude_cli, "run_planned_pr_async", h._async_cli_result(0, "ok", ""))
+    monkeypatch.setattr(h.claude_cli, "run_auto_pr_async", h._async_cli_result(0, "ok", ""))
     pr_list_calls = {"n": 0}
 
     def _fake_open_prs(repo: str, **kw: Any) -> list[PRInfo]:
@@ -819,3 +821,432 @@ def test_diagnose_case_c_skips_codex_review_when_eyes_already_reacted(
         "Codex auto-trigger detected, skipping duplicate @codex review post" in entry["event"]
         for entry in runner.state.history
     )
+
+
+# ---------------------------------------------------------------------------
+# PR-271: AUTO PR dispatch tests.
+#
+# The CODING handler now invokes ``plugin.run_auto_pr`` with explicit
+# ``pr_id``, ``task_file``, and ``task_body`` arguments instead of the
+# legacy ``plugin.run_planned_pr`` indirection that left the coder to
+# discover its task via QUEUE.md. These tests pin the new contract.
+# ---------------------------------------------------------------------------
+
+
+def _runner_for_auto_pr_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    pr_id: str = "PR-001",
+    task_body: str = "# PR-001\n\nBranch: pr-001\n",
+    write_task_file: bool = True,
+):
+    """Build a runner whose ``repo_path`` is a real on-disk tmp tree.
+
+    Unlike ``_runner``, this helper does not stub ``Path.read_text`` so the
+    AUTO PR file read path is exercised end-to-end against the actual
+    filesystem. Used by tests that assert what the dispatch reads from disk.
+    """
+    h._patch_subprocess(monkeypatch, stub_auto_pr_read=False)
+    monkeypatch.setattr(
+        h.claude_cli, "run_auto_pr_async", h._async_cli_result(0, "ok", "")
+    )
+
+    pr = PRInfo(number=42, branch="pr-001")
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs", lambda repo, **kw: [pr]
+    )
+
+    async def _sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(h.runner_module.asyncio, "sleep", _sleep)
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    if write_task_file:
+        (tmp_path / "tasks").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "tasks" / f"{pr_id}.md").write_text(
+            task_body, encoding="utf-8"
+        )
+    runner.state.current_task = QueueTask(
+        pr_id=pr_id,
+        title="Sample task",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file=f"tasks/{pr_id}.md",
+    )
+    runner._post_codex_review = lambda pr_number: True  # type: ignore[method-assign]
+    return runner
+
+
+def test_handle_coding_invokes_run_auto_pr_with_pr_id_and_task_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``plugin.run_auto_pr`` is invoked with the canonical ``pr_id`` and
+    the ``tasks/{pr_id}.md`` task_file label derived from the active task."""
+    runner = _runner_for_auto_pr_dispatch(
+        monkeypatch, tmp_path, pr_id="PR-XYZ"
+    )
+    captured: dict[str, Any] = {}
+
+    async def fake_run_auto_pr(
+        repo_path: str, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        captured["repo_path"] = repo_path
+        captured["kwargs"] = dict(kwargs)
+        return (0, "ok", "")
+
+    coder_name, plugin = runner._get_coder()
+    monkeypatch.setattr(plugin, "run_auto_pr", fake_run_auto_pr)
+
+    asyncio.run(runner.handle_coding())
+
+    assert captured["repo_path"] == runner.repo_path
+    assert captured["kwargs"]["pr_id"] == "PR-XYZ"
+    assert captured["kwargs"]["task_file"] == "tasks/PR-XYZ.md"
+
+
+def test_handle_coding_passes_task_body_inline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The ``task_body`` kwarg passed to ``run_auto_pr`` equals the contents
+    of ``repo_path/tasks/{pr_id}.md`` read at dispatch time."""
+    body = (
+        "# PR-XYZ: example\n\n"
+        "Branch: pr-xyz-example\n"
+        "- Type: feature\n\n"
+        "## Scope\n\n"
+        "Inline task body should be passed verbatim.\n"
+    )
+    runner = _runner_for_auto_pr_dispatch(
+        monkeypatch, tmp_path, pr_id="PR-XYZ", task_body=body
+    )
+    captured: dict[str, Any] = {}
+
+    async def fake_run_auto_pr(
+        repo_path: str, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        captured["task_body"] = kwargs["task_body"]
+        return (0, "ok", "")
+
+    _, plugin = runner._get_coder()
+    monkeypatch.setattr(plugin, "run_auto_pr", fake_run_auto_pr)
+
+    asyncio.run(runner.handle_coding())
+
+    assert captured["task_body"] == body
+
+
+def test_handle_coding_does_not_invoke_run_planned_pr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The legacy ``run_planned_pr`` dispatch path is no longer reached.
+
+    Pin the daemon's switch to AUTO PR by failing if the plugin's
+    ``run_planned_pr`` (or the underlying ``run_planned_pr_async``) is
+    called from ``handle_coding``. Manual VS Code workflows still call
+    these methods, but the daemon must not.
+    """
+    runner = _runner_for_auto_pr_dispatch(monkeypatch, tmp_path)
+
+    async def boom_run_planned_pr(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        raise AssertionError("plugin.run_planned_pr must not be called by daemon dispatch")
+
+    async def boom_run_planned_pr_async(
+        *args: Any, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        raise AssertionError(
+            "claude_cli.run_planned_pr_async must not be called by daemon dispatch"
+        )
+
+    _, plugin = runner._get_coder()
+    monkeypatch.setattr(plugin, "run_planned_pr", boom_run_planned_pr)
+    monkeypatch.setattr(
+        claude_plugin_module.claude_cli,
+        "run_planned_pr_async",
+        boom_run_planned_pr_async,
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+
+
+def test_handle_coding_missing_task_file_transitions_to_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A missing ``tasks/{pr_id}.md`` file must surface as a clean ERROR
+    transition with a descriptive message instead of silently feeding an
+    empty body to the coder."""
+    runner = _runner_for_auto_pr_dispatch(
+        monkeypatch, tmp_path, pr_id="PR-404", write_task_file=False
+    )
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "tasks/PR-404.md" in (runner.state.error_message or "")
+    assert "Cannot read task file" in (runner.state.error_message or "")
+
+
+def test_handle_coding_task_file_read_error_transitions_to_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An OSError raised while reading the task file (e.g. permission
+    denied, broken symlink) must route through the same ERROR transition
+    as a missing file. No exception leaks out of the handler."""
+    runner = _runner_for_auto_pr_dispatch(monkeypatch, tmp_path)
+
+    def fake_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(coding_module.Path, "read_text", fake_read_text)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "permission denied" in (runner.state.error_message or "")
+    assert "Cannot read task file" in (runner.state.error_message or "")
+
+
+def test_handle_coding_uses_queue_task_file_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """When ``current_task.task_file`` points at a non-default location,
+    the AUTO PR dispatch reads from that path instead of hardcoding
+    ``tasks/{pr_id}.md``. Otherwise CODING fails on queue entries the
+    parser legitimately registered with a non-default path."""
+    pr_id = "PR-XYZ"
+    body = "# PR-XYZ\n\nBranch: pr-xyz\n"
+    custom_dir = tmp_path / "subdir" / "tasks"
+    custom_dir.mkdir(parents=True)
+    custom_path = custom_dir / "PR-XYZ.md"
+    custom_path.write_text(body, encoding="utf-8")
+
+    runner = _runner_for_auto_pr_dispatch(
+        monkeypatch, tmp_path, pr_id=pr_id, write_task_file=False
+    )
+    runner.state.current_task = QueueTask(
+        pr_id=pr_id,
+        title="Sample task",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="subdir/tasks/PR-XYZ.md",
+    )
+    runner._post_codex_review = lambda pr_number: True  # type: ignore[method-assign]
+
+    captured: dict[str, Any] = {}
+
+    async def fake_run_auto_pr(
+        repo_path: str, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        captured["kwargs"] = dict(kwargs)
+        return (0, "ok", "")
+
+    _, plugin = runner._get_coder()
+    monkeypatch.setattr(plugin, "run_auto_pr", fake_run_auto_pr)
+
+    asyncio.run(runner.handle_coding())
+
+    assert captured["kwargs"]["task_file"] == "subdir/tasks/PR-XYZ.md"
+    assert captured["kwargs"]["task_body"] == body
+
+
+def test_handle_coding_falls_back_to_default_path_when_task_file_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A legacy queue entry without ``task_file`` set falls back to the
+    conventional ``tasks/{pr_id}.md`` path so existing dispatch behavior
+    is preserved for unmigrated queues."""
+    pr_id = "PR-LEGACY"
+    runner = _runner_for_auto_pr_dispatch(
+        monkeypatch, tmp_path, pr_id=pr_id, task_body="# legacy body\n"
+    )
+    runner.state.current_task = QueueTask(
+        pr_id=pr_id,
+        title="Legacy task",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file=None,
+    )
+    runner._post_codex_review = lambda pr_number: True  # type: ignore[method-assign]
+
+    captured: dict[str, Any] = {}
+
+    async def fake_run_auto_pr(
+        repo_path: str, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        captured["kwargs"] = dict(kwargs)
+        return (0, "ok", "")
+
+    _, plugin = runner._get_coder()
+    monkeypatch.setattr(plugin, "run_auto_pr", fake_run_auto_pr)
+
+    asyncio.run(runner.handle_coding())
+
+    assert captured["kwargs"]["task_file"] == f"tasks/{pr_id}.md"
+    assert captured["kwargs"]["task_body"] == "# legacy body\n"
+
+
+def _runner_for_path_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    task_file: str,
+):
+    """Build a runner whose ``current_task.task_file`` is operator-controlled.
+
+    Used by P1 path-validation tests to assert that an absolute path or a
+    ``..`` traversal in the queue entry is rejected before the task body is
+    read, instead of leaking arbitrary host content into ``run_auto_pr``.
+    """
+    h._patch_subprocess(monkeypatch, stub_auto_pr_read=False)
+
+    captured: dict[str, Any] = {}
+
+    async def fake_run_auto_pr(
+        repo_path: str, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        captured["kwargs"] = dict(kwargs)
+        return (0, "ok", "")
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-EVIL",
+        title="Evil task",
+        status=TaskStatus.DOING,
+        branch="pr-evil",
+        task_file=task_file,
+    )
+    runner._post_codex_review = lambda pr_number: True  # type: ignore[method-assign]
+    _, plugin = runner._get_coder()
+    monkeypatch.setattr(plugin, "run_auto_pr", fake_run_auto_pr)
+    return runner, captured
+
+
+def test_handle_coding_rejects_absolute_task_file_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An absolute ``task_file`` from a queue entry must be rejected so a
+    malicious or mistaken row cannot make CODING read arbitrary host files
+    and inline their contents into ``run_auto_pr``."""
+    secret = tmp_path / "outside_secret.md"
+    secret.write_text("HOST SECRET\n", encoding="utf-8")
+    runner, captured = _runner_for_path_validation(
+        monkeypatch, tmp_path, task_file=str(secret)
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "Invalid task file" in (runner.state.error_message or "")
+    assert "absolute" in (runner.state.error_message or "")
+    assert "kwargs" not in captured, (
+        "run_auto_pr must not be invoked when validation fails"
+    )
+
+
+def test_handle_coding_rejects_dotdot_task_file_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A queue entry with ``..`` segments must be rejected before the
+    daemon resolves the path, even if the resolved location happens to land
+    back inside the repo (defense-in-depth)."""
+    runner, captured = _runner_for_path_validation(
+        monkeypatch, tmp_path, task_file="tasks/../../etc/passwd"
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "Invalid task file" in (runner.state.error_message or "")
+    assert "traversal" in (runner.state.error_message or "")
+    assert "kwargs" not in captured
+
+
+def test_handle_coding_rejects_symlink_escape_task_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A symlink inside ``tasks/`` that points outside the repo root must
+    be rejected so a planted symlink cannot smuggle external content past
+    the absolute/``..`` checks."""
+    repo = tmp_path / "repo"
+    (repo / "tasks").mkdir(parents=True)
+    outside = tmp_path / "outside.md"
+    outside.write_text("OUTSIDE CONTENT\n", encoding="utf-8")
+    (repo / "tasks" / "PR-EVIL.md").symlink_to(outside)
+
+    runner, captured = _runner_for_path_validation(
+        monkeypatch, repo, task_file="tasks/PR-EVIL.md"
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "Invalid task file" in (runner.state.error_message or "")
+    assert "escapes repo root" in (runner.state.error_message or "")
+    assert "kwargs" not in captured
+
+
+def test_handle_coding_rejects_symlink_loop_task_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A symlink loop under ``tasks/`` must fail closed through
+    ``_transition_to_error``: ``Path.resolve()`` raises ``RuntimeError``
+    on a self-referential or cyclic symlink chain, but the handler only
+    catches ``ValueError`` here. Without normalizing resolver
+    exceptions, the ``RuntimeError`` would escape ``handle_coding`` and
+    crash ``run_cycle`` instead of producing a controlled ERROR
+    transition with a user-facing message.
+    """
+    repo = tmp_path / "repo"
+    (repo / "tasks").mkdir(parents=True)
+    loop_a = repo / "tasks" / "PR-LOOP.md"
+    loop_b = repo / "tasks" / "PR-LOOP-other.md"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
+
+    runner, captured = _runner_for_path_validation(
+        monkeypatch, repo, task_file="tasks/PR-LOOP.md"
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "Invalid task file" in (runner.state.error_message or "")
+    assert "cannot resolve" in (runner.state.error_message or "")
+    assert "kwargs" not in captured
+
+
+def test_handle_coding_handles_non_utf8_task_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A ``tasks/{pr_id}.md`` written in a non-UTF-8 encoding must fail
+    closed through ``_transition_to_error``. ``read_text(encoding="utf-8")``
+    raises ``UnicodeDecodeError`` (a ``ValueError`` subclass) on byte
+    sequences that are not valid UTF-8, so the handler must treat decode
+    failures like other read failures instead of letting the exception
+    escape and crash the cycle.
+    """
+    repo = tmp_path / "repo"
+    (repo / "tasks").mkdir(parents=True)
+    # Latin-1 byte 0xff is invalid as the leading byte of a UTF-8 sequence.
+    (repo / "tasks" / "PR-BAD.md").write_bytes(b"\xff invalid utf-8 \xfe\n")
+
+    runner, captured = _runner_for_path_validation(
+        monkeypatch, repo, task_file="tasks/PR-BAD.md"
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "Cannot read task file" in (runner.state.error_message or "")
+    assert "kwargs" not in captured

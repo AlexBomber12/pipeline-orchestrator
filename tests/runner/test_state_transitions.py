@@ -909,7 +909,7 @@ def test_handle_coding_no_pr_routes_to_diagnostic(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(0, "ok", ""),
     )
     monkeypatch.setattr(
@@ -942,7 +942,7 @@ def test_handle_coding_creates_run_record(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(0, "ok", ""),
     )
     monkeypatch.setattr(
@@ -988,7 +988,7 @@ def test_handle_coding_normalizes_task_type_synonym(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(0, "ok", ""),
     )
     monkeypatch.setattr(
@@ -1030,7 +1030,7 @@ def test_handle_coding_saves_record_on_success(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(0, "ok", ""),
     )
     monkeypatch.setattr(
@@ -1068,7 +1068,7 @@ def test_handle_coding_saves_record_on_error(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(1, "", "build failed"),
     )
 
@@ -1101,7 +1101,7 @@ def test_handle_coding_rejects_unmatched_branch(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(0, "ok", ""),
     )
     unrelated = PRInfo(number=99, branch="other-branch")
@@ -1139,7 +1139,7 @@ def test_handle_coding_posts_codex_review_after_pr_found(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(0, "ok", ""),
     )
     opened_pr = PRInfo(number=42, branch="pr-019")
@@ -1175,7 +1175,7 @@ def test_handle_coding_survives_post_comment_failure(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(0, "ok", ""),
     )
     opened_pr = PRInfo(number=42, branch="pr-019")
@@ -1229,7 +1229,7 @@ def test_handle_coding_stop_request_terminates_process(
             await self._done.wait()
             return self.returncode or 0
 
-    async def fake_run_planned_pr_async(*args: object, **kwargs: object) -> tuple[int, str, str]:
+    async def fake_run_auto_pr_async(*args: object, **kwargs: object) -> tuple[int, str, str]:
         proc = _FakeProc()
         on_process_start = kwargs["on_process_start"]
         assert callable(on_process_start)
@@ -1242,8 +1242,8 @@ def test_handle_coding_stop_request_terminates_process(
 
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
-        fake_run_planned_pr_async,
+        "run_auto_pr_async",
+        fake_run_auto_pr_async,
     )
 
     runner = h._make_runner()
@@ -1272,7 +1272,7 @@ def test_handle_coding_honors_persisted_stop_after_fast_cli_exit(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(1, "", "coder failed fast"),
     )
 
@@ -1307,7 +1307,7 @@ def test_handle_coding_honors_stop_requested_during_pr_retry_after_cli_exit(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(0, "ok", ""),
     )
 
@@ -1360,7 +1360,7 @@ def test_handle_coding_errors_when_task_has_no_branch(
     calls = h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(0, "ok", ""),
     )
     monkeypatch.setattr(
@@ -1395,7 +1395,7 @@ def test_handle_coding_retries_pr_detection(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(0, "ok", ""),
     )
 
@@ -1465,6 +1465,9 @@ def test_handle_coding_runs_three_retries_before_diagnostic(
         supports_breach_lifecycle = False
 
         async def run_planned_pr(self, path: str, **kwargs: object) -> tuple[int, str, str]:
+            return (0, "ok", "")
+
+        async def run_auto_pr(self, path: str, **kwargs: object) -> tuple[int, str, str]:
             return (0, "ok", "")
 
         def build_run_kwargs(self, *, daemon_config: Any, **_kw: object) -> dict[str, Any]:
@@ -2648,7 +2651,7 @@ def test_handle_coding_saves_stdout(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(0, "hello from claude", ""),
     )
     pr = PRInfo(number=42, branch="pr-001")
@@ -2681,12 +2684,12 @@ def test_handle_coding_uses_configured_timeout(
     captured: dict[str, Any] = {}
 
     async def fake_planned(
-        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+        path: str, *_args: object, model: str | None = None, timeout: int | None = None, **kwargs: object
     ) -> tuple[int, str, str]:
         captured["timeout"] = timeout
         return (0, "", "")
 
-    monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_planned)
+    monkeypatch.setattr(claude_cli, "run_auto_pr_async", fake_planned)
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [PRInfo(number=1, branch="pr-001")],
@@ -2755,13 +2758,13 @@ def test_handle_external_terminal_pr_state_closed_transitions_to_hung(
 
 
 def test_handle_coding_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:
-    """handle_coding must call run_planned_pr_async, not the sync version."""
+    """handle_coding must call run_auto_pr_async, not the sync version."""
     h._patch_subprocess(monkeypatch)
     async_calls: list[str] = []
     sync_calls: list[str] = []
 
     async def fake_async(
-        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+        path: str, *_args: object, **kwargs: object
     ) -> tuple[int, str, str]:
         async_calls.append(path)
         return (0, "ok", "")
@@ -2770,7 +2773,7 @@ def test_handle_coding_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:
         sync_calls.append(path)
         return (0, "ok", "")
 
-    monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_async)
+    monkeypatch.setattr(claude_cli, "run_auto_pr_async", fake_async)
     monkeypatch.setattr(claude_cli, "run_planned_pr", fake_sync)
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
@@ -2785,7 +2788,7 @@ def test_handle_coding_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:
     runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001")
     asyncio.run(runner.handle_coding())
 
-    assert async_calls, "run_planned_pr_async must be called"
+    assert async_calls, "run_auto_pr_async must be called"
     assert not sync_calls, "sync run_planned_pr must NOT be called"
 
 
@@ -2806,14 +2809,14 @@ def test_handle_coding_publishes_heartbeat(
     cli_done = None
 
     async def slow_cli(
-        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+        path: str, *_args: object, **kwargs: object
     ) -> tuple[int, str, str]:
         nonlocal cli_done
         cli_done = asyncio.get_event_loop().create_future()
         await cli_done
         return (0, "ok", "")
 
-    monkeypatch.setattr(claude_cli, "run_planned_pr_async", slow_cli)
+    monkeypatch.setattr(claude_cli, "run_auto_pr_async", slow_cli)
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [PRInfo(number=1, branch="pr-001")],
@@ -2853,7 +2856,7 @@ def test_handle_coding_errors_when_get_open_prs_raises(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         codex_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(0, "ok", ""),
     )
     monkeypatch.setattr(
@@ -2883,11 +2886,11 @@ def test_handle_coding_uses_codex_cli_when_coder_is_codex(
     h._patch_subprocess(monkeypatch)
     captured_module: list[str] = []
 
-    async def fake_run_planned_pr(path: str, **kwargs: object) -> tuple:
+    async def fake_run_planned_pr(path: str, *_args: object, **kwargs: object) -> tuple:
         captured_module.append("codex")
         return (0, "ok", "")
 
-    monkeypatch.setattr(codex_cli, "run_planned_pr_async", fake_run_planned_pr)
+    monkeypatch.setattr(codex_cli, "run_auto_pr_async", fake_run_planned_pr)
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda *a, **kw: [
@@ -2924,7 +2927,7 @@ def test_handle_coding_honors_stop_requested_after_pr_poll_exhaustion(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(0, "ok", ""),
     )
 

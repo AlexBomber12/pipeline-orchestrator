@@ -19,6 +19,7 @@ from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
 from src.daemon import selector as selector_module
+from src.daemon.handlers import coding as coding_module
 from src.daemon.handlers import error as error_module
 from src.daemon.handlers import idle as idle_module
 from src.daemon.runner import PipelineRunner
@@ -282,6 +283,8 @@ def _patch_subprocess(
     monkeypatch: pytest.MonkeyPatch,
     stdout: str = "",
     returncode: int = 0,
+    *,
+    stub_auto_pr_read: bool = True,
 ) -> list[list[str]]:
     calls: list[list[str]] = []
     rev_parse_head_calls = {"n": 0}
@@ -303,7 +306,37 @@ def _patch_subprocess(
         return _FakeCompletedProcess(args=cmd, stdout=stdout, returncode=returncode)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    if stub_auto_pr_read:
+        _stub_auto_pr_task_body_read(monkeypatch)
     return calls
+
+
+def _stub_auto_pr_task_body_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub the AUTO PR ``Path(repo_path)/tasks/PR-*.md`` read in coding.py.
+
+    The PR-271 dispatch switch reads the inline task body from disk before
+    invoking the coder plugin. Tests in this suite point ``runner.repo_path``
+    at a synthetic location that does not contain a real ``tasks/`` tree, so
+    the read would always raise ``OSError`` and short-circuit the handler
+    into the ERROR transition. Intercept ``Path.read_text`` for the AUTO PR
+    file path only — and only when the file does not actually exist — so
+    dispatch tests get a stable canned body while idle/recovery tests that
+    populate real ``tasks/PR-*.md`` files in a ``tmp_path`` continue to
+    read the on-disk content.
+    """
+    real_read_text = coding_module.Path.read_text
+
+    def fake_read_text(self: Any, *args: Any, **kwargs: Any) -> str:
+        s = str(self)
+        if (
+            "/tasks/PR-" in s
+            and s.endswith(".md")
+            and not self.exists()
+        ):
+            return f"# {self.stem}\n\nBranch: pr-001\n"
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(coding_module.Path, "read_text", fake_read_text)
 
 
 async def _preflight_true_stub() -> bool:

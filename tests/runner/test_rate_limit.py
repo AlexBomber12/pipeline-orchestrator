@@ -109,7 +109,7 @@ def test_handle_coding_honors_persisted_pause_after_fast_cli_exit(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(1, "", "coder failed fast"),
     )
 
@@ -150,7 +150,7 @@ def test_handle_coding_finishes_success_path_when_pause_persists_during_exit(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(0, "ok", ""),
     )
     monkeypatch.setattr(
@@ -610,8 +610,8 @@ def test_handle_coding_skips_when_rate_limited(
     cli_calls: list[str] = []
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
-        h._async_cli_result_with_side_effect(cli_calls, "run_planned_pr_async", 0, "", ""),
+        "run_auto_pr_async",
+        h._async_cli_result_with_side_effect(cli_calls, "run_auto_pr_async", 0, "", ""),
     )
     runner = h._make_runner()
     runner.state.state = PipelineState.CODING
@@ -1280,7 +1280,7 @@ def test_handle_coding_sets_paused_on_rate_limit(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(1, "", "Error: 429 Too Many Requests"),
     )
 
@@ -1418,7 +1418,7 @@ def test_handle_coding_success_ignores_rate_limit_text_in_stderr(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(0, "ok", "Error: 429 Too Many Requests"),
     )
     pr = PRInfo(number=42, branch="pr-001")
@@ -2170,7 +2170,7 @@ def test_handle_coding_cleans_up_breach_marker_after_run(
     captured_run_id: list[str] = []
 
     async def fake_planned(
-        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+        path: str, *_args: object, model: str | None = None, timeout: int | None = None, **kwargs: object
     ) -> tuple[int, str, str]:
         run_id = kwargs.get("breach_run_id", "")
         if run_id:
@@ -2180,7 +2180,7 @@ def test_handle_coding_cleans_up_breach_marker_after_run(
             marker.write_text('{"type":"session","resets_at":0}')
         return (0, "ok", "")
 
-    monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_planned)
+    monkeypatch.setattr(claude_cli, "run_auto_pr_async", fake_planned)
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [PRInfo(number=1, branch="pr-001")],
@@ -2218,7 +2218,7 @@ def test_handle_coding_pauses_on_inflight_breach(
     monkeypatch.setattr(breach_module, "_BREACH_POLL_SEC", 0.05)
 
     async def fake_planned_hangs(
-        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+        path: str, *_args: object, model: str | None = None, timeout: int | None = None, **kwargs: object
     ) -> tuple[int, str, str]:
         run_id = kwargs.get("breach_run_id", "")
         # Write breach marker immediately to simulate mid-flight breach
@@ -2238,7 +2238,7 @@ def test_handle_coding_pauses_on_inflight_breach(
         await asyncio.sleep(999)  # Block until cancelled
         return (0, "", "")
 
-    monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_planned_hangs)
+    monkeypatch.setattr(claude_cli, "run_auto_pr_async", fake_planned_hangs)
 
     runner = h._make_runner()
     runner.state.current_task = QueueTask(
@@ -2262,10 +2262,10 @@ def test_handle_coding_reraises_cancelled_error_without_breach(
 
     h._patch_subprocess(monkeypatch)
 
-    async def fake_run_planned_pr(path: str, **kwargs: object) -> tuple[int, str, str]:
+    async def fake_run_planned_pr(path: str, *_args: object, **kwargs: object) -> tuple[int, str, str]:
         raise asyncio.CancelledError
 
-    monkeypatch.setattr(codex_cli, "run_planned_pr_async", fake_run_planned_pr)
+    monkeypatch.setattr(codex_cli, "run_auto_pr_async", fake_run_planned_pr)
 
     runner = h._make_runner(coder=CoderType.CODEX)
     runner.state.current_task = QueueTask(
@@ -2289,7 +2289,7 @@ def test_handle_coding_records_pr_before_breach_cancel_pause(
     monkeypatch.setattr(breach_module, "_BREACH_POLL_SEC", 0.05)
 
     async def fake_planned_hangs(
-        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+        path: str, *_args: object, model: str | None = None, timeout: int | None = None, **kwargs: object
     ) -> tuple[int, str, str]:
         run_id = kwargs.get("breach_run_id", "")
         if run_id:
@@ -2327,7 +2327,7 @@ def test_handle_coding_records_pr_before_breach_cancel_pause(
     async def fast_sleep(seconds: float) -> None:
         await original_sleep(0)
 
-    monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_planned_hangs)
+    monkeypatch.setattr(claude_cli, "run_auto_pr_async", fake_planned_hangs)
     monkeypatch.setattr("src.github.prs.get_open_prs", fake_get_open_prs)
     monkeypatch.setattr(coding_module.asyncio, "sleep", fast_sleep)
 
@@ -2354,7 +2354,7 @@ def test_handle_coding_records_pr_before_late_breach_pause(
     monkeypatch.setattr(breach_module, "_BREACH_DIR", str(tmp_path))
 
     async def fake_planned(
-        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+        path: str, *_args: object, model: str | None = None, timeout: int | None = None, **kwargs: object
     ) -> tuple[int, str, str]:
         return (0, "ok", "")
 
@@ -2388,7 +2388,7 @@ def test_handle_coding_records_pr_before_late_breach_pause(
     async def fast_sleep(seconds: float) -> None:
         await original_sleep(0)
 
-    monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_planned)
+    monkeypatch.setattr(claude_cli, "run_auto_pr_async", fake_planned)
     monkeypatch.setattr("src.github.prs.get_open_prs", fake_get_open_prs)
     monkeypatch.setattr(coding_module.asyncio, "sleep", fast_sleep)
 

@@ -78,7 +78,7 @@ def test_run_coder_with_supervision_returns_none_on_stop_request(
         runner._stop_requested = True
         raise asyncio.CancelledError
 
-    monkeypatch.setattr(plugin, "run_planned_pr", cli_blocks_until_cancelled)
+    monkeypatch.setattr(plugin, "run_auto_pr", cli_blocks_until_cancelled)
     runner._current_breach_dir = "/tmp/breach-stop"
     runner._current_breach_run_id = "run-stop"
 
@@ -93,6 +93,9 @@ def test_run_coder_with_supervision_returns_none_on_stop_request(
             {},
             target_branch="pr-001",
             current_pr_id="PR-001",
+            pr_id="PR-001",
+            task_file="tasks/PR-001.md",
+            task_body="# PR-001\n",
         )
     )
 
@@ -124,7 +127,7 @@ def test_run_coder_with_supervision_returns_none_on_breach(
     async def fake_save(reason: str) -> None:
         saved.append(reason)
 
-    monkeypatch.setattr(plugin, "run_planned_pr", cli_breaches)
+    monkeypatch.setattr(plugin, "run_auto_pr", cli_breaches)
     monkeypatch.setattr(
         type(runner), "_monitor_inflight_breach", fake_breach_monitor
     )
@@ -150,6 +153,9 @@ def test_run_coder_with_supervision_returns_none_on_breach(
             {},
             target_branch="pr-001",
             current_pr_id="PR-001",
+            pr_id="PR-001",
+            task_file="tasks/PR-001.md",
+            task_body="# PR-001\n",
         )
     )
 
@@ -169,7 +175,7 @@ def test_run_coder_with_supervision_returns_completion_on_normal_exit(
     async def cli_ok(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
         return (0, "out", "")
 
-    monkeypatch.setattr(plugin, "run_planned_pr", cli_ok)
+    monkeypatch.setattr(plugin, "run_auto_pr", cli_ok)
     monkeypatch.setattr(runner, "_check_late_breach", lambda *a, **kw: None)
     monkeypatch.setattr(runner, "_cleanup_breach_marker", lambda *a, **kw: None)
     runner._current_breach_dir = "/tmp/breach-ok"
@@ -182,6 +188,9 @@ def test_run_coder_with_supervision_returns_completion_on_normal_exit(
             {},
             target_branch="pr-001",
             current_pr_id="PR-001",
+            pr_id="PR-001",
+            task_file="tasks/PR-001.md",
+            task_body="# PR-001\n",
         )
     )
 

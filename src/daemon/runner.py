@@ -562,14 +562,22 @@ class PipelineRunner(
         self._apply_staged_config_reload()
 
     def _active_task_coder_pin(self) -> str | None:
-        """Return the active task's ``Coder:`` header value if parseable."""
+        """Return the active task's ``Coder:`` header value if parseable.
+
+        Treat ``ValueError`` (which covers ``UnicodeDecodeError`` from a
+        non-UTF-8 task file) the same as ``OSError``: the pin lookup is
+        best-effort, and any read or decode failure must degrade to "no
+        pin" rather than escape the selector. Otherwise the same bad bytes
+        that ``handle_coding`` is now guarded against would crash here
+        before the handler ever runs.
+        """
         task = self.state.current_task
         if task is None or not task.task_file:
             return None
         task_path = Path(self.repo_path) / task.task_file
         try:
             header = parse_task_header(task_path)
-        except (QueueValidationError, OSError):
+        except (QueueValidationError, OSError, ValueError):
             return None
         return header.coder
 
@@ -665,7 +673,12 @@ class PipelineRunner(
         task_path = Path(self.repo_path) / task.task_file
         try:
             lines = task_path.read_text(encoding="utf-8").splitlines()
-        except OSError:
+        except (OSError, ValueError):
+            # ``ValueError`` covers ``UnicodeDecodeError`` from a non-UTF-8
+            # task file. The metadata lookup is best-effort, so degrade to
+            # ``("unknown", "unknown")`` rather than crash the cycle — the
+            # handler-side body read is the canonical failure surface for
+            # decode errors and routes through ``_transition_to_error``.
             return ("unknown", "unknown")
 
         task_type = "unknown"

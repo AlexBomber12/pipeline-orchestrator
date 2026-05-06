@@ -18,12 +18,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 AGENTS_MD_PATH = REPO_ROOT / "AGENTS.md"
 
 MANAGED_SECTIONS: tuple[str, ...] = (
+    "quick_rules",
     "work_modes",
     "daemon_mode",
     "ci_gates",
     "codex_review_gate",
     "escalate_protocol",
     "branch_naming",
+    "auto_pr_runbook",
     "planned_pr_runbook",
     "micro_pr_runbook",
     "review_fix_runbook",
