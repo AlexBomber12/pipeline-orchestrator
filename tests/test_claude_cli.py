@@ -13,6 +13,8 @@ from src.claude_cli import (
     diagnose_error_async,
     fix_review,
     fix_review_async,
+    run_auto_pr,
+    run_auto_pr_async,
     run_claude,
     run_claude_async,
     run_planned_pr,
@@ -761,3 +763,121 @@ async def test_fix_review_async_appends_extra_context(
     assert prompt.startswith("FIX FEEDBACK\n\n")
     assert "Latest review feedback:" in prompt
     assert "P1: fix this" in prompt
+
+
+# --- AUTO PR helpers ---
+
+
+@pytest.mark.asyncio
+async def test_run_auto_pr_async_formats_prompt_with_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_run_claude_async(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return (0, "ok", "")
+
+    monkeypatch.setattr("src.claude_cli.run_claude_async", fake_run_claude_async)
+
+    await run_auto_pr_async(
+        "/data/repos/demo",
+        "PR-270",
+        "tasks/PR-270.md",
+        "<body>",
+    )
+
+    prompt, repo = captured["args"]
+    assert repo == "/data/repos/demo"
+    assert prompt == "AUTO PR\nTask: PR-270\nFile: tasks/PR-270.md\n\n<body>"
+
+
+@pytest.mark.asyncio
+async def test_run_auto_pr_async_propagates_model_and_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_run_claude_async(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        captured["kwargs"] = kwargs
+        return (0, "ok", "")
+
+    monkeypatch.setattr("src.claude_cli.run_claude_async", fake_run_claude_async)
+
+    await run_auto_pr_async(
+        "/data/repos/demo",
+        "PR-270",
+        "tasks/PR-270.md",
+        "<body>",
+        model="opus",
+        timeout=321,
+        breach_dir="/tmp/breach",
+        breach_run_id="run-9",
+        session_threshold=42,
+        weekly_threshold=84,
+    )
+
+    assert captured["kwargs"] == {
+        "timeout": 321,
+        "model": "opus",
+        "breach_dir": "/tmp/breach",
+        "breach_run_id": "run-9",
+        "session_threshold": 42,
+        "weekly_threshold": 84,
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_auto_pr_async_forwards_on_process_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    callback = object()
+
+    async def fake_run_claude_async(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        captured["kwargs"] = kwargs
+        return (0, "ok", "")
+
+    monkeypatch.setattr("src.claude_cli.run_claude_async", fake_run_claude_async)
+
+    await run_auto_pr_async(
+        "/data/repos/demo",
+        "PR-270",
+        "tasks/PR-270.md",
+        "<body>",
+        on_process_start=callback,  # type: ignore[arg-type]
+    )
+
+    assert captured["kwargs"]["on_process_start"] is callback
+
+
+def test_run_auto_pr_sync_formats_prompt_with_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return _FakeCompletedProcess(stdout="ok", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = run_auto_pr(
+        "/data/repos/demo",
+        "PR-270",
+        "tasks/PR-270.md",
+        "<body>",
+        model="opus",
+        timeout=321,
+    )
+
+    assert result == (0, "ok", "")
+    assert captured["cmd"][-1] == (
+        "AUTO PR\nTask: PR-270\nFile: tasks/PR-270.md\n\n<body>"
+    )
+    assert "--model" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("--model") + 1] == "opus"
+    assert captured["kwargs"]["cwd"] == "/data/repos/demo"
+    assert captured["kwargs"]["timeout"] == 321

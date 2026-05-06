@@ -23,6 +23,18 @@ class DummyCoderPlugin:
     ) -> tuple[int, str, str]:
         return (0, repo_path, model or str(timeout))
 
+    async def run_auto_pr(
+        self,
+        repo_path: str,
+        *,
+        pr_id: str,
+        task_file: str,
+        task_body: str,
+        model: str | None,
+        timeout: int,
+    ) -> tuple[int, str, str]:
+        return (0, repo_path, f"{pr_id}|{task_file}|{task_body}|{model}|{timeout}")
+
     async def fix_review(
         self, repo_path: str, model: str | None, timeout: int | None
     ) -> tuple[int, str, str]:
@@ -206,6 +218,14 @@ def test_codex_plugin_diagnose_error_delegates(
         "context": "ci red",
         "model": "gpt-5.4",
     }
+
+
+def test_protocol_includes_run_auto_pr() -> None:
+    """``CoderPlugin`` declares ``run_auto_pr`` so the daemon can dispatch
+    AUTO PR runs without depending on QUEUE.md/AGENTS.md indirection."""
+    assert "run_auto_pr" in dir(CoderPlugin)
+    assert isinstance(ClaudePlugin(), CoderPlugin)
+    assert isinstance(CodexPlugin(), CoderPlugin)
 
 
 def test_protocol_includes_build_run_kwargs() -> None:

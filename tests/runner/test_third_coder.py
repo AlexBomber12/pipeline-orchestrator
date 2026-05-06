@@ -57,6 +57,9 @@ class FakeCoderPlugin:
         self.run_planned_pr_calls.append({"repo_path": repo_path, **kwargs})
         return (0, "fake stdout", "")
 
+    async def run_auto_pr(self, repo_path: str, **kwargs: Any) -> tuple[int, str, str]:
+        return (0, "fake stdout", "")
+
     async def fix_review(self, repo_path: str, **kwargs: Any) -> tuple[int, str, str]:
         self.fix_review_calls.append({"repo_path": repo_path, **kwargs})
         return (0, "fake stdout", "")

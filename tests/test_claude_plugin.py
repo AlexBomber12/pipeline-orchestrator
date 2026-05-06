@@ -58,6 +58,55 @@ async def test_claude_plugin_run_planned_pr_delegates(
 
 
 @pytest.mark.asyncio
+async def test_claude_plugin_run_auto_pr_delegates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_run_auto_pr_async(
+        repo_path: str,
+        pr_id: str,
+        task_file: str,
+        task_body: str,
+        *,
+        model: str | None = None,
+        timeout: int = 900,
+        **kwargs: object,
+    ) -> tuple[int, str, str]:
+        captured["args"] = (repo_path, pr_id, task_file, task_body)
+        captured["model"] = model
+        captured["timeout"] = timeout
+        captured["kwargs"] = kwargs
+        return (0, "ok", "")
+
+    monkeypatch.setattr(
+        "src.coders.claude.claude_cli.run_auto_pr_async",
+        fake_run_auto_pr_async,
+    )
+
+    result = await ClaudePlugin().run_auto_pr(
+        "/data/repos/demo",
+        pr_id="PR-270",
+        task_file="tasks/PR-270.md",
+        task_body="<body>",
+        model="opus",
+        timeout=321,
+        breach_dir="/tmp/breach",
+    )
+
+    assert result == (0, "ok", "")
+    assert captured["args"] == (
+        "/data/repos/demo",
+        "PR-270",
+        "tasks/PR-270.md",
+        "<body>",
+    )
+    assert captured["model"] == "opus"
+    assert captured["timeout"] == 321
+    assert captured["kwargs"] == {"breach_dir": "/tmp/breach"}
+
+
+@pytest.mark.asyncio
 async def test_claude_plugin_fix_review_delegates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

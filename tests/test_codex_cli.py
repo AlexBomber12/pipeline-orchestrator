@@ -10,6 +10,7 @@ import pytest
 from src.codex_cli import (
     diagnose_error_async,
     fix_review_async,
+    run_auto_pr_async,
     run_codex_async,
     run_planned_pr_async,
 )
@@ -373,6 +374,92 @@ async def test_run_codex_async_cancellation_kills_process(
 
     fake_proc.kill.assert_called_once()
     fake_proc.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_auto_pr_async_formats_prompt_with_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    fake_proc = _make_fake_proc(returncode=0)
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        captured["cmd"] = list(args)
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    await run_auto_pr_async(
+        "/data/repos/demo",
+        "PR-270",
+        "tasks/PR-270.md",
+        "<body>",
+        model="gpt-5.4",
+        timeout=321,
+    )
+
+    cmd = captured["cmd"]
+    assert cmd[:6] == [
+        "codex",
+        "--ask-for-approval",
+        "never",
+        "exec",
+        "--sandbox",
+        "danger-full-access",
+    ]
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "gpt-5.4"
+    assert cmd[-1] == (
+        "AUTO PR\nTask: PR-270\nFile: tasks/PR-270.md\n\n<body>"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_auto_pr_async_forwards_on_process_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_proc = _make_fake_proc(returncode=0)
+    started: list[MagicMock] = []
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    await run_auto_pr_async(
+        "/data/repos/demo",
+        "PR-270",
+        "tasks/PR-270.md",
+        "<body>",
+        on_process_start=lambda proc: started.append(proc),
+    )
+
+    assert started == [fake_proc]
+
+
+@pytest.mark.asyncio
+async def test_run_auto_pr_async_ignores_extra_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Extra kwargs (breach_dir etc.) from the runner are accepted via **_kwargs."""
+    fake_proc = _make_fake_proc(returncode=0)
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    result = await run_auto_pr_async(
+        "/tmp",
+        "PR-270",
+        "tasks/PR-270.md",
+        "<body>",
+        breach_dir="/tmp/breach",
+        breach_run_id="abc",
+        session_threshold=95,
+        weekly_threshold=100,
+    )
+    assert result[0] == 0
 
 
 @pytest.mark.asyncio
