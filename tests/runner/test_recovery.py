@@ -33,6 +33,7 @@ Tests do not change production behavior; they only assert it.
 from __future__ import annotations
 
 import asyncio
+import json
 
 # PR-224a: imports needed by tests moved from tests/test_runner.py
 import random  # noqa: F401
@@ -1032,3 +1033,170 @@ def test_run_cycle_runs_recovery_before_honoring_user_pause(
     assert publishes == ["published"]
     assert runner._recovered is True
     assert not any(entry["event"] == "[INFRA] Paused. Press Play to resume." for entry in runner.state.history)
+
+
+# ---------------------------------------------------------------------------
+# PR-266b: HEADERS_ONLY mode parameterized over PR-266a's golden fixtures
+# ---------------------------------------------------------------------------
+
+
+def _write_pr_md_for_fixture(
+    repo: Path, task: dict[str, Any], priority_default: int = 3
+) -> None:
+    task_dir = repo / "tasks"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    if task.get("legacy_unstructured"):
+        (task_dir / f"{task['pr_id']}.md").write_text(
+            f"# {task['pr_id']}: {task['title']}\n\nLegacy body\n"
+        )
+        return
+    depends = task.get("depends_on") or []
+    depends_value = ", ".join(depends) if depends else "none"
+    (task_dir / f"{task['pr_id']}.md").write_text(
+        "\n".join(
+            [
+                f"# {task['pr_id']}: {task['title']}",
+                "",
+                f"Branch: {task['branch']}",
+                f"- Type: {task.get('type', 'feature')}",
+                f"- Complexity: {task.get('complexity', 'low')}",
+                f"- Depends on: {depends_value}",
+                f"- Priority: {task.get('priority', priority_default)}",
+                f"- Coder: {task.get('coder', 'codex')}",
+                "",
+                "## Problem",
+                "Body.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _setup_headers_recovery_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    before: dict[str, Any],
+):
+    monkeypatch.setenv("PIPELINE_RECOVERY_FROM_HEADERS", "1")
+    monkeypatch.delenv("PIPELINE_RECOVERY_AUDIT", raising=False)
+    repo.mkdir(parents=True, exist_ok=True)
+    for task in before.get("tasks", []):
+        _write_pr_md_for_fixture(repo, task)
+    open_prs = [PRInfo(**pr) for pr in before.get("open_prs", [])]
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs", lambda repo_id, **kw: list(open_prs)
+    )
+
+    from src.daemon import recovery as recovery_module
+
+    def fake_resolve(*args: object, **kwargs: object) -> MergedState:
+        return MergedState(
+            set(before.get("merged_pr_ids_via_git_log", [])),
+            set(before.get("merged_branches_via_api", [])),
+            True,
+        )
+
+    monkeypatch.setattr(recovery_module, "_resolve_merged_state", fake_resolve)
+
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+    runner._crashed_task_pr_ids = set(before.get("crashed_task_pr_ids", []))
+    if before.get("recovered_task_pr_ids"):
+        from src.keyspace import recovered_tasks
+
+        asyncio.run(
+            runner.redis.set(
+                recovered_tasks(runner.name),
+                json.dumps(list(before["recovered_task_pr_ids"])),
+            )
+        )
+
+    if before.get("current_task_pr_id"):
+        runner.state.current_task = QueueTask(
+            pr_id=before["current_task_pr_id"],
+            title="current",
+            status=TaskStatus.DOING,
+        )
+
+    # PR-186/PR-220 crash fixtures: skip the unpushed-commit preserve probe.
+    runner._preserve_crashed_run_commits = (  # type: ignore[method-assign]
+        lambda branch: True
+    )
+    return runner
+
+
+def _projection(runner: runner_module.PipelineRunner, tasks) -> dict[str, Any]:
+    pr_id = (
+        runner.state.current_task.pr_id
+        if runner.state.current_task is not None
+        else None
+    )
+    return {
+        "pipeline_state": runner.state.state.value,
+        "current_task_pr_id": pr_id,
+        "current_pr_number": (
+            runner.state.current_pr.number
+            if runner.state.current_pr is not None
+            else None
+        ),
+        "pending_queue_sync_branch": runner.state.pending_queue_sync_branch,
+        "current_queue": [
+            {
+                "pr_id": t.pr_id,
+                "title": t.title,
+                "status": t.status.value,
+                "task_file": t.task_file,
+                "depends_on": list(t.depends_on),
+                "branch": t.branch,
+                "priority": t.priority,
+            }
+            for t in (tasks or [])
+        ],
+    }
+
+
+def test_headers_mode_recovers_each_golden_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    recovery_golden_cases,
+) -> None:
+    """PR-266b success criterion #3: HEADERS_ONLY recovery on each fixture
+    matches the golden expected.json projection."""
+    import json as _json
+
+    for scenario_name, before, expected in recovery_golden_cases:
+        repo = tmp_path / scenario_name
+        runner = _setup_headers_recovery_fixture(monkeypatch, repo, before)
+        asyncio.run(runner.recover_state())
+        actual = _projection(runner, runner.state.current_queue)
+        assert actual == expected, (
+            f"{scenario_name}: {_json.dumps(actual, sort_keys=True)} != "
+            f"{_json.dumps(expected, sort_keys=True)}"
+        )
+
+
+def test_megaraid_scenario_resolved_in_headers_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    recovery_golden_cases,
+) -> None:
+    """PR-266b success criterion #5: the MegaRAID golden scenario settles
+    in IDLE under HEADERS_ONLY mode because the headers helper consults
+    the API merged-branches set and produces DONE for the stale DOING
+    entry, even though the legacy QUEUE.md row would have re-CODED."""
+    case = next(
+        (case for case in recovery_golden_cases if case[0] == "megaraid_already_merged_via_api"),
+        None,
+    )
+    assert case is not None
+    _, before, _ = case
+    repo = tmp_path / "megaraid"
+    runner = _setup_headers_recovery_fixture(monkeypatch, repo, before)
+
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.current_queue is not None
+    assert [t.status for t in runner.state.current_queue] == [TaskStatus.DONE]

@@ -1,5 +1,5 @@
 {
-  "pipeline_state": "CANCELED",
+  "pipeline_state": "IDLE",
   "current_task_pr_id": null,
   "current_pr_number": null,
   "pending_queue_sync_branch": null,
