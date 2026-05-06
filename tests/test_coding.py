@@ -1250,3 +1250,311 @@ def test_handle_coding_handles_non_utf8_task_body(
     assert runner.state.state == PipelineState.ERROR
     assert "Cannot read task file" in (runner.state.error_message or "")
     assert "kwargs" not in captured
+
+
+# --- PR-272: pre-push hook expected-branch marker ---------------------------
+
+
+def _runner_with_repo_path(
+    monkeypatch: pytest.MonkeyPatch,
+    repo_path: Path,
+    *,
+    open_prs_initial: list[PRInfo] | None = None,
+):
+    """Build a coding-handler runner whose repo_path is a real tmp dir.
+
+    Used by the PR-272 expected-branch tests to verify the daemon writes
+    and removes ``.git/info/expected-branch`` on the real filesystem.
+    Mirrors ``_runner`` but lets the caller place ``.git/info/`` under a
+    tmp_path so write/cleanup is observable.
+    """
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: open_prs_initial or [])
+
+    async def _sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(h.runner_module.asyncio, "sleep", _sleep)
+    runner = h._make_runner()
+    runner.repo_path = str(repo_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="Sample task",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._post_codex_review = lambda pr_number: True  # type: ignore[method-assign]
+    return runner
+
+
+def test_coding_writes_expected_branch_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The daemon must write the active task's branch to
+    ``.git/info/expected-branch`` before invoking ``plugin.run_auto_pr``
+    so the pre-push hook can validate the local branch when the coder
+    pushes.
+    """
+    repo = tmp_path / "repo"
+    (repo / ".git" / "info").mkdir(parents=True)
+    expected_file = repo / ".git" / "info" / "expected-branch"
+
+    captured: dict[str, str] = {}
+    pr = PRInfo(number=42, branch="pr-001")
+    runner = _runner_with_repo_path(monkeypatch, repo, open_prs_initial=[pr])
+
+    async def fake_run_auto_pr(repo_path: str, **kwargs: Any):
+        captured["content_at_dispatch"] = expected_file.read_text(encoding="utf-8")
+        return (0, "ok", "")
+
+    _, plugin = runner._get_coder()
+    monkeypatch.setattr(plugin, "run_auto_pr", fake_run_auto_pr)
+
+    asyncio.run(runner.handle_coding())
+
+    assert captured["content_at_dispatch"] == "pr-001\n"
+
+
+def test_coding_deletes_expected_branch_after_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """After ``handle_coding`` runs through ``_post_coder_resolution`` the
+    expected-branch marker must be removed so manual operator pushes
+    between dispatches are not gated on a stale value.
+    """
+    repo = tmp_path / "repo"
+    (repo / ".git" / "info").mkdir(parents=True)
+    expected_file = repo / ".git" / "info" / "expected-branch"
+
+    pr = PRInfo(number=42, branch="pr-001")
+    runner = _runner_with_repo_path(monkeypatch, repo, open_prs_initial=[pr])
+    _, plugin = runner._get_coder()
+    monkeypatch.setattr(
+        plugin, "run_auto_pr", h._async_cli_result(0, "ok", "")
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert not expected_file.exists()
+
+
+def test_coding_handles_expected_branch_write_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed expected-branch write must NOT block dispatch — the hook
+    is defense-in-depth on top of the prompt-level safeguards from
+    PR-271. The handler logs a warning and continues.
+    """
+    repo = tmp_path / "repo"
+    info_dir = repo / ".git" / "info"
+    info_dir.mkdir(parents=True)
+    # Pre-create a directory at the marker path so write_text raises
+    # IsADirectoryError (a real OSError) without monkeypatching pathlib.
+    (info_dir / "expected-branch").mkdir()
+
+    pr = PRInfo(number=42, branch="pr-001")
+    runner = _runner_with_repo_path(monkeypatch, repo, open_prs_initial=[pr])
+    _, plugin = runner._get_coder()
+
+    invoked = {"n": 0}
+
+    async def fake_run_auto_pr(repo_path: str, **kwargs: Any):
+        invoked["n"] += 1
+        return (0, "ok", "")
+
+    monkeypatch.setattr(plugin, "run_auto_pr", fake_run_auto_pr)
+
+    asyncio.run(runner.handle_coding())
+
+    # Dispatch still proceeded despite the write failure.
+    assert invoked["n"] == 1
+    assert runner.state.state == PipelineState.WATCH
+    log_entries = [entry["event"] for entry in runner.state.history]
+    assert any("expected-branch write failed" in e for e in log_entries)
+
+
+def test_coding_deletes_expected_branch_on_user_stop_pause(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """User-stop pause must still clean up the expected-branch marker.
+
+    ``_run_coder_with_supervision`` returns ``None`` and ``handle_coding``
+    short-circuits before reaching ``_post_coder_resolution``. Without
+    cleanup in a ``finally`` block on the write side, the stale marker
+    persists and the pre-push hook then rejects unrelated pushes from
+    the same worktree.
+    """
+    repo = tmp_path / "repo"
+    (repo / ".git" / "info").mkdir(parents=True)
+    expected_file = repo / ".git" / "info" / "expected-branch"
+
+    runner = _runner_with_repo_path(monkeypatch, repo)
+    _, plugin = runner._get_coder()
+
+    async def fake_run_auto_pr(repo_path: str, **kwargs: Any):
+        # Simulate the stop monitor: mark stop and raise CancelledError so
+        # _run_coder_with_supervision takes the user-stop branch and returns
+        # None.
+        runner._stop_requested = True
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(plugin, "run_auto_pr", fake_run_auto_pr)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert not expected_file.exists()
+
+
+def test_coding_deletes_expected_branch_on_late_breach_pause(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Late in-flight rate-limit breach pause must still clean up the marker.
+
+    The late-breach branch in ``_run_coder_with_supervision`` runs after
+    the coder exits cleanly but flips ``breach_flag["breached"]`` and
+    returns ``None``, bypassing ``_post_coder_resolution``. Cleanup on
+    the write side keeps the worktree's pre-push hook unblocked for
+    subsequent operator activity.
+    """
+    repo = tmp_path / "repo"
+    (repo / ".git" / "info").mkdir(parents=True)
+    expected_file = repo / ".git" / "info" / "expected-branch"
+
+    runner = _runner_with_repo_path(monkeypatch, repo)
+    _, plugin = runner._get_coder()
+
+    async def fake_run_auto_pr(repo_path: str, **kwargs: Any):
+        return (0, "ok", "")
+
+    def fake_check_late_breach(
+        breach_dir: Any, run_id: Any, breach_flag: dict[str, bool]
+    ) -> None:
+        breach_flag["breached"] = True
+
+    monkeypatch.setattr(plugin, "run_auto_pr", fake_run_auto_pr)
+    monkeypatch.setattr(runner, "_check_late_breach", fake_check_late_breach)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert not expected_file.exists()
+
+
+def test_expected_branch_path_falls_back_when_git_probe_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Probe failure (missing git binary, IO error) must return the legacy
+    ``.git/info/expected-branch`` path so the caller's existing
+    ``OSError`` handling still runs on the actual write attempt instead
+    of the helper itself raising and crashing the dispatch.
+    """
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+
+    def boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("git missing")
+
+    monkeypatch.setattr(coding_module.git_ops, "_git", boom)
+    marker = runner._expected_branch_path()
+    assert marker == tmp_path / ".git" / "info" / "expected-branch"
+
+
+def test_expected_branch_path_anchors_relative_git_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``git rev-parse --git-path`` returns a path relative to the repo
+    root for a regular (non-worktree) repo. The helper must anchor that
+    relative path at ``repo_path`` so the marker resolves to an absolute
+    path the caller can ``write_text`` against.
+    """
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+
+    class _R:
+        returncode = 0
+        stdout = ".git/info/expected-branch\n"
+
+    monkeypatch.setattr(
+        coding_module.git_ops, "_git", lambda *a, **k: _R()
+    )
+    marker = runner._expected_branch_path()
+    assert marker == tmp_path / ".git" / "info" / "expected-branch"
+    assert marker.is_absolute()
+
+
+def test_expected_branch_path_resolves_via_git_for_linked_worktree(
+    tmp_path: Path,
+) -> None:
+    """A linked worktree has ``.git`` as a *file* pointing into
+    ``<main>/.git/worktrees/<name>/``; the per-worktree ``info/``
+    directory lives under that gitdir, not under ``<worktree>/.git/``.
+
+    The hardcoded ``Path(repo_path) / ".git" / "info"`` layout would
+    raise ``NotADirectoryError`` on every write/cleanup, the existing
+    ``OSError`` catches would swallow it, and push validation would be
+    silently disabled for the entire CODING run. ``_expected_branch_path``
+    must instead derive the marker path from ``git rev-parse
+    --git-path info/expected-branch`` so it lands inside the
+    per-worktree gitdir where the hook also reads it.
+    """
+    main_repo = tmp_path / "main"
+    main_repo.mkdir()
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(main_repo)], check=True
+    )
+    (main_repo / "x.txt").write_text("ok\n")
+    subprocess.run(
+        ["git", "-C", str(main_repo), "add", "x.txt"], check=True, env=env
+    )
+    subprocess.run(
+        ["git", "-C", str(main_repo), "commit", "-q", "-m", "init"],
+        check=True,
+        env=env,
+    )
+    worktree = tmp_path / "wt"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(main_repo),
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            str(worktree),
+        ],
+        check=True,
+        env=env,
+    )
+
+    # Sanity: in a linked worktree, ``.git`` is a file (not a directory).
+    assert (worktree / ".git").is_file()
+
+    runner = h._make_runner()
+    runner.repo_path = str(worktree)
+
+    marker = runner._expected_branch_path()
+    runner._write_expected_branch("feature")
+    assert marker.exists()
+    assert marker.read_text(encoding="utf-8") == "feature\n"
+    # The marker must land where ``git rev-parse --git-path
+    # info/expected-branch`` resolves (the main repo's ``.git/info/``
+    # in shared-info layouts) and never under the worktree's ``.git``
+    # *file*, which is what would make ``write_text`` raise
+    # ``NotADirectoryError`` and silently disable validation.
+    legacy_hardcoded = worktree / ".git" / "info" / "expected-branch"
+    assert marker.resolve() != legacy_hardcoded.resolve()
+    assert marker.parent.is_dir()
+
+    runner._cleanup_expected_branch()
+    assert not marker.exists()

@@ -224,28 +224,38 @@ class CodingMixin:
         except CoderUnavailable:
             return
 
-        result = await self._run_coder_with_supervision(
-            coder_name,
-            plugin,
-            coder_kwargs,
-            target_branch=target_branch,
-            current_pr_id=current_pr_id,
-            pr_id=pr_id,
-            task_file=task_file,
-            task_body=task_body,
-        )
-        if result is None:
-            return
+        self._write_expected_branch(target_branch)
+        # Cleanup belongs in a finally so the marker is removed on every
+        # post-write exit, including the ``result is None`` short-circuits
+        # that ``_run_coder_with_supervision`` uses for user-stop and
+        # rate-limit pause paths. Without it, a stale marker persists in
+        # the worktree and the pre-push hook rejects later operator or
+        # daemon pushes whose HEAD no longer matches the old task branch.
+        try:
+            result = await self._run_coder_with_supervision(
+                coder_name,
+                plugin,
+                coder_kwargs,
+                target_branch=target_branch,
+                current_pr_id=current_pr_id,
+                pr_id=pr_id,
+                task_file=task_file,
+                task_body=task_body,
+            )
+            if result is None:
+                return
 
-        code, stdout, stderr = result
-        await self._post_coder_resolution(
-            coder_name,
-            code,
-            stdout,
-            stderr,
-            target_branch=target_branch,
-            current_pr_id=current_pr_id,
-        )
+            code, stdout, stderr = result
+            await self._post_coder_resolution(
+                coder_name,
+                code,
+                stdout,
+                stderr,
+                target_branch=target_branch,
+                current_pr_id=current_pr_id,
+            )
+        finally:
+            self._cleanup_expected_branch()
 
     async def _prepare_coder_invocation(
         self,
@@ -406,6 +416,92 @@ class CodingMixin:
             if attempt < 2:
                 await asyncio.sleep(5)
 
+    def _expected_branch_path(self) -> Path:
+        """Return the path of the daemon's ``expected-branch`` marker file.
+
+        The file is read by the pre-push hook installed by the
+        scaffolder; the hook aborts a push when ``HEAD`` is on a
+        different branch than the daemon expected for the active task.
+
+        Resolves the marker via ``git rev-parse --git-path
+        info/expected-branch`` so linked worktrees (where ``.git`` is a
+        file pointing into ``<main-repo>/.git/worktrees/<name>/``) and
+        repos created with ``--separate-git-dir`` land the marker in
+        the per-checkout ``info/`` directory git actually uses. The
+        hardcoded ``Path(repo_path) / ".git" / "info"`` layout would
+        otherwise raise ``NotADirectoryError`` on every write — the
+        ``OSError`` catch in ``_write_expected_branch`` swallows it and
+        silently disables push validation for the entire CODING run.
+        Falls back to the legacy hardcoded path on probe failure
+        (non-zero rc, empty stdout, ``OSError``/``SubprocessError``)
+        so test contexts that point at a synthetic non-git directory
+        still get a Path; the caller's existing ``OSError`` handling
+        then surfaces the real failure on the actual write attempt.
+        """
+        repo_root = Path(self.repo_path)
+        fallback = repo_root / ".git" / "info" / "expected-branch"
+        try:
+            probe = git_ops._git(
+                self.repo_path,
+                "rev-parse",
+                "--git-path",
+                "info/expected-branch",
+                timeout=10,
+                check=False,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return fallback
+        if probe.returncode != 0:
+            return fallback
+        raw = (probe.stdout or "").strip()
+        if not raw:
+            return fallback
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = repo_root / candidate
+        return candidate
+
+    def _write_expected_branch(self, branch: str) -> None:
+        """Write ``branch`` to the expected-branch marker for the pre-push hook.
+
+        Defense-in-depth: PR-271 already steers the coder to the right
+        branch via the ``AUTO PR`` prompt headers, so a write failure
+        here only weakens the local push gate. Log a warning and let the
+        dispatch proceed instead of routing to ERROR — refusing to
+        dispatch on a missing ``info/`` directory would regress against
+        the prompt-level protections that already cover the primary
+        scope-expansion path.
+        """
+        try:
+            self._expected_branch_path().write_text(
+                branch + "\n", encoding="utf-8"
+            )
+        except OSError as exc:
+            self.log_event(
+                f"[CODING] expected-branch write failed ({exc}); pre-push "
+                f"hook disabled for this dispatch — continuing."
+            )
+
+    def _cleanup_expected_branch(self) -> None:
+        """Remove the expected-branch marker after coder resolution.
+
+        Cleanup runs regardless of coder exit code so manual operator
+        pushes between dispatches are not blocked by a stale marker.
+        ``missing_ok=True`` swallows ``FileNotFoundError`` so a missing
+        file (e.g. write failed earlier in the cycle) does not raise;
+        the broader ``OSError`` catch covers permission/IsADirectory
+        edge cases left behind when the write itself collided with a
+        non-file at the marker path.
+        """
+        try:
+            self._expected_branch_path().unlink(missing_ok=True)
+        except OSError as exc:
+            self.log_event(
+                f"[CODING] expected-branch cleanup failed ({exc}); "
+                f"manual git operations on this worktree may be gated "
+                f"until the marker is removed."
+            )
+
     async def _post_coder_resolution(
         self,
         coder_name: str,
@@ -421,7 +517,10 @@ class CodingMixin:
         Either transitions to WATCH (PR found or daemon-created) or
         returns after a state transition to PAUSED, ERROR, or HUNG via
         the appropriate primitive (``_transition_to_error``,
-        ``_diagnose_exit_zero_no_pr``).
+        ``_diagnose_exit_zero_no_pr``). The expected-branch marker is
+        cleaned up in ``handle_coding``'s ``finally`` block so every
+        post-write exit path is covered, including the pause shortcuts
+        in ``_run_coder_with_supervision`` that bypass this method.
         """
         async def pause_for_stop_if_requested() -> bool:
             if self._stop_requested:

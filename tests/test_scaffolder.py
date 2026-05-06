@@ -1002,3 +1002,526 @@ def test_scaffold_repo_propagates_git_push_timeout(
 
     with pytest.raises(subprocess.TimeoutExpired):
         scaffolder.scaffold_repo(str(repo), "main")
+
+
+# --- PR-272: pre-push branch-validation hook installation ----------------
+
+
+def _patch_git_passthrough_install_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[list[str]]:
+    """Like ``_patch_git`` but lets the install-pre-push-hook.sh call run
+    for real so the test can assert the hook file was written to disk.
+
+    The bash invocation path is matched by ``cmd[0] == "bash"`` — every
+    other subprocess (git checkout, add, commit, push, check-ignore) is
+    served by the local fake exactly like ``_patch_git``.
+
+    The PR-272 in-tree-hook helpers issue ``git rev-parse --git-path``
+    (for ``hooks/pre-push`` and ``info/exclude``), ``--show-toplevel``,
+    ``--git-dir``, and ``git ls-files --error-unmatch`` against the real
+    repo to resolve the effective hook path, decide whether the
+    destination is a user-versioned hook, and locate the per-clone
+    exclude file; those probes are passed through as well.
+    """
+    real_run = subprocess.run
+    calls: list[list[str]] = []
+    _GUARD_REV_PARSE_ARGS = {
+        ("--git-path", "hooks/pre-push"),
+        ("--show-toplevel",),
+        ("--git-dir",),
+        ("--git-path", "info/exclude"),
+    }
+
+    def fake_run(cmd: list[str], **kwargs: Any):
+        calls.append(cmd)
+        if (
+            cmd
+            and cmd[0] == "bash"
+            and len(cmd) > 1
+            and cmd[1].endswith("install-pre-push-hook.sh")
+        ):
+            return real_run(cmd, **kwargs)
+        if cmd[:2] == ["git", "rev-parse"] and tuple(cmd[2:]) in _GUARD_REV_PARSE_ARGS:
+            return real_run(cmd, **kwargs)
+        if cmd[:3] == ["git", "ls-files", "--error-unmatch"]:
+            return real_run(cmd, **kwargs)
+        if cmd[:2] == ["git", "check-ignore"]:
+            return _FakeCompletedProcess(args=cmd, returncode=1)
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            ref = cmd[-1]
+            if ref.startswith("refs/remotes/origin/"):
+                return _FakeCompletedProcess(args=cmd, returncode=1)
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        if cmd[:2] == ["git", "rev-list"]:
+            return _FakeCompletedProcess(args=cmd, returncode=0, stdout="0\n")
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+    return calls
+
+
+def test_scaffolder_installs_pre_push_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``scaffold_repo`` must install the pre-push hook on every pass so
+    existing managed repos gain the PR-272 branch-validation defense
+    automatically.
+    """
+    repo = _init_empty_repo(tmp_path)
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True
+    )
+    _patch_git_passthrough_install_hook(monkeypatch)
+
+    scaffolder.scaffold_repo(str(repo), "main")
+
+    hook = repo / ".git" / "hooks" / "pre-push"
+    assert hook.exists()
+    assert hook.stat().st_mode & 0o111
+    content = hook.read_text()
+    assert "[pre-push-hook]" in content
+    assert "expected-branch" in content
+
+
+def test_scaffolder_idempotent_pre_push_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-running the scaffolder must not duplicate or corrupt the hook
+    file. The install script overwrites unconditionally, so the second
+    pass leaves the file content unchanged.
+    """
+    repo = _init_empty_repo(tmp_path)
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True
+    )
+    _patch_git_passthrough_install_hook(monkeypatch)
+
+    scaffolder.scaffold_repo(str(repo), "main")
+    hook = repo / ".git" / "hooks" / "pre-push"
+    first_content = hook.read_text()
+
+    scaffolder.scaffold_repo(str(repo), "main")
+    second_content = hook.read_text()
+
+    assert second_content == first_content
+    # The shebang appears exactly once — no accidental duplication
+    # from a double-write that misses the overwrite path. A unique
+    # one-shot anchor at the top of the script is a stable proxy for
+    # the entire payload not being concatenated to itself.
+    assert first_content.count("#!/bin/bash") == 1
+
+
+def test_scaffolder_logs_warning_on_pre_push_install_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A non-zero install exit must be logged but must NOT abort the
+    cycle: the hook is defense-in-depth and a failed install reduces
+    protection without breaking the dispatch path.
+    """
+    repo = _init_empty_repo(tmp_path)
+
+    def fake_run(cmd: list[str], **kwargs: Any):
+        if (
+            cmd
+            and cmd[0] == "bash"
+            and len(cmd) > 1
+            and cmd[1].endswith("install-pre-push-hook.sh")
+        ):
+            raise subprocess.CalledProcessError(returncode=1, cmd=cmd)
+        if cmd[:2] == ["git", "check-ignore"]:
+            return _FakeCompletedProcess(args=cmd, returncode=1)
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            ref = cmd[-1]
+            if ref.startswith("refs/remotes/origin/"):
+                return _FakeCompletedProcess(args=cmd, returncode=1)
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        if cmd[:2] == ["git", "rev-list"]:
+            return _FakeCompletedProcess(args=cmd, returncode=0, stdout="0\n")
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+
+    with caplog.at_level("WARNING", logger="src.daemon.scaffolder"):
+        scaffolder.scaffold_repo(str(repo), "main")
+
+    assert any(
+        "pre-push hook install failed" in record.message
+        for record in caplog.records
+    )
+
+
+def test_hooks_path_inside_worktree_default_returns_false(
+    tmp_path: Path,
+) -> None:
+    """A repo with no ``core.hooksPath`` keeps hooks under ``.git/hooks/``.
+    That path is technically inside the worktree directory tree but
+    invisible to ``git status``, so the worktree-dirty guard must NOT
+    trigger on the default and the installer must run as before.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True
+    )
+    assert scaffolder._hooks_path_inside_worktree(str(repo)) is False
+
+
+def test_hooks_path_inside_worktree_relative_in_tree_returns_true(
+    tmp_path: Path,
+) -> None:
+    """``core.hooksPath=.githooks`` resolves to ``<repo>/.githooks/`` —
+    inside the worktree but outside ``.git/``. The guard must trigger so
+    scaffold_repo skips the install and avoids dirtying ``git status``.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "core.hooksPath", ".githooks"],
+        check=True,
+    )
+    assert scaffolder._hooks_path_inside_worktree(str(repo)) is True
+
+
+def test_hooks_path_inside_worktree_absolute_outside_returns_false(
+    tmp_path: Path,
+) -> None:
+    """An absolute ``core.hooksPath`` outside the worktree is safe; the
+    bash installer writes there directly without touching the worktree.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    custom = tmp_path / "custom-hooks"
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "core.hooksPath", str(custom)],
+        check=True,
+    )
+    assert scaffolder._hooks_path_inside_worktree(str(repo)) is False
+
+
+def test_hooks_path_inside_worktree_probe_failure_returns_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing rev-parse probe must NOT silently disable the install
+    path. The guard returns False and ``_install_pre_push_hook`` proceeds
+    to invoke the bash installer (which has its own diagnostics).
+    """
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "rev-parse"]:
+            raise subprocess.CalledProcessError(returncode=128, cmd=cmd)
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+    assert scaffolder._hooks_path_inside_worktree(str(tmp_path)) is False
+
+
+def test_scaffolder_installs_pre_push_when_hooks_path_in_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``core.hooksPath`` points inside the worktree (e.g. a
+    relative ``.githooks/`` versioned with the repo) and the destination
+    is not a tracked file, scaffold_repo must still install the hook —
+    skipping would disable the branch-guard for repos that intentionally
+    version hooks in-tree, defeating the defense-in-depth guarantee.
+    The path is appended to the per-clone ``info/exclude`` so the new
+    hook does not show up as untracked under ``git status --porcelain``
+    and stall later preflight checks.
+    """
+    repo = _init_empty_repo(tmp_path)
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "core.hooksPath", ".githooks"],
+        check=True,
+    )
+    _patch_git_passthrough_install_hook(monkeypatch)
+
+    scaffolder.scaffold_repo(str(repo), "main")
+
+    hook = repo / ".githooks" / "pre-push"
+    assert hook.exists()
+    assert hook.stat().st_mode & 0o111
+    content = hook.read_text()
+    assert "[pre-push-hook]" in content
+    assert "expected-branch" in content
+
+    exclude = repo / ".git" / "info" / "exclude"
+    assert exclude.exists()
+    assert "/.githooks/pre-push" in exclude.read_text().splitlines()
+
+    # Sanity: git itself agrees the installed hook is ignored, so
+    # ``git status --porcelain`` will not surface it during preflight.
+    check_ignore = subprocess.run(
+        ["git", "-C", str(repo), "check-ignore", ".githooks/pre-push"],
+        capture_output=True,
+        text=True,
+    )
+    assert check_ignore.returncode == 0
+
+
+def test_scaffolder_in_tree_install_idempotent_exclude_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-running scaffold_repo against an in-tree hooks path must not
+    duplicate the ``info/exclude`` entry on every pass — the helper
+    appends only when missing.
+    """
+    repo = _init_empty_repo(tmp_path)
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "core.hooksPath", ".githooks"],
+        check=True,
+    )
+    _patch_git_passthrough_install_hook(monkeypatch)
+
+    scaffolder.scaffold_repo(str(repo), "main")
+    scaffolder.scaffold_repo(str(repo), "main")
+
+    exclude_text = (repo / ".git" / "info" / "exclude").read_text()
+    assert exclude_text.count("/.githooks/pre-push") == 1
+
+
+def test_scaffolder_skips_install_when_in_tree_dest_is_tracked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When ``core.hooksPath`` points inside the worktree AND the
+    destination file is already tracked by git, scaffold_repo must
+    refuse to clobber the user-versioned hook. The skip is logged at
+    WARNING so operators see the reduced redundancy.
+    """
+    repo = _init_empty_repo(tmp_path)
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "core.hooksPath", ".githooks"],
+        check=True,
+    )
+    githooks = repo / ".githooks"
+    githooks.mkdir()
+    user_hook_body = "#!/bin/bash\n# user-versioned hook\nexit 0\n"
+    user_hook = githooks / "pre-push"
+    user_hook.write_text(user_hook_body)
+    user_hook.chmod(0o755)
+    subprocess.run(
+        ["git", "-C", str(repo), "add", ".githooks/pre-push"], check=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.email=test@example.test",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-q",
+            "-m",
+            "init hook",
+        ],
+        check=True,
+    )
+
+    calls = _patch_git_passthrough_install_hook(monkeypatch)
+
+    with caplog.at_level("WARNING", logger="src.daemon.scaffolder"):
+        scaffolder.scaffold_repo(str(repo), "main")
+
+    assert not any(
+        len(cmd) > 1
+        and cmd[0] == "bash"
+        and cmd[1].endswith("install-pre-push-hook.sh")
+        for cmd in calls
+    )
+    assert user_hook.read_text() == user_hook_body
+    assert any(
+        "tracked file" in record.message
+        and "skipping pre-push hook install" in record.message
+        for record in caplog.records
+    )
+
+
+def test_hook_dest_is_tracked_returns_true_for_committed_path(
+    tmp_path: Path,
+) -> None:
+    """A path committed to the index returns True so the install path
+    can detect the clobber risk.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True
+    )
+    (repo / ".githooks").mkdir()
+    (repo / ".githooks" / "pre-push").write_text("#!/bin/bash\nexit 0\n")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", ".githooks/pre-push"], check=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.email=test@example.test",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ],
+        check=True,
+    )
+
+    assert (
+        scaffolder._hook_dest_is_tracked(
+            str(repo), Path(".githooks/pre-push")
+        )
+        is True
+    )
+
+
+def test_hook_dest_is_tracked_returns_false_for_untracked_path(
+    tmp_path: Path,
+) -> None:
+    """An untracked-on-disk file is not tracked, so install proceeds."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True
+    )
+    (repo / ".githooks").mkdir()
+    (repo / ".githooks" / "pre-push").write_text("#!/bin/bash\nexit 0\n")
+
+    assert (
+        scaffolder._hook_dest_is_tracked(
+            str(repo), Path(".githooks/pre-push")
+        )
+        is False
+    )
+
+
+def test_hook_dest_is_tracked_probe_failure_returns_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timeout on the ``ls-files`` probe must NOT silently mark the
+    destination as tracked — that would skip install even when the
+    repo has no committed hook.
+    """
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "ls-files"]:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=1)
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+    assert (
+        scaffolder._hook_dest_is_tracked(
+            str(tmp_path), Path(".githooks/pre-push")
+        )
+        is False
+    )
+
+
+def test_add_to_local_exclude_creates_file_when_missing(
+    tmp_path: Path,
+) -> None:
+    """``info/exclude`` may not exist on a fresh ``git init`` (depending
+    on git version); the helper must create it rather than silently
+    failing.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True
+    )
+    exclude = repo / ".git" / "info" / "exclude"
+    if exclude.exists():
+        exclude.unlink()
+
+    scaffolder._add_to_local_exclude(
+        str(repo), Path(".githooks/pre-push")
+    )
+
+    assert exclude.exists()
+    assert "/.githooks/pre-push" in exclude.read_text().splitlines()
+
+
+def test_add_to_local_exclude_logs_on_rev_parse_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failing ``rev-parse --git-path info/exclude`` must be logged at
+    WARNING and swallowed; the install path itself succeeded, so a
+    failure to add the exclude entry only degrades preflight cleanliness,
+    not the hook's branch-guard function.
+    """
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:3] == ["git", "rev-parse", "--git-path"]:
+            raise subprocess.CalledProcessError(returncode=128, cmd=cmd)
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+
+    with caplog.at_level("WARNING", logger="src.daemon.scaffolder"):
+        scaffolder._add_to_local_exclude(
+            str(tmp_path), Path(".githooks/pre-push")
+        )
+
+    assert any(
+        "cannot resolve info/exclude" in record.message
+        for record in caplog.records
+    )
+
+
+def test_add_to_local_exclude_logs_on_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An ``OSError`` writing the exclude file is logged and swallowed
+    so install completion is not penalised by a read-only ``.git/info``.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True
+    )
+
+    real_write_text = Path.write_text
+
+    def boom(self: Path, *args: Any, **kwargs: Any) -> int:
+        if self.name == "exclude":
+            raise OSError("read-only filesystem")
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", boom)
+
+    with caplog.at_level("WARNING", logger="src.daemon.scaffolder"):
+        scaffolder._add_to_local_exclude(
+            str(repo), Path(".githooks/pre-push")
+        )
+
+    assert any(
+        "failed to update" in record.message
+        and "pre-push" in record.message
+        for record in caplog.records
+    )

@@ -130,6 +130,20 @@ class RecoveryMixin:
         work.
         """
         strict = self.app_config.daemon.strict_queue_validation
+        # PR-272 follow-up: clear any stale ``info/expected-branch`` marker
+        # left behind by a SIGKILL/OOM/crash mid-CODING. ``handle_coding``
+        # cleans the marker in a ``finally`` block on every normal exit,
+        # but a daemon kill skips Python teardown and the marker survives.
+        # The next IDLE cycle's ``process_pending_uploads`` issues a
+        # daemon-driven ``git push origin {branch}`` for upload commits;
+        # the pre-push hook reads the stale marker, sees HEAD on the base
+        # branch != the dead task's expected branch, and rejects the push,
+        # stalling the runner in IDLE indefinitely. The marker is only
+        # valid during an active CODING dispatch, so clearing it on
+        # startup recovery is always correct: if recovery re-enters
+        # CODING through the DOING-with-matching-PR path the next handle
+        # cycle rewrites the marker before invoking the coder.
+        self._cleanup_expected_branch()
         # PR-247 follow-up: hydrate the operator-recovered task set from
         # Redis before any DOING-task decision. The HUNG recover button
         # writes through ``_persist_recovered_task_pr_ids``; without this
