@@ -1984,6 +1984,156 @@ def test_handle_idle_uses_fallback_queue_counters_when_dag_picks_nothing(
     assert runner.state.queue_total == 1
 
 
+def test_idle_populates_current_queue_after_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    dag_tasks = [
+        QueueTask(
+            pr_id="PR-001",
+            title="Done task",
+            status=TaskStatus.DONE,
+            task_file="tasks/PR-001.md",
+            branch="pr-001-done",
+        ),
+        QueueTask(
+            pr_id="PR-002",
+            title="Selected task",
+            status=TaskStatus.TODO,
+            task_file="tasks/PR-002.md",
+            branch="pr-002-selected",
+        ),
+        QueueTask(
+            pr_id="PR-003",
+            title="Waiting task",
+            status=TaskStatus.TODO,
+            task_file="tasks/PR-003.md",
+            branch="pr-003-waiting",
+            depends_on=["PR-002"],
+        ),
+    ]
+
+    async def fake_select(self):
+        self._idle_dag_tasks = list(dag_tasks)
+        self._idle_dag_statuses = {
+            task.pr_id: task.status for task in dag_tasks
+        }
+        return dag_tasks[1]
+
+    monkeypatch.setattr(idle_module.IdleMixin, "_select_next_task_from_dag", fake_select)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: list(dag_tasks))
+    monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda tasks, repo_path, base_branch, prs, merged_prs=(): tasks,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    async def fake_handle_coding() -> None:
+        return None
+
+    runner = h._make_runner()
+    runner.handle_coding = fake_handle_coding  # type: ignore[method-assign]
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.current_queue == [
+        dag_tasks[0],
+        dag_tasks[1].model_copy(update={"status": TaskStatus.DOING}),
+        dag_tasks[2],
+    ]
+
+
+def test_idle_populates_current_queue_no_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    dag_tasks = [
+        QueueTask(
+            pr_id="PR-001",
+            title="Done task",
+            status=TaskStatus.DONE,
+            task_file="tasks/PR-001.md",
+            branch="pr-001-done",
+        ),
+        QueueTask(
+            pr_id="PR-002",
+            title="Also done",
+            status=TaskStatus.DONE,
+            task_file="tasks/PR-002.md",
+            branch="pr-002-done",
+        ),
+    ]
+
+    async def fake_select(self):
+        self._idle_dag_tasks = list(dag_tasks)
+        return None
+
+    monkeypatch.setattr(idle_module.IdleMixin, "_select_next_task_from_dag", fake_select)
+    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: list(dag_tasks))
+    monkeypatch.setattr(
+        idle_module,
+        "derive_queue_task_statuses",
+        lambda tasks, repo_path, base_branch, prs, merged_prs=(): tasks,
+    )
+    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    runner = h._make_runner()
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.current_task is None
+    assert runner.state.current_queue == dag_tasks
+
+
+def test_idle_skips_population_on_validation_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    prior_queue = [
+        QueueTask(
+            pr_id="PR-001",
+            title="Prior",
+            status=TaskStatus.DONE,
+            task_file="tasks/PR-001.md",
+            branch="pr-001-prior",
+        )
+    ]
+
+    async def fake_select(self):
+        raise QueueValidationError(["tasks/PR-002.md: invalid header"])
+
+    monkeypatch.setattr(idle_module.IdleMixin, "_select_next_task_from_dag", fake_select)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [],
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    runner = h._make_runner()
+    runner.state.current_queue = list(prior_queue)
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_queue == prior_queue
+
+
 def test_handle_idle_keeps_dag_task_when_queue_validation_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
