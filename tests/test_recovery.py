@@ -517,6 +517,37 @@ def test_recover_doing_task_without_pr_marks_canceled_and_idles(
     )
 
 
+def test_recover_clears_stale_expected_branch_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """PR-272 follow-up: a SIGKILL/OOM during CODING bypasses the
+    ``finally`` cleanup in ``handle_coding`` and leaves
+    ``.git/info/expected-branch`` on disk. Recovery must clear the
+    marker so the next IDLE cycle's ``process_pending_uploads`` push
+    is not rejected by the pre-push hook (HEAD on base != stale
+    expected branch). Without this the daemon stalls in IDLE
+    indefinitely after every crash recovery against a managed repo
+    that has the hook installed."""
+    info_dir = tmp_path / ".git" / "info"
+    info_dir.mkdir(parents=True)
+    marker = info_dir / "expected-branch"
+    marker.write_text("pr-old-task-from-killed-cycle\n", encoding="utf-8")
+
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
+
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
+
+    asyncio.run(runner.recover_state())
+
+    assert not marker.exists(), (
+        "stale expected-branch marker survived recovery; pre-push hook "
+        "would reject the next daemon-driven upload push"
+    )
+
+
 def test_recover_seeds_crashed_set_from_canceled_queue_entries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -864,6 +895,13 @@ def test_recover_aborts_when_branch_probe_fails(
         # stays focused on the local-branch probe failure under test.
         if cmd[:2] == ["git", "-C"] and len(cmd) > 3 and cmd[3] == "log":
             return _Result(returncode=0)
+        # PR-272 follow-up: recovery clears the ``info/expected-branch``
+        # marker on startup so a SIGKILL'd CODING dispatch does not
+        # leave a stale marker that blocks the next IDLE upload push.
+        # Report a non-existent path so ``_cleanup_expected_branch``
+        # short-circuits via ``unlink(missing_ok=True)``.
+        if cmd[:3] == ["git", "rev-parse", "--git-path"]:
+            return _Result(returncode=1)
         raise AssertionError(f"unexpected subprocess call: {cmd}")
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
