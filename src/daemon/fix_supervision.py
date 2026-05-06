@@ -198,24 +198,7 @@ async def handle_external_terminal_pr_state(
         )
         await runner._save_current_run_record("success_merged")
         runner._current_run_record = None
-        try:
-            runner._mark_queue_done()
-        except Exception as exc:
-            # ``_mark_queue_done`` sets ``pending_queue_sync_branch``
-            # *before* its fragile git/GitHub ops, and that marker is
-            # the guard that prevents ``handle_idle`` from
-            # redispatching a stale ``DOING`` task before queue-sync
-            # actually resolves. Log the failure for visibility but
-            # preserve the marker so ``_resolve_pending_queue_sync``
-            # owns the retry / timeout (Codex P2 round-2 + P1 round-3
-            # on PR #223: surface the failure but do not nullify the
-            # guard).
-            runner.log_event(
-                "[FIX] Warning: _mark_queue_done failed during "
-                f"external-merge cleanup: {exc}; "
-                "pending_queue_sync_branch preserved so handle_idle "
-                "resolves via _resolve_pending_queue_sync."
-            )
+        runner._mark_task_done_in_snapshot()
         runner.state.current_task = None
         runner._reset_runner_local_task_counters()
         runner.state.state = PipelineState.IDLE

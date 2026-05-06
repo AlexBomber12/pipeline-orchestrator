@@ -12,7 +12,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -24,6 +23,7 @@ from src.daemon.git_ops import (
     _working_tree_dirty,
 )
 from src.keyspace import upload_pending
+from src.models import TaskStatus
 from src.retry import retry_transient
 
 logger = logging.getLogger(__name__)
@@ -155,8 +155,8 @@ class RepoOpsMixin:
         Only safe to call when the runner is IDLE (no active Claude working
         branch to clobber). Uses ``git reset --hard`` instead of ``git pull``
         so that any stray local modifications from a prior crashed cycle are
-        discarded deterministically, guaranteeing QUEUE.md and tasks/ reflect
-        the tip of the base branch before ``parse_queue`` reads them.
+        discarded deterministically, guaranteeing tasks/ reflects the tip
+        of the base branch before the IDLE selector reads it.
 
         Raises the underlying ``subprocess`` exception on failure so the
         caller can translate it into ERROR state with appropriate context.
@@ -178,40 +178,6 @@ class RepoOpsMixin:
             git_ops._git(self.repo_path, "clean", "-fd")
         except OSError as exc:
             raise RuntimeError(f"sync_to_main OS error: {exc}") from exc
-
-    def _origin_queue_md_tracked(self) -> bool | None:
-        """Return ``True``/``False`` for tracked-on-origin, ``None`` on probe failure.
-
-        PR-181 untracks ``tasks/QUEUE.md`` in this repo, but managed
-        repos that have not yet adopted that migration still carry the
-        file in tree. ``.gitignore`` does not retroactively untrack
-        files, so the daemon must detect tracked-QUEUE repos and steer
-        clear of the local-write paths that PR-181's design otherwise
-        relies on.
-
-        Tristate on purpose. A transient ``cat-file`` failure (timeout,
-        OSError) is genuinely indeterminate: collapsing it to ``False``
-        would make legacy repos look post-PR-181 and could dirty the
-        worktree on every IDLE or MERGE cycle. Returning ``None`` lets
-        those callers skip their writes conservatively and self-heal on
-        the next cycle.
-
-        A non-zero ``returncode`` (file genuinely absent on origin) is
-        still a definitive ``False``.
-        """
-        branch = self.repo_config.branch
-        try:
-            result = git_ops._git(
-                self.repo_path,
-                "cat-file",
-                "-e",
-                f"origin/{branch}:tasks/QUEUE.md",
-                check=False,
-                timeout=10,
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            return None
-        return result.returncode == 0
 
     _DELETE_IF_UNCHANGED_LUA = """
 if redis.call("get", KEYS[1]) == ARGV[1] then
@@ -374,7 +340,7 @@ return 0
                     # task on the next IDLE cycle.
                     await self._persist_recovered_task_pr_ids()
             if uploaded_pr_ids:
-                self._clear_canceled_queue_rows(uploaded_pr_ids)
+                self._clear_canceled_in_snapshot(uploaded_pr_ids)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
             logger.error("%s: upload git operations failed: %s", self.name, exc)
             self.log_event(f"[INFRA] Upload push failed: {exc}.")
@@ -402,56 +368,23 @@ return 0
         )
         return None
 
-    def _clear_canceled_queue_rows(self, uploaded_pr_ids: set[str]) -> None:
-        """Flip CANCELED → TODO in the working-tree QUEUE.md for re-uploads.
+    def _clear_canceled_in_snapshot(self, uploaded_pr_ids: set[str]) -> None:
+        """Flip CANCELED → TODO in ``state.current_queue`` for re-uploads.
 
-        Bridges the gap between an upload landing (which the user uses to
-        retry a previously-crashed task) and the next IDLE regeneration of
-        ``tasks/QUEUE.md``. Without this, a daemon restart in that window
-        would re-read the stale CANCELED row from QUEUE.md and re-add the
-        PR-id to ``_crashed_task_pr_ids`` via ``recover_state``'s
-        rehydrate, silently dropping the retry signal.
-
-        Best-effort: missing or unreadable QUEUE.md is a no-op (the next
-        IDLE cycle regenerates from scratch and there is no stale row to
-        clear). Legacy tracked-QUEUE repos see only a working-tree change
-        here; recovery on those repos still parses ``origin/{branch}``,
-        so the user must also keep the upstream queue in sync as before.
+        The user re-uploads a task file to retry a previously-crashed
+        task. ``crashed_task_pr_ids`` and ``recovered_task_pr_ids`` are
+        already pruned by the caller; mirroring the change in the
+        in-memory snapshot keeps the dashboard consistent until the
+        next IDLE cycle rebuilds the snapshot from headers.
         """
-        queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
-        try:
-            text = queue_path.read_text(encoding="utf-8")
-        except (FileNotFoundError, OSError):
+        snapshot = self.state.current_queue
+        if not snapshot:
             return
-
-        new_lines: list[str] = []
-        current_pr_id: str | None = None
-        changed = False
-        header_re = re.compile(r"^##\s+(PR-[A-Za-z0-9_.-]+)\b")
-        status_re = re.compile(r"^(\s*-\s*Status\s*:\s*)CANCELED(\s*)$")
-        for line in text.splitlines(keepends=True):
-            stripped = line.rstrip("\n").rstrip("\r")
-            header_match = header_re.match(stripped)
-            if header_match:
-                current_pr_id = header_match.group(1)
-                new_lines.append(line)
-                continue
-            if current_pr_id in uploaded_pr_ids:
-                status_match = status_re.match(stripped)
-                if status_match:
-                    eol = line[len(stripped):]
-                    new_lines.append(
-                        f"{status_match.group(1)}TODO{status_match.group(2)}{eol}"
-                    )
-                    changed = True
-                    continue
-            new_lines.append(line)
-
-        if changed:
-            try:
-                queue_path.write_text("".join(new_lines), encoding="utf-8")
-            except OSError as exc:
-                self.log_event(
-                    f"[INFRA] Failed to clear stale CANCELED rows in "
-                    f"QUEUE.md: {exc}."
+        for index, queued in enumerate(snapshot):
+            if (
+                queued.pr_id in uploaded_pr_ids
+                and queued.status == TaskStatus.CANCELED
+            ):
+                snapshot[index] = queued.model_copy(
+                    update={"status": TaskStatus.TODO}
                 )

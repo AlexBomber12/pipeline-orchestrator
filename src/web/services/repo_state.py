@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-from pathlib import Path
 
 import redis.asyncio as aioredis
 
@@ -24,7 +23,6 @@ from src.cancellation.blocked_set import (
 from src.config import AppConfig, RepoConfig, load_config
 from src.keyspace import pipeline_state
 from src.models import PipelineState, QueueTask, RepoState, TaskStatus
-from src.queue_parser import parse_queue
 from src.utils import repo_slug_from_url
 
 
@@ -205,12 +203,11 @@ async def build_repo_task_nodes(
 ) -> list[TaskNode]:
     """Return ``TaskNode`` list for a repo's queue.
 
-    Reads ``RepoState.current_queue`` from Redis first via
-    :func:`load_current_queue`; falls back to parsing the on-disk
-    ``tasks/QUEUE.md`` only when the snapshot is absent (daemon has not
-    yet reached IDLE for the repo) or Redis is unreachable. The disk
-    fallback is preserved through Sprint 15a #6 for independent
-    revertability and is removed in PR-267.
+    Reads ``RepoState.current_queue`` from Redis via
+    :func:`load_current_queue`. When no snapshot is available (daemon
+    has not yet reached IDLE for the repo, or Redis is unreachable),
+    falls back to ``extra_canceled_ids`` alone so cancellation cause
+    records still surface on the dashboard.
 
     Each ``QueueTask`` becomes a ``TaskNode`` with ``is_canceled`` set
     when the task's ``TaskStatus`` is ``CANCELED`` or its id appears in
@@ -219,19 +216,11 @@ async def build_repo_task_nodes(
     ``CANCELED`` status in the queue snapshot. Task ids that exist only
     in ``extra_canceled_ids`` are appended as canceled root nodes with
     no ``depends_on`` so the closure walk can still find them.
-
-    Returns an empty list when both sources fail — rendering the
-    dashboard cancellation surface must not 5xx because of a transient
-    parse or Redis failure.
     """
     extras = set(extra_canceled_ids or ())
     queued = await load_current_queue(repo_name, redis_client)
     if queued is None:
-        queue_path = Path(repos_dir) / repo_name / "tasks" / "QUEUE.md"
-        try:
-            queued = parse_queue(str(queue_path))
-        except (OSError, UnicodeDecodeError):
-            queued = []
+        queued = []
     nodes: list[TaskNode] = []
     seen: set[str] = set()
     for task in queued:

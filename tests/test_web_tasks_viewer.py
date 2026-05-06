@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 from src.models import PipelineState, QueueTask, RepoState, TaskStatus
+from src.queue_parser import parse_queue_text
 from src.web import app as web_app
 from src.web.app import app
 
@@ -61,15 +62,38 @@ def _write_alpha_config(
     return repo_dir
 
 
+def _seed_alpha_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tasks: list[QueueTask],
+) -> None:
+    """Seed a ``RepoState.current_queue`` snapshot for ``example__alpha``."""
+    state = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        current_queue=tasks,
+    )
+    store = {"pipeline:example__alpha": state.model_dump_json()}
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_store(store))
+
+
+def _seed_alpha_snapshot_from_queue_md(
+    monkeypatch: pytest.MonkeyPatch,
+    queue_md: str,
+) -> None:
+    """Parse ``queue_md`` text into ``QueueTask`` and seed the snapshot."""
+    _seed_alpha_snapshot(monkeypatch, parse_queue_text(queue_md))
+
+
 def test_list_repo_tasks_returns_grouped_tasks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
-    (repo_dir / "tasks" / "QUEUE.md").write_text(
+    _write_alpha_config(tmp_path, monkeypatch)
+    _seed_alpha_snapshot_from_queue_md(
+        monkeypatch,
         "## PR-001: First done task\n- Status: DONE\n- Branch: pr-001\n\n"
         "## PR-002: Second queued task\n- Status: TODO\n- Branch: pr-002\n\n"
         "## PR-003: In-flight task\n- Status: DOING\n- Branch: pr-003\n",
-        encoding="utf-8",
     )
 
     with TestClient(app) as client:
@@ -103,10 +127,10 @@ def test_list_repo_tasks_uses_collision_free_target_for_dotted_pr_ids(
     keeps the literal pr_id in the DOM id and uses an attribute selector for
     ``hx-target`` so the dot is matched as data, not as a class delimiter.
     """
-    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
-    (repo_dir / "tasks" / "QUEUE.md").write_text(
+    _write_alpha_config(tmp_path, monkeypatch)
+    _seed_alpha_snapshot_from_queue_md(
+        monkeypatch,
         "## PR-1.2: Dotted task\n- Status: TODO\n- Branch: pr-1-2\n",
-        encoding="utf-8",
     )
 
     with TestClient(app) as client:
@@ -128,11 +152,11 @@ def test_list_repo_tasks_target_ids_are_collision_free_across_pr_ids(
     ``task-content-<status>-PR-1-2`` token, producing duplicate ids in the
     same status bucket and making ``hx-target`` non-deterministic.
     """
-    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
-    (repo_dir / "tasks" / "QUEUE.md").write_text(
+    _write_alpha_config(tmp_path, monkeypatch)
+    _seed_alpha_snapshot_from_queue_md(
+        monkeypatch,
         "## PR-1.2: Dotted task\n- Status: TODO\n- Branch: pr-1-dot-2\n\n"
         "## PR-1-2: Dashed task\n- Status: TODO\n- Branch: pr-1-2\n",
-        encoding="utf-8",
     )
 
     with TestClient(app) as client:
@@ -149,10 +173,10 @@ def test_list_repo_tasks_target_ids_are_collision_free_across_pr_ids(
 def test_list_repo_tasks_omits_doing_section_when_absent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
-    (repo_dir / "tasks" / "QUEUE.md").write_text(
+    _write_alpha_config(tmp_path, monkeypatch)
+    _seed_alpha_snapshot_from_queue_md(
+        monkeypatch,
         "## PR-100: Only TODO\n- Status: TODO\n- Branch: pr-100\n",
-        encoding="utf-8",
     )
 
     with TestClient(app) as client:
@@ -172,11 +196,11 @@ def test_list_repo_tasks_renders_canceled_section(
     file. Without the dedicated section, canceled tasks were hidden from
     every group while still counted in the total — leaving operators no
     way to discover or re-upload them from the dashboard."""
-    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
-    (repo_dir / "tasks" / "QUEUE.md").write_text(
+    _write_alpha_config(tmp_path, monkeypatch)
+    _seed_alpha_snapshot_from_queue_md(
+        monkeypatch,
         "## PR-400: Crashed earlier\n- Status: CANCELED\n- Branch: pr-400\n\n"
         "## PR-401: Next up\n- Status: TODO\n- Branch: pr-401\n",
-        encoding="utf-8",
     )
 
     with TestClient(app) as client:
@@ -192,7 +216,7 @@ def test_list_repo_tasks_renders_canceled_section(
     assert "re-upload" in body.lower()
 
 
-def test_list_repo_tasks_returns_friendly_message_when_no_queue_file(
+def test_list_repo_tasks_returns_503_when_snapshot_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write_alpha_config(tmp_path, monkeypatch)
@@ -200,19 +224,17 @@ def test_list_repo_tasks_returns_friendly_message_when_no_queue_file(
     with TestClient(app) as client:
         response = client.get("/repos/example__alpha/tasks")
 
-    assert response.status_code == 200
-    body = response.text
-    assert "0 total" in body
-    assert "No tasks found" in body
+    assert response.status_code == 503
+    assert "Queue not yet computed" in response.text
 
 
 def test_list_repo_tasks_renders_empty_status_placeholders(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
-    (repo_dir / "tasks" / "QUEUE.md").write_text(
+    _write_alpha_config(tmp_path, monkeypatch)
+    _seed_alpha_snapshot_from_queue_md(
+        monkeypatch,
         "## PR-200: Done only\n- Status: DONE\n- Branch: pr-200\n",
-        encoding="utf-8",
     )
 
     with TestClient(app) as client:
@@ -226,10 +248,10 @@ def test_list_repo_tasks_renders_empty_status_placeholders(
 def test_list_repo_tasks_empty_done_section_renders_placeholder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
-    (repo_dir / "tasks" / "QUEUE.md").write_text(
+    _write_alpha_config(tmp_path, monkeypatch)
+    _seed_alpha_snapshot_from_queue_md(
+        monkeypatch,
         "## PR-300: Only TODO\n- Status: TODO\n- Branch: pr-300\n",
-        encoding="utf-8",
     )
 
     with TestClient(app) as client:
@@ -335,12 +357,17 @@ def test_view_repo_task_uses_queued_tasks_file_when_filename_differs(
     ``Task file not found`` for tasks the runner accepts.
     """
     repo_dir = _write_alpha_config(tmp_path, monkeypatch)
-    (repo_dir / "tasks" / "QUEUE.md").write_text(
-        "## PR-555: Custom-name task\n"
-        "- Status: TODO\n"
-        "- Branch: pr-555\n"
-        "- Tasks file: tasks/custom-name.md\n",
-        encoding="utf-8",
+    _seed_alpha_snapshot(
+        monkeypatch,
+        [
+            QueueTask(
+                pr_id="PR-555",
+                title="Custom-name task",
+                status=TaskStatus.TODO,
+                task_file="tasks/custom-name.md",
+                branch="pr-555",
+            )
+        ],
     )
     (repo_dir / "tasks" / "custom-name.md").write_text(
         "# PR-555: Custom-name task\n\nbody from custom file\n",
@@ -382,23 +409,23 @@ def test_view_repo_task_rejects_symlink_under_tasks_dir(
     assert "super secret" not in response.text
 
 
-def test_view_repo_task_rejects_queue_file_escaping_tasks_dir(
+def test_view_repo_task_rejects_snapshot_task_file_escaping_tasks_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A queue entry whose ``Tasks file:`` walks out of ``tasks/`` is rejected.
-
-    The runner only follows queue entries written by the daemon, but the
-    dashboard must defend against a tampered QUEUE.md regardless.
-    """
+    """A snapshot entry whose ``task_file`` walks out of ``tasks/`` is rejected."""
     repo_dir = _write_alpha_config(tmp_path, monkeypatch)
     sibling = repo_dir / "secret.md"
     sibling.write_text("repo-level secret", encoding="utf-8")
-    (repo_dir / "tasks" / "QUEUE.md").write_text(
-        "## PR-777: Escape task\n"
-        "- Status: TODO\n"
-        "- Branch: pr-777\n"
-        "- Tasks file: tasks/../secret.md\n",
-        encoding="utf-8",
+    _seed_alpha_snapshot(
+        monkeypatch,
+        [
+            QueueTask(
+                pr_id="PR-777",
+                title="Escape task",
+                status=TaskStatus.TODO,
+                task_file="tasks/../secret.md",
+            )
+        ],
     )
 
     with TestClient(app) as client:
@@ -409,19 +436,23 @@ def test_view_repo_task_rejects_queue_file_escaping_tasks_dir(
     assert "repo-level secret" not in response.text
 
 
-def test_view_repo_task_rejects_queue_file_with_absolute_path(
+def test_view_repo_task_rejects_snapshot_task_file_with_absolute_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An absolute ``Tasks file:`` value must not be honored."""
+    """An absolute ``task_file`` snapshot value must not be honored."""
     repo_dir = _write_alpha_config(tmp_path, monkeypatch)
     elsewhere = tmp_path / "elsewhere.md"
     elsewhere.write_text("absolute path target", encoding="utf-8")
-    (repo_dir / "tasks" / "QUEUE.md").write_text(
-        "## PR-888: Absolute path task\n"
-        "- Status: TODO\n"
-        "- Branch: pr-888\n"
-        f"- Tasks file: {elsewhere}\n",
-        encoding="utf-8",
+    _seed_alpha_snapshot(
+        monkeypatch,
+        [
+            QueueTask(
+                pr_id="PR-888",
+                title="Absolute path task",
+                status=TaskStatus.TODO,
+                task_file=str(elsewhere),
+            )
+        ],
     )
 
     with TestClient(app) as client:
@@ -461,52 +492,6 @@ def test_view_repo_task_rejects_invalid_pr_id_with_400(
     assert "Invalid task identifier" in response.text
 
 
-def test_list_repo_tasks_returns_error_fragment_when_queue_is_non_utf8(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A non-UTF-8 QUEUE.md must not 500 the entire Tasks panel.
-
-    A bad manual edit, an aborted merge, or the wrong encoding being
-    written by a user can leave bytes that cannot be decoded as UTF-8.
-    The panel handler must catch the decode error and return a
-    controlled error fragment so the rest of the repo detail page
-    keeps rendering.
-    """
-    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
-    # `\xff` is invalid as the leading byte of a UTF-8 sequence.
-    (repo_dir / "tasks" / "QUEUE.md").write_bytes(b"## PR-001: \xff bad\n")
-
-    with TestClient(app) as client:
-        response = client.get("/repos/example__alpha/tasks")
-
-    # 503 (not 500) because the global htmx:beforeSwap hook in base.html
-    # only swaps fragments for 404/422/503 — a 500 would be treated as an
-    # error and the controlled fragment would never render.
-    assert response.status_code == 503
-    body = response.text
-    assert "Unable to read tasks/QUEUE.md" in body
-    # The fragment must not leak the raw exception or stack trace.
-    assert "UnicodeDecodeError" not in body
-    assert "Traceback" not in body
-
-
-def test_list_repo_tasks_returns_error_fragment_when_queue_unreadable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An OSError reading QUEUE.md (e.g. permissions) is also handled."""
-    _write_alpha_config(tmp_path, monkeypatch)
-
-    def _boom(_path: str, *, strict: bool = False) -> list:
-        raise PermissionError("simulated permission denied on QUEUE.md")
-
-    monkeypatch.setattr(web_app, "parse_queue", _boom)
-
-    with TestClient(app) as client:
-        response = client.get("/repos/example__alpha/tasks")
-
-    # 503 keeps the fragment swappable by the htmx hook in base.html.
-    assert response.status_code == 503
-    assert "Unable to read tasks/QUEUE.md" in response.text
 
 
 def test_view_repo_task_falls_back_to_default_when_snapshot_task_file_missing(
@@ -551,53 +536,6 @@ def test_view_repo_task_falls_back_to_default_when_snapshot_task_file_missing(
     assert "tasks/PR-303.md" in body
     assert "old-name.md" not in body
 
-
-def test_view_repo_task_falls_back_to_disk_queue_when_snapshot_stale(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A stale snapshot mapping must defer to a usable disk queue mapping.
-
-    If the snapshot's ``task_file`` points at a missing file but the disk
-    QUEUE.md has a different, still-valid ``Tasks file:`` entry for the
-    same ``pr_id``, the viewer must use the disk mapping instead of
-    skipping straight to the default filename.
-    """
-    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
-    (repo_dir / "tasks" / "QUEUE.md").write_text(
-        "## PR-404: Disk mapping\n"
-        "- Status: TODO\n"
-        "- Branch: pr-404\n"
-        "- Tasks file: tasks/disk-name.md\n",
-        encoding="utf-8",
-    )
-    (repo_dir / "tasks" / "disk-name.md").write_text(
-        "# PR-404: Disk-queue rename\n\nbody from disk-name file\n",
-        encoding="utf-8",
-    )
-    state = RepoState(
-        url="https://github.com/example/alpha.git",
-        name="example__alpha",
-        state=PipelineState.IDLE,
-        current_queue=[
-            QueueTask(
-                pr_id="PR-404",
-                title="Stale snapshot mapping",
-                status=TaskStatus.TODO,
-                task_file="tasks/snapshot-name.md",
-            )
-        ],
-    )
-    store = {"pipeline:example__alpha": state.model_dump_json()}
-    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_store(store))
-
-    with TestClient(app) as client:
-        response = client.get("/repos/example__alpha/tasks/PR-404")
-
-    assert response.status_code == 200
-    body = response.text
-    assert "body from disk-name file" in body
-    assert "tasks/disk-name.md" in body
-    assert "snapshot-name.md" not in body
 
 
 def test_view_repo_task_falls_back_when_queue_unreadable(

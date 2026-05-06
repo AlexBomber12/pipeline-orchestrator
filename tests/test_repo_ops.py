@@ -70,6 +70,7 @@ class _Runner(repo_ops.RepoOpsMixin):
         self._crashed_task_pr_ids: set[str] = set()
         self._recovered_task_pr_ids: set[str] = set()
         self._recovered_persist_calls: list[frozenset[str]] = []
+        self.state = SimpleNamespace(current_queue=None)
 
     def log_event(self, message: str) -> None:
         self.events.append(message)
@@ -357,57 +358,7 @@ def test_sync_to_main_runs_git_sequence_and_wraps_oserror(
         runner.sync_to_main()
 
 
-def test_origin_queue_md_tracked_probes_origin_queue_md(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runner = _Runner(tmp_path)
-    calls: list[tuple[Any, ...]] = []
 
-    def fake_git(*args: Any, **kwargs: Any) -> _FakeCompletedProcess:
-        calls.append(args)
-        assert kwargs == {"check": False, "timeout": 10}
-        return _FakeCompletedProcess(returncode=0)
-
-    monkeypatch.setattr(repo_ops.git_ops, "_git", fake_git)
-
-    assert runner._origin_queue_md_tracked() is True
-    assert calls == [
-        (
-            runner.repo_path,
-            "cat-file",
-            "-e",
-            "origin/main:tasks/QUEUE.md",
-        )
-    ]
-
-
-def test_origin_queue_md_tracked_returns_false_when_absent(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runner = _Runner(tmp_path)
-    monkeypatch.setattr(
-        repo_ops.git_ops,
-        "_git",
-        lambda *args, **kwargs: _FakeCompletedProcess(returncode=1),
-    )
-
-    assert runner._origin_queue_md_tracked() is False
-
-
-def test_origin_queue_md_tracked_returns_none_on_probe_failure(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runner = _Runner(tmp_path)
-    monkeypatch.setattr(
-        repo_ops.git_ops,
-        "_git",
-        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("no git")),
-    )
-
-    assert runner._origin_queue_md_tracked() is None
 
 
 def test_delete_upload_if_unchanged_uses_eval_and_fallback(
@@ -670,38 +621,19 @@ def test_process_pending_uploads_clears_recovered_pr_ids_on_reupload(
     assert runner._recovered_persist_calls == [frozenset({"PR-999"})]
 
 
-def test_process_pending_uploads_clears_canceled_queue_rows_on_reupload(
+def test_process_pending_uploads_flips_canceled_to_todo_in_snapshot(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """PR-186 P2: Re-uploading a crashed task must also flip its
-    ``Status: CANCELED`` row in the working-tree ``tasks/QUEUE.md`` to
-    ``Status: TODO``. Otherwise a daemon restart between this upload and
-    the next IDLE regeneration of QUEUE.md would re-read the stale
-    CANCELED row, rehydrate ``_crashed_task_pr_ids`` from it, and
-    re-cancel the just-retried task. Rows for other PR-ids must not be
-    touched.
-    """
+    """PR-267: Uploading a CANCELED task flips its snapshot status to TODO."""
+    from src.models import QueueTask, TaskStatus
+
     runner = _Runner(tmp_path)
-    repo_dir = Path(runner.repo_path)
-    tasks_dir = repo_dir / "tasks"
-    tasks_dir.mkdir(parents=True)
-    queue_md = tasks_dir / "QUEUE.md"
-    queue_md.write_text(
-        "# Task Queue\n"
-        "\n"
-        "## PR-001: Retried task\n"
-        "- Status: CANCELED\n"
-        "- Tasks file: tasks/PR-001.md\n"
-        "- Branch: pr-001-retried\n"
-        "\n"
-        "## PR-999: Untouched crash\n"
-        "- Status: CANCELED\n"
-        "- Tasks file: tasks/PR-999.md\n"
-        "- Branch: pr-999-untouched\n"
-        "\n",
-        encoding="utf-8",
-    )
+    runner.state.current_queue = [
+        QueueTask(pr_id="PR-001", title="Crashed", status=TaskStatus.CANCELED),
+        QueueTask(pr_id="PR-002", title="Other", status=TaskStatus.TODO),
+    ]
+    Path(runner.repo_path).mkdir(parents=True)
     staging = tmp_path / "uploads" / "demo"
     staging.mkdir(parents=True)
     (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
@@ -714,84 +646,11 @@ def test_process_pending_uploads_clears_canceled_queue_rows_on_reupload(
     monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
 
     assert _run(runner.process_pending_uploads()) is True
-
-    rewritten = queue_md.read_text(encoding="utf-8")
-    assert "## PR-001: Retried task\n- Status: TODO\n" in rewritten
-    assert "## PR-999: Untouched crash\n- Status: CANCELED\n" in rewritten
+    statuses = {q.pr_id: q.status for q in runner.state.current_queue}
+    assert statuses == {"PR-001": TaskStatus.TODO, "PR-002": TaskStatus.TODO}
 
 
-def test_process_pending_uploads_canceled_clear_is_safe_without_queue_md(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """The CANCELED-row clear must be a no-op when ``tasks/QUEUE.md``
-    does not exist yet (the next IDLE cycle regenerates it from
-    headers, so there is no stale row to clear)."""
-    runner = _Runner(tmp_path)
-    repo_dir = Path(runner.repo_path)
-    repo_dir.mkdir(parents=True)
-    staging = tmp_path / "uploads" / "demo"
-    staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
-    key = f"upload:{runner.name}:pending"
-    manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
-    runner.redis.store[key] = manifest
 
-    monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
-    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
-    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
-
-    assert _run(runner.process_pending_uploads()) is True
-    assert not (repo_dir / "tasks" / "QUEUE.md").exists()
-
-
-def test_process_pending_uploads_canceled_clear_logs_on_write_failure(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """A failure to rewrite ``tasks/QUEUE.md`` after a successful upload
-    must be logged but must not propagate, so the upload itself stays
-    successful (the next IDLE regeneration will overwrite the queue
-    anyway)."""
-    runner = _Runner(tmp_path)
-    repo_dir = Path(runner.repo_path)
-    tasks_dir = repo_dir / "tasks"
-    tasks_dir.mkdir(parents=True)
-    queue_md = tasks_dir / "QUEUE.md"
-    queue_md.write_text(
-        "# Task Queue\n"
-        "\n"
-        "## PR-001: Retried task\n"
-        "- Status: CANCELED\n"
-        "- Tasks file: tasks/PR-001.md\n"
-        "- Branch: pr-001-retried\n",
-        encoding="utf-8",
-    )
-    staging = tmp_path / "uploads" / "demo"
-    staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
-    key = f"upload:{runner.name}:pending"
-    manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
-    runner.redis.store[key] = manifest
-
-    monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
-    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
-    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
-
-    original_write_text = Path.write_text
-
-    def fake_write_text(self: Path, *args: Any, **kwargs: Any) -> int:
-        if self == queue_md:
-            raise OSError("disk full")
-        return original_write_text(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "write_text", fake_write_text)
-
-    assert _run(runner.process_pending_uploads()) is True
-    assert any(
-        "Failed to clear stale CANCELED rows in QUEUE.md" in event
-        for event in runner.events
-    )
 
 
 def test_process_pending_uploads_logs_overwrite_collision_hashes(

@@ -69,15 +69,6 @@ def _make_runner() -> PipelineRunner:
         _FakeUsageProvider(),
         _FakeUsageProvider(),
     )
-    # Default the tracked-QUEUE probe to ``False`` (post-PR-181) so
-    # tests that do not exercise the probe directly keep going through
-    # the working-tree path. The real probe shells out to ``git
-    # cat-file`` against ``self.repo_path``, which does not exist in
-    # these unit tests; without this stub the probe would now report
-    # ``None`` (indeterminate) and recovery would short-circuit to
-    # ERROR before the test's stubbed ``_parse_base_queue`` runs.
-    # Tests that *do* exercise the probe install their own override.
-    runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
     return runner
 
 
@@ -1385,7 +1376,6 @@ def test_recover_state_local_queue_missing_falls_back_to_idle(
 
     runner = _make_runner()
     runner._parse_tasks_from_headers = lambda: None  # type: ignore[method-assign]
-    runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
 
     result = asyncio.run(runner.recover_state())
 

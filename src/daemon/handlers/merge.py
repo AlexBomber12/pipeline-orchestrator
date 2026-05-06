@@ -2,7 +2,7 @@
 
 Mixin methods:
     handle_merge                    — merge PR and return to IDLE
-    _mark_queue_done                — mark task DONE in the local QUEUE.md
+    _mark_task_done_in_snapshot     — mark task DONE in RepoState.current_queue
     _resolve_pending_queue_sync     — poll legacy queue-sync PR status
     _escalate_queue_sync_if_expired — escalate to ERROR on timeout
 """
@@ -12,7 +12,6 @@ from __future__ import annotations
 import logging
 import subprocess
 from datetime import datetime, timezone
-from pathlib import Path
 
 from src import claude_cli, codex_cli
 from src.analytics import log_merged_pr
@@ -23,8 +22,7 @@ from src.daemon import git_ops
 from src.github import cache as gh_cache
 from src.github import gh_runner
 from src.github import prs as gh_prs
-from src.models import PipelineState
-from src.queue_parser import mark_task_done
+from src.models import PipelineState, TaskStatus
 from src.retry import retry_transient
 
 # Upper bound on how long an open queue-sync remediation PR may sit
@@ -236,10 +234,7 @@ class MergeMixin:
             )
             return
 
-        try:
-            self._mark_queue_done()
-        except Exception as exc:
-            self.log_event(f"[MERGE] Warning: queue-sync step failed: {exc}.")
+        self._mark_task_done_in_snapshot()
 
         await self._save_current_run_record(
             "success_merged",
@@ -355,61 +350,26 @@ class MergeMixin:
         )
         return coder_name, model
 
-    def _mark_queue_done(self) -> None:
-        """Mark the merged task DONE in the local QUEUE.md only.
+    def _mark_task_done_in_snapshot(self) -> None:
+        """Flip the merged task to DONE in ``state.current_queue``.
 
-        QUEUE.md is gitignored (PR-181) and is regenerated each IDLE
-        cycle from structured task headers, so this update never
-        commits or pushes. The in-place tweak keeps read consumers
-        (dashboard, recovery) consistent with the just-merged status
-        between handle_merge and the next IDLE tick.
-
-        On legacy repos that still track ``tasks/QUEUE.md`` upstream
-        (``.gitignore`` does not retroactively untrack files), an
-        in-place rewrite would dirty the working tree without ever
-        being committed or pushed; the next cycle's preflight would
-        then move the runner to ERROR before ``handle_idle`` ran. Skip
-        the rewrite in that case — the tracked snapshot on origin
-        remains the source of truth until the legacy repo migrates the
-        file out of git, mirroring ``_write_generated_queue_md``.
+        The next IDLE cycle rebuilds the snapshot from task headers and
+        the GitHub merge state anyway, so this is just a between-tick
+        tweak so dashboard consumers see the merge before the next
+        cycle publishes a fresh snapshot.
         """
-        if self.state.current_task is None:
+        task = self.state.current_task
+        if task is None:
             return
-        # ``None`` means the cat-file probe itself failed (transient git
-        # slowness); treat as if tracked so we skip the rewrite. A
-        # legacy repo with a flaky probe would otherwise dirty the
-        # working tree on every merge and trip preflight into ERROR.
-        # Post-PR-181 repos only lose one in-place tweak; the next IDLE
-        # cycle regenerates QUEUE.md from headers anyway.
-        if self._origin_queue_md_tracked() is not False:
+        snapshot = self.state.current_queue
+        if not snapshot:
             return
-        pr_id = self.state.current_task.pr_id
-
-        queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
-        if not queue_path.exists():
-            return
-        try:
-            content = queue_path.read_text()
-        except OSError as exc:
-            self.log_event(
-                f"[MERGE] Warning: read QUEUE.md to mark {pr_id} DONE "
-                f"failed: {exc}."
-            )
-            return
-
-        updated = mark_task_done(content, pr_id)
-        if updated is None or updated == content:
-            return
-
-        try:
-            queue_path.write_text(updated)
-        except OSError as exc:
-            self.log_event(
-                f"[MERGE] Warning: write QUEUE.md to mark {pr_id} DONE "
-                f"failed: {exc}."
-            )
-            return
-        self.log_event(f"[MERGE] Marked {pr_id} DONE in QUEUE.md.")
+        for index, queued in enumerate(snapshot):
+            if queued.pr_id == task.pr_id and queued.status != TaskStatus.DONE:
+                snapshot[index] = queued.model_copy(
+                    update={"status": TaskStatus.DONE}
+                )
+                break
 
     async def _resolve_pending_queue_sync(self) -> bool:
         """Poll the outstanding queue-sync PR and gate IDLE dispatch.

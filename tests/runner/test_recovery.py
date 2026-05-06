@@ -394,12 +394,6 @@ def test_select_next_task_from_dag_skips_crashed_task_marked_canceled(
         "PR-001": TaskStatus.CANCELED,
         "PR-002": TaskStatus.TODO,
     }
-    queue_md = runner._generate_queue_md(
-        runner._idle_dag_headers,
-        runner._idle_dag_statuses,
-    )
-    assert "## PR-001" in queue_md
-    assert "- Status: CANCELED" in queue_md
 
 
 def test_select_next_task_from_dag_preserves_doing_for_crashed_task_with_visible_pr(
@@ -509,12 +503,6 @@ def test_select_next_task_from_dag_cancels_recovered_task_with_visible_pr(
         "PR-002": TaskStatus.TODO,
     }
     assert "PR-001" in runner._recovered_task_pr_ids
-    queue_md = runner._generate_queue_md(
-        runner._idle_dag_headers,
-        runner._idle_dag_statuses,
-    )
-    assert "## PR-001" in queue_md
-    assert "- Status: CANCELED" in queue_md
 
 
 def test_select_next_task_from_dag_clears_recovered_flag_when_done(
@@ -1015,8 +1003,6 @@ def test_run_cycle_resets_stale_transient_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch, stdout="")
-    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
-    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     runner = h._make_runner()

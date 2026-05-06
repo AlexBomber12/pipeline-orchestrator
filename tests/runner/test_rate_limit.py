@@ -58,8 +58,7 @@ def test_handle_idle_rereads_pause_flag_before_coding_transition(
         status=TaskStatus.TODO,
         branch="pr-042-sample",
     )
-    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
-    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: task)
+    h._stub_dag_select(monkeypatch, task=task)
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [],

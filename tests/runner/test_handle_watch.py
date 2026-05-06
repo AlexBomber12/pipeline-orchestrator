@@ -49,7 +49,7 @@ def test_handle_watch_approved_and_green_merges(
         merged.append((repo, number))
 
     monkeypatch.setattr("src.github.prs.merge_pr", fake_merge)
-    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
