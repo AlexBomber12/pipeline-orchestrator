@@ -24,56 +24,81 @@ parse_doing_task() {
     # Returns non-zero when no DOING task is found.
     # Prefers the daemon's test-only runtime marker and falls back to the
     # first PR-*.md task file whose header/frontmatter says Status: DOING.
+    # Status-less task files are accepted as a final fallback because the
+    # dashboard upload template does not write a Status header.
     local repo_path="${1:-${REPO_DIR}}"
     local runtime_file
     runtime_file="$(_active_pr_runtime_path "${repo_path}")"
     local pr=""
     local task_file=""
+    local branch=""
     if [[ -f "${runtime_file}" ]]; then
         pr="$(head -n 1 "${runtime_file}" | tr -d '[:space:]')"
-        if [[ -z "${pr}" ]]; then
-            return 1
-        fi
-        task_file="${repo_path}/tasks/${pr}.md"
-        if [[ ! -f "${task_file}" ]]; then
-            return 1
-        fi
-    else
-        local f
-        for f in "${repo_path}"/tasks/PR-*.md; do
-            [[ -f "${f}" ]] || continue
-            if grep -Eq "^-? ?Status:[[:space:]]*DOING([[:space:]]*)$" "${f}"; then
-                task_file="${f}"
-                break
+        if [[ -n "${pr}" ]]; then
+            task_file="${repo_path}/tasks/${pr}.md"
+            if [[ -f "${task_file}" ]]; then
+                branch="$(task_branch "${task_file}")"
+                if [[ -n "${branch}" ]]; then
+                    printf '%s\t%s\n' "${pr}" "${branch}"
+                    return 0
+                fi
             fi
-        done
-        if [[ -z "${task_file}" ]]; then
-            return 1
         fi
-        pr="$(awk '
-            /^# PR-[A-Za-z0-9_.-]+:/ {
-                match($0, /PR-[A-Za-z0-9_.-]+/)
-                print substr($0, RSTART, RLENGTH)
-                exit 0
-            }
-        ' "${task_file}")"
-        if [[ -z "${pr}" ]]; then
-            return 1
-        fi
+        pr=""
+        task_file=""
     fi
 
-    local branch
-    branch="$(awk '
+    local f
+    local statusless_task_file=""
+    for f in "${repo_path}"/tasks/PR-*.md; do
+        [[ -f "${f}" ]] || continue
+        if grep -Eq "^-? ?Status:[[:space:]]*DOING([[:space:]]*)$" "${f}"; then
+            task_file="${f}"
+            break
+        fi
+        if [[ -z "${statusless_task_file}" ]] &&
+            ! grep -Eq "^-? ?Status:[[:space:]]*" "${f}"; then
+            statusless_task_file="${f}"
+        fi
+    done
+    if [[ -z "${task_file}" ]]; then
+        task_file="${statusless_task_file}"
+    fi
+    if [[ -z "${task_file}" ]]; then
+        return 1
+    fi
+
+    pr="$(task_pr_id "${task_file}")"
+    if [[ -z "${pr}" ]]; then
+        return 1
+    fi
+    branch="$(task_branch "${task_file}")"
+    if [[ -z "${branch}" ]]; then
+        return 1
+    fi
+    printf '%s\t%s\n' "${pr}" "${branch}"
+}
+
+task_pr_id() {
+    local task_file="$1"
+    awk '
+        /^# PR-[A-Za-z0-9_.-]+:/ {
+            match($0, /PR-[A-Za-z0-9_.-]+/)
+            print substr($0, RSTART, RLENGTH)
+            exit 0
+        }
+    ' "${task_file}"
+}
+
+task_branch() {
+    local task_file="$1"
+    awk '
         /^-? ?Branch:[[:space:]]*/ {
             sub(/^-? ?Branch:[[:space:]]*/, "")
             print
             exit 0
         }
-    ' "${task_file}")"
-    if [[ -z "${branch}" ]]; then
-        return 1
-    fi
-    printf '%s\t%s\n' "${pr}" "${branch}"
+    ' "${task_file}"
 }
 
 _active_pr_runtime_path() {
