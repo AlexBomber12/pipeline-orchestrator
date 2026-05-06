@@ -58,11 +58,13 @@ from src.daemon.handlers import idle as idle_module  # noqa: F811
 from src.daemon.handlers import merge as merge_module  # noqa: F401  # noqa: F401,F811
 from src.daemon.handlers import watch as watch_module  # noqa: F401  # noqa: F401,F811
 from src.daemon.runner import PipelineRunner
+from src.keyspace import pipeline_state
 from src.models import (
     CIStatus,
     PipelineState,  # noqa: F811
     PRInfo,  # noqa: F811
     QueueTask,  # noqa: F811
+    RepoState,
     ReviewStatus,
     TaskStatus,  # noqa: F811
 )
@@ -1848,6 +1850,34 @@ def test_handle_hung_persists_recovered_task_pr_ids_to_redis(
     )
     import json as _json
     assert _json.loads(raw) == ["PR-001"]
+
+
+def test_redis_round_trip_includes_current_queue() -> None:
+    runner = h._make_runner()
+    queue = [
+        QueueTask(
+            pr_id="PR-001",
+            title="First",
+            status=TaskStatus.DONE,
+            task_file="tasks/PR-001.md",
+            branch="pr-001-first",
+        ),
+        QueueTask(
+            pr_id="PR-002",
+            title="Second",
+            status=TaskStatus.TODO,
+            task_file="tasks/PR-002.md",
+            depends_on=["PR-001"],
+            branch="pr-002-second",
+        ),
+    ]
+    runner.state.current_queue = queue
+
+    asyncio.run(runner.publish_state())
+
+    raw = runner.redis.store[pipeline_state(runner.name)]
+    restored = RepoState.model_validate_json(raw)
+    assert restored.current_queue == queue
 
 
 def test_handle_hung_recovery_signal_getdel_failure_falls_through(

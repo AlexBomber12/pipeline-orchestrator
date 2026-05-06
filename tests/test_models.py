@@ -80,6 +80,53 @@ def test_repo_state_json_round_trip() -> None:
     assert restored == state
 
 
+def test_repostate_current_queue_default_none() -> None:
+    state = RepoState(
+        url="https://github.com/example/repo.git",
+        name="repo",
+    )
+
+    assert state.current_queue is None
+
+
+def test_repostate_current_queue_round_trip() -> None:
+    queue = [
+        QueueTask(
+            pr_id="PR-001",
+            title="First",
+            status=TaskStatus.DONE,
+            task_file="tasks/PR-001.md",
+            depends_on=[],
+            branch="pr-001-first",
+        ),
+        QueueTask(
+            pr_id="PR-002",
+            title="Second",
+            status=TaskStatus.DOING,
+            task_file="tasks/PR-002.md",
+            depends_on=["PR-001"],
+            branch="pr-002-second",
+        ),
+        QueueTask(
+            pr_id="PR-003",
+            title="Third",
+            status=TaskStatus.TODO,
+            task_file="tasks/PR-003.md",
+            depends_on=["PR-001"],
+            branch="pr-003-third",
+        ),
+    ]
+    state = RepoState(
+        url="https://github.com/example/repo.git",
+        name="repo",
+        current_queue=queue,
+    )
+
+    restored = RepoState.model_validate(state.model_dump())
+
+    assert restored.current_queue == queue
+
+
 def test_pr_info_fix_iteration_count_defaults_to_zero() -> None:
     pr = PRInfo(number=7, branch="pr-007")
 

@@ -714,6 +714,7 @@ class IdleMixin:
             sum(1 for t in queue_tasks if t.status == TaskStatus.DONE),
             len(queue_tasks),
         )
+        self.state.current_queue = list(queue_tasks)
         generated_headers = getattr(self, "_idle_dag_headers", None)
         generated_statuses = getattr(self, "_idle_dag_statuses", None)
         if (

@@ -163,6 +163,7 @@ class RepoState(BaseModel):
     state: PipelineState = PipelineState.IDLE
     user_paused: bool = False
     current_task: QueueTask | None = None
+    current_queue: list[QueueTask] | None = None
     current_pr: PRInfo | None = None
     error_message: str | None = None
     last_updated: datetime = Field(
