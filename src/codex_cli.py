@@ -105,6 +105,30 @@ async def run_planned_pr_async(
     return await run_codex_async("PLANNED PR", repo_path, **kwargs)
 
 
+def _build_auto_pr_prompt(pr_id: str, task_file: str, task_body: str) -> str:
+    return f"AUTO PR\nTask: {pr_id}\nFile: {task_file}\n\n{task_body}"
+
+
+async def run_auto_pr_async(
+    repo_path: str,
+    pr_id: str,
+    task_file: str,
+    task_body: str,
+    *,
+    model: str | None = None,
+    timeout: int = 900,
+    on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    **_kwargs: object,
+) -> tuple[int, str, str]:
+    """Trigger an ``AUTO PR`` run in ``repo_path`` via Codex CLI."""
+    kwargs: dict[str, object] = {"timeout": timeout, "model": model}
+    if on_process_start is not None:
+        kwargs["on_process_start"] = on_process_start
+    return await run_codex_async(
+        _build_auto_pr_prompt(pr_id, task_file, task_body), repo_path, **kwargs
+    )
+
+
 def _build_fix_feedback_prompt(extra_context: str | None) -> str:
     """Compose the ``FIX FEEDBACK`` prompt with optional daemon-supplied context."""
     if extra_context:

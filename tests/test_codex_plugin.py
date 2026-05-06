@@ -289,6 +289,53 @@ def test_check_auth_login_status_not_found_returns_cli_not_installed(
 
 
 @pytest.mark.asyncio
+async def test_codex_plugin_run_auto_pr_delegates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_run_auto_pr_async(
+        repo_path: str,
+        pr_id: str,
+        task_file: str,
+        task_body: str,
+        *,
+        model: str | None = None,
+        timeout: int = 900,
+        **kwargs: object,
+    ) -> tuple[int, str, str]:
+        captured["args"] = (repo_path, pr_id, task_file, task_body)
+        captured["model"] = model
+        captured["timeout"] = timeout
+        captured["kwargs"] = kwargs
+        return (0, "ok", "")
+
+    monkeypatch.setattr(
+        "src.coders.codex.codex_cli.run_auto_pr_async",
+        fake_run_auto_pr_async,
+    )
+
+    result = await CodexPlugin().run_auto_pr(
+        "/data/repos/demo",
+        pr_id="PR-270",
+        task_file="tasks/PR-270.md",
+        task_body="<body>",
+        model="",
+        timeout=321,
+    )
+
+    assert result == (0, "ok", "")
+    assert captured["args"] == (
+        "/data/repos/demo",
+        "PR-270",
+        "tasks/PR-270.md",
+        "<body>",
+    )
+    assert captured["model"] is None
+    assert captured["timeout"] == 321
+
+
+@pytest.mark.asyncio
 async def test_codex_plugin_fix_review_delegates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

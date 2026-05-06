@@ -64,6 +64,27 @@ class ClaudePlugin:
             **kwargs,
         )
 
+    async def run_auto_pr(
+        self,
+        repo_path: str,
+        *,
+        pr_id: str,
+        task_file: str,
+        task_body: str,
+        model: str | None = None,
+        timeout: int = 900,
+        **kwargs: Any,
+    ) -> tuple[int, str, str]:
+        return await claude_cli.run_auto_pr_async(
+            repo_path,
+            pr_id,
+            task_file,
+            task_body,
+            model=model,
+            timeout=timeout,
+            **kwargs,
+        )
+
     async def fix_review(
         self,
         repo_path: str,

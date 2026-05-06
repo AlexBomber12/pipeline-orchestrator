@@ -30,6 +30,18 @@ class CoderPlugin(Protocol):
         **kwargs: Any,
     ) -> tuple[int, str, str]: ...
 
+    async def run_auto_pr(
+        self,
+        repo_path: str,
+        *,
+        pr_id: str,
+        task_file: str,
+        task_body: str,
+        model: str | None,
+        timeout: int,
+        **kwargs: Any,
+    ) -> tuple[int, str, str]: ...
+
     async def fix_review(
         self,
         repo_path: str,

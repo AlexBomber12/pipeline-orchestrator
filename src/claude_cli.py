@@ -87,6 +87,28 @@ def run_planned_pr(
     return run_claude("PLANNED PR", repo_path, timeout=timeout, model=model)
 
 
+def _build_auto_pr_prompt(pr_id: str, task_file: str, task_body: str) -> str:
+    return f"AUTO PR\nTask: {pr_id}\nFile: {task_file}\n\n{task_body}"
+
+
+def run_auto_pr(
+    repo_path: str,
+    pr_id: str,
+    task_file: str,
+    task_body: str,
+    *,
+    model: str | None = None,
+    timeout: int = 900,
+) -> tuple[int, str, str]:
+    """Trigger an ``AUTO PR`` run in ``repo_path`` with task injected inline."""
+    return run_claude(
+        _build_auto_pr_prompt(pr_id, task_file, task_body),
+        repo_path,
+        timeout=timeout,
+        model=model,
+    )
+
+
 def _build_fix_feedback_prompt(extra_context: str | None) -> str:
     """Compose the ``FIX FEEDBACK`` prompt with optional daemon-supplied context."""
     if extra_context:
@@ -239,6 +261,36 @@ async def run_planned_pr_async(
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
     return await run_claude_async("PLANNED PR", repo_path, **kwargs)
+
+
+async def run_auto_pr_async(
+    repo_path: str,
+    pr_id: str,
+    task_file: str,
+    task_body: str,
+    *,
+    model: str | None = None,
+    timeout: int = 900,
+    on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    breach_dir: str | None = None,
+    breach_run_id: str | None = None,
+    session_threshold: int | None = None,
+    weekly_threshold: int | None = None,
+) -> tuple[int, str, str]:
+    """Trigger an ``AUTO PR`` run in ``repo_path`` with task injected inline."""
+    kwargs: dict[str, object] = {
+        "timeout": timeout,
+        "model": model,
+        "breach_dir": breach_dir,
+        "breach_run_id": breach_run_id,
+        "session_threshold": session_threshold,
+        "weekly_threshold": weekly_threshold,
+    }
+    if on_process_start is not None:
+        kwargs["on_process_start"] = on_process_start
+    return await run_claude_async(
+        _build_auto_pr_prompt(pr_id, task_file, task_body), repo_path, **kwargs
+    )
 
 
 async def fix_review_async(
