@@ -642,3 +642,122 @@ def test_headers_only_preserves_prior_idle_open_prs(
     asyncio.run(runner.recover_state())
 
     assert runner._idle_open_prs is sentinel
+
+
+def test_audit_legacy_applies_uses_live_prs_not_stale_idle_attr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The audit diff must score against the live ``get_open_prs`` snapshot.
+
+    Regression: ``_emit_audit_diff`` previously read ``_idle_open_prs``,
+    which the legacy applies path never sets. The diff therefore ran
+    against ``[]`` and missed any divergence whose detection depended on
+    matching open PR branches, undermining the rollout gate.
+    """
+    _set_env(monkeypatch, audit="1", headers="0")
+    live_prs = [PRInfo(number=42, branch="pr-005")]
+    _stub_open_prs(monkeypatch, live_prs)
+    legacy_tasks = [
+        QueueTask(
+            pr_id="PR-005",
+            title="Branch matches live PR",
+            status=TaskStatus.TODO,
+            branch="pr-005",
+            task_file="tasks/PR-005.md",
+        )
+    ]
+    new_tasks = [
+        QueueTask(
+            pr_id="PR-005",
+            title="Branch does not match live PR",
+            status=TaskStatus.TODO,
+            branch="pr-different",
+            task_file="tasks/PR-005.md",
+        )
+    ]
+
+    runner = h._make_runner()
+    # Pre-seed stale empty snapshots so any reliance on these attributes
+    # would silently feed ``[]`` to the audit comparator and miss the
+    # branch-driven divergence below. Also asserts that the dry-run
+    # restores both attributes to their prior values on exit.
+    stale_open: list[PRInfo] = []
+    stale_merged: list[PRInfo] = []
+    runner._idle_open_prs = stale_open
+    runner._idle_merged_prs = stale_merged
+    runner._origin_queue_md_tracked = lambda: True  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **kwargs: list(legacy_tasks)  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: list(new_tasks)  # type: ignore[method-assign]
+
+    asyncio.run(runner.recover_state())
+
+    audit_events = [
+        e["event"]
+        for e in runner.state.history
+        if e["event"].startswith("[AUDIT] recover_state divergence:")
+    ]
+    assert len(audit_events) == 1
+    payload = json.loads(audit_events[0].split(": ", 1)[1])
+    diff = payload["diff"]
+    # legacy: TODO with matching live PR -> recoverable -> WATCH on PR-005.
+    # new: TODO with no matching PR -> IDLE.
+    # The audit must detect this only if the live prs reach the comparator.
+    assert diff["pipeline_state"] == {"legacy": "WATCH", "new": "IDLE"}
+    assert diff["current_pr_number"] == {"legacy": 42, "new": None}
+    # Dry-run must restore both attributes to their prior values.
+    assert runner._idle_open_prs is stale_open
+    assert runner._idle_merged_prs is stale_merged
+
+
+def test_audit_headers_applies_uses_live_prs_after_idle_restore(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Headers-applies audit must use the live PR snapshot, not the restored attr.
+
+    The headers path restores ``_idle_open_prs`` to its prior value
+    before returning, so by the time ``_emit_audit_diff`` runs the
+    attribute no longer reflects the recovery-time PR set.
+    """
+    _set_env(monkeypatch, audit="1", headers="1")
+    live_prs = [PRInfo(number=7, branch="pr-010")]
+    _stub_open_prs(monkeypatch, live_prs)
+
+    legacy_tasks = [
+        QueueTask(
+            pr_id="PR-010",
+            title="legacy branch points elsewhere",
+            status=TaskStatus.TODO,
+            branch="pr-stale",
+            task_file="tasks/PR-010.md",
+        )
+    ]
+    new_tasks = [
+        QueueTask(
+            pr_id="PR-010",
+            title="new branch matches live PR",
+            status=TaskStatus.TODO,
+            branch="pr-010",
+            task_file="tasks/PR-010.md",
+        )
+    ]
+
+    runner = h._make_runner()
+    runner._origin_queue_md_tracked = lambda: True  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **kwargs: list(legacy_tasks)  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: list(new_tasks)  # type: ignore[method-assign]
+
+    asyncio.run(runner.recover_state())
+
+    audit_events = [
+        e["event"]
+        for e in runner.state.history
+        if e["event"].startswith("[AUDIT] recover_state divergence:")
+    ]
+    assert len(audit_events) == 1
+    payload = json.loads(audit_events[0].split(": ", 1)[1])
+    diff = payload["diff"]
+    # legacy: TODO no matching PR -> IDLE.
+    # new: TODO matching PR -> recoverable -> WATCH on PR-010.
+    assert diff["pipeline_state"] == {"legacy": "IDLE", "new": "WATCH"}
+    assert diff["current_pr_number"] == {"legacy": None, "new": 7}

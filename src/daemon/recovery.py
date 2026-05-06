@@ -434,39 +434,46 @@ class RecoveryMixin:
         mode = _resolve_recovery_mode()
 
         if mode == RECOVERY_MODE_LEGACY_ONLY:
-            ok, _ = await self._recover_state_legacy()
+            ok, _, _ = await self._recover_state_legacy()
             return ok
 
         if mode == RECOVERY_MODE_HEADERS_ONLY:
-            ok, _ = await self._recover_state_headers()
+            ok, _, _ = await self._recover_state_headers()
             return ok
 
         if mode == RECOVERY_MODE_AUDIT_LEGACY_APPLIES:
-            ok, applied_tasks = await self._recover_state_legacy()
+            ok, applied_tasks, prs = await self._recover_state_legacy()
             if ok:
                 self._emit_audit_diff(
                     mode,
                     applied_path="legacy",
                     applied_tasks=applied_tasks,
+                    prs=prs,
                 )
             return ok
 
         # RECOVERY_MODE_AUDIT_HEADERS_APPLIES
-        ok, applied_tasks = await self._recover_state_headers()
+        ok, applied_tasks, prs = await self._recover_state_headers()
         if ok:
             self._emit_audit_diff(
                 mode,
                 applied_path="new",
                 applied_tasks=applied_tasks,
+                prs=prs,
             )
         return ok
 
-    async def _recover_state_legacy(self) -> tuple[bool, list[QueueTask]]:
+    async def _recover_state_legacy(
+        self,
+    ) -> tuple[bool, list[QueueTask], list[PRInfo]]:
         """Apply state using the legacy ``_parse_base_queue`` path.
 
-        Returns ``(success, tasks)``: the tasks list is the parsed legacy
-        queue (after ghost filtering), and is exposed so the audit-diff
-        comparator can score it against the headers-derived projection.
+        Returns ``(success, tasks, prs)``: the tasks list is the parsed
+        legacy queue (after ghost filtering), and ``prs`` is the live
+        ``get_open_prs`` snapshot used to apply state. Both are exposed
+        so the audit-diff comparator can score the projection without
+        depending on ``self._idle_open_prs``, which the legacy path does
+        not populate.
         """
         strict = self.app_config.daemon.strict_queue_validation
         # Probe the queue source ONCE and reuse the result for both the
@@ -494,7 +501,7 @@ class RecoveryMixin:
                 publish=False,
                 log_prefix="[INFRA]",
             )
-            return False, []
+            return False, [], []
         try:
             tasks = self._parse_base_queue(
                 strict=strict, queue_from_origin=queue_from_origin,
@@ -506,7 +513,7 @@ class RecoveryMixin:
                 publish=False,
                 log_prefix="[INFRA]",
             )
-            return False, []
+            return False, [], []
         if tasks is None:
             if queue_from_origin:
                 await self._transition_to_error(
@@ -515,7 +522,7 @@ class RecoveryMixin:
                     publish=False,
                     log_prefix="[INFRA]",
                 )
-                return False, []
+                return False, [], []
             # Post-PR-181 repos gitignore ``tasks/QUEUE.md`` and rely on
             # ``handle_idle`` to regenerate it from PR-*.md headers each
             # cycle. A missing snapshot on the working tree therefore
@@ -549,7 +556,7 @@ class RecoveryMixin:
                 log_prefix="[INFRA]",
                 log_message=f"recover_state failed: {exc}",
             )
-            return False, []
+            return False, [], []
         # Ghost filtering uses local task-file existence, which is only a
         # safe signal for post-PR-181 repos (QUEUE.md gitignored, parsed
         # from the working tree). On legacy tracked-QUEUE repos the queue
@@ -560,9 +567,11 @@ class RecoveryMixin:
         if not queue_from_origin:
             tasks = self._drop_ghost_queue_entries(tasks)
         await self._apply_recovery_decisions(tasks, prs)
-        return True, tasks
+        return True, tasks, list(prs)
 
-    async def _recover_state_headers(self) -> tuple[bool, list[QueueTask]]:
+    async def _recover_state_headers(
+        self,
+    ) -> tuple[bool, list[QueueTask], list[PRInfo]]:
         """Apply state using the headers-derived task list (PR-266b).
 
         Skips the QUEUE.md probe entirely: the headers helper reads
@@ -585,7 +594,7 @@ class RecoveryMixin:
                 log_prefix="[INFRA]",
                 log_message=f"recover_state failed: {exc}",
             )
-            return False, []
+            return False, [], []
         # The helper consults ``_idle_open_prs`` to derive each task's
         # status from the live PR set. Populate it from the recovery
         # fetch and reset on exit so ``handle_idle`` does not later read
@@ -604,7 +613,7 @@ class RecoveryMixin:
                     publish=False,
                     log_prefix="[INFRA]",
                 )
-                return False, []
+                return False, [], []
         finally:
             if prior_open_prs is None:
                 if hasattr(self, "_idle_open_prs"):
@@ -629,7 +638,7 @@ class RecoveryMixin:
         # /api/repo/{name}/queue endpoint reflects post-restart state
         # immediately, without waiting for the next IDLE cycle.
         self.state.current_queue = list(tasks)
-        return True, tasks
+        return True, tasks, list(prs)
 
     async def _apply_recovery_decisions(
         self, tasks: list[QueueTask], prs: list[PRInfo]
@@ -849,6 +858,7 @@ class RecoveryMixin:
         *,
         applied_path: str,
         applied_tasks: list[QueueTask],
+        prs: list[PRInfo],
     ) -> None:
         """Run the inactive recovery path as a dry-run and emit any diff.
 
@@ -857,16 +867,43 @@ class RecoveryMixin:
         alongside the applied path's task list. Differences are logged
         as ``[AUDIT] recover_state divergence: <json>``; parity is
         silent so audit logs stay grep-friendly.
+
+        ``prs`` is the live ``get_open_prs`` snapshot the applied path
+        used. It is threaded in explicitly because ``self._idle_open_prs``
+        is unreliable here: the legacy path never sets it, and the
+        headers path restores it before returning. Reading the attribute
+        directly would feed ``_recovery_audit_diff`` an empty or stale
+        PR list and fabricate divergences whenever recoverability
+        depends on open PR branches.
         """
-        prs = list(getattr(self, "_idle_open_prs", ()))
         if applied_path == "legacy":
+            # ``_parse_tasks_from_headers`` consults ``_idle_open_prs``
+            # to derive each task's status. Seed it from the live PR
+            # snapshot and restore on exit so the dry-run sees the same
+            # PR set the applied path used.
+            prior_open_prs = getattr(self, "_idle_open_prs", None)
+            prior_merged_prs = getattr(self, "_idle_merged_prs", None)
+            self._idle_open_prs = list(prs)
+            self._idle_merged_prs = []
             try:
-                new_tasks = self._parse_tasks_from_headers() or []
-            except Exception as exc:
-                self.log_event(
-                    f"[AUDIT] recover_state new-path dry-run failed: {exc}"
-                )
-                return
+                try:
+                    new_tasks = self._parse_tasks_from_headers() or []
+                except Exception as exc:
+                    self.log_event(
+                        f"[AUDIT] recover_state new-path dry-run failed: {exc}"
+                    )
+                    return
+            finally:
+                if prior_open_prs is None:
+                    if hasattr(self, "_idle_open_prs"):
+                        delattr(self, "_idle_open_prs")
+                else:
+                    self._idle_open_prs = prior_open_prs
+                if prior_merged_prs is None:
+                    if hasattr(self, "_idle_merged_prs"):
+                        delattr(self, "_idle_merged_prs")
+                else:
+                    self._idle_merged_prs = prior_merged_prs
             legacy_tasks = applied_tasks
         else:
             strict = self.app_config.daemon.strict_queue_validation
