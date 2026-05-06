@@ -1868,6 +1868,31 @@ def test_mark_task_done_in_snapshot_skips_when_task_already_done() -> None:
     assert runner.state.current_queue[0] is original
 
 
+def test_mark_task_done_in_snapshot_refreshes_snapshot_timestamp() -> None:
+    """Mutation re-stamps current_queue_snapshot_at via __setattr__ hook.
+
+    Regression: in-place ``snapshot[index] = ...`` bypasses the hook,
+    leaving ``current_queue_snapshot_at`` pinned to the pre-mutation
+    time even though queue contents changed. Dashboard consumers that
+    treat ``snapshot_at`` as a change token would miss the update.
+    """
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+    runner.state.current_queue = [
+        QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING),
+    ]
+    stale_stamp = datetime.now(timezone.utc) - timedelta(hours=1)
+    runner.state.current_queue_snapshot_at = stale_stamp
+
+    runner._mark_task_done_in_snapshot()
+
+    refreshed = runner.state.current_queue_snapshot_at
+    assert refreshed is not None
+    assert refreshed > stale_stamp
+
+
 def test_resolve_pending_queue_sync_returns_true_without_branch() -> None:
     runner = h._make_runner()
 

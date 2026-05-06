@@ -357,6 +357,12 @@ class MergeMixin:
         the GitHub merge state anyway, so this is just a between-tick
         tweak so dashboard consumers see the merge before the next
         cycle publishes a fresh snapshot.
+
+        Reassigns ``state.current_queue`` after the mutation so the
+        ``RepoState.__setattr__`` hook re-stamps
+        ``current_queue_snapshot_at``; without that, dashboard clients
+        that treat ``snapshot_at`` as a change token would see the new
+        DONE status under the old timestamp.
         """
         task = self.state.current_task
         if task is None:
@@ -369,6 +375,7 @@ class MergeMixin:
                 snapshot[index] = queued.model_copy(
                     update={"status": TaskStatus.DONE}
                 )
+                self.state.current_queue = snapshot
                 break
 
     async def _resolve_pending_queue_sync(self) -> bool:
