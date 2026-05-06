@@ -20,6 +20,8 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent.parent / "templates"
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "scripts"
+PRE_PUSH_HOOK_INSTALL_SCRIPT = SCRIPTS_DIR / "install-pre-push-hook.sh"
 
 _GITIGNORE_ENTRIES = ("artifacts/", "tasks/QUEUE.md")
 _COMMIT_MESSAGE = "chore: initialize pipeline orchestrator structure"
@@ -148,6 +150,35 @@ def _gitignored_paths(repo_path: str, paths: list[str]) -> set[str]:
         )
         return set()
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def _install_pre_push_hook(repo_path: str) -> None:
+    """Install the pipeline-orchestrator pre-push branch-validation hook.
+
+    Idempotent: the bash installer overwrites ``.git/hooks/pre-push``
+    unconditionally so re-running on every scaffolder pass self-heals
+    a deleted or corrupted hook file. The hook itself is no-op when
+    ``.git/info/expected-branch`` is absent — manual operator git
+    operations are not affected. Defense-in-depth on top of PR-271's
+    AUTO PR prompt headers, so a transient install failure is logged
+    and ignored rather than aborting onboarding.
+    """
+    try:
+        subprocess.run(
+            ["bash", str(PRE_PUSH_HOOK_INSTALL_SCRIPT), repo_path],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=_LOCAL_GIT_TIMEOUT,
+        )
+    except (
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        OSError,
+    ) as exc:
+        logger.warning(
+            "scaffold_repo: pre-push hook install failed: %s", exc
+        )
 
 
 def _run_git(
@@ -502,6 +533,14 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
         except subprocess.TimeoutExpired as exc:
             logger.warning("scaffold_repo git push timed out: %s", exc.cmd)
             raise
+
+    # Install the PR-272 pre-push branch-validation hook on every pass.
+    # The script is idempotent (overwrites unconditionally) so existing
+    # managed repos pick the hook up automatically without churn, and a
+    # deleted or corrupted hook file is self-healed on the next scaffold
+    # cycle. The hook lives in .git/hooks/ which is not git-tracked, so
+    # it is not added to ``created``.
+    _install_pre_push_hook(repo_path)
 
     if created:
         logger.info("scaffold_repo created: %s", ", ".join(created))

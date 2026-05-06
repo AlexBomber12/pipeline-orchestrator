@@ -1250,3 +1250,126 @@ def test_handle_coding_handles_non_utf8_task_body(
     assert runner.state.state == PipelineState.ERROR
     assert "Cannot read task file" in (runner.state.error_message or "")
     assert "kwargs" not in captured
+
+
+# --- PR-272: pre-push hook expected-branch marker ---------------------------
+
+
+def _runner_with_repo_path(
+    monkeypatch: pytest.MonkeyPatch,
+    repo_path: Path,
+    *,
+    open_prs_initial: list[PRInfo] | None = None,
+):
+    """Build a coding-handler runner whose repo_path is a real tmp dir.
+
+    Used by the PR-272 expected-branch tests to verify the daemon writes
+    and removes ``.git/info/expected-branch`` on the real filesystem.
+    Mirrors ``_runner`` but lets the caller place ``.git/info/`` under a
+    tmp_path so write/cleanup is observable.
+    """
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: open_prs_initial or [])
+
+    async def _sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(h.runner_module.asyncio, "sleep", _sleep)
+    runner = h._make_runner()
+    runner.repo_path = str(repo_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="Sample task",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._post_codex_review = lambda pr_number: True  # type: ignore[method-assign]
+    return runner
+
+
+def test_coding_writes_expected_branch_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The daemon must write the active task's branch to
+    ``.git/info/expected-branch`` before invoking ``plugin.run_auto_pr``
+    so the pre-push hook can validate the local branch when the coder
+    pushes.
+    """
+    repo = tmp_path / "repo"
+    (repo / ".git" / "info").mkdir(parents=True)
+    expected_file = repo / ".git" / "info" / "expected-branch"
+
+    captured: dict[str, str] = {}
+    pr = PRInfo(number=42, branch="pr-001")
+    runner = _runner_with_repo_path(monkeypatch, repo, open_prs_initial=[pr])
+
+    async def fake_run_auto_pr(repo_path: str, **kwargs: Any):
+        captured["content_at_dispatch"] = expected_file.read_text(encoding="utf-8")
+        return (0, "ok", "")
+
+    _, plugin = runner._get_coder()
+    monkeypatch.setattr(plugin, "run_auto_pr", fake_run_auto_pr)
+
+    asyncio.run(runner.handle_coding())
+
+    assert captured["content_at_dispatch"] == "pr-001\n"
+
+
+def test_coding_deletes_expected_branch_after_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """After ``handle_coding`` runs through ``_post_coder_resolution`` the
+    expected-branch marker must be removed so manual operator pushes
+    between dispatches are not gated on a stale value.
+    """
+    repo = tmp_path / "repo"
+    (repo / ".git" / "info").mkdir(parents=True)
+    expected_file = repo / ".git" / "info" / "expected-branch"
+
+    pr = PRInfo(number=42, branch="pr-001")
+    runner = _runner_with_repo_path(monkeypatch, repo, open_prs_initial=[pr])
+    _, plugin = runner._get_coder()
+    monkeypatch.setattr(
+        plugin, "run_auto_pr", h._async_cli_result(0, "ok", "")
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert not expected_file.exists()
+
+
+def test_coding_handles_expected_branch_write_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed expected-branch write must NOT block dispatch — the hook
+    is defense-in-depth on top of the prompt-level safeguards from
+    PR-271. The handler logs a warning and continues.
+    """
+    repo = tmp_path / "repo"
+    info_dir = repo / ".git" / "info"
+    info_dir.mkdir(parents=True)
+    # Pre-create a directory at the marker path so write_text raises
+    # IsADirectoryError (a real OSError) without monkeypatching pathlib.
+    (info_dir / "expected-branch").mkdir()
+
+    pr = PRInfo(number=42, branch="pr-001")
+    runner = _runner_with_repo_path(monkeypatch, repo, open_prs_initial=[pr])
+    _, plugin = runner._get_coder()
+
+    invoked = {"n": 0}
+
+    async def fake_run_auto_pr(repo_path: str, **kwargs: Any):
+        invoked["n"] += 1
+        return (0, "ok", "")
+
+    monkeypatch.setattr(plugin, "run_auto_pr", fake_run_auto_pr)
+
+    asyncio.run(runner.handle_coding())
+
+    # Dispatch still proceeded despite the write failure.
+    assert invoked["n"] == 1
+    assert runner.state.state == PipelineState.WATCH
+    log_entries = [entry["event"] for entry in runner.state.history]
+    assert any("expected-branch write failed" in e for e in log_entries)

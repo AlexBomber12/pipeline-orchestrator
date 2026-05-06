@@ -224,6 +224,8 @@ class CodingMixin:
         except CoderUnavailable:
             return
 
+        self._write_expected_branch(target_branch)
+
         result = await self._run_coder_with_supervision(
             coder_name,
             plugin,
@@ -406,6 +408,56 @@ class CodingMixin:
             if attempt < 2:
                 await asyncio.sleep(5)
 
+    def _expected_branch_path(self) -> Path:
+        """Return the path of the daemon's ``expected-branch`` marker file.
+
+        The file is read by the pre-push hook installed by the
+        scaffolder; the hook aborts a push when ``HEAD`` is on a
+        different branch than the daemon expected for the active task.
+        """
+        return Path(self.repo_path) / ".git" / "info" / "expected-branch"
+
+    def _write_expected_branch(self, branch: str) -> None:
+        """Write ``branch`` to the expected-branch marker for the pre-push hook.
+
+        Defense-in-depth: PR-271 already steers the coder to the right
+        branch via the ``AUTO PR`` prompt headers, so a write failure
+        here only weakens the local push gate. Log a warning and let the
+        dispatch proceed instead of routing to ERROR — refusing to
+        dispatch on a missing ``info/`` directory would regress against
+        the prompt-level protections that already cover the primary
+        scope-expansion path.
+        """
+        try:
+            self._expected_branch_path().write_text(
+                branch + "\n", encoding="utf-8"
+            )
+        except OSError as exc:
+            self.log_event(
+                f"[CODING] expected-branch write failed ({exc}); pre-push "
+                f"hook disabled for this dispatch — continuing."
+            )
+
+    def _cleanup_expected_branch(self) -> None:
+        """Remove the expected-branch marker after coder resolution.
+
+        Cleanup runs regardless of coder exit code so manual operator
+        pushes between dispatches are not blocked by a stale marker.
+        ``missing_ok=True`` swallows ``FileNotFoundError`` so a missing
+        file (e.g. write failed earlier in the cycle) does not raise;
+        the broader ``OSError`` catch covers permission/IsADirectory
+        edge cases left behind when the write itself collided with a
+        non-file at the marker path.
+        """
+        try:
+            self._expected_branch_path().unlink(missing_ok=True)
+        except OSError as exc:
+            self.log_event(
+                f"[CODING] expected-branch cleanup failed ({exc}); "
+                f"manual git operations on this worktree may be gated "
+                f"until the marker is removed."
+            )
+
     async def _post_coder_resolution(
         self,
         coder_name: str,
@@ -423,6 +475,7 @@ class CodingMixin:
         the appropriate primitive (``_transition_to_error``,
         ``_diagnose_exit_zero_no_pr``).
         """
+        self._cleanup_expected_branch()
         async def pause_for_stop_if_requested() -> bool:
             if self._stop_requested:
                 requested = True

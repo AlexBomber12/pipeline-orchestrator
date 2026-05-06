@@ -1002,3 +1002,125 @@ def test_scaffold_repo_propagates_git_push_timeout(
 
     with pytest.raises(subprocess.TimeoutExpired):
         scaffolder.scaffold_repo(str(repo), "main")
+
+
+# --- PR-272: pre-push branch-validation hook installation ----------------
+
+
+def _patch_git_passthrough_install_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[list[str]]:
+    """Like ``_patch_git`` but lets the install-pre-push-hook.sh call run
+    for real so the test can assert the hook file was written to disk.
+
+    The bash invocation path is matched by ``cmd[0] == "bash"`` — every
+    other subprocess (git checkout, add, commit, push, check-ignore) is
+    served by the local fake exactly like ``_patch_git``.
+    """
+    real_run = subprocess.run
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any):
+        calls.append(cmd)
+        if (
+            cmd
+            and cmd[0] == "bash"
+            and len(cmd) > 1
+            and cmd[1].endswith("install-pre-push-hook.sh")
+        ):
+            return real_run(cmd, **kwargs)
+        if cmd[:2] == ["git", "check-ignore"]:
+            return _FakeCompletedProcess(args=cmd, returncode=1)
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            ref = cmd[-1]
+            if ref.startswith("refs/remotes/origin/"):
+                return _FakeCompletedProcess(args=cmd, returncode=1)
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        if cmd[:2] == ["git", "rev-list"]:
+            return _FakeCompletedProcess(args=cmd, returncode=0, stdout="0\n")
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+    return calls
+
+
+def test_scaffolder_installs_pre_push_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``scaffold_repo`` must install ``.git/hooks/pre-push`` on every
+    pass so existing managed repos gain the PR-272 branch-validation
+    defense automatically.
+    """
+    repo = _init_empty_repo(tmp_path)
+    _patch_git_passthrough_install_hook(monkeypatch)
+
+    scaffolder.scaffold_repo(str(repo), "main")
+
+    hook = repo / ".git" / "hooks" / "pre-push"
+    assert hook.exists()
+    assert hook.stat().st_mode & 0o111
+    content = hook.read_text()
+    assert "[pre-push-hook]" in content
+    assert "expected-branch" in content
+
+
+def test_scaffolder_idempotent_pre_push_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-running the scaffolder must not duplicate or corrupt the hook
+    file. The install script overwrites unconditionally, so the second
+    pass leaves the file content unchanged.
+    """
+    repo = _init_empty_repo(tmp_path)
+    _patch_git_passthrough_install_hook(monkeypatch)
+
+    scaffolder.scaffold_repo(str(repo), "main")
+    hook = repo / ".git" / "hooks" / "pre-push"
+    first_content = hook.read_text()
+
+    scaffolder.scaffold_repo(str(repo), "main")
+    second_content = hook.read_text()
+
+    assert second_content == first_content
+    # The hook line appears exactly once — no accidental duplication
+    # from a double-write that misses the overwrite path.
+    assert first_content.count("[pre-push-hook]") == 1
+
+
+def test_scaffolder_logs_warning_on_pre_push_install_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A non-zero install exit must be logged but must NOT abort the
+    cycle: the hook is defense-in-depth and a failed install reduces
+    protection without breaking the dispatch path.
+    """
+    repo = _init_empty_repo(tmp_path)
+
+    def fake_run(cmd: list[str], **kwargs: Any):
+        if (
+            cmd
+            and cmd[0] == "bash"
+            and len(cmd) > 1
+            and cmd[1].endswith("install-pre-push-hook.sh")
+        ):
+            raise subprocess.CalledProcessError(returncode=1, cmd=cmd)
+        if cmd[:2] == ["git", "check-ignore"]:
+            return _FakeCompletedProcess(args=cmd, returncode=1)
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            ref = cmd[-1]
+            if ref.startswith("refs/remotes/origin/"):
+                return _FakeCompletedProcess(args=cmd, returncode=1)
+            return _FakeCompletedProcess(args=cmd, returncode=0)
+        if cmd[:2] == ["git", "rev-list"]:
+            return _FakeCompletedProcess(args=cmd, returncode=0, stdout="0\n")
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+
+    with caplog.at_level("WARNING", logger="src.daemon.scaffolder"):
+        scaffolder.scaffold_repo(str(repo), "main")
+
+    assert any(
+        "pre-push hook install failed" in record.message
+        for record in caplog.records
+    )
