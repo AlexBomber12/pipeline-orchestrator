@@ -1,0 +1,17 @@
+{
+  "pipeline_state": "CANCELED",
+  "current_task_pr_id": null,
+  "current_pr_number": null,
+  "pending_queue_sync_branch": null,
+  "current_queue": [
+    {
+      "pr_id": "PR-186",
+      "title": "Crash before PR",
+      "status": "CANCELED",
+      "task_file": "tasks/PR-186.md",
+      "depends_on": [],
+      "branch": "pr-186-crash-no-pr",
+      "priority": 1
+    }
+  ]
+}

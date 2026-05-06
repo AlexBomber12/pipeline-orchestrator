@@ -1,0 +1,25 @@
+{
+  "tasks": [
+    {
+      "pr_id": "PR-333",
+      "title": "Clean doing with PR",
+      "branch": "pr-333-clean-doing",
+      "depends_on": [],
+      "priority": 2,
+      "type": "feature",
+      "complexity": "low"
+    }
+  ],
+  "open_prs": [
+    {
+      "number": 333,
+      "branch": "pr-333-clean-doing",
+      "title": "PR-333: Clean doing with PR",
+      "pr_id": "PR-333"
+    }
+  ],
+  "merged_pr_ids_via_git_log": [],
+  "merged_branches_via_api": [],
+  "crashed_task_pr_ids": [],
+  "recovered_task_pr_ids": []
+}

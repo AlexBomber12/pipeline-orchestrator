@@ -1,0 +1,18 @@
+{
+  "tasks": [
+    {
+      "pr_id": "PR-005",
+      "title": "MegaRAID already merged",
+      "branch": "pr-005-megaraid",
+      "depends_on": [],
+      "priority": 2,
+      "type": "bugfix",
+      "complexity": "low"
+    }
+  ],
+  "open_prs": [],
+  "merged_pr_ids_via_git_log": [],
+  "merged_branches_via_api": ["pr-005-megaraid"],
+  "crashed_task_pr_ids": [],
+  "recovered_task_pr_ids": []
+}

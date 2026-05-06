@@ -1,0 +1,18 @@
+{
+  "tasks": [
+    {
+      "pr_id": "PR-220",
+      "title": "Unpushed crash work",
+      "branch": "pr-220-unpushed",
+      "depends_on": [],
+      "priority": 2,
+      "type": "refactor",
+      "complexity": "medium"
+    }
+  ],
+  "open_prs": [],
+  "merged_pr_ids_via_git_log": [],
+  "merged_branches_via_api": [],
+  "crashed_task_pr_ids": ["PR-220"],
+  "recovered_task_pr_ids": []
+}

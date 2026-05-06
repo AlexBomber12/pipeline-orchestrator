@@ -1,0 +1,17 @@
+{
+  "pipeline_state": "IDLE",
+  "current_task_pr_id": null,
+  "current_pr_number": null,
+  "pending_queue_sync_branch": null,
+  "current_queue": [
+    {
+      "pr_id": "PR-005",
+      "title": "MegaRAID already merged",
+      "status": "DONE",
+      "task_file": "tasks/PR-005.md",
+      "depends_on": [],
+      "branch": "pr-005-megaraid",
+      "priority": 2
+    }
+  ]
+}

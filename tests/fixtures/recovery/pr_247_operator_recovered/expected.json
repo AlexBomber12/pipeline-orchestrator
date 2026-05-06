@@ -1,0 +1,17 @@
+{
+  "pipeline_state": "IDLE",
+  "current_task_pr_id": null,
+  "current_pr_number": null,
+  "pending_queue_sync_branch": null,
+  "current_queue": [
+    {
+      "pr_id": "PR-247",
+      "title": "Operator recovered",
+      "status": "CANCELED",
+      "task_file": "tasks/PR-247.md",
+      "depends_on": [],
+      "branch": "pr-247-operator-recovered",
+      "priority": 3
+    }
+  ]
+}

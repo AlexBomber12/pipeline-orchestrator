@@ -1,0 +1,25 @@
+{
+  "tasks": [
+    {
+      "pr_id": "PR-210",
+      "title": "Pending queue sync dependency",
+      "branch": "pr-210-pending-sync",
+      "depends_on": [],
+      "priority": 4,
+      "type": "refactor",
+      "complexity": "low"
+    }
+  ],
+  "open_prs": [
+    {
+      "number": 310,
+      "branch": "queue-done-pr-209",
+      "title": "Queue sync",
+      "pr_id": null
+    }
+  ],
+  "merged_pr_ids_via_git_log": [],
+  "merged_branches_via_api": [],
+  "crashed_task_pr_ids": [],
+  "recovered_task_pr_ids": []
+}

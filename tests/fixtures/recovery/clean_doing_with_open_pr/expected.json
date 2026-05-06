@@ -1,0 +1,17 @@
+{
+  "pipeline_state": "WATCH",
+  "current_task_pr_id": "PR-333",
+  "current_pr_number": 333,
+  "pending_queue_sync_branch": null,
+  "current_queue": [
+    {
+      "pr_id": "PR-333",
+      "title": "Clean doing with PR",
+      "status": "DOING",
+      "task_file": "tasks/PR-333.md",
+      "depends_on": [],
+      "branch": "pr-333-clean-doing",
+      "priority": 2
+    }
+  ]
+}
