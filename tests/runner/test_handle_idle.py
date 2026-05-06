@@ -3677,3 +3677,126 @@ def test_handle_idle_re_emits_agents_scan_when_drift_changes(
         "PR-088.md" in event and "no_verify_commit" in event
         for event in scan_events
     ), scan_events
+
+
+def test_generate_queue_md_includes_depends_on_when_present() -> None:
+    headers = [
+        TaskHeader(
+            pr_id="PR-002",
+            title="Two",
+            branch="pr-002",
+            task_type="refactor",
+            complexity="low",
+            depends_on=["PR-001"],
+            priority=2,
+            coder="claude",
+        ),
+    ]
+    statuses = {"PR-002": TaskStatus.TODO}
+    rendered = idle_module.IdleMixin._generate_queue_md(headers, statuses)
+    assert "- Depends on: PR-001" in rendered
+
+
+def test_write_generated_queue_md_skips_when_origin_tracks_queue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Legacy tracked-QUEUE repos must not have their worktree dirtied."""
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._origin_queue_md_tracked = lambda: True
+    headers = [
+        TaskHeader(
+            pr_id="PR-001",
+            title="One",
+            branch="pr-001",
+            task_type="refactor",
+            complexity="low",
+            depends_on=[],
+            priority=2,
+            coder="claude",
+        ),
+    ]
+    statuses = {"PR-001": TaskStatus.TODO}
+    runner._write_generated_queue_md(headers, statuses)
+    assert not (tmp_path / "tasks" / "QUEUE.md").exists()
+
+
+def test_write_generated_queue_md_no_op_when_content_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Re-running with identical content must not rewrite the file."""
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._origin_queue_md_tracked = lambda: False
+    headers = [
+        TaskHeader(
+            pr_id="PR-001",
+            title="One",
+            branch="pr-001",
+            task_type="refactor",
+            complexity="low",
+            depends_on=[],
+            priority=2,
+            coder="claude",
+        ),
+    ]
+    statuses = {"PR-001": TaskStatus.TODO}
+    runner._write_generated_queue_md(headers, statuses)
+    queue_path = tmp_path / "tasks" / "QUEUE.md"
+    assert queue_path.exists()
+    first_mtime = queue_path.stat().st_mtime_ns
+    # Force a different mtime by sleeping briefly so we can detect a rewrite.
+    time.sleep(0.01)
+    runner._write_generated_queue_md(headers, statuses)
+    assert queue_path.stat().st_mtime_ns == first_mtime
+
+
+def test_handle_idle_transitions_to_error_when_queue_md_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An OSError from the QUEUE.md write must surface as ERROR state."""
+    h._patch_subprocess(monkeypatch)
+    task = QueueTask(
+        pr_id="PR-042",
+        title="Sample",
+        status=TaskStatus.TODO,
+        branch="pr-042-sample",
+    )
+    h._stub_dag_select(monkeypatch, task=task)
+
+    def fake_write(self, headers, statuses):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_write_generated_queue_md",
+        fake_write,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs", lambda repo, **kw: []
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    runner = h._make_runner()
+    runner._idle_dag_headers = [
+        TaskHeader(
+            pr_id="PR-042",
+            title="Sample",
+            branch="pr-042-sample",
+            task_type="refactor",
+            complexity="low",
+            depends_on=[],
+            priority=2,
+            coder="claude",
+        ),
+    ]
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message is not None
+    assert "QUEUE.md auto-generation failed" in runner.state.error_message

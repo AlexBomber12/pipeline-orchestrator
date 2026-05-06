@@ -358,6 +358,57 @@ def test_sync_to_main_runs_git_sequence_and_wraps_oserror(
         runner.sync_to_main()
 
 
+def test_origin_queue_md_tracked_probes_origin_queue_md(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = _Runner(tmp_path)
+    calls: list[tuple[Any, ...]] = []
+
+    def fake_git(*args: Any, **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(args)
+        assert kwargs == {"check": False, "timeout": 10}
+        return _FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", fake_git)
+
+    assert runner._origin_queue_md_tracked() is True
+    assert calls == [
+        (
+            runner.repo_path,
+            "cat-file",
+            "-e",
+            "origin/main:tasks/QUEUE.md",
+        )
+    ]
+
+
+def test_origin_queue_md_tracked_returns_false_when_absent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = _Runner(tmp_path)
+    monkeypatch.setattr(
+        repo_ops.git_ops,
+        "_git",
+        lambda *args, **kwargs: _FakeCompletedProcess(returncode=1),
+    )
+
+    assert runner._origin_queue_md_tracked() is False
+
+
+def test_origin_queue_md_tracked_returns_none_on_probe_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = _Runner(tmp_path)
+    monkeypatch.setattr(
+        repo_ops.git_ops,
+        "_git",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("no git")),
+    )
+
+    assert runner._origin_queue_md_tracked() is None
 
 
 

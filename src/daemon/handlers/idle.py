@@ -20,6 +20,7 @@ from src.onboarding.markdown_sections import MarkerError
 from src.onboarding.reconciliation import reconcile_agents_md
 from src.queue_parser import (
     QueueValidationError,
+    TaskHeader,
     parse_task_header,
 )
 from src.task_status import (
@@ -53,6 +54,59 @@ class IdleMixin:
                 "push_count": merged_push_count,
             }
         )
+
+    @staticmethod
+    def _generate_queue_md(
+        headers: list[TaskHeader],
+        statuses: dict[str, TaskStatus],
+    ) -> str:
+        """Render a visually compatible QUEUE.md from structured task headers."""
+        lines = ["# Task Queue\n"]
+        for header in headers:
+            lines.append(f"## {header.pr_id}: {header.title}")
+            lines.append(f"- Status: {statuses[header.pr_id].value}")
+            lines.append(f"- Tasks file: tasks/{header.pr_id}.md")
+            lines.append(f"- Branch: {header.branch}")
+            if header.depends_on:
+                lines.append(f"- Depends on: {', '.join(header.depends_on)}")
+            lines.append("")
+        return "\n".join(lines)
+
+    def _write_generated_queue_md(
+        self,
+        headers: list[TaskHeader],
+        statuses: dict[str, TaskStatus],
+    ) -> None:
+        """Write regenerated QUEUE.md so the e2e coder shim can find DOING.
+
+        The e2e coder shim parses ``tasks/QUEUE.md`` to find the active
+        DOING task; PR-269 will migrate it to read PR-*.md directly.
+        Until then, the daemon must keep writing the file so the e2e
+        suite passes. The file is gitignored on managed repos and on
+        legacy tracked-QUEUE repos this helper is a no-op (the
+        ``_origin_queue_md_tracked`` probe returns True/None and the
+        write is skipped to avoid dirtying the worktree).
+        """
+        # ``None`` means the cat-file probe itself failed (transient git
+        # slowness); treat as if tracked so the regenerate is skipped
+        # for this cycle. A legacy repo whose probe is briefly flaky
+        # would otherwise have its working tree dirtied on every IDLE
+        # tick. Post-untrack repos lose only one cycle of regeneration
+        # and self-heal on the next tick once the probe succeeds.
+        tracked = self._origin_queue_md_tracked()
+        if tracked is not False:
+            return
+        queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
+        content = self._generate_queue_md(headers, statuses)
+        existing = (
+            queue_path.read_text(encoding="utf-8")
+            if queue_path.exists()
+            else None
+        )
+        if existing == content:
+            return
+        queue_path.parent.mkdir(parents=True, exist_ok=True)
+        queue_path.write_text(content, encoding="utf-8")
 
     def _scan_task_specs_for_agents_md_drift(self) -> None:
         """Run the AGENTS.md anti-pattern scan over ``tasks/PR-*.md``.
@@ -193,6 +247,7 @@ class IdleMixin:
     async def _select_next_task_from_dag(self) -> QueueTask | None:
         """Pick the next eligible task from structured task headers."""
         self._idle_dag_tasks = None
+        self._idle_dag_headers = None
         self._idle_dag_statuses = None
         task_dir = Path(self.repo_path) / "tasks"
         if not task_dir.is_dir():
@@ -339,6 +394,7 @@ class IdleMixin:
         except ValueError as exc:
             raise QueueValidationError([str(exc)]) from exc
 
+        self._idle_dag_headers = list(dag_headers)
         self._idle_dag_statuses = dict(statuses)
         self._idle_dag_tasks = [
             self._queue_task_from_header(header, statuses[header.pr_id], task_files)
@@ -437,6 +493,29 @@ class IdleMixin:
             len(dag_tasks),
         )
         self.state.current_queue = list(dag_tasks)
+
+        # Keep tasks/QUEUE.md on disk in sync with the snapshot so the
+        # e2e coder shim's ``parse_doing_task`` can locate the active
+        # task. PR-269 will migrate the shim to read PR-*.md directly;
+        # until that ships, removing the disk write breaks the e2e
+        # suite (slow/success shims exit 0 without creating PRs and the
+        # daemon hangs in CODING).
+        generated_headers = getattr(self, "_idle_dag_headers", None)
+        generated_statuses = getattr(self, "_idle_dag_statuses", None)
+        if generated_headers and generated_statuses:
+            try:
+                self._write_generated_queue_md(
+                    generated_headers,
+                    generated_statuses,
+                )
+            except OSError as exc:
+                await self._transition_to_error(
+                    f"QUEUE.md auto-generation failed: {exc}",
+                    save_run_record_as=None,
+                    publish=False,
+                    log_prefix="[INFRA]",
+                )
+                return None
 
         if task is None:
             self.log_event("[INFRA] No tasks available.")
