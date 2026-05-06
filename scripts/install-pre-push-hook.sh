@@ -93,11 +93,19 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         fi
         continue
     fi
+    # ``local-ref`` is ``HEAD`` for explicit HEAD refspec pushes such as
+    # ``git push origin HEAD:<branch>``; HEAD is a symbolic alias resolved
+    # by git to the current commit and carries no branch identity of its
+    # own, so the local-side equality check would falsely reject every
+    # such push. The remote-ref check below is the security-critical
+    # validation (it gates the destination branch on origin), so skipping
+    # the local check on HEAD does not weaken the gate.
     case "$local_ref" in
         refs/heads/*) actual_local="${local_ref#refs/heads/}" ;;
+        HEAD) actual_local="" ;;
         *) actual_local="$local_ref" ;;
     esac
-    if [[ "$EXPECTED" != "$actual_local" ]]; then
+    if [[ -n "$actual_local" ]] && [[ "$EXPECTED" != "$actual_local" ]]; then
         echo "[pre-push-hook] BLOCKED: expected branch '$EXPECTED' but push includes '$actual_local' (local ref '$local_ref'). Aborting push." >&2
         exit 1
     fi

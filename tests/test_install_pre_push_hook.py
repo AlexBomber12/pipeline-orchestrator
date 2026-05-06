@@ -330,6 +330,50 @@ def test_hook_blocks_on_non_branch_ref(tmp_path: Path) -> None:
     assert "push includes 'refs/tags/v1.0'" in result.stderr
 
 
+def test_hook_passes_head_refspec_to_expected_remote(tmp_path: Path) -> None:
+    """``git push origin HEAD:<expected-branch>`` is a valid client refspec
+    style: ``<local-ref>`` arrives as the literal string ``HEAD`` rather
+    than ``refs/heads/<branch>``. HEAD is a symbolic alias resolved by
+    git to the current commit, so the local-side check has no branch
+    identity to compare against; the remote-ref check is the
+    authoritative gate. Without HEAD-as-alias handling the hook would
+    reject every daemon/coder push that uses this refspec form even
+    when the destination matches the marker, breaking CODING and FIX
+    flows depending on client refspec style.
+    """
+    repo = _init_repo(tmp_path)
+    _install(repo)
+    info = repo / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "expected-branch").write_text("pr-001\n")
+    result = _run_hook(
+        repo,
+        stdin=_push_line("HEAD", remote_ref="refs/heads/pr-001"),
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_hook_blocks_head_refspec_to_unexpected_remote(tmp_path: Path) -> None:
+    """HEAD refspec pushes are accepted on the local side because HEAD is
+    a symbolic alias, but the remote destination must still match the
+    expected branch marker — otherwise ``git push origin HEAD:main``
+    while the marker is ``pr-001`` would route task commits to a
+    protected base branch and bypass the gate.
+    """
+    repo = _init_repo(tmp_path)
+    _install(repo)
+    info = repo / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "expected-branch").write_text("pr-001\n")
+    result = _run_hook(
+        repo,
+        stdin=_push_line("HEAD", remote_ref="refs/heads/main"),
+    )
+    assert result.returncode == 1
+    assert "[pre-push-hook] BLOCKED" in result.stderr
+    assert "push targets 'main'" in result.stderr
+
+
 def test_hook_blocks_when_pushing_expected_local_to_unexpected_remote(
     tmp_path: Path,
 ) -> None:
