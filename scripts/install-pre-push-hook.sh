@@ -42,17 +42,22 @@ fi
 cat > "$HOOK_FILE" <<'EOF'
 #!/bin/bash
 # Pipeline-orchestrator pre-push hook (installed by scaffolder).
-# Validates the local branch name against the expected-branch marker
-# when the daemon has written it. Manual git operations (no
+# Validates the local refs being pushed against the expected-branch
+# marker when the daemon has written it. Manual git operations (no
 # expected-branch file) are no-op.
 #
-# Resolves the marker path via ``git rev-parse --git-path
-# info/expected-branch`` so linked worktrees (where ``.git`` is a
-# file pointing at ``<main-repo>/.git/worktrees/<name>/``) and repos
-# initialized with ``--separate-git-dir`` find the file in the
-# per-checkout ``info/`` directory git uses; a hardcoded
-# ``.git/info/expected-branch`` lookup would silently no-op in those
-# layouts because the path does not resolve to a regular file.
+# Per githooks(5), pre-push receives ``<local-ref> <local-oid>
+# <remote-ref> <remote-oid>`` lines on stdin. The hook validates those
+# stdin refs rather than ``git symbolic-ref --short HEAD`` because the
+# push refspec can differ from the checked-out branch: ``git push
+# origin main`` while HEAD is on the expected feature branch would
+# silently pass a HEAD-only check, and pushing the expected branch
+# from a detached/other checkout would falsely trip one. The marker
+# path is resolved via ``git rev-parse --git-path info/expected-branch``
+# so linked worktrees (where ``.git`` is a file pointing at
+# ``<main-repo>/.git/worktrees/<name>/``) and repos initialized with
+# ``--separate-git-dir`` find the per-checkout marker; a hardcoded
+# ``.git/info/expected-branch`` lookup would silently no-op there.
 set -euo pipefail
 
 if ! EXPECTED_FILE=$(git rev-parse --git-path info/expected-branch 2>/dev/null); then
@@ -64,12 +69,23 @@ if [[ ! -f "$EXPECTED_FILE" ]]; then
 fi
 
 EXPECTED=$(<"$EXPECTED_FILE")
-ACTUAL=$(git symbolic-ref --short HEAD 2>/dev/null || echo "<detached>")
 
-if [[ "$EXPECTED" != "$ACTUAL" ]]; then
-    echo "[pre-push-hook] BLOCKED: expected branch '$EXPECTED' but HEAD is on '$ACTUAL'. Aborting push." >&2
-    exit 1
-fi
+while read -r local_ref local_sha remote_ref remote_sha; do
+    # ``local-ref`` is the literal string ``(delete)`` for ref
+    # deletions; nothing is pushed from this side, so there is no
+    # branch to validate.
+    if [[ "$local_ref" == "(delete)" ]]; then
+        continue
+    fi
+    case "$local_ref" in
+        refs/heads/*) actual="${local_ref#refs/heads/}" ;;
+        *) actual="$local_ref" ;;
+    esac
+    if [[ "$EXPECTED" != "$actual" ]]; then
+        echo "[pre-push-hook] BLOCKED: expected branch '$EXPECTED' but push includes '$actual' (local ref '$local_ref'). Aborting push." >&2
+        exit 1
+    fi
+done
 
 exit 0
 EOF

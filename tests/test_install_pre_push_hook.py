@@ -40,13 +40,35 @@ def _install(
     )
 
 
-def _run_hook(repo: Path) -> subprocess.CompletedProcess[str]:
+_ZERO_OID = "0000000000000000000000000000000000000000"
+_FAKE_OID = "0000000000000000000000000000000000000001"
+
+
+def _push_line(local_ref: str, *, remote_ref: str | None = None) -> str:
+    """Build one stdin line in the format git passes to pre-push.
+
+    Per githooks(5): ``<local-ref> <local-oid> <remote-ref>
+    <remote-oid>`` for each ref to be pushed.
+    """
+    return f"{local_ref} {_FAKE_OID} {remote_ref or local_ref} {_ZERO_OID}\n"
+
+
+def _run_hook(
+    repo: Path,
+    *,
+    stdin: str = "",
+    hook_path: Path | None = None,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
     """Invoke the installed hook directly with the same args git passes."""
+    if hook_path is None:
+        hook_path = repo / ".git" / "hooks" / "pre-push"
     return subprocess.run(
-        [str(repo / ".git" / "hooks" / "pre-push"), "origin", "ssh://x"],
-        cwd=str(repo),
+        [str(hook_path), "origin", "ssh://x"],
+        cwd=str(cwd or repo),
         capture_output=True,
         text=True,
+        input=stdin,
     )
 
 
@@ -104,9 +126,27 @@ def test_hook_no_op_when_expected_branch_missing(tmp_path: Path) -> None:
     _install(repo)
     expected = repo / ".git" / "info" / "expected-branch"
     assert not expected.exists()
-    result = _run_hook(repo)
+    # Even when refs are queued for push, an absent marker is no-op:
+    # operator pushes (no daemon CODING run in flight) must not be
+    # affected by the defense-in-depth gate.
+    result = _run_hook(repo, stdin=_push_line("refs/heads/main"))
     assert result.returncode == 0
     assert result.stderr == ""
+
+
+def test_hook_no_op_when_no_refs_pushed(tmp_path: Path) -> None:
+    """Empty stdin means git has no refs queued for push (e.g., the
+    hook was invoked but nothing matched the refspec). With nothing
+    being pushed there is no branch to validate, so the hook must
+    exit 0 even with the marker present.
+    """
+    repo = _init_repo(tmp_path)
+    _install(repo)
+    info = repo / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "expected-branch").write_text("expected-branch-name\n")
+    result = _run_hook(repo, stdin="")
+    assert result.returncode == 0, result.stderr
 
 
 def test_hook_blocks_when_branch_mismatch(tmp_path: Path) -> None:
@@ -115,19 +155,33 @@ def test_hook_blocks_when_branch_mismatch(tmp_path: Path) -> None:
     info = repo / ".git" / "info"
     info.mkdir(parents=True, exist_ok=True)
     (info / "expected-branch").write_text("expected-branch-name\n")
-    result = _run_hook(repo)
+    result = _run_hook(repo, stdin=_push_line("refs/heads/main"))
     assert result.returncode == 1
     assert "[pre-push-hook] BLOCKED" in result.stderr
     assert "expected branch 'expected-branch-name'" in result.stderr
+    assert "push includes 'main'" in result.stderr
     assert "Aborting push" in result.stderr
 
 
 def test_hook_passes_when_branch_matches(tmp_path: Path) -> None:
+    """The pushed local ref equals the expected branch — pass."""
     repo = _init_repo(tmp_path)
     _install(repo)
     info = repo / ".git" / "info"
     info.mkdir(parents=True, exist_ok=True)
-    # Stage and commit so symbolic-ref --short HEAD resolves to the branch.
+    (info / "expected-branch").write_text("pr-001\n")
+    result = _run_hook(repo, stdin=_push_line("refs/heads/pr-001"))
+    assert result.returncode == 0, result.stderr
+
+
+def test_hook_blocks_when_pushing_other_branch_from_expected_head(
+    tmp_path: Path,
+) -> None:
+    """Regression for the HEAD-based check: ``git push origin main`` while
+    HEAD is on the expected feature branch must be blocked. The previous
+    HEAD-based logic incorrectly passed because HEAD matched expected;
+    the stdin-based logic blocks because the pushed local ref does not.
+    """
     env = os.environ.copy()
     env.update(
         {
@@ -137,6 +191,7 @@ def test_hook_passes_when_branch_matches(tmp_path: Path) -> None:
             "GIT_COMMITTER_EMAIL": "t@example.com",
         }
     )
+    repo = _init_repo(tmp_path)
     (repo / "x.txt").write_text("ok\n")
     subprocess.run(["git", "-C", str(repo), "add", "x.txt"], check=True, env=env)
     subprocess.run(
@@ -144,34 +199,110 @@ def test_hook_passes_when_branch_matches(tmp_path: Path) -> None:
         check=True,
         env=env,
     )
-    head_branch = subprocess.run(
-        ["git", "-C", str(repo), "symbolic-ref", "--short", "HEAD"],
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "-q", "-b", "pr-001"],
         check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    (info / "expected-branch").write_text(head_branch + "\n")
-    result = _run_hook(repo)
+        env=env,
+    )
+    _install(repo)
+    info = repo / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "expected-branch").write_text("pr-001\n")
+    # HEAD is on pr-001 (the expected branch) but we are pushing main.
+    result = _run_hook(repo, stdin=_push_line("refs/heads/main"))
+    assert result.returncode == 1, result.stdout
+    assert "push includes 'main'" in result.stderr
+
+
+def test_hook_passes_when_pushing_expected_branch_from_detached_head(
+    tmp_path: Path,
+) -> None:
+    """Regression for the HEAD-based check: pushing the expected branch
+    from a detached/other checkout must pass. The previous HEAD-based
+    logic failed because ``git symbolic-ref --short HEAD`` returned
+    nothing in detached state; the stdin-based logic passes because the
+    pushed local ref matches.
+    """
+    env = os.environ.copy()
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.com",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.com",
+        }
+    )
+    repo = _init_repo(tmp_path)
+    (repo / "x.txt").write_text("ok\n")
+    subprocess.run(["git", "-C", str(repo), "add", "x.txt"], check=True, env=env)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", "init"],
+        check=True,
+        env=env,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "-q", "--detach"],
+        check=True,
+        env=env,
+    )
+    _install(repo)
+    info = repo / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "expected-branch").write_text("pr-001\n")
+    # HEAD is detached, but we are pushing the expected branch by ref.
+    result = _run_hook(repo, stdin=_push_line("refs/heads/pr-001"))
     assert result.returncode == 0, result.stderr
 
 
-def test_hook_blocks_when_head_unresolvable(tmp_path: Path) -> None:
-    """When ``git symbolic-ref --short HEAD`` fails the hook falls back
-    to ``<detached>`` and treats the mismatch as a block. Cover the
-    fallback by pointing HEAD at a non-existent ref.
+def test_hook_skips_delete_lines(tmp_path: Path) -> None:
+    """Ref deletions appear as ``(delete) <oid> <remote-ref> <oid>`` on
+    stdin. Nothing is pushed from the local side, so the hook must skip
+    the line rather than block on the literal token ``(delete)``.
     """
     repo = _init_repo(tmp_path)
     _install(repo)
     info = repo / ".git" / "info"
     info.mkdir(parents=True, exist_ok=True)
-    (info / "expected-branch").write_text("any-branch\n")
-    subprocess.run(
-        ["git", "-C", str(repo), "symbolic-ref", "HEAD", "refs/heads/__none__"],
-        check=True,
+    (info / "expected-branch").write_text("pr-001\n")
+    stdin = (
+        f"(delete) {_ZERO_OID} refs/heads/old-branch {_FAKE_OID}\n"
+        + _push_line("refs/heads/pr-001")
     )
-    result = _run_hook(repo)
+    result = _run_hook(repo, stdin=stdin)
+    assert result.returncode == 0, result.stderr
+
+
+def test_hook_blocks_on_non_branch_ref(tmp_path: Path) -> None:
+    """Refs outside ``refs/heads/`` (tags, notes, raw HEAD pushes) are
+    treated as their full ref so a non-branch push surfaces as a
+    mismatch instead of being silently accepted — the daemon's AUTO PR
+    flow only ever pushes the expected feature branch.
+    """
+    repo = _init_repo(tmp_path)
+    _install(repo)
+    info = repo / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "expected-branch").write_text("pr-001\n")
+    result = _run_hook(repo, stdin=_push_line("refs/tags/v1.0"))
     assert result.returncode == 1
-    assert "[pre-push-hook] BLOCKED" in result.stderr
+    assert "push includes 'refs/tags/v1.0'" in result.stderr
+
+
+def test_hook_blocks_when_any_ref_mismatches(tmp_path: Path) -> None:
+    """Multiple refs may be queued in one push (e.g.,
+    ``git push origin pr-001 main``); blocking only when *all* refs
+    mismatch would let the wrong-branch one through. Block on the
+    first mismatch.
+    """
+    repo = _init_repo(tmp_path)
+    _install(repo)
+    info = repo / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "expected-branch").write_text("pr-001\n")
+    stdin = _push_line("refs/heads/pr-001") + _push_line("refs/heads/main")
+    result = _run_hook(repo, stdin=stdin)
+    assert result.returncode == 1
+    assert "push includes 'main'" in result.stderr
 
 
 def test_install_honors_core_hooks_path(tmp_path: Path) -> None:
@@ -219,35 +350,14 @@ def test_hook_strips_trailing_newline_from_expected(
 ) -> None:
     """The hook's read of expected-branch must compare without the
     trailing newline so the daemon's ``branch + \"\\n\"`` write format
-    matches a plain branch name from ``symbolic-ref --short HEAD``.
+    matches the bare branch name extracted from the pushed local ref.
     """
     repo = _init_repo(tmp_path)
     _install(repo)
     info = repo / ".git" / "info"
     info.mkdir(parents=True, exist_ok=True)
     (info / "expected-branch").write_text(payload)
-    env = os.environ.copy()
-    env.update(
-        {
-            "GIT_AUTHOR_NAME": "t",
-            "GIT_AUTHOR_EMAIL": "t@example.com",
-            "GIT_COMMITTER_NAME": "t",
-            "GIT_COMMITTER_EMAIL": "t@example.com",
-        }
-    )
-    subprocess.run(
-        ["git", "-C", str(repo), "checkout", "-q", "-b", "pr-001"],
-        check=True,
-        env=env,
-    )
-    (repo / "x.txt").write_text("ok\n")
-    subprocess.run(["git", "-C", str(repo), "add", "x.txt"], check=True, env=env)
-    subprocess.run(
-        ["git", "-C", str(repo), "commit", "-q", "-m", "init"],
-        check=True,
-        env=env,
-    )
-    result = _run_hook(repo)
+    result = _run_hook(repo, stdin=_push_line("refs/heads/pr-001"))
     assert result.returncode == 0, result.stderr
 
 
@@ -322,11 +432,11 @@ def test_hook_resolves_marker_in_linked_worktree(tmp_path: Path) -> None:
     marker = _git_path("info/expected-branch")
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text("expected-branch-name\n")
-    result = subprocess.run(
-        [str(hook_file), "origin", "ssh://x"],
-        cwd=str(worktree),
-        capture_output=True,
-        text=True,
+    result = _run_hook(
+        worktree,
+        stdin=_push_line("refs/heads/feature"),
+        hook_path=hook_file,
+        cwd=worktree,
     )
     assert result.returncode == 1
     assert "[pre-push-hook] BLOCKED" in result.stderr
