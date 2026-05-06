@@ -761,3 +761,169 @@ def test_audit_headers_applies_uses_live_prs_after_idle_restore(
     # new: TODO matching PR -> recoverable -> WATCH on PR-010.
     assert diff["pipeline_state"] == {"legacy": "IDLE", "new": "WATCH"}
     assert diff["current_pr_number"] == {"legacy": None, "new": 7}
+
+
+def test_audit_dry_run_drops_ghost_entries_on_local_queue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Audit dry-run must mirror legacy's ghost-entry filter on local queues.
+
+    Regression: ``_emit_audit_diff`` previously called
+    ``_parse_base_queue`` without mirroring ``_recover_state_legacy``'s
+    ``queue_from_origin`` probe and ``_drop_ghost_queue_entries`` step.
+    On post-PR-181 repos (``tasks/QUEUE.md`` is gitignored and survives
+    ``sync_to_main``'s ``git reset --hard`` / ``git clean -fd``), a
+    stale row referencing a deleted ``tasks/PR-XXX.md`` would surface
+    as an ``[AUDIT] recover_state divergence`` even though the actual
+    legacy recovery would have dropped it before any decision,
+    polluting the rollout signal with phantom divergences.
+    """
+    _set_env(monkeypatch, audit="1", headers="1")
+    _stub_open_prs(monkeypatch, [])
+
+    repo = tmp_path / "repo"
+    (repo / "tasks").mkdir(parents=True)
+    (repo / "tasks" / "PR-001.md").write_text("placeholder", encoding="utf-8")
+    # PR-999.md is intentionally NOT created — it's a ghost entry.
+
+    legacy_with_ghost = [
+        QueueTask(
+            pr_id="PR-001",
+            title="real",
+            status=TaskStatus.TODO,
+            branch="pr-001",
+            task_file="tasks/PR-001.md",
+        ),
+        QueueTask(
+            pr_id="PR-999",
+            title="ghost",
+            status=TaskStatus.TODO,
+            branch="pr-999",
+            task_file="tasks/PR-999.md",
+        ),
+    ]
+    new_tasks = [
+        QueueTask(
+            pr_id="PR-001",
+            title="real",
+            status=TaskStatus.TODO,
+            branch="pr-001",
+            task_file="tasks/PR-001.md",
+        ),
+    ]
+
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+    runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **kwargs: list(legacy_with_ghost)  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: list(new_tasks)  # type: ignore[method-assign]
+
+    asyncio.run(runner.recover_state())
+
+    # Without the ghost filter the audit would have logged a
+    # ``current_queue_length`` divergence (1 vs 2). With it, parity
+    # holds and the audit log stays silent.
+    assert not any(
+        e["event"].startswith("[AUDIT] recover_state divergence:")
+        for e in runner.state.history
+    )
+
+
+def test_audit_dry_run_keeps_origin_tracked_queue_unfiltered(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """On origin-tracked queues the dry-run must NOT apply the ghost filter.
+
+    The local-existence test is unsafe when the queue snapshot came
+    from ``origin/{branch}`` (the working tree may legitimately be
+    parked on a feature branch whose checkout lacks task files
+    referenced by the base-branch queue). Applying the filter there
+    would drop real DOING/DONE entries and hide legitimate divergence.
+    """
+    _set_env(monkeypatch, audit="1", headers="1")
+    _stub_open_prs(monkeypatch, [])
+
+    repo = tmp_path / "repo"
+    (repo / "tasks").mkdir(parents=True)
+    # PR-001.md intentionally absent from the working tree.
+
+    legacy_origin_snapshot = [
+        QueueTask(
+            pr_id="PR-001",
+            title="origin task",
+            status=TaskStatus.DOING,
+            branch="pr-001",
+            task_file="tasks/PR-001.md",
+        ),
+    ]
+    new_tasks: list[QueueTask] = []
+
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+    runner._origin_queue_md_tracked = lambda: True  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **kwargs: list(legacy_origin_snapshot)  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: list(new_tasks)  # type: ignore[method-assign]
+
+    asyncio.run(runner.recover_state())
+
+    audit_events = [
+        e["event"]
+        for e in runner.state.history
+        if e["event"].startswith("[AUDIT] recover_state divergence:")
+    ]
+    assert len(audit_events) == 1
+    payload = json.loads(audit_events[0].split(": ", 1)[1])
+    assert payload["diff"]["current_queue_length"] == {"legacy": 1, "new": 0}
+
+
+def test_audit_dry_run_skips_when_queue_probe_indeterminate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A ``None`` probe result must skip the dry-run, not fabricate divergence.
+
+    Mirrors ``_recover_state_legacy``: when the probe is indeterminate
+    legacy would transition to ERROR, so the comparator has no
+    legitimate snapshot to score against. Calling ``_parse_base_queue``
+    anyway would fall back to a possibly-stale working-tree copy and
+    log spurious divergences.
+    """
+    _set_env(monkeypatch, audit="1", headers="1")
+    _stub_open_prs(monkeypatch, [])
+
+    new_tasks = [
+        QueueTask(
+            pr_id="PR-001",
+            title="task",
+            status=TaskStatus.TODO,
+            branch="pr-001",
+            task_file="tasks/PR-001.md",
+        ),
+    ]
+
+    parse_calls: list[bool] = []
+
+    def _parse(**kwargs: Any) -> list[QueueTask]:
+        parse_calls.append(True)
+        return []
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._origin_queue_md_tracked = lambda: None  # type: ignore[method-assign]
+    runner._parse_base_queue = _parse  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: list(new_tasks)  # type: ignore[method-assign]
+
+    asyncio.run(runner.recover_state())
+
+    assert parse_calls == []
+    assert any(
+        "legacy-path dry-run skipped" in e["event"]
+        and "tracking probe failed" in e["event"]
+        for e in runner.state.history
+    )
+    assert not any(
+        e["event"].startswith("[AUDIT] recover_state divergence:")
+        for e in runner.state.history
+    )

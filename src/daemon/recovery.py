@@ -907,15 +907,52 @@ class RecoveryMixin:
             legacy_tasks = applied_tasks
         else:
             strict = self.app_config.daemon.strict_queue_validation
+            # Mirror ``_recover_state_legacy``'s queue-source decision
+            # exactly so the dry-run scores against the same input the
+            # legacy applied path would have used. Probing once and
+            # threading the result into ``_parse_base_queue`` keeps the
+            # parse source (origin/{branch} vs working tree) and the
+            # downstream ghost-filter decision in lockstep, the same
+            # invariant the legacy applied path enforces.
+            queue_from_origin = self._origin_queue_md_tracked()
+            if queue_from_origin is None:
+                # Indeterminate probe: legacy applies would have
+                # transitioned to ERROR, so any comparison here would
+                # measure a snapshot legacy never actually used. Skip
+                # silently rather than fabricate divergences.
+                self.log_event(
+                    "[AUDIT] recover_state legacy-path dry-run skipped: "
+                    "tasks/QUEUE.md tracking probe failed"
+                )
+                return
             try:
-                legacy_tasks = (
-                    self._parse_base_queue(strict=strict) or []
+                parsed = self._parse_base_queue(
+                    strict=strict, queue_from_origin=queue_from_origin,
                 )
             except Exception as exc:
                 self.log_event(
                     f"[AUDIT] recover_state legacy-path dry-run failed: {exc}"
                 )
                 return
+            legacy_tasks = parsed or []
+            if not queue_from_origin:
+                # Mirror ``_drop_ghost_queue_entries`` inline so a stale
+                # ``tasks/QUEUE.md`` ghost row (post-PR-181 repos
+                # gitignore the file; ``sync_to_main`` does not wipe
+                # it) does not fabricate ``[AUDIT] recover_state
+                # divergence`` events that legacy recovery would have
+                # filtered before any decision. Inlining avoids the
+                # helper's ``[INFRA] recover_state: ignoring ghost``
+                # log emission, which would lie about an "actual
+                # recovery" decision in modes where the legacy path is
+                # only a dry-run.
+                repo_root = Path(self.repo_path)
+                legacy_tasks = [
+                    task
+                    for task in legacy_tasks
+                    if task.task_file is None
+                    or (repo_root / task.task_file).is_file()
+                ]
             new_tasks = applied_tasks
 
         diff = _recovery_audit_diff(
