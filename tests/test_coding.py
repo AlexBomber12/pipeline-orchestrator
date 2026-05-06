@@ -1340,14 +1340,13 @@ def test_coding_deletes_expected_branch_after_resolution(
     assert not expected_file.exists()
 
 
-def test_coding_writes_active_pr_runtime_file_in_shim_mode(
+def test_coding_writes_active_pr_runtime_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     repo = tmp_path / "repo"
     marker = repo / ".daemon-runtime" / "active-pr-id"
     pr = PRInfo(number=42, branch="pr-001")
     runner = _runner_with_repo_path(monkeypatch, repo, open_prs_initial=[pr])
-    monkeypatch.setenv("PIPELINE_E2E_SHIM", "1")
 
     captured: dict[str, str] = {}
 
@@ -1370,7 +1369,6 @@ def test_coding_clears_runtime_file_on_exit(
     marker = repo / ".daemon-runtime" / "active-pr-id"
     pr = PRInfo(number=42, branch="pr-001")
     runner = _runner_with_repo_path(monkeypatch, repo, open_prs_initial=[pr])
-    monkeypatch.setenv("PIPELINE_E2E_SHIM", "1")
     _, plugin = runner._get_coder()
     monkeypatch.setattr(
         plugin, "run_auto_pr", h._async_cli_result(0, "ok", "")
@@ -1382,7 +1380,7 @@ def test_coding_clears_runtime_file_on_exit(
     assert not marker.exists()
 
 
-def test_coding_does_not_write_runtime_file_in_production(
+def test_coding_writes_runtime_file_without_env_gate(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     repo = tmp_path / "repo"
@@ -1391,10 +1389,10 @@ def test_coding_does_not_write_runtime_file_in_production(
     runner = _runner_with_repo_path(monkeypatch, repo, open_prs_initial=[pr])
     monkeypatch.delenv("PIPELINE_E2E_SHIM", raising=False)
 
-    captured: dict[str, bool] = {}
+    captured: dict[str, str] = {}
 
     async def fake_run_auto_pr(repo_path: str, **kwargs: Any):
-        captured["marker_exists"] = marker.exists()
+        captured["active_pr"] = marker.read_text(encoding="utf-8")
         return (0, "ok", "")
 
     _, plugin = runner._get_coder()
@@ -1402,7 +1400,7 @@ def test_coding_does_not_write_runtime_file_in_production(
 
     asyncio.run(runner.handle_coding())
 
-    assert captured["marker_exists"] is False
+    assert captured["active_pr"] == "PR-001\n"
     assert not marker.exists()
 
 
@@ -1411,7 +1409,6 @@ def test_active_pr_runtime_write_error_logs_and_continues(
 ) -> None:
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
-    monkeypatch.setenv("PIPELINE_E2E_SHIM", "1")
     (tmp_path / ".daemon-runtime").write_text("not a dir\n", encoding="utf-8")
 
     runner._write_active_pr_runtime_file("PR-001")
@@ -1425,7 +1422,6 @@ def test_active_pr_runtime_cleanup_error_logs_and_continues(
 ) -> None:
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
-    monkeypatch.setenv("PIPELINE_E2E_SHIM", "1")
     (tmp_path / ".daemon-runtime" / "active-pr-id").mkdir(parents=True)
 
     runner._cleanup_active_pr_runtime_file()

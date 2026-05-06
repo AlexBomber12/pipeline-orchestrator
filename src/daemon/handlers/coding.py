@@ -7,7 +7,6 @@ Mixin methods:
 from __future__ import annotations
 
 import asyncio
-import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -489,14 +488,8 @@ class CodingMixin:
         """Return the e2e shim runtime marker path for the active PR id."""
         return Path(self.repo_path) / ".daemon-runtime" / "active-pr-id"
 
-    def _e2e_shim_enabled(self) -> bool:
-        """Return whether test-mode shim integration is enabled."""
-        return os.environ.get("PIPELINE_E2E_SHIM") == "1"
-
     def _write_active_pr_runtime_file(self, pr_id: str) -> None:
-        """Write the active PR id for the e2e coder shim in test mode only."""
-        if not self._e2e_shim_enabled():
-            return
+        """Write the active PR id for coder shim task discovery."""
         try:
             marker = self._active_pr_runtime_path()
             marker.parent.mkdir(parents=True, exist_ok=True)
@@ -508,9 +501,7 @@ class CodingMixin:
             )
 
     def _cleanup_active_pr_runtime_file(self) -> None:
-        """Remove the e2e shim active PR marker when leaving CODING."""
-        if not self._e2e_shim_enabled():
-            return
+        """Remove the active PR marker when leaving CODING."""
         try:
             self._active_pr_runtime_path().unlink(missing_ok=True)
         except OSError as exc:
