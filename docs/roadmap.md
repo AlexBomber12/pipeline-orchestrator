@@ -2,7 +2,11 @@
 
 Живой документ. Обновляется после каждой merge'нутой волны и после каждой chat-session.
 
-Последнее обновление: 2026-05-04 (Sprint 13 + 13.5 + 14 implementation closed and verified — all 23 PRs (PR-238..PR-260) shipped and present in src/. Sprint 15 split into Sprint 15a (performance/UX critical, severity-driven), Sprint 15b (polish + Tier 1 guardrails), Sprint 15c (Tier 2 guardrails — new sprint). Sprint 16 reframed from "multi-testbed harness" to "config architecture three-layer split" reflecting OBS-BZ finding from production session. Multi-testbed harness reassigned to Sprint 17. Documentation Sprint shifts to Sprint 18; Vision A multi-vendor first slice shifts to Sprint 19+. New OBS items added from production session: OBS-BR (HUNG handler idempotency, ~216 events/day spam, Sprint 15a #5), OBS-BT (cross-repo task detection — Codex CLI autonomous repo creation incident, Sprint 15b Item H), OBS-BU (Tier 1 guardrails framework — repo create/delete, force push, direct commit на main, main deletion, Sprint 15b Item I), OBS-BV (QUEUE.md + Redis state divergence after manual edits — solved by Sprint 15a #6 elimination), OBS-BW (QUEUE.md tracking inconsistency на onboarded repos — solved by Sprint 15a #6 elimination), OBS-BX (direct commit на main bypassing CI via admin override — Sprint 15c extended guardrails), OBS-BY (queue validator не handle'ит missing dependencies gracefully — solved by Sprint 15a #6 elimination), OBS-BZ (operator git workflow на production AI-Server — three-layer config split via Sprint 16). Sprint 13/14 verification audit confirmed: 103 test files, 11 dedicated новым модулям, all critical modules parse cleanly via AST. Megaraid-dashboard cross-repo task incident resolved manually 2026-05-04: PR-048..053 task files relocated to homelab-monitoring (created autonomously by Codex CLI без operator approval), PR-062 with Depends-on PR-053 deleted entirely, QUEUE.md untracked, daemon recovered cleanly. Production AI-Server config.yml mitigation: skip-worktree applied until Sprint 16 three-layer config eliminates the issue.).
+Последнее обновление: 2026-05-06 (Sprint 15a.5 added — AUTO PR rollout, queued post-Sprint 15a #4 ahead of Sprint 15a #6. **Reactivation of Sprint F2.1 / Sprint 10 SoT direct task injection** previously deferred 2026-05-04 with rationale "AGENTS.md indirection works adequately." That resolution disproven by 2026-05-05 PR-263 dispatch incident: Codex received `prompt: "PLANNED PR"` (single line), read worktree files including AGENTS.md and tasks/PR-264.md, decided to combine PR-263+PR-264+partial PR-265 scope into single commit on wrong branch `pr-264-api-repo-queue-endpoint`. Same failure class as 2026-04-24 PR-144/PR-145/PR-146 incidents that prompted original Sprint 10 plan. Sprint 15a.5 ships **before** Sprint 15a #6 (PR-263..PR-269 QUEUE.md elimination batch) so the AUTO PR protection lands first and the QUEUE.md elimination work itself runs under the new contract. Items: PR-270 add `run_auto_pr` method to coder plugins; PR-271 daemon coding handler switches dispatch + AGENTS.md daemon-managed sections updated to four-trigger model (AUTO PR daemon-only, PLANNED PR/MICRO PR/FIX FEEDBACK manual-only); PR-272 pre-push hook branch validation defense in depth; PR-273 scaffolder template AGENTS.md alignment for newly onboarded repos. Estimate: 4 PRs, ~11-14 daemon-hours. New OBS-CG records the recurring root cause. Previous update: 2026-05-05.).
+
+Предыдущее: 2026-05-05 (Sprint 15d added — Defense in depth, queued post-15c. Items: OBS-CA panic mode на cascade HUNG, OBS-CB token spend ceiling per day, OBS-CC GUARDRAIL hit quarantine для Tier 1/2 violations, OBS-CD git bundle backups, OBS-CE coder process read-only filesystem. Estimate: 5 PRs, ~12-16 daemon-hours. Companion item OBS-CF network egress allowlist deferred to Sprint 15e+ pending Sprint 19+ multi-vendor design. No PRs landed today; this is a backlog/roadmap edit only. Previous update: 2026-05-04.).
+
+Предыдущее: 2026-05-04 (Sprint 13 + 13.5 + 14 implementation closed and verified — all 23 PRs (PR-238..PR-260) shipped and present in src/. Sprint 15 split into Sprint 15a (performance/UX critical, severity-driven), Sprint 15b (polish + Tier 1 guardrails), Sprint 15c (Tier 2 guardrails — new sprint). Sprint 16 reframed from "multi-testbed harness" to "config architecture three-layer split" reflecting OBS-BZ finding from production session. Multi-testbed harness reassigned to Sprint 17. Documentation Sprint shifts to Sprint 18; Vision A multi-vendor first slice shifts to Sprint 19+. New OBS items added from production session: OBS-BR (HUNG handler idempotency, ~216 events/day spam, Sprint 15a #5), OBS-BT (cross-repo task detection — Codex CLI autonomous repo creation incident, Sprint 15b Item H), OBS-BU (Tier 1 guardrails framework — repo create/delete, force push, direct commit на main, main deletion, Sprint 15b Item I), OBS-BV (QUEUE.md + Redis state divergence after manual edits — solved by Sprint 15a #6 elimination), OBS-BW (QUEUE.md tracking inconsistency на onboarded repos — solved by Sprint 15a #6 elimination), OBS-BX (direct commit на main bypassing CI via admin override — Sprint 15c extended guardrails), OBS-BY (queue validator не handle'ит missing dependencies gracefully — solved by Sprint 15a #6 elimination), OBS-BZ (operator git workflow на production AI-Server — three-layer config split via Sprint 16). Sprint 13/14 verification audit confirmed: 103 test files, 11 dedicated новым модулям, all critical modules parse cleanly via AST. Megaraid-dashboard cross-repo task incident resolved manually 2026-05-04: PR-048..053 task files relocated to homelab-monitoring (created autonomously by Codex CLI без operator approval), PR-062 with Depends-on PR-053 deleted entirely, QUEUE.md untracked, daemon recovered cleanly. Production AI-Server config.yml mitigation: skip-worktree applied until Sprint 16 three-layer config eliminates the issue.).
 
 Предыдущие: 2026-05-02 (Sprint 17 = Documentation Sprint inserted, was Sprint 17+ Vision A which becomes Sprint 18+. Documentation tooling decision MkDocs Material. Sprint 17 estimated 10-15 PRs ~32h covering getting-started + concepts + operating + reference + architecture + uninstall sections. OBS-BH scope expanded to structured event payload + multi-badge UI. Sprint 15 OBS-BH cost grew from ~1-2h to ~3-4h. Sprint 14 expanded with AGENTS.md inline + periodic conflict scans. Sprint 13 estimate corrected to 5-6 PRs ~11-12h reflecting MCP server core inclusion. MCP server design decisions Q1 filesystem-only Q2 conflict combo Q3 advisory editing v1, Cancellation policy v1, Vision C Companion App, Vision D Conversational triage, OBS-BK + OBS-BL + OBS-BM additions, License Apache 2.0 Sprint 13), 2026-05-01 (PR-180..PR-207 shipped, все 28 PR merged. Multi-repo isolation audit complete, parallel run_cycle in main loop deployed. Foundation Sprint 36 PR specs generated for PR-208..PR-236 batch. Architectural future work section added for post-Foundation. Onboarding of megaraid-dashboard и sms-gateway-v2 actively in progress), 2026-04-29 (full roadmap rewrite на основе Implementation Audit), 2026-04-28 (sigkill recovery test multi-race resolved via PR-228/PR-232/PR-234/PR-236; production daemon deployed on fresh main), 2026-04-27 (OBS-AA test pollution v1 misdiagnosis + v2 docker-exec fix; OBS-Y premature merge; Multi-tier agent direction; OBS-Z Codex EYES race), 2026-04-26 (Sprint F1.0 + PR-156/157 + PR-158/159 merged; Variant D direction; Development model & Layer 2 substrate observations), 2026-04-24 (after code audit zip __27__).
 
@@ -21,12 +25,14 @@ Continuous sprint numbering aligned with operator's mental model. Replaces ad-ho
 | Sprint 15a | Performance/UX critical, severity-driven (SSE consolidation, async daemon gh_runner cascade, async web layer, error_message lifecycle on recovery, OBS-BR HUNG handler idempotency, QUEUE.md elimination via PR-FUTURE-7) | Queued | 14-16 PRs, ~32-42 daemon-hours |
 | Sprint 15b | Polish bucket + Tier 1 guardrails (event log badges + time-ago alignment, per-repo coder readonly placement, theme toggle to Settings, global corner spinner, limit badges unified format, repo card buttons fixed-position layout, OBS-BT cross-repo task detection, OBS-BU Tier 1 guardrails framework) | Queued | 6-7 PRs, ~10-13 daemon-hours |
 | Sprint 15c | Tier 2 guardrails + UI (large diffs detection, mass file deletion, .github/ changes detection, secret patterns, CI privilege escalation, self-modifying scripts, test deletion, operator override UI, OBS-BX direct main commit bypass CI) | Queued | 6-7 PRs, ~13-15 daemon-hours |
+| Sprint 15a.5 | AUTO PR rollout — daemon dispatches with explicit Task/File headers + inline task body; AGENTS.md four-trigger model; pre-push hook branch validation; scaffolder template alignment. **Reactivation of Sprint F2.1 / Sprint 10 SoT** — ships before Sprint 15a #6 so QUEUE.md elimination batch runs under AUTO PR protection. | Queued | 4 PRs (PR-270..PR-273), ~11-14 daemon-hours |
+| Sprint 15d | Defense in depth (OBS-CA panic mode auto-stop on cascade HUNG, OBS-CB token spend ceiling per day, OBS-CC GUARDRAIL hit quarantine for Tier 1/2, OBS-CD git bundle backups, OBS-CE coder process read-only filesystem) | Queued | 5 PRs, ~12-16 daemon-hours |
 | Sprint 16 | Config architecture three-layer split (config.yml shipped immutable / config/providers.yml / data/user_state.yml gitignored / Redis transient; OBS-BZ resolution; dynamic list_models per provider plugin; auto-detect bootstrap; one-time migration; UI add-provider/add-coder wizard) | Queued | 12-16 PRs, ~26-32 daemon-hours |
 | Sprint 17 | Multi-testbed harness + multi-repo tests (was Sprint 16 pre-2026-05-04) | Queued | 7+ PRs, ~15 daemon-hours |
 | Sprint 18 | Documentation Sprint (MkDocs Material, full operator + contributor docs, getting-started + concepts + operating + reference + architecture + uninstall, was Sprint 17 pre-2026-05-04) | Queued | 10-15 PRs, ~32 daemon-hours |
 | Sprint 19+ | Vision A multi-vendor routing first slice (Plugin Protocol generalization, API plugins, SQLite Scenario A migration, Analytics dashboard, Thompson Sampling) — was Sprint 18+ pre-2026-05-04 | Pending strategic decision | TBD |
 
-Earlier "Wave X" references inside OBS items remain for backward compatibility; mapping is `Wave 1+2 = Sprint 13`, `Wave 5 = Sprint 14`, `Wave 3+4 = Sprint 15a/15b`, `Wave 6+7 = Sprint 17`. Sprint 13.5 (MCP), Sprint 15c (Tier 2 guardrails), Sprint 16 (config architecture), Sprint 18 (Documentation), Sprint 19+ (Vision A) are entries with no Wave-era predecessor. New OBS items added 2026-05-02..2026-05-04 use sprint terminology directly.
+Earlier "Wave X" references inside OBS items remain for backward compatibility; mapping is `Wave 1+2 = Sprint 13`, `Wave 5 = Sprint 14`, `Wave 3+4 = Sprint 15a/15b`, `Wave 6+7 = Sprint 17`. Sprint 13.5 (MCP), Sprint 15a.5 (AUTO PR), Sprint 15c (Tier 2 guardrails), Sprint 15d (defense in depth), Sprint 16 (config architecture), Sprint 18 (Documentation), Sprint 19+ (Vision A) are entries with no Wave-era predecessor. New OBS items added 2026-05-02..2026-05-06 use sprint terminology directly.
 
 **Renumbering record (2026-05-04):**
 - Sprint 13 split into Sprint 13 (OBS-AX/AY/BN + license) + Sprint 13.5 (MCP) — both closed.
@@ -35,6 +41,15 @@ Earlier "Wave X" references inside OBS items remain for backward compatibility; 
 - Multi-testbed harness reassigned from old Sprint 16 to Sprint 17.
 - Documentation Sprint shifted from old Sprint 17 to Sprint 18.
 - Vision A multi-vendor first slice shifted from old Sprint 18+ to Sprint 19+.
+
+**Renumbering record (2026-05-05):**
+- Sprint 15d added — Defense in depth (OBS-CA panic mode, OBS-CB spend ceiling, OBS-CC quarantine, OBS-CD bundle backups, OBS-CE coder readonly fs). Inserted after Sprint 15c, before Sprint 16. No downstream renumbering.
+- OBS-CF (network egress allowlist for coder process) reserved for Sprint 15e+ pending Sprint 19+ multi-vendor design.
+
+**Renumbering record (2026-05-06):**
+- Sprint 15a.5 added — AUTO PR rollout (PR-270..PR-273). Reactivation of Sprint F2.1 / Sprint 10 SoT direct task injection previously deferred 2026-05-04. Reactivation triggered by 2026-05-05 PR-263 dispatch incident (Codex scope expansion via worktree file reading). Inserted between Sprint 15a #4 and Sprint 15a #6 (QUEUE.md elimination batch). PR numbers 270..273 used continuously after PR-269 (last of Sprint 15a #6 batch numerically). No downstream renumbering of PR-263..PR-269 — those keep their numbers, but their dispatch waits for Sprint 15a.5 to ship via Priority field (Sprint 15a.5 PRs Priority 1, Sprint 15a #6 PRs Priority 2 unchanged).
+- OBS-CG added — recurring "coder reads worktree files instead of using prompt-supplied task spec" failure mode. Pointer to Sprint 15a.5.
+- Sprint F2.1 status changed from "Still deferred" to "REACTIVATED 2026-05-06 as Sprint 15a.5".
 
 ---
 
@@ -211,6 +226,20 @@ Sprint 13/13.5/14 implementation verified and closed 2026-05-04. Below items tra
 - **OBS-BY** (queue validator не handle'ит missing dependencies gracefully): **OPEN — solved by Sprint 15a #6 elimination** — observed 2026-05-04 production session. Megaraid recovery flow: PR-062 task file remained on disk with `Depends-on: PR-053`, but PR-053.md был deleted (cross-repo relocation per OBS-BT). Queue validator strictly enforces depends_on references → fails with `recover_state: queue validation failed: Queue validation failed: PR-062 depends on unknown task 'PR-053'`. Daemon stuck in ERROR for 4 cycles before operator removed PR-062. **Solved by:** Sprint 15a #6 QUEUE.md elimination — DAG-based selection from PR-*.md disk files can gracefully skip PRs with missing dependencies (treat as blocked/ineligible) rather than failing entire queue validation.
 
 - **OBS-BZ** (operator git workflow на production AI-Server): **OPEN, medium-low severity, surfaced 2026-05-04 production session** — manual `git pull`, `git rm --cached`, `git push` operations on production home-server's `~/pipeline-orchestrator/` clone introduce risk: (1) competing with daemon's git operations, (2) overwriting UI-written config.yml runtime modifications, (3) push'ing bogus commits to origin/main. Today's recovery session demonstrated the failure mode: pull aborted on config.yml conflict, leaving repo in diverged state. **Mitigation applied 2026-05-04:** `git update-index --skip-worktree config.yml` so git stops tracking config.yml diffs locally. **Permanent fix:** Sprint 16 three-layer config split — `config.yml` shipped immutable in git, `config/providers.yml` shipped immutable in git, `data/user_state.yml` gitignored runtime UI overrides, Redis transient. After Sprint 16 ships: operator can safely `git pull` on production без losing UI overrides. Auxiliary documentation (Sprint 18 Documentation Sprint): operator git operations должны выполняться **только на dev workstation**, AI-Server только для docker/redis/diagnostics. **Estimate:** Sprint 16 ~12-16 PRs ~26-32 daemon-hours covers this finding directly.
+
+### New OBS items (added 2026-05-05 from defense-in-depth review)
+
+- **OBS-CA** (panic mode — auto-stop daemon on cascade HUNG): **OPEN, medium severity, design 2026-05-05** — daemon today continues dispatching tasks even when many consecutive tasks land in HUNG. A bug in handler logic, GitHub API outage, or coder regression can produce a cascade where every dispatched task crashes within minutes; daemon keeps spending coder tokens and burning event log space until operator notices. **Fix:** counter `state.consecutive_hung_count` incremented on every HUNG entry, decremented or reset on first successful merge. When counter exceeds threshold (proposed default 5 within 1 hour), daemon enters PANIC state — refuses new dispatches, logs `[PANIC] consecutive HUNG threshold exceeded, manual recovery required`, surfaces banner in dashboard. Operator clears via existing `/recover` endpoint extended with `panic` cause. **Fix scope:** ~1 PR, ~2 daemon-hours. **Sprint 15d.**
+
+- **OBS-CB** (token spend ceiling per day with auto-pause): **OPEN, medium severity, design 2026-05-05** — runaway loop scenarios (FIX cycle that never converges, ESCALATE that immediately re-FIXes, etc.) can spend Codex/Claude tokens without bound until operator notices the bill. No daemon-side spend tracking exists today. **Fix:** daemon reads token usage from coder stdout (Claude Code reports tokens-used per invocation; Codex reports via API response headers when available), accumulates per-day per-coder counter in Redis with TTL 26h. When daily counter exceeds operator-configured threshold (default per-coder, configurable in `config.yml`), daemon enters SPEND_LIMITED state — pauses dispatch, logs `[SPEND] daily ceiling reached for {coder}, dispatch paused until UTC midnight`. Counter rolls at UTC midnight. Counter also feeds bandit's cost-aware reward when Sprint 19+ Thompson Sampling lands. **Fix scope:** ~1 PR, ~3-4 daemon-hours. **Sprint 15d.**
+
+- **OBS-CC** (GUARDRAIL hit quarantine — Tier 1/2 violations need destination): **OPEN, medium severity, design 2026-05-05** — Sprint 15b/15c add ESCALATE on guardrail hits but ESCALATE today drops the runner into HUNG awaiting operator. The PR with the violating diff still exists and remains mergeable through normal GitHub UI. Quarantine model: on guardrail hit, daemon tags the PR with label `quarantine:{type}` (e.g. `quarantine:large_diff`, `quarantine:secrets_detected`), posts a comment with the GUARDRAIL details, and adds the PR to `state.quarantined_prs[name]`. Daemon refuses to merge quarantined PRs even when CI green and review approved; only operator action (clearing the label OR explicit `/repos/{name}/quarantine/{pr}/release` endpoint) un-quarantines. Audit log of every quarantine and release goes to `data/audit/quarantine.jsonl`. **Fix scope:** natural extension of Sprint 15b Item I and 15c — ~1 PR, ~2 daemon-hours. **Sprint 15d** (so 15b/15c don't grow scope; Tier 1 ESCALATE message updated to mention quarantine destination once 15d ships).
+
+- **OBS-CD** (git bundle backups of managed repos): **OPEN, low-medium severity, design 2026-05-05** — homelab disk failure, ransomware, or silent corruption on `/data/repos/<repo>` would cost the daemon's entire working state. Today the only backup is GitHub origin (which lags by unpushed commits during CODING and lacks worktree-only artifacts). **Fix:** daemon-side cron writes `git bundle create /data/backups/{repo}-{ISO8601}.bundle --all` every N hours (proposed default 6h), retains last 28 bundles (one week), prunes older. Restore path documented as `git clone <bundle-path>` returning the full repo state including unpushed branches. NAS testbench i7-7700 is the natural backup destination — separate disk from production AI-Server. **Fix scope:** ~1 PR, ~1-2 daemon-hours. **Sprint 15d.** Out of scope: encryption (homelab threat model does not require it; revisit when adopted by external operators).
+
+- **OBS-CE** (coder process read-only filesystem outside repo worktree): **OPEN, high severity, design 2026-05-05** — coder process today runs with daemon's host privileges within its container. Prompt injection in task body or compromised LLM output could write to `/etc/cron.d/`, `~/.ssh/authorized_keys`, daemon binaries, etc. Single layer of protection (AGENTS-SCAN regex) is necessary but not sufficient. **Fix:** wrap coder invocation in a process-scope readonly remount (`unshare -m + mount -o remount,ro /`) with explicit RW exception for `/data/repos/{repo}/worktree/` and `/tmp/coder-{pid}/`. Wrapper script `scripts/coder-sandbox.sh` is invoked by `dispatch_coder` instead of the bare CLI. Failure mode: coder writes outside whitelisted paths → process exits non-zero → daemon treats as ESCALATE per existing path. **Risk:** Codex CLI internals may rely on writing to `~/.config/codex/`; sandbox needs explicit allowlist for that path or a per-coder whitelist file. **Fix scope:** ~1 PR, ~4-5 daemon-hours including soak test on testbed. **Sprint 15d.** Companion item OBS-CF (network egress allowlist for coder process) deferred to Sprint 15e or later — significantly higher complexity (Docker network policies + iptables rules) and intersects with Sprint 19+ multi-vendor LLM API plans, so isolated implementation now would need rework.
+
+- **OBS-CG** (coder reads worktree files instead of using prompt-supplied task spec — recurring failure mode): **OPEN, high severity, root cause for production HUNG incident 2026-05-05**. Daemon dispatches coder with single-line prompt `"PLANNED PR"` (literally two words). Coder is expected to discover its task via AGENTS.md instructions: "Identify the active task via `tasks/QUEUE.md`". The indirection has multiple failure modes that all cause wrong-task execution: (1) coder reads QUEUE.md and finds DOING entry but additionally reads sibling tasks/PR-*.md files to "understand context" and decides to combine scope; (2) QUEUE.md regenerator preserves ghost entries (OBS-BW) and coder picks first non-DONE entry without status; (3) coder picks branch name from a different task file than the one daemon intended; (4) when AGENTS.md content drifts from daemon's actual dispatch state, coder follows AGENTS.md against current truth. **Observed instances:** 2026-04-24 PR-144 (coder did upload work instead of subprocess), 2026-04-24 PR-145 (README work instead of FIX cap), 2026-04-24 PR-146 (predicted same failure), 2026-05-05 PR-263 (Codex created PR #350 on `pr-264-api-repo-queue-endpoint` branch with scope of PR-263+PR-264+partial PR-265 combined; PR was clean and mergeable but violated DAG dependency contract). **Fix:** Sprint 15a.5 (AUTO PR rollout — Sprint F2.1 reactivation). Daemon switches from generic trigger phrase to explicit prompt with `Task:` and `File:` headers plus inline task body. AGENTS.md updated to four-trigger model where AUTO PR is daemon-only and instructs coder "do NOT consult tasks/QUEUE.md for selection — use the values from Task:/File: headers". Pre-push hook in PR-272 catches any residual misroute attempts. **Fix scope:** 4 PRs ~11-14 daemon-hours covered by Sprint 15a.5. **Connected:** Sprint 15a #6 (PR-263..PR-269) QUEUE.md elimination batch must run **after** Sprint 15a.5 ships, otherwise each of the 11 elimination PRs carries the same scope-expansion risk.
 
 ### Memory items still actionable
 
@@ -750,7 +779,7 @@ These weren't in original 2026-04-29 plan but emerged during execution:
 
 ### Deferred (sprint-scale, не в ближайшем 2-week плане)
 
-- **Sprint F2.1 SoT direct instructions:** PR-167/168/169-equivalent — feature flag guarded refactor of how daemon talks to coder. **Still deferred** — текущая indirection через AGENTS.md works adequately.
+- **Sprint F2.1 SoT direct instructions:** **REACTIVATED 2026-05-06 as Sprint 15a.5 — AUTO PR rollout.** Original deferral resolution ("AGENTS.md indirection works adequately") disproven by 2026-05-05 PR-263 dispatch incident: Codex received single-line `prompt: "PLANNED PR"`, read AGENTS.md/QUEUE.md/tasks/PR-264.md from worktree, decided to combine PR-263+PR-264+partial PR-265 scope into one PR on wrong branch `pr-264-api-repo-queue-endpoint`. PR #350 was clean/mergeable on GitHub but violated DAG dependency contract. Same failure class as 2026-04-24 PR-144/PR-145/PR-146 incidents that prompted original Sprint 10 plan. **Implementation: 4 PRs.** PR-270 adds `run_auto_pr` method to claude_cli.py + codex_cli.py + plugins (new prompt format `AUTO PR\nTask: PR-XXX\nFile: tasks/PR-XXX.md\n\n<inline task body>`); existing `run_planned_pr` path untouched (manual VS Code workflows preserved). PR-271 daemon coding handler switches from `plugin.run_planned_pr` to `plugin.run_auto_pr` with explicit pr_id/task_file/task_body; daemon-managed AGENTS.md sections updated to four-trigger model (AUTO PR daemon-only with explicit Task/File headers, PLANNED PR/MICRO PR/FIX FEEDBACK marked manual-only); new `## AUTO PR runbook` section instructs coder "extract PR_ID from `Task:` header, do NOT consult tasks/QUEUE.md for selection". PR-272 adds pre-push hook installed by scaffolder that validates `git symbolic-ref HEAD` against expected task branch from environment variable set by daemon coding handler; defense in depth — fails commit before push if coder switched branch. PR-273 scaffolder template strings aligned with four-trigger model so newly onboarded repos start with AUTO PR runbook in their AGENTS.md scaffold. **Total ~11-14 daemon-hours.** **Sequencing:** Sprint 15a.5 ships before Sprint 15a #6 (PR-263..PR-269 QUEUE.md elimination batch) so QUEUE.md elimination work itself runs under AUTO PR protection — otherwise 11 PRs of Sprint 15a #6 each carry the same scope-expansion risk that just materialized on PR-263.
 - **Sprint F2.2 PAUSED removal:** **Still deferred** — `awaiting_start` flag не shown to be necessary. PAUSED enum still in code but works.
 - **Sprint F3.2 Thompson Sampling:** **Still deferred** — epsilon-greedy adequate. Need 50+ merged PRs across both coders before posterior actually informs (current data: ~250 merged total but mostly Claude-pinned for stability during deploy).
 - **GitHub App migration (OBS-AC Leverage 6):** **Still deferred** — diet (PR-180/PR-184/PR-191/PR-202) proves sufficient for solo operator. Revisit only if quota exhaustion returns OR third-party adoption becomes relevant.
@@ -1865,6 +1894,86 @@ Sprint 15c (Queued — Tier 2 guardrails + UI):
     Post-PR-merge audit by daemon: for every commit on main,
     verify there was a passing CI run on that exact commit SHA
   Total: 6-7 PRs, ~13-15 daemon-hours.
+
+Sprint 15a.5 (Queued — AUTO PR rollout, Sprint F2.1 reactivation):
+  - PR-270 add run_auto_pr method to coder plugins                  (~3-4h)
+    src/claude_cli.py: new run_auto_pr_async(repo_path, pr_id,
+    task_file, task_body) formats prompt as
+    "AUTO PR\nTask: {pr_id}\nFile: {task_file}\n\n{task_body}".
+    src/codex_cli.py: same. src/coders/claude.py and codex.py:
+    plugin method run_auto_pr delegates to CLI helper. CoderPlugin
+    Protocol updated. Existing run_planned_pr path UNTOUCHED so
+    manual VS Code workflows continue working. Tests for new path.
+  - PR-271 daemon switches to AUTO PR + AGENTS.md update            (~4-5h)
+    src/daemon/handlers/coding.py: invoke
+    plugin.run_auto_pr(repo_path, pr_id=task.pr_id,
+    task_file=f"tasks/{task.pr_id}.md",
+    task_body=<read_from_disk>, **kwargs) instead of
+    plugin.run_planned_pr. Daemon-managed AGENTS.md sections in
+    src/onboarding/agents_md_template.py updated to four-trigger
+    model: AUTO PR (daemon-only with explicit Task/File headers),
+    PLANNED PR (manual VS Code), MICRO PR (manual), FIX FEEDBACK
+    (manual). New "## AUTO PR runbook" section: extract PR_ID
+    from Task: header, do NOT consult tasks/QUEUE.md, work
+    strictly from the inline task body. Quick rules updated.
+    Test: handle_coding invokes run_auto_pr with correct kwargs;
+    integration test confirms branch and commit message match
+    task spec.
+  - PR-272 pre-push hook branch validation                          (~2h)
+    scripts/install-pre-push-hook.sh creates .git/hooks/pre-push
+    that reads expected branch from .git/info/expected-branch
+    file and compares to git symbolic-ref HEAD. If mismatch,
+    exit 1 with descriptive error. Daemon coding handler writes
+    expected-branch file before invoking coder. Scaffolder
+    installs hook on first sync. Defense in depth — catches any
+    residual coder branch-rename attempts after PR-270 + PR-271
+    ship.
+  - PR-273 scaffolder template alignment                            (~2-3h)
+    Scaffolder template strings (initial AGENTS.md scaffold for
+    newly onboarded repos) updated to include AUTO PR runbook and
+    four-trigger model from PR-271's daemon-managed content.
+    Quick rules section in template aligned. Onboarding doc
+    docs/onboarding.md updated. Existing managed repos already
+    receive the change via daemon reconciliation framework
+    (PR-192a/b/c) propagating PR-271's daemon-managed sections;
+    this PR is for repos onboarded fresh from scaffolder.
+  Total: 4 PRs, ~11-14 daemon-hours.
+  Note: Ships before Sprint 15a #6 (PR-263..PR-269 QUEUE.md
+  elimination) so the elimination work itself runs under AUTO PR
+  protection.
+
+Sprint 15d (Queued — defense in depth):
+  - OBS-CA panic mode auto-stop on cascade HUNG                     (~2h)
+    state.consecutive_hung_count + threshold 5 within 1h →
+    PANIC, refuse new dispatches, dashboard banner, /recover
+    extended with panic cause.
+  - OBS-CB token spend ceiling per day with auto-pause              (~3-4h)
+    Per-day per-coder counter from coder stdout/headers, TTL
+    26h, SPEND_LIMITED state on threshold breach, rolls at UTC
+    midnight, feeds Sprint 19+ Thompson Sampling cost-aware
+    reward.
+  - OBS-CC GUARDRAIL hit quarantine                                 (~2h)
+    Tier 1/2 violations tag PR with `quarantine:{type}` label,
+    block daemon-side merge, audit log, operator-only release
+    via label-clear or /repos/{name}/quarantine/{pr}/release
+    endpoint. Tier 1 ESCALATE messages updated to mention
+    quarantine destination.
+  - OBS-CD git bundle backups                                       (~1-2h)
+    git bundle create /data/backups/{repo}-{ISO8601}.bundle
+    --all every 6h, retain 28, prune older. Restore path
+    documented. NAS testbench i7-7700 as backup destination.
+  - OBS-CE coder process read-only filesystem                       (~4-5h)
+    scripts/coder-sandbox.sh wraps coder invocation with
+    unshare -m + readonly remount, RW exception for
+    /data/repos/{repo}/worktree/, /tmp/coder-{pid}/, and per-
+    coder allowlist (~/.config/codex/ for Codex CLI). Soak test
+    on testbed before production. Failure mode: coder write
+    outside whitelist → process exits non-zero → ESCALATE.
+  Total: 5 PRs, ~12-16 daemon-hours.
+  Note: OBS-CF (network egress allowlist for coder process)
+  deferred to Sprint 15e+ — significantly higher complexity
+  (Docker network policies + iptables/nftables rules) and
+  intersects with Sprint 19+ multi-vendor LLM API plans.
 
 Sprint 16 (Queued — config architecture three-layer split):
   - Three-layer split design                                       (~3h)
