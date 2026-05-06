@@ -39,6 +39,7 @@ from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
 from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
 from src.daemon.config_watcher import watch_config_file_changes
+from src.daemon.recovery import _resolve_recovery_mode
 from src.daemon.runner import PipelineRunner
 from src.events.wake import repo_from_channel, subscribe_wake
 from src.models import PipelineState
@@ -689,6 +690,10 @@ async def main() -> None:
     logger.info(
         "Daemon starting with %d repositories", len(config.repositories)
     )
+    # PR-266b: surface the resolved recovery mode at startup so operators
+    # can confirm the audit/headers flag flip in ``docker compose logs
+    # daemon`` without reading the env directly.
+    logger.info("recover_state mode: %s", _resolve_recovery_mode())
     if not config.repositories:
         logger.warning(
             "No repositories configured; daemon will idle until config.yml is updated"

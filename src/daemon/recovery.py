@@ -8,7 +8,9 @@ Mixin methods:
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
 import subprocess
 from datetime import datetime, timezone
@@ -18,7 +20,8 @@ from src.branch_context import BranchContext
 from src.daemon import git_ops
 from src.github import gh_runner
 from src.github import prs as gh_prs
-from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
+from src.keyspace import pipeline_state
+from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
 from src.queue_parser import QueueValidationError, parse_task_header
 from src.task_status import (
     _resolve_merged_state,
@@ -29,6 +32,168 @@ from src.task_status import (
 logger = logging.getLogger(__name__)
 
 _PR_NUMBER_RE = re.compile(r"^PR-(\d+)(.*)$")
+
+# PR-266b: feature flags for recover_state source-switch + audit mode.
+RECOVERY_HEADERS_ENV = "PIPELINE_RECOVERY_FROM_HEADERS"
+RECOVERY_AUDIT_ENV = "PIPELINE_RECOVERY_AUDIT"
+
+RECOVERY_MODE_LEGACY_ONLY = "LEGACY_ONLY"
+RECOVERY_MODE_HEADERS_ONLY = "HEADERS_ONLY"
+RECOVERY_MODE_AUDIT_LEGACY_APPLIES = "AUDIT_LEGACY_APPLIES"
+RECOVERY_MODE_AUDIT_HEADERS_APPLIES = "AUDIT_HEADERS_APPLIES"
+
+
+def _read_recovery_flag(name: str) -> bool:
+    """Parse a 0/1 recovery flag from the environment, defaulting to off.
+
+    Values other than ``"0"``/``"1"`` (or unset) fall back to ``False`` and
+    log a warning so a typo in ``docker-compose.yml`` does not silently
+    flip the daemon into a different recovery mode.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return False
+    if raw == "1":
+        return True
+    if raw == "0":
+        return False
+    logger.warning(
+        "%s=%r is not in (0, 1); falling back to default 0", name, raw
+    )
+    return False
+
+
+def _resolve_recovery_mode() -> str:
+    """Return the recover_state mode for the current process environment."""
+    audit = _read_recovery_flag(RECOVERY_AUDIT_ENV)
+    headers = _read_recovery_flag(RECOVERY_HEADERS_ENV)
+    if audit and headers:
+        return RECOVERY_MODE_AUDIT_HEADERS_APPLIES
+    if audit:
+        return RECOVERY_MODE_AUDIT_LEGACY_APPLIES
+    if headers:
+        return RECOVERY_MODE_HEADERS_ONLY
+    return RECOVERY_MODE_LEGACY_ONLY
+
+
+def _recovery_audit_diff(
+    legacy_tasks: list[QueueTask],
+    new_tasks: list[QueueTask],
+    prs: list[PRInfo],
+    recovered_set: set[str],
+) -> dict | None:
+    """Compare legacy vs new recovery projections; return diff or ``None``.
+
+    The diff is structured (JSON-loggable) so operators viewing
+    ``[AUDIT] recover_state divergence:`` events can filter on specific
+    fields. Returns ``None`` on parity to keep the audit log silent
+    while the new path matches.
+    """
+    legacy_proj = _project_recovery_decision(legacy_tasks, prs, recovered_set)
+    new_proj = _project_recovery_decision(new_tasks, prs, recovered_set)
+    diff: dict = {}
+    for field in (
+        "pipeline_state",
+        "current_task_pr_id",
+        "current_pr_number",
+        "pending_queue_sync_branch",
+    ):
+        if legacy_proj[field] != new_proj[field]:
+            diff[field] = {"legacy": legacy_proj[field], "new": new_proj[field]}
+    if len(legacy_tasks) != len(new_tasks):
+        diff["current_queue_length"] = {
+            "legacy": len(legacy_tasks),
+            "new": len(new_tasks),
+        }
+    legacy_status = {task.pr_id: task.status.value for task in legacy_tasks}
+    new_status = {task.pr_id: task.status.value for task in new_tasks}
+    drift = []
+    for pr_id in sorted(set(legacy_status) | set(new_status)):
+        if legacy_status.get(pr_id) != new_status.get(pr_id):
+            drift.append(
+                {
+                    "pr_id": pr_id,
+                    "legacy_status": legacy_status.get(pr_id),
+                    "new_status": new_status.get(pr_id),
+                }
+            )
+    if drift:
+        diff["current_queue_status_drift"] = drift
+    return diff or None
+
+
+def _project_recovery_decision(
+    tasks: list[QueueTask],
+    prs: list[PRInfo],
+    recovered_set: set[str],
+) -> dict:
+    """Project the post-recovery state implied by ``tasks`` + ``prs``.
+
+    Pure function — no side effects, no probes. Mirrors the decision
+    tree in ``RecoveryMixin._apply_recovery_decisions`` at a level that
+    is sufficient for audit diff comparison: the side-effecting
+    ``_is_doing_already_merged`` API probe is intentionally excluded so
+    legacy and new projections are scored against the same input
+    snapshot.
+    """
+    pending_sync_branch = next(
+        (pr.branch for pr in prs if (pr.branch or "").startswith("queue-done-")),
+        None,
+    )
+    doing = next((task for task in tasks if task.status == TaskStatus.DOING), None)
+    if doing is not None and doing.pr_id in recovered_set:
+        return {
+            "pipeline_state": PipelineState.IDLE.value,
+            "current_task_pr_id": None,
+            "current_pr_number": None,
+            "pending_queue_sync_branch": pending_sync_branch,
+        }
+    if doing is not None:
+        matching = (
+            next((pr for pr in prs if pr.branch == doing.branch), None)
+            if doing.branch
+            else None
+        )
+        if matching is not None:
+            return {
+                "pipeline_state": PipelineState.WATCH.value,
+                "current_task_pr_id": doing.pr_id,
+                "current_pr_number": matching.number,
+                "pending_queue_sync_branch": pending_sync_branch,
+            }
+        return {
+            "pipeline_state": PipelineState.IDLE.value,
+            "current_task_pr_id": None,
+            "current_pr_number": None,
+            "pending_queue_sync_branch": pending_sync_branch,
+        }
+    queued_by_branch = {
+        task.branch: task
+        for task in tasks
+        if task.branch and task.status in (TaskStatus.TODO, TaskStatus.DONE)
+    }
+    recoverable = next(
+        (
+            (pr, queued_by_branch[pr.branch])
+            for pr in prs
+            if pr.branch in queued_by_branch
+        ),
+        None,
+    )
+    if recoverable is not None:
+        matched_pr, matched_task = recoverable
+        return {
+            "pipeline_state": PipelineState.WATCH.value,
+            "current_task_pr_id": matched_task.pr_id,
+            "current_pr_number": matched_pr.number,
+            "pending_queue_sync_branch": pending_sync_branch,
+        }
+    return {
+        "pipeline_state": PipelineState.IDLE.value,
+        "current_task_pr_id": None,
+        "current_pr_number": None,
+        "pending_queue_sync_branch": pending_sync_branch,
+    }
 
 
 def _task_pr_sort_key(pr_id: str) -> tuple[int, int | str, str]:
@@ -206,15 +371,14 @@ class RecoveryMixin:
         return doing.pr_id in merged
 
     async def recover_state(self) -> bool:
-        """Reconstruct state from QUEUE.md + GitHub on daemon startup.
+        """Reconstruct state from QUEUE.md / task headers + GitHub.
 
-        Decision tree:
+        Decision tree (shared by both legacy and headers paths):
 
-        1. If QUEUE.md has a DOING task:
+        1. If a DOING task is present:
            - Matching open PR on that branch -> WATCH (runner resumes
              polling the existing PR).
-           - No matching PR -> CODING + re-run ``handle_coding()``
-             (Claude CLI run was interrupted before pushing).
+           - No matching PR -> mark crashed/CANCELED and stay IDLE.
         2. If no DOING task but an open PR whose branch matches a DONE
            task exists -> WATCH (task marked DONE locally but PR not yet
            merged). Unrelated open PRs are ignored.
@@ -237,8 +401,13 @@ class RecoveryMixin:
         startup would strand the runner detached from an in-flight PR
         and later allow ``handle_error`` to SKIP/FIX it onto new queue
         work.
+
+        PR-266b: which queue source applies state is controlled by two
+        env flags read at process start. The default is ``LEGACY_ONLY``,
+        byte-identical to pre-PR-266 behavior. Audit modes run both
+        paths in parallel and emit ``[AUDIT] recover_state divergence:``
+        events when their projections differ.
         """
-        strict = self.app_config.daemon.strict_queue_validation
         # PR-272 follow-up: clear any stale ``info/expected-branch`` marker
         # left behind by a SIGKILL/OOM/crash mid-CODING. ``handle_coding``
         # cleans the marker in a ``finally`` block on every normal exit,
@@ -262,6 +431,52 @@ class RecoveryMixin:
         # back into the PR-186 crashed-task path which intentionally
         # discards on a still-open PR re-deriving DOING.
         await self._load_recovered_task_pr_ids()
+
+        mode = _resolve_recovery_mode()
+
+        if mode == RECOVERY_MODE_LEGACY_ONLY:
+            ok, _, _ = await self._recover_state_legacy()
+            return ok
+
+        if mode == RECOVERY_MODE_HEADERS_ONLY:
+            ok, _, _ = await self._recover_state_headers()
+            return ok
+
+        if mode == RECOVERY_MODE_AUDIT_LEGACY_APPLIES:
+            ok, applied_tasks, prs = await self._recover_state_legacy()
+            if ok:
+                self._emit_audit_diff(
+                    mode,
+                    applied_path="legacy",
+                    applied_tasks=applied_tasks,
+                    prs=prs,
+                )
+            return ok
+
+        # RECOVERY_MODE_AUDIT_HEADERS_APPLIES
+        ok, applied_tasks, prs = await self._recover_state_headers()
+        if ok:
+            self._emit_audit_diff(
+                mode,
+                applied_path="new",
+                applied_tasks=applied_tasks,
+                prs=prs,
+            )
+        return ok
+
+    async def _recover_state_legacy(
+        self,
+    ) -> tuple[bool, list[QueueTask], list[PRInfo]]:
+        """Apply state using the legacy ``_parse_base_queue`` path.
+
+        Returns ``(success, tasks, prs)``: the tasks list is the parsed
+        legacy queue (after ghost filtering), and ``prs`` is the live
+        ``get_open_prs`` snapshot used to apply state. Both are exposed
+        so the audit-diff comparator can score the projection without
+        depending on ``self._idle_open_prs``, which the legacy path does
+        not populate.
+        """
+        strict = self.app_config.daemon.strict_queue_validation
         # Probe the queue source ONCE and reuse the result for both the
         # parse-source decision (origin/{branch} vs working tree) and the
         # ghost-filter decision below. A second independent probe inside
@@ -287,7 +502,7 @@ class RecoveryMixin:
                 publish=False,
                 log_prefix="[INFRA]",
             )
-            return False
+            return False, [], []
         try:
             tasks = self._parse_base_queue(
                 strict=strict, queue_from_origin=queue_from_origin,
@@ -299,7 +514,7 @@ class RecoveryMixin:
                 publish=False,
                 log_prefix="[INFRA]",
             )
-            return False
+            return False, [], []
         if tasks is None:
             if queue_from_origin:
                 await self._transition_to_error(
@@ -308,7 +523,7 @@ class RecoveryMixin:
                     publish=False,
                     log_prefix="[INFRA]",
                 )
-                return False
+                return False, [], []
             # Post-PR-181 repos gitignore ``tasks/QUEUE.md`` and rely on
             # ``handle_idle`` to regenerate it from PR-*.md headers each
             # cycle. A missing snapshot on the working tree therefore
@@ -342,7 +557,7 @@ class RecoveryMixin:
                 log_prefix="[INFRA]",
                 log_message=f"recover_state failed: {exc}",
             )
-            return False
+            return False, [], []
         # Ghost filtering uses local task-file existence, which is only a
         # safe signal for post-PR-181 repos (QUEUE.md gitignored, parsed
         # from the working tree). On legacy tracked-QUEUE repos the queue
@@ -352,6 +567,157 @@ class RecoveryMixin:
         # detach recovery from active DOING/DONE work.
         if not queue_from_origin:
             tasks = self._drop_ghost_queue_entries(tasks)
+        await self._apply_recovery_decisions(tasks, prs)
+        return True, tasks, list(prs)
+
+    async def _hydrate_current_task_from_persisted_state(self) -> None:
+        """Restore ``state.current_task`` from the published Redis snapshot.
+
+        ``publish_state`` writes the live ``RepoState`` to
+        ``pipeline_state(self.name)`` at the end of every cycle, so the
+        last persisted snapshot is the authoritative record of which
+        task was active when the daemon went down. The runner re-builds
+        a fresh ``RepoState`` on startup with ``current_task=None``;
+        without this rehydrate the headers helper's
+        ``current_task_pr_id`` input is always ``None``, and a pre-push
+        crash mid-CODING (no open PR yet) re-derives the task as
+        ``TODO`` rather than ``DOING``.
+
+        Hydration is gated on a persisted ``CODING`` state because that
+        is the only crash-relevant scenario: ``current_task`` is set
+        without an open PR only between IDLE→CODING dispatch and the
+        coder's first push. Snapshots from WATCH/FIX/MERGE always have
+        a matching open PR by construction, so ``derive_task_status``
+        already returns ``DOING`` via ``find_matching_open_pr`` without
+        the ``current_task_pr_id`` fallback. Hydrating those snapshots
+        would misclassify a benign restart as a crash if the PR has
+        since been closed externally: ``derive_task_status`` would fall
+        through to the ``current_task_pr_id`` branch, return ``DOING``,
+        and ``_apply_recovery_decisions`` would mark the task
+        ``CANCELED`` and force manual re-upload.
+
+        Best-effort: Redis read errors, missing snapshots, and corrupt
+        payloads all leave ``state.current_task`` untouched. This is
+        deliberately narrow — we only hydrate ``current_task`` because
+        ``_apply_recovery_decisions`` overwrites it from the parsed task
+        list afterwards, so a stale value cannot leak past recovery
+        even when the snapshot lags reality (e.g. the task was merged
+        externally between crash and restart, in which case
+        ``derive_task_status`` returns ``DONE`` first via the merged-
+        state probe and the hydrated value is irrelevant).
+        """
+        if self.state.current_task is not None:
+            return
+        try:
+            raw = await self.redis.get(pipeline_state(self.name))
+        except Exception:
+            return
+        if not raw:
+            return
+        try:
+            persisted = RepoState.model_validate_json(raw)
+        except Exception:
+            return
+        if persisted.state != PipelineState.CODING:
+            return
+        if persisted.current_task is not None:
+            self.state.current_task = persisted.current_task
+
+    async def _recover_state_headers(
+        self,
+    ) -> tuple[bool, list[QueueTask], list[PRInfo]]:
+        """Apply state using the headers-derived task list (PR-266b).
+
+        Skips the QUEUE.md probe entirely: the headers helper reads
+        ``tasks/PR-*.md`` directly and computes ``DOING``/``TODO``/
+        ``DONE`` via ``derive_task_status`` against the same merged-
+        state input the IDLE cycle uses. ``state.current_queue`` is
+        hydrated from the result so post-restart state matches the
+        in-memory snapshot model introduced in PR-263.
+        """
+        try:
+            prs = gh_prs.get_open_prs(
+                self.owner_repo,
+                allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+            )
+        except Exception as exc:
+            await self._transition_to_error(
+                f"recover_state: get_open_prs failed: {exc}",
+                save_run_record_as=None,
+                publish=False,
+                log_prefix="[INFRA]",
+                log_message=f"recover_state failed: {exc}",
+            )
+            return False, [], []
+        # PR-266b crash-no-PR fix: the headers helper derives ``DOING``
+        # via ``current_task_pr_id`` when no matching open PR exists.
+        # ``state.current_task`` is reset on daemon restart, so without
+        # this rehydrate a pre-push crash (no open PR yet) re-derives
+        # the previously DOING task as ``TODO``; ``_apply_recovery_
+        # decisions`` only runs the PR-186 crash path on a DOING entry,
+        # so the task would be silently re-dispatched into a crash loop
+        # instead of being marked CANCELED pending manual re-upload.
+        # Legacy recovery does not need this because it reads ``DOING``
+        # straight from ``QUEUE.md``. Run after the ``get_open_prs``
+        # probe so a transient GitHub outage during recovery still
+        # surfaces as ERROR with no current_task, matching legacy
+        # error-path behavior.
+        await self._hydrate_current_task_from_persisted_state()
+        # The helper consults ``_idle_open_prs`` to derive each task's
+        # status from the live PR set. Populate it from the recovery
+        # fetch and reset on exit so ``handle_idle`` does not later read
+        # a stale recovery-time snapshot.
+        prior_open_prs = getattr(self, "_idle_open_prs", None)
+        prior_merged_prs = getattr(self, "_idle_merged_prs", None)
+        self._idle_open_prs = list(prs)
+        self._idle_merged_prs = []
+        try:
+            try:
+                tasks = self._parse_tasks_from_headers()
+            except QueueValidationError as exc:
+                await self._transition_to_error(
+                    f"recover_state: queue validation failed: {exc}",
+                    save_run_record_as=None,
+                    publish=False,
+                    log_prefix="[INFRA]",
+                )
+                return False, [], []
+        finally:
+            if prior_open_prs is None:
+                if hasattr(self, "_idle_open_prs"):
+                    delattr(self, "_idle_open_prs")
+            else:
+                self._idle_open_prs = prior_open_prs
+            if prior_merged_prs is None:
+                if hasattr(self, "_idle_merged_prs"):
+                    delattr(self, "_idle_merged_prs")
+            else:
+                self._idle_merged_prs = prior_merged_prs
+
+        if tasks is None:
+            self.log_event(
+                "[INFRA] recover_state: no tasks/PR-*.md headers parsed; "
+                "treating as empty queue and deferring to preflight + "
+                "IDLE regeneration."
+            )
+            tasks = []
+        await self._apply_recovery_decisions(tasks, prs)
+        # PR-263: hydrate the in-memory queue snapshot so the dashboard's
+        # /api/repo/{name}/queue endpoint reflects post-restart state
+        # immediately, without waiting for the next IDLE cycle.
+        self.state.current_queue = list(tasks)
+        return True, tasks, list(prs)
+
+    async def _apply_recovery_decisions(
+        self, tasks: list[QueueTask], prs: list[PRInfo]
+    ) -> None:
+        """Apply the shared post-parse decision tree to runner state.
+
+        Both LEGACY_ONLY and HEADERS_ONLY modes converge here once they
+        have produced a task list and an open-PR list. The body mirrors
+        the original recover_state decision tree so legacy behavior is
+        preserved exactly.
+        """
         self._set_queue_progress(
             sum(1 for t in tasks if t.status == TaskStatus.DONE),
             len(tasks),
@@ -415,7 +781,7 @@ class RecoveryMixin:
             self.state.current_task = None
             self._reset_runner_local_task_counters()
             self.state.state = PipelineState.IDLE
-            return True
+            return
 
         if doing is not None:
             self.state.current_task = doing
@@ -440,7 +806,7 @@ class RecoveryMixin:
                     f"[INFRA] Recovered: DOING task {doing.pr_id} "
                     f"-> WATCH PR #{matching.number}."
                 )
-                return True
+                return
 
             if self._is_doing_already_merged(doing):
                 self.log_event(
@@ -467,14 +833,14 @@ class RecoveryMixin:
                         publish=False,
                         log_prefix="[INFRA]",
                     )
-                    return True
+                    return
                 self.state.current_pr = None
                 self.state.state = PipelineState.IDLE
                 self.log_event(
                     f"[INFRA] Recovered: DOING task {doing.pr_id}, no PR "
                     f"but user_paused -> defer CODING until resume."
                 )
-                return True
+                return
 
             # PR-186: A DOING task with no matching PR after recovery is a
             # crash signature (subprocess kill, OOM, daemon restart mid-
@@ -496,12 +862,26 @@ class RecoveryMixin:
                     publish=False,
                     log_prefix="[INFRA]",
                 )
-                return True
+                return
             # Capture branch surfaces before clearing ``current_task``
             # so the cancellation diagnostic names the task branch the
             # crash was associated with rather than ``<absent>``.
             ctx = BranchContext.from_runner(self)
             self._crashed_task_pr_ids.add(doing.pr_id)
+            # PR-266b crash-no-PR fix: reflect the cancellation in the
+            # in-memory tasks list so the headers-mode current_queue
+            # snapshot does not display ``DOING`` for a task the runner
+            # just gave up on. The IDLE selector applies the same
+            # override on its next cycle; doing it eagerly here keeps
+            # post-restart dashboards consistent without waiting for
+            # the next poll. Legacy callers discard the tasks list, so
+            # the mutation is a no-op for them; the audit comparator
+            # benefits because both projection branches now see
+            # consistent ``CANCELED`` status for the crashed entry.
+            for i, t in enumerate(tasks):
+                if t.pr_id == doing.pr_id and t.status == TaskStatus.DOING:
+                    tasks[i] = t.model_copy(update={"status": TaskStatus.CANCELED})
+                    break
             self.state.current_task = None
             self._reset_runner_local_task_counters()
             self.state.state = PipelineState.IDLE
@@ -510,7 +890,7 @@ class RecoveryMixin:
                 f"Manually re-upload to retry. "
                 f"({ctx.log_summary()})"
             )
-            return True
+            return
 
         queued_by_branch = {
             t.branch: t
@@ -538,7 +918,7 @@ class RecoveryMixin:
                 f"[INFRA] Recovered: {matched_task.status.value} task "
                 f"{matched_task.pr_id} -> WATCH PR #{matched_pr.number}."
             )
-            return True
+            return
 
         self.state.state = PipelineState.IDLE
         self.state.current_task = None
@@ -553,7 +933,145 @@ class RecoveryMixin:
             self.log_event(
                 "[INFRA] Recovered: no DOING tasks, no open PRs -> IDLE."
             )
-        return True
+
+    def _emit_audit_diff(
+        self,
+        mode: str,
+        *,
+        applied_path: str,
+        applied_tasks: list[QueueTask],
+        prs: list[PRInfo],
+    ) -> None:
+        """Run the inactive recovery path as a dry-run and emit any diff.
+
+        Side-effect free for the inactive path: the dry-run helper just
+        produces a task list, which feeds ``_recovery_audit_diff``
+        alongside the applied path's task list. Differences are logged
+        as ``[AUDIT] recover_state divergence: <json>``; parity is
+        silent so audit logs stay grep-friendly.
+
+        ``prs`` is the live ``get_open_prs`` snapshot the applied path
+        used. It is threaded in explicitly because ``self._idle_open_prs``
+        is unreliable here: the legacy path never sets it, and the
+        headers path restores it before returning. Reading the attribute
+        directly would feed ``_recovery_audit_diff`` an empty or stale
+        PR list and fabricate divergences whenever recoverability
+        depends on open PR branches.
+        """
+        if applied_path == "legacy":
+            # ``_parse_tasks_from_headers`` consults ``_idle_open_prs``
+            # to derive each task's status. Seed it from the live PR
+            # snapshot and restore on exit so the dry-run sees the same
+            # PR set the applied path used.
+            prior_open_prs = getattr(self, "_idle_open_prs", None)
+            prior_merged_prs = getattr(self, "_idle_merged_prs", None)
+            self._idle_open_prs = list(prs)
+            self._idle_merged_prs = []
+            try:
+                try:
+                    new_tasks = self._parse_tasks_from_headers() or []
+                except Exception as exc:
+                    self.log_event(
+                        f"[AUDIT] recover_state new-path dry-run failed: {exc}"
+                    )
+                    return
+            finally:
+                if prior_open_prs is None:
+                    if hasattr(self, "_idle_open_prs"):
+                        delattr(self, "_idle_open_prs")
+                else:
+                    self._idle_open_prs = prior_open_prs
+                if prior_merged_prs is None:
+                    if hasattr(self, "_idle_merged_prs"):
+                        delattr(self, "_idle_merged_prs")
+                else:
+                    self._idle_merged_prs = prior_merged_prs
+            legacy_tasks = applied_tasks
+        else:
+            strict = self.app_config.daemon.strict_queue_validation
+            # Mirror ``_recover_state_legacy``'s queue-source decision
+            # exactly so the dry-run scores against the same input the
+            # legacy applied path would have used. Probing once and
+            # threading the result into ``_parse_base_queue`` keeps the
+            # parse source (origin/{branch} vs working tree) and the
+            # downstream ghost-filter decision in lockstep, the same
+            # invariant the legacy applied path enforces.
+            queue_from_origin = self._origin_queue_md_tracked()
+            if queue_from_origin is None:
+                # Indeterminate probe: legacy applies would have
+                # transitioned to ERROR, so any comparison here would
+                # measure a snapshot legacy never actually used. Skip
+                # silently rather than fabricate divergences.
+                self.log_event(
+                    "[AUDIT] recover_state legacy-path dry-run skipped: "
+                    "tasks/QUEUE.md tracking probe failed"
+                )
+                return
+            try:
+                parsed = self._parse_base_queue(
+                    strict=strict, queue_from_origin=queue_from_origin,
+                )
+            except Exception as exc:
+                self.log_event(
+                    f"[AUDIT] recover_state legacy-path dry-run failed: {exc}"
+                )
+                return
+            if parsed is None and queue_from_origin:
+                # ``_parse_base_queue`` returns ``None`` from a tracked
+                # snapshot only when ``git show origin/{branch}:tasks/
+                # QUEUE.md`` failed (missing ref or transient git
+                # error). The legacy applied path treats that as ERROR
+                # and never observes a queue, so coercing to ``[]``
+                # here would score the comparator against a snapshot
+                # legacy never used and emit misleading ``[AUDIT]
+                # recover_state divergence`` events instead of
+                # signaling that the dry-run input was invalid. A
+                # working-tree miss (``queue_from_origin`` False)
+                # falls through below: the legacy applied path
+                # converts that to an empty queue, so ``parsed or []``
+                # mirrors its behavior.
+                self.log_event(
+                    "[AUDIT] recover_state legacy-path dry-run skipped: "
+                    "read QUEUE.md from origin failed"
+                )
+                return
+            legacy_tasks = parsed or []
+            if not queue_from_origin:
+                # Mirror ``_drop_ghost_queue_entries`` inline so a stale
+                # ``tasks/QUEUE.md`` ghost row (post-PR-181 repos
+                # gitignore the file; ``sync_to_main`` does not wipe
+                # it) does not fabricate ``[AUDIT] recover_state
+                # divergence`` events that legacy recovery would have
+                # filtered before any decision. Inlining avoids the
+                # helper's ``[INFRA] recover_state: ignoring ghost``
+                # log emission, which would lie about an "actual
+                # recovery" decision in modes where the legacy path is
+                # only a dry-run.
+                repo_root = Path(self.repo_path)
+                legacy_tasks = [
+                    task
+                    for task in legacy_tasks
+                    if task.task_file is None
+                    or (repo_root / task.task_file).is_file()
+                ]
+            new_tasks = applied_tasks
+
+        diff = _recovery_audit_diff(
+            legacy_tasks,
+            new_tasks,
+            prs,
+            set(self._recovered_task_pr_ids),
+        )
+        if diff is None:
+            return
+        payload = {
+            "audit": "recover_state",
+            "mode": mode,
+            "diff": diff,
+        }
+        self.log_event(
+            f"[AUDIT] recover_state divergence: {json.dumps(payload, sort_keys=True)}"
+        )
 
     def _preserve_crashed_run_commits(self, branch: str) -> bool:
         """Push any unpushed commits on ``branch`` to origin.
