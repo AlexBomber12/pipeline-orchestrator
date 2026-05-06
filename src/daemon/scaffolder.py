@@ -152,6 +152,61 @@ def _gitignored_paths(repo_path: str, paths: list[str]) -> set[str]:
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
+def _hooks_path_inside_worktree(repo_path: str) -> bool:
+    """Return ``True`` when ``core.hooksPath`` resolves inside the worktree
+    but outside ``.git/``.
+
+    Such a configuration (e.g. ``core.hooksPath=.githooks``) would land
+    ``pre-push`` as an untracked or modified worktree file when the
+    installer runs after ``scaffold_repo``'s stage/commit/push, dirtying
+    ``git status --porcelain`` and stalling subsequent preflight checks.
+    The default ``.git/hooks/`` is technically inside the worktree
+    directory tree but invisible to ``git status``, so it does not
+    count.
+
+    Errors and timeouts return ``False`` so a probe failure does not
+    silently disable the install path; the bash installer surfaces its
+    own diagnostics for unwritable destinations.
+    """
+    try:
+        hook_proc = _run_git(
+            repo_path, "rev-parse", "--git-path", "hooks/pre-push"
+        )
+        toplevel_proc = _run_git(repo_path, "rev-parse", "--show-toplevel")
+        gitdir_proc = _run_git(repo_path, "rev-parse", "--git-dir")
+    except (
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        OSError,
+    ):
+        return False
+
+    repo_root = Path(repo_path)
+    hook_path = Path(hook_proc.stdout.strip())
+    if not hook_path.is_absolute():
+        hook_path = repo_root / hook_path
+    toplevel = Path(toplevel_proc.stdout.strip())
+    git_dir = Path(gitdir_proc.stdout.strip())
+    if not git_dir.is_absolute():
+        git_dir = repo_root / git_dir
+
+    hook_resolved = hook_path.resolve()
+    toplevel_resolved = toplevel.resolve()
+    git_dir_resolved = git_dir.resolve()
+
+    try:
+        hook_resolved.relative_to(git_dir_resolved)
+        return False
+    except ValueError:
+        pass
+
+    try:
+        hook_resolved.relative_to(toplevel_resolved)
+        return True
+    except ValueError:
+        return False
+
+
 def _install_pre_push_hook(repo_path: str) -> None:
     """Install the pipeline-orchestrator pre-push branch-validation hook.
 
@@ -168,7 +223,23 @@ def _install_pre_push_hook(repo_path: str) -> None:
     file in the configured directory, and a ``core.hooksPath=/dev/null``
     setup surfaces as an install failure (logged warning) rather than a
     silently bypassed hook in ``.git/hooks/``.
+
+    When ``core.hooksPath`` points at an in-worktree location (for
+    example a relative ``.githooks/`` shared via the repo) the install
+    is skipped: writing the hook there would land it as an untracked
+    or modified worktree file after ``scaffold_repo`` has already
+    staged/committed/pushed, perpetually dirtying ``git status`` and
+    stalling later preflight checks. PR-271's prompt-header defense
+    still applies, so the cost is reduced redundancy on these repos.
     """
+    if _hooks_path_inside_worktree(repo_path):
+        logger.info(
+            "scaffold_repo: skipping pre-push hook install for %s — "
+            "core.hooksPath resolves inside the worktree (would dirty "
+            "git status)",
+            repo_path,
+        )
+        return
     try:
         subprocess.run(
             ["bash", str(PRE_PUSH_HOOK_INSTALL_SCRIPT), repo_path],

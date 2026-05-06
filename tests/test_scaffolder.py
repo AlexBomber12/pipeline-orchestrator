@@ -1016,9 +1016,19 @@ def _patch_git_passthrough_install_hook(
     The bash invocation path is matched by ``cmd[0] == "bash"`` — every
     other subprocess (git checkout, add, commit, push, check-ignore) is
     served by the local fake exactly like ``_patch_git``.
+
+    The PR-272 worktree-inside guard issues ``git rev-parse --git-path``,
+    ``--show-toplevel`` and ``--git-dir`` against the real repo before
+    deciding whether to call the installer; those probes are passed
+    through as well so the guard can resolve the effective hook path.
     """
     real_run = subprocess.run
     calls: list[list[str]] = []
+    _GUARD_REV_PARSE_ARGS = {
+        ("--git-path", "hooks/pre-push"),
+        ("--show-toplevel",),
+        ("--git-dir",),
+    }
 
     def fake_run(cmd: list[str], **kwargs: Any):
         calls.append(cmd)
@@ -1028,6 +1038,8 @@ def _patch_git_passthrough_install_hook(
             and len(cmd) > 1
             and cmd[1].endswith("install-pre-push-hook.sh")
         ):
+            return real_run(cmd, **kwargs)
+        if cmd[:2] == ["git", "rev-parse"] and tuple(cmd[2:]) in _GUARD_REV_PARSE_ARGS:
             return real_run(cmd, **kwargs)
         if cmd[:2] == ["git", "check-ignore"]:
             return _FakeCompletedProcess(args=cmd, returncode=1)
@@ -1128,5 +1140,112 @@ def test_scaffolder_logs_warning_on_pre_push_install_failure(
 
     assert any(
         "pre-push hook install failed" in record.message
+        for record in caplog.records
+    )
+
+
+def test_hooks_path_inside_worktree_default_returns_false(
+    tmp_path: Path,
+) -> None:
+    """A repo with no ``core.hooksPath`` keeps hooks under ``.git/hooks/``.
+    That path is technically inside the worktree directory tree but
+    invisible to ``git status``, so the worktree-dirty guard must NOT
+    trigger on the default and the installer must run as before.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True
+    )
+    assert scaffolder._hooks_path_inside_worktree(str(repo)) is False
+
+
+def test_hooks_path_inside_worktree_relative_in_tree_returns_true(
+    tmp_path: Path,
+) -> None:
+    """``core.hooksPath=.githooks`` resolves to ``<repo>/.githooks/`` —
+    inside the worktree but outside ``.git/``. The guard must trigger so
+    scaffold_repo skips the install and avoids dirtying ``git status``.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "core.hooksPath", ".githooks"],
+        check=True,
+    )
+    assert scaffolder._hooks_path_inside_worktree(str(repo)) is True
+
+
+def test_hooks_path_inside_worktree_absolute_outside_returns_false(
+    tmp_path: Path,
+) -> None:
+    """An absolute ``core.hooksPath`` outside the worktree is safe; the
+    bash installer writes there directly without touching the worktree.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    custom = tmp_path / "custom-hooks"
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "core.hooksPath", str(custom)],
+        check=True,
+    )
+    assert scaffolder._hooks_path_inside_worktree(str(repo)) is False
+
+
+def test_hooks_path_inside_worktree_probe_failure_returns_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing rev-parse probe must NOT silently disable the install
+    path. The guard returns False and ``_install_pre_push_hook`` proceeds
+    to invoke the bash installer (which has its own diagnostics).
+    """
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if cmd[:2] == ["git", "rev-parse"]:
+            raise subprocess.CalledProcessError(returncode=128, cmd=cmd)
+        return _FakeCompletedProcess(args=cmd)
+
+    monkeypatch.setattr(scaffolder.subprocess, "run", fake_run)
+    assert scaffolder._hooks_path_inside_worktree(str(tmp_path)) is False
+
+
+def test_scaffolder_skips_pre_push_install_when_hooks_path_in_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When ``core.hooksPath`` points inside the worktree, scaffold_repo
+    must not run the bash installer — installing would land ``pre-push``
+    as a dirty worktree file and stall later preflight checks. The skip
+    is logged at INFO so operators see the reduced redundancy.
+    """
+    repo = _init_empty_repo(tmp_path)
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "core.hooksPath", ".githooks"],
+        check=True,
+    )
+    calls = _patch_git_passthrough_install_hook(monkeypatch)
+
+    with caplog.at_level("INFO", logger="src.daemon.scaffolder"):
+        scaffolder.scaffold_repo(str(repo), "main")
+
+    assert not any(
+        len(cmd) > 1
+        and cmd[0] == "bash"
+        and cmd[1].endswith("install-pre-push-hook.sh")
+        for cmd in calls
+    )
+    assert not (repo / ".githooks" / "pre-push").exists()
+    assert any(
+        "skipping pre-push hook install" in record.message
         for record in caplog.records
     )
