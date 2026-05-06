@@ -216,6 +216,37 @@ def test_user_authored_quick_rules_without_bullets_is_preserved(
     ) == 1
 
 
+def test_user_authored_quick_rules_with_bullets_is_preserved(
+    tmp_path: Path,
+) -> None:
+    """A user-authored ``Quick rules`` section that uses the same heading
+    + dash-bullet structure as the legacy template — but whose first
+    bullet is NOT the canonical "Always choose a work mode" signature —
+    must be preserved. Otherwise reconciliation silently deletes user
+    content that happens to share the common Markdown shape."""
+    target = tmp_path / "AGENTS.md"
+    target.write_text(
+        "# AGENTS\n\n"
+        "## Quick rules\n"
+        "- Use the linter before pushing.\n"
+        "- Document new env vars in the README.\n"
+        "- Tag the on-call before merging schema changes.\n"
+        "\n## Other section\n\nOther content.\n"
+    )
+
+    proposed, _ = reconcile_agents_md(target, dry_run=True)
+
+    assert "Use the linter before pushing." in proposed
+    assert "Document new env vars in the README." in proposed
+    assert "Tag the on-call before merging schema changes." in proposed
+    assert "## Other section" in proposed
+    # The managed quick_rules block is still appended, so two "Quick
+    # rules" headings coexist: the user's and the managed one.
+    assert proposed.count(
+        "<!-- pipeline-orchestrator: managed BEGIN quick_rules -->"
+    ) == 1
+
+
 # ---------------------------------------------------------------------------
 # Web endpoint tests
 # ---------------------------------------------------------------------------

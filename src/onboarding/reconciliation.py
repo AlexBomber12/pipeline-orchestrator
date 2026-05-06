@@ -39,10 +39,19 @@ _MANAGED_MARKER_RE = re.compile(
 # leave that legacy block in place and append a second managed copy at EOF,
 # producing two conflicting copies. Detect the legacy form and strip it
 # before reconciliation runs.
+#
+# The first bullet is anchored on the canonical legacy template phrase
+# "Always choose a work mode" so user-authored sections that happen to use
+# the same "Quick rules" heading + dash-bullet structure (but with their
+# own first bullet) are left untouched. The new managed quick_rules opens
+# with "When invoked by the pipeline-orchestrator daemon..." instead, so
+# the narrow signature cannot match a managed block either.
 _LEGACY_QUICK_RULES_RE = re.compile(
     r"""
     ^(?:[ \t]*\#{1,3}[ \t]+)?Quick[ \t]+rules[ \t]*\n   # heading line
-    (?:[ \t]*-[ \t][^\n]*\n)+                            # 1+ dash bullets
+    [ \t]*-[ \t]+Always[ \t]+choose[ \t]+a[ \t]+work[ \t]+mode[^\n]*\n
+                                                         # legacy signature bullet
+    (?:[ \t]*-[ \t][^\n]*\n)*                            # 0+ trailing bullets
     """,
     re.MULTILINE | re.VERBOSE,
 )

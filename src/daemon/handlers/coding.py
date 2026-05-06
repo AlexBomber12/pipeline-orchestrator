@@ -23,6 +23,33 @@ from src.github import prs as gh_prs
 from src.models import PipelineState
 
 
+def _resolve_task_file_under_repo(repo_path: str, task_file: str) -> Path:
+    """Resolve ``task_file`` under ``repo_path`` rejecting traversal/escape.
+
+    The queue parser does not validate ``task_file`` paths, so a malicious
+    or mistaken queue entry could otherwise point CODING at an absolute
+    path or a ``..``-prefixed path that escapes the cloned repo and leaks
+    arbitrary host content into the inline ``run_auto_pr`` prompt.
+
+    Raises ``ValueError`` if ``task_file`` is absolute, contains ``..``
+    segments, or — after symlink resolution — escapes ``repo_path``.
+    """
+    candidate = Path(task_file)
+    if candidate.is_absolute():
+        raise ValueError(f"absolute path not allowed: {task_file!r}")
+    if any(part == ".." for part in candidate.parts):
+        raise ValueError(f"path traversal not allowed: {task_file!r}")
+    repo_root = Path(repo_path).resolve()
+    resolved = (repo_root / candidate).resolve()
+    try:
+        resolved.relative_to(repo_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"path escapes repo root: {task_file!r}"
+        ) from exc
+    return resolved
+
+
 def _local_branch_exists(repo_path: str, branch: str) -> bool:
     """Return ``True`` if ``refs/heads/{branch}`` exists in ``repo_path``.
 
@@ -151,7 +178,17 @@ class CodingMixin:
         assert self.state.current_task is not None
         pr_id = self.state.current_task.pr_id
         task_file = self.state.current_task.task_file or f"tasks/{pr_id}.md"
-        task_body_path = Path(self.repo_path) / task_file
+        try:
+            task_body_path = _resolve_task_file_under_repo(
+                self.repo_path, task_file
+            )
+        except ValueError as exc:
+            await self._transition_to_error(
+                f"Invalid task file {task_file!r}: {exc}",
+                publish=False,
+                log_prefix="[CODING]",
+            )
+            return
         try:
             task_body = task_body_path.read_text(encoding="utf-8")
         except OSError as exc:
