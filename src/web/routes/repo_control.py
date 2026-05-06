@@ -24,7 +24,6 @@ from src.web.services.coder import _effective_coder_name
 from src.web.services.repo_state import (
     _default_repo_state,
     _find_repo_config_by_name,
-    load_current_queue,
 )
 
 router = APIRouter()
@@ -63,22 +62,34 @@ def _coder_display_name(coder: str) -> str:
 async def _load_current_queue_snapshot(
     name: str,
 ) -> tuple[list[QueueTask] | None, _QueueSource, str | None]:
-    """Return the current queue snapshot and source marker for ``name``."""
-    snapshot = await load_current_queue(name)
-    if snapshot is None:
-        return None, "fallback_disk", None
+    """Return the current queue snapshot and source marker for ``name``.
 
+    ``snapshot_at`` is sourced from ``RepoState.current_queue_snapshot_at``
+    so it reflects the time the snapshot was actually written, not
+    ``RepoState.last_updated`` (a per-cycle daemon heartbeat that rolls
+    forward every runner cycle even when ``current_queue`` is unchanged).
+    """
     redis_client = getattr(_app.app.state, "redis", None)
-    snapshot_at: str | None = None
-    if redis_client is not None:
-        try:
-            raw = await redis_client.get(pipeline_state(name))
-            if raw:
-                state = RepoState.model_validate_json(raw)
-                snapshot_at = state.last_updated.isoformat()
-        except Exception:
-            snapshot_at = None
-    return snapshot, "snapshot", snapshot_at
+    if redis_client is None:
+        return None, "fallback_disk", None
+    try:
+        raw = await redis_client.get(pipeline_state(name))
+    except Exception:
+        return None, "fallback_disk", None
+    if raw is None:
+        return None, "fallback_disk", None
+    try:
+        state = RepoState.model_validate_json(raw)
+    except Exception:
+        return None, "fallback_disk", None
+    if state.current_queue is None:
+        return None, "fallback_disk", None
+    snapshot_at = (
+        state.current_queue_snapshot_at.isoformat()
+        if state.current_queue_snapshot_at is not None
+        else None
+    )
+    return state.current_queue, "snapshot", snapshot_at
 
 
 def _queue_json_payload(
