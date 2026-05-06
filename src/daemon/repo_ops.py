@@ -3,7 +3,6 @@
 Mixin methods:
     ensure_repo_cloned       — clone or fetch; retry scaffolding
     sync_to_main             — hard-sync working tree to origin/{branch}
-    _parse_base_queue        — parse QUEUE.md from the local working tree
     process_pending_uploads  — commit and push uploaded task files
     _delete_upload_if_unchanged — atomic CAS delete for Redis keys
 """
@@ -25,8 +24,6 @@ from src.daemon.git_ops import (
     _working_tree_dirty,
 )
 from src.keyspace import upload_pending
-from src.models import QueueTask
-from src.queue_parser import parse_queue_text
 from src.retry import retry_transient
 
 logger = logging.getLogger(__name__)
@@ -182,106 +179,9 @@ class RepoOpsMixin:
         except OSError as exc:
             raise RuntimeError(f"sync_to_main OS error: {exc}") from exc
 
-    def _origin_queue_md_tracked(self) -> bool | None:
-        """Return ``True``/``False`` for tracked-on-origin, ``None`` on probe failure.
-
-        PR-181 untracks ``tasks/QUEUE.md`` in this repo, but managed
-        repos that have not yet adopted that migration still carry the
-        file in tree. ``.gitignore`` does not retroactively untrack
-        files, so the daemon must detect tracked-QUEUE repos and steer
-        clear of the local-write / working-tree-read paths that PR-181's
-        design otherwise relies on.
-
-        Tristate on purpose. A transient ``cat-file`` failure (timeout,
-        OSError) is genuinely indeterminate: collapsing it to ``False``
-        would make legacy repos look post-PR-181 and route recovery into
-        the working-tree path, where a feature-branch checkout (or a
-        missing ``tasks/QUEUE.md``) would yield a stale/empty queue and
-        detach the daemon from real in-flight DOING work. Returning
-        ``None`` lets each caller pick its own conservative fallback:
-        recovery escalates to ERROR and retries; the IDLE/merge handlers
-        skip their writes (treat as tracked) and self-heal next cycle.
-
-        A non-zero ``returncode`` (file genuinely absent on origin) is
-        still a definitive ``False``.
-        """
-        branch = self.repo_config.branch
-        try:
-            result = git_ops._git(
-                self.repo_path,
-                "cat-file",
-                "-e",
-                f"origin/{branch}:tasks/QUEUE.md",
-                check=False,
-                timeout=10,
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            return None
-        return result.returncode == 0
-
-    def _parse_base_queue(
-        self, *, strict: bool = False, queue_from_origin: bool | None = None,
-    ) -> list[QueueTask] | None:
-        """Return QUEUE.md parsed for the active base ref, or ``None``.
-
-        Post-PR-181 repos have ``tasks/QUEUE.md`` gitignored: the daemon
-        regenerates it from structured task headers each IDLE cycle and
-        never pushes it, so the only authoritative copy is the local
-        working tree. Pre-PR-181 (legacy) repos still track the file on
-        ``origin/{branch}``, and recovery may run while the working tree
-        is checked out on a feature branch left behind by an interrupted
-        cycle. Reading from the working tree there would return a
-        branch-local snapshot and could resurrect or misclassify
-        in-flight work; instead we read directly from
-        ``origin/{branch}`` whenever the file is tracked there.
-
-        Returns ``None`` when no snapshot can be parsed (fresh clone,
-        unreadable file, ``git show`` failure). The caller translates
-        that into a retryable ERROR so the next cycle's regenerate /
-        sync brings the snapshot back into reach.
-
-        When *strict* is ``True``, ``parse_queue_text`` runs the full
-        validation suite and a ``QueueValidationError`` is propagated.
-
-        When *queue_from_origin* is provided, the caller has already
-        run ``_origin_queue_md_tracked()`` and wants both the parse
-        source and any downstream ghost-filter decision to come from
-        the same probe result. This avoids a transient probe failure
-        between two independent probes from desyncing the two
-        decisions (e.g., reading from origin while the caller still
-        applies the local-existence ghost filter, which would drop
-        real DOING/DONE entries on a feature-branch checkout). When
-        ``None``, the helper probes internally; an indeterminate probe
-        result (``None``) is treated as "no snapshot can be parsed" so
-        the helper does not silently fall back to a possibly-stale
-        working-tree copy on legacy repos.
-        """
-        if queue_from_origin is None:
-            queue_from_origin = self._origin_queue_md_tracked()
-            if queue_from_origin is None:
-                return None
-        if queue_from_origin:
-            branch = self.repo_config.branch
-            try:
-                result = git_ops._git(
-                    self.repo_path,
-                    "show",
-                    f"origin/{branch}:tasks/QUEUE.md",
-                    check=False,
-                    timeout=15,
-                )
-            except (subprocess.TimeoutExpired, OSError):
-                return None
-            if result.returncode != 0:
-                return None
-            return parse_queue_text(result.stdout, strict=strict)
-
-        queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
-        try:
-            content = queue_path.read_text(encoding="utf-8")
-        except OSError:
-            return None
-        return parse_queue_text(content, strict=strict)
+    def _origin_queue_md_tracked(self) -> bool:
+        """Transitional stub until PR-267 removes QUEUE.md write callers."""
+        return False
 
     _DELETE_IF_UNCHANGED_LUA = """
 if redis.call("get", KEYS[1]) == ARGV[1] then

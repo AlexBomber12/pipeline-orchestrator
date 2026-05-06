@@ -137,7 +137,7 @@ def test_recover_doing_task_with_matching_pr_recovers_to_watch(
         coding_called = True
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
     runner.handle_coding = boom  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
@@ -180,7 +180,7 @@ def test_recover_state_sets_queue_counters(
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [matching_pr])
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [done_task, doing_task, todo_task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [done_task, doing_task, todo_task]  # type: ignore[method-assign]
     runner.handle_coding = lambda: None  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
@@ -225,7 +225,7 @@ def test_recover_state_publish_state_emits_progress_update(
     monkeypatch.setattr(runner_module, "publish_repo_event", _fake_publish_repo_event)
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [done_task, doing_task, todo_task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [done_task, doing_task, todo_task]  # type: ignore[method-assign]
     runner.handle_coding = lambda: None  # type: ignore[method-assign]
 
     asyncio.run(runner.recover_state())
@@ -255,7 +255,7 @@ def test_recover_state_restores_pending_queue_sync_branch(
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pending_sync])
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: []  # type: ignore[method-assign]
 
     result = asyncio.run(runner.recover_state())
 
@@ -283,162 +283,11 @@ def test_recover_state_pending_queue_sync_uses_now_when_last_activity_missing(
     monkeypatch.setattr(recovery_module, "datetime", _FrozenDateTime)
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: []  # type: ignore[method-assign]
 
     asyncio.run(runner.recover_state())
 
     assert runner.state.pending_queue_sync_started_at == frozen_now
-
-
-def test_recover_state_drops_ghost_doing_entry_with_missing_task_file(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """A QUEUE.md DOING entry whose declared task file no longer exists
-    must be ignored. After PR-181, ``tasks/QUEUE.md`` is gitignored and
-    survives ``sync_to_main``'s ``git reset --hard``/``git clean -fd``,
-    so a stale snapshot from a prior cycle (or a prior CI run sharing
-    the daemon volume) can outlive the underlying tasks/PR-*.md files
-    after the base branch was wiped. Without this filter, recovery
-    would resurrect that ghost over the live IDLE queue and drag the
-    daemon back onto a deleted task.
-    """
-    ghost = QueueTask(
-        pr_id="PR-999",
-        title="Ghost from prior run",
-        status=TaskStatus.DOING,
-        branch="pr-999-ghost",
-        task_file="tasks/PR-999.md",
-    )
-    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
-    coding_calls: list[str] = []
-
-    async def fake_coding() -> None:  # pragma: no cover - must not fire
-        coding_calls.append("coding")
-
-    runner = _make_runner()
-    runner.repo_path = str(tmp_path)
-    runner._parse_base_queue = lambda **_: [ghost]  # type: ignore[method-assign]
-    runner.handle_coding = fake_coding  # type: ignore[method-assign]
-
-    result = asyncio.run(runner.recover_state())
-
-    assert result is True
-    assert coding_calls == []
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.current_task is None
-    assert runner.state.queue_total == 0
-    assert any("ignoring ghost QUEUE.md entry PR-999" in e["event"] for e in runner.state.history)
-
-
-def test_recover_state_keeps_doing_entry_when_queue_sourced_from_origin(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """On legacy tracked-QUEUE repos ``_parse_base_queue`` reads the
-    authoritative queue from ``origin/{branch}``. Recovery may run while
-    the working tree is parked on a feature branch left behind by an
-    interrupted cycle, so task files referenced by the base-branch queue
-    can be absent from the local checkout. The local-existence ghost
-    filter must NOT run in that case — otherwise it discards real
-    DOING/DONE entries and detaches the daemon from in-flight work.
-    """
-    in_flight = QueueTask(
-        pr_id="PR-555",
-        title="In-flight on feature branch",
-        status=TaskStatus.DOING,
-        branch="pr-555-feature",
-        task_file="tasks/PR-555.md",
-    )
-    matching_pr = PRInfo(number=555, branch="pr-555-feature")
-    monkeypatch.setattr(
-        "src.github.prs.get_open_prs",
-        lambda repo, **kw: [matching_pr],
-    )
-    monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda owner_repo, number: {"head_commit_date": ""},
-    )
-
-    runner = _make_runner()
-    runner.repo_path = str(tmp_path)
-    runner._parse_base_queue = lambda **_: [in_flight]  # type: ignore[method-assign]
-    # Simulate a legacy repo that still tracks tasks/QUEUE.md on origin.
-    runner._origin_queue_md_tracked = lambda: True  # type: ignore[method-assign]
-
-    result = asyncio.run(runner.recover_state())
-
-    assert result is True
-    assert runner.state.state == PipelineState.WATCH
-    assert runner.state.current_task is not None
-    assert runner.state.current_task.pr_id == "PR-555"
-    assert runner.state.current_pr is not None
-    assert runner.state.current_pr.number == 555
-    assert not any("ignoring ghost QUEUE.md entry" in e["event"] for e in runner.state.history)
-
-
-def test_recover_state_uses_single_probe_for_parse_and_ghost_filter(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """recover_state must run ``_origin_queue_md_tracked`` exactly once
-    and feed the same result to both ``_parse_base_queue`` and the
-    ghost-filter decision. Otherwise a transient probe failure between
-    two independent probes would let the queue be parsed from
-    ``origin/{branch}`` while the ghost filter still ran on the local
-    working tree, dropping real DOING/DONE entries whose task files
-    legitimately don't exist on a feature-branch checkout and
-    detaching the daemon from in-flight PR work.
-    """
-    in_flight = QueueTask(
-        pr_id="PR-777",
-        title="In-flight on legacy tracked-QUEUE repo",
-        status=TaskStatus.DOING,
-        branch="pr-777-feature",
-        task_file="tasks/PR-777.md",
-    )
-    matching_pr = PRInfo(number=777, branch="pr-777-feature")
-    monkeypatch.setattr(
-        "src.github.prs.get_open_prs",
-        lambda repo, **kw: [matching_pr],
-    )
-    monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda owner_repo, number: {"head_commit_date": ""},
-    )
-
-    runner = _make_runner()
-    runner.repo_path = str(tmp_path)
-
-    probe_calls: list[bool] = []
-    parse_kwargs: list[dict[str, object]] = []
-
-    def tracked_probe() -> bool:
-        probe_calls.append(True)
-        return True
-
-    def fake_parse(**kwargs: object) -> list[QueueTask]:
-        parse_kwargs.append(kwargs)
-        # Sanity: the caller must have supplied a single shared probe
-        # result instead of letting ``_parse_base_queue`` re-probe.
-        assert kwargs.get("queue_from_origin") is True
-        return [in_flight]
-
-    runner._origin_queue_md_tracked = tracked_probe  # type: ignore[method-assign]
-    runner._parse_base_queue = fake_parse  # type: ignore[method-assign]
-
-    result = asyncio.run(runner.recover_state())
-
-    assert result is True
-    assert len(probe_calls) == 1, (
-        "expected a single _origin_queue_md_tracked probe shared by the parse-source and ghost-filter decisions"
-    )
-    assert len(parse_kwargs) == 1
-    assert parse_kwargs[0].get("queue_from_origin") is True
-    assert runner.state.state == PipelineState.WATCH
-    assert runner.state.current_task is not None
-    assert runner.state.current_task.pr_id == "PR-777"
-    assert not any("ignoring ghost QUEUE.md entry" in e["event"] for e in runner.state.history)
 
 
 def test_recover_doing_task_skipped_when_already_merged_on_origin(
@@ -463,7 +312,7 @@ def test_recover_doing_task_skipped_when_already_merged_on_origin(
         coding_ran.append(True)
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
     runner._is_doing_already_merged = lambda doing: True  # type: ignore[method-assign]
     # Preserve must NOT run for a merged task — the entry is stale, not
@@ -501,7 +350,7 @@ def test_recover_doing_task_without_pr_marks_canceled_and_idles(
         coding_calls.append("coding")
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
     runner._preserve_crashed_run_commits = lambda branch: True  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
@@ -538,7 +387,7 @@ def test_recover_clears_stale_expected_branch_marker(
 
     runner = _make_runner()
     runner.repo_path = str(tmp_path)
-    runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: []  # type: ignore[method-assign]
 
     asyncio.run(runner.recover_state())
 
@@ -569,7 +418,7 @@ def test_recover_seeds_crashed_set_from_canceled_queue_entries(
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [canceled, todo]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [canceled, todo]  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
     assert runner.state.state == PipelineState.IDLE
@@ -602,7 +451,7 @@ def test_recover_paused_doing_task_without_pr_defers_coding(
 
     runner = _make_runner()
     runner.state.user_paused = True
-    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
     runner._preserve_crashed_run_commits = fake_preserve  # type: ignore[method-assign]
 
@@ -630,7 +479,7 @@ def test_recover_paused_doing_task_without_pr_errors_when_preserve_fails(
 
     runner = _make_runner()
     runner.state.user_paused = True
-    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
     runner._preserve_crashed_run_commits = lambda branch: False  # type: ignore[method-assign]
 
     result = asyncio.run(runner.recover_state())
@@ -689,7 +538,7 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
@@ -738,7 +587,7 @@ def test_recover_preserve_tolerates_missing_local_branch(
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
@@ -791,7 +640,7 @@ def test_recover_preserve_refuses_base_branch(
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
@@ -844,7 +693,7 @@ def test_recover_aborts_when_preserve_push_fails(
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
@@ -907,7 +756,7 @@ def test_recover_aborts_when_branch_probe_fails(
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
 
     asyncio.run(runner.recover_state())
@@ -938,7 +787,7 @@ def test_recover_no_doing_with_done_matched_pr_recovers_to_watch(
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [done_pr])
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [done, todo]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [done, todo]  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
     assert runner.state.state == PipelineState.WATCH
@@ -976,7 +825,7 @@ def test_recover_no_doing_with_todo_matched_pr_recovers_to_watch(
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [in_flight])
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [todo]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [todo]  # type: ignore[method-assign]
     result = asyncio.run(runner.recover_state())
 
     assert result is True
@@ -1012,7 +861,7 @@ def test_recover_unrelated_open_pr_stays_idle(
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [unrelated])
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [queued_todo]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [queued_todo]  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
     assert runner.state.state == PipelineState.IDLE
@@ -1041,7 +890,7 @@ def test_recover_attaches_only_to_done_matched_pr_among_many(
     )
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [done]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [done]  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
     assert runner.state.state == PipelineState.WATCH
@@ -1058,7 +907,7 @@ def test_recover_no_doing_no_prs_stays_idle(
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [_todo_task()]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [_todo_task()]  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
 
     assert runner.state.state == PipelineState.IDLE
@@ -1093,7 +942,7 @@ def test_recover_crashed_preflight_task_marks_canceled_and_idles(
     runner = _make_runner()
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "preflight failed: working tree dirty"
-    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
     runner.handle_coding = fake_coding  # type: ignore[method-assign]
     runner._preserve_crashed_run_commits = lambda branch: True  # type: ignore[method-assign]
 
@@ -1126,7 +975,7 @@ def test_recover_clean_slate_resets_prior_error_state(
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: []  # type: ignore[method-assign]
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "recover_state: get_open_prs failed: gh api rate limited"
 
@@ -1150,7 +999,7 @@ def test_recover_clean_slate_resets_error_with_unrelated_prs_present(
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [unrelated])
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: []  # type: ignore[method-assign]
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "recover_state: get_open_prs failed: boom"
 
@@ -1177,7 +1026,7 @@ def test_recover_get_open_prs_failure_sets_error(
     monkeypatch.setattr("src.github.prs.get_open_prs", boom)
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: []  # type: ignore[method-assign]
     result = asyncio.run(runner.recover_state())
 
     assert result is False
@@ -1264,7 +1113,7 @@ def test_run_cycle_recovered_watch_does_not_dispatch_handle_watch(
         return True
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
     runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
     runner.handle_watch = spy_watch  # type: ignore[method-assign]
     runner.handle_fix = spy_fix  # type: ignore[method-assign]
@@ -1310,7 +1159,7 @@ def test_run_cycle_recovered_idle_does_not_dispatch_handle_idle(
         return True
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: []  # type: ignore[method-assign]
     runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
     runner.handle_idle = spy_idle  # type: ignore[method-assign]
     runner.preflight = spy_preflight  # type: ignore[method-assign]
@@ -1357,7 +1206,7 @@ def test_run_cycle_dirty_tree_does_not_clobber_recovered_watch(
         return False
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
     runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
     runner.preflight = fail_preflight  # type: ignore[method-assign]
     runner.handle_watch = noop_watch  # type: ignore[method-assign]
@@ -1405,7 +1254,7 @@ def test_run_cycle_transient_discovery_failure_stays_retryable(
         return True
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
     runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
     runner.preflight = clean_preflight  # type: ignore[method-assign]
 
@@ -1445,7 +1294,7 @@ def test_run_cycle_recovery_never_invokes_handle_coding(
         coding_calls.append(1)
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
     runner.handle_coding = failing_coding  # type: ignore[method-assign]
     runner._preserve_crashed_run_commits = lambda branch: True  # type: ignore[method-assign]
 
@@ -1522,43 +1371,6 @@ def test_sync_to_main_runs_fetch_checkout_reset_in_order(
     ]
 
 
-def test_parse_base_queue_reads_local_working_tree(
-    tmp_path: Path,
-) -> None:
-    """PR-181: ``_parse_base_queue`` reads ``tasks/QUEUE.md`` from the
-    local working tree. The file is gitignored — the daemon regenerates
-    it from structured task headers each IDLE cycle, so an origin read
-    would see no such file."""
-    runner = _make_runner()
-    repo_root = Path(runner.repo_path)
-    (repo_root / "tasks").mkdir(parents=True, exist_ok=True)
-    queue_text = (
-        "## PR-010: Daemon recovery and error handling\n"
-        "- Status: TODO\n"
-        "- Branch: pr-010-recovery\n"
-        "- Depends on: PR-009\n"
-    )
-    (repo_root / "tasks" / "QUEUE.md").write_text(queue_text, encoding="utf-8")
-
-    tasks = runner._parse_base_queue()
-    assert tasks is not None
-    assert len(tasks) == 1
-    assert tasks[0].pr_id == "PR-010"
-    assert tasks[0].status == TaskStatus.TODO
-    assert tasks[0].branch == "pr-010-recovery"
-
-
-def test_parse_base_queue_returns_none_when_queue_md_missing(
-    tmp_path: Path,
-) -> None:
-    """A fresh clone has no ``tasks/QUEUE.md`` yet (it is gitignored and
-    regenerated by the daemon). ``_parse_base_queue`` must surface this
-    as ``None`` so ``recover_state`` translates it into a retryable
-    ERROR rather than driving execution on an empty queue snapshot."""
-    runner = _make_runner()
-    assert runner._parse_base_queue() is None
-
-
 def test_recover_state_local_queue_missing_falls_back_to_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1572,7 +1384,7 @@ def test_recover_state_local_queue_missing_falls_back_to_idle(
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
 
     runner = _make_runner()
-    runner._parse_base_queue = lambda **_: None  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: None  # type: ignore[method-assign]
     runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
 
     result = asyncio.run(runner.recover_state())
@@ -1582,88 +1394,24 @@ def test_recover_state_local_queue_missing_falls_back_to_idle(
     assert runner.state.error_message is None
     assert runner.state.current_task is None
     assert runner.state.current_pr is None
-    assert any("tasks/QUEUE.md absent in working tree" in e["event"] for e in runner.state.history)
+    assert any("no tasks/PR-*.md headers parsed" in e["event"] for e in runner.state.history)
 
 
-def test_recover_state_origin_queue_read_failure_sets_error_and_returns_false(
+def test_recover_validation_error_returns_false(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Legacy tracked-QUEUE repos read from ``origin/{branch}``. When
-    that read fails (transient git/network), recovery must set ERROR
-    and return False so the next cycle retries discovery rather than
-    detaching from real in-flight work referenced by the upstream
-    queue."""
-    gh_calls: list[str] = []
-
-    def spy_gh(repo: str, **kw: Any) -> list[PRInfo]:
-        gh_calls.append(repo)
-        return []
-
-    monkeypatch.setattr("src.github.prs.get_open_prs", spy_gh)
-
-    runner = _make_runner()
-    runner._parse_base_queue = lambda **_: None  # type: ignore[method-assign]
-    runner._origin_queue_md_tracked = lambda: True  # type: ignore[method-assign]
-
-    result = asyncio.run(runner.recover_state())
-
-    assert result is False
-    assert runner.state.state == PipelineState.ERROR
-    assert "read QUEUE.md" in (runner.state.error_message or "")
-    assert "origin" in (runner.state.error_message or "")
-    assert gh_calls == [], "must bail before probing GitHub"
-
-
-def test_recover_state_probe_failure_errors_instead_of_walking_working_tree(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When the ``cat-file`` probe itself fails (timeout/OSError) the
-    tracked-QUEUE state is genuinely unknown. Treating the failure as
-    "untracked" would route a legacy repo into the working-tree parse
-    path — where a feature-branch checkout or a missing
-    ``tasks/QUEUE.md`` yields a stale/empty queue and the daemon
-    detaches from real in-flight DOING work. Recovery must ERROR so
-    the next cycle retries the probe once git is responsive, and must
-    not call ``_parse_base_queue`` or hit GitHub at all."""
-    parse_calls: list[dict[str, object]] = []
-    gh_calls: list[str] = []
-
-    def fake_parse(**kwargs: object) -> list[QueueTask]:  # pragma: no cover - must not run
-        parse_calls.append(kwargs)
-        return []
-
-    def spy_gh(repo: str, **kw: Any) -> list[PRInfo]:  # pragma: no cover - must not run
-        gh_calls.append(repo)
-        return []
-
-    monkeypatch.setattr("src.github.prs.get_open_prs", spy_gh)
-
-    runner = _make_runner()
-    runner._parse_base_queue = fake_parse  # type: ignore[method-assign]
-    runner._origin_queue_md_tracked = lambda: None  # type: ignore[method-assign,return-value]
-
-    result = asyncio.run(runner.recover_state())
-
-    assert result is False
-    assert runner.state.state == PipelineState.ERROR
-    assert "tracking probe failed" in (runner.state.error_message or "")
-    assert parse_calls == [], (
-        "must not parse queue when probe is indeterminate — origin vs working-tree decision is unsafe"
-    )
-    assert gh_calls == [], "must bail before probing GitHub"
-
-
-def test_recover_validation_error_returns_false() -> None:
     """QueueValidationError returns False so _recovered stays unset and
     the daemon retries recovery each cycle — allowing self-heal once
     the operator fixes the queue.  run_cycle processes pending uploads
     even on a failed recovery so the upload path is not blocked."""
 
-    def bad_queue(**_: object) -> None:
+    def bad_queue() -> None:
         raise QueueValidationError(["duplicate pr_id: PR-001"])
 
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
+
     runner = _make_runner()
-    runner._parse_base_queue = bad_queue  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = bad_queue  # type: ignore[method-assign]
     result = asyncio.run(runner.recover_state())
 
     assert result is False

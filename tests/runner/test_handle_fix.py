@@ -3213,8 +3213,8 @@ def test_fix_iterations_survive_recovery_until_merge(
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
     monkeypatch.setattr(
         runner_module.PipelineRunner,
-        "_parse_base_queue",
-        lambda self, **_: parsed_tasks,
+        "_parse_tasks_from_headers",
+        lambda self: parsed_tasks,
     )
     monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
     monkeypatch.setattr(

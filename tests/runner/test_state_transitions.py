@@ -108,7 +108,7 @@ def _stub_recovery_queue(
     runner._origin_queue_md_tracked = (  # type: ignore[method-assign]
         lambda: queue_from_origin
     )
-    runner._parse_base_queue = (  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = (  # type: ignore[method-assign]
         lambda **_: list(tasks)
     )
 
