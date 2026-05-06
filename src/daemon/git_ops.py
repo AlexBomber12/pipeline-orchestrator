@@ -177,8 +177,8 @@ def _repo_looks_scaffolded(repo_path: str) -> bool:
 
     The probe must cover **every** asset scaffold_repo is responsible
     for, not just the three most visible ones — otherwise a partially
-    provisioned repo (pre-existing ``AGENTS.md`` + ``tasks/QUEUE.md``
-    + ``scripts/ci.sh`` but no ``scripts/make-review-artifacts.sh`` or
+    provisioned repo (pre-existing ``AGENTS.md`` + ``tasks/`` +
+    ``scripts/ci.sh`` but no ``scripts/make-review-artifacts.sh`` or
     missing scaffold-owned ``.gitignore`` entries) would permanently skip
     scaffolding on restart, leaving the missing files uncreated and
     letting later artifact/queue generation dirty the working tree until
@@ -191,7 +191,7 @@ def _repo_looks_scaffolded(repo_path: str) -> bool:
     if not path.exists():
         return False
     has_agents = (path / "AGENTS.md").exists() or (path / "CLAUDE.md").exists()
-    has_queue = (path / "tasks" / "QUEUE.md").exists()
+    has_tasks_dir = (path / "tasks").is_dir()
     has_ci = (path / "scripts" / "ci.sh").exists()
     has_review_artifacts = (
         path / "scripts" / "make-review-artifacts.sh"
@@ -203,7 +203,7 @@ def _repo_looks_scaffolded(repo_path: str) -> bool:
     )
     return (
         has_agents
-        and has_queue
+        and has_tasks_dir
         and has_ci
         and has_review_artifacts
         and has_gitignore_entries

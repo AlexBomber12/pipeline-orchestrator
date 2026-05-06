@@ -279,6 +279,26 @@ def test_repo_looks_scaffolded_returns_true_when_all_scaffold_files_exist(
     assert git_ops._repo_looks_scaffolded(str(repo)) is True
 
 
+def test_repo_looks_scaffolded_does_not_require_generated_queue(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "tasks").mkdir(parents=True)
+    (repo / "scripts").mkdir()
+    (repo / "AGENTS.md").write_text("agent\n", encoding="utf-8")
+    (repo / "scripts" / "ci.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    (repo / "scripts" / "make-review-artifacts.sh").write_text(
+        "#!/bin/sh\n",
+        encoding="utf-8",
+    )
+    (repo / ".gitignore").write_text(
+        "artifacts/\ntasks/QUEUE.md\n",
+        encoding="utf-8",
+    )
+
+    assert git_ops._repo_looks_scaffolded(str(repo)) is True
+
+
 def test_repo_looks_scaffolded_accepts_claude_file_instead_of_agents(
     tmp_path: Path,
 ) -> None:

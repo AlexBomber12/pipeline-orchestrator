@@ -2310,8 +2310,8 @@ def test_repo_looks_scaffolded_rejects_partial_provisioning(
 ) -> None:
     """The fs probe must require **every** asset scaffold_repo would
     commit — not just the three most visible files. A repo that
-    pre-existed with ``AGENTS.md`` + ``tasks/QUEUE.md`` +
-    ``scripts/ci.sh`` but no ``scripts/make-review-artifacts.sh``
+    pre-existed with ``AGENTS.md`` + ``tasks/`` + ``scripts/ci.sh``
+    but no ``scripts/make-review-artifacts.sh``
     (or missing scaffold-owned entries in ``.gitignore``) must NOT be
     classified as scaffolded: the daemon would otherwise skip
     scaffold_repo permanently, leaving those files uncreated, and
@@ -2322,7 +2322,6 @@ def test_repo_looks_scaffolded_rejects_partial_provisioning(
     base.mkdir()
     (base / "AGENTS.md").write_text("# AGENTS\n")
     (base / "tasks").mkdir()
-    (base / "tasks" / "QUEUE.md").write_text("# Task Queue\n")
     (base / "scripts").mkdir()
     (base / "scripts" / "ci.sh").write_text("#!/usr/bin/env bash\n")
     # Missing: scripts/make-review-artifacts.sh and .gitignore.
