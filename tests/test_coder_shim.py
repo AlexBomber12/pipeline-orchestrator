@@ -10,6 +10,7 @@ def _write_task(
     *,
     branch: str,
     status: str | None = "TODO",
+    body: str = "",
 ) -> None:
     tasks = repo / "tasks"
     tasks.mkdir(parents=True, exist_ok=True)
@@ -17,7 +18,8 @@ def _write_task(
     (tasks / f"{pr_id}.md").write_text(
         f"# {pr_id}: Sample\n\n"
         f"Branch: {branch}\n"
-        f"{status_line}",
+        f"{status_line}"
+        f"{body}",
         encoding="utf-8",
     )
 
@@ -91,6 +93,22 @@ def test_shim_returns_nothing_when_no_doing_task(tmp_path: Path) -> None:
 
 def test_shim_handles_multiple_doing_status(tmp_path: Path) -> None:
     _write_task(tmp_path, "PR-010", branch="pr-010", status="DOING")
+    _write_task(tmp_path, "PR-002", branch="pr-002", status="DOING")
+
+    result = _parse_doing_task(tmp_path)
+
+    assert result.returncode == 0
+    assert result.stdout == "PR-002\tpr-002\n"
+
+
+def test_shim_ignores_status_doing_outside_task_metadata(tmp_path: Path) -> None:
+    _write_task(
+        tmp_path,
+        "PR-001",
+        branch="pr-001",
+        status="TODO",
+        body="\n## Notes\n\n- Status: DOING\n",
+    )
     _write_task(tmp_path, "PR-002", branch="pr-002", status="DOING")
 
     result = _parse_doing_task(tmp_path)

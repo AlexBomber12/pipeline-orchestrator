@@ -51,7 +51,7 @@ parse_doing_task() {
     local f
     for f in "${repo_path}"/tasks/PR-*.md; do
         [[ -f "${f}" ]] || continue
-        if grep -Eq "^-? ?Status:[[:space:]]*DOING([[:space:]]*)$" "${f}"; then
+        if task_status_is_doing "${f}"; then
             task_file="${f}"
             break
         fi
@@ -89,6 +89,22 @@ task_branch() {
             sub(/^-? ?Branch:[[:space:]]*/, "")
             print
             exit 0
+        }
+    ' "${task_file}"
+}
+
+task_status_is_doing() {
+    local task_file="$1"
+    awk '
+        /^##[[:space:]]/ { exit 1 }
+        /^-? ?Status:[[:space:]]*DOING[[:space:]]*$/ {
+            found = 1
+            exit 0
+        }
+        END {
+            if (!found) {
+                exit 1
+            }
         }
     ' "${task_file}"
 }
