@@ -152,19 +152,17 @@ def _gitignored_paths(repo_path: str, paths: list[str]) -> set[str]:
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
-def _hooks_path_inside_worktree(repo_path: str) -> bool:
-    """Return ``True`` when ``core.hooksPath`` resolves inside the worktree
-    but outside ``.git/``.
+def _in_tree_hook_rel_path(repo_path: str) -> Path | None:
+    """Return the configured pre-push hook path relative to the worktree
+    root when ``core.hooksPath`` points inside the worktree but outside
+    ``.git/``; return ``None`` for the default ``.git/hooks/`` layout,
+    absolute paths outside the worktree, or when a probe fails.
 
-    Such a configuration (e.g. ``core.hooksPath=.githooks``) would land
-    ``pre-push`` as an untracked or modified worktree file when the
-    installer runs after ``scaffold_repo``'s stage/commit/push, dirtying
-    ``git status --porcelain`` and stalling subsequent preflight checks.
     The default ``.git/hooks/`` is technically inside the worktree
-    directory tree but invisible to ``git status``, so it does not
-    count.
+    directory tree but invisible to ``git status``, so it is not
+    treated as in-tree.
 
-    Errors and timeouts return ``False`` so a probe failure does not
+    Errors and timeouts return ``None`` so a probe failure does not
     silently disable the install path; the bash installer surfaces its
     own diagnostics for unwritable destinations.
     """
@@ -179,7 +177,7 @@ def _hooks_path_inside_worktree(repo_path: str) -> bool:
         subprocess.TimeoutExpired,
         OSError,
     ):
-        return False
+        return None
 
     repo_root = Path(repo_path)
     hook_path = Path(hook_proc.stdout.strip())
@@ -196,15 +194,107 @@ def _hooks_path_inside_worktree(repo_path: str) -> bool:
 
     try:
         hook_resolved.relative_to(git_dir_resolved)
-        return False
+        return None
     except ValueError:
         pass
 
     try:
-        hook_resolved.relative_to(toplevel_resolved)
-        return True
+        return hook_resolved.relative_to(toplevel_resolved)
     except ValueError:
+        return None
+
+
+def _hooks_path_inside_worktree(repo_path: str) -> bool:
+    """Return ``True`` when ``core.hooksPath`` resolves inside the worktree
+    but outside ``.git/``. Thin wrapper around :func:`_in_tree_hook_rel_path`.
+    """
+    return _in_tree_hook_rel_path(repo_path) is not None
+
+
+def _hook_dest_is_tracked(repo_path: str, rel_path: Path) -> bool:
+    """Return ``True`` if ``rel_path`` is tracked in ``repo_path``'s index.
+
+    Uses ``git ls-files --error-unmatch`` (rc=0 when tracked, non-zero
+    otherwise). Errors and timeouts default to ``False`` so a probe
+    failure cannot silently disable the install path; if we cannot prove
+    the destination is a user-versioned hook, we still install for
+    defense-in-depth.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", rel_path.as_posix()],
+            capture_output=True,
+            text=True,
+            cwd=repo_path,
+            check=False,
+            timeout=_LOCAL_GIT_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError):
         return False
+    return result.returncode == 0
+
+
+def _add_to_local_exclude(repo_path: str, rel_path: Path) -> None:
+    """Append ``rel_path`` to the per-clone ``info/exclude`` so the
+    installed hook does not show up as untracked under
+    ``git status --porcelain``.
+
+    The exclude file location is resolved via ``git rev-parse
+    --git-path info/exclude`` to honor non-default git-dir layouts
+    (linked worktrees, ``--separate-git-dir``). The pattern is anchored
+    with a leading ``/`` so it only matches the exact destination, never
+    a same-named file under a subdirectory. Idempotent: the entry is
+    only appended when missing.
+
+    Errors and timeouts are logged and swallowed; the hook still
+    functions (it is invoked by git regardless of exclude state), the
+    only consequence is that ``git status`` may surface the hook as
+    untracked until the operator handles it.
+    """
+    try:
+        proc = _run_git(
+            repo_path, "rev-parse", "--git-path", "info/exclude"
+        )
+    except (
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        OSError,
+    ) as exc:
+        logger.warning(
+            "scaffold_repo: cannot resolve info/exclude path (%s); "
+            "pre-push hook may dirty git status until ignored manually",
+            exc,
+        )
+        return
+
+    exclude_path = Path(proc.stdout.strip())
+    if not exclude_path.is_absolute():
+        exclude_path = Path(repo_path) / exclude_path
+
+    pattern = "/" + rel_path.as_posix()
+    try:
+        existing = (
+            exclude_path.read_text(encoding="utf-8")
+            if exclude_path.exists()
+            else ""
+        )
+        if pattern in existing.splitlines():
+            return
+        suffix = (
+            "" if not existing or existing.endswith("\n") else "\n"
+        )
+        exclude_path.parent.mkdir(parents=True, exist_ok=True)
+        exclude_path.write_text(
+            existing + suffix + pattern + "\n", encoding="utf-8"
+        )
+    except OSError as exc:
+        logger.warning(
+            "scaffold_repo: failed to update %s with %s (%s); pre-push "
+            "hook may dirty git status until ignored manually",
+            exclude_path,
+            pattern,
+            exc,
+        )
 
 
 def _install_pre_push_hook(repo_path: str) -> None:
@@ -225,19 +315,35 @@ def _install_pre_push_hook(repo_path: str) -> None:
     silently bypassed hook in ``.git/hooks/``.
 
     When ``core.hooksPath`` points at an in-worktree location (for
-    example a relative ``.githooks/`` shared via the repo) the install
-    is skipped: writing the hook there would land it as an untracked
-    or modified worktree file after ``scaffold_repo`` has already
-    staged/committed/pushed, perpetually dirtying ``git status`` and
-    stalling later preflight checks. PR-271's prompt-header defense
-    still applies, so the cost is reduced redundancy on these repos.
+    example a relative ``.githooks/`` versioned with the repo) two
+    extra concerns apply on top of the basic install:
+
+    - The destination may be a checked-in user-versioned hook. We
+      refuse to clobber tracked files (detected via ``git ls-files
+      --error-unmatch``) and log a warning instead. The repo keeps
+      its own hook; PR-271's AUTO PR prompt-header defense still
+      gates the daemon from the dispatch side.
+    - When the destination is untracked or absent we install as
+      usual, then append the relative path to the per-clone
+      ``info/exclude`` so the new hook file does not show up as
+      untracked under ``git status --porcelain`` and stall later
+      preflight checks. Earlier revisions of this PR skipped install
+      entirely in this configuration to avoid the dirty status, but
+      that disabled the branch-guard for repos that intentionally
+      version hooks in-tree — defense-in-depth wins, and the exclude
+      keeps preflight clean.
     """
-    if _hooks_path_inside_worktree(repo_path):
-        logger.info(
+    in_tree_rel = _in_tree_hook_rel_path(repo_path)
+    if in_tree_rel is not None and _hook_dest_is_tracked(
+        repo_path, in_tree_rel
+    ):
+        logger.warning(
             "scaffold_repo: skipping pre-push hook install for %s — "
-            "core.hooksPath resolves inside the worktree (would dirty "
-            "git status)",
+            "core.hooksPath destination %s is a tracked file; refusing "
+            "to clobber a user-versioned hook (PR-271 prompt-header "
+            "defense still applies)",
             repo_path,
+            in_tree_rel.as_posix(),
         )
         return
     try:
@@ -256,6 +362,9 @@ def _install_pre_push_hook(repo_path: str) -> None:
         logger.warning(
             "scaffold_repo: pre-push hook install failed: %s", exc
         )
+        return
+    if in_tree_rel is not None:
+        _add_to_local_exclude(repo_path, in_tree_rel)
 
 
 def _run_git(
