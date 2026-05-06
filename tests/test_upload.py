@@ -279,7 +279,7 @@ def test_upload_handles_corrupt_state_and_accepts_busy_repos(
         client.app.state.redis = _BusyRedis()
         busy = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file()],
+            files=[_task_file()],
         )
 
     assert busy.status_code == 200
@@ -323,46 +323,44 @@ def test_upload_without_queue_md(
     assert (staging / "PR-001.md").exists()
 
 
-def test_upload_rejects_malformed_queue_md(
+def test_upload_rejects_queue_md_in_zip(
     one_repo_config: Path,
     repo_dir: Path,
     uploads_dir: Path,
 ) -> None:
-    malformed_queue = (
-        "files",
-        (
-            "QUEUE.md",
-            b"## PR-001: First\n- Status: TODO\n- Tasks file: PR-001.md\n- Branch: same\n"
-            b"## PR-001: Duplicate\n- Status: TODO\n- Tasks file: PR-002.md\n- Branch: same\n",
-            "text/markdown",
-        ),
-    )
+    resp = _post_upload([_zip_file({"QUEUE.md": b"# Task Queue\n"})])
 
-    with TestClient(app) as client:
-        resp = client.post(
-            "/repos/example__alpha/upload-tasks",
-            files=[malformed_queue, _task_file()],
-        )
-
-    assert resp.status_code == 400
-    assert "QUEUE.md validation failed" in resp.text
+    assert resp.status_code == 422
+    assert (
+        "Invalid file name: &#39;QUEUE.md&#39;. Only AGENTS.md, "
+        "CLAUDE.md, and PR-*.md allowed."
+    ) in resp.text
 
 
-def test_upload_rejects_non_utf8_queue_and_task_files(
+def test_upload_rejects_queue_md_as_loose_file(
     one_repo_config: Path,
     repo_dir: Path,
 ) -> None:
     with TestClient(app) as client:
         queue_resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[("files", ("QUEUE.md", b"\xff", "text/markdown"))],
+            files=[_queue_file()],
         )
-        assert queue_resp.status_code == 400
-        assert "QUEUE.md is not valid UTF-8" in queue_resp.text
+        assert queue_resp.status_code == 422
+        assert (
+            "Invalid file name: &#39;QUEUE.md&#39;. Only AGENTS.md, "
+            "CLAUDE.md, and PR-*.md allowed."
+        ) in queue_resp.text
 
+
+def test_upload_rejects_non_utf8_task_files(
+    one_repo_config: Path,
+    repo_dir: Path,
+) -> None:
+    with TestClient(app) as client:
         task_resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file(), ("files", ("PR-001.md", b"\xff", "text/markdown"))],
+            files=[("files", ("PR-001.md", b"\xff", "text/markdown"))],
         )
 
     assert task_resp.status_code == 400
@@ -377,7 +375,7 @@ def test_upload_invalid_filename(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file(), _bad_file()],
+            files=[_bad_file()],
         )
     assert resp.status_code == 422
     assert "Invalid file name" in resp.text
@@ -391,12 +389,11 @@ def test_upload_stages_files_and_sets_redis_key(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file(), _task_file()],
+            files=[_task_file()],
         )
 
     assert resp.status_code == 200
     assert "Accepted 1 task file (PR-001)." in resp.text
-    assert "Also uploaded helper file: QUEUE.md." in resp.text
     assert resp.headers["HX-Retarget"] == "#upload-feedback-example__alpha"
     assert "Dismiss upload feedback" in resp.text
     assert "::load" in resp.text
@@ -406,9 +403,7 @@ def test_upload_stages_files_and_sets_redis_key(
     subdirs = list(repo_upload_dir.iterdir())
     assert len(subdirs) == 1
     staging = subdirs[0]
-    assert (staging / "QUEUE.md").exists()
     assert (staging / "PR-001.md").exists()
-    assert (staging / "QUEUE.md").read_bytes() == b"# Task Queue\n"
 
 
 def test_upload_zip_with_pr_files_extracts_and_succeeds(
@@ -716,7 +711,7 @@ def test_upload_rejects_task_without_depends_on(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file(), _task_file(depends_on=None)],
+            files=[_task_file(depends_on=None)],
         )
 
     assert resp.status_code == 400
@@ -733,9 +728,7 @@ def test_upload_rejects_non_numeric_task_without_depends_on(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[
-                _queue_file(),
-                _task_file(name="PR-ABC.md", pr_id="PR-ABC", depends_on=None),
+            files=[_task_file(name="PR-ABC.md", pr_id="PR-ABC", depends_on=None),
             ],
         )
 
@@ -752,9 +745,7 @@ def test_upload_validates_only_last_duplicate_task_copy(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[
-                _queue_file(),
-                _task_file(depends_on=None),
+            files=[_task_file(depends_on=None),
                 _task_file(depends_on="none"),
             ],
         )
@@ -770,9 +761,7 @@ def test_upload_task_validation_errors_reference_uploaded_filename(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[
-                _queue_file(),
-                _task_file(name="PR-ABC.md", pr_id="PR-ABC", depends_on="PR-001, nope"),
+            files=[_task_file(name="PR-ABC.md", pr_id="PR-ABC", depends_on="PR-001, nope"),
             ],
         )
 
@@ -790,7 +779,7 @@ def test_upload_surfaces_invalid_type_details(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file(), _task_file(task_type="nonsense")],
+            files=[_task_file(task_type="nonsense")],
         )
 
     assert resp.status_code == 400
@@ -809,7 +798,7 @@ def test_upload_accepts_type_synonyms(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file(), _task_file(task_type="bug")],
+            files=[_task_file(task_type="bug")],
         )
 
     assert resp.status_code == 200
@@ -841,9 +830,7 @@ def test_upload_aggregates_errors_across_multiple_invalid_files(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[
-                _queue_file(),
-                _task_file(name="PR-001.md", pr_id="PR-001"),
+            files=[_task_file(name="PR-001.md", pr_id="PR-001"),
                 _task_file(
                     name="PR-002.md", pr_id="PR-002", task_type="nonsense"
                 ),
@@ -867,9 +854,7 @@ def test_upload_aggregates_errors_when_all_files_invalid(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[
-                _queue_file(),
-                _task_file(
+            files=[_task_file(
                     name="PR-001.md", pr_id="PR-001", task_type="nope1"
                 ),
                 _task_file(
@@ -893,9 +878,7 @@ def test_upload_aggregated_depends_on_hint_appended_when_multi_file(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[
-                _queue_file(),
-                _task_file(name="PR-001.md", pr_id="PR-001", depends_on=None),
+            files=[_task_file(name="PR-001.md", pr_id="PR-001", depends_on=None),
                 _task_file(name="PR-002.md", pr_id="PR-002", depends_on=None),
             ],
         )
@@ -913,7 +896,7 @@ def test_upload_truncates_aggregated_errors_over_fifty(
 ) -> None:
     """When more than 50 task files are invalid the report is capped at
     50 entries with a trailing summary line."""
-    files = [_queue_file()]
+    files = []
     for i in range(1, 53):
         files.append(
             _task_file(
@@ -937,7 +920,7 @@ def test_upload_depends_on_hint_appended_when_truncated_out(
 ) -> None:
     """A `missing Depends on` error beyond the 50-entry truncation
     boundary still surfaces the friendly hint line."""
-    files = [_queue_file()]
+    files = []
     for i in range(1, 51):
         files.append(
             _task_file(
@@ -967,9 +950,7 @@ def test_upload_succeeds_when_batch_is_all_valid(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[
-                _queue_file(),
-                _task_file(name="PR-001.md", pr_id="PR-001"),
+            files=[_task_file(name="PR-001.md", pr_id="PR-001"),
                 _task_file(name="PR-002.md", pr_id="PR-002"),
                 _task_file(name="PR-003.md", pr_id="PR-003"),
             ],
@@ -1004,7 +985,7 @@ def test_upload_accepts_task_with_depends_on_none(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file(), _task_file(depends_on="none")],
+            files=[_task_file(depends_on="none")],
         )
 
     assert resp.status_code == 200
@@ -1018,7 +999,7 @@ def test_upload_accepts_task_with_dependencies(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file(), _task_file(depends_on="PR-001, PR-002")],
+            files=[_task_file(depends_on="PR-001, PR-002")],
         )
 
     assert resp.status_code == 200
@@ -1032,9 +1013,7 @@ def test_upload_success_message_handles_non_numeric_pr_ids(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[
-                _queue_file(),
-                _task_file(name="PR-ABC.md", pr_id="PR-ABC", depends_on="none"),
+            files=[_task_file(name="PR-ABC.md", pr_id="PR-ABC", depends_on="none"),
             ],
         )
 
@@ -1047,18 +1026,18 @@ def test_upload_allows_non_task_files_without_validation(
     repo_dir: Path,
     uploads_dir: Path,
 ) -> None:
-    queue = ("files", ("QUEUE.md", b"# Task Queue\n", "text/markdown"))
     agents = ("files", ("AGENTS.md", b"# AGENTS\n", "text/markdown"))
+    claude = ("files", ("CLAUDE.md", b"# CLAUDE\n", "text/markdown"))
 
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[queue, agents],
+            files=[agents, claude],
         )
 
     assert resp.status_code == 200
     assert "Accepted 0 task files." in resp.text
-    assert "Also uploaded helper files: AGENTS.md, QUEUE.md." in resp.text
+    assert "Also uploaded helper files: AGENTS.md, CLAUDE.md." in resp.text
 
 
 def test_upload_writes_redis_manifest(
@@ -1087,14 +1066,14 @@ def test_upload_writes_redis_manifest(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file(), _task_file(name="PR-002.md")],
+            files=[_task_file(name="PR-002.md")],
         )
 
     assert resp.status_code == 200
     assert "upload:example__alpha:pending" in redis_sets
     manifest = json.loads(redis_sets["upload:example__alpha:pending"])
     assert manifest["repo"] == "example__alpha"
-    assert set(manifest["files"]) == {"QUEUE.md", "PR-002.md"}
+    assert set(manifest["files"]) == {"PR-002.md"}
     assert "staging_dir" in manifest
     assert "/example__alpha/" in manifest["staging_dir"]
 
@@ -1126,7 +1105,7 @@ def test_upload_accepts_tasks_during_coding_state(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file(), _task_file()],
+            files=[_task_file()],
         )
 
     assert resp.status_code == 200
@@ -1173,7 +1152,7 @@ def test_upload_cleans_staging_on_redis_failure(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file()],
+            files=[_task_file()],
         )
 
     assert resp.status_code == 503
@@ -1194,14 +1173,14 @@ def test_upload_preserves_staging_on_success(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file()],
+            files=[_task_file()],
         )
 
     assert resp.status_code == 200
     repo_upload = uploads_dir / "example__alpha"
     subdirs = list(repo_upload.iterdir())
     assert len(subdirs) >= 1
-    assert (subdirs[0] / "QUEUE.md").exists()
+    assert (subdirs[0] / "PR-001.md").exists()
 
 
 def test_upload_large_plain_file_is_rejected(
@@ -1214,7 +1193,7 @@ def test_upload_large_plain_file_is_rejected(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[("files", ("QUEUE.md", b"x" * 20, "text/markdown"))],
+            files=[("files", ("AGENTS.md", b"x" * 20, "text/markdown"))],
         )
 
     assert resp.status_code == 422
@@ -1266,19 +1245,19 @@ def test_upload_merge_pending_manifest_and_ignore_scan_errors(
         client.app.state.redis = _PendingRedis()
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file()],
+            files=[("files", ("CLAUDE.md", b"# CLAUDE\n", "text/markdown"))],
         )
         redis_client = client.app.state.redis
 
     assert resp.status_code == 200
     assert redis_client.manifest is not None
     manifest = json.loads(redis_client.manifest)
-    assert set(manifest["files"]) == {"QUEUE.md", "AGENTS.md"}
+    assert set(manifest["files"]) == {"CLAUDE.md", "AGENTS.md"}
     assert (Path(manifest["staging_dir"]) / "AGENTS.md").read_text(
         encoding="utf-8"
     ) == "# AGENTS\n"
     assert "Accepted 0 task files." in resp.text
-    assert "Also uploaded helper file: QUEUE.md." in resp.text
+    assert "Also uploaded helper file: CLAUDE.md." in resp.text
     assert "AGENTS.md" not in resp.text
 
 
@@ -1308,7 +1287,7 @@ def test_upload_ignores_pending_manifest_read_errors(
         client.app.state.redis = _ManifestReadErrorRedis()
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file()],
+            files=[_task_file()],
         )
 
     assert resp.status_code == 200
@@ -1340,7 +1319,7 @@ def test_upload_ignores_invalid_existing_manifest_payload(
         client.app.state.redis = _BadExistingManifestRedis()
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file()],
+            files=[_task_file()],
         )
 
     assert resp.status_code == 200
@@ -1379,7 +1358,7 @@ def test_upload_publishes_wake_message(
         client.app.state.redis = _PublishingRedis()
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_queue_file()],
+            files=[_task_file()],
         )
         redis_client = client.app.state.redis
 
@@ -1423,7 +1402,7 @@ def test_upload_succeeds_when_publish_wake_fails(
         with caplog.at_level("WARNING", logger=web_app.logger.name):
             resp = client.post(
                 "/repos/example__alpha/upload-tasks",
-                files=[_queue_file()],
+                files=[_task_file()],
             )
 
     assert resp.status_code == 200
