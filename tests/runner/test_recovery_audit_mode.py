@@ -1219,3 +1219,97 @@ def test_headers_only_mode_does_not_hydrate_when_persisted_idle(
     assert runner._crashed_task_pr_ids == set()
     assert runner.state.current_queue is not None
     assert runner.state.current_queue[0].status == TaskStatus.TODO
+
+
+def test_headers_only_mode_does_not_hydrate_non_coding_persisted_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A WATCH snapshot whose PR vanished must not be marked CANCELED.
+
+    Hydrating ``current_task`` for any persisted ``state`` would
+    misclassify a benign restart as a mid-CODING crash whenever the
+    PR is no longer open: ``derive_task_status`` would fall through
+    to the ``current_task_pr_id`` branch, return ``DOING``, and
+    ``_apply_recovery_decisions`` would force manual re-upload via
+    the PR-186 crash path. The hydrate must be gated on
+    ``PipelineState.CODING`` — the only state where ``current_task``
+    is set without an open PR.
+    """
+    from src.keyspace import pipeline_state as _pipeline_state_key
+    from src.models import RepoState
+
+    _set_env(monkeypatch, audit="0", headers="1")
+    _stub_open_prs(monkeypatch, [])
+    _stub_resolve_merged_state(monkeypatch)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_pr_md(repo, "PR-200", "pr-200-watch-pr-gone", priority=1)
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+    persisted = RepoState(
+        url=runner.repo_config.url,
+        name=runner.name,
+        state=PipelineState.WATCH,
+        current_task=QueueTask(
+            pr_id="PR-200",
+            title="WATCH snapshot",
+            status=TaskStatus.DOING,
+            branch="pr-200-watch-pr-gone",
+            task_file="tasks/PR-200.md",
+        ),
+    )
+    asyncio.run(
+        runner.redis.set(
+            _pipeline_state_key(runner.name), persisted.model_dump_json()
+        )
+    )
+
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert "PR-200" not in runner._crashed_task_pr_ids
+    assert runner.state.current_queue is not None
+    entry = next(
+        (t for t in runner.state.current_queue if t.pr_id == "PR-200"),
+        None,
+    )
+    assert entry is not None
+    assert entry.status == TaskStatus.TODO
+
+
+def test_hydrate_current_task_skips_non_coding_persisted_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The helper itself must skip hydration when persisted state != CODING.
+
+    Direct unit-level guard so the gating cannot regress without a
+    failing test, independent of the full ``recover_state`` flow.
+    """
+    from src.keyspace import pipeline_state as _pipeline_state_key
+    from src.models import RepoState
+
+    runner = h._make_runner()
+    persisted = RepoState(
+        url=runner.repo_config.url,
+        name=runner.name,
+        state=PipelineState.WATCH,
+        current_task=QueueTask(
+            pr_id="PR-STALE",
+            title="stale watch",
+            status=TaskStatus.DOING,
+            branch="pr-stale",
+        ),
+    )
+    asyncio.run(
+        runner.redis.set(
+            _pipeline_state_key(runner.name), persisted.model_dump_json()
+        )
+    )
+    assert runner.state.current_task is None
+
+    asyncio.run(runner._hydrate_current_task_from_persisted_state())
+
+    assert runner.state.current_task is None

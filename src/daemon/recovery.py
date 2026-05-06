@@ -583,6 +583,19 @@ class RecoveryMixin:
         crash mid-CODING (no open PR yet) re-derives the task as
         ``TODO`` rather than ``DOING``.
 
+        Hydration is gated on a persisted ``CODING`` state because that
+        is the only crash-relevant scenario: ``current_task`` is set
+        without an open PR only between IDLE→CODING dispatch and the
+        coder's first push. Snapshots from WATCH/FIX/MERGE always have
+        a matching open PR by construction, so ``derive_task_status``
+        already returns ``DOING`` via ``find_matching_open_pr`` without
+        the ``current_task_pr_id`` fallback. Hydrating those snapshots
+        would misclassify a benign restart as a crash if the PR has
+        since been closed externally: ``derive_task_status`` would fall
+        through to the ``current_task_pr_id`` branch, return ``DOING``,
+        and ``_apply_recovery_decisions`` would mark the task
+        ``CANCELED`` and force manual re-upload.
+
         Best-effort: Redis read errors, missing snapshots, and corrupt
         payloads all leave ``state.current_task`` untouched. This is
         deliberately narrow — we only hydrate ``current_task`` because
@@ -604,6 +617,8 @@ class RecoveryMixin:
         try:
             persisted = RepoState.model_validate_json(raw)
         except Exception:
+            return
+        if persisted.state != PipelineState.CODING:
             return
         if persisted.current_task is not None:
             self.state.current_task = persisted.current_task
