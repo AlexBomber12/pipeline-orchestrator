@@ -32,27 +32,20 @@ parse_doing_task() {
     local pr=""
     local task_file=""
     local branch=""
-    local runtime_pr=""
-    local runtime_task_file=""
-    local runtime_branch=""
     if [[ -f "${runtime_file}" ]]; then
         pr="$(head -n 1 "${runtime_file}" | tr -d '[:space:]')"
         if [[ -n "${pr}" ]]; then
-            runtime_task_file="${repo_path}/tasks/${pr}.md"
-            if [[ -f "${runtime_task_file}" ]]; then
-                runtime_branch="$(task_branch "${runtime_task_file}")"
-                if [[ -n "${runtime_branch}" ]] &&
-                    { task_status_is_doing "${runtime_task_file}" ||
-                        ! task_has_status "${runtime_task_file}"; }; then
-                    runtime_pr="${pr}"
-                    if task_status_is_doing "${runtime_task_file}"; then
-                        printf '%s\t%s\n' "${runtime_pr}" "${runtime_branch}"
-                        return 0
-                    fi
+            task_file="${repo_path}/tasks/${pr}.md"
+            if [[ -f "${task_file}" ]]; then
+                branch="$(task_branch "${task_file}")"
+                if [[ -n "${branch}" ]]; then
+                    printf '%s\t%s\n' "${pr}" "${branch}"
+                    return 0
                 fi
             fi
         fi
         pr=""
+        task_file=""
     fi
 
     local f
@@ -64,10 +57,6 @@ parse_doing_task() {
         fi
     done
     if [[ -z "${task_file}" ]]; then
-        if [[ -n "${runtime_pr}" ]]; then
-            printf '%s\t%s\n' "${runtime_pr}" "${runtime_branch}"
-            return 0
-        fi
         return 1
     fi
 
@@ -109,22 +98,6 @@ task_status_is_doing() {
     awk '
         /^##[[:space:]]/ { exit 1 }
         /^-? ?Status:[[:space:]]*DOING[[:space:]]*$/ {
-            found = 1
-            exit 0
-        }
-        END {
-            if (!found) {
-                exit 1
-            }
-        }
-    ' "${task_file}"
-}
-
-task_has_status() {
-    local task_file="$1"
-    awk '
-        /^##[[:space:]]/ { exit 1 }
-        /^-? ?Status:[[:space:]]*/ {
             found = 1
             exit 0
         }

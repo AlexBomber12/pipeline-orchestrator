@@ -50,7 +50,7 @@ def test_shim_reads_active_pr_from_runtime_file(tmp_path: Path) -> None:
     assert result.stdout == "PR-005\tpr-005\n"
 
 
-def test_shim_runtime_file_does_not_override_doing_metadata(
+def test_shim_honors_runtime_file_before_doing_metadata(
     tmp_path: Path,
 ) -> None:
     _write_task(tmp_path, "PR-001", branch="pr-001", status=None)
@@ -62,7 +62,7 @@ def test_shim_runtime_file_does_not_override_doing_metadata(
     result = _parse_doing_task(tmp_path)
 
     assert result.returncode == 0
-    assert result.stdout == "PR-002\tpr-002\n"
+    assert result.stdout == "PR-001\tpr-001\n"
 
 
 def test_shim_falls_back_to_status_doing_in_pr_md(tmp_path: Path) -> None:
