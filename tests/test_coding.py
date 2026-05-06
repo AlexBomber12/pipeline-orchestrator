@@ -1013,3 +1013,84 @@ def test_handle_coding_task_file_read_error_transitions_to_error(
     assert "permission denied" in (runner.state.error_message or "")
     assert "Cannot read task file" in (runner.state.error_message or "")
 
+
+def test_handle_coding_uses_queue_task_file_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """When ``current_task.task_file`` points at a non-default location,
+    the AUTO PR dispatch reads from that path instead of hardcoding
+    ``tasks/{pr_id}.md``. Otherwise CODING fails on queue entries the
+    parser legitimately registered with a non-default path."""
+    pr_id = "PR-XYZ"
+    body = "# PR-XYZ\n\nBranch: pr-xyz\n"
+    custom_dir = tmp_path / "subdir" / "tasks"
+    custom_dir.mkdir(parents=True)
+    custom_path = custom_dir / "PR-XYZ.md"
+    custom_path.write_text(body, encoding="utf-8")
+
+    runner = _runner_for_auto_pr_dispatch(
+        monkeypatch, tmp_path, pr_id=pr_id, write_task_file=False
+    )
+    runner.state.current_task = QueueTask(
+        pr_id=pr_id,
+        title="Sample task",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="subdir/tasks/PR-XYZ.md",
+    )
+    runner._post_codex_review = lambda pr_number: True  # type: ignore[method-assign]
+
+    captured: dict[str, Any] = {}
+
+    async def fake_run_auto_pr(
+        repo_path: str, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        captured["kwargs"] = dict(kwargs)
+        return (0, "ok", "")
+
+    _, plugin = runner._get_coder()
+    monkeypatch.setattr(plugin, "run_auto_pr", fake_run_auto_pr)
+
+    asyncio.run(runner.handle_coding())
+
+    assert captured["kwargs"]["task_file"] == "subdir/tasks/PR-XYZ.md"
+    assert captured["kwargs"]["task_body"] == body
+
+
+def test_handle_coding_falls_back_to_default_path_when_task_file_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A legacy queue entry without ``task_file`` set falls back to the
+    conventional ``tasks/{pr_id}.md`` path so existing dispatch behavior
+    is preserved for unmigrated queues."""
+    pr_id = "PR-LEGACY"
+    runner = _runner_for_auto_pr_dispatch(
+        monkeypatch, tmp_path, pr_id=pr_id, task_body="# legacy body\n"
+    )
+    runner.state.current_task = QueueTask(
+        pr_id=pr_id,
+        title="Legacy task",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file=None,
+    )
+    runner._post_codex_review = lambda pr_number: True  # type: ignore[method-assign]
+
+    captured: dict[str, Any] = {}
+
+    async def fake_run_auto_pr(
+        repo_path: str, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        captured["kwargs"] = dict(kwargs)
+        return (0, "ok", "")
+
+    _, plugin = runner._get_coder()
+    monkeypatch.setattr(plugin, "run_auto_pr", fake_run_auto_pr)
+
+    asyncio.run(runner.handle_coding())
+
+    assert captured["kwargs"]["task_file"] == f"tasks/{pr_id}.md"
+    assert captured["kwargs"]["task_body"] == "# legacy body\n"
+

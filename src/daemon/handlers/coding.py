@@ -144,9 +144,13 @@ class CodingMixin:
         # coder so the daemon supplies the canonical pr_id, task_file, and
         # task_body explicitly. This replaces the prior PLANNED PR
         # indirection where the coder discovered its task via QUEUE.md.
+        # Honor ``current_task.task_file`` (parsed from ``tasks/QUEUE.md`` by
+        # IDLE) so a queued entry pointing at a non-default location still
+        # resolves correctly; only fall back to ``tasks/{pr_id}.md`` when
+        # the queue entry omits the path (legacy entries).
         assert self.state.current_task is not None
         pr_id = self.state.current_task.pr_id
-        task_file = f"tasks/{pr_id}.md"
+        task_file = self.state.current_task.task_file or f"tasks/{pr_id}.md"
         task_body_path = Path(self.repo_path) / task_file
         try:
             task_body = task_body_path.read_text(encoding="utf-8")

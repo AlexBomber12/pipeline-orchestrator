@@ -16,6 +16,7 @@ guaranteed to match what would actually be written.
 from __future__ import annotations
 
 import difflib
+import re
 from collections.abc import Callable
 from pathlib import Path
 
@@ -23,11 +24,61 @@ from src.mcp.scans import scan_for_conflicts
 from src.onboarding.agents_md_template import daemon_managed_content
 from src.onboarding.markdown_sections import apply_managed_regions
 
+# Mirrors the marker regex in ``markdown_sections``; duplicated here so the
+# legacy migration can locate managed-region spans without leaking that
+# private symbol across modules.
+_MANAGED_MARKER_RE = re.compile(
+    r"<!-- pipeline-orchestrator: managed (BEGIN|END) (\S+) -->"
+)
+
+
+# A pre-PR-271 onboarded repo's AGENTS.md (or a freshly scaffolded one whose
+# template still carries the unmarked block) has a "Quick rules" heading
+# followed by a dash-bullet list with no managed markers. Now that
+# ``quick_rules`` is a managed section, ``apply_managed_regions`` would
+# leave that legacy block in place and append a second managed copy at EOF,
+# producing two conflicting copies. Detect the legacy form and strip it
+# before reconciliation runs.
+_LEGACY_QUICK_RULES_RE = re.compile(
+    r"""
+    ^(?:[ \t]*\#{1,3}[ \t]+)?Quick[ \t]+rules[ \t]*\n   # heading line
+    (?:[ \t]*-[ \t][^\n]*\n)+                            # 1+ dash bullets
+    """,
+    re.MULTILINE | re.VERBOSE,
+)
+
+
+def _strip_legacy_quick_rules(content: str) -> str:
+    """Remove an unmarked legacy 'Quick rules' block outside managed regions.
+
+    Operates only on segments that fall outside ``pipeline-orchestrator``
+    managed markers so the regex cannot accidentally match the heading of
+    the new managed ``quick_rules`` section. Each unmanaged segment is
+    matched once; multiple unmarked blocks across separate segments would
+    each get stripped.
+    """
+    matches = list(_MANAGED_MARKER_RE.finditer(content))
+    if not matches:
+        return _LEGACY_QUICK_RULES_RE.sub("", content, count=1)
+
+    parts: list[str] = []
+    cursor = 0
+    for begin, end in zip(matches[0::2], matches[1::2]):
+        outside = content[cursor:begin.start()]
+        parts.append(_LEGACY_QUICK_RULES_RE.sub("", outside, count=1))
+        parts.append(content[begin.start():end.end()])
+        cursor = end.end()
+    parts.append(
+        _LEGACY_QUICK_RULES_RE.sub("", content[cursor:], count=1)
+    )
+    return "".join(parts)
+
 
 def _proposed_content(current_content: str) -> str:
     """Return what the AGENTS.md file would look like after reconciliation."""
     regions = daemon_managed_content()
-    return apply_managed_regions(current_content, regions)
+    migrated = _strip_legacy_quick_rules(current_content)
+    return apply_managed_regions(migrated, regions)
 
 
 def _unified_diff_text(before: str, after: str, label: str) -> str:
