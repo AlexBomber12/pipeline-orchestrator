@@ -57,19 +57,19 @@ def test_shim_falls_back_to_status_doing_in_pr_md(tmp_path: Path) -> None:
     assert result.stdout == "PR-005\tpr-005\n"
 
 
-def test_shim_falls_back_to_statusless_pr_md(tmp_path: Path) -> None:
+def test_shim_fails_fast_with_only_statusless_pr_md(tmp_path: Path) -> None:
     _write_task(tmp_path, "PR-005", branch="pr-005", status=None)
 
     result = _parse_doing_task(tmp_path)
 
-    assert result.returncode == 0
-    assert result.stdout == "PR-005\tpr-005\n"
+    assert result.returncode == 1
+    assert result.stdout == ""
 
 
 def test_shim_ignores_stale_runtime_file_before_fallback(
     tmp_path: Path,
 ) -> None:
-    _write_task(tmp_path, "PR-005", branch="pr-005", status=None)
+    _write_task(tmp_path, "PR-005", branch="pr-005", status="DOING")
     runtime_dir = tmp_path / ".daemon-runtime"
     runtime_dir.mkdir()
     (runtime_dir / "active-pr-id").write_text("PR-999\n", encoding="utf-8")

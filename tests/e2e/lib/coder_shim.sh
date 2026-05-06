@@ -24,8 +24,8 @@ parse_doing_task() {
     # Returns non-zero when no DOING task is found.
     # Prefers the daemon's test-only runtime marker and falls back to the
     # first PR-*.md task file whose header/frontmatter says Status: DOING.
-    # Status-less task files are accepted as a final fallback because the
-    # dashboard upload template does not write a Status header.
+    # If neither signal exists, fail fast instead of guessing from statusless
+    # uploaded task files.
     local repo_path="${1:-${REPO_DIR}}"
     local runtime_file
     runtime_file="$(_active_pr_runtime_path "${repo_path}")"
@@ -49,21 +49,13 @@ parse_doing_task() {
     fi
 
     local f
-    local statusless_task_file=""
     for f in "${repo_path}"/tasks/PR-*.md; do
         [[ -f "${f}" ]] || continue
         if grep -Eq "^-? ?Status:[[:space:]]*DOING([[:space:]]*)$" "${f}"; then
             task_file="${f}"
             break
         fi
-        if [[ -z "${statusless_task_file}" ]] &&
-            ! grep -Eq "^-? ?Status:[[:space:]]*" "${f}"; then
-            statusless_task_file="${f}"
-        fi
     done
-    if [[ -z "${task_file}" ]]; then
-        task_file="${statusless_task_file}"
-    fi
     if [[ -z "${task_file}" ]]; then
         return 1
     fi
