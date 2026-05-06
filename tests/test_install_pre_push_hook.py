@@ -249,3 +249,85 @@ def test_hook_strips_trailing_newline_from_expected(
     )
     result = _run_hook(repo)
     assert result.returncode == 0, result.stderr
+
+
+def test_hook_resolves_marker_in_linked_worktree(tmp_path: Path) -> None:
+    """In a linked worktree ``.git`` is a *file* pointing at the per-checkout
+    git directory under ``<main>/.git/worktrees/<name>/``; the hook must
+    resolve ``info/expected-branch`` via ``git rev-parse --git-path`` so the
+    marker is read from the per-worktree gitdir. A hardcoded
+    ``.git/info/expected-branch`` lookup would silently no-op (the path
+    does not resolve to a regular file under the ``.git`` *file*) and
+    branch validation would be silently disabled for every linked
+    worktree.
+    """
+    env = os.environ.copy()
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.com",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.com",
+        }
+    )
+    main_repo = _init_repo(tmp_path)
+    (main_repo / "x.txt").write_text("ok\n")
+    subprocess.run(
+        ["git", "-C", str(main_repo), "add", "x.txt"], check=True, env=env
+    )
+    subprocess.run(
+        ["git", "-C", str(main_repo), "commit", "-q", "-m", "init"],
+        check=True,
+        env=env,
+    )
+    worktree = tmp_path / "wt"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(main_repo),
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            str(worktree),
+        ],
+        check=True,
+        env=env,
+    )
+    # In a linked worktree ``.git`` is a file, not a directory.
+    assert (worktree / ".git").is_file()
+    _install(worktree)
+    # Resolve where git stored the hook (linked worktrees inherit
+    # ``hooks/`` from the main repo's gitdir) and where it stores
+    # ``info/expected-branch`` for this worktree. The hook must read
+    # from the per-worktree marker path, not from
+    # ``<worktree>/.git/info/...`` (which does not exist because
+    # ``.git`` is a file).
+    def _git_path(rel: str) -> Path:
+        out = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "--git-path", rel],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        path = Path(out)
+        if not path.is_absolute():
+            path = worktree / path
+        return path
+
+    hook_file = _git_path("hooks/pre-push")
+    assert hook_file.exists()
+    marker = _git_path("info/expected-branch")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("expected-branch-name\n")
+    result = subprocess.run(
+        [str(hook_file), "origin", "ssh://x"],
+        cwd=str(worktree),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "[pre-push-hook] BLOCKED" in result.stderr
+    assert "expected branch 'expected-branch-name'" in result.stderr

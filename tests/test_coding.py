@@ -1441,3 +1441,120 @@ def test_coding_deletes_expected_branch_on_late_breach_pause(
 
     assert runner.state.state == PipelineState.PAUSED
     assert not expected_file.exists()
+
+
+def test_expected_branch_path_falls_back_when_git_probe_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Probe failure (missing git binary, IO error) must return the legacy
+    ``.git/info/expected-branch`` path so the caller's existing
+    ``OSError`` handling still runs on the actual write attempt instead
+    of the helper itself raising and crashing the dispatch.
+    """
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+
+    def boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("git missing")
+
+    monkeypatch.setattr(coding_module.git_ops, "_git", boom)
+    marker = runner._expected_branch_path()
+    assert marker == tmp_path / ".git" / "info" / "expected-branch"
+
+
+def test_expected_branch_path_anchors_relative_git_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``git rev-parse --git-path`` returns a path relative to the repo
+    root for a regular (non-worktree) repo. The helper must anchor that
+    relative path at ``repo_path`` so the marker resolves to an absolute
+    path the caller can ``write_text`` against.
+    """
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+
+    class _R:
+        returncode = 0
+        stdout = ".git/info/expected-branch\n"
+
+    monkeypatch.setattr(
+        coding_module.git_ops, "_git", lambda *a, **k: _R()
+    )
+    marker = runner._expected_branch_path()
+    assert marker == tmp_path / ".git" / "info" / "expected-branch"
+    assert marker.is_absolute()
+
+
+def test_expected_branch_path_resolves_via_git_for_linked_worktree(
+    tmp_path: Path,
+) -> None:
+    """A linked worktree has ``.git`` as a *file* pointing into
+    ``<main>/.git/worktrees/<name>/``; the per-worktree ``info/``
+    directory lives under that gitdir, not under ``<worktree>/.git/``.
+
+    The hardcoded ``Path(repo_path) / ".git" / "info"`` layout would
+    raise ``NotADirectoryError`` on every write/cleanup, the existing
+    ``OSError`` catches would swallow it, and push validation would be
+    silently disabled for the entire CODING run. ``_expected_branch_path``
+    must instead derive the marker path from ``git rev-parse
+    --git-path info/expected-branch`` so it lands inside the
+    per-worktree gitdir where the hook also reads it.
+    """
+    main_repo = tmp_path / "main"
+    main_repo.mkdir()
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(main_repo)], check=True
+    )
+    (main_repo / "x.txt").write_text("ok\n")
+    subprocess.run(
+        ["git", "-C", str(main_repo), "add", "x.txt"], check=True, env=env
+    )
+    subprocess.run(
+        ["git", "-C", str(main_repo), "commit", "-q", "-m", "init"],
+        check=True,
+        env=env,
+    )
+    worktree = tmp_path / "wt"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(main_repo),
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            str(worktree),
+        ],
+        check=True,
+        env=env,
+    )
+
+    # Sanity: in a linked worktree, ``.git`` is a file (not a directory).
+    assert (worktree / ".git").is_file()
+
+    runner = h._make_runner()
+    runner.repo_path = str(worktree)
+
+    marker = runner._expected_branch_path()
+    runner._write_expected_branch("feature")
+    assert marker.exists()
+    assert marker.read_text(encoding="utf-8") == "feature\n"
+    # The marker must land where ``git rev-parse --git-path
+    # info/expected-branch`` resolves (the main repo's ``.git/info/``
+    # in shared-info layouts) and never under the worktree's ``.git``
+    # *file*, which is what would make ``write_text`` raise
+    # ``NotADirectoryError`` and silently disable validation.
+    legacy_hardcoded = worktree / ".git" / "info" / "expected-branch"
+    assert marker.resolve() != legacy_hardcoded.resolve()
+    assert marker.parent.is_dir()
+
+    runner._cleanup_expected_branch()
+    assert not marker.exists()

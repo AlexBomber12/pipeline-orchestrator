@@ -422,8 +422,44 @@ class CodingMixin:
         The file is read by the pre-push hook installed by the
         scaffolder; the hook aborts a push when ``HEAD`` is on a
         different branch than the daemon expected for the active task.
+
+        Resolves the marker via ``git rev-parse --git-path
+        info/expected-branch`` so linked worktrees (where ``.git`` is a
+        file pointing into ``<main-repo>/.git/worktrees/<name>/``) and
+        repos created with ``--separate-git-dir`` land the marker in
+        the per-checkout ``info/`` directory git actually uses. The
+        hardcoded ``Path(repo_path) / ".git" / "info"`` layout would
+        otherwise raise ``NotADirectoryError`` on every write — the
+        ``OSError`` catch in ``_write_expected_branch`` swallows it and
+        silently disables push validation for the entire CODING run.
+        Falls back to the legacy hardcoded path on probe failure
+        (non-zero rc, empty stdout, ``OSError``/``SubprocessError``)
+        so test contexts that point at a synthetic non-git directory
+        still get a Path; the caller's existing ``OSError`` handling
+        then surfaces the real failure on the actual write attempt.
         """
-        return Path(self.repo_path) / ".git" / "info" / "expected-branch"
+        repo_root = Path(self.repo_path)
+        fallback = repo_root / ".git" / "info" / "expected-branch"
+        try:
+            probe = git_ops._git(
+                self.repo_path,
+                "rev-parse",
+                "--git-path",
+                "info/expected-branch",
+                timeout=10,
+                check=False,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return fallback
+        if probe.returncode != 0:
+            return fallback
+        raw = (probe.stdout or "").strip()
+        if not raw:
+            return fallback
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = repo_root / candidate
+        return candidate
 
     def _write_expected_branch(self, branch: str) -> None:
         """Write ``branch`` to the expected-branch marker for the pre-push hook.
