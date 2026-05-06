@@ -929,6 +929,84 @@ def test_audit_dry_run_skips_when_queue_probe_indeterminate(
     )
 
 
+def test_audit_dry_run_skips_when_origin_snapshot_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A ``None`` parse on an origin-tracked queue must skip the dry-run.
+
+    ``_parse_base_queue`` returns ``None`` from a tracked snapshot when
+    ``git show origin/{branch}:tasks/QUEUE.md`` fails (missing ref or
+    transient git error). The legacy applied path transitions to ERROR
+    in that case, so the comparator has no legitimate input to score
+    against. Coercing ``None`` to ``[]`` here would fabricate
+    ``current_queue_length`` divergences whenever the live header
+    snapshot is non-empty.
+    """
+    _set_env(monkeypatch, audit="1", headers="1")
+    _stub_open_prs(monkeypatch, [])
+
+    new_tasks = [
+        QueueTask(
+            pr_id="PR-001",
+            title="task",
+            status=TaskStatus.TODO,
+            branch="pr-001",
+            task_file="tasks/PR-001.md",
+        ),
+    ]
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._origin_queue_md_tracked = lambda: True  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **kwargs: None  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: list(new_tasks)  # type: ignore[method-assign]
+
+    asyncio.run(runner.recover_state())
+
+    assert any(
+        "legacy-path dry-run skipped" in e["event"]
+        and "read QUEUE.md from origin failed" in e["event"]
+        for e in runner.state.history
+    )
+    assert not any(
+        e["event"].startswith("[AUDIT] recover_state divergence:")
+        for e in runner.state.history
+    )
+
+
+def test_audit_dry_run_treats_missing_local_queue_as_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A ``None`` parse on a working-tree queue mirrors legacy's empty fallback.
+
+    On post-PR-181 repos the legacy applied path treats a missing
+    ``tasks/QUEUE.md`` as an empty queue (deferred to preflight + IDLE
+    regeneration). The audit dry-run must mirror that — coercing
+    ``None`` to ``[]`` is the right behavior here, not a skip.
+    """
+    _set_env(monkeypatch, audit="1", headers="1")
+    _stub_open_prs(monkeypatch, [])
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
+    runner._parse_base_queue = lambda **kwargs: None  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: []  # type: ignore[method-assign]
+
+    asyncio.run(runner.recover_state())
+
+    assert not any(
+        "legacy-path dry-run skipped" in e["event"]
+        for e in runner.state.history
+    )
+    assert not any(
+        e["event"].startswith("[AUDIT] recover_state divergence:")
+        for e in runner.state.history
+    )
+
+
 # ---------------------------------------------------------------------------
 # PR-266b crash-no-PR semantics in HEADERS_ONLY mode
 # ---------------------------------------------------------------------------

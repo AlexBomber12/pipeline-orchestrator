@@ -1016,6 +1016,25 @@ class RecoveryMixin:
                     f"[AUDIT] recover_state legacy-path dry-run failed: {exc}"
                 )
                 return
+            if parsed is None and queue_from_origin:
+                # ``_parse_base_queue`` returns ``None`` from a tracked
+                # snapshot only when ``git show origin/{branch}:tasks/
+                # QUEUE.md`` failed (missing ref or transient git
+                # error). The legacy applied path treats that as ERROR
+                # and never observes a queue, so coercing to ``[]``
+                # here would score the comparator against a snapshot
+                # legacy never used and emit misleading ``[AUDIT]
+                # recover_state divergence`` events instead of
+                # signaling that the dry-run input was invalid. A
+                # working-tree miss (``queue_from_origin`` False)
+                # falls through below: the legacy applied path
+                # converts that to an empty queue, so ``parsed or []``
+                # mirrors its behavior.
+                self.log_event(
+                    "[AUDIT] recover_state legacy-path dry-run skipped: "
+                    "read QUEUE.md from origin failed"
+                )
+                return
             legacy_tasks = parsed or []
             if not queue_from_origin:
                 # Mirror ``_drop_ghost_queue_entries`` inline so a stale
