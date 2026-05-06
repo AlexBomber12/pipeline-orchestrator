@@ -179,9 +179,9 @@ def _repo_looks_scaffolded(repo_path: str) -> bool:
     for, not just the three most visible ones — otherwise a partially
     provisioned repo (pre-existing ``AGENTS.md`` + ``tasks/QUEUE.md``
     + ``scripts/ci.sh`` but no ``scripts/make-review-artifacts.sh`` or
-    no ``artifacts/`` entry in ``.gitignore``) would permanently skip
+    missing scaffold-owned ``.gitignore`` entries) would permanently skip
     scaffolding on restart, leaving the missing files uncreated and
-    letting later artifact generation dirty the working tree until
+    letting later artifact/queue generation dirty the working tree until
     ``preflight`` forces ERROR. ``artifacts/`` itself is intentionally
     not checked because it is gitignored and can be deleted at any
     time — scaffold_repo handles the recreate-without-commit case
@@ -197,14 +197,14 @@ def _repo_looks_scaffolded(repo_path: str) -> bool:
         path / "scripts" / "make-review-artifacts.sh"
     ).exists()
     gitignore = path / ".gitignore"
-    has_gitignore_artifacts = (
-        gitignore.exists()
-        and "artifacts/" in gitignore.read_text().splitlines()
+    gitignore_lines = gitignore.read_text().splitlines() if gitignore.exists() else []
+    has_gitignore_entries = all(
+        entry in gitignore_lines for entry in ("artifacts/", "tasks/QUEUE.md")
     )
     return (
         has_agents
         and has_queue
         and has_ci
         and has_review_artifacts
-        and has_gitignore_artifacts
+        and has_gitignore_entries
     )

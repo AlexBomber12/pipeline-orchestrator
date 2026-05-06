@@ -2312,7 +2312,7 @@ def test_repo_looks_scaffolded_rejects_partial_provisioning(
     commit — not just the three most visible files. A repo that
     pre-existed with ``AGENTS.md`` + ``tasks/QUEUE.md`` +
     ``scripts/ci.sh`` but no ``scripts/make-review-artifacts.sh``
-    (or no ``artifacts/`` entry in ``.gitignore``) must NOT be
+    (or missing scaffold-owned entries in ``.gitignore``) must NOT be
     classified as scaffolded: the daemon would otherwise skip
     scaffold_repo permanently, leaving those files uncreated, and
     the first ``make-review-artifacts.sh`` run would dirty the
@@ -2332,12 +2332,18 @@ def test_repo_looks_scaffolded_rejects_partial_provisioning(
     (base / "scripts" / "make-review-artifacts.sh").write_text("#!/usr/bin/env bash\n")
     assert runner_module._repo_looks_scaffolded(str(base)) is False
 
-    # Add a .gitignore that does NOT mention artifacts/.
+    # Add a .gitignore that does NOT mention the scaffold-owned entries.
     (base / ".gitignore").write_text("node_modules/\n*.pyc\n")
     assert runner_module._repo_looks_scaffolded(str(base)) is False
 
-    # Finally append artifacts/ — now fully scaffolded.
+    # Only artifacts/ is not enough: generated QUEUE.md must also stay ignored.
     (base / ".gitignore").write_text("node_modules/\n*.pyc\nartifacts/\n")
+    assert runner_module._repo_looks_scaffolded(str(base)) is False
+
+    # Finally append tasks/QUEUE.md — now fully scaffolded.
+    (base / ".gitignore").write_text(
+        "node_modules/\n*.pyc\nartifacts/\ntasks/QUEUE.md\n"
+    )
     assert runner_module._repo_looks_scaffolded(str(base)) is True
 
 

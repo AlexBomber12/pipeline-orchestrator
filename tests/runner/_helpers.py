@@ -526,7 +526,7 @@ def _populate_fully_scaffolded_repo(repo: Any) -> None:
     (repo / "scripts").mkdir()
     (repo / "scripts" / "ci.sh").write_text("#!/usr/bin/env bash\n")
     (repo / "scripts" / "make-review-artifacts.sh").write_text("#!/usr/bin/env bash\n")
-    (repo / ".gitignore").write_text("artifacts/\n")
+    (repo / ".gitignore").write_text("artifacts/\ntasks/QUEUE.md\n")
 
 
 def _patch_eyes_reaction_present(

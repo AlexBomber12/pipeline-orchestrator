@@ -113,7 +113,7 @@ def test_scaffold_repo_creates_all_files_when_empty(
     assert (repo / ".gitignore").exists()
     gitignore_lines = (repo / ".gitignore").read_text().splitlines()
     assert "artifacts/" in gitignore_lines
-    assert "tasks/QUEUE.md" not in gitignore_lines
+    assert "tasks/QUEUE.md" in gitignore_lines
 
     # Shell helpers must be executable so bash can run them directly.
     assert (repo / "scripts" / "ci.sh").stat().st_mode & 0o111
@@ -598,6 +598,7 @@ def test_scaffold_repo_appends_artifacts_without_duplicating(
 
     lines = (repo / ".gitignore").read_text().splitlines()
     assert lines.count("artifacts/") == 1
+    assert lines.count("tasks/QUEUE.md") == 1
     assert "node_modules/" in lines
     assert "*.pyc" in lines
 
@@ -606,6 +607,7 @@ def test_scaffold_repo_appends_artifacts_without_duplicating(
     scaffolder.scaffold_repo(str(repo), "main")
     lines_after = (repo / ".gitignore").read_text().splitlines()
     assert lines_after.count("artifacts/") == 1
+    assert lines_after.count("tasks/QUEUE.md") == 1
 
 
 def test_scaffold_repo_propagates_git_push_failure(
