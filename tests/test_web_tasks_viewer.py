@@ -6,16 +6,20 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from src.models import PipelineState, QueueTask, RepoState, TaskStatus
 from src.web import app as web_app
 from src.web.app import app
 
 
 class _StubAioredisClient:
+    def __init__(self, store: dict[str, str] | None = None) -> None:
+        self._store: dict[str, str] = store or {}
+
     async def ping(self) -> bool:
         return True
 
     async def get(self, key: str) -> str | None:
-        return None
+        return self._store.get(key)
 
     async def aclose(self) -> None:
         return None
@@ -27,6 +31,18 @@ class _StubAioredis:
         url: str, decode_responses: bool = True
     ) -> _StubAioredisClient:
         return _StubAioredisClient()
+
+
+def _stub_aioredis_with_store(store: dict[str, str]) -> object:
+    return type(
+        "_StubAioredisWithStore",
+        (),
+        {
+            "from_url": staticmethod(
+                lambda url, decode_responses=True: _StubAioredisClient(store)
+            )
+        },
+    )()
 
 
 def _write_alpha_config(
@@ -491,6 +507,97 @@ def test_list_repo_tasks_returns_error_fragment_when_queue_unreadable(
     # 503 keeps the fragment swappable by the htmx hook in base.html.
     assert response.status_code == 503
     assert "Unable to read tasks/QUEUE.md" in response.text
+
+
+def test_view_repo_task_falls_back_to_default_when_snapshot_task_file_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale snapshot mapping must not block a viewable default file.
+
+    The snapshot reflects ``RepoState.current_queue`` at the last IDLE
+    cycle. If the task file was renamed on disk before the next snapshot
+    refresh, the snapshot's ``task_file`` value points at a missing file.
+    The viewer must fall through to ``tasks/{pr_id}.md`` rather than
+    return 404 in that window.
+    """
+    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
+    (repo_dir / "tasks" / "PR-303.md").write_text(
+        "# PR-303: Recovered from stale snapshot\n\n"
+        "body from disk default\n",
+        encoding="utf-8",
+    )
+    state = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        current_queue=[
+            QueueTask(
+                pr_id="PR-303",
+                title="Stale mapping",
+                status=TaskStatus.TODO,
+                task_file="tasks/old-name.md",
+            )
+        ],
+    )
+    store = {"pipeline:example__alpha": state.model_dump_json()}
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_store(store))
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks/PR-303")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "body from disk default" in body
+    assert "tasks/PR-303.md" in body
+    assert "old-name.md" not in body
+
+
+def test_view_repo_task_falls_back_to_disk_queue_when_snapshot_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale snapshot mapping must defer to a usable disk queue mapping.
+
+    If the snapshot's ``task_file`` points at a missing file but the disk
+    QUEUE.md has a different, still-valid ``Tasks file:`` entry for the
+    same ``pr_id``, the viewer must use the disk mapping instead of
+    skipping straight to the default filename.
+    """
+    repo_dir = _write_alpha_config(tmp_path, monkeypatch)
+    (repo_dir / "tasks" / "QUEUE.md").write_text(
+        "## PR-404: Disk mapping\n"
+        "- Status: TODO\n"
+        "- Branch: pr-404\n"
+        "- Tasks file: tasks/disk-name.md\n",
+        encoding="utf-8",
+    )
+    (repo_dir / "tasks" / "disk-name.md").write_text(
+        "# PR-404: Disk-queue rename\n\nbody from disk-name file\n",
+        encoding="utf-8",
+    )
+    state = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        current_queue=[
+            QueueTask(
+                pr_id="PR-404",
+                title="Stale snapshot mapping",
+                status=TaskStatus.TODO,
+                task_file="tasks/snapshot-name.md",
+            )
+        ],
+    )
+    store = {"pipeline:example__alpha": state.model_dump_json()}
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_store(store))
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks/PR-404")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "body from disk-name file" in body
+    assert "tasks/disk-name.md" in body
+    assert "snapshot-name.md" not in body
 
 
 def test_view_repo_task_falls_back_when_queue_unreadable(

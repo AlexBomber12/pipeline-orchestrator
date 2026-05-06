@@ -92,6 +92,16 @@ def test_parse_queue_extracts_fields(tmp_path: Path) -> None:
     assert pr3.depends_on == ["PR-002"]
 
 
+def test_parse_queue_strict_rejects_invalid_priority() -> None:
+    with pytest.raises(QueueValidationError, match="invalid priority 'high'"):
+        parse_queue_text(
+            "## PR-001: Bad priority\n"
+            "- Status: TODO\n"
+            "- Priority: high\n",
+            strict=True,
+        )
+
+
 def test_parse_task_header_complete(tmp_path: Path) -> None:
     task_path = _write_task_file(
         tmp_path,

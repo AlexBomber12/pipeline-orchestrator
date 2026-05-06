@@ -212,6 +212,39 @@ def test_repo_state_assigning_current_task_does_not_clear_current_pr() -> None:
     assert state.current_pr.number == 1
 
 
+def test_repo_state_assigning_current_queue_stamps_snapshot_at() -> None:
+    state = RepoState(
+        url="https://github.com/example/repo.git",
+        name="repo",
+    )
+    assert state.current_queue_snapshot_at is None
+
+    before = datetime.now(timezone.utc)
+    state.current_queue = [
+        QueueTask(pr_id="PR-001", title="t", status=TaskStatus.TODO),
+    ]
+    after = datetime.now(timezone.utc)
+
+    stamped = state.current_queue_snapshot_at
+    assert stamped is not None
+    assert before <= stamped <= after
+
+
+def test_repo_state_clearing_current_queue_clears_snapshot_at() -> None:
+    state = RepoState(
+        url="https://github.com/example/repo.git",
+        name="repo",
+    )
+    state.current_queue = [
+        QueueTask(pr_id="PR-001", title="t", status=TaskStatus.TODO),
+    ]
+    assert state.current_queue_snapshot_at is not None
+
+    state.current_queue = None
+
+    assert state.current_queue_snapshot_at is None
+
+
 def test_repo_state_clearing_current_pr_does_not_clear_current_task() -> None:
     task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     state = RepoState(

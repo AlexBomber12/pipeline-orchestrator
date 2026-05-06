@@ -9,6 +9,72 @@ import pytest
 
 
 @pytest.mark.asyncio
+async def test_load_current_queue_returns_none_without_redis(monkeypatch):
+    from src.web import app as web_app
+    from src.web.services import repo_state as rs
+
+    monkeypatch.setattr(web_app.app.state, "redis", None)
+
+    assert await rs.load_current_queue("owner__repo") is None
+
+
+@pytest.mark.asyncio
+async def test_load_current_queue_handles_redis_error():
+    from src.web.services import repo_state as rs
+
+    class _BoomRedis:
+        async def get(self, key):
+            raise RuntimeError("redis down")
+
+    assert await rs.load_current_queue("owner__repo", _BoomRedis()) is None
+
+
+@pytest.mark.asyncio
+async def test_load_current_queue_handles_decode_error():
+    from src.web.services import repo_state as rs
+
+    class _BadRedis:
+        async def get(self, key):
+            return "{bad json"
+
+    assert await rs.load_current_queue("owner__repo", _BadRedis()) is None
+
+
+@pytest.mark.asyncio
+async def test_load_current_queue_returns_none_when_key_missing():
+    from src.web.services import repo_state as rs
+
+    class _EmptyRedis:
+        async def get(self, key):
+            return None
+
+    assert await rs.load_current_queue("owner__repo", _EmptyRedis()) is None
+
+
+@pytest.mark.asyncio
+async def test_load_current_queue_returns_snapshot_when_present():
+    from src.models import PipelineState, QueueTask, RepoState, TaskStatus
+    from src.web.services import repo_state as rs
+
+    state = RepoState(
+        url="https://github.com/owner/repo.git",
+        name="owner__repo",
+        state=PipelineState.IDLE,
+        current_queue=[
+            QueueTask(pr_id="PR-001", title="t", status=TaskStatus.TODO),
+        ],
+    )
+
+    class _SnapshotRedis:
+        async def get(self, key):
+            return state.model_dump_json()
+
+    queue = await rs.load_current_queue("owner__repo", _SnapshotRedis())
+    assert queue is not None
+    assert [task.pr_id for task in queue] == ["PR-001"]
+
+
+@pytest.mark.asyncio
 async def test_get_all_repo_states_does_not_block_event_loop(monkeypatch):
     """load_config is run via asyncio.to_thread so other tasks can interleave."""
     from src.web.services import repo_state as rs

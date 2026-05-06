@@ -61,6 +61,7 @@ class QueueTask(BaseModel):
     task_file: str | None = None
     depends_on: list[str] = Field(default_factory=list)
     branch: str | None = None
+    priority: int = 3
 
 
 class PRInfo(BaseModel):
@@ -164,6 +165,7 @@ class RepoState(BaseModel):
     user_paused: bool = False
     current_task: QueueTask | None = None
     current_queue: list[QueueTask] | None = None
+    current_queue_snapshot_at: datetime | None = None
     current_pr: PRInfo | None = None
     error_message: str | None = None
     last_updated: datetime = Field(
@@ -219,6 +221,11 @@ class RepoState(BaseModel):
         if name == "current_task" and value is None:
             super().__setattr__("current_pr", None)
             super().__setattr__("error_message", None)
+        if name == "current_queue":
+            super().__setattr__(
+                "current_queue_snapshot_at",
+                datetime.now(timezone.utc) if value is not None else None,
+            )
         super().__setattr__(name, value)
 
     @staticmethod
