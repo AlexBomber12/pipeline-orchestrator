@@ -75,10 +75,22 @@ fi
 EXPECTED=$(<"$EXPECTED_FILE")
 
 while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$remote_ref" in
+        refs/heads/*) actual_remote="${remote_ref#refs/heads/}" ;;
+        *) actual_remote="$remote_ref" ;;
+    esac
     # ``local-ref`` is the literal string ``(delete)`` for ref
-    # deletions; nothing is pushed from this side, so there is no
-    # branch to validate.
+    # deletions; nothing is pushed from the local side, but the
+    # remote destination is still part of the push contract and
+    # must be validated. Without this check, ``git push origin
+    # --delete main`` would bypass the gate and remove a
+    # protected base branch even when a task branch is the only
+    # ref the daemon expects to be touched.
     if [[ "$local_ref" == "(delete)" ]]; then
+        if [[ "$EXPECTED" != "$actual_remote" ]]; then
+            echo "[pre-push-hook] BLOCKED: expected branch '$EXPECTED' but push deletes '$actual_remote' (remote ref '$remote_ref'). Aborting push." >&2
+            exit 1
+        fi
         continue
     fi
     case "$local_ref" in
@@ -89,10 +101,6 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         echo "[pre-push-hook] BLOCKED: expected branch '$EXPECTED' but push includes '$actual_local' (local ref '$local_ref'). Aborting push." >&2
         exit 1
     fi
-    case "$remote_ref" in
-        refs/heads/*) actual_remote="${remote_ref#refs/heads/}" ;;
-        *) actual_remote="$remote_ref" ;;
-    esac
     if [[ "$EXPECTED" != "$actual_remote" ]]; then
         echo "[pre-push-hook] BLOCKED: expected branch '$EXPECTED' but push targets '$actual_remote' (remote ref '$remote_ref'). Aborting push." >&2
         exit 1

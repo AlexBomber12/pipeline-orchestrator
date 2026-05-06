@@ -254,10 +254,51 @@ def test_hook_passes_when_pushing_expected_branch_from_detached_head(
     assert result.returncode == 0, result.stderr
 
 
-def test_hook_skips_delete_lines(tmp_path: Path) -> None:
+def test_hook_passes_delete_of_expected_branch(tmp_path: Path) -> None:
     """Ref deletions appear as ``(delete) <oid> <remote-ref> <oid>`` on
-    stdin. Nothing is pushed from the local side, so the hook must skip
-    the line rather than block on the literal token ``(delete)``.
+    stdin. Nothing is pushed from the local side, but the remote
+    destination is still part of the push contract: when the deleted
+    remote ref equals the expected branch, the operation matches the
+    branch-safety gate and the hook must pass.
+    """
+    repo = _init_repo(tmp_path)
+    _install(repo)
+    info = repo / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "expected-branch").write_text("pr-001\n")
+    stdin = f"(delete) {_ZERO_OID} refs/heads/pr-001 {_FAKE_OID}\n"
+    result = _run_hook(repo, stdin=stdin)
+    assert result.returncode == 0, result.stderr
+
+
+def test_hook_blocks_delete_of_unexpected_branch(tmp_path: Path) -> None:
+    """``git push origin --delete main`` while ``expected-branch`` is
+    ``pr-001`` must be blocked. Without remote-ref validation on delete
+    rows the hook would silently allow operators (or a misbehaving coder)
+    to delete a protected base branch despite the marker being set, which
+    defeats the defense-in-depth purpose of the hook.
+    """
+    repo = _init_repo(tmp_path)
+    _install(repo)
+    info = repo / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "expected-branch").write_text("pr-001\n")
+    stdin = f"(delete) {_ZERO_OID} refs/heads/main {_FAKE_OID}\n"
+    result = _run_hook(repo, stdin=stdin)
+    assert result.returncode == 1
+    assert "[pre-push-hook] BLOCKED" in result.stderr
+    assert "push deletes 'main'" in result.stderr
+    assert "remote ref 'refs/heads/main'" in result.stderr
+
+
+def test_hook_blocks_delete_alongside_expected_branch_push(
+    tmp_path: Path,
+) -> None:
+    """A push that combines an expected-branch update with the deletion
+    of an unrelated remote branch (e.g., ``git push origin pr-001
+    :old-branch``) must be blocked: blocking only when *all* refs
+    mismatch would let the wrong-branch deletion slip through alongside
+    a valid task push.
     """
     repo = _init_repo(tmp_path)
     _install(repo)
@@ -269,7 +310,8 @@ def test_hook_skips_delete_lines(tmp_path: Path) -> None:
         + _push_line("refs/heads/pr-001")
     )
     result = _run_hook(repo, stdin=stdin)
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 1
+    assert "push deletes 'old-branch'" in result.stderr
 
 
 def test_hook_blocks_on_non_branch_ref(tmp_path: Path) -> None:
