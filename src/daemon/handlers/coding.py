@@ -227,12 +227,9 @@ class CodingMixin:
 
         self._write_active_pr_runtime_file(pr_id)
         self._write_expected_branch(target_branch)
-        # Cleanup belongs in a finally so the marker is removed on every
-        # post-write exit, including the ``result is None`` short-circuits
-        # that ``_run_coder_with_supervision`` uses for user-stop and
-        # rate-limit pause paths. Without it, a stale marker persists in
-        # the worktree and the pre-push hook rejects later operator or
-        # daemon pushes whose HEAD no longer matches the old task branch.
+        # Expected-branch cleanup belongs in a finally so the pre-push
+        # hook does not reject later operator or daemon pushes whose HEAD
+        # no longer matches this dispatch branch.
         try:
             result = await self._run_coder_with_supervision(
                 coder_name,
@@ -257,7 +254,6 @@ class CodingMixin:
                 current_pr_id=current_pr_id,
             )
         finally:
-            self._cleanup_active_pr_runtime_file()
             self._cleanup_expected_branch()
 
     async def _prepare_coder_invocation(
@@ -505,18 +501,6 @@ class CodingMixin:
             self.log_event(
                 f"[CODING] active-pr-id runtime write failed ({exc}); "
                 "e2e shim task discovery may fall back to task headers."
-            )
-
-    def _cleanup_active_pr_runtime_file(self) -> None:
-        """Remove the e2e shim active PR marker when leaving CODING."""
-        if not self._e2e_shim_enabled():
-            return
-        try:
-            self._active_pr_runtime_path().unlink(missing_ok=True)
-        except OSError as exc:
-            self.log_event(
-                f"[CODING] active-pr-id runtime cleanup failed ({exc}); "
-                "a stale e2e shim task marker may remain."
             )
 
     def _cleanup_expected_branch(self) -> None:

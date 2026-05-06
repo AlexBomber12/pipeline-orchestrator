@@ -1363,7 +1363,7 @@ def test_coding_writes_active_pr_runtime_file_in_shim_mode(
     assert captured["active_pr"] == "PR-001\n"
 
 
-def test_coding_clears_runtime_file_on_exit(
+def test_coding_keeps_runtime_file_on_exit_for_fix_shim(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     repo = tmp_path / "repo"
@@ -1379,7 +1379,7 @@ def test_coding_clears_runtime_file_on_exit(
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.WATCH
-    assert not marker.exists()
+    assert marker.read_text(encoding="utf-8") == "PR-001\n"
 
 
 def test_coding_does_not_write_runtime_file_in_production(
@@ -1418,20 +1418,6 @@ def test_active_pr_runtime_write_error_logs_and_continues(
 
     log_entries = [entry["event"] for entry in runner.state.history]
     assert any("active-pr-id runtime write failed" in e for e in log_entries)
-
-
-def test_active_pr_runtime_cleanup_error_logs_and_continues(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    runner = h._make_runner()
-    runner.repo_path = str(tmp_path)
-    monkeypatch.setenv("PIPELINE_E2E_SHIM", "1")
-    (tmp_path / ".daemon-runtime" / "active-pr-id").mkdir(parents=True)
-
-    runner._cleanup_active_pr_runtime_file()
-
-    log_entries = [entry["event"] for entry in runner.state.history]
-    assert any("active-pr-id runtime cleanup failed" in e for e in log_entries)
 
 
 def test_coding_handles_expected_branch_write_error(
