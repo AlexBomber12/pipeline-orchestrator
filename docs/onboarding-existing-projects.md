@@ -20,16 +20,43 @@ re-emit:
 
 The currently managed sections are:
 
+- `quick_rules`
 - `work_modes`
 - `daemon_mode`
 - `ci_gates`
 - `codex_review_gate`
 - `escalate_protocol`
 - `branch_naming`
+- `auto_pr_runbook`
 - `planned_pr_runbook`
 - `micro_pr_runbook`
 - `review_fix_runbook`
 - `queue_stability_rules`
+
+## Work-mode trigger phrases
+
+Pipeline-orchestrator drives coders with four exact trigger phrases. The
+daemon-managed `work_modes` section in every onboarded `AGENTS.md`
+documents the same set, so these are the contract a managed repo's
+coder is expected to follow:
+
+- `AUTO PR` — daemon-only. The pipeline-orchestrator daemon prepends
+  this trigger to the prompt along with explicit `Task: PR-XXX` and
+  `File: tasks/PR-XXX.md` headers and the full task body inline. The
+  coder works strictly from the inline body and does not consult
+  `tasks/QUEUE.md` for task selection.
+- `PLANNED PR` — manual VS Code workflow for queue-driven task
+  discovery. The coder reads the active entry in `tasks/QUEUE.md` to
+  identify the task file, then works from that file.
+- `MICRO PR: <one sentence description>` — manual VS Code workflow for
+  small ad-hoc changes that do not warrant a `tasks/PR-*.md` file.
+- `FIX FEEDBACK` — manual VS Code workflow for applying fixes to an
+  existing PR branch in response to CI failures or review feedback.
+
+`AUTO PR` is the daemon's invocation mode; the other three are
+operator-invoked from an editor. New repos onboarded after the AUTO PR
+rollout receive the same four-trigger model from the very first
+scaffold pass.
 
 Anything outside those marker blocks is treated as user-owned and is
 preserved byte-for-byte across reconciliation. Anything inside a marker

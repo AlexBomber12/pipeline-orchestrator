@@ -1525,3 +1525,114 @@ def test_add_to_local_exclude_logs_on_write_failure(
         and "pre-push" in record.message
         for record in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# PR-273: scaffolder template AGENTS.md aligned with the AUTO PR /
+# PLANNED PR / MICRO PR / FIX FEEDBACK four-trigger model. Newly onboarded
+# repos must receive the same trigger contract on the very first scaffold
+# pass instead of waiting for a daemon reconciliation cycle.
+# ---------------------------------------------------------------------------
+
+
+def test_scaffolder_template_lists_four_triggers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A freshly scaffolded AGENTS.md enumerates AUTO PR alongside the
+    three manual triggers so the coder sees the daemon's invocation mode
+    documented from day one."""
+    repo = _init_empty_repo(tmp_path)
+    _patch_git(monkeypatch)
+
+    scaffolder.scaffold_repo(str(repo), "main")
+
+    agents = (repo / "AGENTS.md").read_text()
+    assert "### Work Modes" in agents
+    for trigger in ("AUTO PR", "PLANNED PR", "MICRO PR", "FIX FEEDBACK"):
+        assert trigger in agents, f"missing trigger {trigger!r}"
+
+
+def test_scaffolder_template_includes_auto_pr_runbook_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scaffolded AGENTS.md ships BEGIN/END markers for the
+    auto_pr_runbook section so the daemon's PR-192a/b/c reconciliation
+    framework has a target block to fill in on the first sync. Without
+    the markers reconciliation would append the canonical content at
+    EOF, leaving the scaffold-time stub orphaned higher up."""
+    repo = _init_empty_repo(tmp_path)
+    _patch_git(monkeypatch)
+
+    scaffolder.scaffold_repo(str(repo), "main")
+
+    agents = (repo / "AGENTS.md").read_text()
+    assert (
+        "<!-- pipeline-orchestrator: managed BEGIN auto_pr_runbook -->"
+        in agents
+    )
+    assert (
+        "<!-- pipeline-orchestrator: managed END auto_pr_runbook -->"
+        in agents
+    )
+
+
+def test_scaffolder_template_quick_rules_mentions_auto_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Quick rules block tells the coder that a daemon-driven prompt
+    starts with AUTO PR and carries explicit Task/File headers, so the
+    coder routes to the AUTO PR runbook instead of falling back to
+    PLANNED PR queue discovery."""
+    repo = _init_empty_repo(tmp_path)
+    _patch_git(monkeypatch)
+
+    scaffolder.scaffold_repo(str(repo), "main")
+
+    agents = (repo / "AGENTS.md").read_text()
+    quick_rules_start = agents.index("Quick rules")
+    work_modes_start = agents.index("### Work Modes")
+    quick_rules = agents[quick_rules_start:work_modes_start]
+    assert "AUTO PR" in quick_rules
+    assert "pipeline-orchestrator daemon" in quick_rules
+
+
+def test_scaffolder_template_preserves_planned_pr_runbook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The manual-mode runbooks (PLANNED PR, MICRO PR) remain in the
+    scaffold template — manual VS Code workflows are not deprecated by
+    the AUTO PR rollout."""
+    repo = _init_empty_repo(tmp_path)
+    _patch_git(monkeypatch)
+
+    scaffolder.scaffold_repo(str(repo), "main")
+
+    agents = (repo / "AGENTS.md").read_text()
+    assert "### PLANNED PR runbook" in agents
+    assert "### MICRO PR runbook" in agents
+
+
+def test_scaffolder_template_matches_daemon_managed_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drift guard between the scaffolder's standalone templates/AGENTS.md
+    Work Modes content and the daemon-managed work_modes region from
+    src/onboarding/agents_md_template.py. Both surfaces must agree on
+    the four trigger phrases so a freshly scaffolded repo and a
+    reconciled repo cannot disagree on which triggers exist."""
+    from src.onboarding.agents_md_template import daemon_managed_content
+
+    repo = _init_empty_repo(tmp_path)
+    _patch_git(monkeypatch)
+
+    scaffolder.scaffold_repo(str(repo), "main")
+
+    agents = (repo / "AGENTS.md").read_text()
+    work_modes_start = agents.index("### Work Modes")
+    daemon_mode_start = agents.index("### Daemon Mode")
+    template_work_modes = agents[work_modes_start:daemon_mode_start]
+
+    daemon_work_modes = daemon_managed_content()["work_modes"]
+    for trigger in ("AUTO PR", "PLANNED PR", "MICRO PR", "FIX FEEDBACK"):
+        assert trigger in template_work_modes
+        assert trigger in daemon_work_modes
