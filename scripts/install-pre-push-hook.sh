@@ -8,13 +8,36 @@
 # Idempotent: overwrites any existing pre-push hook unconditionally so
 # rerunning on every scaffolder pass self-heals a deleted or corrupted
 # hook file.
+#
+# Honors ``core.hooksPath``: git does not always read hooks from
+# ``.git/hooks``. Repos (or global config) that set ``core.hooksPath``
+# — including ``/dev/null`` to disable hooks entirely — would silently
+# bypass an installer that hardcodes ``.git/hooks``. We ask git for the
+# effective path via ``rev-parse --git-path hooks/pre-push`` so the
+# installed hook lands where git will actually invoke it. When the
+# configured directory is unwritable (e.g. ``core.hooksPath=/dev/null``)
+# we surface a warning and exit non-zero rather than installing into a
+# location that will never run.
 set -euo pipefail
 
 REPO="${1:?usage: $0 <repo_path>}"
-HOOKS_DIR="$REPO/.git/hooks"
-HOOK_FILE="$HOOKS_DIR/pre-push"
 
-mkdir -p "$HOOKS_DIR"
+if ! HOOK_FILE=$(git -C "$REPO" rev-parse --git-path hooks/pre-push 2>/dev/null); then
+    echo "[install-pre-push-hook] git rev-parse failed for '$REPO' (not a git repo?)" >&2
+    exit 1
+fi
+
+case "$HOOK_FILE" in
+    /*) ;;
+    *) HOOK_FILE="$REPO/$HOOK_FILE" ;;
+esac
+
+HOOKS_DIR=$(dirname "$HOOK_FILE")
+
+if ! mkdir -p "$HOOKS_DIR" 2>/dev/null; then
+    echo "[install-pre-push-hook] cannot create hooks dir '$HOOKS_DIR' (core.hooksPath disables hooks?); skipping install" >&2
+    exit 1
+fi
 
 cat > "$HOOK_FILE" <<'EOF'
 #!/bin/bash

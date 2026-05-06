@@ -155,13 +155,19 @@ def _gitignored_paths(repo_path: str, paths: list[str]) -> set[str]:
 def _install_pre_push_hook(repo_path: str) -> None:
     """Install the pipeline-orchestrator pre-push branch-validation hook.
 
-    Idempotent: the bash installer overwrites ``.git/hooks/pre-push``
+    Idempotent: the bash installer overwrites the effective hook file
     unconditionally so re-running on every scaffolder pass self-heals
     a deleted or corrupted hook file. The hook itself is no-op when
     ``.git/info/expected-branch`` is absent — manual operator git
     operations are not affected. Defense-in-depth on top of PR-271's
     AUTO PR prompt headers, so a transient install failure is logged
     and ignored rather than aborting onboarding.
+
+    The installer honors ``core.hooksPath`` via ``git rev-parse
+    --git-path hooks/pre-push`` — repos that redirect hooks land the
+    file in the configured directory, and a ``core.hooksPath=/dev/null``
+    setup surfaces as an install failure (logged warning) rather than a
+    silently bypassed hook in ``.git/hooks/``.
     """
     try:
         subprocess.run(

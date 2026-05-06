@@ -1047,11 +1047,14 @@ def _patch_git_passthrough_install_hook(
 def test_scaffolder_installs_pre_push_hook(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``scaffold_repo`` must install ``.git/hooks/pre-push`` on every
-    pass so existing managed repos gain the PR-272 branch-validation
-    defense automatically.
+    """``scaffold_repo`` must install the pre-push hook on every pass so
+    existing managed repos gain the PR-272 branch-validation defense
+    automatically.
     """
     repo = _init_empty_repo(tmp_path)
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True
+    )
     _patch_git_passthrough_install_hook(monkeypatch)
 
     scaffolder.scaffold_repo(str(repo), "main")
@@ -1072,6 +1075,9 @@ def test_scaffolder_idempotent_pre_push_install(
     pass leaves the file content unchanged.
     """
     repo = _init_empty_repo(tmp_path)
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True
+    )
     _patch_git_passthrough_install_hook(monkeypatch)
 
     scaffolder.scaffold_repo(str(repo), "main")

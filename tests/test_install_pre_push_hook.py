@@ -29,10 +29,12 @@ def _init_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _install(repo: Path) -> subprocess.CompletedProcess[str]:
+def _install(
+    repo: Path, *, check: bool = True
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["bash", str(INSTALL_SCRIPT), str(repo)],
-        check=True,
+        check=check,
         capture_output=True,
         text=True,
     )
@@ -170,6 +172,45 @@ def test_hook_blocks_when_head_unresolvable(tmp_path: Path) -> None:
     result = _run_hook(repo)
     assert result.returncode == 1
     assert "[pre-push-hook] BLOCKED" in result.stderr
+
+
+def test_install_honors_core_hooks_path(tmp_path: Path) -> None:
+    """When ``core.hooksPath`` redirects hooks to a custom directory the
+    installer must land the hook there — not in ``.git/hooks`` — so git
+    actually executes it on push.
+    """
+    repo = _init_repo(tmp_path)
+    custom = tmp_path / "custom-hooks"
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "core.hooksPath", str(custom)],
+        check=True,
+    )
+    _install(repo)
+    installed = custom / "pre-push"
+    assert installed.exists()
+    assert installed.stat().st_mode & 0o111
+    content = installed.read_text()
+    assert "[pre-push-hook]" in content
+    assert not (repo / ".git" / "hooks" / "pre-push").exists()
+
+
+def test_install_warns_when_core_hooks_path_disables_hooks(
+    tmp_path: Path,
+) -> None:
+    """``core.hooksPath=/dev/null`` is the canonical way to disable hooks
+    entirely. The installer cannot write into ``/dev/null`` and must exit
+    non-zero with a warning so the scaffolder log surfaces that branch
+    protection is bypassed by config rather than silently succeeding.
+    """
+    repo = _init_repo(tmp_path)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "core.hooksPath", "/dev/null"],
+        check=True,
+    )
+    result = _install(repo, check=False)
+    assert result.returncode != 0
+    assert "core.hooksPath" in result.stderr
+    assert not (repo / ".git" / "hooks" / "pre-push").exists()
 
 
 @pytest.mark.parametrize("payload", ["pr-001\n", "pr-001"])
