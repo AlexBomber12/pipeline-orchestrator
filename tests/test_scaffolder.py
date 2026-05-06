@@ -105,7 +105,7 @@ def test_scaffold_repo_creates_all_files_when_empty(
     # All baseline files must be on disk after scaffolding.
     assert (repo / "AGENTS.md").exists()
     assert (repo / "tasks").is_dir()
-    assert (repo / "tasks" / "QUEUE.md").exists()
+    assert not (repo / "tasks" / "QUEUE.md").exists()
     assert (repo / "scripts").is_dir()
     assert (repo / "scripts" / "ci.sh").exists()
     assert (repo / "scripts" / "make-review-artifacts.sh").exists()
@@ -120,11 +120,9 @@ def test_scaffold_repo_creates_all_files_when_empty(
     assert (repo / "scripts" / "make-review-artifacts.sh").stat().st_mode & 0o111
 
     # Every tracked path (directories filtered out) should be reported as
-    # an action so the caller can log it. ``tasks/QUEUE.md`` is created
-    # on disk but gitignored (PR-181), so it is not staged.
+    # an action so the caller can log it.
     for path in (
         "AGENTS.md",
-        "tasks/QUEUE.md",
         "scripts/ci.sh",
         "scripts/make-review-artifacts.sh",
         ".gitignore",
@@ -135,8 +133,7 @@ def test_scaffold_repo_creates_all_files_when_empty(
     # the configured base branch before any file is inspected or written.
     assert calls[0] == ["git", "checkout", "main"]
 
-    # git add must stage every concrete file we created EXCEPT the
-    # gitignored ``tasks/QUEUE.md``.
+    # git add must stage every concrete file we created.
     add_cmds = [cmd for cmd in calls if cmd[:2] == ["git", "add"]]
     assert len(add_cmds) == 1
     staged = add_cmds[0][2:]
@@ -488,6 +485,25 @@ def test_scaffold_repo_preserves_existing_queue(
     assert "tasks/QUEUE.md" not in actions
 
 
+def test_scaffold_repo_rejects_tasks_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_empty_repo(tmp_path)
+    (repo / "tasks").write_text("not a directory\n")
+    calls = _patch_git(monkeypatch)
+
+    with pytest.raises(NotADirectoryError):
+        scaffolder.scaffold_repo(str(repo), "main")
+
+    assert not any(cmd[:2] == ["git", "add"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "commit"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
+
+
+def test_scaffolder_template_directory_no_queue_md() -> None:
+    assert not (scaffolder.TEMPLATES_DIR / "QUEUE.md").exists()
+
+
 def test_scaffold_repo_preserves_existing_ci_sh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -597,6 +613,7 @@ def test_scaffold_repo_appends_artifacts_without_duplicating(
 
     lines = (repo / ".gitignore").read_text().splitlines()
     assert lines.count("artifacts/") == 1
+    assert lines.count("tasks/QUEUE.md") == 1
     assert "node_modules/" in lines
     assert "*.pyc" in lines
 
@@ -605,6 +622,7 @@ def test_scaffold_repo_appends_artifacts_without_duplicating(
     scaffolder.scaffold_repo(str(repo), "main")
     lines_after = (repo / ".gitignore").read_text().splitlines()
     assert lines_after.count("artifacts/") == 1
+    assert lines_after.count("tasks/QUEUE.md") == 1
 
 
 def test_scaffold_repo_propagates_git_push_failure(
@@ -728,9 +746,8 @@ def test_scaffold_repo_handles_unborn_head(
     # Scaffolding continued past the failed checkout, wrote the files,
     # and reported them.
     assert (repo / "AGENTS.md").exists()
-    assert (repo / "tasks" / "QUEUE.md").exists()
+    assert not (repo / "tasks" / "QUEUE.md").exists()
     assert "AGENTS.md" in actions
-    assert "tasks/QUEUE.md" in actions
 
     # The unborn-HEAD fallback must call symbolic-ref with the configured
     # branch, not ``git checkout -b`` or a generic retry.

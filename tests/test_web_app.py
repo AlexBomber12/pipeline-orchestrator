@@ -2888,7 +2888,7 @@ class _UploadAioredis:
         return _UploadRedisClient(self._name)
 
 
-def test_upload_rejects_queue_with_duplicate_pr_id(
+def test_upload_rejects_queue_md_with_duplicate_pr_id_payload_by_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = tmp_path / "config.yml"
@@ -2911,11 +2911,14 @@ def test_upload_rejects_queue_with_duplicate_pr_id(
             "/repos/example__alpha/upload-tasks",
             files=[("files", ("QUEUE.md", queue_content.encode(), "text/markdown"))],
         )
-    assert response.status_code == 400
-    assert "duplicate pr_id" in response.text
+    assert response.status_code == 422
+    assert (
+        "Invalid file name: &#39;QUEUE.md&#39;. Only AGENTS.md, "
+        "CLAUDE.md, and PR-*.md allowed."
+    ) in response.text
 
 
-def test_upload_rejects_queue_with_cycle(
+def test_upload_rejects_queue_md_with_cycle_payload_by_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = tmp_path / "config.yml"
@@ -2938,8 +2941,11 @@ def test_upload_rejects_queue_with_cycle(
             "/repos/example__alpha/upload-tasks",
             files=[("files", ("QUEUE.md", queue_content.encode(), "text/markdown"))],
         )
-    assert response.status_code == 400
-    assert "dependency cycle" in response.text
+    assert response.status_code == 422
+    assert (
+        "Invalid file name: &#39;QUEUE.md&#39;. Only AGENTS.md, "
+        "CLAUDE.md, and PR-*.md allowed."
+    ) in response.text
 
 
 def test_pause_endpoint_returns_404_for_unknown_repo(

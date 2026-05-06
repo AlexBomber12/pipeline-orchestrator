@@ -2,7 +2,7 @@
 
 When the daemon clones a repository for the first time it may land on a
 repo that does not yet have the directories and helper files the pipeline
-runbook expects (``AGENTS.md``, ``tasks/QUEUE.md``, ``scripts/ci.sh``,
+runbook expects (``AGENTS.md``, ``scripts/ci.sh``,
 ``scripts/make-review-artifacts.sh``, ``artifacts/``). ``scaffold_repo``
 fills those gaps from the bundled ``templates/`` directory, commits the
 additions, and pushes them to the same branch. It is idempotent: on every
@@ -596,14 +596,11 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
         created.append(_SKILL_MD_REL_PATH)
 
     tasks_dir = repo / "tasks"
+    if tasks_dir.exists() and not tasks_dir.is_dir():
+        raise NotADirectoryError(f"{tasks_dir} exists but is not a directory")
     if not tasks_dir.exists():
         tasks_dir.mkdir(parents=True)
         created.append("tasks/")
-    queue = tasks_dir / "QUEUE.md"
-    if not queue.exists():
-        _copy_template("QUEUE.md", queue)
-        created.append("tasks/QUEUE.md")
-
     scripts_dir = repo / "scripts"
     if not scripts_dir.exists():
         scripts_dir.mkdir(parents=True)
@@ -648,10 +645,7 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
     # directories, and new directories become visible through the files
     # inside them that we also created above. ``artifacts/`` in
     # particular is an empty directory covered by the ``.gitignore``
-    # entry, so there is nothing for git to track there. ``tasks/QUEUE.md``
-    # is created on disk for read consumers (dashboard, recovery) but is
-    # gitignored too (PR-181) — the daemon regenerates it deterministically
-    # each IDLE cycle, so committing it would just create push noise.
+    # entry, so there is nothing for git to track there.
     candidate_paths = [
         path for path in created
         if not path.endswith("/") and path not in _GITIGNORE_ENTRIES

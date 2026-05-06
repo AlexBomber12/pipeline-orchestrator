@@ -18,7 +18,7 @@ from src.models import PipelineState
 
 _TASK_UPLOAD_PATTERN = r"^PR-[A-Za-z0-9._-]+\.md$"
 _ALLOWED_TASK_PATTERN = (
-    rf"^(QUEUE\.md|AGENTS\.md|CLAUDE\.md|{_TASK_UPLOAD_PATTERN[1:-1]})$"
+    rf"^(AGENTS\.md|CLAUDE\.md|{_TASK_UPLOAD_PATTERN[1:-1]})$"
 )
 _STAGING_MAX_AGE_HOURS = 24
 
