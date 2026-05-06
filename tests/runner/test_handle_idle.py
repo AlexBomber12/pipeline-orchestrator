@@ -4715,26 +4715,15 @@ def test_write_generated_queue_md_skips_when_tracked_on_origin(
     ]
     statuses = {"PR-001": TaskStatus.DONE}
 
-    git_calls: list[list[str]] = []
-
-    def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
-        git_calls.append(cmd)
-        if cmd[1:3] == ["cat-file", "-e"]:
-            return h._FakeCompletedProcess(args=cmd, returncode=0)
-        return h._FakeCompletedProcess(args=cmd, returncode=0)
-
-    monkeypatch.setattr(git_ops_module.subprocess, "run", fake_run)
-
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
+    runner._origin_queue_md_tracked = lambda: True  # type: ignore[method-assign]
 
     published = runner._write_generated_queue_md(headers, statuses)
 
     assert published is True
     # The tracked file on disk is left alone — no dirty modification.
     assert queue_path.read_text(encoding="utf-8") == legacy_text
-    # Only the cat-file probe runs; no further git plumbing is invoked.
-    assert git_calls == [["git", "cat-file", "-e", "origin/main:tasks/QUEUE.md"]]
     assert any(
         "Skipping QUEUE.md regeneration" in entry["event"] and "tracked on origin/main" in entry["event"]
         for entry in runner.state.history

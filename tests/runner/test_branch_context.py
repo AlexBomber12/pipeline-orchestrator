@@ -199,7 +199,7 @@ def _run_recovery_branch_mismatch_scenario(
     runner = h._make_runner()
     runner.repo_config = runner.repo_config.model_copy(update={"branch": BASE_BRANCH})
     runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
-    runner._parse_base_queue = lambda **_: [doing]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [doing]  # type: ignore[method-assign]
     # Preserve must succeed (no local branch present) so the path
     # progresses to the CANCELED transition rather than stranding in
     # ERROR; that is the case being documented here.

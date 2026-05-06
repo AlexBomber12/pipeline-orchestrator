@@ -111,8 +111,7 @@ def test_dirty_tree_recovery_composes_with_crashed_task_marker(
     )
 
     runner = h._make_runner()
-    runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
-    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
 
     preserve_calls: list[str] = []
 
@@ -622,8 +621,7 @@ def test_recover_state_hydrates_recovered_task_pr_ids_from_redis(
     )
 
     runner = h._make_runner()
-    runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
-    runner._parse_base_queue = lambda **_: []  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: []  # type: ignore[method-assign]
     asyncio.run(
         runner.redis.set(
             f"recovered_tasks:{runner.name}",
@@ -710,8 +708,7 @@ def test_recover_state_doing_task_in_recovered_set_stays_idle(
     )
 
     runner = h._make_runner()
-    runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
-    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
     asyncio.run(
         runner.redis.set(
             f"recovered_tasks:{runner.name}",
@@ -770,8 +767,7 @@ def test_recover_state_records_pending_queue_sync_before_recovered_doing_exit(
     )
 
     runner = h._make_runner()
-    runner._origin_queue_md_tracked = lambda: False  # type: ignore[method-assign]
-    runner._parse_base_queue = lambda **_: [task]  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
     asyncio.run(
         runner.redis.set(
             f"recovered_tasks:{runner.name}",
@@ -921,7 +917,7 @@ def test_recover_state_rehydrates_last_push_at(
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
-    runner._parse_base_queue = lambda **_: parsed_tasks  # type: ignore[method-assign]
+    runner._parse_tasks_from_headers = lambda: parsed_tasks  # type: ignore[method-assign]
     assert runner._last_push_at is None
     assert runner._watch_entered_at is None
     asyncio.run(runner.recover_state())
@@ -931,6 +927,83 @@ def test_recover_state_rehydrates_last_push_at(
     # PR-202: recovery anchors the slow-start window so the first
     # post-restart poll already uses the slow cadence.
     assert runner._watch_entered_at is not None
+
+
+def test_recover_state_restores_prior_idle_pr_snapshots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
+
+    runner = h._make_runner()
+    prior_open = [PRInfo(number=1, branch="prior-open")]
+    prior_merged = [PRInfo(number=2, branch="prior-merged")]
+    runner._idle_open_prs = prior_open
+    runner._idle_merged_prs = prior_merged
+    runner._parse_tasks_from_headers = lambda: []  # type: ignore[method-assign]
+
+    assert asyncio.run(runner.recover_state()) is True
+    assert runner._idle_open_prs is prior_open
+    assert runner._idle_merged_prs is prior_merged
+
+
+def test_hydrate_current_task_ignores_corrupt_persisted_state() -> None:
+    runner = h._make_runner()
+    asyncio.run(runner.redis.set(f"pipeline:{runner.name}", "{not-json"))
+
+    asyncio.run(runner._hydrate_current_task_from_persisted_state())
+
+    assert runner.state.current_task is None
+
+
+def test_hydrate_current_task_skips_when_current_task_already_set() -> None:
+    runner = h._make_runner()
+    task = QueueTask(
+        pr_id="PR-266",
+        title="Existing task",
+        status=TaskStatus.DOING,
+        branch="pr-266",
+    )
+    runner.state.current_task = task
+
+    asyncio.run(runner._hydrate_current_task_from_persisted_state())
+
+    assert runner.state.current_task == task
+
+
+def test_hydrate_current_task_skips_non_coding_snapshot() -> None:
+    runner = h._make_runner()
+    task = QueueTask(
+        pr_id="PR-266",
+        title="Idle task",
+        status=TaskStatus.DOING,
+        branch="pr-266",
+    )
+    persisted = runner.state.model_copy(
+        update={"state": PipelineState.IDLE, "current_task": task}
+    )
+    asyncio.run(runner.redis.set(f"pipeline:{runner.name}", persisted.model_dump_json()))
+
+    asyncio.run(runner._hydrate_current_task_from_persisted_state())
+
+    assert runner.state.current_task is None
+
+
+def test_hydrate_current_task_restores_coding_snapshot() -> None:
+    runner = h._make_runner()
+    task = QueueTask(
+        pr_id="PR-266",
+        title="Recovered coding task",
+        status=TaskStatus.DOING,
+        branch="pr-266",
+    )
+    persisted = runner.state.model_copy(
+        update={"state": PipelineState.CODING, "current_task": task}
+    )
+    asyncio.run(runner.redis.set(f"pipeline:{runner.name}", persisted.model_dump_json()))
+
+    asyncio.run(runner._hydrate_current_task_from_persisted_state())
+
+    assert runner.state.current_task == task
 
 
 # ---------------------------------------------------------------------------
@@ -1078,8 +1151,6 @@ def _setup_headers_recovery_fixture(
     repo: Path,
     before: dict[str, Any],
 ):
-    monkeypatch.setenv("PIPELINE_RECOVERY_FROM_HEADERS", "1")
-    monkeypatch.delenv("PIPELINE_RECOVERY_AUDIT", raising=False)
     repo.mkdir(parents=True, exist_ok=True)
     for task in before.get("tasks", []):
         _write_pr_md_for_fixture(repo, task)
