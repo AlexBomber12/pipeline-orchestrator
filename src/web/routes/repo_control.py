@@ -614,42 +614,57 @@ async def _resolve_repo_task_path(name: str, pr_id: str) -> tuple[Path, str] | N
         return None
     tasks_dir_resolved = tasks_dir.resolve()
 
-    relative_str: str | None = None
-    queued_tasks, _source, _snapshot_at = await _load_current_queue_snapshot(name)
-    if queued_tasks is None:
+    def _try_candidate(relative_str: str) -> tuple[Path, str] | None:
+        candidate = repo_root / relative_str
         try:
-            queued_tasks = _app.parse_queue(str(tasks_dir / "QUEUE.md"))
-        except (OSError, UnicodeDecodeError):
-            # A broken QUEUE.md must not block direct lookups by `{pr_id}.md`
-            # — fall through to the default filename so a single malformed
-            # queue file does not also kill task-file viewing.
-            queued_tasks = []
-    for task in queued_tasks:
-        if task.pr_id == pr_id and task.task_file:
-            relative_str = task.task_file
-            break
-    if relative_str is None:
-        relative_str = f"tasks/{pr_id}.md"
-
-    candidate = repo_root / relative_str
-    try:
-        relative_parts = candidate.relative_to(repo_root).parts
-    except ValueError:
-        return None
-    walk = repo_root
-    for part in relative_parts:
-        walk = walk / part
-        if walk.is_symlink():
+            relative_parts = candidate.relative_to(repo_root).parts
+        except ValueError:
             return None
-    if not candidate.is_file():
-        return None
-    resolved = candidate.resolve()
+        walk = repo_root
+        for part in relative_parts:
+            walk = walk / part
+            if walk.is_symlink():
+                return None
+        if not candidate.is_file():
+            return None
+        resolved = candidate.resolve()
+        try:
+            within_tasks = resolved.relative_to(tasks_dir_resolved)
+        except ValueError:
+            return None
+        display_name = (Path("tasks") / within_tasks).as_posix()
+        return resolved, display_name
+
+    # Try mappings in priority order: snapshot, disk queue, default. The
+    # snapshot reflects the queue at the last IDLE cycle, so during the
+    # window after a task file is renamed but before the next snapshot
+    # refresh, the snapshot's ``task_file`` value can point at a file
+    # that no longer exists. In that case degrade to the disk queue and
+    # finally to ``tasks/{pr_id}.md`` instead of returning a 404.
+    snapshot_tasks, _source, _snapshot_at = await _load_current_queue_snapshot(name)
+    if snapshot_tasks is not None:
+        for task in snapshot_tasks:
+            if task.pr_id == pr_id and task.task_file:
+                hit = _try_candidate(task.task_file)
+                if hit is not None:
+                    return hit
+                break
+
     try:
-        within_tasks = resolved.relative_to(tasks_dir_resolved)
-    except ValueError:
-        return None
-    display_name = (Path("tasks") / within_tasks).as_posix()
-    return resolved, display_name
+        disk_tasks = _app.parse_queue(str(tasks_dir / "QUEUE.md"))
+    except (OSError, UnicodeDecodeError):
+        # A broken QUEUE.md must not block direct lookups by `{pr_id}.md`
+        # — fall through to the default filename so a single malformed
+        # queue file does not also kill task-file viewing.
+        disk_tasks = []
+    for task in disk_tasks:
+        if task.pr_id == pr_id and task.task_file:
+            hit = _try_candidate(task.task_file)
+            if hit is not None:
+                return hit
+            break
+
+    return _try_candidate(f"tasks/{pr_id}.md")
 
 
 @router.get("/repos/{name}/tasks/{pr_id}", response_class=HTMLResponse)
