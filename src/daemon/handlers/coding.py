@@ -32,15 +32,27 @@ def _resolve_task_file_under_repo(repo_path: str, task_file: str) -> Path:
     arbitrary host content into the inline ``run_auto_pr`` prompt.
 
     Raises ``ValueError`` if ``task_file`` is absolute, contains ``..``
-    segments, or — after symlink resolution — escapes ``repo_path``.
+    segments, escapes ``repo_path`` after symlink resolution, or fails to
+    resolve at all (e.g. a symlink loop, which ``Path.resolve`` surfaces
+    as ``RuntimeError``, or a permission/IO error surfaced as ``OSError``).
+    Normalizing those resolver exceptions here keeps the caller's error
+    handling uniform — ``handle_coding`` only has to catch ``ValueError``
+    to route every malformed task path through the controlled
+    ``_transition_to_error`` path instead of letting the exception escape
+    and crash the cycle.
     """
     candidate = Path(task_file)
     if candidate.is_absolute():
         raise ValueError(f"absolute path not allowed: {task_file!r}")
     if any(part == ".." for part in candidate.parts):
         raise ValueError(f"path traversal not allowed: {task_file!r}")
-    repo_root = Path(repo_path).resolve()
-    resolved = (repo_root / candidate).resolve()
+    try:
+        repo_root = Path(repo_path).resolve()
+        resolved = (repo_root / candidate).resolve()
+    except (RuntimeError, OSError) as exc:
+        raise ValueError(
+            f"cannot resolve task path {task_file!r}: {exc}"
+        ) from exc
     try:
         resolved.relative_to(repo_root)
     except ValueError as exc:
@@ -191,7 +203,13 @@ class CodingMixin:
             return
         try:
             task_body = task_body_path.read_text(encoding="utf-8")
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # ``ValueError`` covers ``UnicodeDecodeError`` (a ``ValueError``
+            # subclass) raised when ``tasks/{pr_id}.md`` contains non-UTF-8
+            # bytes. Treat decode failures the same as I/O failures so the
+            # daemon records a deterministic task-file error and routes
+            # through ``_transition_to_error`` instead of letting the
+            # exception escape and crash ``run_cycle``.
             await self._transition_to_error(
                 f"Cannot read task file {task_file}: {exc}",
                 publish=False,

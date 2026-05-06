@@ -1194,3 +1194,59 @@ def test_handle_coding_rejects_symlink_escape_task_file(
     assert "Invalid task file" in (runner.state.error_message or "")
     assert "escapes repo root" in (runner.state.error_message or "")
     assert "kwargs" not in captured
+
+
+def test_handle_coding_rejects_symlink_loop_task_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A symlink loop under ``tasks/`` must fail closed through
+    ``_transition_to_error``: ``Path.resolve()`` raises ``RuntimeError``
+    on a self-referential or cyclic symlink chain, but the handler only
+    catches ``ValueError`` here. Without normalizing resolver
+    exceptions, the ``RuntimeError`` would escape ``handle_coding`` and
+    crash ``run_cycle`` instead of producing a controlled ERROR
+    transition with a user-facing message.
+    """
+    repo = tmp_path / "repo"
+    (repo / "tasks").mkdir(parents=True)
+    loop_a = repo / "tasks" / "PR-LOOP.md"
+    loop_b = repo / "tasks" / "PR-LOOP-other.md"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
+
+    runner, captured = _runner_for_path_validation(
+        monkeypatch, repo, task_file="tasks/PR-LOOP.md"
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "Invalid task file" in (runner.state.error_message or "")
+    assert "cannot resolve" in (runner.state.error_message or "")
+    assert "kwargs" not in captured
+
+
+def test_handle_coding_handles_non_utf8_task_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A ``tasks/{pr_id}.md`` written in a non-UTF-8 encoding must fail
+    closed through ``_transition_to_error``. ``read_text(encoding="utf-8")``
+    raises ``UnicodeDecodeError`` (a ``ValueError`` subclass) on byte
+    sequences that are not valid UTF-8, so the handler must treat decode
+    failures like other read failures instead of letting the exception
+    escape and crash the cycle.
+    """
+    repo = tmp_path / "repo"
+    (repo / "tasks").mkdir(parents=True)
+    # Latin-1 byte 0xff is invalid as the leading byte of a UTF-8 sequence.
+    (repo / "tasks" / "PR-BAD.md").write_bytes(b"\xff invalid utf-8 \xfe\n")
+
+    runner, captured = _runner_for_path_validation(
+        monkeypatch, repo, task_file="tasks/PR-BAD.md"
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "Cannot read task file" in (runner.state.error_message or "")
+    assert "kwargs" not in captured
