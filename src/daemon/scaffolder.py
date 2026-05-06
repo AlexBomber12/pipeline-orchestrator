@@ -596,6 +596,8 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
         created.append(_SKILL_MD_REL_PATH)
 
     tasks_dir = repo / "tasks"
+    if tasks_dir.exists() and not tasks_dir.is_dir():
+        raise NotADirectoryError(f"{tasks_dir} exists but is not a directory")
     if not tasks_dir.exists():
         tasks_dir.mkdir(parents=True)
         created.append("tasks/")

@@ -485,6 +485,21 @@ def test_scaffold_repo_preserves_existing_queue(
     assert "tasks/QUEUE.md" not in actions
 
 
+def test_scaffold_repo_rejects_tasks_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_empty_repo(tmp_path)
+    (repo / "tasks").write_text("not a directory\n")
+    calls = _patch_git(monkeypatch)
+
+    with pytest.raises(NotADirectoryError):
+        scaffolder.scaffold_repo(str(repo), "main")
+
+    assert not any(cmd[:2] == ["git", "add"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "commit"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
+
+
 def test_scaffolder_template_directory_no_queue_md() -> None:
     assert not (scaffolder.TEMPLATES_DIR / "QUEUE.md").exists()
 
