@@ -20,7 +20,8 @@ from src.branch_context import BranchContext
 from src.daemon import git_ops
 from src.github import gh_runner
 from src.github import prs as gh_prs
-from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
+from src.keyspace import pipeline_state
+from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
 from src.queue_parser import QueueValidationError, parse_task_header
 from src.task_status import (
     _resolve_merged_state,
@@ -569,6 +570,44 @@ class RecoveryMixin:
         await self._apply_recovery_decisions(tasks, prs)
         return True, tasks, list(prs)
 
+    async def _hydrate_current_task_from_persisted_state(self) -> None:
+        """Restore ``state.current_task`` from the published Redis snapshot.
+
+        ``publish_state`` writes the live ``RepoState`` to
+        ``pipeline_state(self.name)`` at the end of every cycle, so the
+        last persisted snapshot is the authoritative record of which
+        task was active when the daemon went down. The runner re-builds
+        a fresh ``RepoState`` on startup with ``current_task=None``;
+        without this rehydrate the headers helper's
+        ``current_task_pr_id`` input is always ``None``, and a pre-push
+        crash mid-CODING (no open PR yet) re-derives the task as
+        ``TODO`` rather than ``DOING``.
+
+        Best-effort: Redis read errors, missing snapshots, and corrupt
+        payloads all leave ``state.current_task`` untouched. This is
+        deliberately narrow — we only hydrate ``current_task`` because
+        ``_apply_recovery_decisions`` overwrites it from the parsed task
+        list afterwards, so a stale value cannot leak past recovery
+        even when the snapshot lags reality (e.g. the task was merged
+        externally between crash and restart, in which case
+        ``derive_task_status`` returns ``DONE`` first via the merged-
+        state probe and the hydrated value is irrelevant).
+        """
+        if self.state.current_task is not None:
+            return
+        try:
+            raw = await self.redis.get(pipeline_state(self.name))
+        except Exception:
+            return
+        if not raw:
+            return
+        try:
+            persisted = RepoState.model_validate_json(raw)
+        except Exception:
+            return
+        if persisted.current_task is not None:
+            self.state.current_task = persisted.current_task
+
     async def _recover_state_headers(
         self,
     ) -> tuple[bool, list[QueueTask], list[PRInfo]]:
@@ -595,6 +634,20 @@ class RecoveryMixin:
                 log_message=f"recover_state failed: {exc}",
             )
             return False, [], []
+        # PR-266b crash-no-PR fix: the headers helper derives ``DOING``
+        # via ``current_task_pr_id`` when no matching open PR exists.
+        # ``state.current_task`` is reset on daemon restart, so without
+        # this rehydrate a pre-push crash (no open PR yet) re-derives
+        # the previously DOING task as ``TODO``; ``_apply_recovery_
+        # decisions`` only runs the PR-186 crash path on a DOING entry,
+        # so the task would be silently re-dispatched into a crash loop
+        # instead of being marked CANCELED pending manual re-upload.
+        # Legacy recovery does not need this because it reads ``DOING``
+        # straight from ``QUEUE.md``. Run after the ``get_open_prs``
+        # probe so a transient GitHub outage during recovery still
+        # surfaces as ERROR with no current_task, matching legacy
+        # error-path behavior.
+        await self._hydrate_current_task_from_persisted_state()
         # The helper consults ``_idle_open_prs`` to derive each task's
         # status from the live PR set. Populate it from the recovery
         # fetch and reset on exit so ``handle_idle`` does not later read
@@ -800,6 +853,20 @@ class RecoveryMixin:
             # crash was associated with rather than ``<absent>``.
             ctx = BranchContext.from_runner(self)
             self._crashed_task_pr_ids.add(doing.pr_id)
+            # PR-266b crash-no-PR fix: reflect the cancellation in the
+            # in-memory tasks list so the headers-mode current_queue
+            # snapshot does not display ``DOING`` for a task the runner
+            # just gave up on. The IDLE selector applies the same
+            # override on its next cycle; doing it eagerly here keeps
+            # post-restart dashboards consistent without waiting for
+            # the next poll. Legacy callers discard the tasks list, so
+            # the mutation is a no-op for them; the audit comparator
+            # benefits because both projection branches now see
+            # consistent ``CANCELED`` status for the crashed entry.
+            for i, t in enumerate(tasks):
+                if t.pr_id == doing.pr_id and t.status == TaskStatus.DOING:
+                    tasks[i] = t.model_copy(update={"status": TaskStatus.CANCELED})
+                    break
             self.state.current_task = None
             self._reset_runner_local_task_counters()
             self.state.state = PipelineState.IDLE

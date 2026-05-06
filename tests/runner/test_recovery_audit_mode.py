@@ -927,3 +927,295 @@ def test_audit_dry_run_skips_when_queue_probe_indeterminate(
         e["event"].startswith("[AUDIT] recover_state divergence:")
         for e in runner.state.history
     )
+
+
+# ---------------------------------------------------------------------------
+# PR-266b crash-no-PR semantics in HEADERS_ONLY mode
+# ---------------------------------------------------------------------------
+
+
+def _persist_current_task(runner: Any, pr_id: str, branch: str) -> None:
+    """Seed the published RepoState snapshot with a DOING ``current_task``.
+
+    Mirrors what ``publish_state`` writes mid-CODING, so a fresh runner
+    started after a crash can rehydrate the marker exactly as it would
+    on a real daemon restart.
+    """
+    from src.keyspace import pipeline_state as _pipeline_state_key
+    from src.models import RepoState
+
+    persisted = RepoState(
+        url=runner.repo_config.url,
+        name=runner.name,
+        state=PipelineState.CODING,
+        current_task=QueueTask(
+            pr_id=pr_id,
+            title="Crashed before push",
+            status=TaskStatus.DOING,
+            branch=branch,
+            task_file=f"tasks/{pr_id}.md",
+        ),
+    )
+    asyncio.run(
+        runner.redis.set(
+            _pipeline_state_key(runner.name), persisted.model_dump_json()
+        )
+    )
+
+
+def test_headers_only_mode_marks_pre_push_crash_canceled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Pre-push crash on a fresh restart routes through PR-186 crash path.
+
+    When ``PIPELINE_RECOVERY_FROM_HEADERS=1`` and the daemon was killed
+    mid-CODING before any PR was opened, the runner's in-memory
+    ``state.current_task`` resets to ``None`` on restart. Without
+    rehydrating the published snapshot, the headers helper would
+    derive the task back to ``TODO`` (no open PR + no
+    ``current_task_pr_id``), the DOING-with-no-PR crash path in
+    ``_apply_recovery_decisions`` would never run, and the next IDLE
+    cycle would silently re-dispatch the task into another doomed
+    CODING run. Hydrating ``state.current_task`` from
+    ``pipeline_state(repo)`` restores the legacy behavior: task is
+    canceled, added to ``_crashed_task_pr_ids``, and the daemon stays
+    IDLE pending manual re-upload.
+    """
+    _set_env(monkeypatch, audit="0", headers="1")
+    _stub_open_prs(monkeypatch, [])
+    _stub_resolve_merged_state(monkeypatch)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_pr_md(repo, "PR-186", "pr-186-crash-no-pr", priority=1)
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+    runner._preserve_crashed_run_commits = (  # type: ignore[method-assign]
+        lambda branch: True
+    )
+    _persist_current_task(runner, "PR-186", "pr-186-crash-no-pr")
+
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.current_pr is None
+    assert runner._crashed_task_pr_ids == {"PR-186"}
+    assert runner.state.current_queue is not None
+    crash_entry = next(
+        (t for t in runner.state.current_queue if t.pr_id == "PR-186"),
+        None,
+    )
+    assert crash_entry is not None
+    assert crash_entry.status == TaskStatus.CANCELED
+    assert any(
+        "Task PR-186 crashed, marking CANCELED. Manually re-upload to retry"
+        in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_headers_only_mode_pre_push_crash_resumes_watch_when_pr_visible(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A late-visible PR after the same crash resumes WATCH, not CANCELED.
+
+    If the recovery ``get_open_prs`` snapshot does include a matching
+    PR (e.g. push raced with the kill), the rehydrated
+    ``current_task_pr_id`` derives DOING via the open-PR match and
+    ``_apply_recovery_decisions`` reattaches WATCH. The hydrated
+    marker must not force CANCELED for tasks that actually have live
+    PRs.
+    """
+    _set_env(monkeypatch, audit="0", headers="1")
+    _stub_open_prs(
+        monkeypatch,
+        [PRInfo(number=42, branch="pr-186-crash-no-pr", pr_id="PR-186")],
+    )
+    _stub_resolve_merged_state(monkeypatch)
+    monkeypatch.setattr(
+        "src.github.prs.get_pr_metadata",
+        lambda repo, number: {
+            "author": "",
+            "head_sha": "",
+            "head_commit_date": "2026-04-30T12:00:00Z",
+        },
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_pr_md(repo, "PR-186", "pr-186-crash-no-pr", priority=1)
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+    _persist_current_task(runner, "PR-186", "pr-186-crash-no-pr")
+
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == "PR-186"
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 42
+    assert "PR-186" not in runner._crashed_task_pr_ids
+
+
+def test_headers_only_mode_does_not_synthesize_crash_when_redis_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """No persisted snapshot means no rehydrate; task derives ``TODO``.
+
+    A fresh repo (no prior crash) must not pick up a hydrated
+    ``current_task`` from another runner. The helper should be a
+    no-op when ``pipeline_state(repo)`` is missing, leaving the task
+    derivation to the normal PR/header-based path.
+    """
+    _set_env(monkeypatch, audit="0", headers="1")
+    _stub_open_prs(monkeypatch, [])
+    _stub_resolve_merged_state(monkeypatch)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_pr_md(repo, "PR-001", "pr-001-fresh", priority=1)
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner._crashed_task_pr_ids == set()
+    assert runner.state.current_queue is not None
+    assert runner.state.current_queue[0].status == TaskStatus.TODO
+
+
+def test_hydrate_current_task_ignores_corrupt_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A corrupt ``pipeline_state`` payload must not abort recovery.
+
+    Defense-in-depth: the helper is best-effort. A malformed JSON or
+    a schema mismatch should leave ``state.current_task`` untouched
+    rather than raise — recovery still has to make progress for the
+    operator to fix the underlying issue.
+    """
+    from src.keyspace import pipeline_state as _pipeline_state_key
+
+    runner = h._make_runner()
+    asyncio.run(
+        runner.redis.set(_pipeline_state_key(runner.name), "{not json")
+    )
+    assert runner.state.current_task is None
+
+    asyncio.run(runner._hydrate_current_task_from_persisted_state())
+
+    assert runner.state.current_task is None
+
+
+def test_hydrate_current_task_swallows_redis_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Redis read failure must not block recovery startup.
+
+    Mirrors ``_load_recovered_task_pr_ids``'s defensive contract: the
+    rehydrate is best-effort, so a transient Redis outage downgrades
+    to "no hydration" rather than aborting recovery before the
+    headers parser even runs.
+    """
+    runner = h._make_runner()
+
+    async def _boom_get(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("redis down")
+
+    monkeypatch.setattr(runner.redis, "get", _boom_get)
+    assert runner.state.current_task is None
+
+    asyncio.run(runner._hydrate_current_task_from_persisted_state())
+
+    assert runner.state.current_task is None
+
+
+def test_hydrate_current_task_skips_when_already_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An already-set ``current_task`` is the source of truth.
+
+    The hydrate is intentionally narrow: it only fills the gap left
+    by a fresh ``RepoState`` on restart. If something earlier in the
+    cycle already set ``current_task``, the helper must not clobber
+    it with a stale Redis snapshot.
+    """
+    from src.keyspace import pipeline_state as _pipeline_state_key
+    from src.models import RepoState
+
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-LIVE",
+        title="active",
+        status=TaskStatus.DOING,
+        branch="pr-live",
+    )
+    persisted = RepoState(
+        url=runner.repo_config.url,
+        name=runner.name,
+        state=PipelineState.CODING,
+        current_task=QueueTask(
+            pr_id="PR-STALE",
+            title="stale",
+            status=TaskStatus.DOING,
+            branch="pr-stale",
+        ),
+    )
+    asyncio.run(
+        runner.redis.set(
+            _pipeline_state_key(runner.name), persisted.model_dump_json()
+        )
+    )
+
+    asyncio.run(runner._hydrate_current_task_from_persisted_state())
+
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == "PR-LIVE"
+
+
+def test_headers_only_mode_does_not_hydrate_when_persisted_idle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A persisted snapshot with ``current_task=None`` must not change behavior.
+
+    The last persisted state of a healthy IDLE daemon is
+    ``current_task=None``. The helper must remain a no-op in that
+    case so a TODO task is not falsely upgraded to DOING.
+    """
+    from src.keyspace import pipeline_state as _pipeline_state_key
+    from src.models import RepoState
+
+    _set_env(monkeypatch, audit="0", headers="1")
+    _stub_open_prs(monkeypatch, [])
+    _stub_resolve_merged_state(monkeypatch)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_pr_md(repo, "PR-001", "pr-001", priority=1)
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+    persisted = RepoState(
+        url=runner.repo_config.url,
+        name=runner.name,
+        state=PipelineState.IDLE,
+        current_task=None,
+    )
+    asyncio.run(
+        runner.redis.set(
+            _pipeline_state_key(runner.name), persisted.model_dump_json()
+        )
+    )
+
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner._crashed_task_pr_ids == set()
+    assert runner.state.current_queue is not None
+    assert runner.state.current_queue[0].status == TaskStatus.TODO
