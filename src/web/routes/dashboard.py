@@ -1047,19 +1047,21 @@ async def api_repo_events(name: str, request: Request) -> Response:
     )
 
 
-def _augment_causes_with_dependents(
+async def _augment_causes_with_dependents(
     repo: str, causes: list
 ) -> list[dict[str, Any]]:
     """Return ``causes`` as dicts with a ``dependents_count`` field attached.
 
-    PR-257: each cause carries the count of QUEUE.md tasks transitively
+    PR-257: each cause carries the count of queue tasks transitively
     blocked by its ``task_id`` so the dashboard can sort canceled roots
     by downstream-blast radius. Computation is best-effort: a missing
-    or unreadable QUEUE.md degrades to zero counts rather than failing
+    or unreadable queue degrades to zero counts rather than failing
     the surfacing of the cards themselves.
     """
     canceled_ids = {c.task_id for c in causes}
-    counts = compute_repo_dependents_count(_app.REPOS_DIR, repo, canceled_ids)
+    counts = await compute_repo_dependents_count(
+        _app.REPOS_DIR, repo, canceled_ids
+    )
     augmented: list[dict[str, Any]] = []
     for cause in causes:
         record = asdict(cause)
@@ -1101,7 +1103,9 @@ async def api_cancellations(repo: str, request: Request) -> JSONResponse:
         # request time, matching the redis_client-is-None branch above.
         return JSONResponse([])
     return JSONResponse(
-        _augment_causes_with_dependents(repo, causes[:_CANCELLATIONS_MAX])
+        await _augment_causes_with_dependents(
+            repo, causes[:_CANCELLATIONS_MAX]
+        )
     )
 
 
@@ -1343,7 +1347,7 @@ async def partial_repo_cancellations(
             # so the HTMX swap target stays stable instead of 5xx-ing the panel.
             causes = []
     augmented = (
-        _augment_causes_with_dependents(name, causes) if causes else []
+        await _augment_causes_with_dependents(name, causes) if causes else []
     )
     return _app.templates.TemplateResponse(
         request,
