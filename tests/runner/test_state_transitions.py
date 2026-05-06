@@ -102,12 +102,9 @@ def _stub_recovery_queue(
     runner: Any,
     *,
     tasks: list[QueueTask],
-    queue_from_origin: bool = False,
+    queue_from_origin: bool = False,  # retained for callers; no-op
 ) -> None:
-    """Pin the queue-source probe and parse output used by ``recover_state``."""
-    runner._origin_queue_md_tracked = (  # type: ignore[method-assign]
-        lambda: queue_from_origin
-    )
+    """Pin the parsed-headers output used by ``recover_state``."""
     runner._parse_tasks_from_headers = (  # type: ignore[method-assign]
         lambda **_: list(tasks)
     )
@@ -124,7 +121,7 @@ def test_recovery_clears_task_on_already_merged_doing(
     """``recovery.py:284`` — stale DOING already merged on origin.
 
     Setup mirrors a daemon restart where the prior cycle merged the PR
-    but ``_mark_queue_done`` left ``DOING`` pinned in
+    but ``_mark_task_done_in_snapshot`` left ``DOING`` pinned in
     ``origin/{branch}/tasks/QUEUE.md`` (legacy tracked-QUEUE flow).
     ``_is_doing_already_merged`` returns ``True`` and the site clears
     ``current_task`` only — it does NOT touch ``current_pr``,
@@ -264,8 +261,6 @@ def test_idle_clears_task_on_open_pr_check_failure(
     already followed.
     """
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
-    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
 
     def _raise(repo: str, **kw: Any) -> list[PRInfo]:
         raise RuntimeError("API down")
@@ -310,8 +305,7 @@ def test_idle_clears_task_on_user_pause_during_prep(
         status=TaskStatus.TODO,
         branch="pr-042-picked",
     )
-    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
-    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: task)
+    h._stub_dag_select(monkeypatch, task=task)
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
@@ -349,7 +343,7 @@ def test_fix_clears_task_on_terminal_pr_state(
     ``publish_state`` (the FIX handler publishes after dropping the
     work because IDLE consumers depend on the transition signal).
     """
-    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.FIX
@@ -433,7 +427,7 @@ def test_merge_clears_task_after_successful_merge(
     )
     monkeypatch.setattr(
         runner_module.PipelineRunner,
-        "_mark_queue_done",
+        "_mark_task_done_in_snapshot",
         lambda self: None,
     )
 
@@ -649,8 +643,7 @@ def test_idle_assigns_active_task(
         status=TaskStatus.TODO,
         branch="pr-400-picked",
     )
-    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [task])
-    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: task)
+    h._stub_dag_select(monkeypatch, task=task)
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
@@ -670,7 +663,8 @@ def test_idle_assigns_active_task(
 
     asyncio.run(runner.handle_idle())
 
-    assert runner.state.current_task == task
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == task.pr_id
     assert runner.state.state == PipelineState.CODING
     assert coding_calls == [None]
     assert any(f"Picked task {task.pr_id}" in e["event"] for e in runner.state.history)
@@ -1914,7 +1908,7 @@ def test_handle_hung_recovery_signal_getdel_failure_falls_through(
 def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None:
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
-    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -1939,36 +1933,6 @@ def test_handle_merge_without_current_pr_sets_idle() -> None:
 
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is None
-
-
-def test_handle_merge_queue_sync_failure_still_goes_idle(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When _mark_queue_done raises, handle_merge catches the exception
-    and still transitions to IDLE. The pending_queue_sync_branch marker
-    (set eagerly inside _mark_queue_done) gates handle_idle from
-    re-dispatching the same task."""
-    h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
-
-    def _failing_mark(self: Any) -> None:
-        self.state.pending_queue_sync_branch = "queue-done-pr-001"
-        raise RuntimeError("push rejected")
-
-    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", _failing_mark)
-
-    runner = h._make_runner()
-    runner.state.state = PipelineState.WATCH
-    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-001",
-        title="t",
-        status=TaskStatus.DOING,
-    )
-    asyncio.run(runner.handle_merge())
-
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.pending_queue_sync_branch == "queue-done-pr-001"
 
 
 def test_escalate_queue_sync_transitions_to_error_when_expired(
@@ -2028,7 +1992,7 @@ def test_handle_merge_syncs_with_main(monkeypatch: pytest.MonkeyPatch) -> None:
         merge_pr_calls.append((repo, num))
 
     monkeypatch.setattr("src.github.prs.merge_pr", fake_merge_pr)
-    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -2063,7 +2027,7 @@ def test_handle_merge_marks_pr_ready_before_merge(
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     monkeypatch.setattr("src.github.prs.merge_pr", fake_merge_pr)
-    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -2094,7 +2058,7 @@ def test_handle_merge_ignores_pr_ready_failure(
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fail_run_gh)
     monkeypatch.setattr("src.github.prs.merge_pr", fake_merge_pr)
-    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -2139,7 +2103,7 @@ def test_handle_merge_captures_success_stats_before_queue_sync(
     runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     runner._start_current_run_record("claude", "opus")
     monkeypatch.setattr(runner, "_compute_diff_stats", fake_compute)
-    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", fake_mark)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", fake_mark)
 
     asyncio.run(runner.handle_merge())
 
@@ -2471,7 +2435,7 @@ def test_handle_merge_skips_sync_for_cross_repo_pr(
         "src.github.prs.merge_pr",
         lambda repo, num: merge_pr_calls.append((repo, num)),
     )
-    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -2508,7 +2472,7 @@ def test_handle_merge_refreshes_pr_head_before_merge(
         "src.github.comments.post_comment",
         lambda repo, num, body: None,
     )
-    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH

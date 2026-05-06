@@ -1892,7 +1892,7 @@ def test_handle_fix_external_merge_during_coder_transitions_to_idle(
 ) -> None:
     """A polling task that detects MERGED while the coder runs must drive IDLE."""
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
     runner = h._make_runner()
     runner._app_config = h._app_cfg(fix_poll_interval_sec=1)
@@ -2018,7 +2018,7 @@ def test_handle_fix_external_merge_when_coder_exits_during_grace(
     no-op and ``await claude_task`` returns normally), the post-finally
     branch must still drive IDLE on MERGED (Codex P1 on PR #223)."""
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
     monkeypatch.setattr("src.github.comments.post_comment", lambda *a, **kw: None)
 
     async def fake_poll(
@@ -3234,7 +3234,7 @@ def test_fix_iterations_survive_recovery_until_merge(
         lambda repo, number, body: None,
     )
     monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
-    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
     redis = h._FakeRedis()
     claude_provider, codex_provider = h._usage_providers()
@@ -4224,7 +4224,7 @@ def test_handle_external_terminal_pr_state_merged_resets_counters_and_marks_done
     def fake_mark_done(self: object) -> None:
         queue_done_calls["count"] += 1
 
-    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", fake_mark_done)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", fake_mark_done)
 
     asyncio.run(runner._handle_external_terminal_pr_state("MERGED"))
 
@@ -4238,43 +4238,6 @@ def test_handle_external_terminal_pr_state_merged_resets_counters_and_marks_done
     )
 
 
-def test_handle_external_terminal_pr_state_swallows_mark_queue_done_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A queue-sync failure on external merge must not block the IDLE
-    transition and must log a warning, but the
-    ``pending_queue_sync_branch`` guard MUST be preserved so a stale
-    ``DOING`` task is not redispatched on the next idle cycle —
-    ``_resolve_pending_queue_sync`` owns the retry/timeout from
-    ``handle_idle`` (Codex P2 round-2 + P1 round-3 on PR #223)."""
-    runner = h._make_runner()
-    runner.state.current_pr = PRInfo(number=44, branch="pr-044")
-    sync_started_at = datetime.now(timezone.utc)
-
-    def fake_mark_done(self: object) -> None:
-        # Simulate _mark_queue_done's eager marker-then-fragile-op shape:
-        # set the marker, then raise to model a fetch/checkout failure
-        # mid-way through the sync.
-        self.state.pending_queue_sync_branch = "queue-done-pr-044"
-        self.state.pending_queue_sync_started_at = sync_started_at
-        raise RuntimeError("queue mutation failed")
-
-    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", fake_mark_done)
-
-    asyncio.run(runner._handle_external_terminal_pr_state("MERGED"))
-
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.current_pr is None
-    # Marker preserved so handle_idle gates dispatch via
-    # _resolve_pending_queue_sync rather than redispatching the stale
-    # DOING task as new work.
-    assert runner.state.pending_queue_sync_branch == "queue-done-pr-044"
-    assert runner.state.pending_queue_sync_started_at == sync_started_at
-    assert any(
-        "_mark_queue_done failed during external-merge cleanup" in entry["event"] for entry in runner.state.history
-    )
-
-
 def test_handle_external_terminal_pr_state_logs_without_pr_number(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4282,7 +4245,7 @@ def test_handle_external_terminal_pr_state_logs_without_pr_number(
     runner = h._make_runner()
     runner.state.current_pr = None
 
-    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
     asyncio.run(runner._handle_external_terminal_pr_state("MERGED"))
     assert runner.state.state == PipelineState.IDLE
     assert any("merged externally during FIX" in entry["event"] for entry in runner.state.history)
@@ -4314,7 +4277,7 @@ def test_handle_external_terminal_pr_state_merged_saves_success_merged_record(
     runner.state.current_pr = PRInfo(number=91, branch="pr-091")
     runner._start_current_run_record("claude", "opus")
 
-    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
     monkeypatch.setattr(runner, "_compute_diff_stats", lambda base_branch: {})
 
     saved: list[str] = []

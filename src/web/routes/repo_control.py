@@ -30,6 +30,11 @@ router = APIRouter()
 
 _HISTORY_LIMIT = 100
 _TASK_PR_ID_PATTERN = re.compile(r"^PR-[A-Za-z0-9_.-]+$")
+_QUEUE_NOT_READY_FRAGMENT = (
+    '<p class="text-sm italic text-gray-500">Queue not yet computed; '
+    "daemon syncing.</p>"
+)
+_QUEUE_NOT_READY_JSON = {"error": "Queue not yet computed"}
 
 _DEFERRED_CODER_SWITCH_STATES = {
     PipelineState.CODING,
@@ -51,7 +56,7 @@ _CODER_LABELS = {
     "codex": "Codex CLI",
 }
 
-_QueueSource = Literal["snapshot", "fallback_disk"]
+_QueueSource = Literal["snapshot"]
 
 
 def _coder_display_name(coder: str) -> str:
@@ -61,49 +66,49 @@ def _coder_display_name(coder: str) -> str:
 
 async def _load_current_queue_snapshot(
     name: str,
-) -> tuple[list[QueueTask] | None, _QueueSource, str | None]:
-    """Return the current queue snapshot and source marker for ``name``.
+) -> tuple[list[QueueTask] | None, str | None]:
+    """Return the current queue snapshot and snapshot timestamp for ``name``.
 
     ``snapshot_at`` is sourced from ``RepoState.current_queue_snapshot_at``
     so it reflects the time the snapshot was actually written, not
     ``RepoState.last_updated`` (a per-cycle daemon heartbeat that rolls
     forward every runner cycle even when ``current_queue`` is unchanged).
+    Returns ``(None, None)`` if Redis has no usable snapshot yet.
     """
     redis_client = getattr(_app.app.state, "redis", None)
     if redis_client is None:
-        return None, "fallback_disk", None
+        return None, None
     try:
         raw = await redis_client.get(pipeline_state(name))
     except Exception:
-        return None, "fallback_disk", None
+        return None, None
     if raw is None:
-        return None, "fallback_disk", None
+        return None, None
     try:
         state = RepoState.model_validate_json(raw)
     except Exception:
-        return None, "fallback_disk", None
+        return None, None
     if state.current_queue is None:
-        return None, "fallback_disk", None
+        return None, None
     snapshot_at = (
         state.current_queue_snapshot_at.isoformat()
         if state.current_queue_snapshot_at is not None
         else None
     )
-    return state.current_queue, "snapshot", snapshot_at
+    return state.current_queue, snapshot_at
 
 
 def _queue_json_payload(
     name: str,
     tasks: list[QueueTask],
     *,
-    source: _QueueSource,
     snapshot_at: str | None,
 ) -> dict[str, object]:
     return {
         "repo": name,
         "snapshot_at": snapshot_at,
         "queue": [task.model_dump(mode="json") for task in tasks],
-        "source": source,
+        "source": "snapshot",
     }
 
 
@@ -529,22 +534,12 @@ async def list_repo_tasks(request: Request, name: str) -> Response:
             '<p class="text-sm italic text-fail">Repository not found.</p>',
             status_code=404,
         )
-    queue_path = Path(_app.REPOS_DIR) / name / "tasks" / "QUEUE.md"
-    tasks, _source, _snapshot_at = await _load_current_queue_snapshot(name)
+    tasks, _snapshot_at = await _load_current_queue_snapshot(name)
     if tasks is None:
-        try:
-            tasks = _app.parse_queue(str(queue_path))
-        except (OSError, UnicodeDecodeError):
-            # A non-UTF-8 or otherwise unreadable QUEUE.md (bad manual edit,
-            # interrupted merge, lost permissions) must not 500 the entire
-            # Tasks panel — return a controlled fragment instead. Use 503 so
-            # the global htmx:beforeSwap hook in base.html swaps the fragment
-            # in (it only enables swap for 404/422/503).
-            return HTMLResponse(
-                '<p class="text-sm italic text-fail">Unable to read'
-                " tasks/QUEUE.md.</p>",
-                status_code=503,
-            )
+        return HTMLResponse(
+            _QUEUE_NOT_READY_FRAGMENT,
+            status_code=503,
+        )
     grouped = {
         "doing": [t for t in tasks if t.status == TaskStatus.DOING],
         "todo": [t for t in tasks if t.status == TaskStatus.TODO],
@@ -569,26 +564,13 @@ async def api_repo_queue(name: str) -> Response:
     if _find_repo_config_by_name(cfg, name) is None:
         return JSONResponse({"error": "Repository not found"}, status_code=404)
 
-    tasks, source, snapshot_at = await _load_current_queue_snapshot(name)
+    tasks, snapshot_at = await _load_current_queue_snapshot(name)
     if tasks is None:
-        queue_path = Path(_app.REPOS_DIR) / name / "tasks" / "QUEUE.md"
-        if not queue_path.is_file():
-            return JSONResponse(
-                {"error": "Unable to read tasks/QUEUE.md"},
-                status_code=503,
-            )
-        try:
-            tasks = _app.parse_queue(str(queue_path))
-        except (OSError, UnicodeDecodeError):
-            return JSONResponse(
-                {"error": "Unable to read tasks/QUEUE.md"},
-                status_code=503,
-            )
+        return JSONResponse(_QUEUE_NOT_READY_JSON, status_code=503)
     return JSONResponse(
         _queue_json_payload(
             name,
             tasks,
-            source=source,
             snapshot_at=snapshot_at,
         )
     )
@@ -635,13 +617,13 @@ async def _resolve_repo_task_path(name: str, pr_id: str) -> tuple[Path, str] | N
         display_name = (Path("tasks") / within_tasks).as_posix()
         return resolved, display_name
 
-    # Try mappings in priority order: snapshot, disk queue, default. The
-    # snapshot reflects the queue at the last IDLE cycle, so during the
-    # window after a task file is renamed but before the next snapshot
-    # refresh, the snapshot's ``task_file`` value can point at a file
-    # that no longer exists. In that case degrade to the disk queue and
-    # finally to ``tasks/{pr_id}.md`` instead of returning a 404.
-    snapshot_tasks, _source, _snapshot_at = await _load_current_queue_snapshot(name)
+    # Try mappings in priority order: snapshot, default. The snapshot
+    # reflects the queue at the last IDLE cycle, so during the window
+    # after a task file is renamed but before the next snapshot refresh
+    # the snapshot's ``task_file`` value can point at a file that no
+    # longer exists. In that case fall back to ``tasks/{pr_id}.md``
+    # instead of returning a 404.
+    snapshot_tasks, _snapshot_at = await _load_current_queue_snapshot(name)
     if snapshot_tasks is not None:
         for task in snapshot_tasks:
             if task.pr_id == pr_id and task.task_file:
@@ -649,20 +631,6 @@ async def _resolve_repo_task_path(name: str, pr_id: str) -> tuple[Path, str] | N
                 if hit is not None:
                     return hit
                 break
-
-    try:
-        disk_tasks = _app.parse_queue(str(tasks_dir / "QUEUE.md"))
-    except (OSError, UnicodeDecodeError):
-        # A broken QUEUE.md must not block direct lookups by `{pr_id}.md`
-        # — fall through to the default filename so a single malformed
-        # queue file does not also kill task-file viewing.
-        disk_tasks = []
-    for task in disk_tasks:
-        if task.pr_id == pr_id and task.task_file:
-            hit = _try_candidate(task.task_file)
-            if hit is not None:
-                return hit
-            break
 
     return _try_candidate(f"tasks/{pr_id}.md")
 

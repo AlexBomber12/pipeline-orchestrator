@@ -607,7 +607,7 @@ def test_save_current_run_record_sets_duration_none_for_invalid_started_at() -> 
 def test_merge_finalizes_record(monkeypatch: pytest.MonkeyPatch) -> None:
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
-    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
@@ -641,7 +641,7 @@ def test_merge_finalizes_record(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_merge_calculates_duration(monkeypatch: pytest.MonkeyPatch) -> None:
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
-    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_queue_done", lambda self: None)
+    monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
     fixed_now = datetime(2026, 4, 18, 12, 0, 6, 500000, tzinfo=timezone.utc)
 

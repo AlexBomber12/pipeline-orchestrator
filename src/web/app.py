@@ -50,9 +50,6 @@ from src.events.sse import (
     RepoEventsUnavailableError,  # noqa: F401 — accessed by routes via _app.RepoEventsUnavailableError
     stream_repo_events,  # noqa: F401 — accessed by routes via _app.stream_repo_events
 )
-from src.queue_parser import (
-    parse_queue,  # noqa: F401 — accessed by routes via _app.parse_queue
-)
 from src.web.services import (
     upload_validation as _upload_validation_service,
 )

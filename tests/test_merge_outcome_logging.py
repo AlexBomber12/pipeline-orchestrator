@@ -135,7 +135,7 @@ def test_handle_merge_appends_outcome_row(
         "src.github.gh_runner.run_gh",
         lambda *a, **kw: {"state": "MERGED"},
     )
-    monkeypatch.setattr(PipelineRunner, "_mark_queue_done", lambda self: None)
+    monkeypatch.setattr(PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
     # detect_coder_extension_version: avoid relying on host npm.
     monkeypatch.setattr(
         "src.daemon.handlers.merge.detect_coder_extension_version",
@@ -206,7 +206,7 @@ def test_handle_merge_outcome_log_failure_does_not_block_merge(
         "src.github.gh_runner.run_gh",
         lambda *a, **kw: {"state": "MERGED"},
     )
-    monkeypatch.setattr(PipelineRunner, "_mark_queue_done", lambda self: None)
+    monkeypatch.setattr(PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
     def boom(_record: dict) -> None:
         raise RuntimeError("disk full")

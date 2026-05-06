@@ -35,6 +35,34 @@ claude_cli = claude_plugin_module.claude_cli
 _ORIGINAL_SELECT_NEXT_TASK_FROM_DAG = idle_module.IdleMixin._select_next_task_from_dag
 
 
+def _stub_dag_select(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    task: object = None,
+    tasks: list[object] | None = None,
+) -> None:
+    """Replace ``_select_next_task_from_dag`` with a stub that returns ``task``.
+
+    Sets ``_idle_dag_tasks`` and ``_idle_dag_statuses`` on the runner so the
+    surrounding handler can compute queue counters and snapshot the queue
+    just like the real selector does. ``tasks`` defaults to ``[task]`` when
+    omitted.
+    """
+    queue_tasks = list(tasks) if tasks is not None else ([task] if task else [])
+    statuses = {t.pr_id: t.status for t in queue_tasks}
+
+    async def fake_select(self):  # type: ignore[no-untyped-def]
+        self._idle_dag_tasks = list(queue_tasks)
+        self._idle_dag_statuses = dict(statuses)
+        return task
+
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        fake_select,
+    )
+
+
 def _async_cli_result(*result: object):
     async def _fn(*args: object, **kwargs: object) -> tuple:
         return result

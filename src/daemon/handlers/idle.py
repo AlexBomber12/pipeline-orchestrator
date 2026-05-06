@@ -7,7 +7,6 @@ Mixin methods:
 
 from __future__ import annotations
 
-import inspect
 import re
 import subprocess
 from dataclasses import replace
@@ -22,13 +21,10 @@ from src.onboarding.reconciliation import reconcile_agents_md
 from src.queue_parser import (
     QueueValidationError,
     TaskHeader,
-    get_next_task,
-    parse_queue,
     parse_task_header,
 )
 from src.task_status import (
     _resolve_merged_state,
-    derive_queue_task_statuses,
     derive_task_status,
     find_matching_open_pr,
 )
@@ -80,48 +76,27 @@ class IdleMixin:
         self,
         headers: list[TaskHeader],
         statuses: dict[str, TaskStatus],
-    ) -> bool:
-        """Write the regenerated QUEUE.md to disk for read-side consumers.
+    ) -> None:
+        """Write regenerated QUEUE.md so the e2e coder shim can find DOING.
 
-        QUEUE.md is gitignored (PR-181); the daemon never commits or
-        pushes it. The file is rewritten only when its contents would
-        change, so repeated IDLE cycles on a stable queue are no-ops on
-        disk.
-
-        On legacy repos that still track ``tasks/QUEUE.md`` upstream
-        (``.gitignore`` does not retroactively untrack files), writing
-        here would dirty the working tree on every cycle, push preflight
-        into ERROR, and block normal dispatch. Skip the write in that
-        case — the tracked snapshot on origin remains the source of
-        truth until the legacy repo migrates the file out of git.
-
-        Returns ``True`` once the on-disk queue reflects the generated
-        content. The boolean return is preserved so existing callers
-        treat the operation as always-successful (no push step exists
-        to fail).
+        The e2e coder shim parses ``tasks/QUEUE.md`` to find the active
+        DOING task; PR-269 will migrate it to read PR-*.md directly.
+        Until then, the daemon must keep writing the file so the e2e
+        suite passes. The file is gitignored on managed repos and on
+        legacy tracked-QUEUE repos this helper is a no-op (the
+        ``_origin_queue_md_tracked`` probe returns True/None and the
+        write is skipped to avoid dirtying the worktree).
         """
-        queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
-        self._idle_generated_queue_needs_resync = False
         # ``None`` means the cat-file probe itself failed (transient git
         # slowness); treat as if tracked so the regenerate is skipped
         # for this cycle. A legacy repo whose probe is briefly flaky
         # would otherwise have its working tree dirtied on every IDLE
-        # tick. Post-PR-181 repos lose only one cycle of regeneration
+        # tick. Post-untrack repos lose only one cycle of regeneration
         # and self-heal on the next tick once the probe succeeds.
         tracked = self._origin_queue_md_tracked()
         if tracked is not False:
-            if tracked is True and not getattr(
-                self, "_legacy_tracked_queue_md_logged", False,
-            ):
-                self.log_event(
-                    f"[INFRA] Skipping QUEUE.md regeneration: still "
-                    f"tracked on origin/{self.repo_config.branch}; "
-                    f"untrack via 'git rm --cached tasks/QUEUE.md' to "
-                    f"enable daemon-side regeneration."
-                )
-                self._legacy_tracked_queue_md_logged = True
-            return True
-
+            return
+        queue_path = Path(self.repo_path) / "tasks" / "QUEUE.md"
         content = self._generate_queue_md(headers, statuses)
         existing = (
             queue_path.read_text(encoding="utf-8")
@@ -129,11 +104,9 @@ class IdleMixin:
             else None
         )
         if existing == content:
-            return True
-
+            return
         queue_path.parent.mkdir(parents=True, exist_ok=True)
         queue_path.write_text(content, encoding="utf-8")
-        return True
 
     def _scan_task_specs_for_agents_md_drift(self) -> None:
         """Run the AGENTS.md anti-pattern scan over ``tasks/PR-*.md``.
@@ -233,24 +206,6 @@ class IdleMixin:
             any(issue.endswith(suffix) for suffix in allowed_suffixes)
             for issue in exc.issues
         )
-
-    @staticmethod
-    def _queue_md_contains_visible_legacy_entries(
-        queue_path: str | Path,
-        structured_pr_ids: set[str],
-        ignored_pr_ids: set[str] | None = None,
-    ) -> bool:
-        path = Path(queue_path)
-        if not path.is_file():
-            return False
-        skip = structured_pr_ids if ignored_pr_ids is None else (
-            structured_pr_ids | ignored_pr_ids
-        )
-        for raw_line in path.read_text(encoding="utf-8").splitlines():
-            match = re.match(r"^##\s+(PR-[A-Za-z0-9_.-]+)\b", raw_line.rstrip())
-            if match and match.group(1) not in skip:
-                return True
-        return False
 
     @staticmethod
     def _filter_dag_headers_with_available_dependencies(
@@ -389,16 +344,16 @@ class IdleMixin:
             # PR-186: Recovery marks DOING-without-PR tasks crashed before
             # transitioning to IDLE. Override their derived status to
             # CANCELED here so get_eligible_tasks excludes them and the
-            # regenerated QUEUE.md surfaces the CANCELED state to the
-            # dashboard. Existing DONE rulings (e.g. the merged PR landed
-            # before recovery resumed) win — DONE is terminal, never
-            # downgraded to CANCELED. A DOING ruling means
-            # ``derive_task_status`` matched a now-visible open PR (e.g.
-            # ``get_open_prs`` was stale on the recovery cycle and the PR
-            # surfaced later); preserving DOING lets the runner resume
-            # WATCH/merge for that real PR rather than stranding it
-            # behind the crashed flag, and clearing the flag ensures the
-            # next selector pick treats the task as live again.
+            # snapshot surfaces the CANCELED state to the dashboard.
+            # Existing DONE rulings (e.g. the merged PR landed before
+            # recovery resumed) win — DONE is terminal, never downgraded
+            # to CANCELED. A DOING ruling means ``derive_task_status``
+            # matched a now-visible open PR (e.g. ``get_open_prs`` was
+            # stale on the recovery cycle and the PR surfaced later);
+            # preserving DOING lets the runner resume WATCH/merge for
+            # that real PR rather than stranding it behind the crashed
+            # flag, and clearing the flag ensures the next selector pick
+            # treats the task as live again.
             for pr_id in list(statuses.keys()):
                 if pr_id not in crashed_task_pr_ids:
                     continue
@@ -478,44 +433,6 @@ class IdleMixin:
             branch=header.branch,
         )
 
-    def _check_legacy_queue_status(
-        self,
-        ghost_legacy_pr_ids: set[str] | None = None,
-        parse_error: str | None = None,
-    ) -> tuple[bool, str | None]:
-        """Return ``(has_visible_legacy_entries, parse_error_or_None)``.
-
-        Single source of truth for the legacy-queue gating decision.
-        Three scenarios:
-
-        - ``(True, None)``: visible legacy rows present (``## PR-*``
-          headers whose PR ID is not in ``self._idle_dag_tasks`` and
-          not in the optional ghost set).
-        - ``(False, error_text)``: caller flagged a ``parse_queue``
-          failure and no visible legacy entries are present
-          (``parse_error`` echoed back).
-        - ``(False, None)``: clean — no legacy rows, no parse failure.
-
-        Visible-legacy precedence: when both ``parse_error`` is set
-        and visible legacy is detected, returns ``(True, None)``. The
-        regex scan does not depend on parse success and is the
-        dominant gating signal for ``_write_generated_queue_md``.
-
-        The caller (``_select_next_task_or_attach``) supplies
-        ``parse_error`` from its own ``parse_queue`` exception so the
-        helper does not re-parse the queue file each call.
-        """
-        queue_path = str(Path(self.repo_path) / "tasks" / "QUEUE.md")
-        structured_pr_ids = {
-            queued.pr_id for queued in self._idle_dag_tasks or []
-        }
-        visible = self._queue_md_contains_visible_legacy_entries(
-            queue_path, structured_pr_ids, ghost_legacy_pr_ids,
-        )
-        if visible:
-            return True, None
-        return False, parse_error
-
     async def _select_next_task_or_attach(
         self,
         prs,
@@ -529,22 +446,11 @@ class IdleMixin:
         attaching ``current_pr`` to a manual-work open PR) or an
         existing open PR matched the chosen task and the runner has
         already transitioned to WATCH.
-
-        Encapsulates the dispatch decision tree previously inline in
-        ``handle_idle``: DAG selection, legacy queue parse + derive +
-        ghost detection + ``get_next_task``, DAG-vs-legacy combine,
-        DOING marking, queue progress, generated QUEUE.md write, and
-        existing-PR reattach.
         """
-        queue_path = str(Path(self.repo_path) / "tasks" / "QUEUE.md")
-        strict = self.app_config.daemon.strict_queue_validation
-        dag_task = None
-        dag_tasks = None
         self._idle_open_prs = prs
         self._idle_merged_prs = merged_prs
         try:
-            dag_task = await self._select_next_task_from_dag()
-            dag_tasks = self._idle_dag_tasks
+            task = await self._select_next_task_from_dag()
         except (
             OSError,
             RuntimeError,
@@ -562,135 +468,11 @@ class IdleMixin:
             self._idle_open_prs = []
             self._idle_merged_prs = []
 
-        tasks: list[QueueTask] = []
-        queue_task = None
-        structured_pr_ids = {queued.pr_id for queued in dag_tasks or []}
-        has_legacy_queue_tasks = False
-        legacy_queue_check_succeeded = False
-        try:
-            tasks = parse_queue(queue_path, strict=strict)
-        except QueueValidationError as exc:
-            if dag_tasks is None:
-                await self._transition_to_error(
-                    str(exc),
-                    save_run_record_as=None,
-                    publish=False,
-                    log_prefix="[INFRA] Queue validation failed:",
-                )
-                return None
-            self.log_event(
-                f"[INFRA] Queue validation failed after DAG selection; "
-                f"continuing with DAG task: {exc}."
-            )
-            visible, _ = self._check_legacy_queue_status(parse_error=str(exc))
-            legacy_queue_check_succeeded = not visible
-        else:
-            try:
-                derive_args = (
-                    tasks,
-                    self.repo_path,
-                    self.repo_config.branch,
-                )
-                derive_sig_params = inspect.signature(
-                    derive_queue_task_statuses
-                ).parameters
-                if "owner_repo" in derive_sig_params:
-                    derive_args = (*derive_args, self.owner_repo)
-                derive_args = (*derive_args, prs)
-                derive_kwargs: dict[str, object] = {}
-                if "log_event" in derive_sig_params:
-                    derive_kwargs["log_event"] = self.log_event
-                if "current_task_pr_id" in derive_sig_params:
-                    derive_kwargs["current_task_pr_id"] = (
-                        self.state.current_task.pr_id
-                        if self.state.current_task is not None
-                        else None
-                    )
-                if "merged_prs" in derive_sig_params:
-                    tasks = derive_queue_task_statuses(
-                        *derive_args,
-                        merged_prs,
-                        **derive_kwargs,
-                    )
-                else:
-                    tasks = derive_queue_task_statuses(*derive_args)
-            except (
-                OSError,
-                RuntimeError,
-                QueueValidationError,
-                subprocess.TimeoutExpired,
-            ) as exc:
-                if dag_tasks is None:
-                    await self._transition_to_error(
-                        f"Task status derivation failed: {exc}",
-                        save_run_record_as=None,
-                        publish=False,
-                        log_prefix="[INFRA]",
-                    )
-                    return None
-                self.log_event(
-                    f"[INFRA] Task status derivation failed after DAG "
-                    f"selection; continuing with DAG tasks: {exc}."
-                )
-                tasks = []
-                queue_task = None
-                visible, _ = self._check_legacy_queue_status()
-                legacy_queue_check_succeeded = not visible
-            else:
-                # Ghost entries (whose declared task file is missing on disk)
-                # are not real legacy tasks: they're stale residue from a
-                # prior cycle that survived ``sync_to_main`` because QUEUE.md
-                # is gitignored (PR-181). Treating them as legacy would
-                # block ``_write_generated_queue_md`` from rewriting the
-                # file, leaving the shim's ``parse_doing_task`` stuck on a
-                # stale DOING entry and creating a PR for the wrong branch.
-                # Drop ghosts before ``get_next_task`` so the selector
-                # advances to a real legacy entry behind a stale DOING ghost
-                # instead of stalling IDLE on "no tasks available".
-                ghost_legacy_pr_ids = {
-                    queued.pr_id
-                    for queued in tasks
-                    if queued.pr_id not in structured_pr_ids
-                    and queued.task_file is not None
-                    and not (Path(self.repo_path) / queued.task_file).is_file()
-                }
-                for queued in tasks:
-                    if queued.pr_id in ghost_legacy_pr_ids:
-                        self.log_event(
-                            f"[INFRA] Ignoring ghost legacy QUEUE.md "
-                            f"entry {queued.pr_id} (no "
-                            f"{queued.task_file} on disk)."
-                        )
-                non_ghost_tasks = (
-                    [t for t in tasks if t.pr_id not in ghost_legacy_pr_ids]
-                    if ghost_legacy_pr_ids
-                    else tasks
-                )
-                queue_task = get_next_task(non_ghost_tasks)
-                visible, _ = self._check_legacy_queue_status(
-                    ghost_legacy_pr_ids,
-                )
-                has_legacy_queue_tasks = any(
-                    queued.pr_id not in structured_pr_ids
-                    for queued in non_ghost_tasks
-                ) or visible
-                legacy_queue_check_succeeded = not visible
+        dag_tasks = list(self._idle_dag_tasks or [])
 
-        task = dag_task
-        if queue_task is not None:
-            queue_task_is_legacy = queue_task.pr_id not in structured_pr_ids
-            if task is None and (dag_tasks is None or queue_task_is_legacy):
-                task = queue_task
-            elif (
-                task is not None
-                and task.status != TaskStatus.DOING
-                and queue_task_is_legacy
-            ):
-                task = queue_task
-
-        # The shim parses QUEUE.md to find its DOING task and exits 0 if it
-        # sees only TODO. Mark the dispatched structured task DOING in the
-        # statuses dict before _write_generated_queue_md runs.
+        # Mark the dispatched task DOING in the snapshot so dashboard
+        # consumers see the transition without waiting for the next
+        # IDLE cycle.
         statuses_for_dispatch = getattr(self, "_idle_dag_statuses", None)
         if (
             task is not None
@@ -698,7 +480,7 @@ class IdleMixin:
             and statuses_for_dispatch.get(task.pr_id) == TaskStatus.TODO
         ):
             statuses_for_dispatch[task.pr_id] = TaskStatus.DOING
-            for i, queued in enumerate(dag_tasks or ()):
+            for i, queued in enumerate(dag_tasks):
                 if queued.pr_id == task.pr_id:
                     dag_tasks[i] = queued.model_copy(
                         update={"status": TaskStatus.DOING}
@@ -706,23 +488,21 @@ class IdleMixin:
                     break
             task = task.model_copy(update={"status": TaskStatus.DOING})
 
-        if has_legacy_queue_tasks or dag_tasks is None:
-            queue_tasks = tasks
-        else:
-            queue_tasks = dag_tasks
         self._set_queue_progress(
-            sum(1 for t in queue_tasks if t.status == TaskStatus.DONE),
-            len(queue_tasks),
+            sum(1 for t in dag_tasks if t.status == TaskStatus.DONE),
+            len(dag_tasks),
         )
-        self.state.current_queue = list(queue_tasks)
+        self.state.current_queue = list(dag_tasks)
+
+        # Keep tasks/QUEUE.md on disk in sync with the snapshot so the
+        # e2e coder shim's ``parse_doing_task`` can locate the active
+        # task. PR-269 will migrate the shim to read PR-*.md directly;
+        # until that ships, removing the disk write breaks the e2e
+        # suite (slow/success shims exit 0 without creating PRs and the
+        # daemon hangs in CODING).
         generated_headers = getattr(self, "_idle_dag_headers", None)
         generated_statuses = getattr(self, "_idle_dag_statuses", None)
-        if (
-            generated_headers
-            and generated_statuses
-            and legacy_queue_check_succeeded
-            and not has_legacy_queue_tasks
-        ):
+        if generated_headers and generated_statuses:
             try:
                 self._write_generated_queue_md(
                     generated_headers,
@@ -741,7 +521,7 @@ class IdleMixin:
             self.log_event("[INFRA] No tasks available.")
             if prs:
                 done_branches = {
-                    t.branch for t in queue_tasks
+                    t.branch for t in dag_tasks
                     if t.status == TaskStatus.DONE and t.branch
                 }
                 match = next(

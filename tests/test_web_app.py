@@ -454,46 +454,6 @@ def test_api_repo_queue_returns_snapshot(
     assert payload["queue"][0]["priority"] == 1
 
 
-def test_api_repo_queue_falls_back_to_disk(
-    two_repo_config: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repos_dir = tmp_path / "repos"
-    queue_dir = repos_dir / "example__alpha" / "tasks"
-    queue_dir.mkdir(parents=True)
-    (queue_dir / "QUEUE.md").write_text(
-        "# Task Queue\n\n"
-        "## PR-010: Disk task\n"
-        "- Status: TODO\n"
-        "- Tasks file: tasks/PR-010.md\n"
-        "- Branch: pr-010-disk\n"
-        "- Priority: 2\n",
-        encoding="utf-8",
-    )
-    fake = _FakeRedis()
-    monkeypatch.setattr(web_app, "REPOS_DIR", str(repos_dir))
-    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
-
-    with TestClient(app) as client:
-        response = client.get("/api/repo/example__alpha/queue")
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["source"] == "fallback_disk"
-    assert payload["snapshot_at"] is None
-    assert payload["queue"] == [
-        {
-            "pr_id": "PR-010",
-            "title": "Disk task",
-            "status": "TODO",
-            "task_file": "tasks/PR-010.md",
-            "depends_on": [],
-            "branch": "pr-010-disk",
-            "priority": 2,
-        }
-    ]
-
 
 def test_api_repo_queue_snapshot_without_snapshot_timestamp(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
@@ -528,7 +488,7 @@ def test_api_repo_queue_snapshot_without_snapshot_timestamp(
     assert payload["queue"][0]["pr_id"] == "PR-001"
 
 
-def test_api_repo_queue_returns_503_on_total_failure(
+def test_api_repo_queue_returns_503_when_snapshot_unavailable(
     two_repo_config: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -541,32 +501,72 @@ def test_api_repo_queue_returns_503_on_total_failure(
         response = client.get("/api/repo/example__alpha/queue")
 
     assert response.status_code == 503
-    assert response.json()["error"] == "Unable to read tasks/QUEUE.md"
+    assert response.json()["error"] == "Queue not yet computed"
 
 
-def test_api_repo_queue_returns_503_when_disk_parse_fails(
+def test_api_repo_queue_503_when_redis_client_unavailable(
     two_repo_config: Path,
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repos_dir = tmp_path / "repos"
-    queue_dir = repos_dir / "example__alpha" / "tasks"
-    queue_dir.mkdir(parents=True)
-    (queue_dir / "QUEUE.md").write_text("# Task Queue\n", encoding="utf-8")
+    """``state.redis`` is None -> snapshot lookup short-circuits to 503."""
     fake = _FakeRedis()
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
 
-    def boom(_path: str):
-        raise OSError("cannot read")
+    with TestClient(app) as client:
+        client.app.state.redis = None
+        response = client.get("/api/repo/example__alpha/queue")
 
-    monkeypatch.setattr(web_app, "REPOS_DIR", str(repos_dir))
-    monkeypatch.setattr(web_app, "parse_queue", boom)
+    assert response.status_code == 503
+    assert response.json()["error"] == "Queue not yet computed"
+
+
+def test_api_repo_queue_503_when_redis_get_raises(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    boom = _BoomRedis()
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(boom))
+
+    with TestClient(app) as client:
+        response = client.get("/api/repo/example__alpha/queue")
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "Queue not yet computed"
+
+
+def test_api_repo_queue_503_when_state_json_invalid(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeRedis({"pipeline:example__alpha": "{not valid json"})
     monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
 
     with TestClient(app) as client:
         response = client.get("/api/repo/example__alpha/queue")
 
     assert response.status_code == 503
-    assert response.json()["error"] == "Unable to read tasks/QUEUE.md"
+    assert response.json()["error"] == "Queue not yet computed"
+
+
+def test_api_repo_queue_503_when_state_has_no_queue(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+    )
+    assert stored.current_queue is None
+    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
+
+    with TestClient(app) as client:
+        response = client.get("/api/repo/example__alpha/queue")
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "Queue not yet computed"
+
 
 
 def test_api_repo_queue_unknown_repo_returns_404(
@@ -594,92 +594,8 @@ def _seed_disk_queue(repos_dir: Path) -> None:
     )
 
 
-def test_api_repo_queue_falls_back_when_redis_client_unavailable(
-    two_repo_config: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repos_dir = tmp_path / "repos"
-    _seed_disk_queue(repos_dir)
-    monkeypatch.setattr(web_app, "REPOS_DIR", str(repos_dir))
-    monkeypatch.setattr(web_app.app.state, "redis", None, raising=False)
-
-    with TestClient(app) as client:
-        client.app.state.redis = None
-        response = client.get("/api/repo/example__alpha/queue")
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["source"] == "fallback_disk"
-    assert payload["snapshot_at"] is None
-    assert payload["queue"][0]["pr_id"] == "PR-010"
 
 
-def test_api_repo_queue_falls_back_when_redis_get_raises(
-    two_repo_config: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repos_dir = tmp_path / "repos"
-    _seed_disk_queue(repos_dir)
-    fake = _BoomRedis()
-    monkeypatch.setattr(web_app, "REPOS_DIR", str(repos_dir))
-    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
-
-    with TestClient(app) as client:
-        response = client.get("/api/repo/example__alpha/queue")
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["source"] == "fallback_disk"
-    assert payload["snapshot_at"] is None
-
-
-def test_api_repo_queue_falls_back_when_state_json_invalid(
-    two_repo_config: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repos_dir = tmp_path / "repos"
-    _seed_disk_queue(repos_dir)
-    fake = _FakeRedis({"pipeline:example__alpha": "{not valid json"})
-    monkeypatch.setattr(web_app, "REPOS_DIR", str(repos_dir))
-    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
-
-    with TestClient(app) as client:
-        response = client.get("/api/repo/example__alpha/queue")
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["source"] == "fallback_disk"
-    assert payload["snapshot_at"] is None
-
-
-def test_api_repo_queue_falls_back_when_state_has_no_queue(
-    two_repo_config: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repos_dir = tmp_path / "repos"
-    _seed_disk_queue(repos_dir)
-    stored = RepoState(
-        url="https://github.com/example/alpha.git",
-        name="example__alpha",
-        state=PipelineState.IDLE,
-    )
-    assert stored.current_queue is None
-    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
-    monkeypatch.setattr(web_app, "REPOS_DIR", str(repos_dir))
-    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
-
-    with TestClient(app) as client:
-        response = client.get("/api/repo/example__alpha/queue")
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["source"] == "fallback_disk"
-    assert payload["snapshot_at"] is None
-    assert payload["queue"][0]["pr_id"] == "PR-010"
 
 
 def test_list_repo_tasks_uses_snapshot_when_available(
@@ -720,32 +636,6 @@ def test_list_repo_tasks_uses_snapshot_when_available(
     assert "Snapshot task" in response.text
     assert "Disk task that should not render" not in response.text
 
-
-def test_list_repo_tasks_falls_back_to_disk_when_snapshot_none(
-    two_repo_config: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repos_dir = tmp_path / "repos"
-    queue_dir = repos_dir / "example__alpha" / "tasks"
-    queue_dir.mkdir(parents=True)
-    (queue_dir / "QUEUE.md").write_text(
-        "# Task Queue\n\n"
-        "## PR-010: Disk task\n"
-        "- Status: TODO\n"
-        "- Branch: pr-010-disk\n",
-        encoding="utf-8",
-    )
-    fake = _FakeRedis()
-    monkeypatch.setattr(web_app, "REPOS_DIR", str(repos_dir))
-    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
-
-    with TestClient(app) as client:
-        response = client.get("/repos/example__alpha/tasks")
-
-    assert response.status_code == 200
-    assert "Disk task" in response.text
-    assert "pr-010-disk" in response.text
 
 
 def test_partial_repo_list_returns_html_fragment(

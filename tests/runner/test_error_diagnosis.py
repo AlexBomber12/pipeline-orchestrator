@@ -353,8 +353,6 @@ def test_non_error_cycle_resets_error_skip_fields(
     biasing a future, unrelated error.
     """
     h._patch_subprocess(monkeypatch, stdout="")
-    monkeypatch.setattr(idle_module, "parse_queue", lambda path, **kw: [])
-    monkeypatch.setattr(idle_module, "get_next_task", lambda tasks: None)
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
