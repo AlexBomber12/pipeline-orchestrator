@@ -76,7 +76,7 @@ def _runner_with_task(
     tests sit on the same fixture surface as the existing CODING tests.
     """
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(h.claude_cli, "run_planned_pr_async", h._async_cli_result(0, "ok", ""))
+    monkeypatch.setattr(h.claude_cli, "run_auto_pr_async", h._async_cli_result(0, "ok", ""))
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda repo, **_kw: list(open_prs or []),

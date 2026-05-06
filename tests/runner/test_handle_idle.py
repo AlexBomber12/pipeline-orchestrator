@@ -104,12 +104,12 @@ def test_handle_idle_picks_task_and_drives_coding(
     claude_calls: list[str] = []
 
     async def fake_run_planned_pr(
-        path: str, model: str | None = None, timeout: int | None = None, **kwargs: object
+        path: str, *_args: object, **kwargs: object
     ) -> tuple[int, str, str]:
         claude_calls.append(path)
         return (0, "ok", "")
 
-    monkeypatch.setattr(claude_cli, "run_planned_pr_async", fake_run_planned_pr)
+    monkeypatch.setattr(claude_cli, "run_auto_pr_async", fake_run_planned_pr)
 
     opened_pr = PRInfo(
         number=17,
@@ -168,7 +168,7 @@ def test_handle_idle_sets_queue_counters_with_mixed_statuses(
     )
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(0, "ok", ""),
     )
     # First call (guard) returns no matching PR; subsequent calls return the PR.
@@ -1121,7 +1121,7 @@ def test_handle_idle_proceeds_to_coding_when_no_matching_pr(
     monkeypatch.setattr("src.github.prs.get_merged_prs", lambda repo, branch, refresh=False: [])
     monkeypatch.setattr(
         claude_cli,
-        "run_planned_pr_async",
+        "run_auto_pr_async",
         h._async_cli_result(0, "ok", ""),
     )
     monkeypatch.setattr(

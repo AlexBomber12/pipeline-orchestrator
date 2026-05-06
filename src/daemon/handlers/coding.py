@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from src.branch_context import BranchContext
@@ -139,6 +140,24 @@ class CodingMixin:
             )
             return
 
+        # AUTO PR dispatch: read the task spec inline before invoking the
+        # coder so the daemon supplies the canonical pr_id, task_file, and
+        # task_body explicitly. This replaces the prior PLANNED PR
+        # indirection where the coder discovered its task via QUEUE.md.
+        assert self.state.current_task is not None
+        pr_id = self.state.current_task.pr_id
+        task_file = f"tasks/{pr_id}.md"
+        task_body_path = Path(self.repo_path) / task_file
+        try:
+            task_body = task_body_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            await self._transition_to_error(
+                f"Cannot read task file {task_file}: {exc}",
+                publish=False,
+                log_prefix="[CODING]",
+            )
+            return
+
         try:
             coder_kwargs = await self._prepare_coder_invocation(
                 coder_name, plugin
@@ -152,6 +171,9 @@ class CodingMixin:
             coder_kwargs,
             target_branch=target_branch,
             current_pr_id=current_pr_id,
+            pr_id=pr_id,
+            task_file=task_file,
+            task_body=task_body,
         )
         if result is None:
             return
@@ -173,7 +195,7 @@ class CodingMixin:
     ) -> dict[str, Any]:
         """Allocate breach env, build kwargs.
 
-        Returns the kwargs dict ready to pass to ``plugin.run_planned_pr``.
+        Returns the kwargs dict ready to pass to ``plugin.run_auto_pr``.
         Allocates the breach env via ``_breach_env`` and stores it on
         ``self`` so ``_run_coder_with_supervision`` can wire monitors and
         teardown without re-creating it.
@@ -210,6 +232,9 @@ class CodingMixin:
         *,
         target_branch: str,
         current_pr_id: str | None,
+        pr_id: str,
+        task_file: str,
+        task_body: str,
     ) -> tuple[int, str, str] | None:
         """Run the coder subprocess under stop and breach supervision.
 
@@ -225,7 +250,13 @@ class CodingMixin:
 
         heartbeat = asyncio.create_task(self._publish_while_waiting("CODING"))
         cli_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
-            plugin.run_planned_pr(self.repo_path, **coder_kwargs)
+            plugin.run_auto_pr(
+                self.repo_path,
+                pr_id=pr_id,
+                task_file=task_file,
+                task_body=task_body,
+                **coder_kwargs,
+            )
         )
         breach_monitor: asyncio.Task[None] | None = None
         if plugin.supports_breach_lifecycle:
