@@ -1100,9 +1100,11 @@ def test_scaffolder_idempotent_pre_push_install(
     second_content = hook.read_text()
 
     assert second_content == first_content
-    # The hook line appears exactly once — no accidental duplication
-    # from a double-write that misses the overwrite path.
-    assert first_content.count("[pre-push-hook]") == 1
+    # The shebang appears exactly once — no accidental duplication
+    # from a double-write that misses the overwrite path. A unique
+    # one-shot anchor at the top of the script is a stable proxy for
+    # the entire payload not being concatenated to itself.
+    assert first_content.count("#!/bin/bash") == 1
 
 
 def test_scaffolder_logs_warning_on_pre_push_install_failure(

@@ -288,6 +288,31 @@ def test_hook_blocks_on_non_branch_ref(tmp_path: Path) -> None:
     assert "push includes 'refs/tags/v1.0'" in result.stderr
 
 
+def test_hook_blocks_when_pushing_expected_local_to_unexpected_remote(
+    tmp_path: Path,
+) -> None:
+    """``git push origin pr-001:main`` (local pr-001, remote main) must
+    block: even when the source branch matches the expected marker, the
+    push routes task commits to a remote ref that does not, which would
+    bypass the branch-safety gate and overwrite a protected base branch.
+    """
+    repo = _init_repo(tmp_path)
+    _install(repo)
+    info = repo / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "expected-branch").write_text("pr-001\n")
+    result = _run_hook(
+        repo,
+        stdin=_push_line(
+            "refs/heads/pr-001", remote_ref="refs/heads/main"
+        ),
+    )
+    assert result.returncode == 1
+    assert "[pre-push-hook] BLOCKED" in result.stderr
+    assert "push targets 'main'" in result.stderr
+    assert "remote ref 'refs/heads/main'" in result.stderr
+
+
 def test_hook_blocks_when_any_ref_mismatches(tmp_path: Path) -> None:
     """Multiple refs may be queued in one push (e.g.,
     ``git push origin pr-001 main``); blocking only when *all* refs

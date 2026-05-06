@@ -47,9 +47,13 @@ cat > "$HOOK_FILE" <<'EOF'
 # expected-branch file) are no-op.
 #
 # Per githooks(5), pre-push receives ``<local-ref> <local-oid>
-# <remote-ref> <remote-oid>`` lines on stdin. The hook validates those
-# stdin refs rather than ``git symbolic-ref --short HEAD`` because the
-# push refspec can differ from the checked-out branch: ``git push
+# <remote-ref> <remote-oid>`` lines on stdin. The hook validates BOTH
+# the local source and the remote destination on each line: a push
+# like ``git push origin pr-001:main`` carries a matching local ref
+# but routes commits to ``main`` on origin, which would bypass the
+# branch-safety gate if only the local side were checked. Using stdin
+# rather than ``git symbolic-ref --short HEAD`` is necessary because
+# the push refspec can differ from the checked-out branch: ``git push
 # origin main`` while HEAD is on the expected feature branch would
 # silently pass a HEAD-only check, and pushing the expected branch
 # from a detached/other checkout would falsely trip one. The marker
@@ -78,11 +82,19 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         continue
     fi
     case "$local_ref" in
-        refs/heads/*) actual="${local_ref#refs/heads/}" ;;
-        *) actual="$local_ref" ;;
+        refs/heads/*) actual_local="${local_ref#refs/heads/}" ;;
+        *) actual_local="$local_ref" ;;
     esac
-    if [[ "$EXPECTED" != "$actual" ]]; then
-        echo "[pre-push-hook] BLOCKED: expected branch '$EXPECTED' but push includes '$actual' (local ref '$local_ref'). Aborting push." >&2
+    if [[ "$EXPECTED" != "$actual_local" ]]; then
+        echo "[pre-push-hook] BLOCKED: expected branch '$EXPECTED' but push includes '$actual_local' (local ref '$local_ref'). Aborting push." >&2
+        exit 1
+    fi
+    case "$remote_ref" in
+        refs/heads/*) actual_remote="${remote_ref#refs/heads/}" ;;
+        *) actual_remote="$remote_ref" ;;
+    esac
+    if [[ "$EXPECTED" != "$actual_remote" ]]; then
+        echo "[pre-push-hook] BLOCKED: expected branch '$EXPECTED' but push targets '$actual_remote' (remote ref '$remote_ref'). Aborting push." >&2
         exit 1
     fi
 done
