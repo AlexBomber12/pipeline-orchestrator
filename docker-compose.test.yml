@@ -31,6 +31,7 @@ services:
       PATH: /usr/local/bin:/home/runner/.npm-global/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
       PO_CONFIG_PATH: /app/config.test.yml
       PO_SHIM_SCENARIO_FILE: /data/shim-scenario
+      PIPELINE_E2E_SHIM: "1"
 
   daemon-test:
     build: .
@@ -60,6 +61,7 @@ services:
       PATH: /usr/local/bin:/home/runner/.npm-global/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
       PO_CONFIG_PATH: /app/config.test.yml
       PO_SHIM_SCENARIO_FILE: /data/shim-scenario
+      PIPELINE_E2E_SHIM: "1"
 
 volumes:
   codex-auth-test:
