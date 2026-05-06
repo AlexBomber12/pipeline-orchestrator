@@ -90,7 +90,9 @@ def _init_scaffolded_repo(tmp_path: Path) -> Path:
     )
     (repo / "scripts" / "make-review-artifacts.sh").chmod(0o755)
     (repo / "artifacts").mkdir()
-    (repo / ".gitignore").write_text("artifacts/\ntasks/QUEUE.md\n")
+    (repo / ".gitignore").write_text(
+        "artifacts/\ntasks/QUEUE.md\n.daemon-runtime/\n"
+    )
     return repo
 
 
@@ -114,6 +116,7 @@ def test_scaffold_repo_creates_all_files_when_empty(
     gitignore_lines = (repo / ".gitignore").read_text().splitlines()
     assert "artifacts/" in gitignore_lines
     assert "tasks/QUEUE.md" in gitignore_lines
+    assert ".daemon-runtime/" in gitignore_lines
 
     # Shell helpers must be executable so bash can run them directly.
     assert (repo / "scripts" / "ci.sh").stat().st_mode & 0o111
@@ -543,7 +546,9 @@ def test_scaffold_repo_skips_commit_when_fully_provisioned(
     )
     (repo / "scripts" / "make-review-artifacts.sh").chmod(0o755)
     (repo / "artifacts").mkdir()
-    (repo / ".gitignore").write_text("artifacts/\ntasks/QUEUE.md\n")
+    (repo / ".gitignore").write_text(
+        "artifacts/\ntasks/QUEUE.md\n.daemon-runtime/\n"
+    )
     calls = _patch_git(monkeypatch, synced=True)
 
     actions = scaffolder.scaffold_repo(str(repo), "main")
@@ -582,7 +587,9 @@ def test_scaffold_repo_skips_git_when_only_artifacts_dir_missing(
         "#!/usr/bin/env bash\n"
     )
     (repo / "scripts" / "make-review-artifacts.sh").chmod(0o755)
-    (repo / ".gitignore").write_text("artifacts/\ntasks/QUEUE.md\n")
+    (repo / ".gitignore").write_text(
+        "artifacts/\ntasks/QUEUE.md\n.daemon-runtime/\n"
+    )
     # Note: no artifacts/ directory — this is the only gap. The remote
     # is fully in sync, so ``synced=True``.
     calls = _patch_git(monkeypatch, synced=True)
@@ -614,6 +621,7 @@ def test_scaffold_repo_appends_artifacts_without_duplicating(
     lines = (repo / ".gitignore").read_text().splitlines()
     assert lines.count("artifacts/") == 1
     assert lines.count("tasks/QUEUE.md") == 1
+    assert lines.count(".daemon-runtime/") == 1
     assert "node_modules/" in lines
     assert "*.pyc" in lines
 
@@ -623,6 +631,7 @@ def test_scaffold_repo_appends_artifacts_without_duplicating(
     lines_after = (repo / ".gitignore").read_text().splitlines()
     assert lines_after.count("artifacts/") == 1
     assert lines_after.count("tasks/QUEUE.md") == 1
+    assert lines_after.count(".daemon-runtime/") == 1
 
 
 def test_scaffold_repo_propagates_git_push_failure(
@@ -918,7 +927,9 @@ def test_scaffold_repo_retries_stranded_push_with_no_new_commit(
     )
     (repo / "scripts" / "make-review-artifacts.sh").chmod(0o755)
     (repo / "artifacts").mkdir()
-    (repo / ".gitignore").write_text("artifacts/\ntasks/QUEUE.md\n")
+    (repo / ".gitignore").write_text(
+        "artifacts/\ntasks/QUEUE.md\n.daemon-runtime/\n"
+    )
 
     calls: list[list[str]] = []
 

@@ -7,6 +7,7 @@ Mixin methods:
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -224,6 +225,7 @@ class CodingMixin:
         except CoderUnavailable:
             return
 
+        self._write_active_pr_runtime_file(pr_id)
         self._write_expected_branch(target_branch)
         # Cleanup belongs in a finally so the marker is removed on every
         # post-write exit, including the ``result is None`` short-circuits
@@ -255,6 +257,7 @@ class CodingMixin:
                 current_pr_id=current_pr_id,
             )
         finally:
+            self._cleanup_active_pr_runtime_file()
             self._cleanup_expected_branch()
 
     async def _prepare_coder_invocation(
@@ -480,6 +483,40 @@ class CodingMixin:
             self.log_event(
                 f"[CODING] expected-branch write failed ({exc}); pre-push "
                 f"hook disabled for this dispatch — continuing."
+            )
+
+    def _active_pr_runtime_path(self) -> Path:
+        """Return the e2e shim runtime marker path for the active PR id."""
+        return Path(self.repo_path) / ".daemon-runtime" / "active-pr-id"
+
+    def _e2e_shim_enabled(self) -> bool:
+        """Return whether test-mode shim integration is enabled."""
+        return os.environ.get("PIPELINE_E2E_SHIM") == "1"
+
+    def _write_active_pr_runtime_file(self, pr_id: str) -> None:
+        """Write the active PR id for the e2e coder shim in test mode only."""
+        if not self._e2e_shim_enabled():
+            return
+        try:
+            marker = self._active_pr_runtime_path()
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(pr_id + "\n", encoding="utf-8")
+        except OSError as exc:
+            self.log_event(
+                f"[CODING] active-pr-id runtime write failed ({exc}); "
+                "e2e shim task discovery may fall back to task headers."
+            )
+
+    def _cleanup_active_pr_runtime_file(self) -> None:
+        """Remove the e2e shim active PR marker when leaving CODING."""
+        if not self._e2e_shim_enabled():
+            return
+        try:
+            self._active_pr_runtime_path().unlink(missing_ok=True)
+        except OSError as exc:
+            self.log_event(
+                f"[CODING] active-pr-id runtime cleanup failed ({exc}); "
+                "a stale e2e shim task marker may remain."
             )
 
     def _cleanup_expected_branch(self) -> None:
