@@ -701,6 +701,56 @@ def test_process_pending_uploads_flips_canceled_to_todo_in_snapshot(
     assert statuses == {"PR-001": TaskStatus.TODO, "PR-002": TaskStatus.TODO}
 
 
+def test_clear_canceled_in_snapshot_refreshes_snapshot_timestamp(
+    tmp_path: Path,
+) -> None:
+    """Re-stamps current_queue_snapshot_at via the __setattr__ hook.
+
+    Regression: in-place ``snapshot[index] = ...`` bypasses the hook,
+    leaving ``current_queue_snapshot_at`` pinned to the pre-mutation
+    time. Clients keying refreshes off ``snapshot_at`` would miss the
+    CANCELED→TODO transition until the next IDLE rebuild.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from src.models import QueueTask, RepoState, TaskStatus
+
+    runner = _Runner(tmp_path)
+    runner.state = RepoState(url=runner.repo_config.url, name=runner.name)
+    runner.state.current_queue = [
+        QueueTask(pr_id="PR-001", title="Crashed", status=TaskStatus.CANCELED),
+    ]
+    stale_stamp = datetime.now(timezone.utc) - timedelta(hours=1)
+    runner.state.current_queue_snapshot_at = stale_stamp
+
+    runner._clear_canceled_in_snapshot({"PR-001"})
+
+    refreshed = runner.state.current_queue_snapshot_at
+    assert refreshed is not None
+    assert refreshed > stale_stamp
+
+
+def test_clear_canceled_in_snapshot_skips_reassign_when_no_match(
+    tmp_path: Path,
+) -> None:
+    """No CANCELED match ⇒ leave snapshot_at alone (idempotent)."""
+    from datetime import datetime, timedelta, timezone
+
+    from src.models import QueueTask, RepoState, TaskStatus
+
+    runner = _Runner(tmp_path)
+    runner.state = RepoState(url=runner.repo_config.url, name=runner.name)
+    runner.state.current_queue = [
+        QueueTask(pr_id="PR-001", title="Done", status=TaskStatus.TODO),
+    ]
+    stale_stamp = datetime.now(timezone.utc) - timedelta(hours=1)
+    runner.state.current_queue_snapshot_at = stale_stamp
+
+    runner._clear_canceled_in_snapshot({"PR-001"})
+
+    assert runner.state.current_queue_snapshot_at == stale_stamp
+
+
 
 
 

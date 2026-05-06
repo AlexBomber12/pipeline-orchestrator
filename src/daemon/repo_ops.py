@@ -401,10 +401,18 @@ return 0
         already pruned by the caller; mirroring the change in the
         in-memory snapshot keeps the dashboard consistent until the
         next IDLE cycle rebuilds the snapshot from headers.
+
+        Reassigns ``state.current_queue`` after the mutation so the
+        ``RepoState.__setattr__`` hook re-stamps
+        ``current_queue_snapshot_at``; without that, the
+        ``/api/repo/{name}/queue`` ``snapshot_at`` change token would
+        stay pinned to the pre-upload time and clients could miss the
+        CANCELED→TODO transition until the next IDLE rebuild.
         """
         snapshot = self.state.current_queue
         if not snapshot:
             return
+        changed = False
         for index, queued in enumerate(snapshot):
             if (
                 queued.pr_id in uploaded_pr_ids
@@ -413,3 +421,6 @@ return 0
                 snapshot[index] = queued.model_copy(
                     update={"status": TaskStatus.TODO}
                 )
+                changed = True
+        if changed:
+            self.state.current_queue = snapshot
