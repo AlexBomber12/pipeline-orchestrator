@@ -940,6 +940,72 @@ def test_handle_coding_passes_task_body_inline(
     assert captured["task_body"] == body
 
 
+def test_coding_dispatch_cross_repo_intent_transitions_to_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = _runner_for_auto_pr_dispatch(
+        monkeypatch,
+        tmp_path,
+        task_body="# PR-001\n\nBranch: pr-001\n\nThis PR ships in some-other-repo.\n",
+    )
+    _, plugin = runner._get_coder()
+    run_auto_pr_calls: list[dict[str, Any]] = []
+
+    async def fake_run_auto_pr(
+        repo_path: str, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        run_auto_pr_calls.append(dict(kwargs))
+        return (0, "ok", "")
+
+    monkeypatch.setattr(plugin, "run_auto_pr", fake_run_auto_pr)
+    transition_calls: list[str] = []
+    original_transition = runner._transition_to_error
+
+    async def capture_transition(message: str, **kwargs: Any) -> None:
+        transition_calls.append(message)
+        await original_transition(message, **kwargs)
+
+    monkeypatch.setattr(runner, "_transition_to_error", capture_transition)
+
+    asyncio.run(runner.handle_coding())
+
+    assert transition_calls
+    assert transition_calls[0].startswith("CROSS_REPO_INTENT:")
+    assert run_auto_pr_calls == []
+    assert runner.state.state == PipelineState.ERROR
+    assert (runner.state.error_message or "").startswith("CROSS_REPO_INTENT:")
+
+
+def test_coding_dispatch_negated_intent_proceeds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = _runner_for_auto_pr_dispatch(
+        monkeypatch,
+        tmp_path,
+        task_body=(
+            "# PR-001\n\nBranch: pr-001\n\n"
+            "This is NOT in some-other-repo repo; it is for this repo.\n"
+        ),
+    )
+    _, plugin = runner._get_coder()
+    run_auto_pr_calls: list[dict[str, Any]] = []
+
+    async def fake_run_auto_pr(
+        repo_path: str, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        run_auto_pr_calls.append(dict(kwargs))
+        return (0, "ok", "")
+
+    monkeypatch.setattr(plugin, "run_auto_pr", fake_run_auto_pr)
+
+    asyncio.run(runner.handle_coding())
+
+    assert run_auto_pr_calls
+    assert runner.state.state == PipelineState.WATCH
+
+
 def test_handle_coding_does_not_invoke_run_planned_pr(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

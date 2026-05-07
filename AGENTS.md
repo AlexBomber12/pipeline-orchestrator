@@ -229,8 +229,9 @@ When invoked with prompt starting with `AUTO PR`:
 4. Do NOT read `tasks/QUEUE.md` for task selection or context.
 5. Do NOT read other `tasks/PR-*.md` files for context. The inline body is the complete and authoritative spec.
 6. Branch creation: `git checkout -b <Branch from spec> origin/main`. The branch name is in the inline body's `Branch:` header. Do not invent or modify branch names.
-7. Implement the spec, run `scripts/ci.sh` until exit 0, generate review artifacts, commit, push, open PR, post `@codex review`.
-8. Same checklist as PLANNED PR runbook from this point onward.
+7. Task bodies referencing other repositories are ESCALATEd before dispatch; operators must keep task files in their target repo's `tasks/` directory.
+8. Implement the spec, run `scripts/ci.sh` until exit 0, generate review artifacts, commit, push, open PR, post `@codex review`.
+9. Same checklist as PLANNED PR runbook from this point onward.
 <!-- pipeline-orchestrator: managed END auto_pr_runbook -->
 
 <!-- pipeline-orchestrator: managed BEGIN planned_pr_runbook -->

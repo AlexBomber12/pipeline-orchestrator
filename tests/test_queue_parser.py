@@ -10,6 +10,7 @@ from src.models import TaskStatus
 from src.queue_parser import (
     QueueValidationError,
     TaskHeader,
+    detect_cross_repo_intent,
     get_next_task,
     mark_task_done,
     parse_queue,
@@ -52,6 +53,129 @@ def _write_task_file(tmp_path: Path, content: str) -> Path:
     task_path = tmp_path / "PR-999.md"
     task_path.write_text(content, encoding="utf-8")
     return task_path
+
+
+def test_detect_cross_repo_intent_ships_in_other_repo_returns_excerpt() -> None:
+    result = detect_cross_repo_intent(
+        "This PR ships in homelab-monitoring with a narrow change.",
+        "megaraid-dashboard",
+    )
+
+    assert result is not None
+    assert "ships in homelab-monitoring" in result
+
+
+def test_detect_cross_repo_intent_ships_in_same_repo_returns_none() -> None:
+    assert (
+        detect_cross_repo_intent(
+            "This PR ships in MEGARAID-dashboard.",
+            "megaraid-dashboard",
+        )
+        is None
+    )
+
+
+def test_detect_cross_repo_intent_negated_phrase_returns_none() -> None:
+    assert (
+        detect_cross_repo_intent(
+            "Do not ship in homelab-monitoring; this PR is for megaraid.",
+            "megaraid-dashboard",
+        )
+        is None
+    )
+
+
+def test_detect_cross_repo_intent_gh_repo_create_always_flags() -> None:
+    result = detect_cross_repo_intent(
+        "Never automate this manually: gh repo create something.",
+        "something",
+    )
+
+    assert result is not None
+    assert "gh repo create" in result
+
+
+def test_detect_cross_repo_intent_double_negative_still_flags() -> None:
+    result = detect_cross_repo_intent(
+        "Do not forget to gh repo create something.",
+        "something",
+    )
+
+    assert result is not None
+    assert "gh repo create" in result
+
+
+def test_detect_cross_repo_intent_gh_repo_delete_always_flags() -> None:
+    result = detect_cross_repo_intent(
+        "Investigate whether gh repo delete old-target was attempted.",
+        "old-target",
+    )
+
+    assert result is not None
+    assert "gh repo delete" in result
+
+
+def test_detect_cross_repo_intent_belongs_to_other_repo() -> None:
+    result = detect_cross_repo_intent(
+        "This task belongs to homelab-monitoring.",
+        "megaraid-dashboard",
+    )
+
+    assert result is not None
+    assert "belongs to homelab-monitoring" in result
+
+
+def test_detect_cross_repo_intent_in_repo_phrasing() -> None:
+    result = detect_cross_repo_intent(
+        "The dashboard work lives in the homelab-monitoring repository.",
+        "megaraid-dashboard",
+    )
+
+    assert result is not None
+    assert "in the homelab-monitoring repository" in result
+
+
+def test_detect_cross_repo_intent_owner_prefixed_form() -> None:
+    result = detect_cross_repo_intent(
+        "This PR ships in alexbomber12/homelab-monitoring.",
+        "megaraid-dashboard",
+    )
+
+    assert result is not None
+    assert "alexbomber12/homelab-monitoring" in result
+
+
+def test_detect_cross_repo_intent_unicode_repo_name() -> None:
+    result = detect_cross_repo_intent(
+        "This PR ships in café-monitoring without crashing the scanner.",
+        "megaraid-dashboard",
+    )
+
+    assert result is not None
+    assert "café-monitoring" in result
+
+
+def test_detect_cross_repo_intent_excerpt_truncation_120_chars() -> None:
+    body = (
+        "x" * 100
+        + " This PR ships in homelab-monitoring with enough trailing context "
+        + "y" * 100
+    )
+
+    result = detect_cross_repo_intent(body, "megaraid-dashboard")
+
+    assert result is not None
+    assert len(result) <= 120
+    assert "ships in homelab-monitoring" in result
+
+
+def test_detect_cross_repo_intent_long_match_truncates_to_120_chars() -> None:
+    long_repo = "repo-" + ("x" * 140)
+
+    result = detect_cross_repo_intent(f"ships in {long_repo}", "current-repo")
+
+    assert result is not None
+    assert len(result) == 120
 
 
 def test_parse_queue_missing_file_returns_empty(tmp_path: Path) -> None:

@@ -22,6 +22,7 @@ from src.github import cache as gh_cache
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.models import PipelineState
+from src.queue_parser import detect_cross_repo_intent
 
 
 def _resolve_task_file_under_repo(repo_path: str, task_file: str) -> Path:
@@ -112,6 +113,9 @@ def _remote_branch_exists(repo_path: str, branch: str) -> bool:
 
 class CodingMixin:
     """Run ``PLANNED PR`` via the active coder CLI and hand off to WATCH."""
+
+    def _bare_repo_name(self) -> str:
+        return self.name.split("__", 1)[-1]
 
     async def handle_coding(self) -> None:
         """Run ``PLANNED PR`` via the active coder CLI and hand off to WATCH.
@@ -213,6 +217,17 @@ class CodingMixin:
             # exception escape and crash ``run_cycle``.
             await self._transition_to_error(
                 f"Cannot read task file {task_file}: {exc}",
+                publish=False,
+                log_prefix="[CODING]",
+            )
+            return
+
+        intent_violation = detect_cross_repo_intent(
+            task_body, self._bare_repo_name()
+        )
+        if intent_violation is not None:
+            await self._transition_to_error(
+                f"CROSS_REPO_INTENT: {intent_violation}",
                 publish=False,
                 log_prefix="[CODING]",
             )

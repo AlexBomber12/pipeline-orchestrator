@@ -52,6 +52,49 @@ TYPE_SYNONYMS: dict[str, str] = {
 }
 _COMPLEXITY_VALUES = {"low", "medium", "high"}
 _CODER_VALUES = {"claude", "codex", "any"}
+_CROSS_REPO_PATTERNS: tuple[tuple[re.Pattern[str], int | None], ...] = (
+    (
+        re.compile(
+            r"\bships in ((?:[\w-]+/)?[\w-]+)\b",
+            re.IGNORECASE,
+        ),
+        1,
+    ),
+    (
+        re.compile(
+            r"\bin (?:the )?((?:[\w-]+/)?[\w-]+) repo(?:sitory)?\b",
+            re.IGNORECASE,
+        ),
+        1,
+    ),
+    (
+        re.compile(
+            r"\bbelongs to ((?:[\w-]+/)?[\w-]+)\b",
+            re.IGNORECASE,
+        ),
+        1,
+    ),
+    (re.compile(r"\bgh repo create\b", re.IGNORECASE), None),
+    (re.compile(r"\bgh repo delete\b", re.IGNORECASE), None),
+)
+_CROSS_REPO_NEGATION_CONTEXT = re.compile(
+    r"\b(?:"
+    r"do not|don't|don’t|"
+    r"does not|doesn't|doesn’t|"
+    r"cannot|can not|can't|can’t|"
+    r"never|not|"
+    r"must not|mustn't|mustn’t|"
+    r"will not|won't|won’t|would not|wouldn't|wouldn’t|"
+    r"should not|shouldn't|shouldn’t"
+    r")\b",
+    re.IGNORECASE,
+)
+_CROSS_REPO_DOUBLE_NEGATIVE_INVERTER = re.compile(
+    r"\b(?:forget|fail|neglect|hesitate|refuse)\s+to\b",
+    re.IGNORECASE,
+)
+_CROSS_REPO_CLAUSE_BOUNDARIES = ".,;!?:\n"
+_CROSS_REPO_EXCERPT_LIMIT = 120
 
 
 @dataclass(frozen=True)
@@ -64,6 +107,67 @@ class TaskHeader:
     depends_on: list[str]
     priority: int
     coder: str
+
+
+def detect_cross_repo_intent(
+    task_body: str,
+    current_repo_name: str,
+) -> str | None:
+    """Return a suspicious cross-repo phrase excerpt, or None.
+
+    The negation check intentionally mirrors ``src/mcp/scans.py`` locally:
+    this guard lives in queue parsing for AUTO PR dispatch, while the MCP
+    scanner owns task-spec validation. A later refactor can share the helper
+    once both call sites settle.
+    """
+    current = _normalize_repo_name(current_repo_name)
+    for pattern, repo_group in _CROSS_REPO_PATTERNS:
+        for match in pattern.finditer(task_body):
+            if _is_cross_repo_intent_negated(task_body, match.start()):
+                continue
+            if repo_group is not None:
+                referenced = _normalize_repo_name(match.group(repo_group))
+                if referenced == current:
+                    continue
+            return _cross_repo_excerpt(task_body, match.start(), match.end())
+    return None
+
+
+def _normalize_repo_name(repo_name: str) -> str:
+    return repo_name.rsplit("/", 1)[-1].strip().lower()
+
+
+def _is_cross_repo_intent_negated(text: str, match_start: int) -> bool:
+    clause_start = max(
+        text.rfind(c, 0, match_start) for c in _CROSS_REPO_CLAUSE_BOUNDARIES
+    )
+    clause_start = clause_start + 1 if clause_start >= 0 else 0
+    negations = list(
+        _CROSS_REPO_NEGATION_CONTEXT.finditer(text, clause_start, match_start)
+    )
+    if not negations:
+        return False
+    nearest = negations[-1]
+    if _CROSS_REPO_DOUBLE_NEGATIVE_INVERTER.search(
+        text, nearest.end(), match_start
+    ):
+        return False
+    return True
+
+
+def _cross_repo_excerpt(text: str, start: int, end: int) -> str:
+    start = max(0, start)
+    end = min(len(text), end)
+    match_len = max(0, end - start)
+    if match_len >= _CROSS_REPO_EXCERPT_LIMIT:
+        return text[start : start + _CROSS_REPO_EXCERPT_LIMIT].strip()
+
+    spare = _CROSS_REPO_EXCERPT_LIMIT - match_len
+    left = min(start, spare // 2)
+    right = min(len(text) - end, spare - left)
+    left = min(start, spare - right)
+    excerpt = text[start - left : end + right].strip()
+    return excerpt[:_CROSS_REPO_EXCERPT_LIMIT]
 
 
 def parse_queue(
