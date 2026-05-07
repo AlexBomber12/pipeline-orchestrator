@@ -69,9 +69,9 @@ async def monitor_fix_idle(
                 primed = True
                 if latest_push_at is not None:
                     last_known_push = time.monotonic()
-        except gh_prs.GitHubPollError:
+        except gh_prs.GitHubPollError as exc:
             runner.log_event(
-                "[FIX] GitHub API poll failed, preserving deadline."
+                f"[FIX] GitHub API poll failed: {exc}, preserving deadline."
             )
             latest_push_at = None
         if latest_push_at is not None and latest_push_at > last_known_push:
