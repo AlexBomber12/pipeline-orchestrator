@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import NotRequired, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class PipelineState(str, Enum):
@@ -187,6 +187,13 @@ class RepoState(BaseModel):
     coder: str | None = None
     last_stale_retrigger_at: datetime | None = None
     last_codex_retrigger_at: datetime | None = None
+
+    @field_validator("state", mode="before")
+    @classmethod
+    def _migrate_legacy_hung_state(cls, value: object) -> object:
+        if value == "HUNG":
+            return PipelineState.ERROR
+        return value
 
     def __setattr__(self, name: str, value: object) -> None:
         """Couple related task/PR fields so a single write resets them together.

@@ -29,6 +29,17 @@ def test_pipelinestate_enum_no_hung() -> None:
     assert not hasattr(PipelineState, "HUNG")
 
 
+def test_repo_state_migrates_legacy_hung_payload_to_error() -> None:
+    payload = (
+        '{"url":"https://github.com/example/repo.git",'
+        '"name":"repo","state":"HUNG"}'
+    )
+
+    state = RepoState.model_validate_json(payload)
+
+    assert state.state == PipelineState.ERROR
+
+
 def test_task_status_values() -> None:
     assert TaskStatus.TODO.value == "TODO"
     assert TaskStatus.DOING.value == "DOING"

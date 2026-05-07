@@ -796,6 +796,26 @@ def test_pause_endpoint_publishes_pause_wake_event(
     assert payload["repo"] == "example__alpha"
 
 
+def test_pause_endpoint_accepts_legacy_hung_state(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy_payload = (
+        '{"url":"https://github.com/example/alpha.git",'
+        '"name":"example__alpha","state":"HUNG"}'
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": legacy_payload})
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/pause")
+
+    assert response.status_code == 200
+    state = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+    assert state.state == PipelineState.ERROR
+    assert state.user_paused is True
+
+
 def test_resume_endpoint_publishes_resume_wake_event(
     two_repo_config: Path,
     monkeypatch: pytest.MonkeyPatch,
