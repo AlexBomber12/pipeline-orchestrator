@@ -182,7 +182,13 @@ def _has_conditional_can_negation_before_cross_repo_command(
         return False
     negation_end = clause_start + nearest.end()
     between = text[negation_end:match_start]
-    return len(re.findall(r"\b\w+\b", between)) >= 2
+    return bool(
+        re.search(
+            r"\b(?:accessed|available|exist|exists|found|located|verified)\b",
+            between,
+            re.IGNORECASE,
+        )
+    )
 
 
 _INLINE_CODE_SUPPRESSION_CATEGORIES = {

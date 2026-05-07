@@ -918,6 +918,12 @@ def test_scan_does_not_flag_nearer_do_not_in_conditional_gh_repo_create():
     assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
 
 
+def test_scan_does_not_flag_cannot_safely_run_gh_repo_create():
+    body = "If coders cannot safely run gh repo create AlexBomber12/foo, stop."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
 def test_scan_does_not_flag_cannot_run_gh_repo_create():
     body = "Coders cannot run gh repo create from dispatched tasks."
     violations = scan_for_conflicts(body)
