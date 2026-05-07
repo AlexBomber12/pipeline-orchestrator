@@ -230,6 +230,8 @@ async def handle_external_terminal_pr_state(
             ),
             log=runner.log_event,
         )
+        runner._recovered_task_pr_ids.add(current_task.pr_id)
+        await runner._persist_recovered_task_pr_ids()
     runner.state.error_message = None
     runner.state.current_task = None
     runner._reset_runner_local_task_counters()
