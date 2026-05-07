@@ -200,6 +200,33 @@ def _is_inside_inline_code(text: str, match_start: int) -> bool:
     return False
 
 
+def _is_inside_fenced_code(text: str, match_start: int) -> bool:
+    """Return True when ``match_start`` is inside a Markdown code fence."""
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    line_start = 0
+    fence_pattern = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+    while line_start < match_start:
+        line_end = text.find("\n", line_start)
+        if line_end == -1 or line_end > match_start:
+            break
+        line = text[line_start:line_end]
+        fence = fence_pattern.match(line)
+        if fence:
+            marker = fence.group(1)
+            if not in_fence:
+                in_fence = True
+                fence_char = marker[0]
+                fence_len = len(marker)
+            elif marker[0] == fence_char and len(marker) >= fence_len:
+                in_fence = False
+                fence_char = ""
+                fence_len = 0
+        line_start = line_end + 1
+    return in_fence
+
+
 _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
     (
         "draft_pr_flag",
@@ -421,6 +448,11 @@ def scan_for_conflicts(task_spec_body: str) -> list[ConflictViolation]:
             if (
                 vtype in _INLINE_CODE_SUPPRESSION_CATEGORIES
                 and _is_inside_inline_code(normalized, match.start())
+            ):
+                continue
+            if (
+                vtype in _INLINE_CODE_SUPPRESSION_CATEGORIES
+                and _is_inside_fenced_code(normalized, match.start())
             ):
                 continue
             line_start = normalized.rfind("\n", 0, match.start()) + 1

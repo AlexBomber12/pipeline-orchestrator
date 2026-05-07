@@ -904,6 +904,37 @@ def test_scan_does_not_flag_ships_in_inside_double_backticks():
     assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
 
 
+def test_scan_does_not_flag_gh_repo_create_inside_fenced_code_block():
+    body = """Example:
+```bash
+gh repo create AlexBomber12/foo
+```
+"""
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
+def test_scan_flags_gh_repo_create_after_closed_fenced_code_block():
+    body = """Example:
+```bash
+gh repo create AlexBomber12/foo
+```
+Then run gh repo create AlexBomber12/foo.
+"""
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
+
+
+def test_scan_does_not_flag_ships_in_inside_tilde_fenced_code_block():
+    body = """Example:
+~~~
+This PR ships in foo-repo repository.
+~~~
+"""
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
 def test_scan_flags_gh_repo_create_inside_double_quotes():
     body = 'Run "gh repo create AlexBomber12/foo" during bootstrap.'
     violations = scan_for_conflicts(body)
