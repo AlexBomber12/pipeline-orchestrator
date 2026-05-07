@@ -28,9 +28,18 @@ _TASK_HEADER_RE = re.compile(r"^#\s+(PR-[A-Za-z0-9_.-]+):\s*(.+?)\s*$")
 _PR_ID_RE = re.compile(r"^PR-[A-Za-z0-9_.-]+$")
 _FIELD_RE = re.compile(r"^-\s*([A-Za-z ]+?)\s*:\s*(.*?)\s*$")
 _TASK_BRANCH_RE = re.compile(r"^Branch\s*:\s*(.*?)\s*$")
+_FRONTMATTER_STATUS_RE = re.compile(r"^status:\s*(.+?)\s*$")
 _STATUS_LINE_RE = re.compile(
     r"^(-\s*status\s*:\s*)(\S*)(.*)$", re.IGNORECASE
 )
+_FRONTMATTER_STATUS_VALUES = {
+    "queued",
+    "in_progress",
+    "in_review",
+    "merged",
+    "blocked",
+    "canceled",
+}
 _TASK_TYPE_VALUES = {
     "architecture",
     "bugfix",
@@ -54,6 +63,26 @@ _COMPLEXITY_VALUES = {"low", "medium", "high"}
 _CODER_VALUES = {"claude", "codex", "any"}
 
 
+def _normalize_frontmatter_status(value: str) -> str:
+    quote: str | None = None
+    for index, char in enumerate(value):
+        if char in {"'", '"'}:
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+        elif char == "#" and quote is None and (
+            index == 0 or value[index - 1].isspace()
+        ):
+            value = value[:index]
+            break
+
+    status = value.strip().lower()
+    if len(status) >= 2 and status[0] == status[-1] and status[0] in {"'", '"'}:
+        return status[1:-1]
+    return status
+
+
 @dataclass(frozen=True)
 class TaskHeader:
     pr_id: str
@@ -64,6 +93,7 @@ class TaskHeader:
     depends_on: list[str]
     priority: int
     coder: str
+    frontmatter_status: str | None = None
 
 
 def parse_queue(
@@ -179,8 +209,30 @@ def parse_task_header(path: str | Path) -> TaskHeader:
     header_match: re.Match[str] | None = None
     fields: dict[str, str] = {}
     in_header_block = False
+    frontmatter_status: str | None = None
+    header_start_index = 0
 
-    for raw_line in lines:
+    first_content_index = next(
+        (index for index, raw_line in enumerate(lines) if raw_line.strip()),
+        None,
+    )
+    if first_content_index is not None and lines[first_content_index].rstrip() == "---":
+        frontmatter_end_index: int | None = None
+        for index in range(first_content_index + 1, len(lines)):
+            if lines[index].rstrip() == "---":
+                frontmatter_end_index = index
+                break
+
+        if frontmatter_end_index is not None:
+            header_start_index = frontmatter_end_index + 1
+            for raw_line in lines[first_content_index + 1 : frontmatter_end_index]:
+                status_match = _FRONTMATTER_STATUS_RE.match(raw_line.rstrip())
+                if status_match:
+                    frontmatter_status = _normalize_frontmatter_status(
+                        status_match.group(1)
+                    )
+
+    for raw_line in lines[header_start_index:]:
         line = raw_line.rstrip()
         if header_match is None:
             header_match = _TASK_HEADER_RE.match(line)
@@ -285,6 +337,15 @@ def parse_task_header(path: str | Path) -> TaskHeader:
             f"{sorted(_CODER_VALUES)}"
         )
 
+    if (
+        frontmatter_status is not None
+        and frontmatter_status not in _FRONTMATTER_STATUS_VALUES
+    ):
+        issues.append(
+            f"{task_path}: invalid frontmatter status {frontmatter_status!r}; "
+            f"expected one of {sorted(_FRONTMATTER_STATUS_VALUES)}"
+        )
+
     if issues:
         raise QueueValidationError(issues)
 
@@ -297,6 +358,7 @@ def parse_task_header(path: str | Path) -> TaskHeader:
         depends_on=depends_on,
         priority=priority,
         coder=coder,
+        frontmatter_status=frontmatter_status,
     )
 
 

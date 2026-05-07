@@ -54,6 +54,19 @@ def _write_task_file(tmp_path: Path, content: str) -> Path:
     return task_path
 
 
+def _frontmatter_task(status: str | None = None) -> str:
+    frontmatter = "" if status is None else f"---\nstatus: {status}\n---\n"
+    return (
+        f"{frontmatter}# PR-100: Frontmatter status\n\n"
+        "Branch: pr-100-frontmatter-status\n"
+        "- Type: feature\n"
+        "- Complexity: medium\n"
+        "- Depends on: none\n"
+        "- Priority: 2\n"
+        "- Coder: codex\n"
+    )
+
+
 def test_parse_queue_missing_file_returns_empty(tmp_path: Path) -> None:
     assert parse_queue(str(tmp_path / "missing.md")) == []
 
@@ -128,6 +141,87 @@ Branch: pr-084-task-header-parser
         priority=2,
         coder="codex",
     )
+
+
+def test_parse_task_header_with_merged_frontmatter(tmp_path: Path) -> None:
+    header = parse_task_header(_write_task_file(tmp_path, _frontmatter_task("merged")))
+
+    assert header == TaskHeader(
+        pr_id="PR-100",
+        title="Frontmatter status",
+        branch="pr-100-frontmatter-status",
+        task_type="feature",
+        complexity="medium",
+        depends_on=[],
+        priority=2,
+        coder="codex",
+        frontmatter_status="merged",
+    )
+
+
+def test_parse_task_header_with_in_progress_frontmatter(tmp_path: Path) -> None:
+    header = parse_task_header(
+        _write_task_file(tmp_path, _frontmatter_task("in_progress"))
+    )
+
+    assert header.frontmatter_status == "in_progress"
+
+
+@pytest.mark.parametrize("status", ['"merged"', "'merged'"])
+def test_parse_task_header_with_quoted_frontmatter_status(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    header = parse_task_header(_write_task_file(tmp_path, _frontmatter_task(status)))
+
+    assert header.frontmatter_status == "merged"
+
+
+@pytest.mark.parametrize("status", ["merged # reviewer override", '"merged" # note'])
+def test_parse_task_header_with_commented_frontmatter_status(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    header = parse_task_header(_write_task_file(tmp_path, _frontmatter_task(status)))
+
+    assert header.frontmatter_status == "merged"
+
+
+def test_parse_task_header_with_long_frontmatter(tmp_path: Path) -> None:
+    long_frontmatter = (
+        "---\n"
+        + "\n".join(f"metadata_{index}: value" for index in range(25))
+        + "\nstatus: merged\n---\n"
+    )
+    header = parse_task_header(
+        _write_task_file(tmp_path, long_frontmatter + _frontmatter_task())
+    )
+
+    assert header.frontmatter_status == "merged"
+
+
+def test_parse_task_header_without_frontmatter(tmp_path: Path) -> None:
+    header = parse_task_header(_write_task_file(tmp_path, _frontmatter_task()))
+
+    assert header == TaskHeader(
+        pr_id="PR-100",
+        title="Frontmatter status",
+        branch="pr-100-frontmatter-status",
+        task_type="feature",
+        complexity="medium",
+        depends_on=[],
+        priority=2,
+        coder="codex",
+    )
+    assert header.frontmatter_status is None
+
+
+def test_parse_task_header_invalid_frontmatter_status(tmp_path: Path) -> None:
+    with pytest.raises(
+        QueueValidationError,
+        match="invalid frontmatter status",
+    ):
+        parse_task_header(_write_task_file(tmp_path, _frontmatter_task("bogus_value")))
 
 
 def test_parse_task_header_rejects_missing_header(tmp_path: Path) -> None:
