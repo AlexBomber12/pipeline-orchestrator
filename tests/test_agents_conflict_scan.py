@@ -905,6 +905,12 @@ def test_scan_flags_cannot_conditional_execute_gh_repo_create():
     assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
 
 
+def test_scan_flags_cannot_conditional_create_one_with_gh_repo_create():
+    body = "If repo can't be found create one with gh repo create AlexBomber12/foo."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
+
+
 def test_scan_does_not_flag_nearer_do_not_in_conditional_gh_repo_create():
     body = "When repo cannot be found do not run gh repo create AlexBomber12/foo."
     violations = scan_for_conflicts(body)
