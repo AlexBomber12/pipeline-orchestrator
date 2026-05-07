@@ -135,6 +135,19 @@ def test_detect_cross_repo_intent_single_token_repo_name() -> None:
     assert "homelab" in result
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "This PR ships in production.",
+        "Keep this in staging repo for now.",
+    ],
+)
+def test_detect_cross_repo_intent_ignores_generic_environment_names(
+    body: str,
+) -> None:
+    assert detect_cross_repo_intent(body, "pipeline-orchestrator") is None
+
+
 def test_detect_cross_repo_intent_dotted_same_repo_returns_none() -> None:
     assert (
         detect_cross_repo_intent(

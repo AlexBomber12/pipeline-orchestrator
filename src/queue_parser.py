@@ -96,6 +96,16 @@ _CROSS_REPO_DOUBLE_NEGATIVE_INVERTER = re.compile(
 _CROSS_REPO_CLAUSE_BOUNDARIES = ".,;!?:\n"
 _CROSS_REPO_EXCERPT_LIMIT = 120
 _CROSS_REPO_PLACEHOLDER_NAMES = {"the", "this", "current", "same"}
+_CROSS_REPO_GENERIC_CONTEXT_NAMES = {
+    "dev",
+    "development",
+    "prod",
+    "production",
+    "stage",
+    "staging",
+    "test",
+    "testing",
+}
 _CROSS_REPO_PR_ID_TOKEN = re.compile(r"^pr-\d+$", re.IGNORECASE)
 
 
@@ -162,7 +172,10 @@ def _is_same_repo_reference(
 
 
 def _looks_like_repo_reference(repo_name: str) -> bool:
-    return not _CROSS_REPO_PR_ID_TOKEN.fullmatch(repo_name)
+    return (
+        not _CROSS_REPO_PR_ID_TOKEN.fullmatch(repo_name)
+        and repo_name not in _CROSS_REPO_GENERIC_CONTEXT_NAMES
+    )
 
 
 def _is_cross_repo_intent_negated(text: str, match_start: int) -> bool:
