@@ -159,6 +159,28 @@ def _is_negated_cross_repo_shipping(text: str, match_start: int) -> bool:
     return bool(re.fullmatch(r"(?:\s+\w+){0,3}\s+", between))
 
 
+def _has_conditional_can_negation_before_cross_repo_command(
+    text: str,
+    match_start: int,
+) -> bool:
+    """Return True when ``can't`` negates a condition, not the command."""
+    clause_start = max(text.rfind(c, 0, match_start) for c in _CLAUSE_BOUNDARIES)
+    clause_start = clause_start + 1 if clause_start >= 0 else 0
+    negations = list(
+        re.finditer(
+            r"\b(?:cannot|can not|can't|can’t)\b",
+            text[clause_start:match_start],
+            re.IGNORECASE,
+        )
+    )
+    if not negations:
+        return False
+    nearest = negations[-1]
+    negation_end = clause_start + nearest.end()
+    between = text[negation_end:match_start]
+    return bool(re.search(r"\S.+\brun\s+$", between, re.IGNORECASE))
+
+
 _INLINE_CODE_SUPPRESSION_CATEGORIES = {
     "cross_repo_repo_create",
     "cross_repo_repo_delete",
@@ -449,7 +471,16 @@ def scan_for_conflicts(task_spec_body: str) -> list[ConflictViolation]:
     for vtype, pattern, rule in _ANTI_PATTERNS:
         for match in pattern.finditer(normalized):
             if _is_negated(normalized, match.start()):
-                continue
+                if vtype in {
+                    "cross_repo_repo_create",
+                    "cross_repo_repo_delete",
+                } and _has_conditional_can_negation_before_cross_repo_command(
+                    normalized,
+                    match.start(),
+                ):
+                    pass
+                else:
+                    continue
             if vtype == "cross_repo_ships_in" and _is_negated_cross_repo_shipping(
                 normalized,
                 match.start(),

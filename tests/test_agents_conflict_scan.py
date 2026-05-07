@@ -868,6 +868,24 @@ def test_scan_flags_does_not_conditional_gh_repo_create():
     assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
 
 
+def test_scan_flags_cannot_conditional_gh_repo_create():
+    body = "If the repo can't be found run gh repo create AlexBomber12/foo."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
+
+
+def test_scan_flags_cannot_conditional_gh_repo_delete():
+    body = "If the repo cannot be verified run gh repo delete AlexBomber12/foo."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_delete"]
+
+
+def test_scan_does_not_flag_cannot_run_gh_repo_create():
+    body = "Coders cannot run gh repo create from dispatched tasks."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
 def test_scan_does_not_flag_negated_ships_in():
     body = "This task does not ship in another repo."
     violations = scan_for_conflicts(body)
