@@ -6,7 +6,11 @@ case below; the clean-spec case anchors the false-positive direction.
 
 from __future__ import annotations
 
-from src.mcp.scans import _is_inside_inline_code, scan_for_conflicts
+from src.mcp.scans import (
+    _is_inside_fenced_code,
+    _is_inside_inline_code,
+    scan_for_conflicts,
+)
 
 _CLEAN_SPEC = """# PR-999: Example task
 
@@ -792,6 +796,18 @@ def test_scan_flags_in_repo_phrasing():
     assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
 
 
+def test_scan_does_not_flag_generic_in_the_repo_prose():
+    body = "The implementation lives in the repo and uses existing helpers."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
+def test_scan_does_not_flag_generic_in_named_repo_fixtures_prose():
+    body = "Keep the fixture in tests repo fixtures for this module."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
 def test_scan_flags_targets_repo_phrasing():
     body = "This task targets the homelab-monitoring repository."
     violations = scan_for_conflicts(body)
@@ -898,20 +914,35 @@ def test_inline_code_detector_returns_false_for_empty_line():
     assert _is_inside_inline_code("", 0) is False
 
 
+def test_fenced_code_detector_returns_false_after_closed_fence():
+    body = "```bash\ngh repo create AlexBomber12/foo\n```\noutside\n"
+    assert _is_inside_fenced_code(body, body.index("outside")) is False
+
+
 def test_scan_does_not_flag_ships_in_inside_double_backticks():
     body = "Use ``ships in foo-repo repository`` as a literal example."
     violations = scan_for_conflicts(body)
     assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
 
 
-def test_scan_does_not_flag_gh_repo_create_inside_fenced_code_block():
+def test_scan_flags_gh_repo_create_inside_fenced_code_block():
     body = """Example:
 ```bash
 gh repo create AlexBomber12/foo
 ```
 """
     violations = scan_for_conflicts(body)
-    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
+
+
+def test_scan_flags_gh_repo_delete_inside_fenced_code_block():
+    body = """Example:
+```bash
+gh repo delete AlexBomber12/foo --yes
+```
+"""
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_delete"]
 
 
 def test_scan_flags_gh_repo_create_after_closed_fenced_code_block():
@@ -922,7 +953,10 @@ gh repo create AlexBomber12/foo
 Then run gh repo create AlexBomber12/foo.
 """
     violations = scan_for_conflicts(body)
-    assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
+    assert [v.violation_type for v in violations] == [
+        "cross_repo_repo_create",
+        "cross_repo_repo_create",
+    ]
 
 
 def test_scan_does_not_flag_ships_in_inside_tilde_fenced_code_block():
