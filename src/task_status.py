@@ -81,6 +81,8 @@ def derive_task_status(
         return TaskStatus.DOING
     if task_header.frontmatter_status in ("blocked", "canceled"):
         return TaskStatus.CANCELED
+    if task_header.frontmatter_status == "queued":
+        return TaskStatus.TODO
     if (
         task_header.branch
         and task_header.branch in state.merged_branches

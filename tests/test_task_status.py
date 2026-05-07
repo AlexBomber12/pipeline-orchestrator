@@ -124,6 +124,16 @@ def test_derive_task_status_stopped_frontmatter_returns_canceled(
     assert status == TaskStatus.CANCELED
 
 
+def test_derive_task_status_queued_frontmatter_returns_todo() -> None:
+    status = derive_task_status(
+        _header("pr-085-status-from-git", frontmatter_status="queued"),
+        _merged_state({"PR-085"}),
+        [],
+    )
+
+    assert status == TaskStatus.TODO
+
+
 def test_derive_task_status_no_frontmatter_uses_existing_logic() -> None:
     status = derive_task_status(
         _header("pr-085-status-from-git", frontmatter_status=None),
