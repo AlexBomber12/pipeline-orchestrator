@@ -138,6 +138,24 @@ def _is_negated(text: str, match_start: int) -> bool:
     return True
 
 
+def _is_inside_fenced_code_block(text: str, match_start: int) -> bool:
+    """Return True when ``match_start`` falls after an unmatched fence."""
+    return text[:match_start].count("```") % 2 == 1
+
+
+def _is_inside_inline_code(text: str, match_start: int) -> bool:
+    """Return True when ``match_start`` is inside a same-line backtick span."""
+    line_start = text.rfind("\n", 0, match_start) + 1
+    line_prefix = text[line_start:match_start]
+    return line_prefix.count("`") % 2 == 1
+
+
+_MARKDOWN_CODE_SUPPRESSED_TYPES = {
+    "cross_repo_repo_create_command",
+    "cross_repo_repo_new_command",
+}
+
+
 _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
     (
         "draft_pr_flag",
@@ -281,6 +299,16 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         re.compile(r"\bauto.merge[^\n]*(dirty|red|failing)\b", re.IGNORECASE),
         "AGENTS.md prohibits merging with failing checks.",
     ),
+    (
+        "cross_repo_repo_create_command",
+        re.compile(r"\bgh\s+repo\s+create\s+[\w.-]+/[\w.-]+", re.IGNORECASE),
+        "AGENTS.md prohibits coder-initiated cross-repo creation. Tier 1 guardrail. OBS-BT.",
+    ),
+    (
+        "cross_repo_repo_new_command",
+        re.compile(r"\bgh\s+repo\s+new\s+[\w.-]+/[\w.-]+", re.IGNORECASE),
+        "AGENTS.md prohibits coder-initiated cross-repo creation. Tier 1 guardrail. OBS-BT.",
+    ),
 ]
 
 
@@ -313,6 +341,11 @@ def scan_for_conflicts(task_spec_body: str) -> list[ConflictViolation]:
     for vtype, pattern, rule in _ANTI_PATTERNS:
         for match in pattern.finditer(normalized):
             if _is_negated(normalized, match.start()):
+                continue
+            if vtype in _MARKDOWN_CODE_SUPPRESSED_TYPES and (
+                _is_inside_fenced_code_block(normalized, match.start())
+                or _is_inside_inline_code(normalized, match.start())
+            ):
                 continue
             line_start = normalized.rfind("\n", 0, match.start()) + 1
             line_end = normalized.find("\n", match.start())

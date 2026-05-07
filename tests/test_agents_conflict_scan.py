@@ -6,7 +6,11 @@ case below; the clean-spec case anchors the false-positive direction.
 
 from __future__ import annotations
 
-from src.mcp.scans import scan_for_conflicts
+from src.mcp.scans import (
+    _is_inside_fenced_code_block,
+    _is_inside_inline_code,
+    scan_for_conflicts,
+)
 
 
 _CLEAN_SPEC = """# PR-999: Example task
@@ -755,3 +759,98 @@ def test_no_verify_detected_across_shell_continuation():
     violations = scan_for_conflicts(body)
     types = {v.violation_type for v in violations}
     assert "no_verify_commit" in types
+
+
+def test_cross_repo_create_literal_with_owner_repo_argument():
+    body = "Run gh repo create AlexBomber12/foo as setup step"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "cross_repo_repo_create_command" in types
+
+
+def test_cross_repo_new_literal_with_owner_repo_argument():
+    body = "gh repo new owner/bar"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "cross_repo_repo_new_command" in types
+
+
+def test_cross_repo_create_with_flags_after_arg():
+    body = 'gh repo create owner/baz --public --description "x"'
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "cross_repo_repo_create_command" in types
+
+
+def test_cross_repo_create_in_quoted_directive():
+    body = 'Execute "gh repo create owner/repo" immediately'
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "cross_repo_repo_create_command" in types
+
+
+def test_no_match_without_slash_argument():
+    body = "the gh repo create command and gh repo create itself"
+    assert scan_for_conflicts(body) == []
+
+
+def test_no_match_python_targets_prose():
+    body = "This PR targets Python 3.12"
+    assert scan_for_conflicts(body) == []
+
+
+def test_no_match_in_fenced_code_block():
+    body = "Example:\n```bash\ngh repo create owner/foo\n```\nUse it elsewhere."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "cross_repo_repo_create_command" not in types
+
+
+def test_no_match_in_inline_backticks():
+    body = "Use the `gh repo create owner/repo` form from a terminal"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "cross_repo_repo_create_command" not in types
+
+
+def test_no_match_negated_via_is_negated_helper():
+    body = "Coders must not run gh repo create owner/repo"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "cross_repo_repo_create_command" not in types
+
+
+def test_no_match_negated_double():
+    body = "Do not gh repo new owner/repo under any circumstance"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "cross_repo_repo_new_command" not in types
+
+
+def test_no_match_in_url_or_path():
+    body = "see https://example.com/gh/repo/create/owner/foo for docs"
+    assert scan_for_conflicts(body) == []
+
+
+def test_is_inside_fenced_code_block_odd_count():
+    body = "Intro\n```bash\ngh repo create owner/foo\n"
+    match_start = body.index("gh repo create")
+    assert _is_inside_fenced_code_block(body, match_start) is True
+
+
+def test_is_inside_fenced_code_block_balanced():
+    body = "Intro\n```bash\nexample\n```\ngh repo create owner/foo\n"
+    match_start = body.index("gh repo create")
+    assert _is_inside_fenced_code_block(body, match_start) is False
+
+
+def test_is_inside_inline_code_only_same_line():
+    body = (
+        "Use `gh repo create owner/repo` from a terminal\n"
+        "Then gh repo create owner/other is directive text"
+    )
+    inline_match_start = body.index("gh repo create owner/repo")
+    later_match_start = body.index("gh repo create owner/other")
+
+    assert _is_inside_inline_code(body, inline_match_start) is True
+    assert _is_inside_inline_code(body, later_match_start) is False
