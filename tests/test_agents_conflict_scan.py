@@ -762,6 +762,12 @@ def test_scan_flags_gh_repo_create():
     assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
 
 
+def test_scan_flags_gh_repo_new_alias():
+    body = "Run gh repo new AlexBomber12/foo during bootstrap."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
+
+
 def test_scan_flags_gh_repo_delete():
     body = "Run gh repo delete AlexBomber12/foo during cleanup."
     violations = scan_for_conflicts(body)
@@ -838,6 +844,18 @@ def test_scan_does_not_flag_negated_ships_in():
     body = "This task does not ship in another repo."
     violations = scan_for_conflicts(body)
     assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
+def test_scan_does_not_flag_adverbial_negated_ships_in():
+    body = "This task does not currently ship in other-repo repository."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
+def test_scan_flags_double_negative_ships_in():
+    body = "This task does not fail to ship in other-repo repository."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
 
 
 def test_scan_does_not_flag_contracted_negated_ships_in():

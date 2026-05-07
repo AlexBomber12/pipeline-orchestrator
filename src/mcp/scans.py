@@ -138,17 +138,25 @@ def _is_negated(text: str, match_start: int) -> bool:
     return True
 
 
-_CROSS_REPO_SHIPPING_DOES_NOT = re.compile(
-    r"\b(?:does not|does(?:n't|n’t))\s+$",
-    re.IGNORECASE,
-)
-
-
 def _is_negated_cross_repo_shipping(text: str, match_start: int) -> bool:
     """Return True for scoped ``does not <shipping verb>`` negation."""
     clause_start = max(text.rfind(c, 0, match_start) for c in _CLAUSE_BOUNDARIES)
     clause_start = clause_start + 1 if clause_start >= 0 else 0
-    return bool(_CROSS_REPO_SHIPPING_DOES_NOT.search(text, clause_start, match_start))
+    negations = list(
+        re.finditer(
+            r"\b(?:does\s+not|doesn't|doesn’t)\b",
+            text[clause_start:match_start],
+            re.IGNORECASE,
+        )
+    )
+    if not negations:
+        return False
+    nearest = negations[-1]
+    negation_end = clause_start + nearest.end()
+    between = text[negation_end:match_start]
+    if _DOUBLE_NEGATIVE_INVERTER.search(between):
+        return False
+    return bool(re.fullmatch(r"(?:\s+\w+){0,3}\s+", between))
 
 
 _INLINE_CODE_SUPPRESSION_CATEGORIES = {
@@ -338,9 +346,10 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
     (
         "cross_repo_repo_create",
         # gh CLI command that creates a new GitHub repository on the
-        # operator's account or organization. Bare command form;
-        # negation suppression handled by the shared _is_negated check.
-        re.compile(r"\bgh repo create\b", re.IGNORECASE),
+        # operator's account or organization. ``gh repo new`` is a
+        # documented alias of ``gh repo create``; negation suppression
+        # is handled by the shared _is_negated check.
+        re.compile(r"\bgh repo (?:create|new)\b", re.IGNORECASE),
         "AGENTS.md prohibits creating GitHub repositories from coder dispatches. OBS-BT.",
     ),
     (
