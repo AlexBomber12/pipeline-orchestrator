@@ -65,6 +65,16 @@ def test_detect_cross_repo_intent_ships_in_other_repo_returns_excerpt() -> None:
     assert "ships in homelab-monitoring" in result
 
 
+def test_detect_cross_repo_intent_ignores_pr_id_after_ships_in() -> None:
+    assert (
+        detect_cross_repo_intent(
+            "This work ships in PR-240 + PR-241.",
+            "pipeline-orchestrator",
+        )
+        is None
+    )
+
+
 def test_detect_cross_repo_intent_ships_in_same_repo_returns_none() -> None:
     assert (
         detect_cross_repo_intent(
@@ -93,6 +103,16 @@ def test_detect_cross_repo_intent_negated_phrase_returns_none() -> None:
         )
         is None
     )
+
+
+def test_detect_cross_repo_intent_not_only_phrase_still_flags() -> None:
+    result = detect_cross_repo_intent(
+        "This does not only document that the PR ships in homelab-monitoring.",
+        "megaraid-dashboard",
+    )
+
+    assert result is not None
+    assert "ships in homelab-monitoring" in result
 
 
 def test_detect_cross_repo_intent_gh_repo_create_always_flags() -> None:
@@ -180,6 +200,16 @@ def test_detect_cross_repo_intent_owner_prefixed_form() -> None:
 
     assert result is not None
     assert "alexbomber12/homelab-monitoring" in result
+
+
+def test_detect_cross_repo_intent_markdown_quoted_repo_name() -> None:
+    result = detect_cross_repo_intent(
+        "This PR ships in `homelab-monitoring`.",
+        "megaraid-dashboard",
+    )
+
+    assert result is not None
+    assert "`homelab-monitoring`" in result
 
 
 def test_detect_cross_repo_intent_unicode_repo_name() -> None:

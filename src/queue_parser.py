@@ -55,21 +55,21 @@ _CODER_VALUES = {"claude", "codex", "any"}
 _CROSS_REPO_PATTERNS: tuple[tuple[re.Pattern[str], int | None], ...] = (
     (
         re.compile(
-            r"\bships in ((?:[\w.-]+/)?[\w.-]+)\b",
+            r"\bships in `?((?:[\w.-]+/)?[\w.-]+)\b`?",
             re.IGNORECASE,
         ),
         1,
     ),
     (
         re.compile(
-            r"\bin (?:the )?((?:[\w.-]+/)?[\w.-]+) repo(?:sitory)?\b",
+            r"\bin (?:the )?`?((?:[\w.-]+/)?[\w.-]+)\b`? repo(?:sitory)?\b",
             re.IGNORECASE,
         ),
         1,
     ),
     (
         re.compile(
-            r"\bbelongs to ((?:[\w.-]+/)?[\w.-]+)\b",
+            r"\bbelongs to `?((?:[\w.-]+/)?[\w.-]+)\b`?",
             re.IGNORECASE,
         ),
         1,
@@ -82,7 +82,7 @@ _CROSS_REPO_NEGATION_CONTEXT = re.compile(
     r"do not|don't|don’t|"
     r"does not|doesn't|doesn’t|"
     r"cannot|can not|can't|can’t|"
-    r"never|not|"
+    r"never|not(?!\s+only)|"
     r"must not|mustn't|mustn’t|"
     r"will not|won't|won’t|would not|wouldn't|wouldn’t|"
     r"should not|shouldn't|shouldn’t"
@@ -96,6 +96,8 @@ _CROSS_REPO_DOUBLE_NEGATIVE_INVERTER = re.compile(
 _CROSS_REPO_CLAUSE_BOUNDARIES = ".,;!?:\n"
 _CROSS_REPO_EXCERPT_LIMIT = 120
 _CROSS_REPO_PLACEHOLDER_NAMES = {"this", "current", "same"}
+_CROSS_REPO_PR_ID_TOKEN = re.compile(r"^pr-\d+$", re.IGNORECASE)
+_CROSS_REPO_REPO_MARKERS = re.compile(r"[-./]")
 
 
 @dataclass(frozen=True)
@@ -131,6 +133,7 @@ def detect_cross_repo_intent(
                 if (
                     referenced == current
                     or referenced in _CROSS_REPO_PLACEHOLDER_NAMES
+                    or not _looks_like_repo_reference(referenced)
                 ):
                     continue
             return _cross_repo_excerpt(task_body, match.start(), match.end())
@@ -139,6 +142,12 @@ def detect_cross_repo_intent(
 
 def _normalize_repo_name(repo_name: str) -> str:
     return repo_name.rsplit("/", 1)[-1].strip().lower()
+
+
+def _looks_like_repo_reference(repo_name: str) -> bool:
+    if _CROSS_REPO_PR_ID_TOKEN.fullmatch(repo_name):
+        return False
+    return bool(_CROSS_REPO_REPO_MARKERS.search(repo_name))
 
 
 def _is_cross_repo_intent_negated(text: str, match_start: int) -> bool:
@@ -152,6 +161,8 @@ def _is_cross_repo_intent_negated(text: str, match_start: int) -> bool:
     if not negations:
         return False
     nearest = negations[-1]
+    if text[nearest.end() : match_start].lstrip().lower().startswith("only"):
+        return False
     if _CROSS_REPO_DOUBLE_NEGATIVE_INVERTER.search(
         text, nearest.end(), match_start
     ):
