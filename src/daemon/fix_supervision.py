@@ -22,6 +22,7 @@ import asyncio
 import time
 from typing import TYPE_CHECKING
 
+from src.cancellation import CancellationCause, safe_record_cancellation_cause
 from src.github import prs as gh_prs
 from src.models import PipelineState
 
@@ -184,7 +185,8 @@ async def handle_external_terminal_pr_state(
     DONE if applicable, drop ``current_pr`` / ``current_task``, and
     return to ``IDLE``.
 
-    On ``CLOSED``: park in ``HUNG`` so a human can resolve.
+    On ``CLOSED``: record a crash cause, clear the task, and return to IDLE
+    so the queue can continue.
     """
     pr = runner.state.current_pr
     pr_number_str = f"#{pr.number}" if pr is not None else ""
@@ -207,15 +209,29 @@ async def handle_external_terminal_pr_state(
     # CLOSED
     runner.log_event(
         f"[FIX] PR {pr_number_str} closed externally during FIX, "
-        f"transitioning to HUNG."
+        f"skipping task and returning to IDLE."
     )
-    # Finalize the run record before parking in HUNG. Otherwise the next
-    # ``handle_hung`` tick will move the runner to IDLE and clear
-    # ``current_task`` while ``ended_at`` / ``exit_reason`` are still
-    # unset, leaving incomplete metrics for the closed PR (Codex P2
-    # follow-up on PR #223).
+    # Finalize the run record before clearing the task so closed PR metrics
+    # retain their explicit exit reason.
     await runner._save_current_run_record("closed_unmerged")
     runner._current_run_record = None
+    current_task = runner.state.current_task
+    if current_task is not None:
+        await safe_record_cancellation_cause(
+            runner.redis,
+            runner.name,
+            current_task.pr_id,
+            CancellationCause(
+                category="CRASH",
+                payload={
+                    "closed_externally": True,
+                    "pr_number": pr.number if pr is not None else None,
+                },
+            ),
+            log=runner.log_event,
+        )
     runner.state.error_message = None
-    runner.state.state = PipelineState.HUNG
+    runner.state.current_task = None
+    runner._reset_runner_local_task_counters()
+    runner.state.state = PipelineState.IDLE
     await runner.publish_state()

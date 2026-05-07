@@ -94,13 +94,13 @@ def test_happy_path_pr_exists_transitions_to_watch(
     assert runner.state.current_pr.number == 42
 
 
-def test_case_a_no_branch_no_remote_marks_hung(
+def test_case_a_no_branch_no_remote_skips_to_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = _runner(monkeypatch)
     _patch_branch_state(monkeypatch, local_exists=False, remote_exists=False)
     asyncio.run(runner.handle_coding())
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert "did nothing" in (runner.state.error_message or "")
     assert any("did nothing" in entry["event"] for entry in runner.state.history)
 
@@ -110,11 +110,11 @@ def test_branch_mismatch_after_coder_exit_escalates_explicitly(
 ) -> None:
     """When ``BranchContext`` reports an explicit divergence between
     ``task_branch`` and the actual checked-out branch after the coder
-    exits 0, ``handle_coding`` parks in HUNG with a [BRANCH] log
+    exits 0, ``handle_coding`` skips to IDLE with a [BRANCH] log
     instead of degrading into the case-A "did nothing" diagnostic.
 
     This is the OBS-AI gap PR-222 closes: surfacing the divergence
-    before the PR lookup loop turns a silent HUNG into a named branch
+    before the PR lookup loop turns a silent skip into a named branch
     mismatch with both surfaces named in the diagnostic.
     """
     runner = _runner(monkeypatch)
@@ -128,7 +128,7 @@ def test_branch_mismatch_after_coder_exit_escalates_explicitly(
 
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     error = runner.state.error_message or ""
     assert "Branch mismatch" in error
     assert "task_branch=pr-001" in error
@@ -137,13 +137,13 @@ def test_branch_mismatch_after_coder_exit_escalates_explicitly(
     assert any("[BRANCH] mismatch detected" in e for e in log_entries)
 
 
-def test_case_b_local_branch_only_marks_hung(
+def test_case_b_local_branch_only_skips_to_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = _runner(monkeypatch)
     _patch_branch_state(monkeypatch, local_exists=True, remote_exists=False)
     asyncio.run(runner.handle_coding())
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert "no push" in (runner.state.error_message or "")
 
 
@@ -205,7 +205,7 @@ def test_case_c_branch_mismatch_does_not_block_daemon_recovery(
     assert not any("[BRANCH] mismatch detected" in e for e in log_entries)
 
 
-def test_case_c_create_pr_failure_marks_hung(
+def test_case_c_create_pr_failure_skips_to_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = _runner(monkeypatch)
@@ -218,7 +218,7 @@ def test_case_c_create_pr_failure_marks_hung(
 
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert "Daemon PR creation failed" in (runner.state.error_message or "")
 
 
@@ -264,7 +264,7 @@ def test_case_c_post_create_list_transient_failure_recovers(
     assert any("Daemon-created PR list failed" in entry["event"] for entry in runner.state.history)
 
 
-def test_case_c_pr_not_found_after_create_marks_hung(
+def test_case_c_pr_not_found_after_create_skips_to_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = _runner(monkeypatch, open_prs_after_create=[])
@@ -273,7 +273,7 @@ def test_case_c_pr_not_found_after_create_marks_hung(
 
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert "Daemon-created PR not found" in (runner.state.error_message or "")
 
 
@@ -395,7 +395,7 @@ def test_case_c_already_exists_error_falls_through_when_pr_invisible(
     """When ``gh`` reports the PR exists but the post-create list never
     surfaces it, the diagnostic should still escalate after the bounded
     retry window — the recovery path defers to the existing 'PR not found'
-    HUNG branch rather than silently swallowing the error."""
+    skip branch rather than silently swallowing the error."""
     runner = _runner(monkeypatch, open_prs_after_create=[])
     _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
 
@@ -406,7 +406,7 @@ def test_case_c_already_exists_error_falls_through_when_pr_invisible(
 
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert "Daemon-created PR not found" in (runner.state.error_message or "")
 
 

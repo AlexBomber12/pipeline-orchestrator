@@ -9,7 +9,7 @@ single incident can fire more than one layer.
 
 These four tests pin the **current** layer composition before PR-220
 replaces the three ``_escalate_fix_*`` methods with a single
-``_escalate_to_hung`` primitive. Each test asserts the terminal state,
+``_escalate_and_skip`` primitive. Each test asserts the terminal state,
 the side effect (label apply, comment post, ``is_escalated`` flag)
 and the operator-visible log line so the upcoming refactor preserves
 behavior verbatim:
@@ -208,25 +208,14 @@ def test_no_push_escalation_cancels_task_and_returns_to_idle(
 
 
 # ---------------------------------------------------------------------------
-# Test 3 — coder ESCALATE + label apply failure parks in HUNG
+# Test 3 — coder ESCALATE + label apply failure skips to IDLE
 # ---------------------------------------------------------------------------
 
 
-def test_coder_escalate_label_apply_failure_parks_in_hung(
+def test_coder_escalate_label_apply_failure_skips_to_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Coder ESCALATE with a label-apply failure parks the PR in HUNG.
-
-    ``_escalate_fix_coder_initiated`` ordinarily moves to IDLE on the
-    success path so the next IDLE refresh can rehydrate
-    ``is_escalated`` from the GitHub label. When the label apply
-    soft-fails, the rehydrate would observe a missing label and drop
-    the parking signal; HUNG honors the in-memory ``is_escalated``
-    flag, so the runner stays parked until manual intervention.
-    ``error_message`` carries both the failure context and the
-    coder-supplied reason so an operator reading the dashboard can
-    act on it without diving into the daemon log.
-    """
+    """Coder ESCALATE with a label-apply failure records context and skips."""
     posted: list[tuple[str, int, str]] = []
 
     monkeypatch.setattr(
@@ -248,7 +237,7 @@ def test_coder_escalate_label_apply_failure_parks_in_hung(
 
     asyncio.run(runner._escalate_fix_coder_initiated(pr, "transient infra failure"))
 
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert pr.is_escalated is True
     assert runner.state.error_message is not None
     assert "FIX coder ESCALATE on PR #401" in runner.state.error_message

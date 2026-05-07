@@ -496,9 +496,18 @@ def test_handle_watch_pending_within_threshold_does_not_reclassify(
     assert "reclassified" not in history_events
 
 
-def test_handle_watch_timeout_sets_hung(
+def test_handle_watch_timeout_skips_to_idle_with_cause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    recorded: list[tuple[str, str, str, dict[str, object]]] = []
+
+    async def fake_safe_record(redis_client, repo_slug, task_id, cause, *, log=None):
+        recorded.append((repo_slug, task_id, cause.category, cause.payload))
+
+    monkeypatch.setattr(
+        "src.daemon.runner.safe_record_cancellation_cause",
+        fake_safe_record,
+    )
     stale = datetime.now(timezone.utc) - timedelta(minutes=90)
     pr = PRInfo(
         number=5,
@@ -512,9 +521,27 @@ def test_handle_watch_timeout_sets_hung(
     runner = h._make_runner(review_timeout_min=30)
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-005",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+    )
     asyncio.run(runner.handle_watch())
 
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
+    assert recorded == [
+        (
+            runner.name,
+            "PR-005",
+            "ESCALATE",
+            {
+                "subsource": "daemon",
+                "reason_text": "PR #5 hung after 90m (review=EYES, ci=PENDING)",
+                "previous_state": "WATCH",
+            },
+        )
+    ]
 
 
 def test_handle_watch_within_timeout_stays_watching(
@@ -566,7 +593,7 @@ def test_handle_watch_approved_but_ci_pending_applies_timeout(
 ) -> None:
     """APPROVED + CI PENDING used to fall through the branches in handle_watch,
     leaving the runner stuck in WATCH forever. It should now apply the review
-    timeout and transition to HUNG when the PR stays pending for too long."""
+    timeout and transition to IDLE when the PR stays pending for too long."""
     stale = datetime.now(timezone.utc) - timedelta(minutes=90)
     pr = PRInfo(
         number=5,
@@ -582,7 +609,7 @@ def test_handle_watch_approved_but_ci_pending_applies_timeout(
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     asyncio.run(runner.handle_watch())
 
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert any("review=APPROVED" in e["event"] and "ci=PENDING" in e["event"] for e in runner.state.history)
 
 
@@ -611,7 +638,7 @@ def test_handle_watch_falls_back_to_daemon_review_timeout(
 
     # ``review_timeout_min=None`` on the repo → the runner must use the
     # daemon's 30-minute default. 40 minutes of inactivity is past that,
-    # so the PR flips to HUNG.
+    # so the task is skipped to IDLE.
     repo_cfg = RepoConfig(
         url="https://github.com/octo/demo.git",
         branch="main",
@@ -630,7 +657,7 @@ def test_handle_watch_falls_back_to_daemon_review_timeout(
     runner.state.current_pr = PRInfo(number=7, branch="pr-002")
     asyncio.run(runner.handle_watch())
 
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
 
 
 def test_handle_watch_repo_timeout_override_wins_over_daemon_default(
@@ -934,7 +961,7 @@ def test_handle_watch_stale_feedback_still_times_out(
     asyncio.run(runner.handle_watch())
 
     assert fix_called == []
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
 
 
 def test_handle_watch_retriggers_stale_changes_requested_review(
@@ -1547,7 +1574,7 @@ def test_handle_watch_falls_through_for_fork_with_ci_failure(
     asyncio.run(runner.handle_watch())
 
     assert fix_called == []
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
 
 
 def test_handle_watch_falls_through_for_fork_with_changes_requested(
@@ -1584,7 +1611,7 @@ def test_handle_watch_falls_through_for_fork_with_changes_requested(
     asyncio.run(runner.handle_watch())
 
     assert fix_called == []
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
 
 
 def test_handle_watch_rehydrates_on_pr_number_mismatch(

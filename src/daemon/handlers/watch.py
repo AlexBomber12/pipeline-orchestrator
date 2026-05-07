@@ -321,7 +321,7 @@ class WatchMixin:
             else self.app_config.daemon.review_timeout_min
         )
         if elapsed_min >= timeout_min:
-            await self._escalate_to_hung(
+            await self._escalate_and_skip(
                 f"PR #{found.number} hung after {elapsed_min:.0f}m "
                 f"(review={review.value}, ci={ci.value})",
                 error_message_override=None,

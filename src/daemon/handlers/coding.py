@@ -90,9 +90,9 @@ def _remote_branch_exists(repo_path: str, branch: str) -> bool:
 
     Uses ``git ls-remote --exit-code`` so a missing ref returns rc=2 and a
     transient transport failure returns rc>=128 — both interpreted as "not
-    visible upstream" by the caller, which routes A/B to HUNG without
-    risking a false-positive PR-creation attempt against a non-existent
-    upstream branch.
+    visible upstream" by the caller, which routes A/B through escalation and
+    back to IDLE without risking a false-positive PR-creation attempt against
+    a non-existent upstream branch.
     """
     try:
         probe = git_ops._git(
@@ -536,7 +536,7 @@ class CodingMixin:
         """CLI log save, exit classification, PR lookup, WATCH handoff.
 
         Either transitions to WATCH (PR found or daemon-created) or
-        returns after a state transition to PAUSED, ERROR, or HUNG via
+        returns after a state transition to PAUSED, ERROR, or IDLE via
         the appropriate primitive (``_transition_to_error``,
         ``_diagnose_exit_zero_no_pr``). The expected-branch marker is
         cleaned up in ``handle_coding``'s ``finally`` block so every
@@ -669,13 +669,13 @@ class CodingMixin:
         """Resolve the "coder exited 0 but no PR" outcome by branch state.
 
         Distinguishes three cases the runner used to collapse into a single
-        HUNG transition: (A) coder did nothing — neither a local branch nor
-        an upstream ref exists; (B) coder created the branch locally but
+        escalation transition: (A) coder did nothing — neither a local branch
+        nor an upstream ref exists; (B) coder created the branch locally but
         never pushed; (C) coder pushed a branch but failed to open the PR.
-        Cases A and B route to HUNG because we cannot trust the local tree
+        Cases A and B skip back to IDLE because we cannot trust the local tree
         or push outcome without inspection. Case C is auto-recoverable —
         the daemon issues ``gh pr create`` itself and hands off to WATCH on
-        success, falling back to HUNG when PR creation fails.
+        success, falling back to IDLE when PR creation fails.
 
         ``pause_for_stop_if_requested`` is rechecked before any state-changing
         side effect (PR creation, sleep between visibility retries, final
@@ -688,7 +688,7 @@ class CodingMixin:
 
         # ``_remote_branch_exists`` can block up to its 30s timeout; a stop
         # pressed during that window must still be honored before either A/B
-        # routes to HUNG or C proceeds to PR creation, otherwise the user's
+        # skips to IDLE or C proceeds to PR creation, otherwise the user's
         # stop is silently overridden by an unwanted state transition.
         if await pause_for_stop_if_requested():
             return
@@ -711,7 +711,7 @@ class CodingMixin:
                     f"{ctx.mismatch_reason} ({ctx.log_summary()})"
                 )
                 await self._save_current_run_record("error")
-                await self._escalate_to_hung(
+                await self._escalate_and_skip(
                     message,
                     apply_escalated_label=False,
                     set_pr_escalated_flag=False,
@@ -729,7 +729,7 @@ class CodingMixin:
                     f"no push — escalating ({ctx.log_summary()})"
                 )
             await self._save_current_run_record("error")
-            await self._escalate_to_hung(
+            await self._escalate_and_skip(
                 message,
                 apply_escalated_label=False,
                 set_pr_escalated_flag=False,
@@ -827,7 +827,7 @@ class CodingMixin:
                     f"{target_branch!r}"
                 )
                 await self._save_current_run_record("error")
-                await self._escalate_to_hung(
+                await self._escalate_and_skip(
                     message,
                     apply_escalated_label=False,
                     set_pr_escalated_flag=False,
@@ -863,8 +863,8 @@ class CodingMixin:
         already open (often because the earlier list lagged GitHub PR
         visibility); that case is treated as success so the caller's
         post-create visibility loop can pick up the existing PR rather than
-        parking the runner as HUNG. On any other failure the runner is
-        transitioned to HUNG with the gh error and the run record saved,
+        skipping the task. On any other failure the runner is
+        transitioned to IDLE with the gh error and the run record saved,
         matching the ESCALATE-style handling the diagnostic uses for cases
         A and B — a failed creation is not silently retried.
         """
@@ -922,7 +922,7 @@ class CodingMixin:
                 f"{target_branch!r}: {exc}"
             )
             await self._save_current_run_record("error")
-            await self._escalate_to_hung(
+            await self._escalate_and_skip(
                 message,
                 apply_escalated_label=False,
                 set_pr_escalated_flag=False,

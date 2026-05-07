@@ -117,7 +117,7 @@ _HISTORY_LIMIT = 100
 _STOP_POLL_INTERVAL_SEC = 0.5
 _IDLE_STREAK_CAP = 100
 
-# Sentinel for ``_escalate_to_hung``'s ``error_message_override``: when
+# Sentinel for ``_escalate_and_skip``'s ``error_message_override``: when
 # the caller passes the sentinel (the default), ``error_message`` is set
 # to ``message``. ``None`` and any string value override that default.
 _USE_MESSAGE_AS_ERROR: object = object()
@@ -1091,15 +1091,13 @@ class PipelineRunner(
         if publish:
             await self.publish_state()
 
-    # All escalation transitions to HUNG must use this primitive after
-    # PR-220 ships. Direct writes to ``state.state = PipelineState.HUNG``
-    # are reserved for legitimate non-escalation HUNG transitions
-    # (e.g. operator-initiated stop, review timeout fall-through).
-    async def _escalate_to_hung(
+    # All daemon escalation-and-skip transitions must use this primitive so
+    # the queue can continue while the PR keeps its durable escalation signal.
+    async def _escalate_and_skip(
         self,
         message: str,
         *,
-        target_state: PipelineState = PipelineState.HUNG,
+        target_state: PipelineState = PipelineState.IDLE,
         error_message_override: str | None | object = _USE_MESSAGE_AS_ERROR,
         apply_escalated_label: bool = True,
         label_create_log_prefix: str = "escalate",
@@ -1109,7 +1107,7 @@ class PipelineRunner(
     ) -> bool:
         """Escalate the active PR with consistent telemetry.
 
-        By default sets state=HUNG, applies the ``escalated`` label on
+        By default sets state=IDLE, applies the ``escalated`` label on
         the current PR via ``_ensure_escalated_label`` (FixMixin),
         marks ``PRInfo.is_escalated=True``, logs an ``[ESCALATE]``
         event and publishes state.
@@ -1126,18 +1124,14 @@ class PipelineRunner(
                 payload. Callers that need a different log body pass
                 ``log_message``; callers that need to clear or replace
                 ``error_message`` pass ``error_message_override``.
-            target_state: Final state. Default ``HUNG``. ``IDLE`` is
-                used by ``_escalate_fix_iteration_cap`` and
-                ``_escalate_fix_coder_initiated`` on the success path
-                where the GitHub ``escalated`` label is the durable
-                parking signal. ``ERROR`` may also be passed when the
-                escalation should also act as a durable parking error.
+            target_state: Final state. Default ``IDLE``. ``ERROR`` may be
+                passed when the escalation should also act as a durable
+                parking error.
             error_message_override: Sentinel default uses ``message``.
-                Pass ``None`` to clear ``state.error_message`` (e.g.
-                ``_escalate_fix_no_push_deadlock`` clears it because
-                HUNG itself is the parking signal). Pass a string to
-                replace it (e.g. ``_escalate_fix_coder_initiated``
-                expands the failure context when label-apply fails).
+                Pass ``None`` to clear ``state.error_message``. Pass a
+                string to replace it (e.g.
+                ``_escalate_fix_coder_initiated`` expands the failure
+                context when label-apply fails).
             apply_escalated_label: When True, calls
                 ``_ensure_escalated_label`` so the GitHub label is
                 created (idempotent) and applied to the PR. Default
@@ -1184,6 +1178,24 @@ class PipelineRunner(
 
         if set_pr_escalated_flag and pr is not None:
             pr.is_escalated = True
+
+        prior_state = self.state.state
+        current_task = self.state.current_task
+        if current_task is not None:
+            await safe_record_cancellation_cause(
+                self.redis,
+                self.name,
+                current_task.pr_id,
+                CancellationCause(
+                    category="ESCALATE",
+                    payload={
+                        "subsource": "daemon",
+                        "reason_text": message,
+                        "previous_state": prior_state.value,
+                    },
+                ),
+                log=self.log_event,
+            )
 
         self.state.state = target_state
         if error_message_override is _USE_MESSAGE_AS_ERROR:

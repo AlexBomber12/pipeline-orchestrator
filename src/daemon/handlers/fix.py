@@ -101,7 +101,7 @@ class FixMixin(BreachMixin):
     ) -> bool:
         """Thin wrapper over ``fix_escalation.ensure_escalated_label``.
 
-        Kept as a method because ``runner._escalate_to_hung`` calls it via
+        Kept as a method because ``runner._escalate_and_skip`` calls it via
         ``self._ensure_escalated_label(...)`` and existing tests still
         invoke ``runner._ensure_escalated_label(...)`` directly.
         """
