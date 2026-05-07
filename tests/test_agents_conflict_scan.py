@@ -775,7 +775,7 @@ def test_scan_flags_ships_in_phrasing():
 
 
 def test_scan_flags_belongs_to_phrasing():
-    body = "This task belongs to other-repo."
+    body = "This task belongs to other-repo repository."
     violations = scan_for_conflicts(body)
     assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
 
@@ -800,6 +800,24 @@ def test_scan_flags_targets_owner_repo_phrasing():
 
 def test_scan_does_not_flag_plain_targets_prose():
     body = "This PR targets Python 3.12."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
+def test_scan_does_not_flag_plain_deploys_to_production_prose():
+    body = "The service deploys to production after the unit job passes."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
+def test_scan_does_not_flag_plain_lives_in_path_prose():
+    body = "The module lives in src/mcp/scans.py."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
+def test_scan_does_not_flag_plain_belongs_to_prose():
+    body = "This behavior belongs to the validation layer."
     violations = scan_for_conflicts(body)
     assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
 
@@ -835,13 +853,13 @@ def test_scan_flags_gh_repo_create_inside_double_quotes():
 
 
 def test_scan_flags_ships_in_inside_double_quotes():
-    body = 'Test: body contains "ships in foo-repo" and current=bar.'
+    body = 'Test: body contains "ships in foo-repo repository" and current=bar.'
     violations = scan_for_conflicts(body)
     assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
 
 
 def test_scan_flags_belongs_to_inside_quotes():
-    body = 'Fixture: "belongs to other-repo" string.'
+    body = 'Fixture: "belongs to other-repo repository" string.'
     violations = scan_for_conflicts(body)
     assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
 
@@ -865,8 +883,8 @@ Add patterns named `cross_repo_repo_create`, `cross_repo_repo_delete`,
 and `cross_repo_ships_in`.
 
 Task body containing `gh repo create` triggers the rule.
-Test fixture: body contains `ships in foo-repo` and current_repo_name="bar".
-Fixture: `belongs to other-repo` string.
+Test fixture: body contains `ships in foo-repo repository` and current_repo_name="bar".
+Fixture: `belongs to other-repo repository` string.
 """
     violations = scan_for_conflicts(body)
     cross_repo_types = [
