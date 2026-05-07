@@ -15,7 +15,7 @@ daemon:
   claude_model: opus
   fix_idle_timeout_sec: 1800
   # PR-231: Operator-confirmed production cap on FIX iterations.
-  fix_iteration_cap: 15
+  fix_iteration_cap: 25
   fix_no_push_cap: 3
   fix_poll_interval_sec: 30
   coder_terminate_grace_sec: 5

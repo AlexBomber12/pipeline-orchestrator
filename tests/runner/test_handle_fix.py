@@ -289,6 +289,7 @@ def test_handle_fix_escalates_at_iteration_cap_before_next_spawn(
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     runner = h._make_runner()
+    cap = runner.app_config.daemon.fix_iteration_cap
     runner._get_coder = lambda allow_exploration=False: (  # type: ignore[method-assign]
         "claude",
         _UnexpectedPlugin(),
@@ -297,9 +298,8 @@ def test_handle_fix_escalates_at_iteration_cap_before_next_spawn(
     runner.state.current_pr = PRInfo(
         number=77,
         branch="pr-077",
-        fix_iteration_count=15,
+        fix_iteration_count=cap,
     )
-    runner._app_config = h._app_cfg(fix_iteration_cap=15)
 
     asyncio.run(runner.handle_fix())
 
@@ -310,7 +310,7 @@ def test_handle_fix_escalates_at_iteration_cap_before_next_spawn(
         (
             runner.owner_repo,
             77,
-            "@AlexBomber12 FIX iteration cap reached (15/15). Escalating for manual review.",
+            f"@AlexBomber12 FIX iteration cap reached ({cap}/{cap}). Escalating for manual review.",
         )
     ]
     assert gh_calls == [
@@ -326,7 +326,8 @@ def test_handle_fix_escalates_at_iteration_cap_before_next_spawn(
         ["pr", "edit", "77", "--add-label", "escalated"],
     ]
     assert any(
-        entry["event"] == "[ESCALATE] FIX cap reached (15/15) on PR #77: escalated, moving to IDLE."
+        entry["event"]
+        == f"[ESCALATE] FIX cap reached ({cap}/{cap}) on PR #77: escalated, moving to IDLE."
         for entry in runner.state.history
     )
 
@@ -730,7 +731,7 @@ def test_handle_fix_no_push_counter_independent_of_fix_iteration_count(
     posted = h._patch_no_push_fix(monkeypatch, head_seq=lambda: "abc123")
 
     runner = h._make_runner()
-    runner._app_config = h._app_cfg(fix_iteration_cap=15, fix_no_push_cap=3)
+    runner._app_config = h._app_cfg(fix_no_push_cap=3)
     runner.state.state = PipelineState.WATCH
     # fix_iteration_count=2 reflects two prior productive cycles; the no-push
     # counter advances orthogonally and trips cancellation without touching

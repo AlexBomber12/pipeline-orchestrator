@@ -122,7 +122,7 @@ class DaemonConfig(BaseModel):
     error_handler_use_ai: bool = True
     claude_model: str = "opus"
     fix_idle_timeout_sec: int = Field(default=1800, ge=1)
-    fix_iteration_cap: int = Field(default=15, ge=1)
+    fix_iteration_cap: int = Field(default=25, ge=1)
     fix_no_push_cap: int = Field(default=3, ge=1)
     fix_poll_interval_sec: int = Field(default=30, ge=1)
     coder_terminate_grace_sec: int = Field(default=5, ge=1)

@@ -486,7 +486,7 @@ def test_update_daemon_config_does_not_persist_env_override(
 
     monkeypatch.delenv("PO_FIX_ITERATION_CAP")
     reloaded = load_config(str(path))
-    assert reloaded.daemon.fix_iteration_cap == 15
+    assert reloaded.daemon.fix_iteration_cap == 25
 
 
 def test_daemon_config_rejects_exploration_epsilon_out_of_range() -> None:
@@ -560,7 +560,7 @@ def test_fix_idle_timeout_default() -> None:
 def test_fix_iteration_cap_default() -> None:
     from src.config import DaemonConfig
 
-    assert DaemonConfig().fix_iteration_cap == 15
+    assert DaemonConfig().fix_iteration_cap == 25
 
 
 def test_fix_review_timeout_removed() -> None:
@@ -927,7 +927,7 @@ def test_load_config_no_overlay_uses_base(tmp_path: Path) -> None:
 
     assert cfg.daemon.poll_interval_sec == 45
     # Defaults remain intact for fields the base does not pin.
-    assert cfg.daemon.fix_iteration_cap == 15
+    assert cfg.daemon.fix_iteration_cap == 25
 
 
 def test_load_config_overlay_merges_over_base(
@@ -1312,7 +1312,7 @@ def test_committed_config_yml_uses_production_defaults() -> None:
 
     assert cfg.daemon.review_timeout_min == 20
     assert cfg.daemon.planned_pr_timeout_sec == 3600
-    assert cfg.daemon.fix_iteration_cap == 15
+    assert cfg.daemon.fix_iteration_cap == 25
     assert cfg.daemon.usage_api_beta_header == "oauth-2025-04-20"
     assert cfg.daemon.rate_limit_session_pause_percent == 95
     assert cfg.daemon.rate_limit_weekly_pause_percent == 100
