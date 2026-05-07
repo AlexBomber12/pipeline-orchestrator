@@ -95,6 +95,7 @@ _CROSS_REPO_DOUBLE_NEGATIVE_INVERTER = re.compile(
 )
 _CROSS_REPO_CLAUSE_BOUNDARIES = ".,;!?:\n"
 _CROSS_REPO_EXCERPT_LIMIT = 120
+_CROSS_REPO_PLACEHOLDER_NAMES = {"this", "current", "same"}
 
 
 @dataclass(frozen=True)
@@ -127,7 +128,10 @@ def detect_cross_repo_intent(
                 continue
             if repo_group is not None:
                 referenced = _normalize_repo_name(match.group(repo_group))
-                if referenced == current:
+                if (
+                    referenced == current
+                    or referenced in _CROSS_REPO_PLACEHOLDER_NAMES
+                ):
                     continue
             return _cross_repo_excerpt(task_body, match.start(), match.end())
     return None

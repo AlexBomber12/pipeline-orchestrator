@@ -135,6 +135,23 @@ def test_detect_cross_repo_intent_in_repo_phrasing() -> None:
     assert "in the homelab-monitoring repository" in result
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Keep the dashboard work in this repo.",
+        "Keep the dashboard work in this repository.",
+        "Keep the dashboard work in the current repo.",
+        "Keep the dashboard work in the current repository.",
+        "Keep the dashboard work in the same repo.",
+        "Keep the dashboard work in the same repository.",
+    ],
+)
+def test_detect_cross_repo_intent_placeholder_repo_names_return_none(
+    body: str,
+) -> None:
+    assert detect_cross_repo_intent(body, "megaraid-dashboard") is None
+
+
 def test_detect_cross_repo_intent_owner_prefixed_form() -> None:
     result = detect_cross_repo_intent(
         "This PR ships in alexbomber12/homelab-monitoring.",
