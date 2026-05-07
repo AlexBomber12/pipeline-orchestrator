@@ -834,6 +834,13 @@ def test_no_match_in_multi_backtick_inline_code():
     assert "cross_repo_repo_create_command" not in types
 
 
+def test_escaped_backtick_does_not_suppress_cross_repo_command():
+    body = r"Run \`gh repo create owner/repo now"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "cross_repo_repo_create_command" in types
+
+
 def test_no_match_negated_via_is_negated_helper():
     body = "Coders must not run gh repo create owner/repo"
     violations = scan_for_conflicts(body)

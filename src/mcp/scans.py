@@ -164,6 +164,13 @@ def _is_inside_inline_code(text: str, match_start: int) -> bool:
     line_prefix = text[line_start:match_start]
     open_delimiter_len: int | None = None
     for delimiter in re.finditer(r"`+", line_prefix):
+        backslash_count = 0
+        cursor = delimiter.start() - 1
+        while cursor >= 0 and line_prefix[cursor] == "\\":
+            backslash_count += 1
+            cursor -= 1
+        if backslash_count % 2 == 1:
+            continue
         delimiter_len = len(delimiter.group(0))
         if open_delimiter_len is None:
             open_delimiter_len = delimiter_len
