@@ -7,6 +7,7 @@ case below; the clean-spec case anchors the false-positive direction.
 from __future__ import annotations
 
 from src.mcp.scans import (
+    _has_conditional_can_negation_before_cross_repo_command,
     _is_inside_fenced_code,
     _is_inside_inline_code,
     scan_for_conflicts,
@@ -880,6 +881,18 @@ def test_scan_flags_cannot_conditional_gh_repo_delete():
     assert [v.violation_type for v in violations] == ["cross_repo_repo_delete"]
 
 
+def test_scan_flags_cannot_conditional_execute_gh_repo_create():
+    body = "If the repo cannot be found execute gh repo create AlexBomber12/foo."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
+
+
+def test_scan_does_not_flag_nearer_do_not_in_conditional_gh_repo_create():
+    body = "When repo cannot be found do not run gh repo create AlexBomber12/foo."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
 def test_scan_does_not_flag_cannot_run_gh_repo_create():
     body = "Coders cannot run gh repo create from dispatched tasks."
     violations = scan_for_conflicts(body)
@@ -970,6 +983,17 @@ def test_fenced_code_detector_returns_false_after_closed_fence():
 def test_fenced_code_detector_ignores_malformed_closing_fence_suffix():
     body = "```\ninside\n```not-close\noutside\n"
     assert _is_inside_fenced_code(body, body.index("outside")) is True
+
+
+def test_conditional_can_negation_helper_returns_false_without_negation():
+    body = "If repo exists run gh repo create AlexBomber12/foo."
+    assert (
+        _has_conditional_can_negation_before_cross_repo_command(
+            body,
+            body.index("gh repo create"),
+        )
+        is False
+    )
 
 
 def test_scan_does_not_flag_ships_in_inside_double_backticks():

@@ -166,22 +166,25 @@ def _has_conditional_can_negation_before_cross_repo_command(
     """Return True when ``can't`` negates a condition, not the command."""
     clause_start = max(text.rfind(c, 0, match_start) for c in _CLAUSE_BOUNDARIES)
     clause_start = clause_start + 1 if clause_start >= 0 else 0
-    negations = list(
-        re.finditer(
-            r"\b(?:cannot|can not|can't|can’t)\b",
-            text[clause_start:match_start],
-            re.IGNORECASE,
-        )
-    )
+    clause_prefix = text[clause_start:match_start]
+    negations = list(_NEGATION_CONTEXT.finditer(clause_prefix))
     if not negations:
         return False
     nearest = negations[-1]
+    if not re.fullmatch(
+        r"(?:cannot|can not|can't|can’t)",
+        nearest.group(0),
+        re.IGNORECASE,
+    ):
+        return False
     prefix = text[clause_start : clause_start + nearest.start()]
     if not re.search(r"\b(?:if|when|unless)\b", prefix, re.IGNORECASE):
         return False
     negation_end = clause_start + nearest.end()
     between = text[negation_end:match_start]
-    return bool(re.search(r"\S.+\brun\s+$", between, re.IGNORECASE))
+    return bool(
+        re.search(r"\S.+\b(?:run|execute|invoke|use)\s+$", between, re.IGNORECASE)
+    )
 
 
 _INLINE_CODE_SUPPRESSION_CATEGORIES = {
