@@ -195,7 +195,7 @@ def _is_inside_inline_code(text: str, match_start: int) -> bool:
         closing_pattern = re.compile(rf"(?<!`)`{{{delimiter_len}}}(?!`)")
         closer = closing_pattern.search(line, opening_end)
         if closer is None:
-            return opening_end <= relative_match_start
+            return False
         closing_start = closer.start()
         closing_end = closer.end()
         if opening_end <= relative_match_start < closing_start:
@@ -210,7 +210,7 @@ def _is_inside_fenced_code(text: str, match_start: int) -> bool:
     fence_char = ""
     fence_len = 0
     line_start = 0
-    fence_pattern = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+    fence_pattern = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})(.*)$")
     while line_start < match_start:
         line_end = text.find("\n", line_start)
         if line_end == -1 or line_end > match_start:
@@ -219,11 +219,16 @@ def _is_inside_fenced_code(text: str, match_start: int) -> bool:
         fence = fence_pattern.match(line)
         if fence:
             marker = fence.group(1)
+            suffix = fence.group(2)
             if not in_fence:
                 in_fence = True
                 fence_char = marker[0]
                 fence_len = len(marker)
-            elif marker[0] == fence_char and len(marker) >= fence_len:
+            elif (
+                marker[0] == fence_char
+                and len(marker) >= fence_len
+                and suffix.strip() == ""
+            ):
                 in_fence = False
                 fence_char = ""
                 fence_len = 0

@@ -898,10 +898,10 @@ def test_scan_does_not_flag_gh_repo_create_inside_double_backticks():
     assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
 
 
-def test_scan_does_not_flag_gh_repo_create_after_unclosed_backtick():
+def test_scan_flags_gh_repo_create_after_unclosed_backtick():
     body = "Example: `gh repo create AlexBomber12/foo"
     violations = scan_for_conflicts(body)
-    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
 
 
 def test_scan_flags_gh_repo_create_after_closed_backtick_span():
@@ -917,6 +917,11 @@ def test_inline_code_detector_returns_false_for_empty_line():
 def test_fenced_code_detector_returns_false_after_closed_fence():
     body = "```bash\ngh repo create AlexBomber12/foo\n```\noutside\n"
     assert _is_inside_fenced_code(body, body.index("outside")) is False
+
+
+def test_fenced_code_detector_ignores_malformed_closing_fence_suffix():
+    body = "```\ninside\n```not-close\noutside\n"
+    assert _is_inside_fenced_code(body, body.index("outside")) is True
 
 
 def test_scan_does_not_flag_ships_in_inside_double_backticks():
