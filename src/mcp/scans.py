@@ -195,6 +195,10 @@ _FENCED_CODE_SUPPRESSION_CATEGORIES = {
     "cross_repo_ships_in",
 }
 
+_DOUBLE_QUOTE_SUPPRESSION_CATEGORIES = {
+    "cross_repo_ships_in",
+}
+
 
 def _is_inside_inline_code(text: str, match_start: int) -> bool:
     """Return True when ``match_start`` is in inline code.
@@ -528,7 +532,7 @@ def scan_for_conflicts(task_spec_body: str) -> list[ConflictViolation]:
             ):
                 continue
             if (
-                vtype in _INLINE_CODE_SUPPRESSION_CATEGORIES
+                vtype in _DOUBLE_QUOTE_SUPPRESSION_CATEGORIES
                 and _is_inside_double_quoted_span(normalized, match.start())
             ):
                 continue

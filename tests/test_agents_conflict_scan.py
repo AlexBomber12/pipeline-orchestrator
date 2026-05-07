@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from src.mcp.scans import (
     _has_conditional_can_negation_before_cross_repo_command,
+    _is_inside_double_quoted_span,
     _is_inside_fenced_code,
     _is_inside_inline_code,
     scan_for_conflicts,
@@ -1020,6 +1021,16 @@ def test_conditional_can_negation_helper_returns_false_without_negation():
     )
 
 
+def test_double_quote_detector_ignores_escaped_quotes():
+    body = r"not \"quoted gh repo create AlexBomber12/foo"
+    assert _is_inside_double_quoted_span(body, body.index("gh repo create")) is False
+
+
+def test_double_quote_detector_returns_false_after_closed_span():
+    body = '"literal example" then ships in foo repo.'
+    assert _is_inside_double_quoted_span(body, body.index("ships in")) is False
+
+
 def test_scan_does_not_flag_ships_in_inside_double_backticks():
     body = "Use ``ships in foo-repo repository`` as a literal example."
     violations = scan_for_conflicts(body)
@@ -1070,10 +1081,16 @@ This PR ships in foo-repo repository.
     assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
 
 
-def test_scan_does_not_flag_gh_repo_create_inside_double_quotes():
+def test_scan_flags_gh_repo_create_inside_double_quotes():
     body = 'Run "gh repo create AlexBomber12/foo" during bootstrap.'
     violations = scan_for_conflicts(body)
-    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
+
+
+def test_scan_flags_gh_repo_delete_inside_double_quotes():
+    body = 'Run "gh repo delete AlexBomber12/foo" during cleanup.'
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_delete"]
 
 
 def test_scan_flags_gh_repo_create_after_closed_double_quotes():
