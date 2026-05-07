@@ -97,7 +97,6 @@ _CROSS_REPO_CLAUSE_BOUNDARIES = ".,;!?:\n"
 _CROSS_REPO_EXCERPT_LIMIT = 120
 _CROSS_REPO_PLACEHOLDER_NAMES = {"this", "current", "same"}
 _CROSS_REPO_PR_ID_TOKEN = re.compile(r"^pr-\d+$", re.IGNORECASE)
-_CROSS_REPO_REPO_MARKERS = re.compile(r"[-./_]")
 
 
 @dataclass(frozen=True)
@@ -161,9 +160,7 @@ def _is_same_repo_reference(
 
 
 def _looks_like_repo_reference(repo_name: str) -> bool:
-    if _CROSS_REPO_PR_ID_TOKEN.fullmatch(repo_name):
-        return False
-    return bool(_CROSS_REPO_REPO_MARKERS.search(repo_name))
+    return not _CROSS_REPO_PR_ID_TOKEN.fullmatch(repo_name)
 
 
 def _is_cross_repo_intent_negated(text: str, match_start: int) -> bool:

@@ -105,6 +105,16 @@ def test_detect_cross_repo_intent_owner_prefixed_same_basename_flags() -> None:
     assert "other-org/pipeline-orchestrator" in result
 
 
+def test_detect_cross_repo_intent_single_token_repo_name() -> None:
+    result = detect_cross_repo_intent(
+        "This PR ships in homelab.",
+        "megaraid-dashboard",
+    )
+
+    assert result is not None
+    assert "homelab" in result
+
+
 def test_detect_cross_repo_intent_dotted_same_repo_returns_none() -> None:
     assert (
         detect_cross_repo_intent(

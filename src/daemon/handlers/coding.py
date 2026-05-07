@@ -114,8 +114,8 @@ def _remote_branch_exists(repo_path: str, branch: str) -> bool:
 class CodingMixin:
     """Run ``PLANNED PR`` via the active coder CLI and hand off to WATCH."""
 
-    def _bare_repo_name(self) -> str:
-        return self.name.split("__", 1)[-1]
+    def _repo_identity(self) -> str:
+        return self.name.replace("__", "/", 1)
 
     async def handle_coding(self) -> None:
         """Run ``PLANNED PR`` via the active coder CLI and hand off to WATCH.
@@ -223,7 +223,7 @@ class CodingMixin:
             return
 
         intent_violation = detect_cross_repo_intent(
-            task_body, self._bare_repo_name()
+            task_body, self._repo_identity()
         )
         if intent_violation is not None:
             await self._transition_to_error(
