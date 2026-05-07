@@ -280,7 +280,7 @@ async def _repo_template_context(
     """Return template context for repo detail renders."""
     if config_path is None:
         config_path = _app.CONFIG_PATH
-    config = load_config(config_path)
+    config = await asyncio.to_thread(load_config, config_path)
     state = await _app.get_repo_state(name, redis_client, config_path)
     repo_config = _find_repo_config_by_name(config, name)
     effective_coder = _effective_coder_name(repo_config, config)

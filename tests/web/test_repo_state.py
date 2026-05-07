@@ -9,6 +9,21 @@ import pytest
 
 
 @pytest.mark.asyncio
+async def test_get_repo_state_invokes_load_config_via_to_thread(monkeypatch):
+    from src.web.services import repo_state as rs
+
+    fake_cfg = MagicMock()
+    fake_cfg.repositories = [MagicMock(url="https://github.com/AlexBomber12/example.git")]
+    to_thread = AsyncMock(return_value=fake_cfg)
+    monkeypatch.setattr(rs.asyncio, "to_thread", to_thread)
+
+    await rs.get_repo_state("AlexBomber12__example", redis_client=None)
+
+    to_thread.assert_awaited_once()
+    assert to_thread.await_args.args[0] is rs.load_config
+
+
+@pytest.mark.asyncio
 async def test_load_current_queue_returns_none_without_redis(monkeypatch):
     from src.web import app as web_app
     from src.web.services import repo_state as rs

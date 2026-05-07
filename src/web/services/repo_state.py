@@ -84,7 +84,7 @@ async def get_repo_state(
         from src.web import app as _app
 
         config_path = _app.CONFIG_PATH
-    cfg = load_config(config_path)
+    cfg = await asyncio.to_thread(load_config, config_path)
     url = ""
     found = False
     for repo in cfg.repositories:
