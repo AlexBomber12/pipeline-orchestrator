@@ -886,6 +886,12 @@ def test_scan_does_not_flag_cannot_run_gh_repo_create():
     assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
 
 
+def test_scan_does_not_flag_cannot_directly_run_gh_repo_create():
+    body = "Coders cannot directly run gh repo create from dispatched tasks."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
 def test_scan_does_not_flag_negated_ships_in():
     body = "This task does not ship in another repo."
     violations = scan_for_conflicts(body)

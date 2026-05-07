@@ -176,6 +176,9 @@ def _has_conditional_can_negation_before_cross_repo_command(
     if not negations:
         return False
     nearest = negations[-1]
+    prefix = text[clause_start : clause_start + nearest.start()]
+    if not re.search(r"\b(?:if|when|unless)\b", prefix, re.IGNORECASE):
+        return False
     negation_end = clause_start + nearest.end()
     between = text[negation_end:match_start]
     return bool(re.search(r"\S.+\brun\s+$", between, re.IGNORECASE))
