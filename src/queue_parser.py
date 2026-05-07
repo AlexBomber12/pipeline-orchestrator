@@ -28,7 +28,7 @@ _TASK_HEADER_RE = re.compile(r"^#\s+(PR-[A-Za-z0-9_.-]+):\s*(.+?)\s*$")
 _PR_ID_RE = re.compile(r"^PR-[A-Za-z0-9_.-]+$")
 _FIELD_RE = re.compile(r"^-\s*([A-Za-z ]+?)\s*:\s*(.*?)\s*$")
 _TASK_BRANCH_RE = re.compile(r"^Branch\s*:\s*(.*?)\s*$")
-_FRONTMATTER_STATUS_RE = re.compile(r"^status:\s*(\S+)\s*$")
+_FRONTMATTER_STATUS_RE = re.compile(r"^status:\s*(.+?)\s*$")
 _STATUS_LINE_RE = re.compile(
     r"^(-\s*status\s*:\s*)(\S*)(.*)$", re.IGNORECASE
 )
@@ -64,7 +64,20 @@ _CODER_VALUES = {"claude", "codex", "any"}
 
 
 def _normalize_frontmatter_status(value: str) -> str:
-    status = value.lower()
+    quote: str | None = None
+    for index, char in enumerate(value):
+        if char in {"'", '"'}:
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+        elif char == "#" and quote is None and (
+            index == 0 or value[index - 1].isspace()
+        ):
+            value = value[:index]
+            break
+
+    status = value.strip().lower()
     if len(status) >= 2 and status[0] == status[-1] and status[0] in {"'", '"'}:
         return status[1:-1]
     return status
