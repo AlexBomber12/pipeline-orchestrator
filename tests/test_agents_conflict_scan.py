@@ -966,22 +966,22 @@ def test_scan_does_not_flag_curly_contracted_negated_ships_in():
     assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
 
 
-def test_scan_does_not_flag_gh_repo_create_inside_backticks():
+def test_scan_flags_gh_repo_create_inside_backticks():
     body = "`gh repo create` is the command we block."
     violations = scan_for_conflicts(body)
-    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
 
 
-def test_scan_does_not_flag_gh_repo_create_inside_double_backticks():
+def test_scan_flags_gh_repo_create_inside_double_backticks():
     body = "``gh repo create`` is the command we block."
     violations = scan_for_conflicts(body)
-    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
 
 
-def test_scan_does_not_flag_gh_repo_create_inside_code_span_ending_backslash():
+def test_scan_flags_gh_repo_create_inside_code_span_ending_backslash():
     body = r"`gh repo create AlexBomber12/foo \\` is a literal example."
     violations = scan_for_conflicts(body)
-    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
 
 
 def test_scan_flags_gh_repo_create_inside_escaped_backticks():
@@ -1004,6 +1004,16 @@ def test_scan_flags_gh_repo_create_after_closed_backtick_span():
 
 def test_inline_code_detector_returns_false_for_empty_line():
     assert _is_inside_inline_code("", 0) is False
+
+
+def test_inline_code_detector_returns_false_for_unclosed_span():
+    body = "`literal example"
+    assert _is_inside_inline_code(body, body.index("literal")) is False
+
+
+def test_inline_code_detector_returns_false_after_closed_span():
+    body = "`literal example` outside"
+    assert _is_inside_inline_code(body, body.index("outside")) is False
 
 
 def test_fenced_code_detector_returns_false_after_closed_fence():
@@ -1123,7 +1133,7 @@ def test_scan_does_flag_gh_repo_create_outside_backticks():
     assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
 
 
-def test_scan_does_not_flag_pr_275_spec_itself():
+def test_scan_flags_pr_275_spec_backticked_repo_create_commands():
     body = """# PR-275: MCP cross-repo intent detection
 
 ## Problem
@@ -1145,4 +1155,7 @@ Fixture: `belongs to other-repo repository` string.
         for v in violations
         if v.violation_type.startswith("cross_repo_")
     ]
-    assert cross_repo_types == []
+    assert cross_repo_types == [
+        "cross_repo_repo_create",
+        "cross_repo_repo_create",
+    ]

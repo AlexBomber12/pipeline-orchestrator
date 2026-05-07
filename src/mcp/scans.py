@@ -192,8 +192,6 @@ def _has_conditional_can_negation_before_cross_repo_command(
 
 
 _INLINE_CODE_SUPPRESSION_CATEGORIES = {
-    "cross_repo_repo_create",
-    "cross_repo_repo_delete",
     "cross_repo_ships_in",
 }
 
