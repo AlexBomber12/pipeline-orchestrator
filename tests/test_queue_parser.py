@@ -205,9 +205,19 @@ def test_detect_cross_repo_intent_gh_repo_create_always_flags() -> None:
     assert "gh repo create" in result
 
 
-def test_detect_cross_repo_intent_gh_repo_create_negated_prose_still_flags() -> None:
+def test_detect_cross_repo_intent_gh_repo_create_negated_prose_returns_none() -> None:
+    assert (
+        detect_cross_repo_intent(
+            "Do not run gh repo create something.",
+            "something",
+        )
+        is None
+    )
+
+
+def test_detect_cross_repo_intent_gh_repo_create_double_negative_still_flags() -> None:
     result = detect_cross_repo_intent(
-        "Do not run gh repo create something.",
+        "Do not forget to gh repo create something.",
         "something",
     )
 

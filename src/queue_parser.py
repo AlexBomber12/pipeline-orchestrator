@@ -137,6 +137,8 @@ def detect_cross_repo_intent(
                     or not _looks_like_repo_reference(referenced)
                 ):
                     continue
+            elif _is_cross_repo_intent_negated(task_body, match.start()):
+                continue
             return _cross_repo_excerpt(task_body, match.start(), match.end())
     return None
 
