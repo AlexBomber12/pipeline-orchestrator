@@ -167,6 +167,16 @@ def test_parse_task_header_with_in_progress_frontmatter(tmp_path: Path) -> None:
     assert header.frontmatter_status == "in_progress"
 
 
+@pytest.mark.parametrize("status", ['"merged"', "'merged'"])
+def test_parse_task_header_with_quoted_frontmatter_status(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    header = parse_task_header(_write_task_file(tmp_path, _frontmatter_task(status)))
+
+    assert header.frontmatter_status == "merged"
+
+
 def test_parse_task_header_with_long_frontmatter(tmp_path: Path) -> None:
     long_frontmatter = (
         "---\n"

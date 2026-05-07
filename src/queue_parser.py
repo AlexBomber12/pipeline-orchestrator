@@ -63,6 +63,13 @@ _COMPLEXITY_VALUES = {"low", "medium", "high"}
 _CODER_VALUES = {"claude", "codex", "any"}
 
 
+def _normalize_frontmatter_status(value: str) -> str:
+    status = value.lower()
+    if len(status) >= 2 and status[0] == status[-1] and status[0] in {"'", '"'}:
+        return status[1:-1]
+    return status
+
+
 @dataclass(frozen=True)
 class TaskHeader:
     pr_id: str
@@ -208,7 +215,9 @@ def parse_task_header(path: str | Path) -> TaskHeader:
             for raw_line in lines[first_content_index + 1 : frontmatter_end_index]:
                 status_match = _FRONTMATTER_STATUS_RE.match(raw_line.rstrip())
                 if status_match:
-                    frontmatter_status = status_match.group(1).lower()
+                    frontmatter_status = _normalize_frontmatter_status(
+                        status_match.group(1)
+                    )
 
     for raw_line in lines[header_start_index:]:
         line = raw_line.rstrip()
