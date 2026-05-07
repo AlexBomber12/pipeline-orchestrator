@@ -152,7 +152,8 @@ def _is_inside_fenced_code_block(text: str, match_start: int) -> bool:
             fence_open = (marker_char, marker_len)
             continue
         open_char, open_len = fence_open
-        if marker_char == open_char and marker_len >= open_len:
+        closes_fence = re.fullmatch(r"[ \t]{0,3}(?:`{3,}|~{3,})[ \t]*", line)
+        if closes_fence and marker_char == open_char and marker_len >= open_len:
             fence_open = None
     return fence_open is not None
 

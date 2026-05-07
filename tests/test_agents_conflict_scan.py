@@ -813,6 +813,13 @@ def test_no_match_in_tilde_fenced_code_block():
     assert "cross_repo_repo_create_command" not in types
 
 
+def test_no_match_after_invalid_closing_fence_syntax():
+    body = "Example:\n```bash\n```notclose\ngh repo create owner/foo\n```\n"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "cross_repo_repo_create_command" not in types
+
+
 def test_no_match_in_inline_backticks():
     body = "Use the `gh repo create owner/repo` form from a terminal"
     violations = scan_for_conflicts(body)
