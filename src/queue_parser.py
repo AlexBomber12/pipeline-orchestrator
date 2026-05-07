@@ -33,6 +33,9 @@ _STATUS_LINE_RE = re.compile(
     r"^(-\s*status\s*:\s*)(\S*)(.*)$", re.IGNORECASE
 )
 _FRONTMATTER_STATUS_VALUES = {
+    "todo",
+    "done",
+    "error",
     "queued",
     "in_progress",
     "in_review",
