@@ -898,6 +898,12 @@ def test_scan_does_not_flag_gh_repo_create_inside_double_backticks():
     assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
 
 
+def test_scan_flags_gh_repo_create_inside_escaped_backticks():
+    body = r"\`gh repo create AlexBomber12/foo\` remains visible prose."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
+
+
 def test_scan_flags_gh_repo_create_after_unclosed_backtick():
     body = "Example: `gh repo create AlexBomber12/foo"
     violations = scan_for_conflicts(body)

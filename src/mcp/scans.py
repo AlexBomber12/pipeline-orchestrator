@@ -185,14 +185,15 @@ def _is_inside_inline_code(text: str, match_start: int) -> bool:
     line = text[line_start:line_end]
     relative_match_start = match_start - line_start
     cursor = 0
+    opener_pattern = re.compile(r"(?<!\\)`+")
     while cursor < len(line):
-        opener = re.search(r"`+", line[cursor:])
+        opener = opener_pattern.search(line, cursor)
         if opener is None:
             return False
-        opening_start = cursor + opener.start()
-        opening_end = cursor + opener.end()
+        opening_start = opener.start()
+        opening_end = opener.end()
         delimiter_len = opening_end - opening_start
-        closing_pattern = re.compile(rf"(?<!`)`{{{delimiter_len}}}(?!`)")
+        closing_pattern = re.compile(rf"(?<![\\`])`{{{delimiter_len}}}(?!`)")
         closer = closing_pattern.search(line, opening_end)
         if closer is None:
             return False
