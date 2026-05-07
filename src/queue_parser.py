@@ -55,7 +55,7 @@ _CODER_VALUES = {"claude", "codex", "any"}
 _CROSS_REPO_PATTERNS: tuple[tuple[re.Pattern[str], int | None], ...] = (
     (
         re.compile(
-            r"\bships in `?((?:[\w.-]+/)?[\w.-]+)\b`?",
+            r"\bships? in `?((?:[\w.-]+/)?[\w.-]+)\b`?",
             re.IGNORECASE,
         ),
         1,

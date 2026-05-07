@@ -65,6 +65,16 @@ def test_detect_cross_repo_intent_ships_in_other_repo_returns_excerpt() -> None:
     assert "ships in homelab-monitoring" in result
 
 
+def test_detect_cross_repo_intent_ship_in_other_repo_returns_excerpt() -> None:
+    result = detect_cross_repo_intent(
+        "This PR should ship in homelab-monitoring with a narrow change.",
+        "megaraid-dashboard",
+    )
+
+    assert result is not None
+    assert "ship in homelab-monitoring" in result
+
+
 def test_detect_cross_repo_intent_ignores_pr_id_after_ships_in() -> None:
     assert (
         detect_cross_repo_intent(
@@ -207,12 +217,12 @@ def test_detect_cross_repo_intent_gh_repo_create_negated_prose_still_flags() -> 
 
 def test_detect_cross_repo_intent_double_negative_still_flags() -> None:
     result = detect_cross_repo_intent(
-        "Do not forget to mention this PR ships in homelab-monitoring.",
+        "Do not forget to mention this PR should ship in homelab-monitoring.",
         "megaraid-dashboard",
     )
 
     assert result is not None
-    assert "ships in homelab-monitoring" in result
+    assert "ship in homelab-monitoring" in result
 
 
 def test_detect_cross_repo_intent_gh_repo_delete_always_flags() -> None:
