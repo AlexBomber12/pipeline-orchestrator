@@ -1085,8 +1085,9 @@ async def api_cancellations(repo: str, request: Request) -> JSONResponse:
     config returns ``[]``, mirroring the redis-None short-circuit.
 
     Each entry carries a ``dependents_count`` field (PR-257) reflecting
-    the number of QUEUE.md tasks transitively blocked by the canceled
-    root, so clients can prioritize the highest-blast-radius cards.
+    the number of queue snapshot tasks transitively blocked by the
+    canceled root, so clients can prioritize the highest-blast-radius
+    cards.
     """
     if _find_repo_config_by_name(load_config(_app.CONFIG_PATH), repo) is None:
         return JSONResponse([])

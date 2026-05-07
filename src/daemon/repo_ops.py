@@ -179,31 +179,6 @@ class RepoOpsMixin:
         except OSError as exc:
             raise RuntimeError(f"sync_to_main OS error: {exc}") from exc
 
-    def _origin_queue_md_tracked(self) -> bool | None:
-        """Return ``True``/``False`` for tracked-on-origin, ``None`` on probe failure.
-
-        Tristate by design. A transient ``cat-file`` failure (timeout or
-        OSError) is genuinely indeterminate: collapsing it to ``False``
-        would let legacy repos that still track ``tasks/QUEUE.md`` look
-        post-untrack and dirty the worktree on every IDLE write. ``None``
-        lets the caller skip its write conservatively and self-heal on
-        the next cycle. A non-zero ``returncode`` (file genuinely absent
-        on origin) is a definitive ``False``.
-        """
-        branch = self.repo_config.branch
-        try:
-            result = git_ops._git(
-                self.repo_path,
-                "cat-file",
-                "-e",
-                f"origin/{branch}:tasks/QUEUE.md",
-                check=False,
-                timeout=10,
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            return None
-        return result.returncode == 0
-
     _DELETE_IF_UNCHANGED_LUA = """
 if redis.call("get", KEYS[1]) == ARGV[1] then
     return redis.call("del", KEYS[1])

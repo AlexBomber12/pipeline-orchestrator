@@ -250,12 +250,13 @@ async def compute_repo_dependents_count(
 ) -> dict[str, int]:
     """Return ``{canceled_task_id: dependents_count}`` for a repo.
 
-    Builds the repo's task graph from the queue snapshot (or QUEUE.md
-    fallback, see :func:`build_repo_task_nodes`), folding in
-    ``canceled_task_ids`` so cancellation causes recorded in Redis are
-    treated as canceled roots even when the queue has not yet caught
-    up, and runs the dependents-count helper. Empty result when the
-    queue is missing or has no tasks that depend on a canceled root.
+    Builds the repo's task graph from the queue snapshot, with no
+    fallback when the snapshot is unavailable; cancellation
+    dependents-count returns empty dict in that case. The helper folds
+    in ``canceled_task_ids`` so cancellation causes recorded in Redis
+    are treated as canceled roots even when the queue has not yet
+    caught up, then runs the dependents-count helper. Empty result when
+    the queue is missing or has no tasks that depend on a canceled root.
     """
     nodes = await build_repo_task_nodes(
         repos_dir,

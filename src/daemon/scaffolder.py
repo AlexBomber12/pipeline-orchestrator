@@ -50,10 +50,17 @@ This repository is managed by the pipeline-orchestrator daemon. The
 canonical rules for AI coders working here live in `AGENTS.md` at the
 repository root. Read it fully before generating code or opening PRs.
 
-When the daemon dispatches a PLANNED PR task, the active task file
-lives at `tasks/PR-XXX.md` and is identified by `tasks/QUEUE.md`,
-which is auto-generated from task headers and git state. Read the
-task file fully before starting; do not drift from its scope.
+The daemon invokes coders with the `AUTO PR` trigger and embeds the
+active task body inline in the prompt with `Task: PR-XXX` and
+`File: tasks/PR-XXX.md` headers. Coders working under daemon dispatch
+should follow the AUTO PR runbook in AGENTS.md and work strictly from
+the inline body without consulting `tasks/QUEUE.md` or other
+`tasks/PR-*.md` files.
+
+When invoked manually in an editor (PLANNED PR / MICRO PR / FIX FEEDBACK
+modes), follow the corresponding runbook in AGENTS.md. The active task
+file for manual workflows lives at `tasks/PR-XXX.md` and is identified
+via `tasks/QUEUE.md` for the manual PLANNED PR mode only.
 
 For new task spec generation, follow the schema in
 `docs/TASK_SCHEMA.md` from the orchestrator repo (or the canonical
@@ -540,8 +547,8 @@ def scaffold_repo(repo_path: str, branch: str) -> list[str]:
     to land on. A fresh clone leaves ``HEAD`` on the remote's default
     branch, which is not necessarily the configured base branch; without
     an explicit checkout the scaffolding commit can end up on the wrong
-    branch, leaving ``origin/{branch}`` without ``tasks/QUEUE.md`` and
-    later recovery/preflight logic reading stale state.
+    branch, leaving ``origin/{branch}`` without the expected scaffolded
+    files and later recovery/preflight logic reading stale state.
 
     Returns the list of relative paths created or edited. If any of
     those entries are trackable by git (i.e. not just empty
