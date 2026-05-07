@@ -337,3 +337,79 @@ def test_records_cause_before_state_transition(
         "reason_text": "review timeout",
         "previous_state": "WATCH",
     }
+
+
+def test_idle_escalation_clears_current_task_and_marks_recovered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """IDLE escalation abandons the task so IDLE selection cannot reattach it."""
+    _patch_label_calls(monkeypatch)
+    persist_calls: list[set[str]] = []
+
+    async def fake_persist() -> None:
+        persist_calls.append(set(runner._recovered_task_pr_ids))
+
+    runner = h._make_runner()
+    runner._persist_recovered_task_pr_ids = fake_persist  # type: ignore[method-assign]
+    runner._error_skip_active = True
+    runner._idle_dispatch_deferred = True
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = QueueTask(
+        pr_id="PR-601",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-601",
+    )
+    runner.state.current_pr = PRInfo(number=601, branch="pr-601")
+    _install_publish_state_spy(runner)
+
+    asyncio.run(
+        runner._escalate_and_skip(
+            "coder escalated",
+            error_message_override=None,
+        )
+    )
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.current_pr is None
+    assert runner.state.error_message is None
+    assert "PR-601" in runner._recovered_task_pr_ids
+    assert persist_calls == [{"PR-601"}]
+    assert runner._error_skip_active is False
+    assert runner._idle_dispatch_deferred is False
+
+
+def test_error_escalation_preserves_current_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-IDLE escalation can still park with the active task attached."""
+    _patch_label_calls(monkeypatch)
+    persist_calls: list[None] = []
+
+    async def fake_persist() -> None:
+        persist_calls.append(None)
+
+    runner = h._make_runner()
+    runner._persist_recovered_task_pr_ids = fake_persist  # type: ignore[method-assign]
+    task = QueueTask(
+        pr_id="PR-602",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-602",
+    )
+    runner.state.current_task = task
+    runner.state.current_pr = PRInfo(number=602, branch="pr-602")
+    _install_publish_state_spy(runner)
+
+    asyncio.run(
+        runner._escalate_and_skip(
+            "iteration cap",
+            target_state=PipelineState.ERROR,
+        )
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_task == task
+    assert "PR-602" not in runner._recovered_task_pr_ids
+    assert persist_calls == []

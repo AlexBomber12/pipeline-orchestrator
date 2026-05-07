@@ -1197,6 +1197,12 @@ class PipelineRunner(
                 log=self.log_event,
             )
 
+        if target_state == PipelineState.IDLE and current_task is not None:
+            self._recovered_task_pr_ids.add(current_task.pr_id)
+            await self._persist_recovered_task_pr_ids()
+            self.state.current_task = None
+            self._reset_runner_local_task_counters()
+
         self.state.state = target_state
         if error_message_override is _USE_MESSAGE_AS_ERROR:
             self.state.error_message = message
