@@ -140,14 +140,35 @@ def _is_negated(text: str, match_start: int) -> bool:
 
 def _is_inside_fenced_code_block(text: str, match_start: int) -> bool:
     """Return True when ``match_start`` falls after an unmatched fence."""
-    return text[:match_start].count("```") % 2 == 1
+    fence_open: tuple[str, int] | None = None
+    for line in text[:match_start].splitlines():
+        fence = re.match(r"^[ \t]{0,3}(`{3,}|~{3,})", line)
+        if not fence:
+            continue
+        marker = fence.group(1)
+        marker_char = marker[0]
+        marker_len = len(marker)
+        if fence_open is None:
+            fence_open = (marker_char, marker_len)
+            continue
+        open_char, open_len = fence_open
+        if marker_char == open_char and marker_len >= open_len:
+            fence_open = None
+    return fence_open is not None
 
 
 def _is_inside_inline_code(text: str, match_start: int) -> bool:
     """Return True when ``match_start`` is inside a same-line backtick span."""
     line_start = text.rfind("\n", 0, match_start) + 1
     line_prefix = text[line_start:match_start]
-    return line_prefix.count("`") % 2 == 1
+    open_delimiter_len: int | None = None
+    for delimiter in re.finditer(r"`+", line_prefix):
+        delimiter_len = len(delimiter.group(0))
+        if open_delimiter_len is None:
+            open_delimiter_len = delimiter_len
+        elif delimiter_len == open_delimiter_len:
+            open_delimiter_len = None
+    return open_delimiter_len is not None
 
 
 _MARKDOWN_CODE_SUPPRESSED_TYPES = {

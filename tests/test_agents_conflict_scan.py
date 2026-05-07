@@ -806,8 +806,22 @@ def test_no_match_in_fenced_code_block():
     assert "cross_repo_repo_create_command" not in types
 
 
+def test_no_match_in_tilde_fenced_code_block():
+    body = "Example:\n~~~bash\ngh repo create owner/foo\n~~~\nUse it elsewhere."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "cross_repo_repo_create_command" not in types
+
+
 def test_no_match_in_inline_backticks():
     body = "Use the `gh repo create owner/repo` form from a terminal"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "cross_repo_repo_create_command" not in types
+
+
+def test_no_match_in_multi_backtick_inline_code():
+    body = "Use ``gh repo create owner/repo`` as a quoted example"
     violations = scan_for_conflicts(body)
     types = {v.violation_type for v in violations}
     assert "cross_repo_repo_create_command" not in types
@@ -844,10 +858,28 @@ def test_is_inside_fenced_code_block_balanced():
     assert _is_inside_fenced_code_block(body, match_start) is False
 
 
+def test_is_inside_fenced_code_block_tilde_fence():
+    body = "Intro\n~~~bash\ngh repo create owner/foo\n"
+    match_start = body.index("gh repo create")
+    assert _is_inside_fenced_code_block(body, match_start) is True
+
+
 def test_is_inside_inline_code_only_same_line():
     body = (
         "Use `gh repo create owner/repo` from a terminal\n"
         "Then gh repo create owner/other is directive text"
+    )
+    inline_match_start = body.index("gh repo create owner/repo")
+    later_match_start = body.index("gh repo create owner/other")
+
+    assert _is_inside_inline_code(body, inline_match_start) is True
+    assert _is_inside_inline_code(body, later_match_start) is False
+
+
+def test_is_inside_inline_code_multi_backtick_span():
+    body = (
+        "Use ``gh repo create owner/repo`` from a terminal and then "
+        "gh repo create owner/other"
     )
     inline_match_start = body.index("gh repo create owner/repo")
     later_match_start = body.index("gh repo create owner/other")
