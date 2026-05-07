@@ -2738,57 +2738,6 @@ def test_post_repo_detail_coder_defers_paused_repo_switch_message(
     assert stored.coder == "claude"
 
 
-def test_post_repo_detail_coder_defers_paused_repo_switch_message(
-    two_repo_config: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    paused = RepoState(
-        url="https://github.com/example/alpha.git",
-        name="example__alpha",
-        state=PipelineState.PAUSED,
-        coder="claude",
-        current_pr=PRInfo(number=17, branch="pr-017-sample"),
-        last_updated=datetime(2026, 4, 20, 17, 0, 0, tzinfo=timezone.utc),
-    )
-    fake = _FakeRedis({"pipeline:example__alpha": paused.model_dump_json()})
-
-    async def _fake_publish_repo_event(*args: object, **kwargs: object) -> None:
-        return None
-
-    async def _fake_repo_template_context(
-        name: str,
-        redis_client: object | None,
-        *,
-        coder_update_message: str | None = None,
-        include_metrics: bool = False,
-    ) -> dict[str, object]:
-        return {"coder_update_message": coder_update_message or ""}
-
-    def _fake_template_response(
-        request: object,
-        template_name: str,
-        context: dict[str, object],
-    ) -> HTMLResponse:
-        return HTMLResponse(str(context["coder_update_message"]))
-
-    monkeypatch.setattr(web_app, "publish_repo_event", _fake_publish_repo_event)
-    monkeypatch.setattr(web_app, "update_repository", lambda *args, **kwargs: None)
-    monkeypatch.setattr(web_app, "_repo_template_context", _fake_repo_template_context)
-    monkeypatch.setattr(web_app.templates, "TemplateResponse", _fake_template_response)
-
-    with TestClient(app) as client:
-        client.app.state.redis = fake
-        response = client.post(
-            "/repos/example__alpha/coder",
-            data={"coder": "codex"},
-        )
-
-    assert response.status_code == 200
-    assert response.text == "Switching to Codex CLI - applies after current PR completes."
-    stored = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
-    assert stored.coder == "claude"
-
-
 def test_post_repo_detail_coder_updates_idle_repo_via_transaction(
     two_repo_config: Path,
     monkeypatch: pytest.MonkeyPatch,
