@@ -437,7 +437,7 @@ _TERMINAL_METRICS_EXIT_REASONS = frozenset(
 _ACTIVE_STATES = frozenset(
     {PipelineState.CODING, PipelineState.WATCH, PipelineState.FIX}
 )
-_ALERT_STATES = frozenset({PipelineState.HUNG, PipelineState.ERROR})
+_ALERT_STATES = frozenset({PipelineState.ERROR})
 _ACTIVITY_FEED_LIMIT = 50
 # Sentinel used as the sort key for feed entries whose ``time`` field is
 # a legacy/unparseable value. Pushing them to epoch-start makes sure they
@@ -549,14 +549,14 @@ def _build_activity_feed(
     return [payload for _, payload in items[:_ACTIVITY_FEED_LIMIT]]
 
 
-_ALERT_KIND_ORDER = {"ERROR": 0, "HUNG": 1}
+_ALERT_KIND_ORDER = {"ERROR": 0}
 
 
 def _format_alert_duration(seconds: int) -> str:
     """Return a human-readable duration for an alert card.
 
     Used by the alerts panel to render how long a repo has been in the
-    ERROR/HUNG state. Negative inputs (clock skew, a state whose
+    ERROR state. Negative inputs (clock skew, a state whose
     ``last_updated`` is a few ms in the future) are clamped to zero so
     the UI never renders "-3 sec".
     """
@@ -605,10 +605,8 @@ def _most_recent_transition_into(
 def _alert_reference_time(state: RepoState) -> datetime:
     """Return the "since" timestamp an alert card should display.
 
-    HUNG prefers ``current_pr.last_activity`` (the daemon's own
-    hung-detection signal) when it is set. Otherwise — and for every
-    ERROR card — scan ``state.history`` for the most recent transition
-    into the current state. This matters because ``publish_state``
+    Scan ``state.history`` for the most recent transition into the
+    current state. This matters because ``publish_state``
     rewrites ``state.last_updated`` on every daemon cycle (see
     ``src/daemon/runner.py``), so using ``last_updated`` as the "since"
     timestamp would make an hours-old ERROR card display "a few sec"
@@ -619,12 +617,6 @@ def _alert_reference_time(state: RepoState) -> datetime:
     unparseable timestamps) — in that case "now-ish" is the best signal
     we have and the alert still renders.
     """
-    if (
-        state.state == PipelineState.HUNG
-        and state.current_pr is not None
-        and state.current_pr.last_activity is not None
-    ):
-        return state.current_pr.last_activity
     transition = _most_recent_transition_into(
         state.history, state.state.value
     )
@@ -634,12 +626,11 @@ def _alert_reference_time(state: RepoState) -> datetime:
 
 
 def _build_alerts(states: list[RepoState]) -> list[dict[str, Any]]:
-    """Collect alert cards for every repo currently in HUNG or ERROR.
+    """Collect alert cards for every repo currently in ERROR.
 
     Each alert dict is self-contained so the template does not need to
-    reach back into ``RepoState``. Sort order: ERROR first (highest
-    severity), then HUNG, then by duration descending so the longest-
-    standing problem bubbles to the top of its severity bucket.
+    reach back into ``RepoState``. Sort by duration descending so the
+    longest-standing problem bubbles to the top.
     """
     now = datetime.now(timezone.utc)
     alerts: list[dict[str, Any]] = []
@@ -647,7 +638,7 @@ def _build_alerts(states: list[RepoState]) -> list[dict[str, Any]]:
     for state in states:
         if state.state not in _ALERT_STATES:
             continue
-        kind = state.state.value  # "ERROR" or "HUNG"
+        kind = state.state.value
         since = _alert_reference_time(state)
         if since.tzinfo is None:
             since = since.replace(tzinfo=timezone.utc)
@@ -660,18 +651,7 @@ def _build_alerts(states: list[RepoState]) -> list[dict[str, Any]]:
             "duration_text": _format_alert_duration(duration_sec),
             "since_iso": since.astimezone(timezone.utc).isoformat(),
         }
-        if kind == "ERROR":
-            alert["error_message"] = state.error_message or ""
-        else:
-            pr = state.current_pr
-            if pr is not None:
-                alert["pr_number"] = pr.number
-                alert["pr_url"] = pr.url
-                alert["review_status"] = pr.review_status.value
-            else:
-                alert["pr_number"] = None
-                alert["pr_url"] = ""
-                alert["review_status"] = ""
+        alert["error_message"] = state.error_message or ""
         alerts.append(alert)
 
     alerts.sort(
@@ -690,7 +670,7 @@ def _compute_stats(states: list[RepoState]) -> dict[str, Any]:
 
     * ``repos`` - number of configured repositories.
     * ``active`` - repos currently in CODING/WATCH/FIX.
-    * ``alerts`` - repos currently in HUNG/ERROR.
+    * ``alerts`` - repos currently in ERROR.
     * ``done_today`` / ``done_week`` - count of ``Merged PR`` events in the
       merged history whose timestamp falls inside the window. Entries
       without a parseable ``time`` are excluded from the windows but still

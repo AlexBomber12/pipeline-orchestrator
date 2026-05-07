@@ -31,6 +31,32 @@ from tests.runner import _helpers as h
 claude_cli = claude_plugin_module.claude_cli
 
 
+def test_observe_watch_event_signature_resets_retrigger_count() -> None:
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=5,
+        branch="pr-001",
+        watch_retrigger_count=2,
+    )
+    prior = PRInfo(
+        number=5,
+        branch="pr-001",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+    )
+    updated = PRInfo(
+        number=5,
+        branch="pr-001",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.PENDING,
+    )
+
+    runner._observe_watch_event_signature(prior)
+    runner._observe_watch_event_signature(updated)
+
+    assert runner.state.current_pr.watch_retrigger_count == 0
+
+
 def test_handle_watch_approved_and_green_merges(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2265,24 +2291,16 @@ def test_handle_watch_skips_codex_bot_error_check_outside_eyes(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("state", "handler_name"),
-    [
-        (PipelineState.WATCH, "handle_watch"),
-        (PipelineState.HUNG, "handle_hung"),
-    ],
-)
-def test_run_cycle_dispatches_watch_and_hung_handlers(
+def test_run_cycle_dispatches_watch_handler(
     monkeypatch: pytest.MonkeyPatch,
-    state: PipelineState,
-    handler_name: str,
 ) -> None:
     calls: list[str] = []
     publishes: list[str] = []
     runner = h._make_runner()
     runner._recovered = True
     runner._scaffolded = True
-    runner.state.state = state
+    runner.state.state = PipelineState.WATCH
+    handler_name = "handle_watch"
 
     async def fake_ensure_repo_cloned() -> None:
         return None

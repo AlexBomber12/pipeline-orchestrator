@@ -54,11 +54,10 @@ def test_alerts_endpoint_returns_zero_when_no_alerts(alerts_client) -> None:
     assert resp.json() == {"has_alerts": False, "count": 0}
 
 
-def test_alerts_endpoint_counts_hung_and_error_states(alerts_client) -> None:
+def test_alerts_endpoint_counts_error_states(alerts_client) -> None:
     client, states = alerts_client
     states[:] = [
         _make_state("alpha", PipelineState.IDLE),
-        _make_state("beta", PipelineState.HUNG),
         _make_state("gamma", PipelineState.ERROR),
         _make_state("delta", PipelineState.WATCH),
     ]
@@ -66,7 +65,7 @@ def test_alerts_endpoint_counts_hung_and_error_states(alerts_client) -> None:
     resp = client.get("/api/alerts")
 
     assert resp.status_code == 200
-    assert resp.json() == {"has_alerts": True, "count": 2}
+    assert resp.json() == {"has_alerts": True, "count": 1}
 
 
 def test_alerts_endpoint_payload_size_independent_of_repo_count(
@@ -89,7 +88,7 @@ def test_alerts_endpoint_payload_size_independent_of_repo_count(
 
 
 def test_alerts_endpoint_ignores_non_alert_states(alerts_client) -> None:
-    """States other than HUNG/ERROR (CODING/FIX/MERGE/etc.) are not alerts."""
+    """States other than ERROR (CODING/FIX/MERGE/etc.) are not alerts."""
     client, states = alerts_client
     states[:] = [
         _make_state("alpha", PipelineState.CODING),

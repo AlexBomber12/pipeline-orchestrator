@@ -1,11 +1,4 @@
-"""PR-247: Recover button visibility on the repo card.
-
-The Recover control is HUNG-specific. The dashboard repo cards must
-render the button only when the persisted RepoState is HUNG and never
-on any other state — surfacing it on IDLE/CODING/WATCH/FIX/MERGE/ERROR
-or PAUSED would imply the operator can use it as a generic abort, but
-the daemon-side handler refuses any state but HUNG.
-"""
+"""Recover button removal on the repo card."""
 
 from __future__ import annotations
 
@@ -58,19 +51,8 @@ def _render_summary(state: PipelineState) -> str:
     ).render(context)
 
 
-def test_recover_button_renders_when_state_is_hung(
-    alpha_config: Path,
-) -> None:
-    rendered = _render_summary(PipelineState.HUNG)
-
-    assert 'hx-post="/repos/example__alpha/recover"' in rendered
-    assert "aria-label=\"Recover from HUNG\"" in rendered
-    assert "cancel current task and return to IDLE" in rendered
-    assert "id=\"controls-recover-spinner-example__alpha\"" in rendered
-
-
 @pytest.mark.parametrize(
-    "non_hung_state",
+    "state",
     [
         PipelineState.IDLE,
         PipelineState.CODING,
@@ -82,10 +64,11 @@ def test_recover_button_renders_when_state_is_hung(
         PipelineState.PREFLIGHT,
     ],
 )
-def test_recover_button_hidden_on_non_hung_state(
-    alpha_config: Path, non_hung_state: PipelineState
+def test_recover_button_never_renders(
+    alpha_config: Path, state: PipelineState
 ) -> None:
-    rendered = _render_summary(non_hung_state)
+    rendered = _render_summary(state)
 
     assert "/repos/example__alpha/recover" not in rendered
     assert "controls-recover-spinner-example__alpha" not in rendered
+    assert "Recover from HUNG" not in rendered

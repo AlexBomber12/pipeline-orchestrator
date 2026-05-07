@@ -16,7 +16,6 @@ class PipelineState(str, Enum):
     WATCH = "WATCH"
     FIX = "FIX"
     MERGE = "MERGE"
-    HUNG = "HUNG"
     ERROR = "ERROR"
     PAUSED = "PAUSED"
 
@@ -86,10 +85,8 @@ class PRInfo(BaseModel):
     head_sha: str = ""
     fix_iteration_count: int = 0
     no_push_fix_count: int = 0
-    # OBS-BL (PR-249): WATCH<->HUNG retrigger cycles counted to cap
-    # ``daemon.watch_retrigger_cap`` runaway codex-silent loops where
-    # ``handle_hung`` would otherwise post ``@codex review`` and reset
-    # WATCH indefinitely. Reset on fresh review activity.
+    # OBS-BL (PR-249): WATCH retrigger cycles counted to cap runaway
+    # codex-silent loops. Reset on fresh review activity.
     watch_retrigger_count: int = 0
     url: str = ""
     last_activity: datetime | None = None

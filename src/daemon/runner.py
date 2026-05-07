@@ -3,7 +3,7 @@
 One ``PipelineRunner`` instance exists per connected repository. The daemon
 main loop calls ``run_cycle`` once per poll interval; each cycle clones or
 fetches the repo, runs a preflight check, and dispatches on the persisted
-state (``IDLE``, ``WATCH``, ``HUNG``, ``PAUSED``, or ``ERROR``). Transient states
+state (``IDLE``, ``WATCH``, ``PAUSED``, or ``ERROR``). Transient states
 (``CODING``, ``FIX``, ``MERGE``) are resolved within a single cycle and
 never persisted across cycles.
 
@@ -1870,8 +1870,6 @@ class PipelineRunner(
             await self.handle_idle()
         elif current == PipelineState.WATCH:
             await self.handle_watch()
-        elif current == PipelineState.HUNG:
-            await self.handle_hung()
         elif current == PipelineState.PAUSED:
             await self.handle_paused()
         elif current == PipelineState.ERROR:
