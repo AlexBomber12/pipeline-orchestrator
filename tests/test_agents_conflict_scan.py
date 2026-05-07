@@ -786,6 +786,24 @@ def test_scan_flags_in_repo_phrasing():
     assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
 
 
+def test_scan_flags_targets_repo_phrasing():
+    body = "This task targets the homelab-monitoring repository."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
+
+
+def test_scan_flags_targets_owner_repo_phrasing():
+    body = "This task targets AlexBomber12/homelab-monitoring."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
+
+
+def test_scan_does_not_flag_plain_targets_prose():
+    body = "This PR targets Python 3.12."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
 def test_scan_does_not_flag_negated_gh_repo_create():
     body = "Coders must not run gh repo create from dispatched tasks."
     violations = scan_for_conflicts(body)

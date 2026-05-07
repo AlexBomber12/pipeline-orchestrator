@@ -325,12 +325,19 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         # Phrase form indicating the spec author believes this task ships
         # in a different repository. Captures phrasings observed in
         # OBS-BT (verb forms: `ships`, `belongs`, `lives`, `deploys`,
-        # `targets`; identifier shape: slug-style chars). Negation
-        # suppression by the shared `_is_negated` check covers prose that
-        # explicitly forbids the shipping verb.
+        # `targets`; identifier shape: slug-style chars). The `targets`
+        # arm intentionally requires repository context so ordinary task
+        # prose such as "This PR targets Python 3.12" is not treated as
+        # cross-repo routing intent. Negation suppression by the shared
+        # `_is_negated` check covers prose that explicitly forbids the
+        # shipping verb.
         re.compile(
             r"\b(?:"
-            r"ships? in|belongs to|lives in|deploys to|targets|"
+            r"ships? in|belongs to|lives in|deploys to|"
+            r"targets (?:"
+            r"[\w.-]+/[\w.-]+|"
+            r"(?:the )?[\w.-]+ repo(?:sitory)?"
+            r")|"
             r"in (?:the )?[\w.-]+ repo(?:sitory)?"
             r")\b",
             re.IGNORECASE,
