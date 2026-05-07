@@ -820,6 +820,18 @@ def test_scan_flags_targets_owner_repo_phrasing():
     assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
 
 
+def test_scan_flags_targets_plain_repository_name_phrasing():
+    body = "This task targets foorepo repository."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
+
+
+def test_scan_flags_ships_in_underscore_repository_name_phrasing():
+    body = "This task ships in foo_repo repository."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
+
+
 def test_scan_does_not_flag_plain_targets_prose():
     body = "This PR targets Python 3.12."
     violations = scan_for_conflicts(body)
@@ -894,6 +906,12 @@ def test_scan_does_not_flag_gh_repo_create_inside_backticks():
 
 def test_scan_does_not_flag_gh_repo_create_inside_double_backticks():
     body = "``gh repo create`` is the command we block."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
+def test_scan_does_not_flag_gh_repo_create_inside_code_span_ending_backslash():
+    body = r"`gh repo create AlexBomber12/foo \\` is a literal example."
     violations = scan_for_conflicts(body)
     assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
 

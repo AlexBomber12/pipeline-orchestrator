@@ -193,7 +193,7 @@ def _is_inside_inline_code(text: str, match_start: int) -> bool:
         opening_start = opener.start()
         opening_end = opener.end()
         delimiter_len = opening_end - opening_start
-        closing_pattern = re.compile(rf"(?<![\\`])`{{{delimiter_len}}}(?!`)")
+        closing_pattern = re.compile(rf"(?<!`)`{{{delimiter_len}}}(?!`)")
         closer = closing_pattern.search(line, opening_end)
         if closer is None:
             return False
@@ -410,8 +410,8 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         re.compile(
             r"\b(?:"
             r"(?:ships? in|belongs to|lives in|deploys to|targets) "
-            r"(?:[\w.-]+/[\w.-]+(?!/)|(?:the )?[\w.-]*[.-][\w.-]+ repo(?:sitory)?)|"
-            r"in (?:the )?(?:[\w.-]*[.-][\w.-]+|[\w.-]+/[\w.-]+) repo(?:sitory)?"
+            r"(?:[\w.-]+/[\w.-]+(?!/)|(?:the )?[\w.-]*[.-][\w.-]+ repo(?:sitory)?|(?:the )?\w+ repository)|"
+            r"in (?:the )?(?:[\w.-]*[.-][\w.-]+ repo(?:sitory)?|[\w.-]+/[\w.-]+ repo(?:sitory)?|\w+ repository)"
             r")\b",
             re.IGNORECASE,
         ),
