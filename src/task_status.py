@@ -79,6 +79,8 @@ def derive_task_status(
         return TaskStatus.DONE
     if task_header.frontmatter_status in ("in_progress", "in_review"):
         return TaskStatus.DOING
+    if task_header.frontmatter_status in ("blocked", "canceled"):
+        return TaskStatus.CANCELED
     if (
         task_header.branch
         and task_header.branch in state.merged_branches

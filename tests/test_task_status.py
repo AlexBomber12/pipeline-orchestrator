@@ -105,6 +105,25 @@ def test_derive_task_status_in_progress_frontmatter_returns_doing() -> None:
     assert status == TaskStatus.DOING
 
 
+@pytest.mark.parametrize("frontmatter_status", ["blocked", "canceled"])
+def test_derive_task_status_stopped_frontmatter_returns_canceled(
+    frontmatter_status: str,
+) -> None:
+    status = derive_task_status(
+        _header("pr-085-status-from-git", frontmatter_status=frontmatter_status),
+        _merged_state(),
+        [
+            PRInfo(
+                number=109,
+                branch="pr-085-status-from-git",
+                title="PR-085: Status derivation from git",
+            )
+        ],
+    )
+
+    assert status == TaskStatus.CANCELED
+
+
 def test_derive_task_status_no_frontmatter_uses_existing_logic() -> None:
     status = derive_task_status(
         _header("pr-085-status-from-git", frontmatter_status=None),

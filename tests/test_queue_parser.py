@@ -167,6 +167,19 @@ def test_parse_task_header_with_in_progress_frontmatter(tmp_path: Path) -> None:
     assert header.frontmatter_status == "in_progress"
 
 
+def test_parse_task_header_with_long_frontmatter(tmp_path: Path) -> None:
+    long_frontmatter = (
+        "---\n"
+        + "\n".join(f"metadata_{index}: value" for index in range(25))
+        + "\nstatus: merged\n---\n"
+    )
+    header = parse_task_header(
+        _write_task_file(tmp_path, long_frontmatter + _frontmatter_task())
+    )
+
+    assert header.frontmatter_status == "merged"
+
+
 def test_parse_task_header_without_frontmatter(tmp_path: Path) -> None:
     header = parse_task_header(_write_task_file(tmp_path, _frontmatter_task()))
 

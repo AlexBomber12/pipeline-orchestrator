@@ -198,7 +198,7 @@ def parse_task_header(path: str | Path) -> TaskHeader:
     )
     if first_content_index is not None and lines[first_content_index].rstrip() == "---":
         frontmatter_end_index: int | None = None
-        for index in range(first_content_index + 1, min(len(lines), 20)):
+        for index in range(first_content_index + 1, len(lines)):
             if lines[index].rstrip() == "---":
                 frontmatter_end_index = index
                 break
