@@ -75,6 +75,10 @@ def derive_task_status(
     current_task_pr_id: str | None = None,
 ) -> TaskStatus:
     """Derive task status from git state."""
+    if task_header.frontmatter_status == "merged":
+        return TaskStatus.DONE
+    if task_header.frontmatter_status in ("in_progress", "in_review"):
+        return TaskStatus.DOING
     if (
         task_header.branch
         and task_header.branch in state.merged_branches
