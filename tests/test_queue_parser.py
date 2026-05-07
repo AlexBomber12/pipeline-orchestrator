@@ -75,6 +75,16 @@ def test_detect_cross_repo_intent_ignores_pr_id_after_ships_in() -> None:
     )
 
 
+def test_detect_cross_repo_intent_ignores_generic_in_the_repo() -> None:
+    assert (
+        detect_cross_repo_intent(
+            "Show the branch in the repo detail page.",
+            "pipeline-orchestrator",
+        )
+        is None
+    )
+
+
 def test_detect_cross_repo_intent_ships_in_same_repo_returns_none() -> None:
     assert (
         detect_cross_repo_intent(
@@ -138,6 +148,16 @@ def test_detect_cross_repo_intent_negated_phrase_returns_none() -> None:
 def test_detect_cross_repo_intent_not_only_phrase_still_flags() -> None:
     result = detect_cross_repo_intent(
         "This does not only document that the PR ships in homelab-monitoring.",
+        "megaraid-dashboard",
+    )
+
+    assert result is not None
+    assert "ships in homelab-monitoring" in result
+
+
+def test_detect_cross_repo_intent_unrelated_not_still_flags() -> None:
+    result = detect_cross_repo_intent(
+        "This change is not trivial and ships in homelab-monitoring.",
         "megaraid-dashboard",
     )
 
