@@ -75,6 +75,16 @@ def test_detect_cross_repo_intent_ships_in_same_repo_returns_none() -> None:
     )
 
 
+def test_detect_cross_repo_intent_dotted_same_repo_returns_none() -> None:
+    assert (
+        detect_cross_repo_intent(
+            "This PR ships in my.repo.",
+            "my.repo",
+        )
+        is None
+    )
+
+
 def test_detect_cross_repo_intent_negated_phrase_returns_none() -> None:
     assert (
         detect_cross_repo_intent(
@@ -95,14 +105,24 @@ def test_detect_cross_repo_intent_gh_repo_create_always_flags() -> None:
     assert "gh repo create" in result
 
 
-def test_detect_cross_repo_intent_double_negative_still_flags() -> None:
+def test_detect_cross_repo_intent_gh_repo_create_negated_prose_still_flags() -> None:
     result = detect_cross_repo_intent(
-        "Do not forget to gh repo create something.",
+        "Do not run gh repo create something.",
         "something",
     )
 
     assert result is not None
     assert "gh repo create" in result
+
+
+def test_detect_cross_repo_intent_double_negative_still_flags() -> None:
+    result = detect_cross_repo_intent(
+        "Do not forget to mention this PR ships in homelab-monitoring.",
+        "megaraid-dashboard",
+    )
+
+    assert result is not None
+    assert "ships in homelab-monitoring" in result
 
 
 def test_detect_cross_repo_intent_gh_repo_delete_always_flags() -> None:

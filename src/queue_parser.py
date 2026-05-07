@@ -55,21 +55,21 @@ _CODER_VALUES = {"claude", "codex", "any"}
 _CROSS_REPO_PATTERNS: tuple[tuple[re.Pattern[str], int | None], ...] = (
     (
         re.compile(
-            r"\bships in ((?:[\w-]+/)?[\w-]+)\b",
+            r"\bships in ((?:[\w.-]+/)?[\w.-]+)\b",
             re.IGNORECASE,
         ),
         1,
     ),
     (
         re.compile(
-            r"\bin (?:the )?((?:[\w-]+/)?[\w-]+) repo(?:sitory)?\b",
+            r"\bin (?:the )?((?:[\w.-]+/)?[\w.-]+) repo(?:sitory)?\b",
             re.IGNORECASE,
         ),
         1,
     ),
     (
         re.compile(
-            r"\bbelongs to ((?:[\w-]+/)?[\w-]+)\b",
+            r"\bbelongs to ((?:[\w.-]+/)?[\w.-]+)\b",
             re.IGNORECASE,
         ),
         1,
@@ -124,9 +124,9 @@ def detect_cross_repo_intent(
     current = _normalize_repo_name(current_repo_name)
     for pattern, repo_group in _CROSS_REPO_PATTERNS:
         for match in pattern.finditer(task_body):
-            if _is_cross_repo_intent_negated(task_body, match.start()):
-                continue
             if repo_group is not None:
+                if _is_cross_repo_intent_negated(task_body, match.start()):
+                    continue
                 referenced = _normalize_repo_name(match.group(repo_group))
                 if (
                     referenced == current
