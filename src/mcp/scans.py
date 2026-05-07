@@ -138,7 +138,10 @@ def _is_negated(text: str, match_start: int) -> bool:
     return True
 
 
-_CROSS_REPO_SHIPPING_DOES_NOT = re.compile(r"\bdoes not\s+$", re.IGNORECASE)
+_CROSS_REPO_SHIPPING_DOES_NOT = re.compile(
+    r"\b(?:does not|does(?:n't|n’t))\s+$",
+    re.IGNORECASE,
+)
 
 
 def _is_negated_cross_repo_shipping(text: str, match_start: int) -> bool:
@@ -164,9 +167,28 @@ def _is_inside_inline_code(text: str, match_start: int) -> bool:
     anti-pattern categories.
     """
     line_start = text.rfind("\n", 0, match_start) + 1
-    prefix = text[line_start:match_start]
-    if prefix.count("`") % 2 == 1:
-        return True
+    line_end = text.find("\n", match_start)
+    if line_end == -1:
+        line_end = len(text)
+    line = text[line_start:line_end]
+    relative_match_start = match_start - line_start
+    cursor = 0
+    while cursor < len(line):
+        opener = re.search(r"`+", line[cursor:])
+        if opener is None:
+            return False
+        opening_start = cursor + opener.start()
+        opening_end = cursor + opener.end()
+        delimiter_len = opening_end - opening_start
+        closing_pattern = re.compile(rf"(?<!`)`{{{delimiter_len}}}(?!`)")
+        closer = closing_pattern.search(line, opening_end)
+        if closer is None:
+            return opening_end <= relative_match_start
+        closing_start = closer.start()
+        closing_end = closer.end()
+        if opening_end <= relative_match_start < closing_start:
+            return True
+        cursor = closing_end
     return False
 
 

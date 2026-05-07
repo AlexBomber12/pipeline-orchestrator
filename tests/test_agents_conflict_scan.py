@@ -6,7 +6,7 @@ case below; the clean-spec case anchors the false-positive direction.
 
 from __future__ import annotations
 
-from src.mcp.scans import scan_for_conflicts
+from src.mcp.scans import _is_inside_inline_code, scan_for_conflicts
 
 _CLEAN_SPEC = """# PR-999: Example task
 
@@ -840,8 +840,48 @@ def test_scan_does_not_flag_negated_ships_in():
     assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
 
 
+def test_scan_does_not_flag_contracted_negated_ships_in():
+    body = "This task doesn't ship in another repo."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
+def test_scan_does_not_flag_curly_contracted_negated_ships_in():
+    body = "This task doesn’t ship in another repo."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
 def test_scan_does_not_flag_gh_repo_create_inside_backticks():
     body = "`gh repo create` is the command we block."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
+def test_scan_does_not_flag_gh_repo_create_inside_double_backticks():
+    body = "``gh repo create`` is the command we block."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
+def test_scan_does_not_flag_gh_repo_create_after_unclosed_backtick():
+    body = "Example: `gh repo create AlexBomber12/foo"
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
+def test_scan_flags_gh_repo_create_after_closed_backtick_span():
+    body = "`literal example` then run gh repo create AlexBomber12/foo."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
+
+
+def test_inline_code_detector_returns_false_for_empty_line():
+    assert _is_inside_inline_code("", 0) is False
+
+
+def test_scan_does_not_flag_ships_in_inside_double_backticks():
+    body = "Use ``ships in foo-repo repository`` as a literal example."
     violations = scan_for_conflicts(body)
     assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
 
