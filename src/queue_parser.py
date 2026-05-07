@@ -97,7 +97,7 @@ _CROSS_REPO_CLAUSE_BOUNDARIES = ".,;!?:\n"
 _CROSS_REPO_EXCERPT_LIMIT = 120
 _CROSS_REPO_PLACEHOLDER_NAMES = {"this", "current", "same"}
 _CROSS_REPO_PR_ID_TOKEN = re.compile(r"^pr-\d+$", re.IGNORECASE)
-_CROSS_REPO_REPO_MARKERS = re.compile(r"[-./]")
+_CROSS_REPO_REPO_MARKERS = re.compile(r"[-./_]")
 
 
 @dataclass(frozen=True)
@@ -123,16 +123,18 @@ def detect_cross_repo_intent(
     scanner owns task-spec validation. A later refactor can share the helper
     once both call sites settle.
     """
-    current = _normalize_repo_name(current_repo_name)
+    current = _normalize_repo_identity(current_repo_name)
+    current_bare = _normalize_repo_name(current_repo_name)
     for pattern, repo_group in _CROSS_REPO_PATTERNS:
         for match in pattern.finditer(task_body):
             if repo_group is not None:
                 if _is_cross_repo_intent_negated(task_body, match.start()):
                     continue
-                referenced = _normalize_repo_name(match.group(repo_group))
+                referenced = _normalize_repo_identity(match.group(repo_group))
+                referenced_bare = _normalize_repo_name(referenced)
                 if (
-                    referenced == current
-                    or referenced in _CROSS_REPO_PLACEHOLDER_NAMES
+                    _is_same_repo_reference(referenced, current, current_bare)
+                    or referenced_bare in _CROSS_REPO_PLACEHOLDER_NAMES
                     or not _looks_like_repo_reference(referenced)
                 ):
                     continue
@@ -140,8 +142,22 @@ def detect_cross_repo_intent(
     return None
 
 
+def _normalize_repo_identity(repo_name: str) -> str:
+    return repo_name.strip().lower()
+
+
 def _normalize_repo_name(repo_name: str) -> str:
     return repo_name.rsplit("/", 1)[-1].strip().lower()
+
+
+def _is_same_repo_reference(
+    referenced: str,
+    current: str,
+    current_bare: str,
+) -> bool:
+    if "/" in referenced:
+        return referenced == current
+    return referenced == current_bare
 
 
 def _looks_like_repo_reference(repo_name: str) -> bool:

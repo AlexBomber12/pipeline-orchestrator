@@ -85,6 +85,26 @@ def test_detect_cross_repo_intent_ships_in_same_repo_returns_none() -> None:
     )
 
 
+def test_detect_cross_repo_intent_owner_prefixed_same_repo_returns_none() -> None:
+    assert (
+        detect_cross_repo_intent(
+            "This PR ships in alexbomber12/pipeline-orchestrator.",
+            "AlexBomber12/pipeline-orchestrator",
+        )
+        is None
+    )
+
+
+def test_detect_cross_repo_intent_owner_prefixed_same_basename_flags() -> None:
+    result = detect_cross_repo_intent(
+        "This PR ships in other-org/pipeline-orchestrator.",
+        "pipeline-orchestrator",
+    )
+
+    assert result is not None
+    assert "other-org/pipeline-orchestrator" in result
+
+
 def test_detect_cross_repo_intent_dotted_same_repo_returns_none() -> None:
     assert (
         detect_cross_repo_intent(
@@ -210,6 +230,16 @@ def test_detect_cross_repo_intent_markdown_quoted_repo_name() -> None:
 
     assert result is not None
     assert "`homelab-monitoring`" in result
+
+
+def test_detect_cross_repo_intent_underscore_repo_name() -> None:
+    result = detect_cross_repo_intent(
+        "This PR ships in my_repo.",
+        "megaraid-dashboard",
+    )
+
+    assert result is not None
+    assert "my_repo" in result
 
 
 def test_detect_cross_repo_intent_unicode_repo_name() -> None:
