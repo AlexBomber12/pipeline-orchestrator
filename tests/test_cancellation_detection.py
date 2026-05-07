@@ -247,8 +247,14 @@ def test_escalate_wiring_writes_reason_text(
     asyncio.run(runner.handle_fix())
 
     escalate_writes = [c for c in captured if c.category == "ESCALATE"]
-    assert len(escalate_writes) == 1
-    assert escalate_writes[0].payload == {"reason_text": "cannot resolve"}
+    assert [c.payload for c in escalate_writes] == [
+        {"reason_text": "cannot resolve"},
+        {
+            "subsource": "daemon",
+            "reason_text": "FIX coder ESCALATE on PR #304: cannot resolve. Moving to IDLE.",
+            "previous_state": "FIX",
+        },
+    ]
 
 
 def test_infra_classifier_recognizes_retry_exhaustion() -> None:

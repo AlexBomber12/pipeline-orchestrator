@@ -478,8 +478,8 @@ def test_handle_idle_transitions_to_hung_when_pinned_coder_unavailable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A task pinned to ``codex`` whose coder is unavailable must transition
-    to HUNG with a clear message instead of silently falling back."""
+    """A task pinned to ``codex`` whose coder is unavailable must skip to IDLE
+    with a clear message instead of silently falling back."""
     h._patch_subprocess(monkeypatch)
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
@@ -531,7 +531,7 @@ def test_handle_idle_transitions_to_hung_when_pinned_coder_unavailable(
     )
     asyncio.run(runner.handle_idle())
 
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert runner.state.error_message == ("Task PR-200 pinned to codex but coder unavailable")
     assert runner.state.current_pr is None
     assert not coding_called["v"]

@@ -2,10 +2,10 @@
 
 Each function takes the active ``PipelineRunner`` as the first argument
 because the operations need access to ``runner.state``, ``runner.owner_repo``,
-``runner.app_config``, ``runner.log_event`` and ``runner._escalate_to_hung`` /
+``runner.app_config``, ``runner.log_event`` and ``runner._escalate_and_skip`` /
 ``runner._transition_to_error`` primitives. ``handlers/fix.py`` keeps thin
 wrapper methods on ``FixMixin`` so existing callers (regression tests in
-``tests/runner/`` and the runner itself via ``_escalate_to_hung``) continue
+``tests/runner/`` and the runner itself via ``_escalate_and_skip``) continue
 to work unchanged.
 """
 
@@ -192,14 +192,11 @@ async def escalate_fix_no_push_deadlock(
 async def escalate_fix_coder_initiated(
     runner: "PipelineRunner", current_pr: PRInfo, reason: str
 ) -> None:
-    """Park the PR after the coder emits an ESCALATE marker.
+    """Skip the task after the coder emits an ESCALATE marker.
 
     Posts a fix.py-specific failure-log comment and then routes state via
-    ``_escalate_to_hung``. On label-apply success the runner parks in
-    ``IDLE`` so the next refresh rehydrates ``is_escalated`` from the
-    GitHub label. On label-apply failure ``HUNG`` is used so the in-memory
-    flag stays the load-bearing parking signal during a GitHub outage
-    (Codex P1 on PR #228).
+    ``_escalate_and_skip``. The durable PR escalation markers remain on the
+    PR while daemon state returns to ``IDLE`` for the next task.
     """
     pr_number = current_pr.number
     clean_reason = reason.strip() or _ESCALATE_EMPTY_REASON
@@ -218,7 +215,7 @@ async def escalate_fix_coder_initiated(
         runner, pr_number, "FIX coder ESCALATE"
     )
     if label_applied:
-        await runner._escalate_to_hung(
+        await runner._escalate_and_skip(
             f"FIX coder ESCALATE on PR #{pr_number}: {clean_reason}. "
             "Moving to IDLE.",
             target_state=PipelineState.IDLE,
@@ -226,7 +223,7 @@ async def escalate_fix_coder_initiated(
             apply_escalated_label=False,
         )
         return
-    await runner._escalate_to_hung(
+    await runner._escalate_and_skip(
         f"FIX coder ESCALATE on PR #{pr_number}: failed to apply "
         f"`escalated` label. Reason: {clean_reason}. Manual "
         "review required.",
@@ -242,7 +239,7 @@ async def escalate_fix_iteration_cap(
     The comment-post and ``pr edit --add-label`` failure paths route to
     ``ERROR`` (durable parking signal for daemon-driven escalation,
     distinct from the coder-initiated ``HUNG`` fallback). The success path
-    delegates to ``_escalate_to_hung`` for the IDLE transition +
+    delegates to ``_escalate_and_skip`` for the IDLE transition +
     ``[ESCALATE]`` log + publish.
     """
     count = current_pr.fix_iteration_count
@@ -290,7 +287,7 @@ async def escalate_fix_iteration_cap(
             log_prefix="[FIX]",
         )
         return
-    await runner._escalate_to_hung(
+    await runner._escalate_and_skip(
         f"FIX cap reached ({count}/{fix_iteration_cap}) on PR "
         f"#{pr_number}: escalated, moving to IDLE.",
         target_state=PipelineState.IDLE,

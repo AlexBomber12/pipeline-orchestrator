@@ -927,7 +927,7 @@ def test_handle_coding_no_pr_routes_to_diagnostic(
     runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001")
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert "did nothing" in (runner.state.error_message or "")
 
 
@@ -1092,8 +1092,8 @@ def test_handle_coding_rejects_unmatched_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When no open PR matches current_task.branch, fail fast instead of
-    attaching to an unrelated newest open PR. The diagnostic handler then
-    routes the no-PR outcome to HUNG via case A/B/C."""
+        attaching to an unrelated newest open PR. The diagnostic handler then
+        routes the no-PR outcome to IDLE via case A/B/C."""
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
@@ -1120,7 +1120,7 @@ def test_handle_coding_rejects_unmatched_branch(
     runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001")
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is None
     assert "did nothing" in (runner.state.error_message or "")
 
@@ -1433,9 +1433,9 @@ def test_handle_coding_runs_three_retries_before_diagnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """After 3 consecutive empty get_open_prs results the runner must
-    invoke ``_diagnose_exit_zero_no_pr`` rather than flipping straight
-    to ERROR. That diagnostic distinguishes A/B/C and routes to HUNG
-    when the coder did nothing observable upstream."""
+        invoke ``_diagnose_exit_zero_no_pr`` rather than flipping straight
+        to ERROR. That diagnostic distinguishes A/B/C and routes to IDLE
+        when the coder did nothing observable upstream."""
     h._patch_subprocess(monkeypatch)
     call_count = {"n": 0}
 
@@ -1477,7 +1477,7 @@ def test_handle_coding_runs_three_retries_before_diagnostic(
     runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001")
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert "[codex]" in (runner.state.error_message or "")
     assert call_count["n"] == 3
     assert slept.count(5) == 2
@@ -2710,14 +2710,11 @@ def test_handle_coding_uses_configured_timeout(
     assert captured.get("timeout") == 1234
 
 
-def test_handle_external_terminal_pr_state_closed_transitions_to_hung(
+def test_handle_external_terminal_pr_state_closed_skips_to_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Detected external close must transition runner to HUNG for manual
-    review AND finalize the active run record as ``closed_unmerged`` so
-    the next ``handle_hung`` -> IDLE tick does not strand the run with
-    a missing ``ended_at`` / ``exit_reason`` (Codex P2 follow-up on PR
-    #223)."""
+    """Detected external close must skip to IDLE and finalize the active
+    run record as ``closed_unmerged``."""
     runner = h._make_runner()
     runner.state.current_task = QueueTask(
         pr_id="PR-055",
@@ -2741,12 +2738,12 @@ def test_handle_external_terminal_pr_state_closed_transitions_to_hung(
 
     asyncio.run(runner._handle_external_terminal_pr_state("CLOSED"))
 
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert runner.state.error_message is None
     assert saved == ["closed_unmerged"]
     assert runner._current_run_record is None
     assert any(
-        "PR #55 closed externally during FIX, transitioning to HUNG." in entry["event"]
+        "PR #55 closed externally during FIX, skipping task and returning to IDLE." in entry["event"]
         for entry in runner.state.history
     )
 

@@ -632,7 +632,7 @@ class IdleMixin:
                 message = (
                     f"Task {task.pr_id} pinned to {pin} but coder unavailable"
                 )
-                await self._escalate_to_hung(
+                await self._escalate_and_skip(
                     message,
                     apply_escalated_label=False,
                     set_pr_escalated_flag=False,

@@ -1,17 +1,8 @@
-"""PR-220: ``_escalate_to_hung`` primitive tests.
+"""``_escalate_and_skip`` primitive tests.
 
-These tests pin the contract for the unified HUNG escalation primitive
-that PR-220 introduces. They exercise the primitive in isolation; the
-PR-212 recovery interaction tests cover the migration of the three
-``_escalate_fix_*`` wrappers and the inlined escalation sites in
-coding/idle/watch are covered by their existing handler tests.
-
-After PR-220 ships, escalations to ``PipelineState.HUNG`` driven by
-daemon-side logic (max breach, terminal coder error, FIX iteration
-cap, FIX no-push deadlock, coder ESCALATE marker, coder unavailable,
-review timeout) flow through this primitive. Direct
-``state.state = PipelineState.HUNG`` writes are reserved for legitimate
-non-escalation transitions (e.g. operator-initiated stop).
+These tests pin the daemon escalation contract: record a structured
+``ESCALATE`` cause, keep the durable PR escalation markers, and return to
+``IDLE`` so the next eligible task can run.
 """
 
 from __future__ import annotations
@@ -20,7 +11,8 @@ import asyncio
 from typing import Any
 
 import pytest
-from src.models import PipelineState, PRInfo
+from src.cancellation import CancellationCause
+from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 
 from tests.runner import _helpers as h
 
@@ -48,10 +40,10 @@ def _patch_label_calls(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
     return gh_calls
 
 
-def test_default_args_park_in_hung_apply_label_no_comment(
+def test_default_args_skip_to_idle_apply_label_no_comment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Default arguments transition to HUNG, apply the label, no comment."""
+    """Default arguments transition to IDLE, apply the label, no comment."""
     gh_calls = _patch_label_calls(monkeypatch)
     posted: list[tuple[str, int, str]] = []
     monkeypatch.setattr(
@@ -64,9 +56,9 @@ def test_default_args_park_in_hung_apply_label_no_comment(
     runner.state.current_pr = pr
     publish_calls = _install_publish_state_spy(runner)
 
-    asyncio.run(runner._escalate_to_hung("park me"))
+    asyncio.run(runner._escalate_and_skip("park me"))
 
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert runner.state.error_message == "park me"
     assert pr.is_escalated is True
     assert posted == []
@@ -86,7 +78,7 @@ def test_target_state_error_transitions_to_error(
     _install_publish_state_spy(runner)
 
     asyncio.run(
-        runner._escalate_to_hung(
+        runner._escalate_and_skip(
             "iteration cap",
             target_state=PipelineState.ERROR,
         )
@@ -108,7 +100,7 @@ def test_apply_escalated_label_calls_pr_edit(
     _install_publish_state_spy(runner)
 
     asyncio.run(
-        runner._escalate_to_hung(
+        runner._escalate_and_skip(
             "park me",
             label_create_log_prefix="custom",
         )
@@ -135,11 +127,11 @@ def test_label_apply_failure_still_sets_in_memory_flag(
     runner.state.current_pr = pr
     _install_publish_state_spy(runner)
 
-    label_applied = asyncio.run(runner._escalate_to_hung("park me"))
+    label_applied = asyncio.run(runner._escalate_and_skip("park me"))
 
     assert label_applied is False
     assert pr.is_escalated is True
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert any("failed to apply escalated label to PR #503: gh down" in e["event"] for e in runner.state.history)
 
 
@@ -160,7 +152,7 @@ def test_post_comment_on_pr_calls_post_comment(
     _install_publish_state_spy(runner)
 
     asyncio.run(
-        runner._escalate_to_hung(
+        runner._escalate_and_skip(
             "park me",
             post_comment_on_pr="please review",
         )
@@ -186,13 +178,13 @@ def test_post_comment_failure_logged_not_raised(
     _install_publish_state_spy(runner)
 
     asyncio.run(
-        runner._escalate_to_hung(
+        runner._escalate_and_skip(
             "park me",
             post_comment_on_pr="please review",
         )
     )
 
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert any("failed to post escalation comment on PR #505: gh down" in e["event"] for e in runner.state.history)
 
 
@@ -206,7 +198,7 @@ def test_publish_state_called_at_end(
     runner.state.current_pr = pr
     publish_calls = _install_publish_state_spy(runner)
 
-    asyncio.run(runner._escalate_to_hung("park me"))
+    asyncio.run(runner._escalate_and_skip("park me"))
 
     assert publish_calls == [None]
 
@@ -216,9 +208,8 @@ def test_error_message_override_clears_error_message(
 ) -> None:
     """``error_message_override=None`` clears ``state.error_message``.
 
-    The no-push deadlock wrapper relies on this so HUNG itself remains
-    the parking signal without an operator-visible error_message
-    leaking from the prior FIX cycle.
+    Daemon escalation paths use cancellation cause storage as the parking
+    detail, so callers can clear stale operator-visible error text.
     """
     _patch_label_calls(monkeypatch)
     runner = h._make_runner()
@@ -228,7 +219,7 @@ def test_error_message_override_clears_error_message(
     _install_publish_state_spy(runner)
 
     asyncio.run(
-        runner._escalate_to_hung(
+        runner._escalate_and_skip(
             "park me",
             error_message_override=None,
         )
@@ -249,7 +240,7 @@ def test_log_message_overrides_log_body(
     _install_publish_state_spy(runner)
 
     asyncio.run(
-        runner._escalate_to_hung(
+        runner._escalate_and_skip(
             "stored",
             log_message="logged.",
         )
@@ -270,7 +261,7 @@ def test_set_pr_escalated_flag_false_skips_flag(
     _install_publish_state_spy(runner)
 
     asyncio.run(
-        runner._escalate_to_hung(
+        runner._escalate_and_skip(
             "park me",
             apply_escalated_label=False,
             set_pr_escalated_flag=False,
@@ -278,7 +269,7 @@ def test_set_pr_escalated_flag_false_skips_flag(
     )
 
     assert pr.is_escalated is False
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
 
 
 def test_no_current_pr_skips_label_and_comment(
@@ -297,11 +288,128 @@ def test_no_current_pr_skips_label_and_comment(
     _install_publish_state_spy(runner)
 
     asyncio.run(
-        runner._escalate_to_hung(
+        runner._escalate_and_skip(
             "park me",
             post_comment_on_pr="ignored",
         )
     )
 
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert posted == []
+
+
+def test_records_cause_before_state_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cancellation cause is written while the prior state is still visible."""
+    _patch_label_calls(monkeypatch)
+    seen: list[tuple[str, PipelineState, CancellationCause]] = []
+
+    async def fake_safe_record(redis_client, repo_slug, task_id, cause, *, log=None):
+        seen.append((task_id, runner.state.state, cause))
+
+    monkeypatch.setattr(
+        "src.daemon.runner.safe_record_cancellation_cause",
+        fake_safe_record,
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_task = QueueTask(
+        pr_id="PR-600",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-600",
+    )
+    runner.state.current_pr = PRInfo(number=600, branch="pr-600")
+    _install_publish_state_spy(runner)
+
+    asyncio.run(runner._escalate_and_skip("review timeout"))
+
+    assert runner.state.state == PipelineState.IDLE
+    assert len(seen) == 1
+    task_id, state_at_record, cause = seen[0]
+    assert task_id == "PR-600"
+    assert state_at_record == PipelineState.WATCH
+    assert cause.category == "ESCALATE"
+    assert cause.payload == {
+        "subsource": "daemon",
+        "reason_text": "review timeout",
+        "previous_state": "WATCH",
+    }
+
+
+def test_idle_escalation_clears_current_task_and_marks_recovered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """IDLE escalation abandons the task so IDLE selection cannot reattach it."""
+    _patch_label_calls(monkeypatch)
+    persist_calls: list[set[str]] = []
+
+    async def fake_persist() -> None:
+        persist_calls.append(set(runner._recovered_task_pr_ids))
+
+    runner = h._make_runner()
+    runner._persist_recovered_task_pr_ids = fake_persist  # type: ignore[method-assign]
+    runner._error_skip_active = True
+    runner._idle_dispatch_deferred = True
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = QueueTask(
+        pr_id="PR-601",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-601",
+    )
+    runner.state.current_pr = PRInfo(number=601, branch="pr-601")
+    _install_publish_state_spy(runner)
+
+    asyncio.run(
+        runner._escalate_and_skip(
+            "coder escalated",
+            error_message_override=None,
+        )
+    )
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.current_pr is None
+    assert runner.state.error_message is None
+    assert "PR-601" in runner._recovered_task_pr_ids
+    assert persist_calls == [{"PR-601"}]
+    assert runner._error_skip_active is False
+    assert runner._idle_dispatch_deferred is False
+
+
+def test_error_escalation_preserves_current_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-IDLE escalation can still park with the active task attached."""
+    _patch_label_calls(monkeypatch)
+    persist_calls: list[None] = []
+
+    async def fake_persist() -> None:
+        persist_calls.append(None)
+
+    runner = h._make_runner()
+    runner._persist_recovered_task_pr_ids = fake_persist  # type: ignore[method-assign]
+    task = QueueTask(
+        pr_id="PR-602",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-602",
+    )
+    runner.state.current_task = task
+    runner.state.current_pr = PRInfo(number=602, branch="pr-602")
+    _install_publish_state_spy(runner)
+
+    asyncio.run(
+        runner._escalate_and_skip(
+            "iteration cap",
+            target_state=PipelineState.ERROR,
+        )
+    )
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_task == task
+    assert "PR-602" not in runner._recovered_task_pr_ids
+    assert persist_calls == []

@@ -83,7 +83,7 @@ def test_watch_retrigger_increments_counter(
 def test_watch_retrigger_cap_escalates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """At the cap, escalation fires (HUNG + ``escalated`` label) instead of post."""
+    """At the cap, escalation fires (IDLE + ``escalated`` label) instead of post."""
     posted: list[tuple[str, int, str]] = []
     monkeypatch.setattr(
         "src.github.comments.post_comment",
@@ -101,7 +101,7 @@ def test_watch_retrigger_cap_escalates(
 
     # Cap reached at next_count=3 == cap=3: no @codex review post, escalate.
     assert posted == []
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert pr.is_escalated is True
     assert ["pr", "edit", "99", "--add-label", "escalated"] in gh_calls
     assert runner.state.error_message is not None
@@ -277,7 +277,7 @@ def test_watch_retrigger_cap_configurable(
 
     # next_count=2 == cap=2 -> escalates without posting.
     assert posted == []
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert pr.is_escalated is True
     assert any(
         "(2/2); escalating instead of resetting WATCH" in entry["event"]
@@ -403,7 +403,7 @@ def test_hung_refresh_no_signature_change_still_escalates_at_cap(
 
     # Identical signature -> no reset -> cap fires as before.
     assert posted == []
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert pr.is_escalated is True
     assert ["pr", "edit", "99", "--add-label", "escalated"] in gh_calls
 

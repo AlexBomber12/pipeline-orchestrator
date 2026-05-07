@@ -1046,19 +1046,10 @@ def test_handle_fix_coder_escalate_post_failure_still_parks_pr(
     )
 
 
-def test_handle_fix_coder_escalate_label_apply_failure_parks_in_hung(
+def test_handle_fix_coder_escalate_label_apply_failure_skips_to_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Label apply failure must park in HUNG, not IDLE.
-
-    IDLE refreshes rehydrate ``is_escalated`` from GitHub labels via
-    ``_preserve_fix_iteration_count``; if the label apply soft-failed,
-    transitioning to IDLE would silently drop the parking signal on
-    the next refresh (Codex P1 on PR #228). HUNG honors the in-memory
-    flag, so the runner stays parked until the operator resolves the
-    PR. The comment is still posted (descriptive record) and the
-    ``label create`` soft-fail is unchanged.
-    """
+    """Label apply failure keeps context and returns to IDLE."""
     posted, _ = h._patch_fix_with_stdout(monkeypatch, stdout="ESCALATE: infra error\n")
 
     def fake_run_gh(cmd: list[str], **kwargs: Any) -> str:
@@ -1076,7 +1067,7 @@ def test_handle_fix_coder_escalate_label_apply_failure_parks_in_hung(
 
     asyncio.run(runner.handle_fix())
 
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.is_escalated is True
     assert runner.state.error_message is not None
@@ -1939,16 +1930,37 @@ def test_handle_fix_external_merge_during_coder_transitions_to_idle(
     assert any("merged externally during FIX" in e["event"] for e in runner.state.history)
 
 
-def test_handle_fix_external_close_during_coder_transitions_to_hung(
+def test_handle_fix_external_close_during_coder_skips_with_crash_cause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A polling task that detects CLOSED while the coder runs must park HUNG."""
+    """A polling task that detects CLOSED while the coder runs skips to IDLE."""
+    recorded: list[tuple[str, str, str, dict[str, object]]] = []
+    persisted: list[set[str]] = []
+
+    async def fake_safe_record(redis_client, repo_slug, task_id, cause, *, log=None):
+        recorded.append((repo_slug, task_id, cause.category, cause.payload))
+
+    monkeypatch.setattr(
+        "src.daemon.fix_supervision.safe_record_cancellation_cause",
+        fake_safe_record,
+    )
     h._patch_subprocess(monkeypatch)
 
     runner = h._make_runner()
     runner._app_config = h._app_cfg(fix_poll_interval_sec=1)
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=78, branch="pr-078")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-078",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-078",
+    )
+
+    async def fake_persist_recovered() -> None:
+        persisted.append(set(runner._recovered_task_pr_ids))
+
+    runner._persist_recovered_task_pr_ids = fake_persist_recovered  # type: ignore[method-assign]
 
     async def fake_poll(
         self: object,
@@ -1973,7 +1985,18 @@ def test_handle_fix_external_close_during_coder_transitions_to_hung(
 
     asyncio.run(runner.handle_fix())
 
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert "PR-078" in runner._recovered_task_pr_ids
+    assert persisted == [{"PR-078"}]
+    assert recorded == [
+        (
+            runner.name,
+            "PR-078",
+            "CRASH",
+            {"closed_externally": True, "pr_number": 78},
+        )
+    ]
     assert any("closed externally during FIX" in e["event"] for e in runner.state.history)
 
 
@@ -4258,11 +4281,11 @@ def test_handle_external_terminal_pr_state_logs_without_pr_number(
 
 
 def test_handle_external_terminal_pr_state_closed_logs_without_pr_number() -> None:
-    """No-pr CLOSED race must still transition to HUNG with a generic log."""
+    """No-pr CLOSED race must still transition to IDLE with a generic log."""
     runner = h._make_runner()
     runner.state.current_pr = None
     asyncio.run(runner._handle_external_terminal_pr_state("CLOSED"))
-    assert runner.state.state == PipelineState.HUNG
+    assert runner.state.state == PipelineState.IDLE
     assert any("closed externally during FIX" in entry["event"] for entry in runner.state.history)
 
 

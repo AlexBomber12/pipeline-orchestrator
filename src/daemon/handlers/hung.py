@@ -417,7 +417,7 @@ class HungMixin:
             cap = self.app_config.daemon.watch_retrigger_cap
             next_count = current_pr.watch_retrigger_count + 1
             if next_count >= cap:
-                await self._escalate_to_hung(
+                await self._escalate_and_skip(
                     f"watch_retrigger_cap_reached: {next_count} cycles "
                     f"with no fresh review activity",
                     apply_escalated_label=True,
