@@ -810,6 +810,12 @@ def test_scan_does_not_flag_negated_gh_repo_create():
     assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
 
 
+def test_scan_flags_does_not_conditional_gh_repo_create():
+    body = "If the repo does not exist run gh repo create AlexBomber12/foo."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
+
+
 def test_scan_does_not_flag_negated_ships_in():
     body = "This task does not ship in another repo."
     violations = scan_for_conflicts(body)
@@ -822,16 +828,22 @@ def test_scan_does_not_flag_gh_repo_create_inside_backticks():
     assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
 
 
-def test_scan_does_not_flag_ships_in_inside_double_quotes():
+def test_scan_flags_gh_repo_create_inside_double_quotes():
+    body = 'Run "gh repo create AlexBomber12/foo" during bootstrap.'
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
+
+
+def test_scan_flags_ships_in_inside_double_quotes():
     body = 'Test: body contains "ships in foo-repo" and current=bar.'
     violations = scan_for_conflicts(body)
-    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+    assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
 
 
-def test_scan_does_not_flag_belongs_to_inside_quotes():
+def test_scan_flags_belongs_to_inside_quotes():
     body = 'Fixture: "belongs to other-repo" string.'
     violations = scan_for_conflicts(body)
-    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+    assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
 
 
 def test_scan_does_flag_gh_repo_create_outside_backticks():
@@ -853,8 +865,8 @@ Add patterns named `cross_repo_repo_create`, `cross_repo_repo_delete`,
 and `cross_repo_ships_in`.
 
 Task body containing `gh repo create` triggers the rule.
-Test fixture: body contains "ships in foo-repo" and current_repo_name="bar".
-Fixture: "belongs to other-repo" string.
+Test fixture: body contains `ships in foo-repo` and current_repo_name="bar".
+Fixture: `belongs to other-repo` string.
 """
     violations = scan_for_conflicts(body)
     cross_repo_types = [

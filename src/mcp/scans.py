@@ -36,7 +36,7 @@ class ConflictViolation:
 # produce silent false negatives in the core safety scan.
 _NEGATION_CONTEXT = re.compile(
     r"\b(?:"
-    r"do not|does not|don't|don’t|"
+    r"do not|don't|don’t|"
     r"cannot|can not|can't|can’t|"
     r"never|"
     r"must not|mustn't|mustn’t|"
@@ -138,15 +138,25 @@ def _is_negated(text: str, match_start: int) -> bool:
     return True
 
 
-_INLINE_QUOTE_SUPPRESSION_CATEGORIES = {
+_CROSS_REPO_SHIPPING_DOES_NOT = re.compile(r"\bdoes not\s+$", re.IGNORECASE)
+
+
+def _is_negated_cross_repo_shipping(text: str, match_start: int) -> bool:
+    """Return True for scoped ``does not <shipping verb>`` negation."""
+    clause_start = max(text.rfind(c, 0, match_start) for c in _CLAUSE_BOUNDARIES)
+    clause_start = clause_start + 1 if clause_start >= 0 else 0
+    return bool(_CROSS_REPO_SHIPPING_DOES_NOT.search(text, clause_start, match_start))
+
+
+_INLINE_CODE_SUPPRESSION_CATEGORIES = {
     "cross_repo_repo_create",
     "cross_repo_repo_delete",
     "cross_repo_ships_in",
 }
 
 
-def _is_inside_inline_code_or_quote(text: str, match_start: int) -> bool:
-    """Return True when ``match_start`` is in inline code or quotes.
+def _is_inside_inline_code(text: str, match_start: int) -> bool:
+    """Return True when ``match_start`` is in inline code.
 
     This intentionally checks only the current physical line. The
     cross-repo patterns need to ignore specs that describe the detection
@@ -156,8 +166,6 @@ def _is_inside_inline_code_or_quote(text: str, match_start: int) -> bool:
     line_start = text.rfind("\n", 0, match_start) + 1
     prefix = text[line_start:match_start]
     if prefix.count("`") % 2 == 1:
-        return True
-    if prefix.count('"') % 2 == 1:
         return True
     return False
 
@@ -377,9 +385,14 @@ def scan_for_conflicts(task_spec_body: str) -> list[ConflictViolation]:
         for match in pattern.finditer(normalized):
             if _is_negated(normalized, match.start()):
                 continue
+            if vtype == "cross_repo_ships_in" and _is_negated_cross_repo_shipping(
+                normalized,
+                match.start(),
+            ):
+                continue
             if (
-                vtype in _INLINE_QUOTE_SUPPRESSION_CATEGORIES
-                and _is_inside_inline_code_or_quote(normalized, match.start())
+                vtype in _INLINE_CODE_SUPPRESSION_CATEGORIES
+                and _is_inside_inline_code(normalized, match.start())
             ):
                 continue
             line_start = normalized.rfind("\n", 0, match.start()) + 1
