@@ -3431,20 +3431,37 @@ def test_run_cycle_pending_upload_retries_keep_polling_fast(
     assert runner._idle_streak == 0
 
 
-def test_handle_idle_emits_agents_scan_events_when_specs_drift(
+def test_idle_does_not_invoke_agents_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs", lambda repo, **kw: []
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    runner = h._make_runner()
+    calls = 0
+
+    def fake_scan() -> None:
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(runner, "_scan_task_specs_for_agents_md_drift", fake_scan)
+
+    asyncio.run(runner.handle_idle())
+
+    assert calls == 0
+
+
+def test_agents_scan_method_emits_events_when_specs_drift(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """The IDLE handler must invoke ``reconcile_agents_md`` with the
-    runner's ``log_event`` so the PR-260 drift scan reaches production.
-
-    Regression for the PR-260 review feedback: the scan was wired into
-    ``reconcile_agents_md`` but no daemon caller passed ``log_event_fn``,
-    so violations were detected only by tests, never by the daemon.
-    Pinning the IDLE-cycle invocation guarantees that pre-existing task
-    specs containing AGENTS.md anti-patterns surface in the dashboard
-    event log.
-    """
+    """The scan method buffers reconcile events through the runner log."""
     h._patch_subprocess(monkeypatch)
 
     tasks_dir = tmp_path / "tasks"
@@ -3464,7 +3481,7 @@ def test_handle_idle_emits_agents_scan_events_when_specs_drift(
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
-    asyncio.run(runner.handle_idle())
+    runner._scan_task_specs_for_agents_md_drift()
 
     scan_events = [
         entry["event"]
@@ -3480,7 +3497,7 @@ def test_handle_idle_emits_agents_scan_events_when_specs_drift(
     )
 
 
-def test_handle_idle_clean_tasks_dir_emits_no_agents_scan_events(
+def test_agents_scan_method_clean_tasks_dir_emits_no_events(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -3508,7 +3525,7 @@ def test_handle_idle_clean_tasks_dir_emits_no_agents_scan_events(
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
-    asyncio.run(runner.handle_idle())
+    runner._scan_task_specs_for_agents_md_drift()
 
     scan_events = [
         entry["event"]
@@ -3518,7 +3535,7 @@ def test_handle_idle_clean_tasks_dir_emits_no_agents_scan_events(
     assert scan_events == []
 
 
-def test_handle_idle_swallows_os_error_in_agents_md_read(
+def test_agents_scan_method_swallows_os_error_in_agents_md_read(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -3545,7 +3562,7 @@ def test_handle_idle_swallows_os_error_in_agents_md_read(
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
-    asyncio.run(runner.handle_idle())
+    runner._scan_task_specs_for_agents_md_drift()
 
     assert runner.state.state == PipelineState.IDLE
     scan_events = [
@@ -3558,7 +3575,7 @@ def test_handle_idle_swallows_os_error_in_agents_md_read(
     ), scan_events
 
 
-def test_handle_idle_swallows_marker_error_in_agents_md(
+def test_agents_scan_method_swallows_marker_error_in_agents_md(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -3589,7 +3606,7 @@ def test_handle_idle_swallows_marker_error_in_agents_md(
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
-    asyncio.run(runner.handle_idle())
+    runner._scan_task_specs_for_agents_md_drift()
 
     assert runner.state.state == PipelineState.IDLE
     scan_events = [
@@ -3602,7 +3619,7 @@ def test_handle_idle_swallows_marker_error_in_agents_md(
     ), scan_events
 
 
-def test_handle_idle_swallows_unicode_error_in_agents_md(
+def test_agents_scan_method_swallows_unicode_error_in_agents_md(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -3630,7 +3647,7 @@ def test_handle_idle_swallows_unicode_error_in_agents_md(
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
-    asyncio.run(runner.handle_idle())
+    runner._scan_task_specs_for_agents_md_drift()
 
     assert runner.state.state == PipelineState.IDLE
     scan_events = [
@@ -3643,7 +3660,7 @@ def test_handle_idle_swallows_unicode_error_in_agents_md(
     ), scan_events
 
 
-def test_handle_idle_suppresses_unchanged_agents_scan_output(
+def test_agents_scan_method_suppresses_unchanged_output(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -3674,7 +3691,7 @@ def test_handle_idle_suppresses_unchanged_agents_scan_output(
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
 
-    asyncio.run(runner.handle_idle())
+    runner._scan_task_specs_for_agents_md_drift()
     first_pass_scan = [
         entry["event"]
         for entry in runner.state.history
@@ -3685,7 +3702,7 @@ def test_handle_idle_suppresses_unchanged_agents_scan_output(
         for event in first_pass_scan
     ), first_pass_scan
 
-    asyncio.run(runner.handle_idle())
+    runner._scan_task_specs_for_agents_md_drift()
     second_pass_scan = [
         entry["event"]
         for entry in runner.state.history
@@ -3699,7 +3716,7 @@ def test_handle_idle_suppresses_unchanged_agents_scan_output(
     )
 
 
-def test_handle_idle_re_emits_agents_scan_when_drift_changes(
+def test_agents_scan_method_re_emits_when_drift_changes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -3729,7 +3746,7 @@ def test_handle_idle_re_emits_agents_scan_when_drift_changes(
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
 
-    asyncio.run(runner.handle_idle())
+    runner._scan_task_specs_for_agents_md_drift()
     history_after_first = len([
         entry for entry in runner.state.history
         if entry["event"].startswith("[AGENTS-SCAN]")
@@ -3739,7 +3756,7 @@ def test_handle_idle_re_emits_agents_scan_when_drift_changes(
         "# PR-088: Old spec\n\nRun git commit --no-verify to skip hooks.\n",
         encoding="utf-8",
     )
-    asyncio.run(runner.handle_idle())
+    runner._scan_task_specs_for_agents_md_drift()
 
     scan_events = [
         entry["event"]
@@ -3751,4 +3768,3 @@ def test_handle_idle_re_emits_agents_scan_when_drift_changes(
         "PR-088.md" in event and "no_verify_commit" in event
         for event in scan_events
     ), scan_events
-

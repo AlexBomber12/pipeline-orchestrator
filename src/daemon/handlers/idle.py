@@ -520,7 +520,8 @@ class IdleMixin:
             )
             return
 
-        self._scan_task_specs_for_agents_md_drift()
+        # AGENTS-SCAN periodic IDLE invocation removed
+        # (PR-260 detection without response generated event-log noise; see backlog OBS-CE)
 
         upload_result = await self.process_pending_uploads()
         if upload_result is None:
