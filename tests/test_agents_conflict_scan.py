@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from src.mcp.scans import scan_for_conflicts
 
-
 _CLEAN_SPEC = """# PR-999: Example task
 
 Branch: pr-999-example
@@ -755,3 +754,94 @@ def test_no_verify_detected_across_shell_continuation():
     violations = scan_for_conflicts(body)
     types = {v.violation_type for v in violations}
     assert "no_verify_commit" in types
+
+
+def test_scan_flags_gh_repo_create():
+    body = "Run gh repo create AlexBomber12/foo during bootstrap."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
+
+
+def test_scan_flags_gh_repo_delete():
+    body = "Run gh repo delete AlexBomber12/foo during cleanup."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_delete"]
+
+
+def test_scan_flags_ships_in_phrasing():
+    body = "This PR ships in homelab-monitoring repository."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
+
+
+def test_scan_flags_belongs_to_phrasing():
+    body = "This task belongs to other-repo."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
+
+
+def test_scan_flags_in_repo_phrasing():
+    body = "The implementation is in the homelab-monitoring repository."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
+
+
+def test_scan_does_not_flag_negated_gh_repo_create():
+    body = "Coders must not run gh repo create from dispatched tasks."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
+def test_scan_does_not_flag_negated_ships_in():
+    body = "This task does not ship in another repo."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
+def test_scan_does_not_flag_gh_repo_create_inside_backticks():
+    body = "`gh repo create` is the command we block."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
+def test_scan_does_not_flag_ships_in_inside_double_quotes():
+    body = 'Test: body contains "ships in foo-repo" and current=bar.'
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
+def test_scan_does_not_flag_belongs_to_inside_quotes():
+    body = 'Fixture: "belongs to other-repo" string.'
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
+def test_scan_does_flag_gh_repo_create_outside_backticks():
+    body = "Run gh repo create today."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
+
+
+def test_scan_does_not_flag_pr_275_spec_itself():
+    body = """# PR-275: MCP cross-repo intent detection
+
+## Problem
+
+OBS-BT documented a session where a coder executed `gh repo create`.
+
+## Scope
+
+Add patterns named `cross_repo_repo_create`, `cross_repo_repo_delete`,
+and `cross_repo_ships_in`.
+
+Task body containing `gh repo create` triggers the rule.
+Test fixture: body contains "ships in foo-repo" and current_repo_name="bar".
+Fixture: "belongs to other-repo" string.
+"""
+    violations = scan_for_conflicts(body)
+    cross_repo_types = [
+        v.violation_type
+        for v in violations
+        if v.violation_type.startswith("cross_repo_")
+    ]
+    assert cross_repo_types == []

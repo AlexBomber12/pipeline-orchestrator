@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,12 @@ from src.github import gh_runner
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 
 from tests.runner import _helpers as h
+
+
+def test_handle_coding_no_longer_invokes_detect_cross_repo_intent() -> None:
+    source = inspect.getsource(coding_module)
+    assert "detect_cross_repo_intent" not in source
+    assert "CROSS_REPO_INTENT" not in source
 
 
 def _runner(

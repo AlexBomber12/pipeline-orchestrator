@@ -36,7 +36,7 @@ class ConflictViolation:
 # produce silent false negatives in the core safety scan.
 _NEGATION_CONTEXT = re.compile(
     r"\b(?:"
-    r"do not|don't|don’t|"
+    r"do not|does not|don't|don’t|"
     r"cannot|can not|can't|can’t|"
     r"never|"
     r"must not|mustn't|mustn’t|"
@@ -136,6 +136,30 @@ def _is_negated(text: str, match_start: int) -> bool:
     if _DOUBLE_NEGATIVE_INVERTER.search(text, nearest.end(), match_start):
         return False
     return True
+
+
+_INLINE_QUOTE_SUPPRESSION_CATEGORIES = {
+    "cross_repo_repo_create",
+    "cross_repo_repo_delete",
+    "cross_repo_ships_in",
+}
+
+
+def _is_inside_inline_code_or_quote(text: str, match_start: int) -> bool:
+    """Return True when ``match_start`` is in inline code or quotes.
+
+    This intentionally checks only the current physical line. The
+    cross-repo patterns need to ignore specs that describe the detection
+    rule itself, without changing long-standing behavior for the older
+    anti-pattern categories.
+    """
+    line_start = text.rfind("\n", 0, match_start) + 1
+    prefix = text[line_start:match_start]
+    if prefix.count("`") % 2 == 1:
+        return True
+    if prefix.count('"') % 2 == 1:
+        return True
+    return False
 
 
 _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
@@ -281,6 +305,38 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         re.compile(r"\bauto.merge[^\n]*(dirty|red|failing)\b", re.IGNORECASE),
         "AGENTS.md prohibits merging with failing checks.",
     ),
+    (
+        "cross_repo_repo_create",
+        # gh CLI command that creates a new GitHub repository on the
+        # operator's account or organization. Bare command form;
+        # negation suppression handled by the shared _is_negated check.
+        re.compile(r"\bgh repo create\b", re.IGNORECASE),
+        "AGENTS.md prohibits creating GitHub repositories from coder dispatches. OBS-BT.",
+    ),
+    (
+        "cross_repo_repo_delete",
+        # gh CLI command that deletes a GitHub repository. Same form
+        # and rationale as cross_repo_repo_create.
+        re.compile(r"\bgh repo delete\b", re.IGNORECASE),
+        "AGENTS.md prohibits deleting GitHub repositories from coder dispatches. OBS-BT.",
+    ),
+    (
+        "cross_repo_ships_in",
+        # Phrase form indicating the spec author believes this task ships
+        # in a different repository. Captures phrasings observed in
+        # OBS-BT (verb forms: `ships`, `belongs`, `lives`, `deploys`,
+        # `targets`; identifier shape: slug-style chars). Negation
+        # suppression by the shared `_is_negated` check covers prose that
+        # explicitly forbids the shipping verb.
+        re.compile(
+            r"\b(?:"
+            r"ships? in|belongs to|lives in|deploys to|targets|"
+            r"in (?:the )?[\w.-]+ repo(?:sitory)?"
+            r")\b",
+            re.IGNORECASE,
+        ),
+        "Cross-repo target phrasing detected. Verify the task is uploaded to the correct repo. OBS-BT.",
+    ),
 ]
 
 
@@ -313,6 +369,11 @@ def scan_for_conflicts(task_spec_body: str) -> list[ConflictViolation]:
     for vtype, pattern, rule in _ANTI_PATTERNS:
         for match in pattern.finditer(normalized):
             if _is_negated(normalized, match.start()):
+                continue
+            if (
+                vtype in _INLINE_QUOTE_SUPPRESSION_CATEGORIES
+                and _is_inside_inline_code_or_quote(normalized, match.start())
+            ):
                 continue
             line_start = normalized.rfind("\n", 0, match.start()) + 1
             line_end = normalized.find("\n", match.start())
