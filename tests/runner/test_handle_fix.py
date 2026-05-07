@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import subprocess
 import types
 from datetime import datetime, timedelta, timezone
@@ -3991,7 +3992,9 @@ def test_monitor_fix_idle_logs_poll_failures_before_timing_out(
         if fake_branch_last_push.calls == 0:
             fake_branch_last_push.calls += 1
             return None
-        raise fix_supervision_module.gh_prs.GitHubPollError("poll failed")
+        raise fix_supervision_module.gh_prs.GitHubPollError(
+            "simulated transient API error"
+        )
 
     fake_branch_last_push.calls = 0
 
@@ -4032,10 +4035,12 @@ def test_monitor_fix_idle_logs_poll_failures_before_timing_out(
     idle_flag, target = asyncio.run(run_monitor())
     assert idle_flag["timed_out"] is True
     assert target.cancelled() is True
-    assert events == [
-        "[FIX] GitHub API poll failed, preserving deadline.",
-        "[FIX] idle timeout (30s since last push), killing.",
-    ]
+    assert re.fullmatch(
+        r"\[FIX\] GitHub API poll failed: .+, preserving deadline\.",
+        events[0],
+    )
+    assert "simulated transient API error" in events[0]
+    assert events[1] == "[FIX] idle timeout (30s since last push), killing."
 
 
 def test_run_coder_with_polling_returns_none_when_pr_number_is_zero() -> None:
