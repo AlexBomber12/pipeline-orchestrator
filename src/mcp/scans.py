@@ -233,6 +233,34 @@ def _is_inside_inline_code(text: str, match_start: int) -> bool:
     return False
 
 
+def _is_inside_double_quoted_span(text: str, match_start: int) -> bool:
+    """Return True when ``match_start`` is inside a closed double-quoted span."""
+    line_start = text.rfind("\n", 0, match_start) + 1
+    line_end = text.find("\n", match_start)
+    if line_end == -1:
+        line_end = len(text)
+    line = text[line_start:line_end]
+    relative_match_start = match_start - line_start
+    opener: int | None = None
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char != '"':
+            continue
+        if opener is None:
+            opener = index
+            continue
+        if opener < relative_match_start < index:
+            return True
+        opener = None
+    return False
+
+
 def _is_inside_fenced_code(text: str, match_start: int) -> bool:
     """Return True when ``match_start`` is inside a Markdown code fence."""
     in_fence = False
@@ -438,8 +466,12 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         re.compile(
             r"\b(?:"
             r"(?:ships? in|belongs to|lives in|deploys to|targets) "
-            r"(?:[\w.-]+/[\w.-]+(?!/)|(?:the )?[\w.-]*[.-][\w.-]+ repo(?:sitory)?|(?:the )?\w+ repository)|"
-            r"in (?:the )?(?:[\w.-]*[.-][\w.-]+ repo(?:sitory)?|[\w.-]+/[\w.-]+ repo(?:sitory)?|\w+ repository)"
+            r"(?:[\w.-]+/[\w.-]+(?!/)|"
+            r"(?!the repo(?:sitory)?\b)(?:the (?!repo(?:sitory)?\b)\w+|\w+) repo(?:sitory)?|"
+            r"(?:the )?[\w.-]*[.-][\w.-]+ repo(?:sitory)?)|"
+            r"in (?:(?:the )?[\w.-]*[.-][\w.-]+ repo(?:sitory)?|"
+            r"(?:the )?[\w.-]+/[\w.-]+ repo(?:sitory)?|"
+            r"(?!the repository\b)(?:the (?!repository\b)\w+|\w+) repository)"
             r")\b",
             re.IGNORECASE,
         ),
@@ -495,6 +527,11 @@ def scan_for_conflicts(task_spec_body: str) -> list[ConflictViolation]:
             if (
                 vtype in _INLINE_CODE_SUPPRESSION_CATEGORIES
                 and _is_inside_inline_code(normalized, match.start())
+            ):
+                continue
+            if (
+                vtype in _INLINE_CODE_SUPPRESSION_CATEGORIES
+                and _is_inside_double_quoted_span(normalized, match.start())
             ):
                 continue
             if (

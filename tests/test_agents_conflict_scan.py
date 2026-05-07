@@ -833,6 +833,18 @@ def test_scan_flags_ships_in_underscore_repository_name_phrasing():
     assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
 
 
+def test_scan_flags_ships_in_single_word_repo_phrasing():
+    body = "This task ships in foo repo."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
+
+
+def test_scan_flags_belongs_to_single_word_repo_phrasing():
+    body = "This task belongs to foo repo."
+    violations = scan_for_conflicts(body)
+    assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
+
+
 def test_scan_does_not_flag_plain_targets_prose():
     body = "This PR targets Python 3.12."
     violations = scan_for_conflicts(body)
@@ -847,6 +859,12 @@ def test_scan_does_not_flag_plain_deploys_to_production_prose():
 
 def test_scan_does_not_flag_plain_lives_in_path_prose():
     body = "The module lives in src/mcp/scans.py."
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
+def test_scan_does_not_flag_plain_lives_in_the_repository_prose():
+    body = "This behavior lives in the repository validation layer."
     violations = scan_for_conflicts(body)
     assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
 
@@ -1046,22 +1064,28 @@ This PR ships in foo-repo repository.
     assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
 
 
-def test_scan_flags_gh_repo_create_inside_double_quotes():
+def test_scan_does_not_flag_gh_repo_create_inside_double_quotes():
     body = 'Run "gh repo create AlexBomber12/foo" during bootstrap.'
+    violations = scan_for_conflicts(body)
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
+
+
+def test_scan_flags_gh_repo_create_after_closed_double_quotes():
+    body = '"literal example" then run gh repo create AlexBomber12/foo.'
     violations = scan_for_conflicts(body)
     assert [v.violation_type for v in violations] == ["cross_repo_repo_create"]
 
 
-def test_scan_flags_ships_in_inside_double_quotes():
+def test_scan_does_not_flag_ships_in_inside_double_quotes():
     body = 'Test: body contains "ships in foo-repo repository" and current=bar.'
     violations = scan_for_conflicts(body)
-    assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
 
 
-def test_scan_flags_belongs_to_inside_quotes():
+def test_scan_does_not_flag_belongs_to_inside_quotes():
     body = 'Fixture: "belongs to other-repo repository" string.'
     violations = scan_for_conflicts(body)
-    assert [v.violation_type for v in violations] == ["cross_repo_ships_in"]
+    assert not any(v.violation_type.startswith("cross_repo_") for v in violations)
 
 
 def test_scan_does_flag_gh_repo_create_outside_backticks():
