@@ -97,7 +97,6 @@ _CROSS_REPO_CLAUSE_BOUNDARIES = ".,;!?:\n"
 _CROSS_REPO_EXCERPT_LIMIT = 120
 _CROSS_REPO_PLACEHOLDER_NAMES = {"the", "this", "current", "same"}
 _CROSS_REPO_PR_ID_TOKEN = re.compile(r"^pr-\d+$", re.IGNORECASE)
-_CROSS_REPO_NEGATION_DISCONNECTOR = re.compile(r"\b(?:and|but|or)\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -178,7 +177,7 @@ def _is_cross_repo_intent_negated(text: str, match_start: int) -> bool:
     between = text[nearest.end() : match_start]
     if between.lstrip().lower().startswith("only"):
         return False
-    if _CROSS_REPO_NEGATION_DISCONNECTOR.search(between):
+    if nearest.group(0).lower() == "not" and between.strip():
         return False
     if _CROSS_REPO_DOUBLE_NEGATIVE_INVERTER.search(
         between

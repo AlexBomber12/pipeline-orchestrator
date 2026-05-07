@@ -165,6 +165,26 @@ def test_detect_cross_repo_intent_unrelated_not_still_flags() -> None:
     assert "ships in homelab-monitoring" in result
 
 
+def test_detect_cross_repo_intent_unrelated_not_because_still_flags() -> None:
+    result = detect_cross_repo_intent(
+        "This change is not trivial because it ships in homelab-monitoring.",
+        "megaraid-dashboard",
+    )
+
+    assert result is not None
+    assert "ships in homelab-monitoring" in result
+
+
+def test_detect_cross_repo_intent_coordinated_negated_references_return_none() -> None:
+    assert (
+        detect_cross_repo_intent(
+            "Do not work in foo repo or in bar repo.",
+            "pipeline-orchestrator",
+        )
+        is None
+    )
+
+
 def test_detect_cross_repo_intent_gh_repo_create_always_flags() -> None:
     result = detect_cross_repo_intent(
         "Never automate this manually: gh repo create something.",
