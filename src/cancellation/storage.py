@@ -4,6 +4,11 @@ The cancellation policy substrate. Detection paths (PR-253) write
 through these helpers; UI (PR-254) reads through them. Centralizing
 the schema here makes the contract bisectable from its consumers.
 PR-252.
+
+``ESCALATE`` causes use ``payload.subsource`` to distinguish explicit
+coder ``ESCALATE`` markers from daemon-detected stuck states. Canonical
+values are ``"coder"`` and ``"daemon"``; the daemon subsource includes
+transitions that previously used HUNG-specific cancellation semantics.
 """
 
 from __future__ import annotations
@@ -18,7 +23,6 @@ CATEGORIES = (
     "ESCALATE",
     "TIMEOUT",
     "INFRA",
-    "OPERATOR_RECOVERY",
     "NO_PUSH_DEADLOCK",
 )
 

@@ -125,15 +125,18 @@ class _FakeRedis:
         return float(value), False
 
 
-def test_categories_cover_expected_set() -> None:
-    assert set(CATEGORIES) == {
+def test_categories_tuple_does_not_include_operator_recovery() -> None:
+    assert "OPERATOR_RECOVERY" not in CATEGORIES
+
+
+def test_categories_tuple_has_5_canonical_values() -> None:
+    assert CATEGORIES == (
         "CRASH",
         "ESCALATE",
         "TIMEOUT",
         "INFRA",
-        "OPERATOR_RECOVERY",
         "NO_PUSH_DEADLOCK",
-    }
+    )
 
 
 def test_cause_and_index_key_format() -> None:
@@ -228,7 +231,7 @@ async def test_multi_repo_isolation() -> None:
         "beta",
         "PR-500",
         CancellationCause(
-            category="OPERATOR_RECOVERY",
+            category="ESCALATE",
             payload={"actor": "alice"},
             created_at="2026-05-04T09:05:00+00:00",
         ),
@@ -237,7 +240,7 @@ async def test_multi_repo_isolation() -> None:
     alpha = await get_cancellation_cause(redis, "alpha", "PR-500")
     beta = await get_cancellation_cause(redis, "beta", "PR-500")
     assert alpha is not None and alpha.category == "TIMEOUT"
-    assert beta is not None and beta.category == "OPERATOR_RECOVERY"
+    assert beta is not None and beta.category == "ESCALATE"
     assert alpha.repo_slug == "alpha"
     assert beta.repo_slug == "beta"
 

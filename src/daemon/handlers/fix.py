@@ -587,7 +587,10 @@ class FixMixin(BreachMixin):
                     self.state.current_task.pr_id,
                     CancellationCause(
                         category="ESCALATE",
-                        payload={"reason_text": escalate_reason},
+                        payload={
+                            "subsource": "coder",
+                            "reason_text": escalate_reason,
+                        },
                     ),
                     log=self.log_event,
                 )

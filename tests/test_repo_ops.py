@@ -68,18 +68,10 @@ class _Runner(repo_ops.RepoOpsMixin):
         self.name = "demo"
         self.events: list[str] = []
         self._crashed_task_pr_ids: set[str] = set()
-        self._recovered_task_pr_ids: set[str] = set()
-        self._recovered_persist_calls: list[frozenset[str]] = []
         self.state = SimpleNamespace(current_queue=None)
 
     def log_event(self, message: str) -> None:
         self.events.append(message)
-
-    async def _persist_recovered_task_pr_ids(self) -> None:
-        self._recovered_persist_calls.append(
-            frozenset(self._recovered_task_pr_ids)
-        )
-
 
 def _run(coro: Any) -> Any:
     return asyncio.run(coro)
@@ -586,18 +578,13 @@ def test_process_pending_uploads_clears_crashed_pr_ids_on_reupload(
     assert runner._crashed_task_pr_ids == {"PR-999"}
 
 
-def test_process_pending_uploads_clears_recovered_pr_ids_on_reupload(
+def test_process_pending_uploads_clears_crashed_pr_ids_on_reupload(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """PR-247 follow-up: Re-uploading a task file the operator error
-    via the HUNG recover button is the user's signal to retry. The
-    recovered-pr-ids set must be cleared for any uploaded PR-id so the
-    next IDLE cycle no longer forces it ERROR, mirroring the PR-186
-    contract for the crashed-pr-ids set. Other recovered entries that
-    were not re-uploaded must remain intact."""
+    """Re-uploading an errored task file is the user's retry signal."""
     runner = _Runner(tmp_path)
-    runner._recovered_task_pr_ids.update({"PR-001", "PR-999"})
+    runner._crashed_task_pr_ids.update({"PR-001", "PR-999"})
     Path(runner.repo_path).mkdir(parents=True)
     staging = tmp_path / "uploads" / "demo"
     staging.mkdir(parents=True)
@@ -611,11 +598,7 @@ def test_process_pending_uploads_clears_recovered_pr_ids_on_reupload(
     monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
 
     assert _run(runner.process_pending_uploads()) is True
-    assert runner._recovered_task_pr_ids == {"PR-999"}
-    # PR-247 follow-up: the trimmed recovered-task set must be persisted
-    # so a daemon restart immediately after upload does not rehydrate
-    # the stale set from Redis and re-cancel the freshly retried task.
-    assert runner._recovered_persist_calls == [frozenset({"PR-999"})]
+    assert runner._crashed_task_pr_ids == {"PR-999"}
 
 
 def test_process_pending_uploads_flips_canceled_to_todo_in_snapshot(

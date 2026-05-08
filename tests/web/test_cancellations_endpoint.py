@@ -202,10 +202,22 @@ def test_partial_endpoint_renders_each_category(cancellations_client) -> None:
             created_at=(now - timedelta(minutes=10)).isoformat(),
         ),
         _make_cause(
-            "PR-ESC",
+            "PR-ESC-CODER",
             category="ESCALATE",
-            payload={"reason_text": "manual ESCALATE marker"},
+            payload={
+                "subsource": "coder",
+                "reason_text": "manual ESCALATE marker",
+            },
             created_at=(now - timedelta(minutes=20)).isoformat(),
+        ),
+        _make_cause(
+            "PR-ESC-DAEMON",
+            category="ESCALATE",
+            payload={
+                "subsource": "daemon",
+                "reason_text": "review timeout",
+            },
+            created_at=(now - timedelta(minutes=25)).isoformat(),
         ),
         _make_cause(
             "PR-TO",
@@ -228,12 +240,6 @@ def test_partial_endpoint_renders_each_category(cancellations_client) -> None:
             created_at=(now - timedelta(minutes=40)).isoformat(),
         ),
         _make_cause(
-            "PR-OPR",
-            category="OPERATOR_RECOVERY",
-            payload={},
-            created_at=(now - timedelta(minutes=50)).isoformat(),
-        ),
-        _make_cause(
             "PR-NPD",
             category="NO_PUSH_DEADLOCK",
             payload={"attempts": 3},
@@ -250,14 +256,13 @@ def test_partial_endpoint_renders_each_category(cancellations_client) -> None:
     assert "category-escalate" in body and ">ESCALATE<" in body
     assert "category-timeout" in body and ">TIMEOUT<" in body
     assert "category-infra" in body and ">INFRA<" in body
-    assert "category-operator_recovery" in body and ">OPERATOR_RECOVERY<" in body
     assert "category-no_push_deadlock" in body and ">NO_PUSH_DEADLOCK<" in body
     # Payload fields render per branch.
     assert "boom on stderr" in body
-    assert "manual ESCALATE marker" in body
+    assert "Coder gave up: manual ESCALATE marker" in body
+    assert "Daemon detected stuck: review timeout" in body
     assert "wallclock" in body and "1800s" in body and "CODING" in body
     assert "gh_api" in body
-    assert "Manual recovery via dashboard" in body
     assert "no push for" in body and ">3<" in body
 
 

@@ -22,7 +22,13 @@
             {% endif %}
         {% elif cause.category == 'ESCALATE' %}
             {% if cause.payload.get('reason_text') %}
+                {% if cause.payload.get('subsource') == 'coder' %}
+            <div class="cancellation-reason">Coder gave up: {{ cause.payload.get('reason_text') }}</div>
+                {% elif cause.payload.get('subsource') == 'daemon' %}
+            <div class="cancellation-reason">Daemon detected stuck: {{ cause.payload.get('reason_text') }}</div>
+                {% else %}
             <div class="cancellation-reason">{{ cause.payload.get('reason_text') }}</div>
+                {% endif %}
             {% endif %}
         {% elif cause.category == 'TIMEOUT' %}
             {% if cause.payload.get('limit_type') %}
@@ -48,8 +54,6 @@
                       data-ts="{{ cause.payload.get('last_attempt_iso') }}">{{ cause.payload.get('last_attempt_iso') }}</time>
             </div>
             {% endif %}
-        {% elif cause.category == 'OPERATOR_RECOVERY' %}
-            <div>Manual recovery via dashboard</div>
         {% elif cause.category == 'NO_PUSH_DEADLOCK' %}
             {% if cause.payload.get('attempts') is not none %}
             <div>FIX iteration produced no push for <span class="font-mono">{{ cause.payload.get('attempts') }}</span> cycles</div>

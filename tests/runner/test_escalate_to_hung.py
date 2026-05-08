@@ -396,18 +396,13 @@ def test_records_cause_before_state_transition(
     }
 
 
-def test_idle_escalation_clears_current_task_and_marks_recovered(
+def test_idle_escalation_clears_current_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """IDLE escalation abandons the task so IDLE selection cannot reattach it."""
     _patch_label_calls(monkeypatch)
-    persist_calls: list[set[str]] = []
-
-    async def fake_persist() -> None:
-        persist_calls.append(set(runner._recovered_task_pr_ids))
 
     runner = h._make_runner()
-    runner._persist_recovered_task_pr_ids = fake_persist  # type: ignore[method-assign]
     runner._error_skip_active = True
     runner._idle_dispatch_deferred = True
     runner.state.state = PipelineState.CODING
@@ -431,8 +426,7 @@ def test_idle_escalation_clears_current_task_and_marks_recovered(
     assert runner.state.current_task is None
     assert runner.state.current_pr is None
     assert runner.state.error_message is None
-    assert "PR-601" in runner._recovered_task_pr_ids
-    assert persist_calls == [{"PR-601"}]
+    assert not hasattr(runner, "_recovered_task_pr_ids")
     assert runner._error_skip_active is False
     assert runner._idle_dispatch_deferred is False
 
@@ -442,13 +436,7 @@ def test_error_escalation_preserves_current_task(
 ) -> None:
     """Non-IDLE escalation can still park with the active task attached."""
     _patch_label_calls(monkeypatch)
-    persist_calls: list[None] = []
-
-    async def fake_persist() -> None:
-        persist_calls.append(None)
-
     runner = h._make_runner()
-    runner._persist_recovered_task_pr_ids = fake_persist  # type: ignore[method-assign]
     task = QueueTask(
         pr_id="PR-602",
         title="t",
@@ -468,8 +456,7 @@ def test_error_escalation_preserves_current_task(
 
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.current_task == task
-    assert "PR-602" not in runner._recovered_task_pr_ids
-    assert persist_calls == []
+    assert not hasattr(runner, "_recovered_task_pr_ids")
 
 
 def test_escalate_and_skip_writes_status_error_to_file(
@@ -482,13 +469,14 @@ def test_escalate_and_skip_writes_status_error_to_file(
     runner.repo_path = str(repo)
     runner.state.state = PipelineState.FIX
     runner.state.current_pr = PRInfo(number=700, branch="pr-test")
-    runner.state.current_task = QueueTask(
+    task = QueueTask(
         pr_id="PR-700",
         title="t",
         status=TaskStatus.DOING,
         branch="pr-test",
         task_file="tasks/PR-700.md",
     )
+    runner.state.current_task = task
     _install_publish_state_spy(runner)
 
     asyncio.run(runner._escalate_and_skip("final failure"))
@@ -514,13 +502,14 @@ def test_escalate_status_commit_ignores_divergent_pr_branch_task_file(
     runner.repo_path = str(repo)
     runner.state.state = PipelineState.FIX
     runner.state.current_pr = PRInfo(number=700, branch="pr-test")
-    runner.state.current_task = QueueTask(
+    task = QueueTask(
         pr_id="PR-700",
         title="t",
         status=TaskStatus.DOING,
         branch="pr-test",
         task_file="tasks/PR-700.md",
     )
+    runner.state.current_task = task
     _install_publish_state_spy(runner)
 
     asyncio.run(runner._escalate_and_skip("final failure"))
@@ -565,20 +554,21 @@ def test_escalate_logs_status_commit_exception(
     )
 
 
-def test_escalate_skips_status_commit_for_recoverable_escalation(
+def test_escalate_writes_status_error_for_recoverable_escalation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_label_calls(monkeypatch)
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=700, branch="pr-test")
-    runner.state.current_task = QueueTask(
+    task = QueueTask(
         pr_id="PR-700",
         title="t",
         status=TaskStatus.DOING,
         branch="pr-test",
         task_file="tasks/PR-700.md",
     )
+    runner.state.current_task = task
     _install_publish_state_spy(runner)
     commit_calls: list[tuple[Any, ...]] = []
 
@@ -595,7 +585,9 @@ def test_escalate_skips_status_commit_for_recoverable_escalation(
         )
     )
 
-    assert commit_calls == []
+    assert commit_calls == [
+        (task, "ERROR", "review timeout")
+    ]
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
 
