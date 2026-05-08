@@ -17,6 +17,7 @@ from src.branch_context import BranchContext
 from src.cancellation import (
     CancellationCause,
     classify_infra_exception,
+    get_task_spec_hash,
     record_task_spec_hash,
     task_spec_content_hash,
 )
@@ -225,6 +226,12 @@ class CodingMixin:
             return
         task_hash = task_spec_content_hash(task_body)
         try:
+            previous_task_hash = await get_task_spec_hash(
+                self.redis, self.name, pr_id
+            )
+        except Exception:
+            previous_task_hash = None
+        try:
             await record_task_spec_hash(self.redis, self.name, pr_id, task_hash)
         except Exception as exc:
             await self._transition_to_error(
@@ -233,6 +240,10 @@ class CodingMixin:
                 log_prefix="[CODING]",
             )
             return
+        await self._prepare_current_run_record_dispatch_metadata(
+            task_hash=task_hash,
+            previous_task_hash=previous_task_hash,
+        )
 
         try:
             coder_kwargs = await self._prepare_coder_invocation(

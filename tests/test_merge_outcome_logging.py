@@ -19,6 +19,7 @@ class _FakeRedis:
     def __init__(self) -> None:
         self.store: dict[str, str] = {}
         self.lists: dict[str, list[str]] = {}
+        self.sets: dict[str, set[str]] = {}
 
     async def set(self, key: str, value: str, ex: int | None = None, nx: bool = False) -> bool:
         if nx and key in self.store:
@@ -28,6 +29,18 @@ class _FakeRedis:
 
     async def get(self, key: str) -> str | None:
         return self.store.get(key)
+
+    async def mget(self, keys: list[str]) -> list[str | None]:
+        return [self.store.get(key) for key in keys]
+
+    async def sadd(self, key: str, value: str) -> int:
+        bucket = self.sets.setdefault(key, set())
+        before = len(bucket)
+        bucket.add(value)
+        return len(bucket) - before
+
+    async def smembers(self, key: str) -> set[str]:
+        return set(self.sets.get(key, set()))
 
     async def delete(self, *keys: str) -> int:
         removed = 0
