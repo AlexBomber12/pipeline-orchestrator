@@ -1182,20 +1182,30 @@ class PipelineRunner(
         prior_state = self.state.state
         current_task = self.state.current_task
         if current_task is not None:
-            await safe_record_cancellation_cause(
-                self.redis,
-                self.name,
-                current_task.pr_id,
-                CancellationCause(
-                    category="ESCALATE",
-                    payload={
-                        "subsource": "daemon",
-                        "reason_text": message,
-                        "previous_state": prior_state.value,
-                    },
-                ),
-                log=self.log_event,
-            )
+            existing_cause: CancellationCause | None
+            try:
+                existing_cause = await get_cancellation_cause(
+                    self.redis,
+                    self.name,
+                    current_task.pr_id,
+                )
+            except Exception:
+                existing_cause = None
+            if existing_cause is None:
+                await safe_record_cancellation_cause(
+                    self.redis,
+                    self.name,
+                    current_task.pr_id,
+                    CancellationCause(
+                        category="ESCALATE",
+                        payload={
+                            "subsource": "daemon",
+                            "reason_text": message,
+                            "previous_state": prior_state.value,
+                        },
+                    ),
+                    log=self.log_event,
+                )
             try:
                 status_written = await self._commit_task_status_change(
                     current_task,

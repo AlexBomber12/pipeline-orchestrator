@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 from src.cancellation import CancellationCause
+from src.cancellation.storage import cause_key
 from src.keyspace import status_write_failed_tasks
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 
@@ -513,6 +514,72 @@ def test_records_cause_before_state_transition(
         "reason_text": "review timeout",
         "previous_state": "WATCH",
     }
+
+
+def test_escalate_and_skip_preserves_existing_coder_escalate_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Coder-authored ESCALATE attribution must not be overwritten."""
+    _patch_label_calls(monkeypatch)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.FIX
+    runner.state.current_task = QueueTask(
+        pr_id="PR-602",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-602",
+    )
+    runner.state.current_pr = PRInfo(number=602, branch="pr-602")
+    coder_cause = CancellationCause(
+        category="ESCALATE",
+        payload={"subsource": "coder", "reason_text": "blocked"},
+    )
+    coder_cause.task_id = "PR-602"
+    coder_cause.repo_slug = runner.name
+    runner.redis.store[cause_key(runner.name, "PR-602")] = coder_cause.to_redis()
+    _install_publish_state_spy(runner)
+
+    asyncio.run(runner._escalate_and_skip("daemon wrapper"))
+
+    stored = CancellationCause.from_redis(
+        runner.redis.store[cause_key(runner.name, "PR-602")]
+    )
+    assert stored.payload == {"subsource": "coder", "reason_text": "blocked"}
+
+
+def test_escalate_and_skip_records_cause_when_existing_read_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation-cause read failure should not block escalation telemetry."""
+    _patch_label_calls(monkeypatch)
+    recorded: list[str] = []
+
+    async def fail_get(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("redis read failed")
+
+    async def fake_safe_record(redis_client, repo_slug, task_id, cause, *, log=None):
+        recorded.append(task_id)
+
+    monkeypatch.setattr("src.daemon.runner.get_cancellation_cause", fail_get)
+    monkeypatch.setattr(
+        "src.daemon.runner.safe_record_cancellation_cause",
+        fake_safe_record,
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.FIX
+    runner.state.current_task = QueueTask(
+        pr_id="PR-603",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-603",
+    )
+    runner.state.current_pr = PRInfo(number=603, branch="pr-603")
+    _install_publish_state_spy(runner)
+
+    asyncio.run(runner._escalate_and_skip("daemon wrapper"))
+
+    assert recorded == ["PR-603"]
 
 
 def test_idle_escalation_clears_current_task(
