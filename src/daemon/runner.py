@@ -1197,7 +1197,7 @@ class PipelineRunner(
                 ),
                 log=self.log_event,
             )
-            if current_task.task_file:
+            if set_pr_escalated_flag and current_task.task_file:
                 try:
                     await self._commit_task_status_change(
                         current_task,

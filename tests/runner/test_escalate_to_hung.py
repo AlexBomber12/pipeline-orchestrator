@@ -565,6 +565,41 @@ def test_escalate_logs_status_commit_exception(
     )
 
 
+def test_escalate_skips_status_commit_for_recoverable_escalation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_label_calls(monkeypatch)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=700, branch="pr-test")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-700",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-test",
+        task_file="tasks/PR-700.md",
+    )
+    _install_publish_state_spy(runner)
+    commit_calls: list[tuple[Any, ...]] = []
+
+    async def record_commit(*args: Any, **kwargs: Any) -> None:
+        commit_calls.append(args)
+
+    runner._commit_task_status_change = record_commit  # type: ignore[method-assign]
+
+    asyncio.run(
+        runner._escalate_and_skip(
+            "review timeout",
+            apply_escalated_label=False,
+            set_pr_escalated_flag=False,
+        )
+    )
+
+    assert commit_calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+
+
 def test_merge_writes_status_done_to_file(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
