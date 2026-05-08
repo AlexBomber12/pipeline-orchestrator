@@ -1206,20 +1206,21 @@ class PipelineRunner(
                     ),
                     log=self.log_event,
                 )
-            try:
-                status_written = await self._commit_task_status_change(
-                    current_task,
-                    "ERROR",
-                    message,
-                )
-            except Exception as exc:
-                self.log_event(
-                    f"[ERROR] Failed to write status:ERROR to "
-                    f"{current_task.task_file}: {exc}"
-                )
-                status_written = False
-            if not status_written:
-                await self._mark_status_write_failed_task(current_task)
+            if set_pr_escalated_flag:
+                try:
+                    status_written = await self._commit_task_status_change(
+                        current_task,
+                        "ERROR",
+                        message,
+                    )
+                except Exception as exc:
+                    self.log_event(
+                        f"[ERROR] Failed to write status:ERROR to "
+                        f"{current_task.task_file}: {exc}"
+                    )
+                    status_written = False
+                if not status_written:
+                    await self._mark_status_write_failed_task(current_task)
 
         if target_state == PipelineState.IDLE and current_task is not None:
             self.state.current_task = None

@@ -740,7 +740,7 @@ def test_escalate_logs_status_commit_exception(
     )
 
 
-def test_escalate_writes_status_error_for_recoverable_escalation(
+def test_escalate_skips_status_error_for_recoverable_escalation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_label_calls(monkeypatch)
@@ -771,9 +771,7 @@ def test_escalate_writes_status_error_for_recoverable_escalation(
         )
     )
 
-    assert commit_calls == [
-        (task, "ERROR", "review timeout")
-    ]
+    assert commit_calls == []
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
 
