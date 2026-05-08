@@ -389,15 +389,17 @@ def test_safe_record_succeeds_when_redis_pipeline_works() -> None:
     assert "PR-205" in stored
     assert "CRASH" in stored
     tracker = redis.zsets[error_rate_tracker.key("alpha")]
-    assert list(tracker) == ["PR-205"]
-    assert tracker["PR-205"] == pytest.approx(
+    assert len(tracker) == 1
+    member = next(iter(tracker))
+    assert member.startswith("PR-205:")
+    assert tracker[member] == pytest.approx(
         datetime.fromisoformat(
             CancellationCause.from_redis(stored).created_at
         ).timestamp()
     )
 
 
-def test_safe_delete_clears_error_rate_tracker_event() -> None:
+def test_safe_delete_preserves_error_rate_tracker_events() -> None:
     redis = _FakeRedisWithPipeline()
 
     asyncio.run(
@@ -411,7 +413,7 @@ def test_safe_delete_clears_error_rate_tracker_event() -> None:
 
     asyncio.run(safe_delete_cancellation_cause(redis, "alpha", "PR-207"))
 
-    assert redis.zsets[error_rate_tracker.key("alpha")] == {}
+    assert len(redis.zsets[error_rate_tracker.key("alpha")]) == 1
 
 
 def test_safe_record_logs_tracker_failure_via_module_logger(
@@ -513,57 +515,6 @@ def test_safe_delete_cancellation_cause_falls_back_to_module_logger(
     assert any(
         "Failed to clear cancellation cause for PR-303" in record.message
         for record in caplog.records
-    )
-
-
-def test_safe_delete_cancellation_cause_logs_tracker_cleanup_failure(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Tracker cleanup is best-effort and logs via the module logger."""
-
-    class _TrackerBoomRedis:
-        async def delete(self, key: str) -> int:
-            return 1
-
-        async def zrem(self, key: str, *members: str) -> int:
-            if key.startswith("error_rate:"):
-                raise RuntimeError("tracker down")
-            return 1
-
-    with caplog.at_level("WARNING", logger="src.cancellation"):
-        asyncio.run(
-            safe_delete_cancellation_cause(
-                _TrackerBoomRedis(), "alpha", "PR-304"
-            )
-        )
-
-    assert any(
-        "Failed to clear ERROR-rate event for PR-304" in record.message
-        for record in caplog.records
-    )
-
-
-def test_safe_delete_logs_tracker_cleanup_failure_to_callback() -> None:
-    """Tracker cleanup failures use the provided log callback when present."""
-
-    class _TrackerBoomRedis:
-        async def delete(self, key: str) -> int:
-            return 1
-
-        async def zrem(self, key: str, *members: str) -> int:
-            if key.startswith("error_rate:"):
-                raise RuntimeError("tracker down")
-            return 1
-
-    logged: list[str] = []
-    asyncio.run(
-        safe_delete_cancellation_cause(
-            _TrackerBoomRedis(), "alpha", "PR-305", log=logged.append
-        )
-    )
-
-    assert any(
-        "Failed to clear ERROR-rate event for PR-305" in line for line in logged
     )
 
 

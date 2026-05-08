@@ -36,11 +36,8 @@ async def record(
 ) -> None:
     """Record one task cancellation/error event for ``repo_slug``."""
     score = _timestamp(ts)
-    member = (
-        member_id
-        if member_id is not None
-        else f"{score:.6f}:{uuid.uuid4().hex}"
-    )
+    prefix = f"{member_id}:" if member_id is not None else ""
+    member = f"{prefix}{score:.6f}:{uuid.uuid4().hex}"
     await redis_client.zadd(key(repo_slug), {member: score})
 
 

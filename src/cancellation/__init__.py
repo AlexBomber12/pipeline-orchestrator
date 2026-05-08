@@ -124,18 +124,6 @@ async def safe_delete_cancellation_cause(
             log(msg)
         else:
             logger.warning(msg)
-    try:
-        await error_rate_tracker.discard(redis_client, repo_slug, task_id)
-    except Exception as exc:
-        msg = (
-            f"[ERROR] Failed to clear ERROR-rate event for {task_id}: "
-            f"{exc} - continuing without tracker cleanup."
-        )
-        if log is not None:
-            log(msg)
-        else:
-            logger.warning(msg)
-
 
 def classify_infra_exception(
     exc: BaseException, *, subsystem: str = "gh_api"

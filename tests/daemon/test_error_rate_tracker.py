@@ -94,15 +94,28 @@ async def test_record_accepts_default_and_naive_timestamps() -> None:
 
 
 @pytest.mark.asyncio
-async def test_record_with_member_id_can_be_discarded() -> None:
+async def test_record_with_member_id_counts_each_event() -> None:
     redis = _FakeRedis()
     now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
 
     await error_rate_tracker.record(
         redis, "octo__demo", now, member_id="PR-123"
     )
+    await error_rate_tracker.record(
+        redis, "octo__demo", now + timedelta(seconds=1), member_id="PR-123"
+    )
 
-    assert await error_rate_tracker.discard(redis, "octo__demo", "PR-123") == 1
+    members = redis.zsets[error_rate_tracker.key("octo__demo")]
+    assert len(members) == 2
+    assert all(member.startswith("PR-123:") for member in members)
+
+
+@pytest.mark.asyncio
+async def test_discard_removes_exact_member_id() -> None:
+    redis = _FakeRedis()
+    await redis.zadd(error_rate_tracker.key("octo__demo"), {"event-1": 1.0})
+
+    assert await error_rate_tracker.discard(redis, "octo__demo", "event-1") == 1
     assert redis.zsets[error_rate_tracker.key("octo__demo")] == {}
 
 
