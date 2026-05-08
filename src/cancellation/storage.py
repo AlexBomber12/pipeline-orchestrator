@@ -57,6 +57,14 @@ def index_key(repo_slug: str) -> str:
     return f"cancellation_index:{repo_slug}"
 
 
+def task_spec_hash_key(repo_slug: str, task_id: str) -> str:
+    return f"task_spec_hash:{repo_slug}:{task_id}"
+
+
+def retry_count_key(repo_slug: str, task_id: str) -> str:
+    return f"metrics:retry_count:{repo_slug}:{task_id}"
+
+
 async def record_cancellation_cause(
     redis_client: Any,
     repo_slug: str,
@@ -103,6 +111,57 @@ async def delete_cancellation_cause(
     """
     await redis_client.delete(cause_key(repo_slug, task_id))
     await redis_client.zrem(index_key(repo_slug), task_id)
+
+
+async def record_task_spec_hash(
+    redis_client: Any,
+    repo_slug: str,
+    task_id: str,
+    spec_hash: str,
+) -> None:
+    """Persist the last task spec content hash attempted by the daemon."""
+    await redis_client.set(
+        task_spec_hash_key(repo_slug, task_id),
+        spec_hash,
+        ex=TTL_SECONDS,
+    )
+
+
+async def get_task_spec_hash(
+    redis_client: Any,
+    repo_slug: str,
+    task_id: str,
+) -> str | None:
+    raw = await redis_client.get(task_spec_hash_key(repo_slug, task_id))
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8")
+    return str(raw)
+
+
+async def delete_task_spec_hash(
+    redis_client: Any,
+    repo_slug: str,
+    task_id: str,
+) -> None:
+    await redis_client.delete(task_spec_hash_key(repo_slug, task_id))
+
+
+async def reset_retry_count(
+    redis_client: Any,
+    repo_slug: str,
+    task_id: str,
+) -> None:
+    await redis_client.set(retry_count_key(repo_slug, task_id), "0", ex=TTL_SECONDS)
+
+
+async def delete_retry_count(
+    redis_client: Any,
+    repo_slug: str,
+    task_id: str,
+) -> None:
+    await redis_client.delete(retry_count_key(repo_slug, task_id))
 
 
 async def list_recent_cancellations(

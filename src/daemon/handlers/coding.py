@@ -7,6 +7,7 @@ Mixin methods:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import subprocess
 from datetime import datetime, timezone
@@ -14,7 +15,11 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from src.branch_context import BranchContext
-from src.cancellation import CancellationCause, classify_infra_exception
+from src.cancellation import (
+    CancellationCause,
+    classify_infra_exception,
+    record_task_spec_hash,
+)
 from src.coder_registry import CoderPlugin
 from src.daemon import git_ops
 from src.daemon.handlers import CoderUnavailable
@@ -203,7 +208,8 @@ class CodingMixin:
             )
             return
         try:
-            task_body = task_body_path.read_text(encoding="utf-8")
+            task_bytes = task_body_path.read_bytes()
+            task_body = task_bytes.decode("utf-8")
         except (OSError, ValueError) as exc:
             # ``ValueError`` covers ``UnicodeDecodeError`` (a ``ValueError``
             # subclass) raised when ``tasks/{pr_id}.md`` contains non-UTF-8
@@ -217,6 +223,8 @@ class CodingMixin:
                 log_prefix="[CODING]",
             )
             return
+        task_hash = hashlib.sha256(task_bytes).hexdigest()
+        await record_task_spec_hash(self.redis, self.name, pr_id, task_hash)
 
         try:
             coder_kwargs = await self._prepare_coder_invocation(

@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
-
 from src.cancellation import storage
 from src.cancellation.storage import (
     CATEGORIES,
@@ -79,6 +78,17 @@ class _FakeRedis:
 
     async def get(self, key: str) -> str | None:
         return self.values.get(key)
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
+        self.values[key] = value
+        if ex is not None:
+            self.ttls[key] = ex
+
+    async def delete(self, key: str) -> int:
+        existed = key in self.values
+        self.values.pop(key, None)
+        self.ttls.pop(key, None)
+        return int(existed)
 
     async def zrangebyscore(self, key: str, min_score, max_score) -> list[str]:
         bucket = self.zsets.get(key, {})
@@ -212,6 +222,34 @@ async def test_record_overrides_stale_identifiers_in_payload() -> None:
 async def test_missing_key_returns_none() -> None:
     redis = _FakeRedis()
     assert await get_cancellation_cause(redis, "alpha", "PR-404") is None
+
+
+async def test_task_spec_hash_helpers_decode_bytes_and_delete() -> None:
+    class _BytesRedis(_FakeRedis):
+        async def get(self, key: str) -> bytes | None:
+            raw = self.values.get(key)
+            return raw.encode("utf-8") if raw is not None else None
+
+    redis = _BytesRedis()
+    await storage.record_task_spec_hash(redis, "alpha", "PR-300", "abc123")
+
+    assert storage.task_spec_hash_key("alpha", "PR-300") in redis.values
+    assert await storage.get_task_spec_hash(redis, "alpha", "PR-300") == "abc123"
+
+    await storage.delete_task_spec_hash(redis, "alpha", "PR-300")
+    assert storage.task_spec_hash_key("alpha", "PR-300") not in redis.values
+
+
+async def test_retry_count_helpers_reset_and_delete() -> None:
+    redis = _FakeRedis()
+    await storage.reset_retry_count(redis, "alpha", "PR-300")
+
+    key = storage.retry_count_key("alpha", "PR-300")
+    assert redis.values[key] == "0"
+    assert redis.ttls[key] == TTL_SECONDS
+
+    await storage.delete_retry_count(redis, "alpha", "PR-300")
+    assert key not in redis.values
 
 
 async def test_multi_repo_isolation() -> None:

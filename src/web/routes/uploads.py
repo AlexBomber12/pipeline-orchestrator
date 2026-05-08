@@ -10,6 +10,7 @@ commits the new tasks on its next IDLE boundary.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import re
@@ -23,9 +24,14 @@ from pathlib import Path
 from fastapi import APIRouter, Request, UploadFile
 from fastapi.responses import HTMLResponse
 
+from src.cancellation import (
+    get_task_spec_hash,
+    record_task_spec_hash,
+    reset_retry_count,
+)
 from src.events import publish_wake
 from src.keyspace import pipeline_state, upload_pending
-from src.models import RepoState
+from src.models import RepoState, TaskStatus
 from src.queue_parser import (
     QueueValidationError,
     parse_task_header,
@@ -78,6 +84,28 @@ def _render_upload_success(
     response.headers["HX-Retarget"] = _upload_feedback_target(repo_name)
     response.headers["HX-Reswap"] = "innerHTML"
     return response
+
+
+def _task_id_from_filename(fname: str) -> str:
+    return fname[:-3]
+
+
+def _is_task_in_error_state(repo_state: RepoState, task_id: str) -> bool:
+    if (
+        repo_state.current_task is not None
+        and repo_state.current_task.pr_id == task_id
+        and (
+            repo_state.current_task.status == TaskStatus.ERROR
+            or repo_state.state.value == "ERROR"
+        )
+    ):
+        return True
+    if repo_state.current_queue:
+        return any(
+            task.pr_id == task_id and task.status == TaskStatus.ERROR
+            for task in repo_state.current_queue
+        )
+    return False
 
 
 @router.post("/repos/{name}/upload-tasks", response_class=HTMLResponse)
@@ -266,6 +294,7 @@ async def upload_tasks(
             task_uploads[fname] = content
 
     aggregated_issues: list[str] = []
+    parsed_task_ids: dict[str, str] = {}
     for fname, content in task_uploads.items():
         try:
             task_text = content.decode("utf-8")
@@ -280,7 +309,8 @@ async def upload_tasks(
             task_path = Path(tmpdir) / fname
             task_path.write_text(task_text, encoding="utf-8")
             try:
-                parse_task_header(task_path)
+                header = parse_task_header(task_path)
+                parsed_task_ids[fname] = header.pr_id
             except QueueValidationError as exc:
                 for issue in exc.issues:
                     aggregated_issues.append(
@@ -315,6 +345,45 @@ async def upload_tasks(
         if has_missing_depends_on:
             body += "\nUse 'Depends on: none' for tasks with no dependencies."
         return _render_upload_error(request, body, 400, repo_name=name)
+
+    hash_rejections: list[str] = []
+    accepted_file_contents: list[tuple[str, bytes]] = []
+    accepted_task_hashes: dict[str, str] = {}
+    for fname, content in file_contents:
+        if fname not in task_uploads:
+            accepted_file_contents.append((fname, content))
+            continue
+        task_id = parsed_task_ids.get(fname, _task_id_from_filename(fname))
+        uploaded_hash = hashlib.sha256(content).hexdigest()
+        try:
+            existing_hash = await get_task_spec_hash(redis_client, name, task_id)
+        except Exception:
+            return _render_upload_error(
+                request,
+                "Cannot verify task spec hash (Redis error). Upload blocked.",
+                503,
+                repo_name=name,
+            )
+        if (
+            existing_hash == uploaded_hash
+            and _is_task_in_error_state(repo_state, task_id)
+        ):
+            hash_rejections.append(
+                f"{fname}: File unchanged. Use Retry button to re-attempt without changes."
+            )
+            continue
+        accepted_file_contents.append((fname, content))
+        accepted_task_hashes[task_id] = uploaded_hash
+
+    if hash_rejections and not accepted_file_contents:
+        return _render_upload_error(
+            request,
+            "\n".join(hash_rejections),
+            409,
+            repo_name=name,
+        )
+
+    file_contents = accepted_file_contents
 
     # Stage files to /data/uploads/{repo}/ and enqueue for daemon processing.
     # Git write operations are handled by the daemon to preserve the
@@ -375,6 +444,20 @@ async def upload_tasks(
                 except Exception:
                     pass
 
+            try:
+                for task_id, uploaded_hash in accepted_task_hashes.items():
+                    await record_task_spec_hash(
+                        redis_client, name, task_id, uploaded_hash
+                    )
+                    await reset_retry_count(redis_client, name, task_id)
+            except Exception:
+                return _render_upload_error(
+                    request,
+                    "Failed to update upload metadata (Redis error).",
+                    503,
+                    repo_name=name,
+                )
+
             manifest = {
                 "repo": name,
                 "files": manifest_filenames,
@@ -408,11 +491,15 @@ async def upload_tasks(
             exc_info=True,
         )
 
-    return _render_upload_success(
-        request,
-        _build_upload_success_message(uploaded_filenames, repo_state.state),
-        repo_name=name,
-    )
+    success_message = _build_upload_success_message(uploaded_filenames, repo_state.state)
+    if hash_rejections:
+        return _render_upload_error(
+            request,
+            success_message + "\n" + "\n".join(hash_rejections),
+            409,
+            repo_name=name,
+        )
+    return _render_upload_success(request, success_message, repo_name=name)
 
 
 # Imported at end-of-file so all ``@router`` decorators above have already
