@@ -243,7 +243,7 @@ async def handle_external_terminal_pr_state(
             )
             status_written = False
         if not status_written:
-            runner._mark_status_write_failed_task(current_task)
+            await runner._mark_status_write_failed_task(current_task)
     runner.state.error_message = None
     runner.state.current_task = None
     runner._reset_runner_local_task_counters()

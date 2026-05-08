@@ -334,6 +334,13 @@ return 0
             )
             if status_write_failed_pr_ids:
                 status_write_failed_pr_ids.difference_update(uploaded_pr_ids)
+                persist_status_write_failed = getattr(
+                    self,
+                    "_persist_status_write_failed_task_pr_ids",
+                    None,
+                )
+                if persist_status_write_failed is not None:
+                    await persist_status_write_failed()
             if uploaded_pr_ids:
                 self._clear_canceled_in_snapshot(uploaded_pr_ids)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:

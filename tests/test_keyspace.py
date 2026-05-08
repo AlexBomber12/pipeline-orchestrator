@@ -45,6 +45,17 @@ def test_upload_pending_format() -> None:
     assert keyspace.upload_pending("owner__repo") == "upload:owner__repo:pending"
 
 
+def test_status_write_failed_tasks_format() -> None:
+    assert (
+        keyspace.status_write_failed_tasks("alpha")
+        == "status_write_failed_tasks:alpha"
+    )
+    assert (
+        keyspace.status_write_failed_tasks("owner__repo")
+        == "status_write_failed_tasks:owner__repo"
+    )
+
+
 def test_upload_pending_pattern_is_glob() -> None:
     assert keyspace.upload_pending_pattern() == "upload:*:pending"
 

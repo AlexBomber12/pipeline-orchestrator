@@ -193,7 +193,7 @@ async def escalate_fix_no_push_deadlock(
             )
             status_written = False
         if not status_written:
-            runner._mark_status_write_failed_task(current_task)
+            await runner._mark_status_write_failed_task(current_task)
 
     runner.state.current_task = None
     runner._reset_runner_local_task_counters()

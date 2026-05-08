@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 from src.cancellation import CancellationCause
+from src.keyspace import status_write_failed_tasks
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 
 from tests.runner import _helpers as h
@@ -150,6 +151,9 @@ def test_escalate_and_skip_sets_status_write_fallback_when_commit_fails(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert runner._status_write_failed_task_pr_ids == {"PR-501"}
+    assert runner.redis.store[status_write_failed_tasks(runner.name)] == (
+        '["PR-501"]'
+    )
     assert any(
         "using in-memory ERROR fallback for PR-501" in entry["event"]
         for entry in runner.state.history
@@ -159,10 +163,60 @@ def test_escalate_and_skip_sets_status_write_fallback_when_commit_fails(
 def test_mark_status_write_failed_task_ignores_missing_pr_id() -> None:
     runner = h._make_runner()
 
-    runner._mark_status_write_failed_task(object())
+    asyncio.run(runner._mark_status_write_failed_task(object()))
 
     assert runner._status_write_failed_task_pr_ids == set()
     assert runner.state.history == []
+
+
+def test_persist_status_write_failed_task_ids_deletes_empty_set() -> None:
+    runner = h._make_runner()
+    key = status_write_failed_tasks(runner.name)
+    runner.redis.store[key] = '["PR-001"]'
+
+    asyncio.run(runner._persist_status_write_failed_task_pr_ids())
+
+    assert key not in runner.redis.store
+    assert key in runner.redis.deleted
+
+
+def test_persist_status_write_failed_task_ids_logs_redis_failure() -> None:
+    runner = h._make_runner()
+
+    async def fail_delete(key: str) -> int:
+        raise RuntimeError("redis down")
+
+    runner.redis.delete = fail_delete  # type: ignore[method-assign]
+
+    asyncio.run(runner._persist_status_write_failed_task_pr_ids())
+
+    assert any(
+        "failed to persist status-write fallback markers: redis down"
+        in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'["PR-001", "", 12, "PR-002"]',
+        "{not json",
+        '{"not":"a list"}',
+    ],
+)
+def test_hydrate_status_write_failed_task_ids_handles_stored_shapes(
+    raw: bytes | str,
+) -> None:
+    runner = h._make_runner()
+    runner.redis.store[status_write_failed_tasks(runner.name)] = raw  # type: ignore[assignment]
+
+    asyncio.run(runner._hydrate_status_write_failed_task_pr_ids())
+
+    if isinstance(raw, bytes):
+        assert runner._status_write_failed_task_pr_ids == {"PR-001", "PR-002"}
+    else:
+        assert runner._status_write_failed_task_pr_ids == set()
 
 
 def test_target_state_error_transitions_to_error(

@@ -69,10 +69,14 @@ class _Runner(repo_ops.RepoOpsMixin):
         self.events: list[str] = []
         self._crashed_task_pr_ids: set[str] = set()
         self._status_write_failed_task_pr_ids: set[str] = set()
+        self.persisted_status_write_failed_calls = 0
         self.state = SimpleNamespace(current_queue=None)
 
     def log_event(self, message: str) -> None:
         self.events.append(message)
+
+    async def _persist_status_write_failed_task_pr_ids(self) -> None:
+        self.persisted_status_write_failed_calls += 1
 
 def _run(coro: Any) -> Any:
     return asyncio.run(coro)
@@ -600,6 +604,7 @@ def test_process_pending_uploads_clears_status_write_fallback_on_reupload(
 
     assert _run(runner.process_pending_uploads()) is True
     assert runner._status_write_failed_task_pr_ids == {"PR-999"}
+    assert runner.persisted_status_write_failed_calls == 1
 
 
 def test_process_pending_uploads_clears_crashed_pr_ids_on_reupload(

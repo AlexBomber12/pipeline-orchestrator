@@ -45,6 +45,11 @@ def upload_pending(repo_name: str) -> str:
     return f"upload:{repo_name}:pending"
 
 
+def status_write_failed_tasks(repo_name: str) -> str:
+    """PR IDs parked after status:ERROR could not be committed."""
+    return f"status_write_failed_tasks:{repo_name}"
+
+
 def upload_pending_pattern() -> str:
     """Glob pattern matching all ``upload:*:pending`` keys."""
     return "upload:*:pending"

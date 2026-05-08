@@ -302,6 +302,7 @@ class RecoveryMixin:
         # outage during recovery still surfaces as ERROR with no
         # current_task.
         await self._hydrate_current_task_from_persisted_state()
+        await self._hydrate_status_write_failed_task_pr_ids()
         # The helper consults ``_idle_open_prs`` to derive each task's
         # status from the live PR set. Populate it from the recovery
         # fetch and reset on exit so ``handle_idle`` does not later read
@@ -372,6 +373,28 @@ class RecoveryMixin:
         for queued in tasks:
             if queued.status == TaskStatus.ERROR:
                 self._crashed_task_pr_ids.add(queued.pr_id)
+
+        status_write_failed_task_pr_ids = getattr(
+            self,
+            "_status_write_failed_task_pr_ids",
+            set(),
+        )
+        if status_write_failed_task_pr_ids:
+            changed = False
+            for index, queued in enumerate(tasks):
+                if queued.pr_id not in status_write_failed_task_pr_ids:
+                    continue
+                if queued.status == TaskStatus.DONE:
+                    status_write_failed_task_pr_ids.discard(queued.pr_id)
+                    changed = True
+                    continue
+                if queued.status != TaskStatus.ERROR:
+                    tasks[index] = queued.model_copy(
+                        update={"status": TaskStatus.ERROR}
+                    )
+                    changed = True
+            if changed:
+                await self._persist_status_write_failed_task_pr_ids()
 
         doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
 

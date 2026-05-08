@@ -51,6 +51,7 @@ from src.daemon.handlers import error as error_module  # noqa: F401,F811
 from src.daemon.handlers import idle as idle_module  # noqa: F811
 from src.daemon.handlers import merge as merge_module  # noqa: F401,F811
 from src.daemon.handlers import watch as watch_module  # noqa: F401,F811
+from src.keyspace import status_write_failed_tasks
 from src.models import (
     PipelineState,  # noqa: F811
     PRInfo,  # noqa: F811
@@ -530,6 +531,99 @@ def test_select_next_task_from_dag_clears_status_write_fallback_when_done(
     assert task is None
     assert runner._idle_dag_statuses == {"PR-001": TaskStatus.DONE}
     assert runner._status_write_failed_task_pr_ids == set()
+
+
+def test_recover_state_hydrates_status_write_fallback_from_redis(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A restart keeps failed status-write tasks parked until re-upload."""
+    h._patch_subprocess(monkeypatch)
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Persisted fallback task\n\n"
+        "Branch: pr-001-parked\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+    (tasks_dir / "PR-002.md").write_text(
+        "# PR-002: Healthy follow-up\n\n"
+        "Branch: pr-002-healthy\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 2\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda *args, **kwargs: [
+            PRInfo(number=42, branch="pr-001-parked", pr_id="PR-001")
+        ],
+    )
+    monkeypatch.setattr(
+        "src.daemon.recovery._resolve_merged_state",
+        lambda *args, **kwargs: _merged_state(),
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.redis.store[status_write_failed_tasks(runner.name)] = '["PR-001"]'
+
+    assert asyncio.run(runner._recover_state_headers()) is True
+
+    assert runner._status_write_failed_task_pr_ids == {"PR-001"}
+    assert {task.pr_id: task.status for task in runner.state.current_queue} == {
+        "PR-001": TaskStatus.ERROR,
+        "PR-002": TaskStatus.TODO,
+    }
+    assert runner.state.current_task is None
+
+
+def test_recover_state_clears_status_write_fallback_for_done_task(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Recovery prunes durable fallback markers once the task is DONE."""
+    h._patch_subprocess(monkeypatch)
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Done fallback task\n\n"
+        "Branch: pr-001-done\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "src.daemon.recovery._resolve_merged_state",
+        lambda *args, **kwargs: _merged_state({"PR-001"}),
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    key = status_write_failed_tasks(runner.name)
+    runner.redis.store[key] = '["PR-001"]'
+
+    assert asyncio.run(runner._recover_state_headers()) is True
+
+    assert runner._status_write_failed_task_pr_ids == set()
+    assert {task.pr_id: task.status for task in runner.state.current_queue} == {
+        "PR-001": TaskStatus.DONE,
+    }
+    assert key not in runner.redis.store
 
 
 def test_select_next_task_from_dag_uses_frontmatter_error_with_visible_pr(

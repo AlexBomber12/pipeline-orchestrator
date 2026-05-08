@@ -92,6 +92,7 @@ from src.keyspace import (
     control_config_dirty,
     control_stop,
     pipeline_state,
+    status_write_failed_tasks,
     upload_pending,
 )
 from src.metrics import MetricsStore, RunRecord
@@ -1207,7 +1208,7 @@ class PipelineRunner(
                 )
                 status_written = False
             if not status_written:
-                self._mark_status_write_failed_task(current_task)
+                await self._mark_status_write_failed_task(current_task)
 
         if target_state == PipelineState.IDLE and current_task is not None:
             self.state.current_task = None
@@ -1303,7 +1304,47 @@ class PipelineRunner(
             )
             return False
 
-    def _mark_status_write_failed_task(self, current_task: Any) -> None:
+    async def _persist_status_write_failed_task_pr_ids(self) -> None:
+        """Persist status-write fallback markers across daemon restarts."""
+        key = status_write_failed_tasks(self.name)
+        try:
+            if self._status_write_failed_task_pr_ids:
+                await self.redis.set(
+                    key,
+                    json.dumps(
+                        sorted(self._status_write_failed_task_pr_ids),
+                        separators=(",", ":"),
+                    ),
+                )
+            else:
+                await self.redis.delete(key)
+        except Exception as exc:
+            self.log_event(
+                f"[INFRA] Warning: failed to persist status-write "
+                f"fallback markers: {exc}."
+            )
+
+    async def _hydrate_status_write_failed_task_pr_ids(self) -> None:
+        """Load status-write fallback markers persisted by a prior process."""
+        try:
+            raw = await self.redis.get(status_write_failed_tasks(self.name))
+        except Exception:
+            return
+        if not raw:
+            return
+        try:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            decoded = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(decoded, list):
+            return
+        self._status_write_failed_task_pr_ids.update(
+            item for item in decoded if isinstance(item, str) and item
+        )
+
+    async def _mark_status_write_failed_task(self, current_task: Any) -> None:
         """Keep an explicitly parked task skipped when status commit fails."""
         pr_id = getattr(current_task, "pr_id", "")
         if not pr_id:
@@ -1313,6 +1354,7 @@ class PipelineRunner(
             f"[INFRA] Warning: using in-memory ERROR fallback for "
             f"{pr_id}; task file re-upload is required to retry."
         )
+        await self._persist_status_write_failed_task_pr_ids()
 
     def _track_current_coder_process(
         self, proc: asyncio.subprocess.Process
