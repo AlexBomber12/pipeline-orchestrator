@@ -818,7 +818,11 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
         await _release_retry_reservation(redis_client, name, pr_id)
         return HTMLResponse("Task file not found", status_code=404)
 
-    current_status = _read_task_frontmatter_status(task_path)
+    try:
+        current_status = _read_task_frontmatter_status(task_path)
+    except (OSError, UnicodeError):
+        await _release_retry_reservation(redis_client, name, pr_id)
+        return HTMLResponse("Failed to read task status", status_code=503)
     if current_status not in {TaskStatus.ERROR, TaskStatus.TODO}:
         await _release_retry_reservation(redis_client, name, pr_id)
         return HTMLResponse("Task is not in ERROR", status_code=409)

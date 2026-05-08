@@ -491,6 +491,42 @@ def test_retry_rechecks_status_after_base_checkout(
     assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
 
 
+def test_retry_releases_counter_when_status_reread_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _RetryRedis()
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    status_reads = 0
+
+    def fake_read_task_frontmatter_status(task_path: Path) -> TaskStatus:
+        nonlocal status_reads
+        status_reads += 1
+        if status_reads == 2:
+            raise OSError("cannot reread")
+        return TaskStatus.ERROR
+
+    monkeypatch.setattr(
+        repo_control,
+        "_read_task_frontmatter_status",
+        fake_read_task_frontmatter_status,
+    )
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+
+    assert response.status_code == 503
+    assert "Failed to read task status" in response.text
+    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
+
+
 def test_retry_git_failure_returns_503(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
