@@ -24,7 +24,12 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from src.cancellation.storage import delete_cancellation_cause
 from src.config import load_config
-from src.keyspace import control_stop, pipeline_state, status_write_failed_tasks
+from src.keyspace import (
+    control_stop,
+    legacy_recovered_tasks,
+    pipeline_state,
+    status_write_failed_tasks,
+)
 from src.models import PipelineState, QueueTask, RepoState, TaskStatus
 from src.queue_parser import write_frontmatter_status
 from src.web.services.coder import _effective_coder_name
@@ -44,6 +49,7 @@ _QUEUE_NOT_READY_FRAGMENT = (
 _QUEUE_NOT_READY_JSON = {"error": "Queue not yet computed"}
 _RETRY_TTL_SECONDS = 30 * 24 * 3600
 _RETRY_RESERVATION_TTL_SECONDS = 30 * 60
+_RETRY_GIT_TIMEOUT_SECONDS = 60
 
 _DEFERRED_CODER_SWITCH_STATES = {
     PipelineState.CODING,
@@ -68,6 +74,11 @@ _CODER_LABELS = {
     "claude": "Claude CLI",
     "codex": "Codex CLI",
 }
+_PAUSE_CONTROL_EVENT_PREFIXES = (
+    "Pause requested.",
+    "Resume requested.",
+    "Stop requested.",
+)
 
 _QueueSource = Literal["snapshot"]
 
@@ -160,9 +171,11 @@ def _retry_reservation_key(repo_slug: str) -> str:
 
 
 def _repo_busy_for_retry(state: RepoState) -> bool:
+    if state.user_paused:
+        return True
     if state.state in _RETRY_BUSY_STATES:
         return True
-    return state.state == PipelineState.PAUSED and not state.user_paused
+    return state.state == PipelineState.PAUSED
 
 
 def _decode_retry_count(raw: object) -> int:
@@ -237,10 +250,11 @@ async def _reserve_repo_for_retry(
     """Atomically pause an inactive repo while retry rewrites its worktree."""
     state_key = pipeline_state(repo_slug)
     reservation_key = _retry_reservation_key(repo_slug)
+    reservation_started_at = datetime.now(timezone.utc).isoformat()
     acquired = await _await_if_needed(
         redis_client.set(
             reservation_key,
-            "1",
+            reservation_started_at,
             ex=_RETRY_RESERVATION_TTL_SECONDS,
             nx=True,
         )
@@ -282,6 +296,31 @@ async def _reserve_repo_for_retry(
         raise
 
 
+def _has_pause_control_after_reservation(
+    state: RepoState,
+    reservation_started_at: str | None,
+) -> bool:
+    if reservation_started_at is None:
+        return False
+    try:
+        reservation_time = datetime.fromisoformat(reservation_started_at)
+    except ValueError:
+        return False
+    for entry in reversed(state.history):
+        event = str(entry.get("event", ""))
+        if not event.startswith(_PAUSE_CONTROL_EVENT_PREFIXES):
+            continue
+        raw_time = entry.get("last_seen_at") or entry.get("time")
+        if raw_time is None:
+            continue
+        try:
+            event_time = datetime.fromisoformat(str(raw_time))
+        except ValueError:
+            continue
+        return event_time > reservation_time
+    return False
+
+
 async def _release_repo_retry_reservation(
     redis_client: aioredis.Redis,
     repo_slug: str,
@@ -290,6 +329,10 @@ async def _release_repo_retry_reservation(
     """Restore the pre-retry pause bit unless a daemon has become active."""
     state_key = pipeline_state(repo_slug)
     reservation_key = _retry_reservation_key(repo_slug)
+    try:
+        reservation_started_at = _decode_redis_text(await redis_client.get(reservation_key))
+    except Exception:
+        reservation_started_at = None
 
     async def _transaction(pipe: Any) -> None:
         raw = await pipe.get(state_key)
@@ -300,6 +343,8 @@ async def _release_repo_retry_reservation(
         except Exception:
             return
         if state.state in _ACTIVE_RUN_STATES:
+            return
+        if _has_pause_control_after_reservation(state, reservation_started_at):
             return
         state.user_paused = previous_user_paused
         pipe.multi()
@@ -331,7 +376,11 @@ async def _increment_retry_count(
             _decode_redis_text(await pipe.get(fingerprint_key)) if fingerprint is not None else None
         )
         current = _decode_retry_count(await pipe.get(key))
-        if fingerprint is not None and stored_fingerprint != fingerprint:
+        if (
+            fingerprint is not None
+            and stored_fingerprint is not None
+            and stored_fingerprint != fingerprint
+        ):
             current = 0
         if current >= cap:
             raise _RetryCapExceeded(current, cap)
@@ -387,21 +436,22 @@ async def _clear_status_write_failed_retry_marker(
     task_id: str,
 ) -> None:
     """Remove a successfully retried task from the status-write-failed set."""
-    key = status_write_failed_tasks(repo_slug)
+    keys = (status_write_failed_tasks(repo_slug), legacy_recovered_tasks(repo_slug))
     try:
-        decoded = _decode_redis_text(await redis_client.get(key))
-        if decoded is None:
-            return
-        task_ids = json.loads(decoded)
-        if not isinstance(task_ids, list):
-            return
-        if all(str(item) != task_id for item in task_ids):
-            return
-        remaining = sorted({str(item) for item in task_ids if str(item) != task_id})
-        if remaining:
-            await _await_if_needed(redis_client.set(key, json.dumps(remaining)))
-        else:
-            await _await_if_needed(redis_client.delete(key))
+        for key in keys:
+            decoded = _decode_redis_text(await redis_client.get(key))
+            if decoded is None:
+                continue
+            task_ids = json.loads(decoded)
+            if not isinstance(task_ids, list):
+                continue
+            if all(str(item) != task_id for item in task_ids):
+                continue
+            remaining = sorted({str(item) for item in task_ids if str(item) != task_id})
+            if remaining:
+                await _await_if_needed(redis_client.set(key, json.dumps(remaining)))
+            else:
+                await _await_if_needed(redis_client.delete(key))
     except Exception:
         pass
 
@@ -413,6 +463,25 @@ def _is_nothing_to_commit(exc: subprocess.CalledProcessError) -> bool:
 
 def _git_output(result: subprocess.CompletedProcess[str]) -> str:
     return "\n".join(str(part) for part in (result.stdout, result.stderr) if part)
+
+
+def _called_process_output(exc: subprocess.CalledProcessError) -> str:
+    return "\n".join(str(part) for part in (exc.stdout, exc.stderr) if part)
+
+
+def _is_missing_task_pathspec(exc: subprocess.CalledProcessError) -> bool:
+    output = _called_process_output(exc).lower()
+    return "pathspec" in output and "did not match any file" in output
+
+
+def _run_retry_git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=_RETRY_GIT_TIMEOUT_SECONDS,
+    )
 
 
 def _read_task_frontmatter_status(task_path: Path) -> TaskStatus | None:
@@ -438,13 +507,32 @@ def _read_task_frontmatter_status(task_path: Path) -> TaskStatus | None:
     return None
 
 
+def _task_status_from_snapshot(
+    tasks: list[QueueTask] | None,
+    pr_id: str,
+) -> TaskStatus | None:
+    if tasks is None:
+        return None
+    for task in tasks:
+        if task.pr_id == pr_id:
+            return task.status
+    return None
+
+
+def _is_retryable_task_status(
+    frontmatter_status: TaskStatus | None,
+    snapshot_status: TaskStatus | None,
+) -> bool:
+    if frontmatter_status in {TaskStatus.ERROR, TaskStatus.TODO}:
+        return True
+    return frontmatter_status is None and snapshot_status in {
+        TaskStatus.ERROR,
+        TaskStatus.TODO,
+    }
+
+
 def _head_commit_subject(repo_root: Path) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(repo_root), "log", "-1", "--pretty=%s"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    result = _run_retry_git(repo_root, "log", "-1", "--pretty=%s")
     return result.stdout.strip()
 
 
@@ -460,37 +548,15 @@ def _checkout_retry_base_task(
     base_branch: str,
     relative_task: Path,
 ) -> None:
-    subprocess.run(
-        ["git", "-C", str(repo_root), "fetch", "origin", base_branch],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(repo_root), "checkout", base_branch],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(repo_root), "reset", "--mixed", f"origin/{base_branch}"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(
-        [
-            "git",
-            "-C",
-            str(repo_root),
-            "checkout",
-            f"origin/{base_branch}",
-            "--",
-            relative_task.as_posix(),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
+    _run_retry_git(repo_root, "fetch", "origin", base_branch)
+    _run_retry_git(repo_root, "checkout", "-f", base_branch)
+    _run_retry_git(repo_root, "reset", "--hard", f"origin/{base_branch}")
+    _run_retry_git(
+        repo_root,
+        "checkout",
+        f"origin/{base_branch}",
+        "--",
+        relative_task.as_posix(),
     )
 
 
@@ -501,29 +567,17 @@ def _commit_and_push_retry_reset(
     base_branch: str,
 ) -> None:
     replayed_existing_commit = False
-    subprocess.run(
-        ["git", "-C", str(repo_root), "add", relative_task.as_posix()],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    _run_retry_git(repo_root, "add", relative_task.as_posix())
     try:
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(repo_root),
-                "commit",
-                "-m",
-                commit_subject,
-                "-m",
-                "[skip ci]",
-                "--",
-                relative_task.as_posix(),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
+        _run_retry_git(
+            repo_root,
+            "commit",
+            "-m",
+            commit_subject,
+            "-m",
+            "[skip ci]",
+            "--",
+            relative_task.as_posix(),
         )
     except subprocess.CalledProcessError as exc:
         if not _is_nothing_to_commit(exc):
@@ -532,12 +586,7 @@ def _commit_and_push_retry_reset(
             raise _TaskNotRetryable
         replayed_existing_commit = True
 
-    push_result = subprocess.run(
-        ["git", "-C", str(repo_root), "push", "origin", f"HEAD:{base_branch}"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    push_result = _run_retry_git(repo_root, "push", "origin", f"HEAD:{base_branch}")
     if replayed_existing_commit and "everything up-to-date" in _git_output(
         push_result
     ).lower():
@@ -545,12 +594,7 @@ def _commit_and_push_retry_reset(
 
 
 def _reset_retry_worktree(repo_root: Path, base_branch: str) -> None:
-    subprocess.run(
-        ["git", "-C", str(repo_root), "reset", "--hard", f"origin/{base_branch}"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    _run_retry_git(repo_root, "reset", "--hard", f"origin/{base_branch}")
 
 
 async def _task_view(
@@ -985,7 +1029,9 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
         current_status = _read_task_frontmatter_status(task_path)
     except (OSError, UnicodeError):
         return HTMLResponse("Failed to read task status", status_code=503)
-    if current_status not in {TaskStatus.ERROR, TaskStatus.TODO}:
+    snapshot_tasks, _snapshot_at = await _load_current_queue_snapshot(name)
+    snapshot_status = _task_status_from_snapshot(snapshot_tasks, pr_id)
+    if not _is_retryable_task_status(current_status, snapshot_status):
         return HTMLResponse("Task is not in ERROR", status_code=409)
 
     retry_reserved = True
@@ -1008,7 +1054,11 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
                 repo_config.branch,
                 relative_task,
             )
-        except subprocess.CalledProcessError:
+        except subprocess.CalledProcessError as exc:
+            if _is_missing_task_pathspec(exc):
+                return HTMLResponse("Task file not found", status_code=404)
+            return HTMLResponse("Failed to commit retry change", status_code=503)
+        except subprocess.TimeoutExpired:
             return HTMLResponse("Failed to commit retry change", status_code=503)
         if not task_path.is_file():
             return HTMLResponse("Task file not found", status_code=404)
@@ -1018,9 +1068,9 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
             retry_fingerprint = _task_retry_fingerprint(task_path)
         except (OSError, UnicodeError):
             return HTMLResponse("Failed to read task status", status_code=503)
-        if current_status not in {TaskStatus.ERROR, TaskStatus.TODO}:
+        if not _is_retryable_task_status(current_status, snapshot_status):
             return HTMLResponse("Task is not in ERROR", status_code=409)
-        rewrote_status = current_status == TaskStatus.ERROR
+        rewrote_status = current_status != TaskStatus.TODO
 
         try:
             next_count = await _increment_retry_count(
@@ -1039,7 +1089,7 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
             return HTMLResponse("Failed to update retry counter", status_code=503)
 
         try:
-            if current_status == TaskStatus.ERROR:
+            if current_status != TaskStatus.TODO:
                 write_frontmatter_status(task_path, "TODO")
         except Exception:
             await _release_retry_reservation(redis_client, name, pr_id)
@@ -1060,7 +1110,7 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
             if retry_reserved:
                 await _release_retry_reservation(redis_client, name, pr_id)
             return HTMLResponse("Task is not in ERROR", status_code=409)
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             reset_failed = False
             try:
                 await asyncio.to_thread(
@@ -1068,7 +1118,7 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
                     repo_root,
                     repo_config.branch,
                 )
-            except subprocess.CalledProcessError:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 reset_failed = True
             if rewrote_status and reset_failed:
                 _restore_retry_error_status(task_path)
@@ -1081,6 +1131,14 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
         except Exception:
             pass
         await _clear_status_write_failed_retry_marker(redis_client, name, pr_id)
+        try:
+            await _app.publish_wake(redis_client, name, "retry")
+        except Exception:
+            _app.logger.warning(
+                "publish_wake failed for %s; daemon will pick up retry on next tick",
+                name,
+                exc_info=True,
+            )
 
         tasks, _snapshot_at = await _load_current_queue_snapshot(name)
         if tasks is None:
