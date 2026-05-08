@@ -220,6 +220,30 @@ def test_hydrate_status_write_failed_task_ids_handles_stored_shapes(
         assert runner._status_write_failed_task_pr_ids == set()
 
 
+def test_hydrate_status_write_failed_task_ids_replaces_stale_memory() -> None:
+    runner = h._make_runner()
+    runner._status_write_failed_task_pr_ids = {"PR-OLD"}
+    runner.redis.store[status_write_failed_tasks(runner.name)] = '["PR-NEW"]'
+
+    asyncio.run(runner._hydrate_status_write_failed_task_pr_ids())
+
+    assert runner._status_write_failed_task_pr_ids == {"PR-NEW"}
+
+
+def test_hydrate_status_write_failed_task_ids_keeps_memory_on_redis_failure() -> None:
+    runner = h._make_runner()
+    runner._status_write_failed_task_pr_ids = {"PR-OLD"}
+
+    async def fail_get(key: str) -> str | None:
+        raise RuntimeError("redis down")
+
+    runner.redis.get = fail_get  # type: ignore[method-assign]
+
+    asyncio.run(runner._hydrate_status_write_failed_task_pr_ids())
+
+    assert runner._status_write_failed_task_pr_ids == {"PR-OLD"}
+
+
 def test_clear_status_write_failed_task_ids_logs_legacy_delete_failure() -> None:
     runner = h._make_runner()
     runner._status_write_failed_task_pr_ids.add("PR-001")

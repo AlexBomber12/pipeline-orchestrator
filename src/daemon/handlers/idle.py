@@ -277,6 +277,13 @@ class IdleMixin:
             if current_task_pr_id in stopped_task_pr_ids:
                 current_task_pr_id = None
             crashed_task_pr_ids = getattr(self, "_crashed_task_pr_ids", set())
+            hydrate_status_write_failed = getattr(
+                self,
+                "_hydrate_status_write_failed_task_pr_ids",
+                None,
+            )
+            if hydrate_status_write_failed is not None:
+                await hydrate_status_write_failed()
             status_write_failed_task_pr_ids = getattr(
                 self,
                 "_status_write_failed_task_pr_ids",
