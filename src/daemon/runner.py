@@ -35,6 +35,9 @@ import redis.asyncio as aioredis
 from redis.exceptions import RedisError
 
 from src.cancellation import (
+    TTL_SECONDS as TASK_SPEC_HASH_TTL_SECONDS,
+)
+from src.cancellation import (
     CancellationCause,
     get_cancellation_cause,
     safe_record_cancellation_cause,
@@ -104,7 +107,7 @@ from src.keyspace import (
     status_write_failed_tasks,
     upload_pending,
 )
-from src.metrics import RUN_RECORD_TTL_SECONDS, MetricsStore, RunRecord
+from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
 from src.queue_parser import (
     TYPE_SYNONYMS,
@@ -861,7 +864,7 @@ class PipelineRunner(
             current = 0
         next_attempt = current + 1
         try:
-            await self.redis.set(key, str(next_attempt), ex=RUN_RECORD_TTL_SECONDS)
+            await self.redis.set(key, str(next_attempt), ex=TASK_SPEC_HASH_TTL_SECONDS)
         except Exception:
             pass
         record.attempt_index = next_attempt
