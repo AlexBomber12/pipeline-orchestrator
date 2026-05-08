@@ -9,6 +9,7 @@ reads-only paths (rendering, JSON status, partials) live in
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 import subprocess
 from datetime import datetime, timezone
@@ -195,7 +196,9 @@ async def _decrement_retry_count(
     if current <= 1:
         await redis_client.delete(key)
         return
-    redis_client.set(key, str(current - 1), ex=_RETRY_TTL_SECONDS)
+    result = redis_client.set(key, str(current - 1), ex=_RETRY_TTL_SECONDS)
+    if inspect.isawaitable(result):
+        await result
 
 
 def _is_nothing_to_commit(exc: subprocess.CalledProcessError) -> bool:

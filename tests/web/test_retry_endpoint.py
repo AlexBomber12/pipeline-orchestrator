@@ -249,6 +249,19 @@ async def test_decrement_retry_count_preserves_remaining_attempts() -> None:
     assert redis_client.expiries["metrics:retry_count:repo:PR-1"] == 30 * 24 * 3600
 
 
+@pytest.mark.asyncio
+async def test_decrement_retry_count_awaits_async_set() -> None:
+    class _AsyncSetRedis(_RetryRedis):
+        async def set(self, key: str, value: str, ex: int | None = None) -> None:  # type: ignore[override]
+            super().set(key, value, ex=ex)
+
+    redis_client = _AsyncSetRedis({"metrics:retry_count:repo:PR-1": "2"})
+
+    await repo_control._decrement_retry_count(redis_client, "repo", "PR-1")
+
+    assert redis_client.store["metrics:retry_count:repo:PR-1"] == "1"
+
+
 @pytest.mark.parametrize(
     ("content", "expected"),
     [
