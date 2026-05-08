@@ -50,10 +50,12 @@ _DEFERRED_CODER_SWITCH_STATES = {
     PipelineState.PAUSED,
 }
 _ACTIVE_RUN_STATES = {
+    PipelineState.PREFLIGHT,
     PipelineState.CODING,
     PipelineState.WATCH,
     PipelineState.FIX,
     PipelineState.MERGE,
+    PipelineState.PAUSED,
 }
 _CODER_LABELS = {
     "any": "Any (bandit picks per-PR)",
@@ -164,6 +166,17 @@ async def _get_retry_count(
     except Exception:
         return 0
     return _decode_retry_count(raw)
+
+
+async def _retry_repo_state_is_safe(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+) -> bool:
+    raw = await redis_client.get(pipeline_state(repo_slug))
+    if raw is None:
+        return True
+    state = RepoState.model_validate_json(raw)
+    return state.state not in _ACTIVE_RUN_STATES
 
 
 async def _increment_retry_count(
@@ -732,6 +745,12 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
     current_status = _read_task_frontmatter_status(task_path)
     if current_status not in {TaskStatus.ERROR, TaskStatus.TODO}:
         return HTMLResponse("Task is not in ERROR", status_code=409)
+
+    try:
+        if not await _retry_repo_state_is_safe(redis_client, name):
+            return HTMLResponse("Repository is busy; retry later.", status_code=409)
+    except Exception:
+        return HTMLResponse("Failed to read repository state", status_code=503)
 
     try:
         next_count = await _increment_retry_count(redis_client, name, pr_id, cap)
