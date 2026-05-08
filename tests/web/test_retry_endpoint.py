@@ -245,6 +245,25 @@ async def test_retry_count_helpers_handle_bad_values() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_retry_count_returns_zero_for_stale_fingerprint() -> None:
+    redis_client = _RetryRedis(
+        {
+            "metrics:retry_count:repo:PR-1": "3",
+            "metrics:retry_fingerprint:repo:PR-1": "old",
+        }
+    )
+
+    retry_count = await repo_control._get_retry_count(
+        redis_client,
+        "repo",
+        "PR-1",
+        fingerprint="new",
+    )
+
+    assert retry_count == 0
+
+
+@pytest.mark.asyncio
 async def test_increment_retry_count_rejects_cap() -> None:
     redis_client = _RetryRedis({"metrics:retry_count:repo:PR-1": "2"})
 
@@ -328,6 +347,59 @@ async def test_release_retry_reservation_swallows_cleanup_failure(
     await repo_control._release_retry_reservation(_RetryRedis(), "repo", "PR-1")
 
 
+@pytest.mark.asyncio
+async def test_repo_retry_reservation_handles_async_set_and_release_edges() -> None:
+    class _AsyncSetRedis(_RetryRedis):
+        async def set(self, key: str, value: str, ex: int | None = None) -> None:  # type: ignore[override]
+            super().set(key, value, ex=ex)
+
+    idle_state = _state_snapshot(PipelineState.IDLE)
+    redis_client = _AsyncSetRedis({"pipeline:repo": idle_state})
+
+    previous_user_paused = await repo_control._reserve_repo_for_retry(
+        redis_client,
+        "repo",
+        "https://github.com/example/repo.git",
+    )
+
+    reserved_state = RepoState.model_validate_json(redis_client.store["pipeline:repo"])
+    assert previous_user_paused is False
+    assert reserved_state.user_paused is True
+
+    await repo_control._release_repo_retry_reservation(
+        _RetryRedis(),
+        "repo",
+        previous_user_paused=False,
+    )
+    await repo_control._release_repo_retry_reservation(
+        _RetryRedis({"pipeline:repo": "not-json"}),
+        "repo",
+        previous_user_paused=False,
+    )
+    active = _RetryRedis({"pipeline:repo": _state_snapshot(PipelineState.CODING)})
+    await repo_control._release_repo_retry_reservation(
+        active,
+        "repo",
+        previous_user_paused=False,
+    )
+    assert RepoState.model_validate_json(active.store["pipeline:repo"]).state == PipelineState.CODING
+
+    class _BoomTransactionRedis(_RetryRedis):
+        async def transaction(
+            self,
+            callback: Any,
+            *keys: str,
+            value_from_callable: bool = False,
+        ) -> Any:
+            raise RuntimeError("boom")
+
+    await repo_control._release_repo_retry_reservation(
+        _BoomTransactionRedis(),
+        "repo",
+        previous_user_paused=False,
+    )
+
+
 @pytest.mark.parametrize(
     ("content", "expected"),
     [
@@ -403,12 +475,18 @@ def test_retry_counter_failure_returns_503(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _write_config_and_task(tmp_path, monkeypatch)
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(_RetryRedis()))
 
-    class _BoomTransactionRedis(_RetryRedis):
-        async def transaction(self, callback: Any, *keys: str, value_from_callable: bool = False) -> Any:
-            raise RuntimeError("boom")
+    async def fake_increment(
+        redis_client: Any,
+        repo_slug: str,
+        task_id: str,
+        cap: int,
+        fingerprint: str | None = None,
+    ) -> int:
+        raise RuntimeError("boom")
 
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(_BoomTransactionRedis()))
+    monkeypatch.setattr(repo_control, "_increment_retry_count", fake_increment)
 
     with TestClient(app) as client:
         response = client.post("/repos/example__alpha/tasks/PR-283/retry")
@@ -751,6 +829,28 @@ def test_retry_rejects_while_repo_active_before_git(
     assert git_called is False
 
 
+def test_retry_reservation_restores_prior_pause_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _RetryRedis({"pipeline:example__alpha": _state_snapshot(PipelineState.IDLE)})
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+
+    assert response.status_code == 200
+    stored_state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
+    assert stored_state.state == PipelineState.IDLE
+    assert stored_state.user_paused is False
+
+
 def test_retry_state_read_failure_returns_503_before_git(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -775,6 +875,32 @@ def test_retry_state_read_failure_returns_503_before_git(
     assert "Failed to read repository state" in response.text
     assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
     assert git_called is False
+
+
+def test_retry_reservation_failure_returns_503_before_counter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config_and_task(tmp_path, monkeypatch)
+
+    class _BoomTransactionRedis(_RetryRedis):
+        async def transaction(
+            self,
+            callback: Any,
+            *keys: str,
+            value_from_callable: bool = False,
+        ) -> Any:
+            raise RuntimeError("boom")
+
+    redis_client = _BoomTransactionRedis()
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+
+    assert response.status_code == 503
+    assert "Failed to read repository state" in response.text
+    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
 
 
 def test_retry_not_retryable_after_status_rewrite_restores_error(
