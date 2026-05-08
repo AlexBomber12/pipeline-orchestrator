@@ -1199,10 +1199,6 @@ class PipelineRunner(
             )
             if current_task.task_file:
                 try:
-                    write_frontmatter_status(
-                        Path(self.repo_path) / current_task.task_file,
-                        "ERROR",
-                    )
                     await self._commit_task_status_change(
                         current_task,
                         "ERROR",

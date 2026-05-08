@@ -60,6 +60,20 @@ def _make_repo_with_task(tmp_path: Path, pr_id: str) -> Path:
     return work
 
 
+def _commit_pr_branch_task_status(repo: Path, pr_id: str, status: str) -> None:
+    _git(repo, "checkout", "pr-test")
+    task_file = repo / "tasks" / f"{pr_id}.md"
+    task_file.write_text(
+        task_file.read_text(encoding="utf-8").replace(
+            "status: TODO", f"status: {status}", 1
+        ),
+        encoding="utf-8",
+    )
+    _git(repo, "add", str(task_file.relative_to(repo)))
+    _git(repo, "commit", "-m", f"mark {pr_id} {status} on pr branch")
+    _git(repo, "push", "origin", "pr-test")
+
+
 def _install_publish_state_spy(runner: Any) -> list[None]:
     """Replace ``publish_state`` with an awaitable spy and return the call log."""
     calls: list[None] = []
@@ -489,11 +503,140 @@ def test_escalate_and_skip_writes_status_error_to_file(
     )
 
 
+def test_escalate_status_commit_ignores_divergent_pr_branch_task_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_label_calls(monkeypatch)
+    repo = _make_repo_with_task(tmp_path, "PR-700")
+    _commit_pr_branch_task_status(repo, "PR-700", "DOING")
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+    runner.state.state = PipelineState.FIX
+    runner.state.current_pr = PRInfo(number=700, branch="pr-test")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-700",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-test",
+        task_file="tasks/PR-700.md",
+    )
+    _install_publish_state_spy(runner)
+
+    asyncio.run(runner._escalate_and_skip("final failure"))
+
+    task_text = (repo / "tasks" / "PR-700.md").read_text(encoding="utf-8")
+    assert task_text.startswith("---\nstatus: ERROR\n---\n")
+    assert "[STATUS] PR-700 marked ERROR: final failure" in _git(
+        repo,
+        "log",
+        "--oneline",
+        "-1",
+    )
+
+
+def test_escalate_logs_status_commit_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_label_calls(monkeypatch)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.FIX
+    runner.state.current_pr = PRInfo(number=700, branch="pr-test")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-700",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-test",
+        task_file="tasks/PR-700.md",
+    )
+    _install_publish_state_spy(runner)
+
+    async def fail_commit(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("checkout refused")
+
+    runner._commit_task_status_change = fail_commit  # type: ignore[method-assign]
+
+    asyncio.run(runner._escalate_and_skip("final failure"))
+
+    assert any(
+        "[ERROR] Failed to write status:ERROR to tasks/PR-700.md: checkout refused"
+        in event["event"]
+        for event in runner.state.history
+    )
+
+
 def test_merge_writes_status_done_to_file(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     repo = _make_repo_with_task(tmp_path, "PR-701")
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: "")
+
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+    runner.state.state = PipelineState.MERGE
+    runner.state.current_pr = PRInfo(number=701, branch="pr-test")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-701",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-test",
+        task_file="tasks/PR-701.md",
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    task_text = (repo / "tasks" / "PR-701.md").read_text(encoding="utf-8")
+    assert task_text.startswith("---\nstatus: DONE\n---\n")
+    assert "[STATUS] PR-701 marked DONE: PR merged" in _git(
+        repo,
+        "log",
+        "--oneline",
+        "-1",
+    )
+
+
+def test_merge_logs_status_commit_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-701")
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: "")
+
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+    runner.state.state = PipelineState.MERGE
+    runner.state.current_pr = PRInfo(number=701, branch="pr-test")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-701",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-test",
+        task_file="tasks/PR-701.md",
+    )
+
+    async def fail_commit(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("checkout refused")
+
+    runner._commit_task_status_change = fail_commit  # type: ignore[method-assign]
+
+    asyncio.run(runner.handle_merge())
+
+    assert any(
+        "[ERROR] Failed to write status:DONE to tasks/PR-701.md: checkout refused"
+        in event["event"]
+        for event in runner.state.history
+    )
+
+
+def test_merge_status_commit_ignores_divergent_pr_branch_task_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-701")
+    _commit_pr_branch_task_status(repo, "PR-701", "DOING")
     monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: "")
 
