@@ -214,7 +214,7 @@ def test_retry_at_cap_returns_409(
     assert redis_client.store["metrics:retry_count:example__alpha:PR-283"] == "3"
     assert cause_key("example__alpha", "PR-283") in redis_client.store
     assert "status: ERROR" in (repo_dir / "tasks" / "PR-283.md").read_text(encoding="utf-8")
-    assert git_called is False
+    assert git_called is True
 
 
 def test_retry_unknown_repo_returns_404(
@@ -567,6 +567,11 @@ def test_retry_counter_failure_returns_503(
 ) -> None:
     _write_config_and_task(tmp_path, monkeypatch)
     monkeypatch.setattr(web_app, "aioredis", _aioredis(_RetryRedis()))
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+    )
 
     async def fake_increment(
         redis_client: Any,
@@ -704,6 +709,45 @@ def test_retry_rechecks_status_after_base_checkout(
     assert response.status_code == 409
     assert "Task is not in ERROR" in response.text
     assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
+
+
+def test_retry_counter_uses_post_checkout_task_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_dir = _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _RetryRedis()
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    captured_fingerprints: list[str | None] = []
+
+    def fake_checkout(repo_root: Path, base_branch: str, relative_task: Path) -> None:
+        (repo_dir / "tasks" / "PR-283.md").write_text(
+            "---\nstatus: ERROR\n---\n\n# PR-283: Retry me\n\nFresh base body\n",
+            encoding="utf-8",
+        )
+
+    async def fake_increment(
+        redis_client: Any,
+        repo_slug: str,
+        task_id: str,
+        cap: int,
+        fingerprint: str | None = None,
+    ) -> int:
+        captured_fingerprints.append(fingerprint)
+        return 1
+
+    monkeypatch.setattr(repo_control, "_checkout_retry_base_task", fake_checkout)
+    monkeypatch.setattr(repo_control, "_increment_retry_count", fake_increment)
+    monkeypatch.setattr(repo_control, "_commit_and_push_retry_reset", lambda *args: None)
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+
+    assert response.status_code == 200
+    assert captured_fingerprints == [
+        repo_control._task_retry_fingerprint(repo_dir / "tasks" / "PR-283.md")
+    ]
 
 
 def test_retry_first_status_read_failure_returns_503_before_counter(

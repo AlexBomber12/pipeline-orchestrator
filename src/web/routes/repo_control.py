@@ -965,7 +965,6 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
     cap = cfg.daemon.retry_button_cap
     try:
         current_status = _read_task_frontmatter_status(task_path)
-        retry_fingerprint = _task_retry_fingerprint(task_path)
     except (OSError, UnicodeError):
         return HTMLResponse("Failed to read task status", status_code=503)
     if current_status not in {TaskStatus.ERROR, TaskStatus.TODO}:
@@ -985,22 +984,6 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
 
     try:
         try:
-            next_count = await _increment_retry_count(
-                redis_client,
-                name,
-                pr_id,
-                cap,
-                retry_fingerprint,
-            )
-        except _RetryCapExceeded:
-            return HTMLResponse(
-                "Retry cap reached. Edit task spec or delete to proceed.",
-                status_code=409,
-            )
-        except Exception:
-            return HTMLResponse("Failed to update retry counter", status_code=503)
-
-        try:
             await asyncio.to_thread(
                 _checkout_retry_base_task,
                 repo_root,
@@ -1016,6 +999,7 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
 
         try:
             current_status = _read_task_frontmatter_status(task_path)
+            retry_fingerprint = _task_retry_fingerprint(task_path)
         except (OSError, UnicodeError):
             await _release_retry_reservation(redis_client, name, pr_id)
             return HTMLResponse("Failed to read task status", status_code=503)
@@ -1023,6 +1007,22 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
             await _release_retry_reservation(redis_client, name, pr_id)
             return HTMLResponse("Task is not in ERROR", status_code=409)
         rewrote_status = current_status == TaskStatus.ERROR
+
+        try:
+            next_count = await _increment_retry_count(
+                redis_client,
+                name,
+                pr_id,
+                cap,
+                retry_fingerprint,
+            )
+        except _RetryCapExceeded:
+            return HTMLResponse(
+                "Retry cap reached. Edit task spec or delete to proceed.",
+                status_code=409,
+            )
+        except Exception:
+            return HTMLResponse("Failed to update retry counter", status_code=503)
 
         try:
             if current_status == TaskStatus.ERROR:
