@@ -18,7 +18,7 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from src.config import load_config
-from src.keyspace import control_recover, control_stop, pipeline_state
+from src.keyspace import control_stop, pipeline_state
 from src.models import PipelineState, QueueTask, RepoState, TaskStatus
 from src.web.services.coder import _effective_coder_name
 from src.web.services.repo_state import (
@@ -41,7 +41,6 @@ _DEFERRED_CODER_SWITCH_STATES = {
     PipelineState.WATCH,
     PipelineState.FIX,
     PipelineState.MERGE,
-    PipelineState.HUNG,
     PipelineState.PAUSED,
 }
 _ACTIVE_RUN_STATES = {
@@ -334,91 +333,6 @@ async def stop_repo(request: Request, name: str) -> Response:
                 exc_info=True,
             )
     return JSONResponse({"ok": True, "user_paused": True})
-
-
-class _RecoverNotHung(Exception):
-    """Internal sentinel: state is not HUNG inside the recover transaction."""
-
-    def __init__(self, current_state: str) -> None:
-        super().__init__(current_state)
-        self.current_state = current_state
-
-
-@router.post("/repos/{name}/recover")
-async def recover_repo(request: Request, name: str) -> Response:
-    """Operator-initiated recovery from HUNG state (PR-247).
-
-    The HUNG-state check and the recover-flag write run inside a single
-    ``WATCH``/``MULTI`` transaction on ``pipeline:{name}`` so a daemon
-    cycle that moves the repo out of HUNG between the two operations
-    cannot leave a stale ``control:{name}:recover`` flag behind. Without
-    the atomic guard the flag would survive its 5-minute TTL and trigger
-    an unrelated, later HUNG episode into auto-recovery. On WatchError
-    redis-py re-invokes the callback, which re-reads the state and
-    rejects with 400 if it is no longer HUNG.
-
-    Returns 400 (recovery_only_from_hung) when state != HUNG, and queues
-    a wake event so ``handle_hung`` consumes the signal on the next
-    daemon tick. The HTTP 200 response confirms the signal was queued —
-    not that the transition has already executed — so the client UI must
-    refresh state after receiving 200 to observe the new IDLE.
-    """
-    try:
-        redis_client, state_key, repo_url = await _apply_repo_control_update(
-            request, name
-        )
-    except _RepoStateMutationError as exc:
-        return HTMLResponse(exc.message, status_code=exc.status_code)
-
-    recover_key = control_recover(name)
-
-    async def _transaction(pipe: Any) -> None:
-        raw = await pipe.get(state_key)
-        if raw is None:
-            state = _default_repo_state(name, repo_url)
-        else:
-            try:
-                state = RepoState.model_validate_json(raw)
-            except Exception as exc:
-                raise _RepoStateMutationError(
-                    "Repository state unavailable"
-                ) from exc
-        if state.state != PipelineState.HUNG:
-            raise _RecoverNotHung(state.state.value)
-        pipe.multi()
-        pipe.set(recover_key, "1", ex=300)
-
-    try:
-        await redis_client.transaction(
-            _transaction,
-            state_key,
-        )
-    except _RecoverNotHung as exc:
-        return JSONResponse(
-            {
-                "error": "recovery_only_from_hung",
-                "current_state": exc.current_state,
-            },
-            status_code=400,
-        )
-    except _RepoStateMutationError as exc:
-        return HTMLResponse(exc.message, status_code=exc.status_code)
-    except Exception:
-        return HTMLResponse(
-            "Failed to queue recovery request", status_code=503
-        )
-
-    try:
-        await _app.publish_wake(redis_client, name, "recover")
-    except Exception:
-        _app.logger.warning(
-            "publish_wake failed for %s; daemon will pick up recover on "
-            "next tick",
-            name,
-            exc_info=True,
-        )
-
-    return JSONResponse({"ok": True, "queued_state": "IDLE"})
 
 
 @router.post("/repos/{name}/coder", response_class=HTMLResponse)

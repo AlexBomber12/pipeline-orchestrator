@@ -2816,7 +2816,6 @@ def test_drain_finished_cycle_defers_apply_when_runner_below_idle_boundary() -> 
             PipelineState.FIX,
             PipelineState.MERGE,
             PipelineState.PAUSED,
-            PipelineState.HUNG,
         ):
             applied["called"] = 0
             task = asyncio.create_task(quick())
@@ -2866,7 +2865,6 @@ def test_drain_finished_cycle_applies_non_idle_staging_after_cycle() -> None:
             PipelineState.FIX,
             PipelineState.MERGE,
             PipelineState.PAUSED,
-            PipelineState.HUNG,
             PipelineState.IDLE,
             PipelineState.ERROR,
         ):

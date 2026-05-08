@@ -13,13 +13,8 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 from src.models import (
-    CIStatus,
     PipelineState,
-    PRInfo,
-    QueueTask,
     RepoState,
-    ReviewStatus,
-    TaskStatus,
 )
 from src.web import app as web_app
 from src.web.app import (
@@ -73,35 +68,6 @@ def _write_config(tmp_path: Path, urls: list[str]) -> Path:
     return cfg
 
 
-def _hung_state(
-    name: str,
-    url: str,
-    *,
-    last_updated: datetime,
-    last_activity: datetime | None = None,
-    pr_number: int = 42,
-    review_status: ReviewStatus = ReviewStatus.EYES,
-) -> RepoState:
-    return RepoState(
-        url=url,
-        name=name,
-        state=PipelineState.HUNG,
-        current_task=QueueTask(
-            pr_id="PR-099",
-            title="Sample",
-            status=TaskStatus.DOING,
-        ),
-        current_pr=PRInfo(
-            number=pr_number,
-            branch=f"pr-{pr_number}-sample",
-            ci_status=CIStatus.SUCCESS,
-            review_status=review_status,
-            url=f"{url.rstrip('/').removesuffix('.git')}/pull/{pr_number}",
-            last_activity=last_activity,
-        ),
-        last_updated=last_updated,
-    )
-
 
 def _error_state(
     name: str,
@@ -147,24 +113,8 @@ def test_build_alerts_skips_healthy_repos() -> None:
     assert alerts == []
 
 
-def test_build_alerts_sorts_error_before_hung_and_by_duration() -> None:
+def test_build_alerts_sorts_errors_by_duration() -> None:
     now = datetime.now(timezone.utc)
-
-    # Longest hung first in its bucket but still below the error bucket.
-    long_hung = _hung_state(
-        "example__alpha",
-        "https://github.com/example/alpha.git",
-        last_updated=now - timedelta(hours=2),
-        last_activity=now - timedelta(hours=2),
-    )
-    short_hung = _hung_state(
-        "example__beta",
-        "https://github.com/example/beta.git",
-        last_updated=now - timedelta(minutes=10),
-        last_activity=now - timedelta(minutes=10),
-        pr_number=7,
-    )
-    # ERROR must sort to the top regardless of its duration.
     recent_error = _error_state(
         "example__gamma",
         "https://github.com/example/gamma.git",
@@ -178,55 +128,12 @@ def test_build_alerts_sorts_error_before_hung_and_by_duration() -> None:
         error_message="earlier boom",
     )
 
-    alerts = _build_alerts(
-        [short_hung, recent_error, long_hung, older_error]
-    )
+    alerts = _build_alerts([recent_error, older_error])
     kinds = [a["kind"] for a in alerts]
-    # both ERRORs come before both HUNGs
-    assert kinds == ["ERROR", "ERROR", "HUNG", "HUNG"]
-    # within ERROR bucket, longest duration first
+    assert kinds == ["ERROR", "ERROR"]
     assert alerts[0]["repo_name"] == "example__delta"
     assert alerts[1]["repo_name"] == "example__gamma"
-    # within HUNG bucket, longest duration first
-    assert alerts[2]["repo_name"] == "example__alpha"
-    assert alerts[3]["repo_name"] == "example__beta"
 
-
-def test_build_alerts_uses_last_activity_for_hung_duration() -> None:
-    """HUNG duration must come from ``current_pr.last_activity`` when set.
-
-    The daemon's hung detector keys off ``last_activity`` (the last time
-    the PR saw a review event), not off ``state.last_updated`` — the
-    latter rewrites to "now" every time the runner loops through WATCH
-    even though nothing actually happened on the PR. If the alert card
-    pulled its "Hung for X" off ``last_updated`` it would silently
-    reset the clock on every daemon tick and always display a tiny
-    duration even for long-stuck PRs.
-    """
-    now = datetime.now(timezone.utc)
-    state = _hung_state(
-        "example__alpha",
-        "https://github.com/example/alpha.git",
-        last_updated=now - timedelta(seconds=5),
-        last_activity=now - timedelta(minutes=45),
-    )
-    alerts = _build_alerts([state])
-    assert len(alerts) == 1
-    assert alerts[0]["duration_text"] == "45 min"
-
-
-def test_build_alerts_falls_back_to_last_updated_when_no_pr() -> None:
-    now = datetime.now(timezone.utc)
-    bare = RepoState(
-        url="https://github.com/example/alpha.git",
-        name="example__alpha",
-        state=PipelineState.HUNG,
-        last_updated=now - timedelta(minutes=12),
-    )
-    alerts = _build_alerts([bare])
-    assert len(alerts) == 1
-    assert alerts[0]["duration_text"] == "12 min"
-    assert alerts[0]["pr_number"] is None
 
 
 def test_most_recent_transition_into_picks_latest_run_start() -> None:
@@ -313,34 +220,6 @@ def test_build_alerts_error_duration_survives_publish_state_rewrite() -> None:
     # most recent "still broken" poll and not from last_updated.
     assert alert["duration_text"] == "47 min"
 
-
-def test_build_alerts_hung_duration_falls_back_to_history_transition() -> None:
-    """HUNG without ``current_pr.last_activity`` must also survive the
-    ``publish_state`` rewrite by scanning history for the most recent
-    transition into HUNG instead of reading ``last_updated`` directly.
-    """
-    now = datetime.now(timezone.utc)
-    hung_transition = now - timedelta(hours=1, minutes=30)
-    bare = RepoState(
-        url="https://github.com/example/alpha.git",
-        name="example__alpha",
-        state=PipelineState.HUNG,
-        last_updated=now - timedelta(seconds=1),
-        history=[
-            {
-                "time": _iso(now - timedelta(hours=2)),
-                "state": "WATCH",
-                "event": "watching review",
-            },
-            {
-                "time": _iso(hung_transition),
-                "state": "HUNG",
-                "event": "marked hung",
-            },
-        ],
-    )
-    [alert] = _build_alerts([bare])
-    assert alert["duration_text"] == "1h 30min"
 
 
 def test_build_alerts_error_card_carries_message_and_repo_link() -> None:
@@ -436,65 +315,6 @@ def test_partial_alerts_renders_error_card(alerts_config: Path) -> None:
     assert "bg-fail text-white" in body
     assert "1" in body
 
-
-def test_partial_alerts_renders_hung_card_with_pr_number(
-    alerts_config: Path,
-) -> None:
-    now = datetime.now(timezone.utc)
-    hung = _hung_state(
-        "example__alpha",
-        "https://github.com/example/alpha.git",
-        last_updated=now,
-        last_activity=now - timedelta(minutes=30),
-        pr_number=123,
-    )
-    fake = _FakeRedis({"pipeline:example__alpha": hung.model_dump_json()})
-
-    with TestClient(app) as client:
-        client.app.state.redis = fake
-        response = client.get("/partials/alerts")
-
-    assert response.status_code == 200
-    body = response.text
-    assert "Hung for 30 min" in body
-    assert "#123" in body
-    # PR number links out to GitHub
-    assert "https://github.com/example/alpha/pull/123" in body
-    # review status surfaces on the card
-    assert "EYES" in body
-    # hung cards use the hung border utility
-    assert "border-hung" in body
-
-
-def test_partial_alerts_places_error_before_hung(alerts_config: Path) -> None:
-    now = datetime.now(timezone.utc)
-    err = _error_state(
-        "example__alpha",
-        "https://github.com/example/alpha.git",
-        last_updated=now - timedelta(seconds=30),
-        error_message="boom",
-    )
-    hung = _hung_state(
-        "example__beta",
-        "https://github.com/example/beta.git",
-        last_updated=now - timedelta(hours=3),
-        last_activity=now - timedelta(hours=3),
-    )
-    fake = _FakeRedis(
-        {
-            "pipeline:example__alpha": err.model_dump_json(),
-            "pipeline:example__beta": hung.model_dump_json(),
-        }
-    )
-
-    with TestClient(app) as client:
-        client.app.state.redis = fake
-        response = client.get("/partials/alerts")
-
-    assert response.status_code == 200
-    body = response.text
-    # ERROR copy must appear before HUNG copy despite hung's longer duration
-    assert body.index("boom") < body.index("Hung for")
 
 
 def test_alert_repo_link_points_to_repo_detail(alerts_config: Path) -> None:

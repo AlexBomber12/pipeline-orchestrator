@@ -169,7 +169,7 @@ def test_compute_stats_counts_active_alerts_and_merges() -> None:
         "beta",
         "https://github.com/example/beta.git",
         history=[],
-        state=PipelineState.HUNG,
+        state=PipelineState.ERROR,
     )
     gamma = _coding_state(
         "gamma",
@@ -182,7 +182,7 @@ def test_compute_stats_counts_active_alerts_and_merges() -> None:
 
     assert stats["repos"] == 3
     assert stats["active"] == 1  # alpha in CODING
-    assert stats["alerts"] == 1  # beta in HUNG
+    assert stats["alerts"] == 1  # beta in ERROR
     assert stats["done_today"] == 1  # only the today_morning merge
     assert stats["done_week"] == 2  # today + 3 days ago, NOT 10 days ago
     # 1 iteration event / 3 merges == 0.33
@@ -442,17 +442,17 @@ def test_api_stats_returns_expected_json_shape(
     assert payload["done_today"] == 1
 
 
-def test_api_stats_counts_alerts_when_repo_is_hung(
+def test_api_stats_counts_alerts_when_repo_is_error(
     observability_config: Path,
 ) -> None:
     now = datetime.now(timezone.utc)
-    hung = RepoState(
+    errored = RepoState(
         url="https://github.com/example/alpha.git",
         name="example__alpha",
-        state=PipelineState.HUNG,
+        state=PipelineState.ERROR,
         last_updated=now,
     )
-    fake = _FakeRedis({"pipeline:example__alpha": hung.model_dump_json()})
+    fake = _FakeRedis({"pipeline:example__alpha": errored.model_dump_json()})
 
     with TestClient(app) as client:
         client.app.state.redis = fake

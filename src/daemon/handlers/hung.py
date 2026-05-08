@@ -1,7 +1,6 @@
-"""HUNG state handler and Codex review posting.
+"""Codex review posting helpers.
 
 Mixin methods:
-    handle_hung                   — nudge reviewer or escalate
     _post_codex_review            — post @codex review on a PR
     _should_skip_codex_review_post — fail-open EYES race-window dedup gate
 """
@@ -14,8 +13,6 @@ from src.daemon import git_ops
 from src.github import comments as gh_comments
 from src.github import gh_runner, reactions
 from src.github import prs as gh_prs
-from src.keyspace import control_recover
-from src.models import PipelineState
 
 
 def _author_already_requested_review(
@@ -55,7 +52,7 @@ def _author_recent_review_requested_at(
 
 
 class HungMixin:
-    """Nudge the reviewer with ``@codex review`` or give up, per config."""
+    """Shared reviewer nudging helpers for active PR handlers."""
 
     def _should_skip_codex_review_post(self, pr_number: int) -> bool:
         """Return ``True`` when a fresh Codex EYES reaction covers the head.
@@ -247,212 +244,3 @@ class HungMixin:
             bypass_same_head_dedup=bypass_same_head_dedup,
         )
         return success
-
-    async def _check_operator_recovery_signal(self) -> bool:
-        """Atomically read-and-clear the one-shot recover flag.
-
-        Uses Redis ``GETDEL`` so the read and the clear share a single
-        round-trip: the daemon never observes a recovery signal whose
-        clearing has not also succeeded. A non-atomic ``get`` then
-        ``delete`` could leave a stale ``control:{repo}:recover`` key
-        in place if the delete failed, then trigger an unintended
-        auto-recovery on a later, unrelated HUNG state inside the
-        web-side TTL window.
-
-        Fails closed (returns ``False``) on any Redis error so a
-        transient outage cannot manufacture a recovery transition the
-        operator did not request. The flag carries a short TTL on the
-        web side so a stale signal cannot strand around for hours.
-        """
-        key = control_recover(self.name)
-        try:
-            raw = await self.redis.getdel(key)
-        except Exception:
-            return False
-        return bool(raw)
-
-    async def _perform_operator_recovery(self) -> None:
-        """Exit HUNG to IDLE on operator request (PR-247).
-
-        Clears ``current_task`` so the IDLE handler picks up the next
-        task and resets the runner-private SKIP/diagnose counters tied
-        to the trapped task. The persisted RepoState's ``__setattr__``
-        hook releases ``current_pr`` and ``error_message`` when
-        ``current_task`` flips to None, so we do not need to clear them
-        explicitly here.
-
-        Records the trapped task in ``_recovered_task_pr_ids`` before
-        clearing it. Without this, the next ``handle_idle`` cycle would
-        re-derive the same task as ``DOING`` from the still-open PR
-        (``find_matching_open_pr`` matches by branch) and immediately
-        reattach the runner to ``WATCH`` — defeating the recover
-        button. The IDLE selector consults the set and forces
-        ``CANCELED``; the user's task re-upload clears it (matching the
-        PR-186 ``_crashed_task_pr_ids`` retry contract).
-
-        Also snapshots the set to Redis so the marker survives a daemon
-        restart between the recover click and the user's task re-upload
-        — without that persistence ``recover_state`` would rehydrate the
-        CANCELED row into ``_crashed_task_pr_ids`` instead, and the IDLE
-        selector would discard the override on the still-open PR
-        deriving back to ``DOING``, reattaching the runner to WATCH on
-        the same stuck PR.
-        """
-        current_pr = self.state.current_pr
-        pr_label = (
-            f"PR #{current_pr.number}" if current_pr is not None else "no PR"
-        )
-        current_task = self.state.current_task
-        if current_task is not None:
-            self._recovered_task_pr_ids.add(current_task.pr_id)
-            await self._persist_recovered_task_pr_ids()
-        self.log_event(
-            f"[RECOVERY] Operator-initiated recovery from HUNG ({pr_label}) "
-            f"-> IDLE."
-        )
-        self.state.current_task = None
-        self._reset_runner_local_task_counters()
-        self.state.state = PipelineState.IDLE
-        await self.publish_state()
-
-    async def handle_hung(self) -> None:
-        """Nudge the reviewer with ``@codex review`` or give up, per config."""
-        if await self._check_operator_recovery_signal():
-            await self._perform_operator_recovery()
-            return
-        current_pr = self.state.current_pr
-        if current_pr is not None:
-            # Always check whether the operator resolved the PR before
-            # branching on escalation/fallback. An escalated PR that gets
-            # manually merged or closed must transition out of HUNG; the
-            # prior shape returned early on ``is_escalated`` and trapped
-            # the runner there forever (Codex P1 on PR #222).
-            try:
-                result = gh_runner.run_gh(
-                    [
-                        "pr",
-                        "view",
-                        str(current_pr.number),
-                        "--json",
-                        "state",
-                    ],
-                    repo=self.owner_repo,
-                )
-            except Exception as exc:
-                self.log_event(
-                    f"[ESCALATE] hung: failed to check PR state: {exc}; "
-                    f"staying HUNG."
-                )
-                return
-
-            pr_state = ""
-            if isinstance(result, dict):
-                pr_state = str(result.get("state") or "").upper()
-
-            if pr_state in ("MERGED", "CLOSED"):
-                self.log_event(
-                    f"[ESCALATE] PR #{current_pr.number} {pr_state} by "
-                    f"operator -> IDLE."
-                )
-                self.state.current_task = None
-                self._reset_runner_local_task_counters()
-                self.state.state = PipelineState.IDLE
-                return
-
-            if current_pr.is_escalated:
-                # Escalated PRs (e.g. parked here by the FIX no-push deadlock
-                # circuit breaker) require manual intervention. Skip the
-                # @codex review fallback so the runner stays HUNG instead of
-                # bouncing through WATCH and re-entering the loop that
-                # triggered escalation in the first place.
-                self.log_event(
-                    f"[ESCALATE] PR #{current_pr.number} escalated; "
-                    f"staying HUNG, skipping @codex review fallback. "
-                    f"Manual review required."
-                )
-                return
-
-        if (
-            self.app_config.daemon.hung_fallback_codex_review
-            and current_pr is not None
-        ):
-            # OBS-BL (PR-249): cap the WATCH<->HUNG retrigger cycle so a
-            # codex-silent loop (auto-trigger drop, infrastructure
-            # outage, model unavailable) cannot burn operator API budget
-            # forever. ``watch_retrigger_count`` resets on fresh review
-            # activity in handle_watch, so genuine progress always
-            # restores the full budget; only stuck cycles trip the cap.
-            #
-            # Re-check PR activity here too: ``handle_watch`` only resets
-            # the counter while it is the active handler, so a fresh
-            # event arriving between the WATCH-timeout escalation and
-            # this HUNG cycle would otherwise leave the counter stale
-            # and false-escalate an active PR. Compare a fresh fetch
-            # against ``current_pr`` (which holds the last WATCH-fetched
-            # snapshot) and reset on a real change. Fail-safe: any
-            # refresh error stays HUNG instead of escalating.
-            try:
-                prs_now = gh_prs.get_open_prs(
-                    self.owner_repo,
-                    allow_merge_without_checks=(
-                        self.repo_config.allow_merge_without_checks
-                    ),
-                )
-            except Exception as exc:
-                self.log_event(
-                    f"[ESCALATE] hung: failed to refresh PR activity "
-                    f"for cap check: {exc}; staying HUNG."
-                )
-                return
-            found_now = next(
-                (p for p in prs_now if p.number == current_pr.number),
-                None,
-            )
-            if found_now is not None and (
-                found_now.review_status != current_pr.review_status
-                or found_now.ci_status != current_pr.ci_status
-                or found_now.last_activity != current_pr.last_activity
-            ):
-                current_pr.watch_retrigger_count = 0
-            cap = self.app_config.daemon.watch_retrigger_cap
-            next_count = current_pr.watch_retrigger_count + 1
-            if next_count >= cap:
-                await self._escalate_and_skip(
-                    f"watch_retrigger_cap_reached: {next_count} cycles "
-                    f"with no fresh review activity",
-                    apply_escalated_label=True,
-                    set_pr_escalated_flag=True,
-                    label_create_log_prefix="watch retrigger cap",
-                    log_message=(
-                        f"PR #{current_pr.number} watch_retrigger cap "
-                        f"reached ({next_count}/{cap}); escalating "
-                        f"instead of resetting WATCH."
-                    ),
-                )
-                return
-            try:
-                gh_comments.post_comment(
-                    self.owner_repo,
-                    current_pr.number,
-                    "@codex review",
-                )
-            except Exception as exc:
-                await self._transition_to_error(
-                    f"post_comment failed: {exc}",
-                    log_prefix="[ESCALATE]",
-                    log_message=str(exc),
-                    save_run_record_as=None,
-                    publish=False,
-                )
-                return
-            current_pr.watch_retrigger_count = next_count
-            current_pr.last_activity = datetime.now(timezone.utc)
-            self.state.state = PipelineState.WATCH
-            self.log_event("[ESCALATE] posted @codex review -> WATCH.")
-            return
-
-        self.log_event(
-            "[ESCALATE] hung fallback disabled; leaving runner in HUNG "
-            "for operator action. Resolve the PR manually or re-enable "
-            "hung_fallback_codex_review."
-        )

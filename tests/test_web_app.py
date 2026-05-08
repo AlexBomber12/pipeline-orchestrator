@@ -796,6 +796,26 @@ def test_pause_endpoint_publishes_pause_wake_event(
     assert payload["repo"] == "example__alpha"
 
 
+def test_pause_endpoint_accepts_legacy_hung_state(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy_payload = (
+        '{"url":"https://github.com/example/alpha.git",'
+        '"name":"example__alpha","state":"HUNG"}'
+    )
+    fake = _FakeRedis({"pipeline:example__alpha": legacy_payload})
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/pause")
+
+    assert response.status_code == 200
+    state = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
+    assert state.state == PipelineState.ERROR
+    assert state.user_paused is True
+
+
 def test_resume_endpoint_publishes_resume_wake_event(
     two_repo_config: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1171,344 +1191,6 @@ def test_stop_endpoint_reports_atomic_stop_key_write_failure(
     assert state.user_paused is False
     assert "control:example__alpha:stop" not in fake.store
 
-
-def test_recover_endpoint_queues_recovery_signal_when_state_is_hung(
-    two_repo_config: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``POST /repos/{name}/recover`` writes a one-shot recover flag and
-    publishes a wake event when the repo is HUNG (PR-247)."""
-    stored = RepoState(
-        url="https://github.com/example/alpha.git",
-        name="example__alpha",
-        state=PipelineState.HUNG,
-        current_task=QueueTask(
-            pr_id="PR-001", title="parked", status=TaskStatus.DOING
-        ),
-    )
-    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
-    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/recover")
-
-    assert response.status_code == 200
-    assert response.json() == {"ok": True, "queued_state": "IDLE"}
-    assert fake.store.get("control:example__alpha:recover") == "1"
-    assert len(fake.published) == 1
-    channel, message = fake.published[0]
-    assert channel == "orchestrator:wake:example__alpha"
-    payload = json.loads(message)
-    assert payload["event_type"] == "recover"
-    assert payload["repo"] == "example__alpha"
-    # The endpoint must NOT mutate state directly — the daemon performs the
-    # transition on its next tick after consuming the signal.
-    persisted = RepoState.model_validate_json(
-        fake.store["pipeline:example__alpha"]
-    )
-    assert persisted.state == PipelineState.HUNG
-    assert persisted.current_task is not None
-
-
-@pytest.mark.parametrize(
-    "non_hung_state",
-    [
-        PipelineState.IDLE,
-        PipelineState.CODING,
-        PipelineState.WATCH,
-        PipelineState.FIX,
-        PipelineState.MERGE,
-        PipelineState.ERROR,
-        PipelineState.PAUSED,
-    ],
-)
-def test_recover_endpoint_rejects_non_hung_state(
-    two_repo_config: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    non_hung_state: PipelineState,
-) -> None:
-    """Recover must be HUNG-specific — every other state returns 400 and
-    leaves Redis untouched (no flag, no wake)."""
-    stored = RepoState(
-        url="https://github.com/example/alpha.git",
-        name="example__alpha",
-        state=non_hung_state,
-    )
-    fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
-    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/recover")
-
-    assert response.status_code == 400
-    body = response.json()
-    assert body["error"] == "recovery_only_from_hung"
-    assert body["current_state"] == non_hung_state.value
-    assert "control:example__alpha:recover" not in fake.store
-    assert fake.published == []
-
-
-def test_recover_endpoint_404_for_unknown_repo(
-    two_repo_config: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake = _FakeRedis()
-    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
-
-    with TestClient(app) as client:
-        response = client.post("/repos/unknown__repo/recover")
-
-    assert response.status_code == 404
-
-
-def test_recover_endpoint_503_when_pipeline_state_unreadable(
-    two_repo_config: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A get() error after the initial ping must surface as 503 — never as
-    a recovery transition for an unknown current state."""
-
-    class _ReadFailRedis(_FakeRedis):
-        async def get(self, key: str) -> str | None:
-            raise RuntimeError("redis read failed")
-
-    fake = _ReadFailRedis()
-    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/recover")
-
-    assert response.status_code == 503
-    assert "control:example__alpha:recover" not in fake.store
-
-
-def test_recover_endpoint_503_when_pipeline_state_unparseable(
-    two_repo_config: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Garbage in the persisted state blob must produce 503, not a 400 with
-    a bogus ``current_state`` value."""
-    fake = _FakeRedis({"pipeline:example__alpha": "{not-json"})
-    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/recover")
-
-    assert response.status_code == 503
-    assert "control:example__alpha:recover" not in fake.store
-
-
-def test_recover_endpoint_uses_default_state_when_pipeline_state_absent(
-    two_repo_config: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """No persisted state means the daemon has not initialized yet — there
-    cannot be a HUNG repo to recover, so the endpoint returns 400 with the
-    default state's value."""
-    fake = _FakeRedis()
-    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/recover")
-
-    assert response.status_code == 400
-    body = response.json()
-    assert body["error"] == "recovery_only_from_hung"
-    assert "control:example__alpha:recover" not in fake.store
-
-
-def test_recover_endpoint_503_when_signal_write_fails(
-    two_repo_config: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """If the recover-flag write fails we must surface 503 so the operator
-    sees a failure — pretending the signal was queued would let them think
-    the daemon will act and silently drop the request."""
-
-    class _SetFailRedis(_FakeRedis):
-        async def set(self, key: str, value: str, **kwargs: object) -> None:
-            if key == "control:example__alpha:recover":
-                raise RuntimeError("set failed")
-            await super().set(key, value, **kwargs)
-
-    stored = RepoState(
-        url="https://github.com/example/alpha.git",
-        name="example__alpha",
-        state=PipelineState.HUNG,
-    )
-    fake = _SetFailRedis(
-        {"pipeline:example__alpha": stored.model_dump_json()}
-    )
-    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/recover")
-
-    assert response.status_code == 503
-    assert fake.published == []
-
-
-def test_recover_endpoint_succeeds_when_publish_wake_fails(
-    two_repo_config: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A wake-publish failure must not block the recovery signal — the
-    daemon will still consume the Redis flag on its next tick."""
-
-    class _PublishBoomRedis(_FakeRedis):
-        async def publish(self, channel: str, message: str) -> int:
-            raise RuntimeError("publish boom")
-
-    stored = RepoState(
-        url="https://github.com/example/alpha.git",
-        name="example__alpha",
-        state=PipelineState.HUNG,
-    )
-    fake = _PublishBoomRedis(
-        {"pipeline:example__alpha": stored.model_dump_json()}
-    )
-    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
-
-    with TestClient(app) as client:
-        with caplog.at_level("WARNING", logger=web_app.logger.name):
-            response = client.post("/repos/example__alpha/recover")
-
-    assert response.status_code == 200
-    assert fake.store.get("control:example__alpha:recover") == "1"
-    assert any(
-        "publish_wake failed for example__alpha" in rec.getMessage()
-        for rec in caplog.records
-    )
-
-
-def test_recover_endpoint_uses_atomic_check_and_set(
-    two_repo_config: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The HUNG-state check and the recover-flag write must execute inside
-    a single ``WATCH``/``MULTI`` transaction on the pipeline-state key.
-
-    Without the atomic guard, a daemon cycle could move the repo out of
-    HUNG between the check and the write — the endpoint would still return
-    200 and leave a recover flag that a later, unrelated HUNG episode
-    would consume within the 5-minute TTL, causing an unexpected
-    auto-recovery. This test pins the contract that the SET is queued
-    inside the same transaction that watches ``pipeline:{name}``.
-    """
-    transaction_calls: list[dict[str, object]] = []
-
-    stored = RepoState(
-        url="https://github.com/example/alpha.git",
-        name="example__alpha",
-        state=PipelineState.HUNG,
-    )
-
-    class _SpyRedis(_FakeRedis):
-        async def transaction(
-            self,
-            func,
-            *watches: str,
-            value_from_callable: bool = False,
-            **kwargs: object,
-        ):
-            pipe = _FakePipeline(self)
-            func_value = func(pipe)
-            if asyncio.iscoroutine(func_value):
-                func_value = await func_value
-            transaction_calls.append(
-                {
-                    "watches": watches,
-                    "queued": list(pipe.commands),
-                }
-            )
-            exec_value = await pipe.execute()
-            if value_from_callable:
-                return func_value
-            return exec_value
-
-    fake = _SpyRedis({"pipeline:example__alpha": stored.model_dump_json()})
-    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/recover")
-
-    assert response.status_code == 200
-    assert len(transaction_calls) == 1
-    call = transaction_calls[0]
-    assert call["watches"] == ("pipeline:example__alpha",)
-    queued = [
-        (cmd, args) for cmd, args, _kw in call["queued"]
-    ]
-    assert ("set", ("control:example__alpha:recover", "1")) in queued
-
-
-def test_recover_endpoint_aborts_when_state_changes_during_transaction(
-    two_repo_config: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Race: a daemon cycle moves the repo out of HUNG between the
-    endpoint's ``WATCH`` and the ``EXEC``.
-
-    redis-py's ``Redis.transaction(...)`` retries the callback on
-    ``WatchError``; on the retry the callback re-reads the state via the
-    pipeline, finds it is no longer HUNG, and aborts with 400. No flag
-    must be written and no wake event must be published.
-    """
-    hung = RepoState(
-        url="https://github.com/example/alpha.git",
-        name="example__alpha",
-        state=PipelineState.HUNG,
-    )
-    idle = RepoState(
-        url="https://github.com/example/alpha.git",
-        name="example__alpha",
-        state=PipelineState.IDLE,
-    )
-
-    class _RaceRedis(_FakeRedis):
-        """Models redis-py's retry behavior on ``WatchError``.
-
-        In real Redis, a watched key changing between ``WATCH`` and
-        ``EXEC`` causes ``EXEC`` to fail; redis-py re-invokes the
-        callback against the new value. We collapse both observations
-        into the single callback invocation here by serving the
-        post-race value the first time the callback reads the watched
-        key. The endpoint must therefore observe the state change on
-        its very first ``pipe.get`` and abort with 400.
-        """
-
-        async def transaction(
-            self,
-            func,
-            *watches: str,
-            value_from_callable: bool = False,
-            **kwargs: object,
-        ):
-            for key in watches:
-                if key in self.store:
-                    self.store[key] = idle.model_dump_json()
-            pipe = _FakePipeline(self)
-            func_value = func(pipe)
-            if asyncio.iscoroutine(func_value):
-                func_value = await func_value
-            exec_value = await pipe.execute()
-            if value_from_callable:
-                return func_value
-            return exec_value
-
-    fake = _RaceRedis({"pipeline:example__alpha": hung.model_dump_json()})
-    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis_with_state(fake))
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/recover")
-
-    assert response.status_code == 400
-    body = response.json()
-    assert body["error"] == "recovery_only_from_hung"
-    assert body["current_state"] == PipelineState.IDLE.value
-    assert "control:example__alpha:recover" not in fake.store
-    assert fake.published == []
 
 
 @pytest.mark.parametrize(
@@ -2760,7 +2442,6 @@ def test_updated_header_has_data_ts(
         (PipelineState.IDLE, False),
         (PipelineState.PREFLIGHT, False),
         (PipelineState.PAUSED, False),
-        (PipelineState.HUNG, False),
         (PipelineState.ERROR, False),
     ],
 )
@@ -3057,57 +2738,6 @@ def test_post_repo_detail_coder_defers_paused_repo_switch_message(
     assert stored.coder == "claude"
 
 
-def test_post_repo_detail_coder_defers_hung_repo_switch_message(
-    two_repo_config: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    hung = RepoState(
-        url="https://github.com/example/alpha.git",
-        name="example__alpha",
-        state=PipelineState.HUNG,
-        coder="claude",
-        current_pr=PRInfo(number=17, branch="pr-017-sample"),
-        last_updated=datetime(2026, 4, 20, 17, 0, 0, tzinfo=timezone.utc),
-    )
-    fake = _FakeRedis({"pipeline:example__alpha": hung.model_dump_json()})
-
-    async def _fake_publish_repo_event(*args: object, **kwargs: object) -> None:
-        return None
-
-    async def _fake_repo_template_context(
-        name: str,
-        redis_client: object | None,
-        *,
-        coder_update_message: str | None = None,
-        include_metrics: bool = False,
-    ) -> dict[str, object]:
-        return {"coder_update_message": coder_update_message or ""}
-
-    def _fake_template_response(
-        request: object,
-        template_name: str,
-        context: dict[str, object],
-    ) -> HTMLResponse:
-        return HTMLResponse(str(context["coder_update_message"]))
-
-    monkeypatch.setattr(web_app, "publish_repo_event", _fake_publish_repo_event)
-    monkeypatch.setattr(web_app, "update_repository", lambda *args, **kwargs: None)
-    monkeypatch.setattr(web_app, "_repo_template_context", _fake_repo_template_context)
-    monkeypatch.setattr(web_app.templates, "TemplateResponse", _fake_template_response)
-
-    with TestClient(app) as client:
-        client.app.state.redis = fake
-        response = client.post(
-            "/repos/example__alpha/coder",
-            data={"coder": "codex"},
-        )
-
-    assert response.status_code == 200
-    assert response.text == "Switching to Codex CLI - applies after current PR completes."
-    stored = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
-    assert stored.coder == "claude"
-
-
 def test_post_repo_detail_coder_updates_idle_repo_via_transaction(
     two_repo_config: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3250,7 +2880,7 @@ def test_post_repo_detail_coder_skips_missing_state_during_transaction(
     assert "pipeline:example__alpha" not in fake.store
 
 
-def test_post_repo_detail_coder_skips_transaction_when_state_turns_hung(
+def test_post_repo_detail_coder_skips_transaction_when_state_turns_paused(
     two_repo_config: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3262,7 +2892,7 @@ def test_post_repo_detail_coder_skips_transaction_when_state_turns_hung(
         last_updated=datetime(2026, 4, 20, 17, 0, 0, tzinfo=timezone.utc),
     )
 
-    class _HungDuringTransactionRedis(_FakeRedis):
+    class _PausedDuringTransactionRedis(_FakeRedis):
         async def ping(self) -> bool:
             return True
 
@@ -3276,7 +2906,7 @@ def test_post_repo_detail_coder_skips_transaction_when_state_turns_hung(
             self.store["pipeline:example__alpha"] = RepoState(
                 url="https://github.com/example/alpha.git",
                 name="example__alpha",
-                state=PipelineState.HUNG,
+                state=PipelineState.PAUSED,
                 coder="claude",
                 current_pr=PRInfo(number=17, branch="pr-017-sample"),
                 last_updated=datetime(2026, 4, 20, 17, 0, 0, tzinfo=timezone.utc),
@@ -3288,7 +2918,7 @@ def test_post_repo_detail_coder_skips_transaction_when_state_turns_hung(
                 **_kwargs,
             )
 
-    fake = _HungDuringTransactionRedis(
+    fake = _PausedDuringTransactionRedis(
         {"pipeline:example__alpha": idle.model_dump_json()}
     )
 

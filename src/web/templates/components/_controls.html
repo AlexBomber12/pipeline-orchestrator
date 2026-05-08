@@ -16,19 +16,11 @@
 </svg>
 {%- endmacro %}
 
-{% macro recover_icon() -%}
-<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" class="w-5 h-5">
-    <path d="M3 12a9 9 0 1 0 3-6.7" />
-    <path d="M3 4v5h5" />
-</svg>
-{%- endmacro %}
-
 {% macro repo_controls(repo, extra_classes='') -%}
 {% set active_states = ['CODING', 'WATCH', 'FIX', 'MERGE'] %}
 {% set show_play = repo.user_paused or (repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done) %}
 {% set show_pause = (repo.state.value in active_states) and not repo.user_paused %}
 {% set show_stop = repo.state.value in active_states %}
-{% set show_recover = repo.state.value == 'HUNG' %}
 {% set escaped_name = css_escape(repo.name) %}
 <div class="flex items-center gap-3 md:gap-2 {{ extra_classes }}">
     {% if show_play %}
@@ -74,22 +66,6 @@
         {{ stop_icon() }}
     </button>
     {% with spinner_id="controls-stop-spinner-" ~ repo.name %}
-    {% include "components/_spinner.html" %}
-    {% endwith %}
-    {% endif %}
-    {% if show_recover %}
-    <button type="button"
-            aria-label="Recover from HUNG"
-            title="Recover from HUNG: cancel current task and return to IDLE"
-            class="relative inline-flex items-center justify-center h-8 w-8 md:h-7 md:w-7 rounded-md text-gray-400 hover:text-warn hover:bg-warn/10 transition-colors before:absolute before:-inset-1.5 before:content-[''] md:before:content-none"
-            hx-post="/repos/{{ repo.name }}/recover"
-            hx-confirm="Recover from HUNG: cancel current task and return to IDLE?"
-            hx-swap="none"
-            hx-indicator="#controls-recover-spinner-{{ escaped_name }}"
-            onclick="event.stopPropagation()">
-        {{ recover_icon() }}
-    </button>
-    {% with spinner_id="controls-recover-spinner-" ~ repo.name %}
     {% include "components/_spinner.html" %}
     {% endwith %}
     {% endif %}

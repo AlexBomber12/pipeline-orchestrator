@@ -287,20 +287,6 @@ def reset_testbed():
 
 
 @pytest.fixture
-def recover_repo():
-    def _recover_repo(slug: str = TESTBED_SLUG) -> tuple[int, dict]:
-        url = f"{TEST_DASHBOARD_URL}/repos/{slug}/recover"
-        response = requests.post(url, timeout=10)
-        try:
-            body = response.json()
-        except ValueError:
-            body = {}
-        return response.status_code, body
-
-    return _recover_repo
-
-
-@pytest.fixture
 def post_review():
     """Post a PR review on the testbed via ``gh api`` and return the review id.
 

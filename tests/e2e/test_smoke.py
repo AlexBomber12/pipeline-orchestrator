@@ -10,7 +10,6 @@ def test_smoke_dashboard_responds(dashboard_url, testbed_slug):
         "FIX",
         "MERGE",
         "ERROR",
-        "HUNG",
         "PAUSED",
         "PREFLIGHT",
     }

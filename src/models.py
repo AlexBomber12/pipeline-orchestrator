@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import NotRequired, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class PipelineState(str, Enum):
@@ -16,7 +16,6 @@ class PipelineState(str, Enum):
     WATCH = "WATCH"
     FIX = "FIX"
     MERGE = "MERGE"
-    HUNG = "HUNG"
     ERROR = "ERROR"
     PAUSED = "PAUSED"
 
@@ -86,10 +85,8 @@ class PRInfo(BaseModel):
     head_sha: str = ""
     fix_iteration_count: int = 0
     no_push_fix_count: int = 0
-    # OBS-BL (PR-249): WATCH<->HUNG retrigger cycles counted to cap
-    # ``daemon.watch_retrigger_cap`` runaway codex-silent loops where
-    # ``handle_hung`` would otherwise post ``@codex review`` and reset
-    # WATCH indefinitely. Reset on fresh review activity.
+    # OBS-BL (PR-249): WATCH retrigger cycles counted to cap runaway
+    # codex-silent loops. Reset on fresh review activity.
     watch_retrigger_count: int = 0
     url: str = ""
     last_activity: datetime | None = None
@@ -190,6 +187,13 @@ class RepoState(BaseModel):
     coder: str | None = None
     last_stale_retrigger_at: datetime | None = None
     last_codex_retrigger_at: datetime | None = None
+
+    @field_validator("state", mode="before")
+    @classmethod
+    def _migrate_legacy_hung_state(cls, value: object) -> object:
+        if value == "HUNG":
+            return PipelineState.ERROR
+        return value
 
     def __setattr__(self, name: str, value: object) -> None:
         """Couple related task/PR fields so a single write resets them together.

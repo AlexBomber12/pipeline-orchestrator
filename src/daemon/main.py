@@ -65,7 +65,6 @@ _DEFERRED_RUNNER_CONFIG_STATES = {
     PipelineState.FIX,
     PipelineState.MERGE,
     PipelineState.PAUSED,
-    PipelineState.HUNG,
 }
 
 
