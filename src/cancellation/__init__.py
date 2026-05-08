@@ -28,6 +28,7 @@ from src.cancellation.storage import (
     record_task_spec_hash,
     reset_retry_count,
     retry_count_key,
+    task_spec_content_hash,
     task_spec_hash_key,
 )
 
@@ -159,6 +160,7 @@ __all__ = [
     "retry_count_key",
     "safe_delete_cancellation_cause",
     "safe_record_cancellation_cause",
+    "task_spec_content_hash",
     "task_spec_hash_key",
     "truncate_for_payload",
 ]

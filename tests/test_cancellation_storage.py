@@ -240,6 +240,23 @@ async def test_task_spec_hash_helpers_decode_bytes_and_delete() -> None:
     assert storage.task_spec_hash_key("alpha", "PR-300") not in redis.values
 
 
+def test_task_spec_content_hash_ignores_frontmatter_status() -> None:
+    error_text = "---\nstatus: ERROR\n---\n\nBody\n"
+    todo_text = "---\nstatus: TODO\n---\n\nBody\n"
+    changed_text = "---\nstatus: TODO\n---\n\nChanged\n"
+    plain_text = "status: ERROR\n\nBody\n"
+
+    assert storage.task_spec_content_hash(error_text) == storage.task_spec_content_hash(
+        todo_text
+    )
+    assert storage.task_spec_content_hash(changed_text) != storage.task_spec_content_hash(
+        error_text
+    )
+    assert storage.task_spec_content_hash(plain_text) != storage.task_spec_content_hash(
+        error_text
+    )
+
+
 async def test_retry_count_helpers_reset_and_delete() -> None:
     redis = _FakeRedis()
     await storage.reset_retry_count(redis, "alpha", "PR-300")

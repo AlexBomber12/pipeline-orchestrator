@@ -10,7 +10,6 @@ commits the new tasks on its next IDLE boundary.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import io
 import json
 import re
@@ -25,9 +24,13 @@ from fastapi import APIRouter, Request, UploadFile
 from fastapi.responses import HTMLResponse
 
 from src.cancellation import (
+    TTL_SECONDS,
     get_task_spec_hash,
     record_task_spec_hash,
     reset_retry_count,
+    retry_count_key,
+    task_spec_content_hash,
+    task_spec_hash_key,
 )
 from src.events import publish_wake
 from src.keyspace import pipeline_state, upload_pending
@@ -295,6 +298,7 @@ async def upload_tasks(
 
     aggregated_issues: list[str] = []
     parsed_task_ids: dict[str, str] = {}
+    parsed_task_texts: dict[str, str] = {}
     for fname, content in task_uploads.items():
         try:
             task_text = content.decode("utf-8")
@@ -311,6 +315,7 @@ async def upload_tasks(
             try:
                 header = parse_task_header(task_path)
                 parsed_task_ids[fname] = header.pr_id
+                parsed_task_texts[fname] = task_text
             except QueueValidationError as exc:
                 for issue in exc.issues:
                     aggregated_issues.append(
@@ -354,7 +359,7 @@ async def upload_tasks(
             accepted_file_contents.append((fname, content))
             continue
         task_id = parsed_task_ids.get(fname, _task_id_from_filename(fname))
-        uploaded_hash = hashlib.sha256(content).hexdigest()
+        uploaded_hash = task_spec_content_hash(parsed_task_texts[fname])
         try:
             existing_hash = await get_task_spec_hash(redis_client, name, task_id)
         except Exception:
@@ -444,20 +449,6 @@ async def upload_tasks(
                 except Exception:
                     pass
 
-            try:
-                for task_id, uploaded_hash in accepted_task_hashes.items():
-                    await record_task_spec_hash(
-                        redis_client, name, task_id, uploaded_hash
-                    )
-                    await reset_retry_count(redis_client, name, task_id)
-            except Exception:
-                return _render_upload_error(
-                    request,
-                    "Failed to update upload metadata (Redis error).",
-                    503,
-                    repo_name=name,
-                )
-
             manifest = {
                 "repo": name,
                 "files": manifest_filenames,
@@ -472,6 +463,50 @@ async def upload_tasks(
                 return _render_upload_error(
                     request,
                     "Failed to enqueue upload (Redis error).",
+                    503,
+                    repo_name=name,
+                )
+            previous_metadata: dict[str, tuple[str | None, str | None]] = {}
+            try:
+                for task_id in accepted_task_hashes:
+                    previous_metadata[task_id] = (
+                        await redis_client.get(task_spec_hash_key(name, task_id)),
+                        await redis_client.get(retry_count_key(name, task_id)),
+                    )
+                for task_id, uploaded_hash in accepted_task_hashes.items():
+                    await record_task_spec_hash(
+                        redis_client, name, task_id, uploaded_hash
+                    )
+                    await reset_retry_count(redis_client, name, task_id)
+            except Exception:
+                for task_id, (previous_hash, previous_retry) in previous_metadata.items():
+                    hash_key = task_spec_hash_key(name, task_id)
+                    retry_key = retry_count_key(name, task_id)
+                    try:
+                        if previous_hash is None:
+                            await redis_client.delete(hash_key)
+                        else:
+                            await redis_client.set(
+                                hash_key, previous_hash, ex=TTL_SECONDS
+                            )
+                        if previous_retry is None:
+                            await redis_client.delete(retry_key)
+                        else:
+                            await redis_client.set(
+                                retry_key, previous_retry, ex=TTL_SECONDS
+                            )
+                    except Exception:
+                        pass
+                try:
+                    if existing_raw is None:
+                        await redis_client.delete(pending_key)
+                    else:
+                        await redis_client.set(pending_key, existing_raw)
+                except Exception:
+                    pass
+                return _render_upload_error(
+                    request,
+                    "Failed to update upload metadata (Redis error).",
                     503,
                     repo_name=name,
                 )

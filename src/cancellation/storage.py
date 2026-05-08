@@ -13,7 +13,9 @@ transitions that previously used HUNG-specific cancellation semantics.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -63,6 +65,27 @@ def task_spec_hash_key(repo_slug: str, task_id: str) -> str:
 
 def retry_count_key(repo_slug: str, task_id: str) -> str:
     return f"metrics:retry_count:{repo_slug}:{task_id}"
+
+
+def task_spec_content_hash(task_text: str) -> str:
+    """Hash task spec content excluding daemon-managed frontmatter status."""
+    lines = task_text.splitlines(keepends=True)
+    first_content_index = next(
+        (index for index, raw_line in enumerate(lines) if raw_line.strip()),
+        None,
+    )
+    if first_content_index is None or lines[first_content_index].rstrip() != "---":
+        normalized = lines
+    else:
+        normalized = []
+        in_frontmatter = True
+        for index, raw_line in enumerate(lines):
+            if index > first_content_index and in_frontmatter and raw_line.rstrip() == "---":
+                in_frontmatter = False
+            if in_frontmatter and re.match(r"^status:\s*", raw_line.rstrip()):
+                continue
+            normalized.append(raw_line)
+    return hashlib.sha256("".join(normalized).encode("utf-8")).hexdigest()
 
 
 async def record_cancellation_cause(

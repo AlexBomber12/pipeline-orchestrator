@@ -7,7 +7,6 @@ Mixin methods:
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
 import subprocess
 from datetime import datetime, timezone
@@ -19,6 +18,7 @@ from src.cancellation import (
     CancellationCause,
     classify_infra_exception,
     record_task_spec_hash,
+    task_spec_content_hash,
 )
 from src.coder_registry import CoderPlugin
 from src.daemon import git_ops
@@ -223,8 +223,16 @@ class CodingMixin:
                 log_prefix="[CODING]",
             )
             return
-        task_hash = hashlib.sha256(task_bytes).hexdigest()
-        await record_task_spec_hash(self.redis, self.name, pr_id, task_hash)
+        task_hash = task_spec_content_hash(task_body)
+        try:
+            await record_task_spec_hash(self.redis, self.name, pr_id, task_hash)
+        except Exception as exc:
+            await self._transition_to_error(
+                f"Cannot persist task spec hash for {pr_id}: {exc}",
+                publish=False,
+                log_prefix="[CODING]",
+            )
+            return
 
         try:
             coder_kwargs = await self._prepare_coder_invocation(
