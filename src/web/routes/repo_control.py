@@ -9,6 +9,7 @@ reads-only paths (rendering, JSON status, partials) live in
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import re
 import subprocess
@@ -145,6 +146,10 @@ def _retry_count_key(repo_slug: str, task_id: str) -> str:
     return f"metrics:retry_count:{repo_slug}:{task_id}"
 
 
+def _retry_fingerprint_key(repo_slug: str, task_id: str) -> str:
+    return f"metrics:retry_fingerprint:{repo_slug}:{task_id}"
+
+
 def _decode_retry_count(raw: object) -> int:
     if raw is None:
         return 0
@@ -168,6 +173,34 @@ async def _get_retry_count(
     return _decode_retry_count(raw)
 
 
+def _decode_redis_text(raw: object) -> str | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8")
+    return str(raw)
+
+
+def _task_retry_fingerprint(task_path: Path) -> str:
+    lines = task_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    first_content_index = next(
+        (index for index, raw_line in enumerate(lines) if raw_line.strip()),
+        None,
+    )
+    if first_content_index is None or lines[first_content_index].rstrip() != "---":
+        normalized = lines
+    else:
+        normalized = []
+        in_frontmatter = True
+        for index, raw_line in enumerate(lines):
+            if index > first_content_index and in_frontmatter and raw_line.rstrip() == "---":
+                in_frontmatter = False
+            if in_frontmatter and re.match(r"^status:\s*", raw_line.rstrip()):
+                continue
+            normalized.append(raw_line)
+    return hashlib.sha256("".join(normalized).encode("utf-8")).hexdigest()
+
+
 async def _retry_repo_state_is_safe(
     redis_client: aioredis.Redis,
     repo_slug: str,
@@ -184,19 +217,33 @@ async def _increment_retry_count(
     repo_slug: str,
     task_id: str,
     cap: int,
+    fingerprint: str | None = None,
 ) -> int:
     key = _retry_count_key(repo_slug, task_id)
+    fingerprint_key = _retry_fingerprint_key(repo_slug, task_id)
 
     async def _transaction(pipe: Any) -> int:
+        stored_fingerprint = (
+            _decode_redis_text(await pipe.get(fingerprint_key)) if fingerprint is not None else None
+        )
         current = _decode_retry_count(await pipe.get(key))
+        if fingerprint is not None and stored_fingerprint != fingerprint:
+            current = 0
         if current >= cap:
             raise _RetryCapExceeded(current, cap)
         next_count = current + 1
         pipe.multi()
+        if fingerprint is not None:
+            pipe.set(fingerprint_key, fingerprint, ex=_RETRY_TTL_SECONDS)
         pipe.set(key, str(next_count), ex=_RETRY_TTL_SECONDS)
         return next_count
 
-    return await redis_client.transaction(_transaction, key, value_from_callable=True)
+    return await redis_client.transaction(
+        _transaction,
+        key,
+        fingerprint_key,
+        value_from_callable=True,
+    )
 
 
 async def _decrement_retry_count(
@@ -783,7 +830,11 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
         return HTMLResponse("Task file not found", status_code=404)
 
     cap = cfg.daemon.retry_button_cap
-    current_status = _read_task_frontmatter_status(task_path)
+    try:
+        current_status = _read_task_frontmatter_status(task_path)
+        retry_fingerprint = _task_retry_fingerprint(task_path)
+    except (OSError, UnicodeError):
+        return HTMLResponse("Failed to read task status", status_code=503)
     if current_status not in {TaskStatus.ERROR, TaskStatus.TODO}:
         return HTMLResponse("Task is not in ERROR", status_code=409)
 
@@ -794,7 +845,13 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
         return HTMLResponse("Failed to read repository state", status_code=503)
 
     try:
-        next_count = await _increment_retry_count(redis_client, name, pr_id, cap)
+        next_count = await _increment_retry_count(
+            redis_client,
+            name,
+            pr_id,
+            cap,
+            retry_fingerprint,
+        )
     except _RetryCapExceeded:
         return HTMLResponse(
             "Retry cap reached. Edit task spec or delete to proceed.",

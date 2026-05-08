@@ -171,12 +171,14 @@ def test_retry_at_cap_returns_409(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo_dir = _write_config_and_task(tmp_path, monkeypatch)
+    fingerprint = repo_control._task_retry_fingerprint(repo_dir / "tasks" / "PR-283.md")
     redis_client = _RetryRedis(
         {
             "pipeline:example__alpha": _snapshot(
                 [QueueTask(pr_id="PR-283", title="Retry me", status=TaskStatus.ERROR)]
             ),
             "metrics:retry_count:example__alpha:PR-283": "3",
+            "metrics:retry_fingerprint:example__alpha:PR-283": fingerprint,
             cause_key("example__alpha", "PR-283"): "{}",
         }
     )
@@ -238,6 +240,7 @@ async def test_retry_count_helpers_handle_bad_values() -> None:
 
     assert repo_control._decode_retry_count(b"2") == 2
     assert repo_control._decode_retry_count("bad") == 0
+    assert repo_control._decode_redis_text(b"fingerprint") == "fingerprint"
     assert await repo_control._get_retry_count(_BoomRedis(), "repo", "PR-1") == 0
 
 
@@ -247,6 +250,28 @@ async def test_increment_retry_count_rejects_cap() -> None:
 
     with pytest.raises(repo_control._RetryCapExceeded):
         await repo_control._increment_retry_count(redis_client, "repo", "PR-1", cap=2)
+
+
+@pytest.mark.asyncio
+async def test_increment_retry_count_resets_when_task_fingerprint_changes() -> None:
+    redis_client = _RetryRedis(
+        {
+            "metrics:retry_count:repo:PR-1": "3",
+            "metrics:retry_fingerprint:repo:PR-1": "old",
+        }
+    )
+
+    next_count = await repo_control._increment_retry_count(
+        redis_client,
+        "repo",
+        "PR-1",
+        cap=3,
+        fingerprint="new",
+    )
+
+    assert next_count == 1
+    assert redis_client.store["metrics:retry_count:repo:PR-1"] == "1"
+    assert redis_client.store["metrics:retry_fingerprint:repo:PR-1"] == "new"
 
 
 @pytest.mark.asyncio
@@ -322,6 +347,27 @@ def test_read_task_frontmatter_status_variants(
     task_path.write_text(content, encoding="utf-8")
 
     assert repo_control._read_task_frontmatter_status(task_path) == expected
+
+
+def test_task_retry_fingerprint_ignores_status_but_tracks_spec(
+    tmp_path: Path,
+) -> None:
+    task_path = tmp_path / "PR-1.md"
+    task_path.write_text("---\nstatus: ERROR\n---\n\nBody\n", encoding="utf-8")
+    error_fingerprint = repo_control._task_retry_fingerprint(task_path)
+
+    task_path.write_text("---\nstatus: TODO\n---\n\nBody\n", encoding="utf-8")
+    todo_fingerprint = repo_control._task_retry_fingerprint(task_path)
+
+    task_path.write_text("---\nstatus: TODO\n---\n\nChanged\n", encoding="utf-8")
+    changed_fingerprint = repo_control._task_retry_fingerprint(task_path)
+
+    no_frontmatter = tmp_path / "plain.md"
+    no_frontmatter.write_text("Body\n", encoding="utf-8")
+
+    assert todo_fingerprint == error_fingerprint
+    assert changed_fingerprint != error_fingerprint
+    assert repo_control._task_retry_fingerprint(no_frontmatter) != error_fingerprint
 
 
 def test_retry_invalid_pr_id_returns_400(
@@ -488,6 +534,36 @@ def test_retry_rechecks_status_after_base_checkout(
 
     assert response.status_code == 409
     assert "Task is not in ERROR" in response.text
+    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
+
+
+def test_retry_first_status_read_failure_returns_503_before_counter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _RetryRedis()
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    def fake_read_task_frontmatter_status(task_path: Path) -> TaskStatus:
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")
+
+    monkeypatch.setattr(
+        repo_control,
+        "_read_task_frontmatter_status",
+        fake_read_task_frontmatter_status,
+    )
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+
+    assert response.status_code == 503
+    assert "Failed to read task status" in response.text
     assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
 
 
@@ -953,6 +1029,7 @@ def test_retry_counter_reservation_cap_returns_409_before_git(
         repo_slug: str,
         task_id: str,
         cap: int,
+        fingerprint: str | None = None,
     ) -> int:
         raise repo_control._RetryCapExceeded(cap, cap)
 
@@ -982,6 +1059,7 @@ def test_retry_counter_reservation_failure_returns_503_before_git(
         repo_slug: str,
         task_id: str,
         cap: int,
+        fingerprint: str | None = None,
     ) -> int:
         raise RuntimeError("redis down")
 
