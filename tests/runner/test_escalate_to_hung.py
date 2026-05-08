@@ -222,6 +222,10 @@ def test_hydrate_status_write_failed_task_ids_handles_stored_shapes(
 def test_clear_status_write_failed_task_ids_logs_legacy_delete_failure() -> None:
     runner = h._make_runner()
     runner._status_write_failed_task_pr_ids.add("PR-001")
+    legacy_key = status_write_failed_tasks(runner.name).replace(
+        "status_write_failed_tasks:",
+        "recovered_tasks:",
+    )
 
     async def fail_delete(key: str) -> int:
         raise RuntimeError("redis down")
@@ -231,6 +235,7 @@ def test_clear_status_write_failed_task_ids_logs_legacy_delete_failure() -> None
     asyncio.run(runner._clear_status_write_failed_task_ids({"PR-001"}))
 
     assert runner._status_write_failed_task_pr_ids == set()
+    assert runner.redis.store[legacy_key] == "[]"
     assert any(
         "failed to clear legacy status-write fallback markers: redis down"
         in entry["event"]

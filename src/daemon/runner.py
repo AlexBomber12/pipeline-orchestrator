@@ -1343,8 +1343,16 @@ class PipelineRunner(
         await self._hydrate_status_write_failed_task_pr_ids()
         self._status_write_failed_task_pr_ids.difference_update(uploaded_pr_ids)
         await self._persist_status_write_failed_task_pr_ids()
+        legacy_key = legacy_recovered_tasks(self.name)
         try:
-            await self.redis.delete(legacy_recovered_tasks(self.name))
+            await self.redis.set(
+                legacy_key,
+                json.dumps(
+                    sorted(self._status_write_failed_task_pr_ids),
+                    separators=(",", ":"),
+                ),
+            )
+            await self.redis.delete(legacy_key)
         except Exception as exc:
             self.log_event(
                 f"[INFRA] Warning: failed to clear legacy status-write "
