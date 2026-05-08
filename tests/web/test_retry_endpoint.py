@@ -239,6 +239,16 @@ async def test_increment_retry_count_rejects_cap() -> None:
         await repo_control._increment_retry_count(redis_client, "repo", "PR-1", cap=2)
 
 
+@pytest.mark.asyncio
+async def test_decrement_retry_count_preserves_remaining_attempts() -> None:
+    redis_client = _RetryRedis({"metrics:retry_count:repo:PR-1": "2"})
+
+    await repo_control._decrement_retry_count(redis_client, "repo", "PR-1")
+
+    assert redis_client.store["metrics:retry_count:repo:PR-1"] == "1"
+    assert redis_client.expiries["metrics:retry_count:repo:PR-1"] == 30 * 24 * 3600
+
+
 @pytest.mark.parametrize(
     ("content", "expected"),
     [
@@ -400,6 +410,30 @@ def test_retry_returns_404_when_task_disappears_after_base_checkout(
 
     assert response.status_code == 404
     assert "Task file not found" in response.text
+    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
+
+
+def test_retry_rechecks_status_after_base_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_dir = _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _RetryRedis()
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    def fake_checkout(repo_root: Path, base_branch: str) -> None:
+        (repo_dir / "tasks" / "PR-283.md").write_text(
+            "---\nstatus: DONE\n---\n\n# PR-283: Retry me\n\nBody\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(repo_control, "_checkout_retry_base", fake_checkout)
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+
+    assert response.status_code == 409
+    assert "Task is not in ERROR" in response.text
     assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
 
 
@@ -709,7 +743,7 @@ def test_retry_pushes_configured_base_branch_and_commits_only_task_path(
     assert ["git", "-C", str(repo_dir), "push", "origin", "HEAD:develop"] in git_calls
 
 
-def test_retry_post_push_counter_cap_is_best_effort(
+def test_retry_counter_reservation_cap_returns_409_before_git(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -734,11 +768,11 @@ def test_retry_post_push_counter_cap_is_best_effort(
     with TestClient(app) as client:
         response = client.post("/repos/example__alpha/tasks/PR-283/retry")
 
-    assert response.status_code == 200
-    assert "TODO" in response.text
+    assert response.status_code == 409
+    assert "Edit task spec or delete to proceed" in response.text
 
 
-def test_retry_post_push_counter_failure_is_best_effort(
+def test_retry_counter_reservation_failure_returns_503_before_git(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -763,8 +797,8 @@ def test_retry_post_push_counter_failure_is_best_effort(
     with TestClient(app) as client:
         response = client.post("/repos/example__alpha/tasks/PR-283/retry")
 
-    assert response.status_code == 200
-    assert "TODO" in response.text
+    assert response.status_code == 503
+    assert "Failed to update retry counter" in response.text
 
 
 def test_retry_success_without_snapshot_returns_single_todo_fragment(

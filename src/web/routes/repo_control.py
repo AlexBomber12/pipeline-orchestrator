@@ -185,21 +185,17 @@ async def _increment_retry_count(
     return await redis_client.transaction(_transaction, key, value_from_callable=True)
 
 
-async def _next_retry_count(
+async def _decrement_retry_count(
     redis_client: aioredis.Redis,
     repo_slug: str,
     task_id: str,
-    cap: int,
-) -> int:
+) -> None:
     key = _retry_count_key(repo_slug, task_id)
-
-    async def _transaction(pipe: Any) -> int:
-        current = _decode_retry_count(await pipe.get(key))
-        if current >= cap:
-            raise _RetryCapExceeded(current, cap)
-        return current + 1
-
-    return await redis_client.transaction(_transaction, key, value_from_callable=True)
+    current = _decode_retry_count(await redis_client.get(key))
+    if current <= 1:
+        await redis_client.delete(key)
+        return
+    redis_client.set(key, str(current - 1), ex=_RETRY_TTL_SECONDS)
 
 
 def _is_nothing_to_commit(exc: subprocess.CalledProcessError) -> bool:
@@ -730,8 +726,12 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
         return HTMLResponse("Task file not found", status_code=404)
 
     cap = cfg.daemon.retry_button_cap
+    current_status = _read_task_frontmatter_status(task_path)
+    if current_status not in {TaskStatus.ERROR, TaskStatus.TODO}:
+        return HTMLResponse("Task is not in ERROR", status_code=409)
+
     try:
-        next_count = await _next_retry_count(redis_client, name, pr_id, cap)
+        next_count = await _increment_retry_count(redis_client, name, pr_id, cap)
     except _RetryCapExceeded:
         return HTMLResponse(
             "Retry cap reached. Edit task spec or delete to proceed.",
@@ -740,15 +740,19 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
     except Exception:
         return HTMLResponse("Failed to update retry counter", status_code=503)
 
+    retry_reserved = True
     try:
         await asyncio.to_thread(_checkout_retry_base, repo_root, repo_config.branch)
     except subprocess.CalledProcessError:
+        await _decrement_retry_count(redis_client, name, pr_id)
         return HTMLResponse("Failed to commit retry change", status_code=503)
     if not task_path.is_file():
+        await _decrement_retry_count(redis_client, name, pr_id)
         return HTMLResponse("Task file not found", status_code=404)
 
     current_status = _read_task_frontmatter_status(task_path)
     if current_status not in {TaskStatus.ERROR, TaskStatus.TODO}:
+        await _decrement_retry_count(redis_client, name, pr_id)
         return HTMLResponse("Task is not in ERROR", status_code=409)
     rewrote_status = current_status == TaskStatus.ERROR
 
@@ -756,6 +760,7 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
         if current_status == TaskStatus.ERROR:
             write_frontmatter_status(task_path, "TODO")
     except (OSError, ValueError):
+        await _decrement_retry_count(redis_client, name, pr_id)
         return HTMLResponse("Failed to update task status", status_code=503)
 
     commit_subject = f"[RETRY] {pr_id} cleared by operator (attempt {next_count}/{cap})"
@@ -770,16 +775,15 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
     except _TaskNotRetryable:
         if rewrote_status:
             write_frontmatter_status(task_path, "ERROR")
+        if retry_reserved:
+            await _decrement_retry_count(redis_client, name, pr_id)
         return HTMLResponse("Task is not in ERROR", status_code=409)
     except subprocess.CalledProcessError:
         if rewrote_status:
             write_frontmatter_status(task_path, "ERROR")
+        if retry_reserved:
+            await _decrement_retry_count(redis_client, name, pr_id)
         return HTMLResponse("Failed to commit retry change", status_code=503)
-
-    try:
-        await _increment_retry_count(redis_client, name, pr_id, cap)
-    except Exception:
-        pass
 
     try:
         await delete_cancellation_cause(redis_client, name, pr_id)
