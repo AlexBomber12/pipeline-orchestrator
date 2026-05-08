@@ -123,6 +123,20 @@ _TRANSIENT_STATES = {
     PipelineState.MERGE,
 }
 
+_EXIT_REASON_TO_RUN_OUTCOME: dict[str, tuple[str, str | None]] = {
+    "success_merged": ("merged", None),
+    "closed_unmerged": ("superseded", None),
+    "coding_complete": ("superseded", None),
+    "rate_limit": ("paused", None),
+    "paused": ("paused", None),
+    "stopped": ("paused", None),
+    "cancelled": ("paused", None),
+    "timeout": ("failed", "TIMEOUT"),
+    "escalated": ("failed", "ESCALATE"),
+    "error": ("failed", "CRASH"),
+    "crash": ("failed", "CRASH"),
+}
+
 _HISTORY_LIMIT = 100
 _STOP_POLL_INTERVAL_SEC = 0.5
 _IDLE_STREAK_CAP = 100
@@ -795,8 +809,65 @@ class PipelineRunner(
             tokens_out=0,
             exit_reason="",
             operator_intervention=False,
+            outcome="failed",
+            cause="CRASH",
+            run_phase="coding",
+            coder_session_id=str(uuid.uuid4()),
             repo_name=self.name,
             stage="coder",
+        )
+
+    def _git_rev_parse(self, ref: str) -> str:
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", ref],
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return ""
+        if result.returncode != 0:
+            return ""
+        return result.stdout.strip()
+
+    @staticmethod
+    def _attempt_count_key(repo_name: str, task_id: str) -> str:
+        return f"metrics:attempt_count:{repo_name}:{task_id}"
+
+    async def _prepare_current_run_record_dispatch_metadata(
+        self,
+        *,
+        task_hash: str,
+        previous_task_hash: str | None,
+    ) -> None:
+        """Populate dispatch-time metadata on the active run record."""
+        record = self._current_run_record
+        task = self.state.current_task
+        if record is None or task is None:
+            return
+        key = self._attempt_count_key(self.name, task.pr_id)
+        if previous_task_hash is not None and previous_task_hash != task_hash:
+            try:
+                await self.redis.delete(key)
+            except Exception:
+                pass
+        try:
+            raw = await self.redis.get(key)
+            current = int(raw) if raw is not None else 0
+        except Exception:
+            current = 0
+        next_attempt = current + 1
+        try:
+            await self.redis.set(key, str(next_attempt))
+        except Exception:
+            pass
+        record.attempt_index = next_attempt
+        record.task_spec_hash = task_hash
+        record.base_sha = self._git_rev_parse(
+            f"origin/{self.repo_config.branch or 'main'}"
         )
 
     @staticmethod
@@ -1026,6 +1097,29 @@ class PipelineRunner(
             return
         await self._metrics_store.save(record)
 
+    def _run_phase_for_metrics(self, exit_reason: str) -> str:
+        if self.state.state == PipelineState.FIX:
+            return "fix"
+        if self.state.state == PipelineState.MERGE:
+            return "merge"
+        if self.state.state == PipelineState.CODING:
+            return "coding"
+        if exit_reason == "success_merged":
+            return "merge"
+        if self.state.current_pr is not None:
+            return "fix"
+        return "coding"
+
+    @staticmethod
+    def _run_phase_from_state(state: PipelineState) -> str:
+        if state == PipelineState.FIX:
+            return "fix"
+        if state == PipelineState.MERGE:
+            return "merge"
+        if state == PipelineState.ERROR:
+            return "recovery"
+        return "coding"
+
     async def _restore_current_run_record(self) -> None:
         """Reload the latest persisted record for the active task."""
         task = self.state.current_task
@@ -1056,6 +1150,8 @@ class PipelineRunner(
         *,
         diff_stats: dict[str, object] | None = None,
         base_branch: str | None = None,
+        run_phase: str | None = None,
+        cause: str | None = None,
     ) -> None:
         """Finalize and persist the active run record."""
         record = self._current_run_record
@@ -1073,6 +1169,14 @@ class PipelineRunner(
                 0,
             )
         record.exit_reason = exit_reason
+        outcome, mapped_cause = _EXIT_REASON_TO_RUN_OUTCOME.get(
+            exit_reason,
+            ("failed", "CRASH"),
+        )
+        record.outcome = outcome  # type: ignore[assignment]
+        record.cause = cause or mapped_cause  # type: ignore[assignment]
+        record.run_phase = run_phase or self._run_phase_for_metrics(exit_reason)
+        record.head_sha = self._git_rev_parse("HEAD")
         if exit_reason in ("success_merged", "coding_complete", "closed_unmerged"):
             resolved_base_branch = base_branch or self.repo_config.branch or "main"
             stats = diff_stats
@@ -1139,12 +1243,21 @@ class PipelineRunner(
         matching delete in ``handle_error`` clears the slot when a retry
         succeeds, so the next genuine failure can record again.
         """
+        prior_state = self.state.state
         self.state.state = PipelineState.ERROR
         self.state.error_message = message
         log_body = message if log_message is None else log_message
         self.log_event(f"{log_prefix} {log_body}.")
         if save_run_record_as:
-            await self._save_current_run_record(save_run_record_as)
+            await self._save_current_run_record(
+                save_run_record_as,
+                run_phase=self._run_phase_from_state(prior_state),
+                cause=(
+                    cancellation_cause.category
+                    if cancellation_cause is not None
+                    else None
+                ),
+            )
         task = self.state.current_task
         if task is not None:
             existing: CancellationCause | None

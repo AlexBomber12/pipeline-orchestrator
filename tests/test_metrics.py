@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from src.metrics import MetricsStore, RunRecord
 
 
@@ -11,6 +13,7 @@ class _FakeRedis:
         self.store: dict[str, str] = {}
         self.ttls: dict[str, int] = {}
         self.lists: dict[str, list[str]] = {}
+        self.sets: dict[str, set[str]] = {}
 
     async def set(self, key: str, value: str, ex: int | None = None) -> None:
         self.store[key] = value
@@ -19,6 +22,18 @@ class _FakeRedis:
 
     async def get(self, key: str) -> str | None:
         return self.store.get(key)
+
+    async def mget(self, keys: list[str]) -> list[str | None]:
+        return [self.store.get(key) for key in keys]
+
+    async def sadd(self, key: str, value: str) -> int:
+        bucket = self.sets.setdefault(key, set())
+        before = len(bucket)
+        bucket.add(value)
+        return len(bucket) - before
+
+    async def smembers(self, key: str) -> set[str]:
+        return set(self.sets.get(key, set()))
 
     async def lpush(self, key: str, value: str) -> int:
         bucket = self.lists.setdefault(key, [])
@@ -78,7 +93,7 @@ async def test_save_and_get_record() -> None:
     saved = await store.get("run-1")
 
     assert saved == record
-    assert redis.ttls["metrics:run:run-1"] == 90 * 86400
+    assert redis.ttls["metrics:run:run-1"] == 365 * 86400
     assert redis.lists["metrics:repo:AlexBomber12__pipeline-orchestrator:PR"] == ["run-1"]
 
 
@@ -202,7 +217,10 @@ async def test_record_serialization() -> None:
 
     assert payload == {
         "base_branch": "",
+        "base_sha": "",
+        "cause": None,
         "complexity": "medium",
+        "coder_session_id": "",
         "diff_lines_added": 0,
         "diff_lines_deleted": 0,
         "duration_ms": None,
@@ -213,12 +231,17 @@ async def test_record_serialization() -> None:
         "had_merge_conflict": False,
         "languages_touched": [],
         "operator_intervention": False,
+        "outcome": "merged",
+        "attempt_index": 1,
+        "head_sha": "",
+        "run_phase": "coding",
         "stage": "coder",
         "profile_id": "claude:opus:container",
         "repo_name": "AlexBomber12__pipeline-orchestrator",
         "run_id": "run-serialized",
         "started_at": "2026-04-18T10:00:00+00:00",
         "task_id": "PR-080",
+        "task_spec_hash": "",
         "task_type": "feature",
         "test_file_ratio": 0.0,
         "tokens_in": 1200,
@@ -246,6 +269,113 @@ async def test_runrecord_roundtrip_with_new_fields() -> None:
     saved = await store.get("run-new-fields")
 
     assert saved == record
+
+
+async def test_runrecord_with_all_new_fields_serializes_and_parses() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+    record = _record(
+        "run-expanded",
+        outcome="failed",
+        cause="INFRA",
+        run_phase="fix",
+        attempt_index=3,
+        coder_session_id="956e933d-ed15-45e0-97f6-c5784b6e89a3",
+        base_sha="base123",
+        head_sha="head456",
+        task_spec_hash="task789",
+    )
+
+    await store.save(record)
+
+    saved = await store.get("run-expanded")
+
+    assert saved == record
+
+
+def test_runrecord_outcome_merged_no_cause() -> None:
+    record = _record("run-merged", outcome="merged", cause="CRASH")
+
+    assert record.cause is None
+
+
+def test_runrecord_outcome_failed_requires_cause() -> None:
+    with pytest.raises(ValueError, match="failed run records require cause"):
+        _record("run-failed", outcome="failed", cause=None, exit_reason="")
+
+
+def test_runrecord_rejects_invalid_new_fields() -> None:
+    with pytest.raises(ValueError, match="invalid run record cause"):
+        _record("bad-cause", outcome="failed", cause="RATE_LIMIT")
+    with pytest.raises(ValueError, match="invalid run record outcome"):
+        _record("bad-outcome", outcome="done")
+    with pytest.raises(ValueError, match="invalid run record phase"):
+        _record("bad-phase", run_phase="watch")
+    with pytest.raises(ValueError, match="attempt_index must be >= 1"):
+        _record("bad-attempt", attempt_index=0)
+
+
+async def test_taskruns_index_populated_on_save() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+
+    await store.save(_record("run-indexed", task_id="PR-286"))
+
+    assert redis.sets[
+        "metrics:task_runs:AlexBomber12__pipeline-orchestrator:PR-286"
+    ] == {"run-indexed"}
+
+
+async def test_list_task_runs_returns_all_records_for_task() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+    for index in range(3):
+        await store.save(_record(f"run-{index}", task_id="PR-286"))
+    await store.save(_record("other-run", task_id="PR-999"))
+
+    records = await store.list_task_runs(
+        "AlexBomber12__pipeline-orchestrator",
+        "PR-286",
+    )
+
+    assert {record.run_id for record in records} == {"run-0", "run-1", "run-2"}
+
+
+async def test_list_task_runs_empty_and_skips_missing_records() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+
+    assert await store.list_task_runs("repo", "PR-404") == []
+
+    await store.save(_record("run-present", task_id="PR-286", repo_name="repo"))
+    redis.sets["metrics:task_runs:repo:PR-286"].add("run-missing")
+
+    records = await store.list_task_runs("repo", "PR-286")
+
+    assert [record.run_id for record in records] == ["run-present"]
+
+
+async def test_list_task_runs_decodes_bytes_members_and_payloads() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+    record = _record("run-bytes", task_id="PR-286", repo_name="repo")
+    await store.save(record)
+    payload = redis.store["metrics:run:run-bytes"].encode("utf-8")
+    redis.store["metrics:run:run-bytes"] = payload  # type: ignore[assignment]
+    redis.sets["metrics:task_runs:repo:PR-286"] = {b"run-bytes"}  # type: ignore[list-item]
+
+    records = await store.list_task_runs("repo", "PR-286")
+
+    assert records == [record]
+
+
+async def test_ttl_extension_sets_365d() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+
+    await store.save(_record("run-ttl"))
+
+    assert redis.ttls["metrics:run:run-ttl"] == 365 * 86400
 
 
 async def test_runrecord_roundtrip_from_old_payload_sets_defaults() -> None:
@@ -280,6 +410,10 @@ async def test_runrecord_roundtrip_from_old_payload_sets_defaults() -> None:
     assert saved.test_file_ratio == 0.0
     assert saved.had_merge_conflict is False
     assert saved.base_branch == ""
+    assert saved.outcome == "merged"
+    assert saved.cause is None
+    assert saved.run_phase == "coding"
+    assert saved.attempt_index == 1
 
 
 def test_runrecord_stage_default_is_coder() -> None:

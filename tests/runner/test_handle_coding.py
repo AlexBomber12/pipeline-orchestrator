@@ -117,6 +117,56 @@ def test_dispatch_task_spec_hash_ignores_frontmatter_status(
     )
 
 
+def test_dispatch_continues_when_previous_task_hash_read_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    h._patch_subprocess(monkeypatch, stub_auto_pr_read=False)
+
+    async def fake_auto_pr(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        return (0, "ok", "")
+
+    monkeypatch.setattr(h.claude_cli, "run_auto_pr_async", fake_auto_pr)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [PRInfo(number=42, branch="pr-001")],
+    )
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: None,
+    )
+
+    task_content = "# PR-001: Sample\n\nBranch: pr-001\n"
+    task_file = tmp_path / "tasks" / "PR-001.md"
+    task_file.parent.mkdir(parents=True)
+    task_file.write_text(task_content, encoding="utf-8")
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="Sample",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    original_get = runner.redis.get
+
+    async def fail_hash_get(key: str) -> str | None:
+        if key == task_spec_hash_key("octo__demo", "PR-001"):
+            raise RuntimeError("read failed")
+        return await original_get(key)
+
+    runner.redis.get = fail_hash_get  # type: ignore[method-assign]
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_run_record is not None
+    assert runner._current_run_record.attempt_index == 1
+
+
 def test_handle_coding_transitions_error_when_task_hash_persist_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

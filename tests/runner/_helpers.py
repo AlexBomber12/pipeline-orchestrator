@@ -102,6 +102,7 @@ class _FakeRedis:
         self.store: dict[str, str] = {}
         self.deleted: list[str] = []
         self.lists: dict[str, list[str]] = {}
+        self.sets: dict[str, set[str]] = {}
         self.zsets: dict[str, dict[str, float]] = {}
 
     async def set(
@@ -119,6 +120,9 @@ class _FakeRedis:
 
     async def get(self, key: str) -> str | None:
         return self.store.get(key)
+
+    async def mget(self, keys: list[str]) -> list[str | None]:
+        return [self.store.get(key) for key in keys]
 
     async def exists(self, key: str) -> int:
         return int(key in self.store)
@@ -236,6 +240,15 @@ class _FakeRedis:
         if stop < 0:
             stop = len(values) + stop
         self.lists[key] = values[start : stop + 1]
+
+    async def sadd(self, key: str, value: str) -> int:
+        bucket = self.sets.setdefault(key, set())
+        before = len(bucket)
+        bucket.add(value)
+        return len(bucket) - before
+
+    async def smembers(self, key: str) -> set[str]:
+        return set(self.sets.get(key, set()))
 
     async def publish(self, key: str, value: str) -> int:
         return 1
