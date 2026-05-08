@@ -971,10 +971,12 @@ def test_base_html_htmx_whitelist_includes_400() -> None:
 
     pattern = re.compile(
         r"htmx:beforeSwap.*?status\s*===\s*400.*?status\s*===\s*404"
-        r".*?status\s*===\s*422.*?status\s*===\s*503",
+        r".*?status\s*===\s*409.*?status\s*===\s*422.*?status\s*===\s*503",
         re.DOTALL,
     )
-    assert pattern.search(base_html), "base.html must whitelist 400 alongside 404/422/503"
+    assert pattern.search(base_html), (
+        "base.html must whitelist 400/409 alongside 404/422/503"
+    )
 
 
 def test_upload_accepts_task_with_depends_on_none(

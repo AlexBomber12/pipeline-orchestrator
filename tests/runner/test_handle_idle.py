@@ -147,6 +147,44 @@ def test_handle_idle_picks_task_and_drives_coding(
     assert runner.state.queue_total == 1
 
 
+def test_select_next_task_clears_crashed_marker_when_frontmatter_is_todo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.undo()
+    task_dir = tmp_path / "tasks"
+    task_dir.mkdir()
+    (task_dir / "PR-001.md").write_text(
+        "---\n"
+        "status: TODO\n"
+        "---\n\n"
+        "# PR-001: Retry crashed task\n"
+        "Branch: pr-001-retry\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "_resolve_merged_state",
+        lambda *args, **kwargs: _merged_state(),
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+    runner._crashed_task_pr_ids.add("PR-001")
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-001"
+    assert task.status == TaskStatus.TODO
+    assert "PR-001" not in runner._crashed_task_pr_ids
+
+
 def test_handle_idle_sets_queue_counters_with_mixed_statuses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

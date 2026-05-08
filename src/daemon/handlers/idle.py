@@ -292,6 +292,9 @@ class IdleMixin:
                 )
                 for header in headers
             }
+            frontmatter_statuses = {
+                header.pr_id: header.frontmatter_status for header in headers
+            }
             # PR-186: Recovery marks DOING-without-PR tasks crashed before
             # transitioning to IDLE. Override their derived status to
             # ERROR here so get_eligible_tasks excludes them and the
@@ -307,6 +310,9 @@ class IdleMixin:
             # treats the task as live again.
             for pr_id in list(statuses.keys()):
                 if pr_id not in crashed_task_pr_ids:
+                    continue
+                if frontmatter_statuses.get(pr_id) == "todo":
+                    crashed_task_pr_ids.discard(pr_id)
                     continue
                 if statuses[pr_id] in (TaskStatus.DONE, TaskStatus.DOING):
                     crashed_task_pr_ids.discard(pr_id)
