@@ -272,6 +272,18 @@ async def test_decrement_retry_count_awaits_async_set() -> None:
     assert redis_client.store["metrics:retry_count:repo:PR-1"] == "1"
 
 
+@pytest.mark.asyncio
+async def test_release_retry_reservation_swallows_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_decrement(redis_client: _RetryRedis, repo_slug: str, task_id: str) -> None:
+        raise RuntimeError("redis down")
+
+    monkeypatch.setattr(repo_control, "_decrement_retry_count", fake_decrement)
+
+    await repo_control._release_retry_reservation(_RetryRedis(), "repo", "PR-1")
+
+
 @pytest.mark.parametrize(
     ("content", "expected"),
     [
@@ -423,10 +435,10 @@ def test_retry_returns_404_when_task_disappears_after_base_checkout(
     redis_client = _RetryRedis()
     monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
 
-    def fake_checkout(repo_root: Path, base_branch: str) -> None:
+    def fake_checkout(repo_root: Path, base_branch: str, relative_task: Path) -> None:
         (repo_dir / "tasks" / "PR-283.md").unlink()
 
-    monkeypatch.setattr(repo_control, "_checkout_retry_base", fake_checkout)
+    monkeypatch.setattr(repo_control, "_checkout_retry_base_task", fake_checkout)
 
     with TestClient(app) as client:
         response = client.post("/repos/example__alpha/tasks/PR-283/retry")
@@ -444,13 +456,13 @@ def test_retry_rechecks_status_after_base_checkout(
     redis_client = _RetryRedis()
     monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
 
-    def fake_checkout(repo_root: Path, base_branch: str) -> None:
+    def fake_checkout(repo_root: Path, base_branch: str, relative_task: Path) -> None:
         (repo_dir / "tasks" / "PR-283.md").write_text(
             "---\nstatus: DONE\n---\n\n# PR-283: Retry me\n\nBody\n",
             encoding="utf-8",
         )
 
-    monkeypatch.setattr(repo_control, "_checkout_retry_base", fake_checkout)
+    monkeypatch.setattr(repo_control, "_checkout_retry_base_task", fake_checkout)
 
     with TestClient(app) as client:
         response = client.post("/repos/example__alpha/tasks/PR-283/retry")
@@ -757,8 +769,8 @@ def test_retry_git_commands_run_in_thread(
     assert response.status_code == 200
     assert to_thread_calls == [
         (
-            repo_control._checkout_retry_base,
-            (repo_dir, "main"),
+            repo_control._checkout_retry_base_task,
+            (repo_dir, "main", Path("tasks/PR-283.md")),
             {},
         ),
         (
@@ -812,8 +824,17 @@ def test_retry_pushes_configured_base_branch_and_commits_only_task_path(
         "-C",
         str(repo_dir),
         "reset",
-        "--hard",
+        "--mixed",
         "origin/develop",
+    ] in git_calls
+    assert [
+        "git",
+        "-C",
+        str(repo_dir),
+        "checkout",
+        "origin/develop",
+        "--",
+        "tasks/PR-283.md",
     ] in git_calls
     assert ["git", "-C", str(repo_dir), "push", "origin", "HEAD:develop"] in git_calls
 
