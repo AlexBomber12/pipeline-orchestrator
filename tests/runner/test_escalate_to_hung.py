@@ -816,6 +816,41 @@ def test_commit_task_status_change_rejects_symlink_escape(
     )
 
 
+def test_commit_task_status_change_force_checkouts_base_with_dirty_pr_branch(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-707")
+    _git(repo, "checkout", "pr-test")
+    task_file = repo / "tasks" / "PR-707.md"
+    task_file.write_text(
+        task_file.read_text(encoding="utf-8").replace(
+            "status: TODO", "status: DOING", 1
+        ),
+        encoding="utf-8",
+    )
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+    task = QueueTask(
+        pr_id="PR-707",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-test",
+        task_file="tasks/PR-707.md",
+    )
+
+    asyncio.run(runner._commit_task_status_change(task, "ERROR", "failed hard"))
+
+    assert (repo / "tasks" / "PR-707.md").read_text(encoding="utf-8").startswith(
+        "---\nstatus: ERROR\n---\n"
+    )
+    assert "[STATUS] PR-707 marked ERROR: failed hard" in _git(
+        repo,
+        "log",
+        "--oneline",
+        "-1",
+    )
+
+
 def test_commit_task_status_change_truncates_long_reason(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

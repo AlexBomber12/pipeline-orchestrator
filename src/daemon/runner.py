@@ -1266,7 +1266,7 @@ class PipelineRunner(
 
         try:
             git_ops._git(self.repo_path, "fetch", "origin", base, timeout=60)
-            git_ops._git(self.repo_path, "checkout", base, timeout=60)
+            git_ops._git(self.repo_path, "checkout", "-f", base, timeout=60)
             git_ops._git(
                 self.repo_path,
                 "reset",
