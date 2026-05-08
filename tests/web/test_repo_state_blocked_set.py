@@ -52,7 +52,7 @@ async def test_repo_state_includes_dependents_count(
 ) -> None:
     state = _state_with_queue(
         [
-            QueueTask(pr_id="PR-100", title="Root canceled", status=TaskStatus.CANCELED),
+            QueueTask(pr_id="PR-100", title="Root error", status=TaskStatus.ERROR),
             QueueTask(
                 pr_id="PR-101",
                 title="Direct dep",
@@ -81,7 +81,7 @@ async def test_repo_state_includes_blocked_by(
 ) -> None:
     state = _state_with_queue(
         [
-            QueueTask(pr_id="PR-100", title="Root canceled", status=TaskStatus.CANCELED),
+            QueueTask(pr_id="PR-100", title="Root error", status=TaskStatus.ERROR),
             QueueTask(
                 pr_id="PR-101",
                 title="Direct dep",
@@ -131,7 +131,7 @@ async def test_extra_canceled_ids_treated_as_canceled_root(
 async def test_canceled_ids_unknown_to_queue_appended_as_roots(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Cause ids absent from the snapshot are still folded in as canceled roots."""
+    """Cause ids absent from the snapshot are still folded in as error roots."""
     state = _state_with_queue(
         [
             QueueTask(pr_id="PR-300", title="Lonely task", status=TaskStatus.TODO),
@@ -176,8 +176,8 @@ async def test_build_repo_task_nodes_from_snapshot(
         [
             QueueTask(
                 pr_id="PR-001",
-                title="Canceled root",
-                status=TaskStatus.CANCELED,
+                title="Error root",
+                status=TaskStatus.ERROR,
             ),
             QueueTask(
                 pr_id="PR-002",
@@ -235,7 +235,7 @@ async def test_build_repo_task_nodes_extra_canceled_overlay_works_in_snapshot(
         [
             QueueTask(
                 pr_id="PR-099",
-                title="TODO in snapshot, CANCELED in cause record",
+                title="TODO in snapshot, ERROR in cause record",
                 status=TaskStatus.TODO,
             ),
             QueueTask(
@@ -264,8 +264,8 @@ async def test_compute_repo_dependents_count_uses_snapshot(
         [
             QueueTask(
                 pr_id="PR-005",
-                title="Canceled root",
-                status=TaskStatus.CANCELED,
+                title="Error root",
+                status=TaskStatus.ERROR,
             ),
             QueueTask(
                 pr_id="PR-006",
@@ -296,8 +296,8 @@ async def test_compute_repo_blocked_set_uses_snapshot(
         [
             QueueTask(
                 pr_id="PR-005",
-                title="Canceled root",
-                status=TaskStatus.CANCELED,
+                title="Error root",
+                status=TaskStatus.ERROR,
             ),
             QueueTask(
                 pr_id="PR-006",

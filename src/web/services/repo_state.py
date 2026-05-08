@@ -210,11 +210,11 @@ async def build_repo_task_nodes(
     records still surface on the dashboard.
 
     Each ``QueueTask`` becomes a ``TaskNode`` with ``is_canceled`` set
-    when the task's ``TaskStatus`` is ``CANCELED`` or its id appears in
+    when the task's ``TaskStatus`` is ``ERROR`` or its id appears in
     ``extra_canceled_ids`` — the latter lets callers fold in cancellation
     cause records from Redis whose ``task_id`` may not (yet) carry the
-    ``CANCELED`` status in the queue snapshot. Task ids that exist only
-    in ``extra_canceled_ids`` are appended as canceled root nodes with
+    ``ERROR`` status in the queue snapshot. Task ids that exist only
+    in ``extra_canceled_ids`` are appended as error root nodes with
     no ``depends_on`` so the closure walk can still find them.
     """
     extras = set(extra_canceled_ids or ())
@@ -225,7 +225,7 @@ async def build_repo_task_nodes(
     seen: set[str] = set()
     for task in queued:
         is_canceled = (
-            task.status == TaskStatus.CANCELED or task.pr_id in extras
+            task.status == TaskStatus.ERROR or task.pr_id in extras
         )
         nodes.append(
             TaskNode(
@@ -254,9 +254,9 @@ async def compute_repo_dependents_count(
     fallback when the snapshot is unavailable; cancellation
     dependents-count returns empty dict in that case. The helper folds
     in ``canceled_task_ids`` so cancellation causes recorded in Redis
-    are treated as canceled roots even when the queue has not yet
+    are treated as error roots even when the queue has not yet
     caught up, then runs the dependents-count helper. Empty result when
-    the queue is missing or has no tasks that depend on a canceled root.
+    the queue is missing or has no tasks that depend on a error root.
     """
     nodes = await build_repo_task_nodes(
         repos_dir,

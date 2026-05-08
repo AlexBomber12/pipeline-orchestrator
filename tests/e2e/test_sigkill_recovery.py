@@ -113,7 +113,7 @@ def test_sigkill_during_coding_recovers_correctly(
         # PR-186 changed the recovery contract: a DOING task with no
         # matching open PR after a crash is the crash signature for a
         # SIGKILL/OOM/restart-mid-CODING. Recovery now marks that task
-        # CANCELED and parks the runner in IDLE rather than re-running
+        # ERROR and parks the runner in IDLE rather than re-running
         # CODING (which used to loop the same crash forever); the user
         # re-uploads the task file to retry. The slow shim was a child
         # of the killed daemon process, so SIGKILL terminated it too —
@@ -166,7 +166,7 @@ def test_sigkill_during_coding_recovers_correctly(
         # equality so the diagnostic context can grow without breaking
         # the recovery contract this e2e pins.
         crash_event_prefix = (
-            f"[INFRA] Task {expected_pr_id} crashed, marking CANCELED. "
+            f"[INFRA] Task {expected_pr_id} crashed, marking ERROR. "
             "Manually re-upload to retry."
         )
         assert any(

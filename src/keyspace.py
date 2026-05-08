@@ -50,7 +50,7 @@ def recovered_tasks(repo_name: str) -> str:
     any uploaded PR-IDs and rewrites the snapshot. Without this
     persistence a daemon restart between the recover click and the
     user's task re-upload would lose the marker, ``recover_state`` would
-    rehydrate the CANCELED row into ``_crashed_task_pr_ids`` instead,
+    rehydrate the ERROR row into ``_crashed_task_pr_ids`` instead,
     and the IDLE selector would discard the override on the still-open
     PR deriving back to ``DOING`` — defeating the recover button's
     "abandon until re-upload" contract (PR-247 follow-up).

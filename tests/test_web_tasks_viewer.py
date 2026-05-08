@@ -191,15 +191,15 @@ def test_list_repo_tasks_omits_doing_section_when_absent(
 def test_list_repo_tasks_renders_canceled_section(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PR-186 Codex P2: CANCELED tasks must be visible in the panel so
-    operators can see which task was canceled and click through to its
-    file. Without the dedicated section, canceled tasks were hidden from
+    """PR-186 Codex P2: ERROR tasks must be visible in the panel so
+    operators can see which task was error and click through to its
+    file. Without the dedicated section, error tasks were hidden from
     every group while still counted in the total — leaving operators no
     way to discover or re-upload them from the dashboard."""
     _write_alpha_config(tmp_path, monkeypatch)
     _seed_alpha_snapshot_from_queue_md(
         monkeypatch,
-        "## PR-400: Crashed earlier\n- Status: CANCELED\n- Branch: pr-400\n\n"
+        "## PR-400: Crashed earlier\n- Status: ERROR\n- Branch: pr-400\n\n"
         "## PR-401: Next up\n- Status: TODO\n- Branch: pr-401\n",
     )
 
@@ -209,7 +209,7 @@ def test_list_repo_tasks_renders_canceled_section(
     assert response.status_code == 200
     body = response.text
     assert "2 total" in body
-    assert "Canceled" in body
+    assert "Error" in body
     assert "PR-400" in body
     assert "Crashed earlier" in body
     assert 'hx-get="/repos/example__alpha/tasks/PR-400"' in body

@@ -200,7 +200,7 @@ def _run_recovery_branch_mismatch_scenario(
     runner.repo_config = runner.repo_config.model_copy(update={"branch": BASE_BRANCH})
     runner._parse_tasks_from_headers = lambda: [doing]  # type: ignore[method-assign]
     # Preserve must succeed (no local branch present) so the path
-    # progresses to the CANCELED transition rather than stranding in
+    # progresses to the ERROR transition rather than stranding in
     # ERROR; that is the case being documented here.
     runner._preserve_crashed_run_commits = lambda branch: True  # type: ignore[method-assign]
 
@@ -430,7 +430,7 @@ def test_recover_state_with_branch_mismatch_marks_task_canceled_and_idles(
     ``branch`` is ``pr-foo``; the only open PR on the remote has head
     ``pr-foo-2``. The branch-by-branch match in ``recovery.py`` returns
     no candidate, so the DOING task is treated as a crash and marked
-    CANCELED, the daemon settles back to IDLE, and the user must
+    ERROR, the daemon settles back to IDLE, and the user must
     manually re-upload to retry.
 
     Branch values in this scenario:
@@ -454,7 +454,7 @@ def test_recover_state_with_branch_mismatch_marks_task_canceled_and_idles(
     assert runner.state.current_pr is None
     assert runner.state.error_message is None
     log = _log_text(runner)
-    assert ("[INFRA] Task PR-FOO crashed, marking CANCELED. Manually re-upload to retry.") in log
+    assert ("[INFRA] Task PR-FOO crashed, marking ERROR. Manually re-upload to retry.") in log
 
 
 @pytest.mark.xfail(strict=True, reason=XFAIL_BRANCH_CONTEXT_REASON)
@@ -465,7 +465,7 @@ def test_recover_state_with_branch_mismatch_branch_context_diagnostic(
     cancellation diagnostic."""
     runner, _ = _run_recovery_branch_mismatch_scenario(monkeypatch)
     _assert_branch_context_in_diagnostic(
-        _diagnostic_for(runner, "marking CANCELED"),
+        _diagnostic_for(runner, "marking ERROR"),
         runner.state.error_message or "",
         base_branch=BASE_BRANCH,
         task_branch=TASK_BRANCH,

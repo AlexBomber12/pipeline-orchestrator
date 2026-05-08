@@ -201,7 +201,7 @@ def test_helper_applies_crashed_set_override(
     tasks = runner._parse_tasks_from_headers()
 
     assert tasks is not None
-    assert tasks[0].status == TaskStatus.CANCELED
+    assert tasks[0].status == TaskStatus.ERROR
 
 
 def test_helper_orders_by_priority_then_pr_id(

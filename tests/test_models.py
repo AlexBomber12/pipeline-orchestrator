@@ -44,6 +44,15 @@ def test_task_status_values() -> None:
     assert TaskStatus.TODO.value == "TODO"
     assert TaskStatus.DOING.value == "DOING"
     assert TaskStatus.DONE.value == "DONE"
+    assert TaskStatus.ERROR.value == "ERROR"
+
+
+def test_taskstatus_error_value() -> None:
+    assert TaskStatus.ERROR.value == "ERROR"
+
+
+def test_taskstatus_no_canceled() -> None:
+    assert not hasattr(TaskStatus, "CANCELED")
 
 
 def test_queue_task_defaults() -> None:

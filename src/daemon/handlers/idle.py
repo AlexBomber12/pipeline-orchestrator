@@ -289,11 +289,11 @@ class IdleMixin:
             }
             # PR-186: Recovery marks DOING-without-PR tasks crashed before
             # transitioning to IDLE. Override their derived status to
-            # CANCELED here so get_eligible_tasks excludes them and the
-            # snapshot surfaces the CANCELED state to the dashboard.
+            # ERROR here so get_eligible_tasks excludes them and the
+            # snapshot surfaces the ERROR state to the dashboard.
             # Existing DONE rulings (e.g. the merged PR landed before
             # recovery resumed) win — DONE is terminal, never downgraded
-            # to CANCELED. A DOING ruling means ``derive_task_status``
+            # to ERROR. A DOING ruling means ``derive_task_status``
             # matched a now-visible open PR (e.g. ``get_open_prs`` was
             # stale on the recovery cycle and the PR surfaced later);
             # preserving DOING lets the runner resume WATCH/merge for
@@ -306,10 +306,10 @@ class IdleMixin:
                 if statuses[pr_id] in (TaskStatus.DONE, TaskStatus.DOING):
                     crashed_task_pr_ids.discard(pr_id)
                     continue
-                statuses[pr_id] = TaskStatus.CANCELED
+                statuses[pr_id] = TaskStatus.ERROR
             # PR-247 follow-up: Operator-initiated HUNG recovery records
             # the trapped task in ``_recovered_task_pr_ids``. Force its
-            # status to CANCELED unconditionally (except DONE — a real
+            # status to ERROR unconditionally (except DONE — a real
             # merge wins) so the still-open PR cannot re-derive DOING and
             # bounce the runner back into WATCH on the same stuck work
             # item. This is intentionally stronger than the PR-186
@@ -325,7 +325,7 @@ class IdleMixin:
                 if statuses[pr_id] == TaskStatus.DONE:
                     recovered_task_pr_ids.discard(pr_id)
                     continue
-                statuses[pr_id] = TaskStatus.CANCELED
+                statuses[pr_id] = TaskStatus.ERROR
             eligible = get_eligible_tasks(dag_headers, statuses)
             stopped_eligible = [
                 header

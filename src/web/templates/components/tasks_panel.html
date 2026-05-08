@@ -2,7 +2,7 @@
     'doing':    'bg-accent/10 text-accent border-accent/30',
     'todo':     'bg-gray-500/10 text-gray-300 border-gray-500/30',
     'done':     'bg-ok/10 text-ok border-ok/30',
-    'canceled': 'bg-fail/10 text-fail border-fail/30',
+    'error':    'bg-fail/10 text-fail border-fail/30',
 } %}
 {% macro task_row(repo_name, task, status_key) -%}
 {# Use the literal pr_id in the DOM id (HTML5-valid) and an attribute selector
@@ -67,16 +67,16 @@
         {% endif %}
     </section>
 
-    {% if tasks_by_status.canceled %}
+    {% if tasks_by_status.error %}
     <section class="mb-4">
         <h4 class="mb-2 inline-flex items-center gap-2 text-xs font-medium uppercase tracking-[0.16em] text-gray-400">
-            <span class="rounded border px-2 py-0.5 text-[11px] {{ status_styles.canceled }}">Canceled</span>
-            <span class="font-mono text-gray-500">{{ tasks_by_status.canceled | length }}</span>
+            <span class="rounded border px-2 py-0.5 text-[11px] {{ status_styles.error }}">Error</span>
+            <span class="font-mono text-gray-500">{{ tasks_by_status.error | length }}</span>
         </h4>
         <p class="mb-2 text-xs italic text-gray-500">Crashed during a prior run; re-upload the task file to retry.</p>
         <ul class="space-y-2">
-            {% for task in tasks_by_status.canceled %}
-            {{ task_row(repo_name, task, 'canceled') }}
+            {% for task in tasks_by_status.error %}
+            {{ task_row(repo_name, task, 'error') }}
             {% endfor %}
         </ul>
     </section>

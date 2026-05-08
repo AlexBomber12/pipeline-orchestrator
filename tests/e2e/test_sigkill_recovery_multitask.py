@@ -1,14 +1,14 @@
 """Multi-task variant of the SIGKILL-recovery e2e (PR-258d).
 
 PR-186 established that a SIGKILL during CODING (before the coder pushes
-a branch) recovers to IDLE with the in-flight task auto-CANCELED rather
+a branch) recovers to IDLE with the in-flight task auto-ERROR rather
 than rebooting into a CODING loop on the same crashed task. The single-
 task case is already pinned by ``tests/e2e/test_sigkill_recovery.py``.
 This test exercises the multi-task variant so the upcoming PR-266
 recovery refactor (header-driven queue derivation replacing the legacy
 ``tasks/QUEUE.md`` probe) has a load-bearing integration anchor: a
 post-recovery queue that mis-orders TODOs, mis-handles ``depends_on``
-edges across a CANCELED root, or fails to feed the IDLE selector
+edges across a ERROR root, or fails to feed the IDLE selector
 correctly will fail this test rather than silently land.
 
 The queue mix is:
@@ -19,21 +19,21 @@ The queue mix is:
 * PR-D — priority 3, no deps.
 
 PR-A wins the initial CODING dispatch (priority 1 sorts ahead of every
-sibling). After SIGKILL-then-recover, PR-A becomes CANCELED. The
-production ``depends_on`` policy treats CANCELED as **not DONE**, so
+sibling). After SIGKILL-then-recover, PR-A becomes ERROR. The
+production ``depends_on`` policy treats ERROR as **not DONE**, so
 PR-C remains BLOCKED (TODO but not eligible) and the next dispatch is
 PR-B (priority 2 with no unmet deps). The test asserts both ends:
 
 1. The dashboard's ``/repos/{slug}/tasks`` fragment reports PR-A under
-   ``canceled`` and the remaining tasks under ``todo`` (or ``doing`` if
+   ``error`` and the remaining tasks under ``todo`` (or ``doing`` if
    the daemon already advanced).
 2. After the slow shim exits and ``success`` takes over, the daemon
    dispatches PR-B — not PR-A (would mean re-entry on the crashed task)
-   and not PR-C (would mean CANCELED unblocked dependents, contradicting
+   and not PR-C (would mean ERROR unblocked dependents, contradicting
    ``src/dag.py:get_eligible_tasks``).
 
 A regression in the recovery code that mis-derives the post-CANCEL
-queue (drops a TODO, mis-orders priority, treats CANCELED as DONE)
+queue (drops a TODO, mis-orders priority, treats ERROR as DONE)
 fails one of those two assertions.
 """
 
@@ -56,7 +56,7 @@ DISPATCH_DEADLINE_SEC = 30
 # next ``handle_idle()`` tick (``src/daemon/handlers/idle.py``). The
 # default ``poll_interval_sec`` is 60s (``src/config.py``), so there is
 # a window between the daemon publishing IDLE and the dashboard panel
-# reflecting the CANCELED status. Poll the panel for up to two poll
+# reflecting the ERROR status. Poll the panel for up to two poll
 # intervals to absorb that lag without masking a real regression.
 PANEL_DEADLINE_SEC = 150
 
@@ -111,7 +111,7 @@ def _task_status_from_html(html: str, pr_id: str) -> str | None:
     most stable hook into the rendered HTML — no class name, ARIA role,
     or text changes will move it. Missing pr_id returns ``None``.
     """
-    for status in ("doing", "todo", "canceled", "done"):
+    for status in ("doing", "todo", "error", "done"):
         marker = f'task-content-{status}-{pr_id}'
         if marker in html:
             return status
@@ -233,7 +233,7 @@ def test_sigkill_during_coding_with_multitask_queue_recovers_and_progresses(
 
         # PR-186 contract: a DOING task with no matching open PR after a
         # crash is the SIGKILL/OOM signature; recovery marks the task
-        # CANCELED and parks the runner in IDLE rather than re-running
+        # ERROR and parks the runner in IDLE rather than re-running
         # CODING. The freshness gate (ts > pre_kill_ts) rejects the
         # pre-kill snapshot Redis still holds before the new daemon
         # publishes its first state. ``current_task is None`` rejects
@@ -283,7 +283,7 @@ def test_sigkill_during_coding_with_multitask_queue_recovers_and_progresses(
         # without breaking the recovery contract this e2e pins.
         history = recovered.get("history") or []
         crash_event_prefix = (
-            f"[INFRA] Task {pr_a_id} crashed, marking CANCELED. "
+            f"[INFRA] Task {pr_a_id} crashed, marking ERROR. "
             "Manually re-upload to retry."
         )
         assert any(
@@ -301,18 +301,18 @@ def test_sigkill_during_coding_with_multitask_queue_recovers_and_progresses(
         # migration: pre-PR-263 it is backed by ``tasks/QUEUE.md``,
         # post-PR-263 by ``RepoState.current_queue``. Either way the
         # rendered HTML is what an operator inspecting the queue sees.
-        # The CANCELED bucket is the load-bearing assertion: a
+        # The ERROR bucket is the load-bearing assertion: a
         # regression that drops the CANCEL or mis-derives PR-A's
         # status would leave it in TODO/DOING. PR-B/C/D may already
         # have advanced into DOING by the time we read the panel
         # (the daemon dispatches the next eligible TODO immediately on
         # the next IDLE tick), so the assertion accepts ``todo`` or
-        # ``doing`` and only excludes ``canceled``.
+        # ``doing`` and only excludes ``error``.
         #
         # Recovery publishes IDLE before the next ``handle_idle()`` tick
-        # rewrites QUEUE.md with the CANCELED status, so a single fetch
+        # rewrites QUEUE.md with the ERROR status, so a single fetch
         # right after IDLE is observed can race the regeneration. Poll
-        # until PR-A surfaces as CANCELED (or the deadline expires) so
+        # until PR-A surfaces as ERROR (or the deadline expires) so
         # the assertion pins the post-regeneration steady state rather
         # than the in-flight window.
         deadline = time.monotonic() + PANEL_DEADLINE_SEC
@@ -325,15 +325,15 @@ def test_sigkill_during_coding_with_multitask_queue_recovers_and_progresses(
             )
             if status_code == 200:
                 pr_a_status = _task_status_from_html(html, pr_a_id)
-                if pr_a_status == "canceled":
+                if pr_a_status == "error":
                     break
             time.sleep(1)
         assert status_code == 200, (
             f"GET /repos/{testbed_slug}/tasks returned "
             f"status_code={status_code}; body[:500]={html[:500]!r}"
         )
-        assert pr_a_status == "canceled", (
-            f"{pr_a_id!r} not in canceled bucket within "
+        assert pr_a_status == "error", (
+            f"{pr_a_id!r} not in error bucket within "
             f"{PANEL_DEADLINE_SEC}s post-recovery; "
             f"status={pr_a_status!r}; "
             f"html[:1500]={html[:1500]!r}"
@@ -351,14 +351,14 @@ def test_sigkill_during_coding_with_multitask_queue_recovers_and_progresses(
     # under test is independent of the shim — what matters is which PR
     # the IDLE selector picks. PR-B is the load-bearing answer:
     #
-    # * PR-A is CANCELED, so re-picking it would mean the recovery
+    # * PR-A is ERROR, so re-picking it would mean the recovery
     #   contract leaked.
     # * PR-C ``depends_on: PR-A`` and ``get_eligible_tasks`` requires
-    #   the dep to be DONE, not just terminal — CANCELED is NOT DONE
+    #   the dep to be DONE, not just terminal — ERROR is NOT DONE
     #   (see ``src/dag.py``), so PR-C is BLOCKED.
     # * PR-D is priority 3, sorts behind PR-B's priority 2.
     #
-    # If a future change makes CANCELED dependencies unblock dependents
+    # If a future change makes ERROR dependencies unblock dependents
     # (PR-C becomes eligible), this assertion is the canary; the test
     # owner updates the assertion only after the policy change lands
     # intentionally.
@@ -389,5 +389,5 @@ def test_sigkill_during_coding_with_multitask_queue_recovers_and_progresses(
         )
         assert last_task_pr_id != pr_c_id, (
             f"daemon dispatched {pr_c_id!r} whose dep {pr_a_id!r} is "
-            f"CANCELED; production policy requires Depends-on to be DONE"
+            f"ERROR; production policy requires Depends-on to be DONE"
         )

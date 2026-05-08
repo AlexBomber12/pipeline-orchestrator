@@ -566,7 +566,7 @@ def test_process_pending_uploads_clears_crashed_pr_ids_on_reupload(
     """PR-186: Re-uploading a previously-crashed task file is the user's
     signal to retry. The crashed-pr-ids set on the runner must be
     cleared for any uploaded PR-id so the next IDLE cycle picks the
-    task again instead of treating it as still CANCELED. Other
+    task again instead of treating it as still ERROR. Other
     crashed entries that were not re-uploaded must remain intact."""
     runner = _Runner(tmp_path)
     runner._crashed_task_pr_ids.update({"PR-001", "PR-999"})
@@ -590,10 +590,10 @@ def test_process_pending_uploads_clears_recovered_pr_ids_on_reupload(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """PR-247 follow-up: Re-uploading a task file the operator canceled
+    """PR-247 follow-up: Re-uploading a task file the operator error
     via the HUNG recover button is the user's signal to retry. The
     recovered-pr-ids set must be cleared for any uploaded PR-id so the
-    next IDLE cycle no longer forces it CANCELED, mirroring the PR-186
+    next IDLE cycle no longer forces it ERROR, mirroring the PR-186
     contract for the crashed-pr-ids set. Other recovered entries that
     were not re-uploaded must remain intact."""
     runner = _Runner(tmp_path)
@@ -622,12 +622,12 @@ def test_process_pending_uploads_flips_canceled_to_todo_in_snapshot(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """PR-267: Uploading a CANCELED task flips its snapshot status to TODO."""
+    """PR-267: Uploading a ERROR task flips its snapshot status to TODO."""
     from src.models import QueueTask, TaskStatus
 
     runner = _Runner(tmp_path)
     runner.state.current_queue = [
-        QueueTask(pr_id="PR-001", title="Crashed", status=TaskStatus.CANCELED),
+        QueueTask(pr_id="PR-001", title="Crashed", status=TaskStatus.ERROR),
         QueueTask(pr_id="PR-002", title="Other", status=TaskStatus.TODO),
     ]
     Path(runner.repo_path).mkdir(parents=True)
@@ -655,7 +655,7 @@ def test_clear_canceled_in_snapshot_refreshes_snapshot_timestamp(
     Regression: in-place ``snapshot[index] = ...`` bypasses the hook,
     leaving ``current_queue_snapshot_at`` pinned to the pre-mutation
     time. Clients keying refreshes off ``snapshot_at`` would miss the
-    CANCELED→TODO transition until the next IDLE rebuild.
+    ERROR→TODO transition until the next IDLE rebuild.
     """
     from datetime import datetime, timedelta, timezone
 
@@ -664,7 +664,7 @@ def test_clear_canceled_in_snapshot_refreshes_snapshot_timestamp(
     runner = _Runner(tmp_path)
     runner.state = RepoState(url=runner.repo_config.url, name=runner.name)
     runner.state.current_queue = [
-        QueueTask(pr_id="PR-001", title="Crashed", status=TaskStatus.CANCELED),
+        QueueTask(pr_id="PR-001", title="Crashed", status=TaskStatus.ERROR),
     ]
     stale_stamp = datetime.now(timezone.utc) - timedelta(hours=1)
     runner.state.current_queue_snapshot_at = stale_stamp
@@ -679,7 +679,7 @@ def test_clear_canceled_in_snapshot_refreshes_snapshot_timestamp(
 def test_clear_canceled_in_snapshot_skips_reassign_when_no_match(
     tmp_path: Path,
 ) -> None:
-    """No CANCELED match ⇒ leave snapshot_at alone (idempotent)."""
+    """No ERROR match ⇒ leave snapshot_at alone (idempotent)."""
     from datetime import datetime, timedelta, timezone
 
     from src.models import QueueTask, RepoState, TaskStatus
