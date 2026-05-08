@@ -104,7 +104,7 @@ from src.keyspace import (
     status_write_failed_tasks,
     upload_pending,
 )
-from src.metrics import MetricsStore, RunRecord
+from src.metrics import RUN_RECORD_TTL_SECONDS, MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
 from src.queue_parser import (
     TYPE_SYNONYMS,
@@ -861,7 +861,7 @@ class PipelineRunner(
             current = 0
         next_attempt = current + 1
         try:
-            await self.redis.set(key, str(next_attempt))
+            await self.redis.set(key, str(next_attempt), ex=RUN_RECORD_TTL_SECONDS)
         except Exception:
             pass
         record.attempt_index = next_attempt

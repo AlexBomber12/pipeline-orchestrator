@@ -100,6 +100,7 @@ class _FakeRedis:
     def __init__(self) -> None:
         self.writes: list[tuple[str, str]] = []
         self.store: dict[str, str] = {}
+        self.ttls: dict[str, int] = {}
         self.deleted: list[str] = []
         self.lists: dict[str, list[str]] = {}
         self.sets: dict[str, set[str]] = {}
@@ -116,6 +117,8 @@ class _FakeRedis:
             return None
         self.writes.append((key, value))
         self.store[key] = value
+        if ex is not None:
+            self.ttls[key] = ex
         return True
 
     async def get(self, key: str) -> str | None:

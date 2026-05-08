@@ -128,6 +128,8 @@ def test_attempt_index_increments_on_redispatch(
 
     assert runner._current_run_record is not None
     assert runner._current_run_record.attempt_index == 2
+    key = runner._attempt_count_key(runner.name, "PR-286")
+    assert runner.redis.ttls[key] == 365 * 86400
 
 
 def test_attempt_index_resets_on_file_content_change(

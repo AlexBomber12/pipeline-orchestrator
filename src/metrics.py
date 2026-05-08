@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 _TTL_SECONDS = 365 * 86400
+RUN_RECORD_TTL_SECONDS = _TTL_SECONDS
 _RECENT_INDEX_LIMIT = 200
 
 RunOutcome = Literal["merged", "failed", "paused", "superseded"]
@@ -98,10 +99,11 @@ class MetricsStore:
         payload = json.dumps(asdict(record), sort_keys=True)
         recent_key = self._recent_key(record.task_id, record.repo_name)
         await self._redis.set(key, payload, ex=_TTL_SECONDS)
-        await self._redis.sadd(
-            self._task_runs_key(record.repo_name, record.task_id),
-            record.run_id,
-        )
+        task_runs_key = self._task_runs_key(record.repo_name, record.task_id)
+        await self._redis.sadd(task_runs_key, record.run_id)
+        expire = getattr(self._redis, "expire", None)
+        if expire is not None:
+            await expire(task_runs_key, _TTL_SECONDS)
         await self._redis.lrem(recent_key, 0, record.run_id)
         await self._redis.lpush(recent_key, record.run_id)
         await self._redis.ltrim(recent_key, 0, _RECENT_INDEX_LIMIT - 1)

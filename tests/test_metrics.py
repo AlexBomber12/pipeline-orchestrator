@@ -32,6 +32,10 @@ class _FakeRedis:
         bucket.add(value)
         return len(bucket) - before
 
+    async def expire(self, key: str, seconds: int) -> bool:
+        self.ttls[key] = seconds
+        return True
+
     async def smembers(self, key: str) -> set[str]:
         return set(self.sets.get(key, set()))
 
@@ -324,6 +328,9 @@ async def test_taskruns_index_populated_on_save() -> None:
     assert redis.sets[
         "metrics:task_runs:AlexBomber12__pipeline-orchestrator:PR-286"
     ] == {"run-indexed"}
+    assert redis.ttls[
+        "metrics:task_runs:AlexBomber12__pipeline-orchestrator:PR-286"
+    ] == 365 * 86400
 
 
 async def test_list_task_runs_returns_all_records_for_task() -> None:
