@@ -96,15 +96,14 @@ def write_frontmatter_status(task_path: Path, status: str) -> None:
     if status not in _WRITER_STATUS_VALUES:
         raise ValueError(f"unknown frontmatter status {status!r}")
 
-    text = task_path.read_text(encoding="utf-8")
+    with task_path.open("r", encoding="utf-8", newline="") as handle:
+        text = handle.read()
     yaml = YAML()
     yaml.preserve_quotes = True
 
-    if not text.startswith("---\n"):
-        task_path.write_text(
-            f"---\nstatus: {status}\n---\n\n{text}",
-            encoding="utf-8",
-        )
+    if not text.startswith(("---\n", "---\r\n")):
+        with task_path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(f"---\nstatus: {status}\n---\n\n{text}")
         return
 
     lines = text.splitlines(keepends=True)
@@ -117,10 +116,8 @@ def write_frontmatter_status(task_path: Path, status: str) -> None:
         None,
     )
     if closing_index is None:
-        task_path.write_text(
-            f"---\nstatus: {status}\n---\n\n{text}",
-            encoding="utf-8",
-        )
+        with task_path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(f"---\nstatus: {status}\n---\n\n{text}")
         return
 
     frontmatter = "".join(lines[1:closing_index])
@@ -135,10 +132,8 @@ def write_frontmatter_status(task_path: Path, status: str) -> None:
 
     stream = StringIO()
     yaml.dump(data, stream)
-    task_path.write_text(
-        f"---\n{stream.getvalue()}---\n{body}",
-        encoding="utf-8",
-    )
+    with task_path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(f"---\n{stream.getvalue()}---\n{body}")
 
 
 @dataclass(frozen=True)

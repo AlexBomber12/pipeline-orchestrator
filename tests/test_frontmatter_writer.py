@@ -28,6 +28,19 @@ def test_write_status_replaces_existing_field(tmp_path: Path) -> None:
     )
 
 
+def test_write_status_replaces_existing_field_with_crlf_frontmatter(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "PR-001.md"
+    task.write_text("---\r\nstatus: TODO\r\n---\r\n\r\nBody\r\n", encoding="utf-8")
+
+    write_frontmatter_status(task, "ERROR")
+
+    assert task.read_bytes() == (
+        b"---\nstatus: ERROR\n---\n\r\nBody\r\n"
+    )
+
+
 def test_write_status_inserts_into_existing_frontmatter_with_other_fields(
     tmp_path: Path,
 ) -> None:
