@@ -9,6 +9,7 @@ reads-only paths (rendering, JSON status, partials) live in
 from __future__ import annotations
 
 import re
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -17,9 +18,11 @@ import redis.asyncio as aioredis
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
+from src.cancellation.storage import delete_cancellation_cause
 from src.config import load_config
 from src.keyspace import control_stop, pipeline_state
 from src.models import PipelineState, QueueTask, RepoState, TaskStatus
+from src.queue_parser import write_frontmatter_status
 from src.web.services.coder import _effective_coder_name
 from src.web.services.repo_state import (
     _default_repo_state,
@@ -35,6 +38,7 @@ _QUEUE_NOT_READY_FRAGMENT = (
     "daemon syncing.</p>"
 )
 _QUEUE_NOT_READY_JSON = {"error": "Queue not yet computed"}
+_RETRY_TTL_SECONDS = 30 * 24 * 3600
 
 _DEFERRED_CODER_SWITCH_STATES = {
     PipelineState.CODING,
@@ -118,6 +122,104 @@ class _RepoStateMutationError(Exception):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
+
+
+class _RetryCapExceeded(Exception):
+    """Raised when the operator retry counter has reached its configured cap."""
+
+    def __init__(self, current: int, cap: int) -> None:
+        super().__init__("retry cap reached")
+        self.current = current
+        self.cap = cap
+
+
+def _retry_count_key(repo_slug: str, task_id: str) -> str:
+    return f"metrics:retry_count:{repo_slug}:{task_id}"
+
+
+def _decode_retry_count(raw: object) -> int:
+    if raw is None:
+        return 0
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _get_retry_count(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    task_id: str,
+) -> int:
+    try:
+        raw = await redis_client.get(_retry_count_key(repo_slug, task_id))
+    except Exception:
+        return 0
+    return _decode_retry_count(raw)
+
+
+async def _increment_retry_count(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    task_id: str,
+    cap: int,
+) -> int:
+    key = _retry_count_key(repo_slug, task_id)
+
+    async def _transaction(pipe: Any) -> int:
+        current = _decode_retry_count(await pipe.get(key))
+        if current >= cap:
+            raise _RetryCapExceeded(current, cap)
+        next_count = current + 1
+        pipe.multi()
+        pipe.set(key, str(next_count), ex=_RETRY_TTL_SECONDS)
+        return next_count
+
+    return await redis_client.transaction(_transaction, key, value_from_callable=True)
+
+
+async def _task_view(
+    task: QueueTask,
+    repo_name: str,
+    redis_client: aioredis.Redis | None,
+) -> dict[str, object]:
+    retry_count = 0
+    if task.status == TaskStatus.ERROR and redis_client is not None:
+        retry_count = await _get_retry_count(redis_client, repo_name, task.pr_id)
+    return {
+        **task.model_dump(mode="json"),
+        "retry_count": retry_count,
+    }
+
+
+async def _build_tasks_panel_context(
+    name: str,
+    tasks: list[QueueTask],
+    *,
+    redis_client: aioredis.Redis | None,
+    retry_cap: int,
+) -> dict[str, object]:
+    async def _views_for(status: TaskStatus) -> list[dict[str, object]]:
+        return [
+            await _task_view(task, name, redis_client)
+            for task in tasks
+            if task.status == status
+        ]
+
+    grouped = {
+        "doing": await _views_for(TaskStatus.DOING),
+        "todo": await _views_for(TaskStatus.TODO),
+        "done": await _views_for(TaskStatus.DONE),
+        "error": await _views_for(TaskStatus.ERROR),
+    }
+    return {
+        "repo_name": name,
+        "tasks_by_status": grouped,
+        "tasks_total": len(tasks),
+        "retry_cap": retry_cap,
+    }
 
 
 async def _apply_repo_control_update(
@@ -454,20 +556,123 @@ async def list_repo_tasks(request: Request, name: str) -> Response:
             _QUEUE_NOT_READY_FRAGMENT,
             status_code=503,
         )
-    grouped = {
-        "doing": [t for t in tasks if t.status == TaskStatus.DOING],
-        "todo": [t for t in tasks if t.status == TaskStatus.TODO],
-        "done": [t for t in tasks if t.status == TaskStatus.DONE],
-        "error": [t for t in tasks if t.status == TaskStatus.ERROR],
-    }
     return _app.templates.TemplateResponse(
         request,
         "components/tasks_panel.html",
-        {
-            "repo_name": name,
-            "tasks_by_status": grouped,
-            "tasks_total": len(tasks),
-        },
+        await _build_tasks_panel_context(
+            name,
+            tasks,
+            redis_client=getattr(request.app.state, "redis", None),
+            retry_cap=cfg.daemon.retry_button_cap,
+        ),
+    )
+
+
+@router.post("/repos/{name}/tasks/{pr_id}/retry", response_class=HTMLResponse)
+async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
+    """Reset an ERROR task to queued when an operator requests a retry."""
+    if not _TASK_PR_ID_PATTERN.match(pr_id):
+        return HTMLResponse("Invalid task identifier", status_code=400)
+
+    cfg = load_config(_app.CONFIG_PATH)
+    if _find_repo_config_by_name(cfg, name) is None:
+        return HTMLResponse("Repository not found", status_code=404)
+
+    resolved = await _resolve_repo_task_path(name, pr_id)
+    if resolved is None:
+        return HTMLResponse("Task file not found", status_code=404)
+    task_path, _task_filename = resolved
+
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return HTMLResponse("Redis unavailable", status_code=503)
+
+    cap = cfg.daemon.retry_button_cap
+    try:
+        next_count = await _increment_retry_count(redis_client, name, pr_id, cap)
+    except _RetryCapExceeded:
+        return HTMLResponse(
+            "Retry cap reached. Edit task spec or delete to proceed.",
+            status_code=409,
+        )
+    except Exception:
+        return HTMLResponse("Failed to update retry counter", status_code=503)
+
+    try:
+        await delete_cancellation_cause(redis_client, name, pr_id)
+    except Exception:
+        return HTMLResponse("Failed to clear cancellation cause", status_code=503)
+
+    try:
+        write_frontmatter_status(task_path, "TODO")
+    except (OSError, ValueError):
+        return HTMLResponse("Failed to update task status", status_code=503)
+
+    repo_root = Path(_app.REPOS_DIR) / name
+    try:
+        relative_task = task_path.relative_to(repo_root)
+    except ValueError:
+        return HTMLResponse("Task file not found", status_code=404)
+
+    commit_subject = f"[RETRY] {pr_id} cleared by operator (attempt {next_count}/{cap})"
+    try:
+        subprocess.run(
+            ["git", "-C", str(repo_root), "add", relative_task.as_posix()],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "commit",
+                "-m",
+                commit_subject,
+                "-m",
+                "[skip ci]",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_root), "push", "origin", "HEAD:main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError:
+        return HTMLResponse("Failed to commit retry change", status_code=503)
+
+    tasks, _snapshot_at = await _load_current_queue_snapshot(name)
+    if tasks is None:
+        tasks = [
+            QueueTask(
+                pr_id=pr_id,
+                title=pr_id,
+                status=TaskStatus.TODO,
+                task_file=relative_task.as_posix(),
+            )
+        ]
+    else:
+        tasks = [
+            task.model_copy(update={"status": TaskStatus.TODO})
+            if task.pr_id == pr_id
+            else task
+            for task in tasks
+        ]
+
+    return _app.templates.TemplateResponse(
+        request,
+        "components/tasks_panel.html",
+        await _build_tasks_panel_context(
+            name,
+            tasks,
+            redis_client=redis_client,
+            retry_cap=cap,
+        ),
     )
 
 
