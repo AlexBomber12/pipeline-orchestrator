@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 from src.cancellation.storage import cause_key, index_key
+from src.keyspace import status_write_failed_tasks
 from src.models import PipelineState, QueueTask, RepoState, TaskStatus
 from src.web import app as web_app
 from src.web.app import app
@@ -135,6 +136,7 @@ def test_retry_increments_counter_clears_cause_writes_queued(
                 ]
             ),
             cause_key("example__alpha", "PR-283"): "{}",
+            status_write_failed_tasks("example__alpha"): '["PR-283", "PR-999"]',
         }
     )
     monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
@@ -154,6 +156,7 @@ def test_retry_increments_counter_clears_cause_writes_queued(
     assert redis_client.store["metrics:retry_count:example__alpha:PR-283"] == "1"
     assert redis_client.expiries["metrics:retry_count:example__alpha:PR-283"] == 30 * 24 * 3600
     assert cause_key("example__alpha", "PR-283") not in redis_client.store
+    assert redis_client.store[status_write_failed_tasks("example__alpha")] == '["PR-999"]'
     assert cause_key("example__alpha", "PR-283") in redis_client.deleted
     assert "control:retry_reservation:example__alpha" in redis_client.deleted
     assert redis_client.zremmed == [(index_key("example__alpha"), ("PR-283",))]
@@ -361,6 +364,38 @@ async def test_release_retry_reservation_swallows_cleanup_failure(
     monkeypatch.setattr(repo_control, "_decrement_retry_count", fake_decrement)
 
     await repo_control._release_retry_reservation(_RetryRedis(), "repo", "PR-1")
+
+
+@pytest.mark.asyncio
+async def test_clear_status_write_failed_retry_marker_edges() -> None:
+    key = status_write_failed_tasks("repo")
+
+    non_list = _RetryRedis({key: "{}"})
+    await repo_control._clear_status_write_failed_retry_marker(non_list, "repo", "PR-1")
+    assert non_list.store[key] == "{}"
+
+    missing_task = _RetryRedis({key: '["PR-2"]'})
+    await repo_control._clear_status_write_failed_retry_marker(
+        missing_task,
+        "repo",
+        "PR-1",
+    )
+    assert missing_task.store[key] == '["PR-2"]'
+
+    only_task = _RetryRedis({key: '["PR-1"]'})
+    await repo_control._clear_status_write_failed_retry_marker(only_task, "repo", "PR-1")
+    assert key not in only_task.store
+    assert key in only_task.deleted
+
+    class _BoomRedis(_RetryRedis):
+        async def get(self, key: str) -> str | None:
+            raise RuntimeError("boom")
+
+    await repo_control._clear_status_write_failed_retry_marker(
+        _BoomRedis(),
+        "repo",
+        "PR-1",
+    )
 
 
 @pytest.mark.asyncio

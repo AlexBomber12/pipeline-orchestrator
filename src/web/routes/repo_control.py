@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import json
 import re
 import subprocess
 from datetime import datetime, timezone
@@ -23,7 +24,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from src.cancellation.storage import delete_cancellation_cause
 from src.config import load_config
-from src.keyspace import control_stop, pipeline_state
+from src.keyspace import control_stop, pipeline_state, status_write_failed_tasks
 from src.models import PipelineState, QueueTask, RepoState, TaskStatus
 from src.queue_parser import write_frontmatter_status
 from src.web.services.coder import _effective_coder_name
@@ -367,6 +368,31 @@ async def _release_retry_reservation(
 ) -> None:
     try:
         await _decrement_retry_count(redis_client, repo_slug, task_id)
+    except Exception:
+        pass
+
+
+async def _clear_status_write_failed_retry_marker(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    task_id: str,
+) -> None:
+    """Remove a successfully retried task from the status-write-failed set."""
+    key = status_write_failed_tasks(repo_slug)
+    try:
+        decoded = _decode_redis_text(await redis_client.get(key))
+        if decoded is None:
+            return
+        task_ids = json.loads(decoded)
+        if not isinstance(task_ids, list):
+            return
+        if all(str(item) != task_id for item in task_ids):
+            return
+        remaining = sorted({str(item) for item in task_ids if str(item) != task_id})
+        if remaining:
+            await _await_if_needed(redis_client.set(key, json.dumps(remaining)))
+        else:
+            await _await_if_needed(redis_client.delete(key))
     except Exception:
         pass
 
@@ -1031,6 +1057,7 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
             await delete_cancellation_cause(redis_client, name, pr_id)
         except Exception:
             pass
+        await _clear_status_write_failed_retry_marker(redis_client, name, pr_id)
 
         tasks, _snapshot_at = await _load_current_queue_snapshot(name)
         if tasks is None:
