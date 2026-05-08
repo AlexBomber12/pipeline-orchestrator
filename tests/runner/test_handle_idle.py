@@ -2717,6 +2717,71 @@ def test_picker_does_not_pick_task_with_unresolved_deps(
     ]
 
 
+def test_picker_keeps_unresolved_cycle_idle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Unresolved blocked tasks stay visible without triggering cycle errors."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: First blocked\n\n"
+        "Branch: pr-001\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: PR-002\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+    (tasks_dir / "PR-002.md").write_text(
+        "# PR-002: Second blocked\n\n"
+        "Branch: pr-002\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: PR-001, PR-MISSING\n"
+        "- Priority: 2\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is None
+    assert runner._idle_dag_tasks == [
+        QueueTask(
+            pr_id="PR-001",
+            title="First blocked",
+            status=TaskStatus.TODO,
+            task_file="tasks/PR-001.md",
+            depends_on=["PR-002"],
+            unresolved_deps=["PR-MISSING"],
+            branch="pr-001",
+        ),
+        QueueTask(
+            pr_id="PR-002",
+            title="Second blocked",
+            status=TaskStatus.TODO,
+            task_file="tasks/PR-002.md",
+            depends_on=["PR-001", "PR-MISSING"],
+            unresolved_deps=["PR-MISSING"],
+            branch="pr-002",
+        ),
+    ]
+
+
 def test_filter_dag_headers_blocks_tasks_with_transitively_blocked_dependencies(
     tmp_path: Path,
 ) -> None:

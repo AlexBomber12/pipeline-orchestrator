@@ -258,6 +258,15 @@ class IdleMixin:
                 )
                 for header in headers
             ]
+            eligibility_dag_headers = [
+                replace(
+                    header,
+                    depends_on=list(unresolved_deps_map[header.pr_id]),
+                )
+                if header.pr_id in unresolved_deps_map
+                else header
+                for header in dag_headers
+            ]
             dag_header_ids = {header.pr_id for header in dag_headers}
             synthetic_blocker_headers = [
                 TaskHeader(
@@ -279,7 +288,7 @@ class IdleMixin:
                     }
                 )
             ]
-            eligibility_headers = [*dag_headers, *synthetic_blocker_headers]
+            eligibility_headers = [*eligibility_dag_headers, *synthetic_blocker_headers]
             merged_pr_ids = {
                 pr_id for pr_id in merged_pr_ids if pr_id in {header.pr_id for header in headers}
             }
