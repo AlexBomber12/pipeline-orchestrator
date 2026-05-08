@@ -16,6 +16,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from src.cancellation import safe_delete_cancellation_cause
 from src.daemon import git_ops, scaffolder
 from src.daemon.git_ops import (
     _FETCH_MISSING_REF_NEEDLE,
@@ -335,6 +336,13 @@ return 0
             if uploaded_pr_ids and clear_status_write_failed is not None:
                 await clear_status_write_failed(uploaded_pr_ids)
             if uploaded_pr_ids:
+                for pr_id in uploaded_pr_ids:
+                    await safe_delete_cancellation_cause(
+                        self.redis,
+                        self.name,
+                        pr_id,
+                        log=self.log_event,
+                    )
                 self._clear_canceled_in_snapshot(uploaded_pr_ids)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
             logger.error("%s: upload git operations failed: %s", self.name, exc)
