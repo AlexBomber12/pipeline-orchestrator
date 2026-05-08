@@ -235,6 +235,27 @@ async def test_increment_retry_count_rejects_cap() -> None:
         await repo_control._increment_retry_count(redis_client, "repo", "PR-1", cap=2)
 
 
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("# PR-1: No frontmatter\n", None),
+        ("---\n---\n# PR-1: Missing status\n", None),
+        ("---\ntitle: Test\nstatus: ERROR # retry\n---\n", TaskStatus.ERROR),
+        ("---\nstatus: maybe\n---\n", None),
+        ("---\ntitle: Test\n", None),
+    ],
+)
+def test_read_task_frontmatter_status_variants(
+    tmp_path: Path,
+    content: str,
+    expected: TaskStatus | None,
+) -> None:
+    task_path = tmp_path / "PR-1.md"
+    task_path.write_text(content, encoding="utf-8")
+
+    assert repo_control._read_task_frontmatter_status(task_path) == expected
+
+
 def test_retry_invalid_pr_id_returns_400(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -401,6 +422,13 @@ def test_retry_push_failure_can_retry_existing_local_commit(
     def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         nonlocal commit_attempts, push_attempts
         git_calls.append(args)
+        if args[3] == "log":
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                "[RETRY] PR-283 cleared by operator (attempt 1/3)\n",
+                "",
+            )
         if args[3] == "commit":
             commit_attempts += 1
             if commit_attempts == 2:
@@ -427,6 +455,133 @@ def test_retry_push_failure_can_retry_existing_local_commit(
     assert push_attempts == 2
     assert commit_attempts == 2
     assert ["git", "-C", str(repo_dir), "push", "origin", "HEAD:main"] in git_calls
+
+
+def test_retry_rejects_task_not_in_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config_and_task(tmp_path, monkeypatch, status="DONE")
+    redis_client = _RetryRedis()
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    git_called = False
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal git_called
+        git_called = True
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+
+    assert response.status_code == 409
+    assert "Task is not in ERROR" in response.text
+    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
+    assert git_called is False
+
+
+def test_retry_rejects_already_pushed_retry_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config_and_task(tmp_path, monkeypatch, status="TODO")
+    redis_client = _RetryRedis()
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if args[3] == "commit":
+            raise subprocess.CalledProcessError(
+                1,
+                args,
+                output="On branch main\nnothing to commit, working tree clean\n",
+            )
+        if args[3] == "log":
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                "[RETRY] PR-283 cleared by operator (attempt 1/3)\n",
+                "",
+            )
+        if args[3] == "push":
+            return subprocess.CompletedProcess(args, 0, "Everything up-to-date\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+
+    assert response.status_code == 409
+    assert "Task is not in ERROR" in response.text
+    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
+
+
+def test_retry_noop_commit_without_replay_permission_is_not_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if args[3] == "commit":
+            raise subprocess.CalledProcessError(
+                1,
+                args,
+                output="On branch main\nnothing to commit, working tree clean\n",
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+
+    with pytest.raises(repo_control._TaskNotRetryable):
+        repo_control._commit_and_push_retry_reset(
+            repo_dir,
+            Path("tasks/PR-283.md"),
+            "[RETRY] PR-283 cleared by operator (attempt 1/3)",
+            allow_existing_retry_commit=False,
+        )
+
+
+def test_retry_git_commands_run_in_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_dir = _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _RetryRedis()
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    to_thread_calls: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
+
+    async def fake_to_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
+        to_thread_calls.append((func, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(repo_control.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+
+    assert response.status_code == 200
+    assert to_thread_calls == [
+        (
+            repo_control._commit_and_push_retry_reset,
+            (
+                repo_dir,
+                Path("tasks/PR-283.md"),
+                "[RETRY] PR-283 cleared by operator (attempt 1/3)",
+            ),
+            {"allow_existing_retry_commit": False},
+        )
+    ]
 
 
 def test_retry_post_push_counter_cap_returns_409(

@@ -8,6 +8,7 @@ reads-only paths (rendering, JSON status, partials) live in
 
 from __future__ import annotations
 
+import asyncio
 import re
 import subprocess
 from datetime import datetime, timezone
@@ -133,6 +134,10 @@ class _RetryCapExceeded(Exception):
         self.cap = cap
 
 
+class _TaskNotRetryable(Exception):
+    """Raised when a retry request targets a task that is not retryable."""
+
+
 def _retry_count_key(repo_slug: str, task_id: str) -> str:
     return f"metrics:retry_count:{repo_slug}:{task_id}"
 
@@ -200,6 +205,93 @@ async def _next_retry_count(
 def _is_nothing_to_commit(exc: subprocess.CalledProcessError) -> bool:
     output = "\n".join(str(part) for part in (exc.stdout, exc.stderr) if part)
     return "nothing to commit" in output.lower()
+
+
+def _git_output(result: subprocess.CompletedProcess[str]) -> str:
+    return "\n".join(str(part) for part in (result.stdout, result.stderr) if part)
+
+
+def _read_task_frontmatter_status(task_path: Path) -> TaskStatus | None:
+    lines = task_path.read_text(encoding="utf-8").splitlines()
+    first_content_index = next(
+        (index for index, raw_line in enumerate(lines) if raw_line.strip()),
+        None,
+    )
+    if first_content_index is None or lines[first_content_index].rstrip() != "---":
+        return None
+
+    for raw_line in lines[first_content_index + 1 :]:
+        if raw_line.rstrip() == "---":
+            return None
+        status_match = re.match(r"^status:\s*(.+?)\s*$", raw_line.rstrip())
+        if status_match is None:
+            continue
+        raw_status = status_match.group(1).split("#", 1)[0].strip().strip("\"'")
+        try:
+            return TaskStatus(raw_status.upper())
+        except ValueError:
+            return None
+    return None
+
+
+def _head_commit_subject(repo_root: Path) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "log", "-1", "--pretty=%s"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _commit_and_push_retry_reset(
+    repo_root: Path,
+    relative_task: Path,
+    commit_subject: str,
+    *,
+    allow_existing_retry_commit: bool,
+) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo_root), "add", relative_task.as_posix()],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "commit",
+                "-m",
+                commit_subject,
+                "-m",
+                "[skip ci]",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        if not _is_nothing_to_commit(exc):
+            raise
+        if (
+            not allow_existing_retry_commit
+            or _head_commit_subject(repo_root) != commit_subject
+        ):
+            raise _TaskNotRetryable
+
+    push_result = subprocess.run(
+        ["git", "-C", str(repo_root), "push", "origin", "HEAD:main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if allow_existing_retry_commit and "everything up-to-date" in _git_output(
+        push_result
+    ).lower():
+        raise _TaskNotRetryable
 
 
 async def _task_view(
@@ -609,6 +701,12 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
     if redis_client is None:
         return HTMLResponse("Redis unavailable", status_code=503)
 
+    repo_root = Path(_app.REPOS_DIR) / name
+    try:
+        relative_task = task_path.relative_to(repo_root)
+    except ValueError:
+        return HTMLResponse("Task file not found", status_code=404)
+
     cap = cfg.daemon.retry_button_cap
     try:
         next_count = await _next_retry_count(redis_client, name, pr_id, cap)
@@ -620,55 +718,34 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
     except Exception:
         return HTMLResponse("Failed to update retry counter", status_code=503)
 
+    current_status = _read_task_frontmatter_status(task_path)
+    allow_existing_retry_commit = current_status == TaskStatus.TODO
+    if current_status not in {TaskStatus.ERROR, TaskStatus.TODO}:
+        return HTMLResponse("Task is not in ERROR", status_code=409)
+
     try:
-        await delete_cancellation_cause(redis_client, name, pr_id)
+        if current_status == TaskStatus.ERROR:
+            await delete_cancellation_cause(redis_client, name, pr_id)
     except Exception:
         return HTMLResponse("Failed to clear cancellation cause", status_code=503)
 
     try:
-        write_frontmatter_status(task_path, "TODO")
+        if current_status == TaskStatus.ERROR:
+            write_frontmatter_status(task_path, "TODO")
     except (OSError, ValueError):
         return HTMLResponse("Failed to update task status", status_code=503)
 
-    repo_root = Path(_app.REPOS_DIR) / name
-    try:
-        relative_task = task_path.relative_to(repo_root)
-    except ValueError:
-        return HTMLResponse("Task file not found", status_code=404)
-
     commit_subject = f"[RETRY] {pr_id} cleared by operator (attempt {next_count}/{cap})"
     try:
-        subprocess.run(
-            ["git", "-C", str(repo_root), "add", relative_task.as_posix()],
-            check=True,
-            capture_output=True,
-            text=True,
+        await asyncio.to_thread(
+            _commit_and_push_retry_reset,
+            repo_root,
+            relative_task,
+            commit_subject,
+            allow_existing_retry_commit=allow_existing_retry_commit,
         )
-        try:
-            subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(repo_root),
-                    "commit",
-                    "-m",
-                    commit_subject,
-                    "-m",
-                    "[skip ci]",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except subprocess.CalledProcessError as exc:
-            if not _is_nothing_to_commit(exc):
-                raise
-        subprocess.run(
-            ["git", "-C", str(repo_root), "push", "origin", "HEAD:main"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+    except _TaskNotRetryable:
+        return HTMLResponse("Task is not in ERROR", status_code=409)
     except subprocess.CalledProcessError:
         return HTMLResponse("Failed to commit retry change", status_code=503)
 
