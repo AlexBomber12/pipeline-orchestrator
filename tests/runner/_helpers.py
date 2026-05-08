@@ -170,20 +170,23 @@ class _FakeRedis:
     async def zremrangebyscore(
         self, key: str, min_score: object, max_score: object
     ) -> int:
-        def _bound(value: object) -> float:
+        def _bound(value: object) -> tuple[float, bool]:
             if value == "-inf":
-                return float("-inf")
+                return float("-inf"), False
             if value == "+inf":
-                return float("inf")
+                return float("inf"), False
             if isinstance(value, str) and value.startswith("("):
-                return float(value[1:])
-            return float(value)
+                return float(value[1:]), True
+            return float(value), False
 
-        lower = _bound(min_score)
-        upper = _bound(max_score)
+        lower, lower_exclusive = _bound(min_score)
+        upper, upper_exclusive = _bound(max_score)
         bucket = self.zsets.setdefault(key, {})
         doomed = [
-            member for member, score in bucket.items() if lower <= score <= upper
+            member
+            for member, score in bucket.items()
+            if (score > lower if lower_exclusive else score >= lower)
+            and (score < upper if upper_exclusive else score <= upper)
         ]
         for member in doomed:
             del bucket[member]

@@ -47,7 +47,7 @@ async def prune(
 ) -> int:
     """Remove entries outside the retained history window."""
     cutoff = _timestamp(now) - retain_for.total_seconds()
-    return int(await redis_client.zremrangebyscore(key(repo_slug), "-inf", cutoff))
+    return int(await redis_client.zremrangebyscore(key(repo_slug), "-inf", f"({cutoff}"))
 
 
 async def count_recent(

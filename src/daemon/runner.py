@@ -470,18 +470,13 @@ class PipelineRunner(
         """Return True when AVAILABLE-mode ERROR rate pauses this repo.
 
         AWAY mode intentionally absorbs individual skip-and-record
-        failures without repo-level attention; AVAILABLE mode converts a
-        sustained ERROR burst into the same PAUSED state as a manual
-        operator pause so Resume remains the only way forward.
+        failures without repo-level attention while still pruning the
+        bounded ERROR-rate tracker; AVAILABLE mode converts a sustained
+        ERROR burst into the same PAUSED state as a manual operator pause
+        so Resume remains the only way forward.
         """
         cfg = self.app_config.daemon
         if not cfg.error_rate_auto_pause_enabled:
-            return False
-        try:
-            availability = await is_operator_available(self._availability_sources())
-        except Exception:
-            availability = AvailabilityState.AVAILABLE
-        if availability is not AvailabilityState.AVAILABLE:
             return False
         try:
             count = await error_rate_tracker.count_recent(
@@ -495,6 +490,12 @@ class PipelineRunner(
                 self.name,
                 exc,
             )
+            return False
+        try:
+            availability = await is_operator_available(self._availability_sources())
+        except Exception:
+            availability = AvailabilityState.AVAILABLE
+        if availability is not AvailabilityState.AVAILABLE:
             return False
         if count < cfg.error_rate_threshold:
             return False

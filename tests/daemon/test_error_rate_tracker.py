@@ -39,6 +39,23 @@ async def test_count_excludes_outside_window() -> None:
 
 
 @pytest.mark.asyncio
+async def test_count_keeps_event_exactly_at_window_boundary() -> None:
+    redis = _FakeRedis()
+    now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
+    boundary = now - timedelta(minutes=60)
+
+    await error_rate_tracker.record(redis, "octo__demo", boundary)
+
+    assert (
+        await error_rate_tracker.count_recent(
+            redis, "octo__demo", 60, now=now
+        )
+        == 1
+    )
+    assert len(redis.zsets[error_rate_tracker.key("octo__demo")]) == 1
+
+
+@pytest.mark.asyncio
 async def test_count_honors_windows_longer_than_24_hours() -> None:
     redis = _FakeRedis()
     now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
