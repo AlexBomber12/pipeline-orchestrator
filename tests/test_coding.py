@@ -1002,10 +1002,10 @@ def test_handle_coding_task_file_read_error_transitions_to_error(
     as a missing file. No exception leaks out of the handler."""
     runner = _runner_for_auto_pr_dispatch(monkeypatch, tmp_path)
 
-    def fake_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+    def fake_read_bytes(self: Path, *args: Any, **kwargs: Any) -> bytes:
         raise OSError("permission denied")
 
-    monkeypatch.setattr(coding_module.Path, "read_text", fake_read_text)
+    monkeypatch.setattr(coding_module.Path, "read_bytes", fake_read_bytes)
 
     asyncio.run(runner.handle_coding())
 

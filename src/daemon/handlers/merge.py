@@ -17,6 +17,7 @@ from src import claude_cli, codex_cli
 from src.analytics import log_merged_pr
 from src.analytics.coder_version import detect_coder_extension_version
 from src.branch_context import BranchContext
+from src.cancellation import delete_retry_count, delete_task_spec_hash
 from src.config import CoderType
 from src.daemon import git_ops
 from src.github import cache as gh_cache
@@ -262,6 +263,17 @@ class MergeMixin:
             self.log_event(
                 f"[ANALYTICS] outcome log for PR #{number} failed: {exc}."
             )
+        if current_task is not None:
+            try:
+                await delete_task_spec_hash(
+                    self.redis, self.name, current_task.pr_id
+                )
+                await delete_retry_count(self.redis, self.name, current_task.pr_id)
+            except Exception as exc:
+                self.log_event(
+                    f"[MERGE] Failed to clear retry metadata for "
+                    f"{current_task.pr_id}: {exc}."
+                )
         self._current_run_record = None
         self.state.current_task = None
         self._reset_runner_local_task_counters()

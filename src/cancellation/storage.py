@@ -13,7 +13,9 @@ transitions that previously used HUNG-specific cancellation semantics.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -55,6 +57,54 @@ def cause_key(repo_slug: str, task_id: str) -> str:
 
 def index_key(repo_slug: str) -> str:
     return f"cancellation_index:{repo_slug}"
+
+
+def task_spec_hash_key(repo_slug: str, task_id: str) -> str:
+    return f"task_spec_hash:{repo_slug}:{task_id}"
+
+
+def retry_count_key(repo_slug: str, task_id: str) -> str:
+    return f"metrics:retry_count:{repo_slug}:{task_id}"
+
+
+def task_spec_content_hash(task_text: str) -> str:
+    """Hash task spec content excluding daemon-managed frontmatter status."""
+    lines = task_text.splitlines(keepends=True)
+    first_content_index = next(
+        (index for index, raw_line in enumerate(lines) if raw_line.strip()),
+        None,
+    )
+    if first_content_index is None or lines[first_content_index].rstrip() != "---":
+        normalized = lines
+    else:
+        closing_index = next(
+            (
+                index
+                for index, raw_line in enumerate(lines[first_content_index + 1 :], start=first_content_index + 1)
+                if raw_line.rstrip() == "---"
+            ),
+            None,
+        )
+        if closing_index is None:
+            normalized = lines
+        else:
+            frontmatter = [
+                raw_line
+                for raw_line in lines[first_content_index + 1 : closing_index]
+                if not re.match(r"^status:\s*", raw_line.rstrip())
+            ]
+            if any(raw_line.strip() for raw_line in frontmatter):
+                normalized = (
+                    lines[: first_content_index + 1]
+                    + frontmatter
+                    + lines[closing_index:]
+                )
+            else:
+                body_start = closing_index + 1
+                if body_start < len(lines) and not lines[body_start].strip():
+                    body_start += 1
+                normalized = lines[:first_content_index] + lines[body_start:]
+    return hashlib.sha256("".join(normalized).encode("utf-8")).hexdigest()
 
 
 async def record_cancellation_cause(
@@ -103,6 +153,57 @@ async def delete_cancellation_cause(
     """
     await redis_client.delete(cause_key(repo_slug, task_id))
     await redis_client.zrem(index_key(repo_slug), task_id)
+
+
+async def record_task_spec_hash(
+    redis_client: Any,
+    repo_slug: str,
+    task_id: str,
+    spec_hash: str,
+) -> None:
+    """Persist the last task spec content hash attempted by the daemon."""
+    await redis_client.set(
+        task_spec_hash_key(repo_slug, task_id),
+        spec_hash,
+        ex=TTL_SECONDS,
+    )
+
+
+async def get_task_spec_hash(
+    redis_client: Any,
+    repo_slug: str,
+    task_id: str,
+) -> str | None:
+    raw = await redis_client.get(task_spec_hash_key(repo_slug, task_id))
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8")
+    return str(raw)
+
+
+async def delete_task_spec_hash(
+    redis_client: Any,
+    repo_slug: str,
+    task_id: str,
+) -> None:
+    await redis_client.delete(task_spec_hash_key(repo_slug, task_id))
+
+
+async def reset_retry_count(
+    redis_client: Any,
+    repo_slug: str,
+    task_id: str,
+) -> None:
+    await redis_client.set(retry_count_key(repo_slug, task_id), "0", ex=TTL_SECONDS)
+
+
+async def delete_retry_count(
+    redis_client: Any,
+    repo_slug: str,
+    task_id: str,
+) -> None:
+    await redis_client.delete(retry_count_key(repo_slug, task_id))
 
 
 async def list_recent_cancellations(

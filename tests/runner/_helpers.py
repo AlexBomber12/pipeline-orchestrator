@@ -353,6 +353,7 @@ def _stub_auto_pr_task_body_read(monkeypatch: pytest.MonkeyPatch) -> None:
     read the on-disk content.
     """
     real_read_text = coding_module.Path.read_text
+    real_read_bytes = coding_module.Path.read_bytes
 
     def fake_read_text(self: Any, *args: Any, **kwargs: Any) -> str:
         s = str(self)
@@ -364,7 +365,18 @@ def _stub_auto_pr_task_body_read(monkeypatch: pytest.MonkeyPatch) -> None:
             return f"# {self.stem}\n\nBranch: pr-001\n"
         return real_read_text(self, *args, **kwargs)
 
+    def fake_read_bytes(self: Any, *args: Any, **kwargs: Any) -> bytes:
+        s = str(self)
+        if (
+            "/tasks/PR-" in s
+            and s.endswith(".md")
+            and not self.exists()
+        ):
+            return f"# {self.stem}\n\nBranch: pr-001\n".encode("utf-8")
+        return real_read_bytes(self, *args, **kwargs)
+
     monkeypatch.setattr(coding_module.Path, "read_text", fake_read_text)
+    monkeypatch.setattr(coding_module.Path, "read_bytes", fake_read_bytes)
 
 
 async def _preflight_true_stub() -> bool:

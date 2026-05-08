@@ -16,7 +16,11 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from src.cancellation import safe_delete_cancellation_cause
+from src.cancellation import (
+    record_task_spec_hash,
+    reset_retry_count,
+    safe_delete_cancellation_cause,
+)
 from src.daemon import git_ops, scaffolder
 from src.daemon.git_ops import (
     _FETCH_MISSING_REF_NEEDLE,
@@ -237,6 +241,9 @@ return 0
 
         staging_dir = Path(manifest["staging_dir"]) if "staging_dir" in manifest else Path("/data/uploads") / self.name
         filenames: list[str] = manifest.get("files", [])
+        task_hashes = manifest.get("task_hashes", {})
+        if not isinstance(task_hashes, dict):
+            task_hashes = {}
         if not filenames or not staging_dir.is_dir():
             logger.warning("%s: upload manifest has no files or staging dir missing", self.name)
             await self.redis.delete(key)
@@ -299,6 +306,19 @@ return 0
                 lambda: git_ops._git(self.repo_path, "push", "origin", branch, timeout=60),
                 operation_name=f"git push origin {branch}",
             )
+            try:
+                for task_id, task_hash in task_hashes.items():
+                    await record_task_spec_hash(
+                        self.redis,
+                        self.name,
+                        str(task_id),
+                        str(task_hash),
+                    )
+                    await reset_retry_count(self.redis, self.name, str(task_id))
+            except Exception as exc:
+                logger.error("%s: upload metadata update failed: %s", self.name, exc)
+                self.log_event(f"[INFRA] Upload metadata update failed: {exc}.")
+                return None
             task_count = len(
                 {
                     name
