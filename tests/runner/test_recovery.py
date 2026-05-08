@@ -431,6 +431,107 @@ def test_select_next_task_from_dag_preserves_doing_for_crashed_task_with_visible
     assert "PR-001" not in runner._crashed_task_pr_ids
 
 
+def test_select_next_task_from_dag_status_write_fallback_beats_visible_pr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Explicitly escalated tasks stay parked when the ERROR commit failed."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Escalated task with visible PR\n\n"
+        "Branch: pr-001-escalated\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+    (tasks_dir / "PR-002.md").write_text(
+        "# PR-002: Healthy follow-up\n\n"
+        "Branch: pr-002-healthy\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = [
+        PRInfo(number=42, branch="pr-001-escalated", pr_id="PR-001"),
+    ]
+    runner._idle_merged_prs = []
+    runner._status_write_failed_task_pr_ids.add("PR-001")
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-002"
+    assert task.status == TaskStatus.TODO
+    assert runner._idle_dag_statuses == {
+        "PR-001": TaskStatus.ERROR,
+        "PR-002": TaskStatus.TODO,
+    }
+    assert runner._status_write_failed_task_pr_ids == {"PR-001"}
+
+
+def test_select_next_task_from_dag_clears_status_write_fallback_when_done(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Merged tasks are terminal and clear stale status-write fallbacks."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Merged escalated task\n\n"
+        "Branch: pr-001-done\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        idle_module,
+        "_resolve_merged_state",
+        lambda *args, **kwargs: _merged_state({"PR-001"}),
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+    runner._status_write_failed_task_pr_ids.add("PR-001")
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is None
+    assert runner._idle_dag_statuses == {"PR-001": TaskStatus.DONE}
+    assert runner._status_write_failed_task_pr_ids == set()
+
+
 def test_select_next_task_from_dag_uses_frontmatter_error_with_visible_pr(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

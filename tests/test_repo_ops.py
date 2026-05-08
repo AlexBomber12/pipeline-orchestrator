@@ -68,6 +68,7 @@ class _Runner(repo_ops.RepoOpsMixin):
         self.name = "demo"
         self.events: list[str] = []
         self._crashed_task_pr_ids: set[str] = set()
+        self._status_write_failed_task_pr_ids: set[str] = set()
         self.state = SimpleNamespace(current_queue=None)
 
     def log_event(self, message: str) -> None:
@@ -576,6 +577,29 @@ def test_process_pending_uploads_clears_crashed_pr_ids_on_reupload(
 
     assert _run(runner.process_pending_uploads()) is True
     assert runner._crashed_task_pr_ids == {"PR-999"}
+
+
+def test_process_pending_uploads_clears_status_write_fallback_on_reupload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Re-uploading a task clears the in-memory status-write fallback."""
+    runner = _Runner(tmp_path)
+    runner._status_write_failed_task_pr_ids.update({"PR-001", "PR-999"})
+    Path(runner.repo_path).mkdir(parents=True)
+    staging = tmp_path / "uploads" / "demo"
+    staging.mkdir(parents=True)
+    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
+    key = f"upload:{runner.name}:pending"
+    manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
+    runner.redis.store[key] = manifest
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
+    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
+    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
+
+    assert _run(runner.process_pending_uploads()) is True
+    assert runner._status_write_failed_task_pr_ids == {"PR-999"}
 
 
 def test_process_pending_uploads_clears_crashed_pr_ids_on_reupload(

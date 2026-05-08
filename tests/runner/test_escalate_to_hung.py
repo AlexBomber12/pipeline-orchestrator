@@ -124,6 +124,38 @@ def test_default_args_skip_to_idle_apply_label_no_comment(
     assert publish_calls == [None]
 
 
+def test_escalate_and_skip_sets_status_write_fallback_when_commit_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed task status write must still park the task until re-upload."""
+    _patch_label_calls(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=501, branch="pr-501")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-501",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-501",
+        task_file="tasks/PR-501.md",
+    )
+    _install_publish_state_spy(runner)
+
+    async def fake_commit(*args: Any, **kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", fake_commit)
+
+    asyncio.run(runner._escalate_and_skip("park after write failure"))
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner._status_write_failed_task_pr_ids == {"PR-501"}
+    assert any(
+        "using in-memory ERROR fallback for PR-501" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
 def test_target_state_error_transitions_to_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

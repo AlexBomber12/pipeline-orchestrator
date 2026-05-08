@@ -294,6 +294,10 @@ class PipelineRunner(
         # task is not re-picked into a crash loop. Cleared when the user
         # re-uploads the task file.
         self._crashed_task_pr_ids: set[str] = set()
+        # Tasks explicitly escalated/canceled where the best-effort
+        # task-file status commit failed. Unlike crashed tasks, these
+        # must stay parked even if their old PR remains visible.
+        self._status_write_failed_task_pr_ids: set[str] = set()
         self._user_pause_logged = False
         self._pending_repo_config: RepoConfig | None = None
         self._pending_app_config: AppConfig | None = None
@@ -1190,18 +1194,25 @@ class PipelineRunner(
                 ),
                 log=self.log_event,
             )
-            if current_task.task_file:
-                try:
-                    await self._commit_task_status_change(
-                        current_task,
-                        "ERROR",
-                        message,
-                    )
-                except Exception as exc:
-                    self.log_event(
-                        f"[ERROR] Failed to write status:ERROR to "
-                        f"{current_task.task_file}: {exc}"
-                    )
+            try:
+                status_written = await self._commit_task_status_change(
+                    current_task,
+                    "ERROR",
+                    message,
+                )
+            except Exception as exc:
+                self.log_event(
+                    f"[ERROR] Failed to write status:ERROR to "
+                    f"{current_task.task_file}: {exc}"
+                )
+                status_written = False
+            if not status_written:
+                self._status_write_failed_task_pr_ids.add(current_task.pr_id)
+                self.log_event(
+                    f"[INFRA] Warning: using in-memory ERROR fallback for "
+                    f"{current_task.pr_id}; task file re-upload is required "
+                    "to retry."
+                )
 
         if target_state == PipelineState.IDLE and current_task is not None:
             self.state.current_task = None
@@ -1222,12 +1233,12 @@ class PipelineRunner(
         current_task: Any,
         status: str,
         reason: str,
-    ) -> None:
+    ) -> bool:
         """Best-effort commit of daemon-written task frontmatter status."""
         task_file = getattr(current_task, "task_file", None)
         pr_id = getattr(current_task, "pr_id", "")
         if not task_file:
-            return
+            return False
 
         task_path = Path(task_file)
         if task_path.is_absolute() or ".." in task_path.parts:
@@ -1235,7 +1246,7 @@ class PipelineRunner(
                 f"[INFRA] Warning: refusing to commit unsafe task path "
                 f"{task_file!r}."
             )
-            return
+            return False
         repo_root = Path(self.repo_path).resolve()
         resolved_task_path = (repo_root / task_path).resolve()
         try:
@@ -1245,7 +1256,7 @@ class PipelineRunner(
                 f"[INFRA] Warning: refusing to commit task path outside repo "
                 f"{task_file!r}."
             )
-            return
+            return False
 
         short_reason = " ".join(reason.split())
         if len(short_reason) > 80:
@@ -1280,7 +1291,7 @@ class PipelineRunner(
                 self.log_event(
                     f"[MERGE] No task status change to commit for {task_file}."
                 )
-                return
+                return True
             git_ops._git(
                 self.repo_path,
                 "commit",
@@ -1289,11 +1300,13 @@ class PipelineRunner(
                 timeout=60,
             )
             git_ops._git(self.repo_path, "push", "origin", base, timeout=60)
+            return True
         except Exception as exc:
             self.log_event(
                 f"[INFRA] Warning: failed to commit {status} status for "
                 f"{task_file}: {exc}."
             )
+            return False
 
     def _track_current_coder_process(
         self, proc: asyncio.subprocess.Process
