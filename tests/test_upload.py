@@ -522,14 +522,20 @@ def test_reupload_changed_content_proceeds(
 
         assert (
             redis._store[task_spec_hash_key("example__alpha", "PR-001")]
-            == hashlib.sha256(changed).hexdigest()
+            == hashlib.sha256(original).hexdigest()
         )
-        assert redis._store[retry_count_key("example__alpha", "PR-001")] == "0"
+        assert redis._store[retry_count_key("example__alpha", "PR-001")] == "3"
 
     assert resp.status_code == 200
     assert "Accepted 1 task file (PR-001)." in resp.text
     staging = next((uploads_dir / "example__alpha").iterdir())
     assert (staging / "PR-001.md").read_bytes() == changed
+    manifest = json.loads(
+        client.app.state.redis._store["upload:example__alpha:pending"]
+    )
+    assert manifest["task_hashes"] == {
+        "PR-001": hashlib.sha256(changed).hexdigest()
+    }
 
 
 def test_upload_new_task_no_existing_hash_proceeds(
@@ -677,105 +683,11 @@ def test_upload_blocks_when_pending_manifest_write_fails(
     assert client.app.state.redis._store[retry_count_key("example__alpha", "PR-001")] == "3"
 
 
-def test_upload_blocks_when_metadata_write_fails_after_enqueue(
+def test_upload_preserves_existing_pending_manifest_task_hashes(
     one_repo_config: Path,
     repo_dir: Path,
     uploads_dir: Path,
 ) -> None:
-    class _MetadataSetFails(_StubAioredisClient):
-        async def set(self, key: str, value: str, **kwargs: object) -> None:
-            if key.startswith("task_spec_hash:"):
-                raise RuntimeError("redis down")
-            await super().set(key, value, **kwargs)
-
-        async def delete(self, key: str) -> int:
-            if key.startswith("metrics:retry_count:") or key == "upload:example__alpha:pending":
-                raise RuntimeError("redis down")
-            return await super().delete(key)
-
-    with TestClient(app) as client:
-        client.app.state.redis = _MetadataSetFails()
-        resp = client.post(
-            "/repos/example__alpha/upload-tasks",
-            files=[_task_file()],
-        )
-
-    assert resp.status_code == 503
-    assert "Failed to update upload metadata" in resp.text
-    assert "upload:example__alpha:pending" in client.app.state.redis._store
-    assert not list((uploads_dir / "example__alpha").iterdir())
-
-
-def test_upload_rolls_back_partial_metadata_writes(
-    one_repo_config: Path,
-    repo_dir: Path,
-    uploads_dir: Path,
-) -> None:
-    class _SecondHashSetFails(_StubAioredisClient):
-        def __init__(self) -> None:
-            super().__init__()
-            self.hash_writes = 0
-
-        async def set(self, key: str, value: str, **kwargs: object) -> None:
-            if key.startswith("task_spec_hash:"):
-                self.hash_writes += 1
-                if self.hash_writes == 2:
-                    raise RuntimeError("redis down")
-            await super().set(key, value, **kwargs)
-
-    old_one = _task_bytes("PR-001.md", pr_id="PR-001")
-    old_two = _task_bytes("PR-002.md", pr_id="PR-002")
-    new_one = old_one + b"\nChanged one.\n"
-    new_two = old_two + b"\nChanged two.\n"
-    old_hash_one = hashlib.sha256(old_one).hexdigest()
-    old_hash_two = hashlib.sha256(old_two).hexdigest()
-
-    with TestClient(app) as client:
-        client.app.state.redis = _SecondHashSetFails()
-        client.app.state.redis._store[
-            task_spec_hash_key("example__alpha", "PR-001")
-        ] = old_hash_one
-        client.app.state.redis._store[
-            task_spec_hash_key("example__alpha", "PR-002")
-        ] = old_hash_two
-        client.app.state.redis._store[retry_count_key("example__alpha", "PR-001")] = "3"
-        client.app.state.redis._store[retry_count_key("example__alpha", "PR-002")] = "4"
-
-        resp = client.post(
-            "/repos/example__alpha/upload-tasks",
-            files=[
-                ("files", ("PR-001.md", new_one, "text/markdown")),
-                ("files", ("PR-002.md", new_two, "text/markdown")),
-            ],
-        )
-
-    assert resp.status_code == 503
-    assert "Failed to update upload metadata" in resp.text
-    assert (
-        client.app.state.redis._store[task_spec_hash_key("example__alpha", "PR-001")]
-        == old_hash_one
-    )
-    assert (
-        client.app.state.redis._store[task_spec_hash_key("example__alpha", "PR-002")]
-        == old_hash_two
-    )
-    assert client.app.state.redis._store[retry_count_key("example__alpha", "PR-001")] == "3"
-    assert client.app.state.redis._store[retry_count_key("example__alpha", "PR-002")] == "4"
-    assert "upload:example__alpha:pending" not in client.app.state.redis._store
-    assert not list((uploads_dir / "example__alpha").iterdir())
-
-
-def test_upload_restores_existing_pending_manifest_when_metadata_write_fails(
-    one_repo_config: Path,
-    repo_dir: Path,
-    uploads_dir: Path,
-) -> None:
-    class _MetadataSetFails(_StubAioredisClient):
-        async def set(self, key: str, value: str, **kwargs: object) -> None:
-            if key.startswith("task_spec_hash:"):
-                raise RuntimeError("redis down")
-            await super().set(key, value, **kwargs)
-
     old_staging = uploads_dir / "example__alpha" / "old-submission"
     old_staging.mkdir(parents=True)
     (old_staging / "PR-000.md").write_text("# old\n", encoding="utf-8")
@@ -784,11 +696,11 @@ def test_upload_restores_existing_pending_manifest_when_metadata_write_fails(
             "repo": "example__alpha",
             "files": ["PR-000.md"],
             "staging_dir": str(old_staging),
+            "task_hashes": {"PR-000": "old-hash"},
         }
     )
 
     with TestClient(app) as client:
-        client.app.state.redis = _MetadataSetFails()
         client.app.state.redis._store["upload:example__alpha:pending"] = (
             existing_manifest
         )
@@ -797,16 +709,17 @@ def test_upload_restores_existing_pending_manifest_when_metadata_write_fails(
             files=[_task_file()],
         )
 
-    assert resp.status_code == 503
-    assert "Failed to update upload metadata" in resp.text
-    assert (
-        client.app.state.redis._store["upload:example__alpha:pending"]
-        == existing_manifest
-    )
+    assert resp.status_code == 200
+    manifest = json.loads(client.app.state.redis._store["upload:example__alpha:pending"])
+    assert manifest["task_hashes"] == {
+        "PR-000": "old-hash",
+        "PR-001": hashlib.sha256(_task_bytes()).hexdigest(),
+    }
     assert old_staging.is_dir()
-    assert sorted(path.name for path in (uploads_dir / "example__alpha").iterdir()) == [
-        "old-submission"
-    ]
+    assert {path.name for path in (uploads_dir / "example__alpha").iterdir()} == {
+        "old-submission",
+        manifest["staging_dir"].rsplit("/", 1)[-1],
+    }
 
 
 def test_upload_zip_with_pr_files_extracts_and_succeeds(
