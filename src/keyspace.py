@@ -50,6 +50,11 @@ def status_write_failed_tasks(repo_name: str) -> str:
     return f"status_write_failed_tasks:{repo_name}"
 
 
+def legacy_recovered_tasks(repo_name: str) -> str:
+    """Legacy PR IDs parked by pre-PR-281 recovery fallback state."""
+    return f"recovered_tasks:{repo_name}"
+
+
 def upload_pending_pattern() -> str:
     """Glob pattern matching all ``upload:*:pending`` keys."""
     return "upload:*:pending"

@@ -22,7 +22,7 @@ from src.daemon.git_ops import (
     _base_branch_ahead_of_origin,
     _working_tree_dirty,
 )
-from src.keyspace import upload_pending
+from src.keyspace import legacy_recovered_tasks, upload_pending
 from src.models import TaskStatus
 from src.retry import retry_transient
 
@@ -341,6 +341,10 @@ return 0
                 )
                 if persist_status_write_failed is not None:
                     await persist_status_write_failed()
+                try:
+                    await self.redis.delete(legacy_recovered_tasks(self.name))
+                except Exception:
+                    pass
             if uploaded_pr_ids:
                 self._clear_canceled_in_snapshot(uploaded_pr_ids)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:

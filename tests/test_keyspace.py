@@ -56,6 +56,14 @@ def test_status_write_failed_tasks_format() -> None:
     )
 
 
+def test_legacy_recovered_tasks_format() -> None:
+    assert keyspace.legacy_recovered_tasks("alpha") == "recovered_tasks:alpha"
+    assert (
+        keyspace.legacy_recovered_tasks("owner__repo")
+        == "recovered_tasks:owner__repo"
+    )
+
+
 def test_upload_pending_pattern_is_glob() -> None:
     assert keyspace.upload_pending_pattern() == "upload:*:pending"
 

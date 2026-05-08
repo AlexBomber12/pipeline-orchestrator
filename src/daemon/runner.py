@@ -91,6 +91,7 @@ from src.keyspace import (
     cli_log_latest,
     control_config_dirty,
     control_stop,
+    legacy_recovered_tasks,
     pipeline_state,
     status_write_failed_tasks,
     upload_pending,
@@ -1326,23 +1327,33 @@ class PipelineRunner(
 
     async def _hydrate_status_write_failed_task_pr_ids(self) -> None:
         """Load status-write fallback markers persisted by a prior process."""
+        decoded = await self._read_status_write_failed_task_ids(
+            status_write_failed_tasks(self.name)
+        )
+        legacy_decoded = await self._read_status_write_failed_task_ids(
+            legacy_recovered_tasks(self.name)
+        )
+        self._status_write_failed_task_pr_ids.update(decoded | legacy_decoded)
+
+    async def _read_status_write_failed_task_ids(self, key: str) -> set[str]:
+        """Return a persisted fallback marker set from one Redis key."""
         try:
-            raw = await self.redis.get(status_write_failed_tasks(self.name))
+            raw = await self.redis.get(key)
         except Exception:
-            return
+            return set()
         if not raw:
-            return
+            return set()
         try:
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8")
             decoded = json.loads(raw)
         except (TypeError, ValueError, json.JSONDecodeError):
-            return
+            return set()
         if not isinstance(decoded, list):
-            return
-        self._status_write_failed_task_pr_ids.update(
+            return set()
+        return {
             item for item in decoded if isinstance(item, str) and item
-        )
+        }
 
     async def _mark_status_write_failed_task(self, current_task: Any) -> None:
         """Keep an explicitly parked task skipped when status commit fails."""
