@@ -31,6 +31,7 @@ from src.cancellation.storage import (
     task_spec_content_hash,
     task_spec_hash_key,
 )
+from src.daemon import error_rate_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,22 @@ async def safe_record_cancellation_cause(
             log(msg)
         else:
             logger.warning(msg)
+        return
+
+    try:
+        tracker_created_at = datetime.fromisoformat(cause.created_at)
+        await error_rate_tracker.record(
+            redis_client, repo_slug, tracker_created_at, member_id=task_id
+        )
+    except Exception as exc:
+        msg = (
+            f"[ERROR] Failed to record ERROR-rate event "
+            f"({cause.category}): {exc} - continuing without tracker."
+        )
+        if log is not None:
+            log(msg)
+        else:
+            logger.warning(msg)
 
 
 async def safe_delete_cancellation_cause(
@@ -107,7 +124,6 @@ async def safe_delete_cancellation_cause(
             log(msg)
         else:
             logger.warning(msg)
-
 
 def classify_infra_exception(
     exc: BaseException, *, subsystem: str = "gh_api"

@@ -139,6 +139,59 @@ class _FakeRedis:
                 removed += 1
         return removed
 
+    async def zadd(self, key: str, mapping: dict[str, float]) -> int:
+        bucket = self.zsets.setdefault(key, {})
+        added = 0
+        for member, score in mapping.items():
+            if member not in bucket:
+                added += 1
+            bucket[member] = float(score)
+        return added
+
+    async def zcount(self, key: str, min_score: object, max_score: object) -> int:
+        def _bound(value: object) -> tuple[float, bool]:
+            if value == "-inf":
+                return float("-inf"), False
+            if value == "+inf":
+                return float("inf"), False
+            if isinstance(value, str) and value.startswith("("):
+                return float(value[1:]), True
+            return float(value), False
+
+        lower, lower_exclusive = _bound(min_score)
+        upper, upper_exclusive = _bound(max_score)
+        return sum(
+            1
+            for score in self.zsets.get(key, {}).values()
+            if (score > lower if lower_exclusive else score >= lower)
+            and (score < upper if upper_exclusive else score <= upper)
+        )
+
+    async def zremrangebyscore(
+        self, key: str, min_score: object, max_score: object
+    ) -> int:
+        def _bound(value: object) -> tuple[float, bool]:
+            if value == "-inf":
+                return float("-inf"), False
+            if value == "+inf":
+                return float("inf"), False
+            if isinstance(value, str) and value.startswith("("):
+                return float(value[1:]), True
+            return float(value), False
+
+        lower, lower_exclusive = _bound(min_score)
+        upper, upper_exclusive = _bound(max_score)
+        bucket = self.zsets.setdefault(key, {})
+        doomed = [
+            member
+            for member, score in bucket.items()
+            if (score > lower if lower_exclusive else score >= lower)
+            and (score < upper if upper_exclusive else score <= upper)
+        ]
+        for member in doomed:
+            del bucket[member]
+        return len(doomed)
+
     async def getdel(self, key: str) -> str | None:
         self.deleted.append(key)
         return self.store.pop(key, None)

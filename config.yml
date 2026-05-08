@@ -58,6 +58,13 @@ daemon:
   # GitHub Actions "queued/in_progress forever" failure mode where the
   # runner died and no terminal state ever arrives.
   ci_pending_max_min: 30
+  # PR-285: AVAILABLE mode auto-pauses the repo when recorded ERROR
+  # cancellations reach this count inside the configured window. AWAY
+  # mode keeps skip-and-record behavior without auto-pause so the
+  # operator can batch-triage on return.
+  error_rate_threshold: 5
+  error_rate_window_min: 60
+  error_rate_auto_pause_enabled: true
   # PR-255: Operator availability window for the Cancellation policy
   # SignalSource composition. Outside the window the ActiveHoursSource
   # reports AWAY so downstream consumers can defer speculative coder

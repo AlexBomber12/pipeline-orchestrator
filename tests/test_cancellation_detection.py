@@ -9,6 +9,7 @@ wiring contract from each detection point through to a recorded cause.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from typing import Any
 
 import pytest
@@ -24,6 +25,7 @@ from src.cancellation import (
     safe_record_cancellation_cause,
     truncate_for_payload,
 )
+from src.daemon import error_rate_tracker
 from src.daemon import runner as runner_module
 from src.daemon.handlers import coding as coding_module
 from src.daemon.handlers import error as error_module
@@ -97,6 +99,11 @@ class _FakeRedisWithPipeline:
             return 1
         return 0
 
+    async def zadd(self, key: str, mapping: dict[str, float]) -> int:
+        bucket = self.zsets.setdefault(key, {})
+        bucket.update(mapping)
+        return len(mapping)
+
     async def zrem(self, key: str, *members: str) -> int:
         bucket = self.zsets.setdefault(key, {})
         removed = 0
@@ -105,6 +112,10 @@ class _FakeRedisWithPipeline:
                 del bucket[member]
                 removed += 1
         return removed
+
+    async def zremrangebyscore(self, key: str, min_score: Any, max_score: Any) -> int:
+        self.zsets.setdefault(key, {})
+        return 0
 
 
 def _captured_safe_record(monkeypatch: pytest.MonkeyPatch) -> list[CancellationCause]:
@@ -377,6 +388,62 @@ def test_safe_record_succeeds_when_redis_pipeline_works() -> None:
     stored = redis.values["cancellation:alpha:PR-205"]
     assert "PR-205" in stored
     assert "CRASH" in stored
+    tracker = redis.zsets[error_rate_tracker.key("alpha")]
+    assert len(tracker) == 1
+    member = next(iter(tracker))
+    assert member.startswith("PR-205:")
+    assert tracker[member] == pytest.approx(
+        datetime.fromisoformat(
+            CancellationCause.from_redis(stored).created_at
+        ).timestamp()
+    )
+
+
+def test_safe_delete_preserves_error_rate_tracker_events() -> None:
+    redis = _FakeRedisWithPipeline()
+
+    asyncio.run(
+        safe_record_cancellation_cause(
+            redis,
+            "alpha",
+            "PR-207",
+            CancellationCause(category="CRASH", payload={"error_message": "boom"}),
+        )
+    )
+
+    asyncio.run(safe_delete_cancellation_cause(redis, "alpha", "PR-207"))
+
+    assert len(redis.zsets[error_rate_tracker.key("alpha")]) == 1
+
+
+def test_safe_record_logs_tracker_failure_via_module_logger(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Tracker failures are best-effort and use the module logger by default."""
+
+    async def boom(*_a: Any, **_k: Any) -> None:
+        raise RuntimeError("tracker down")
+
+    monkeypatch.setattr(error_rate_tracker, "record", boom)
+
+    with caplog.at_level("WARNING", logger="src.cancellation"):
+        asyncio.run(
+            safe_record_cancellation_cause(
+                _FakeRedisWithPipeline(),
+                "alpha",
+                "PR-206",
+                CancellationCause(
+                    category="CRASH",
+                    payload={"error_message": "boom"},
+                ),
+            )
+        )
+
+    assert any(
+        "Failed to record ERROR-rate event (CRASH)" in record.message
+        for record in caplog.records
+    )
 
 
 def test_coding_handler_imports_classifier_and_cause() -> None:
