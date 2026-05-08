@@ -180,6 +180,28 @@ async def _increment_retry_count(
     return await redis_client.transaction(_transaction, key, value_from_callable=True)
 
 
+async def _next_retry_count(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    task_id: str,
+    cap: int,
+) -> int:
+    key = _retry_count_key(repo_slug, task_id)
+
+    async def _transaction(pipe: Any) -> int:
+        current = _decode_retry_count(await pipe.get(key))
+        if current >= cap:
+            raise _RetryCapExceeded(current, cap)
+        return current + 1
+
+    return await redis_client.transaction(_transaction, key, value_from_callable=True)
+
+
+def _is_nothing_to_commit(exc: subprocess.CalledProcessError) -> bool:
+    output = "\n".join(str(part) for part in (exc.stdout, exc.stderr) if part)
+    return "nothing to commit" in output.lower()
+
+
 async def _task_view(
     task: QueueTask,
     repo_name: str,
@@ -589,7 +611,7 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
 
     cap = cfg.daemon.retry_button_cap
     try:
-        next_count = await _increment_retry_count(redis_client, name, pr_id, cap)
+        next_count = await _next_retry_count(redis_client, name, pr_id, cap)
     except _RetryCapExceeded:
         return HTMLResponse(
             "Retry cap reached. Edit task spec or delete to proceed.",
@@ -622,21 +644,25 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
             capture_output=True,
             text=True,
         )
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(repo_root),
-                "commit",
-                "-m",
-                commit_subject,
-                "-m",
-                "[skip ci]",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo_root),
+                    "commit",
+                    "-m",
+                    commit_subject,
+                    "-m",
+                    "[skip ci]",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            if not _is_nothing_to_commit(exc):
+                raise
         subprocess.run(
             ["git", "-C", str(repo_root), "push", "origin", "HEAD:main"],
             check=True,
@@ -645,6 +671,16 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
         )
     except subprocess.CalledProcessError:
         return HTMLResponse("Failed to commit retry change", status_code=503)
+
+    try:
+        await _increment_retry_count(redis_client, name, pr_id, cap)
+    except _RetryCapExceeded:
+        return HTMLResponse(
+            "Retry cap reached. Edit task spec or delete to proceed.",
+            status_code=409,
+        )
+    except Exception:
+        return HTMLResponse("Failed to update retry counter", status_code=503)
 
     tasks, _snapshot_at = await _load_current_queue_snapshot(name)
     if tasks is None:
