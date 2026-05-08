@@ -371,6 +371,7 @@ def test_partial_endpoint_renders_legacy_records_without_payload_fields(
         _make_cause("PR-LEGACY-TO", category="TIMEOUT", payload={}),
         _make_cause("PR-LEGACY-INF", category="INFRA", payload={}),
         _make_cause("PR-LEGACY-NPD", category="NO_PUSH_DEADLOCK", payload={}),
+        _make_cause("PR-LEGACY-OP", category="OPERATOR_RECOVERY", payload={}),
     ]
 
     resp = client.get("/partials/repo/example__repo/cancellations")
@@ -379,6 +380,7 @@ def test_partial_endpoint_renders_legacy_records_without_payload_fields(
     body = resp.text
     assert "PR-LEGACY-CRASH" in body
     assert "PR-LEGACY-ESC" in body
+    assert "Manual recovery via dashboard" in body
     # NO_PUSH_DEADLOCK falls back to the no-attempts message.
     assert "no push across consecutive cycles" in body
 

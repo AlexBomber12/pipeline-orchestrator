@@ -60,6 +60,8 @@
             {% else %}
             <div>FIX iteration produced no push across consecutive cycles</div>
             {% endif %}
+        {% elif cause.category == 'OPERATOR_RECOVERY' %}
+            <div>Manual recovery via dashboard</div>
         {% endif %}
     </div>
 </article>
