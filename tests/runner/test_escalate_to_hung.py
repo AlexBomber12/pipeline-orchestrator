@@ -773,6 +773,49 @@ def test_commit_task_status_change_rejects_unsafe_task_path() -> None:
     )
 
 
+def test_commit_task_status_change_rejects_symlink_escape(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "PR-706.md").write_text(
+        "---\nstatus: TODO\n---\n\nBody\n",
+        encoding="utf-8",
+    )
+    (repo / "tasks").symlink_to(outside, target_is_directory=True)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> h._FakeCompletedProcess:
+        calls.append(args)
+        return h._FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr("src.daemon.git_ops._git", fake_git)
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+    task = QueueTask(
+        pr_id="PR-706",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-test",
+        task_file="tasks/PR-706.md",
+    )
+
+    asyncio.run(runner._commit_task_status_change(task, "ERROR", "bad path"))
+
+    assert calls == []
+    assert (outside / "PR-706.md").read_text(encoding="utf-8").startswith(
+        "---\nstatus: TODO\n---\n"
+    )
+    assert any(
+        "refusing to commit task path outside repo 'tasks/PR-706.md'"
+        in event["event"]
+        for event in runner.state.history
+    )
+
+
 def test_commit_task_status_change_truncates_long_reason(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

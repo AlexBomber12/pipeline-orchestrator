@@ -1245,6 +1245,16 @@ class PipelineRunner(
                 f"{task_file!r}."
             )
             return
+        repo_root = Path(self.repo_path).resolve()
+        resolved_task_path = (repo_root / task_path).resolve()
+        try:
+            resolved_task_path.relative_to(repo_root)
+        except ValueError:
+            self.log_event(
+                f"[INFRA] Warning: refusing to commit task path outside repo "
+                f"{task_file!r}."
+            )
+            return
 
         short_reason = " ".join(reason.split())
         if len(short_reason) > 80:
