@@ -60,7 +60,9 @@ _ACTIVE_RUN_STATES = {
     PipelineState.MERGE,
     PipelineState.PAUSED,
 }
-_RETRY_BUSY_STATES = _ACTIVE_RUN_STATES - {PipelineState.PAUSED}
+_RETRY_BUSY_STATES = (_ACTIVE_RUN_STATES - {PipelineState.PAUSED}) | {
+    PipelineState.ERROR
+}
 _CODER_LABELS = {
     "any": "Any (bandit picks per-PR)",
     "claude": "Claude CLI",
@@ -540,6 +542,15 @@ def _commit_and_push_retry_reset(
         push_result
     ).lower():
         raise _TaskNotRetryable
+
+
+def _reset_retry_worktree(repo_root: Path, base_branch: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo_root), "reset", "--hard", f"origin/{base_branch}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 async def _task_view(
@@ -1050,7 +1061,16 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
                 await _release_retry_reservation(redis_client, name, pr_id)
             return HTMLResponse("Task is not in ERROR", status_code=409)
         except subprocess.CalledProcessError:
-            if rewrote_status:
+            reset_failed = False
+            try:
+                await asyncio.to_thread(
+                    _reset_retry_worktree,
+                    repo_root,
+                    repo_config.branch,
+                )
+            except subprocess.CalledProcessError:
+                reset_failed = True
+            if rewrote_status and reset_failed:
                 _restore_retry_error_status(task_path)
             if retry_reserved:
                 await _release_retry_reservation(redis_client, name, pr_id)

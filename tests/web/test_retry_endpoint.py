@@ -918,12 +918,6 @@ def test_retry_push_failure_can_retry_existing_local_commit(
             )
         if args[3] == "commit":
             commit_attempts += 1
-            if commit_attempts == 2:
-                raise subprocess.CalledProcessError(
-                    1,
-                    args,
-                    output="On branch main\nnothing to commit, working tree clean\n",
-                )
         if args[3] == "push":
             push_attempts += 1
             if push_attempts == 1:
@@ -941,6 +935,7 @@ def test_retry_push_failure_can_retry_existing_local_commit(
     assert redis_client.store["metrics:retry_count:example__alpha:PR-283"] == "1"
     assert push_attempts == 2
     assert commit_attempts == 2
+    assert ["git", "-C", str(repo_dir), "reset", "--hard", "origin/main"] in git_calls
     assert ["git", "-C", str(repo_dir), "push", "origin", "HEAD:main"] in git_calls
 
 
@@ -994,6 +989,31 @@ def test_retry_rejects_while_repo_active_before_git(
     assert response.status_code == 409
     assert "Repository is busy" in response.text
     assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
+    assert git_called is False
+
+
+def test_retry_rejects_while_repo_error_before_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _RetryRedis({"pipeline:example__alpha": _state_snapshot(PipelineState.ERROR)})
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    git_called = False
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal git_called
+        git_called = True
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+
+    assert response.status_code == 409
+    assert "Repository is busy" in response.text
     assert git_called is False
 
 
@@ -1188,6 +1208,11 @@ def test_retry_releases_counter_when_error_status_restore_fails(
         "_commit_and_push_retry_reset",
         fake_commit_and_push,
     )
+
+    def fail_reset(repo_root: Path, base_branch: str) -> None:
+        raise subprocess.CalledProcessError(1, ["git", "reset"])
+
+    monkeypatch.setattr(repo_control, "_reset_retry_worktree", fail_reset)
     monkeypatch.setattr(
         repo_control,
         "write_frontmatter_status",
