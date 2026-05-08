@@ -31,11 +31,22 @@ async def record(
     redis_client: Any,
     repo_slug: str,
     ts: datetime | float | int | None = None,
+    *,
+    member_id: str | None = None,
 ) -> None:
     """Record one task cancellation/error event for ``repo_slug``."""
     score = _timestamp(ts)
-    member = f"{score:.6f}:{uuid.uuid4().hex}"
+    member = (
+        member_id
+        if member_id is not None
+        else f"{score:.6f}:{uuid.uuid4().hex}"
+    )
     await redis_client.zadd(key(repo_slug), {member: score})
+
+
+async def discard(redis_client: Any, repo_slug: str, member_id: str) -> int:
+    """Remove a previously-recorded ERROR-rate event by member id."""
+    return int(await redis_client.zrem(key(repo_slug), member_id))
 
 
 async def prune(

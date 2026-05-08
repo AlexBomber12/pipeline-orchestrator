@@ -85,7 +85,7 @@ async def safe_record_cancellation_cause(
     try:
         tracker_created_at = datetime.fromisoformat(cause.created_at)
         await error_rate_tracker.record(
-            redis_client, repo_slug, tracker_created_at
+            redis_client, repo_slug, tracker_created_at, member_id=task_id
         )
     except Exception as exc:
         msg = (
@@ -119,6 +119,17 @@ async def safe_delete_cancellation_cause(
         msg = (
             f"[ERROR] Failed to clear cancellation cause for {task_id}: "
             f"{exc} - continuing without cleanup."
+        )
+        if log is not None:
+            log(msg)
+        else:
+            logger.warning(msg)
+    try:
+        await error_rate_tracker.discard(redis_client, repo_slug, task_id)
+    except Exception as exc:
+        msg = (
+            f"[ERROR] Failed to clear ERROR-rate event for {task_id}: "
+            f"{exc} - continuing without tracker cleanup."
         )
         if log is not None:
             log(msg)

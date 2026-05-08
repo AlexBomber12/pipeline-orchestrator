@@ -94,6 +94,19 @@ async def test_record_accepts_default_and_naive_timestamps() -> None:
 
 
 @pytest.mark.asyncio
+async def test_record_with_member_id_can_be_discarded() -> None:
+    redis = _FakeRedis()
+    now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
+
+    await error_rate_tracker.record(
+        redis, "octo__demo", now, member_id="PR-123"
+    )
+
+    assert await error_rate_tracker.discard(redis, "octo__demo", "PR-123") == 1
+    assert redis.zsets[error_rate_tracker.key("octo__demo")] == {}
+
+
+@pytest.mark.asyncio
 async def test_last_auto_pause_marker_requires_newer_records() -> None:
     redis = _FakeRedis()
     now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
