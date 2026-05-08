@@ -346,6 +346,11 @@ def test_retry_frontmatter_write_failure_returns_503(
         "write_frontmatter_status",
         lambda task_path, status: (_ for _ in ()).throw(OSError("boom")),
     )
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+    )
 
     with TestClient(app) as client:
         response = client.post("/repos/example__alpha/tasks/PR-283/retry")
@@ -375,6 +380,27 @@ def test_retry_rejects_resolved_task_outside_repo(
     assert response.status_code == 404
     assert "Task file not found" in response.text
     assert "metrics:retry_count:example__alpha:PR-283" not in app.state.redis.store
+
+
+def test_retry_returns_404_when_task_disappears_after_base_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_dir = _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _RetryRedis()
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    def fake_checkout(repo_root: Path, base_branch: str) -> None:
+        (repo_dir / "tasks" / "PR-283.md").unlink()
+
+    monkeypatch.setattr(repo_control, "_checkout_retry_base", fake_checkout)
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+
+    assert response.status_code == 404
+    assert "Task file not found" in response.text
+    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
 
 
 def test_retry_git_failure_returns_503(
@@ -480,11 +506,12 @@ def test_retry_rejects_task_not_in_error(
     redis_client = _RetryRedis()
     monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
 
-    git_called = False
+    publish_called = False
 
     def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        nonlocal git_called
-        git_called = True
+        nonlocal publish_called
+        if args[3] in {"add", "commit", "push"}:
+            publish_called = True
         return subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
@@ -495,7 +522,7 @@ def test_retry_rejects_task_not_in_error(
     assert response.status_code == 409
     assert "Task is not in ERROR" in response.text
     assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
-    assert git_called is False
+    assert publish_called is False
 
 
 def test_retry_not_retryable_after_status_rewrite_restores_error(
@@ -513,6 +540,11 @@ def test_retry_not_retryable_after_status_rewrite_restores_error(
         repo_control,
         "_commit_and_push_retry_reset",
         fake_commit_and_push,
+    )
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
     )
 
     with TestClient(app) as client:
@@ -616,6 +648,11 @@ def test_retry_git_commands_run_in_thread(
     assert response.status_code == 200
     assert to_thread_calls == [
         (
+            repo_control._checkout_retry_base,
+            (repo_dir, "main"),
+            {},
+        ),
+        (
             repo_control._commit_and_push_retry_reset,
             (
                 repo_dir,
@@ -658,6 +695,16 @@ def test_retry_pushes_configured_base_branch_and_commits_only_task_path(
         "[skip ci]",
         "--",
         "tasks/PR-283.md",
+    ] in git_calls
+    assert ["git", "-C", str(repo_dir), "fetch", "origin", "develop"] in git_calls
+    assert ["git", "-C", str(repo_dir), "checkout", "develop"] in git_calls
+    assert [
+        "git",
+        "-C",
+        str(repo_dir),
+        "reset",
+        "--hard",
+        "origin/develop",
     ] in git_calls
     assert ["git", "-C", str(repo_dir), "push", "origin", "HEAD:develop"] in git_calls
 

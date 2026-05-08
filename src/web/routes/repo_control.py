@@ -244,6 +244,27 @@ def _head_commit_subject(repo_root: Path) -> str:
     return result.stdout.strip()
 
 
+def _checkout_retry_base(repo_root: Path, base_branch: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo_root), "fetch", "origin", base_branch],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo_root), "checkout", base_branch],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo_root), "reset", "--hard", f"origin/{base_branch}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def _commit_and_push_retry_reset(
     repo_root: Path,
     relative_task: Path,
@@ -718,6 +739,13 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
         )
     except Exception:
         return HTMLResponse("Failed to update retry counter", status_code=503)
+
+    try:
+        await asyncio.to_thread(_checkout_retry_base, repo_root, repo_config.branch)
+    except subprocess.CalledProcessError:
+        return HTMLResponse("Failed to commit retry change", status_code=503)
+    if not task_path.is_file():
+        return HTMLResponse("Task file not found", status_code=404)
 
     current_status = _read_task_frontmatter_status(task_path)
     if current_status not in {TaskStatus.ERROR, TaskStatus.TODO}:
