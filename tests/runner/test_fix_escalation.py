@@ -121,8 +121,9 @@ def test_escalate_fix_no_push_deadlock_transitions_to_idle_and_clears_task(
 
     async def fake_commit_status(
         current_task: QueueTask, status: str, reason: str
-    ) -> None:
+    ) -> bool:
         status_writes.append((current_task, status, reason))
+        return True
 
     runner._commit_task_status_change = fake_commit_status  # type: ignore[method-assign]
 
@@ -140,6 +141,39 @@ def test_escalate_fix_no_push_deadlock_transitions_to_idle_and_clears_task(
         entry["event"]
         for entry in runner.state.history
     )
+
+
+def test_escalate_fix_no_push_deadlock_sets_fallback_when_status_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No-push cancellation stays parked when status:ERROR cannot be committed."""
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda cmd, **kw: "")
+
+    async def noop_record(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "src.cancellation.record_cancellation_cause", noop_record
+    )
+
+    runner = h._make_runner()
+    pr = PRInfo(number=504, branch="pr-504", no_push_fix_count=3)
+    runner.state.state = PipelineState.FIX
+    runner.state.current_pr = pr
+    task = _make_pr_task("PR-504", "pr-504")
+    task.task_file = "tasks/PR-504.md"
+    runner.state.current_task = task
+
+    async def fail_commit_status(*args: Any, **kwargs: Any) -> bool:
+        return False
+
+    runner._commit_task_status_change = fail_commit_status  # type: ignore[method-assign]
+
+    asyncio.run(fix_escalation.escalate_fix_no_push_deadlock(runner, pr))
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner._status_write_failed_task_pr_ids == {"PR-504"}
 
 
 def test_escalate_fix_no_push_deadlock_storage_failure_does_not_block_idle(

@@ -2290,6 +2290,36 @@ def test_handle_external_terminal_pr_state_closed_skips_to_idle(
     )
 
 
+def test_handle_external_terminal_pr_state_closed_sets_status_write_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Externally closed FIX tasks stay skipped when status write fails."""
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-056",
+        title="external close",
+        status=TaskStatus.DOING,
+        branch="pr-056",
+        task_file="tasks/PR-056.md",
+    )
+    runner.state.current_pr = PRInfo(number=56, branch="pr-056")
+
+    async def fail_commit_status(*args: object, **kwargs: object) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        runner,
+        "_commit_task_status_change",
+        fail_commit_status,
+    )
+
+    asyncio.run(runner._handle_external_terminal_pr_state("CLOSED"))
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner._status_write_failed_task_pr_ids == {"PR-056"}
+
+
 def test_handle_coding_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:
     """handle_coding must call run_auto_pr_async, not the sync version."""
     h._patch_subprocess(monkeypatch)

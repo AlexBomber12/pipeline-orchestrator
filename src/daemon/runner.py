@@ -1207,12 +1207,7 @@ class PipelineRunner(
                 )
                 status_written = False
             if not status_written:
-                self._status_write_failed_task_pr_ids.add(current_task.pr_id)
-                self.log_event(
-                    f"[INFRA] Warning: using in-memory ERROR fallback for "
-                    f"{current_task.pr_id}; task file re-upload is required "
-                    "to retry."
-                )
+                self._mark_status_write_failed_task(current_task)
 
         if target_state == PipelineState.IDLE and current_task is not None:
             self.state.current_task = None
@@ -1307,6 +1302,17 @@ class PipelineRunner(
                 f"{task_file}: {exc}."
             )
             return False
+
+    def _mark_status_write_failed_task(self, current_task: Any) -> None:
+        """Keep an explicitly parked task skipped when status commit fails."""
+        pr_id = getattr(current_task, "pr_id", "")
+        if not pr_id:
+            return
+        self._status_write_failed_task_pr_ids.add(pr_id)
+        self.log_event(
+            f"[INFRA] Warning: using in-memory ERROR fallback for "
+            f"{pr_id}; task file re-upload is required to retry."
+        )
 
     def _track_current_coder_process(
         self, proc: asyncio.subprocess.Process

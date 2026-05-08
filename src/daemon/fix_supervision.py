@@ -230,18 +230,20 @@ async def handle_external_terminal_pr_state(
             ),
             log=runner.log_event,
         )
-        if current_task.task_file:
-            try:
-                await runner._commit_task_status_change(
-                    current_task,
-                    "ERROR",
-                    "PR closed externally during FIX",
-                )
-            except Exception as exc:  # pragma: no cover - defensive status-write logging.
-                runner.log_event(
-                    f"[ERROR] Failed to write status:ERROR to "
-                    f"{current_task.task_file}: {exc}"
-                )
+        try:
+            status_written = await runner._commit_task_status_change(
+                current_task,
+                "ERROR",
+                "PR closed externally during FIX",
+            )
+        except Exception as exc:  # pragma: no cover - defensive status-write logging.
+            runner.log_event(
+                f"[ERROR] Failed to write status:ERROR to "
+                f"{current_task.task_file}: {exc}"
+            )
+            status_written = False
+        if not status_written:
+            runner._mark_status_write_failed_task(current_task)
     runner.state.error_message = None
     runner.state.current_task = None
     runner._reset_runner_local_task_counters()

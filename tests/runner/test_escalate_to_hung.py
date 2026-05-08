@@ -156,6 +156,15 @@ def test_escalate_and_skip_sets_status_write_fallback_when_commit_fails(
     )
 
 
+def test_mark_status_write_failed_task_ignores_missing_pr_id() -> None:
+    runner = h._make_runner()
+
+    runner._mark_status_write_failed_task(object())
+
+    assert runner._status_write_failed_task_pr_ids == set()
+    assert runner.state.history == []
+
+
 def test_target_state_error_transitions_to_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
