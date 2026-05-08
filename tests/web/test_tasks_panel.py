@@ -41,6 +41,8 @@ def _setup_panel(
     retry_count: int,
     stored_fingerprint: str | None = None,
     task_body: str = "Body",
+    task_status: TaskStatus = TaskStatus.ERROR,
+    unresolved_deps: list[str] | None = None,
 ) -> None:
     cfg = tmp_path / "config.yml"
     cfg.write_text(
@@ -65,8 +67,9 @@ def _setup_panel(
             QueueTask(
                 pr_id="PR-283",
                 title="Retry me",
-                status=TaskStatus.ERROR,
+                status=task_status,
                 branch="pr-283",
+                unresolved_deps=list(unresolved_deps or []),
             )
         ],
     )
@@ -150,3 +153,42 @@ def test_renders_raw_retry_count_when_fingerprint_read_fails(
 
     assert response.status_code == 200
     assert "Retry count 2/3" in response.text
+
+
+def test_renders_unresolved_deps_red_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_panel(
+        tmp_path,
+        monkeypatch,
+        retry_count=0,
+        task_status=TaskStatus.TODO,
+        unresolved_deps=["PR-275a", "PR-275b"],
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "Blocked by: PR-275a, PR-275b" in body
+    assert "border-fail/40 bg-fail/10" in body
+
+
+def test_normal_todo_no_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_panel(
+        tmp_path,
+        monkeypatch,
+        retry_count=0,
+        task_status=TaskStatus.TODO,
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks")
+
+    assert response.status_code == 200
+    assert "Blocked by:" not in response.text
