@@ -39,6 +39,7 @@ from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
 from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
 from src.daemon.config_watcher import watch_config_file_changes
+from src.daemon.migrations.hung_to_idle import migrate_hung_to_idle_on_startup
 from src.daemon.runner import PipelineRunner
 from src.events.wake import repo_from_channel, subscribe_wake
 from src.models import PipelineState
@@ -684,6 +685,11 @@ async def main() -> None:
 
     redis_url = os.environ.get("REDIS_URL", DEFAULT_REDIS_URL)
     redis_client = aioredis.from_url(redis_url, decode_responses=True)
+    migrated_hung_repos = await migrate_hung_to_idle_on_startup(redis_client, logger)
+    logger.info(
+        "[MIGRATION] HUNG to IDLE startup migration rewrote %d repo(s)",
+        migrated_hung_repos,
+    )
 
     logger.info(
         "Daemon starting with %d repositories", len(config.repositories)

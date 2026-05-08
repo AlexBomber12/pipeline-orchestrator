@@ -39,6 +39,13 @@ def _disable_config_watcher(monkeypatch: pytest.MonkeyPatch) -> None:
 class _FakeRedisClient:
     """Placeholder returned by the patched ``aioredis.from_url``."""
 
+    async def scan_iter(self, match: str):
+        if False:
+            yield match
+
+    async def get(self, key: str) -> str | None:
+        return None
+
 
 class _FakeRunner:
     """Captures constructor args and ``run_cycle`` calls for assertions."""
@@ -95,6 +102,7 @@ def _patch_main(
     config: AppConfig,
     runner_cls: type = _FakeRunner,
     sleep_iterations: int = 1,
+    migration: Any | None = None,
 ) -> dict[str, Any]:
     """Wire up the common monkeypatches used by every test."""
     _reset_fake_runner()
@@ -109,6 +117,11 @@ def _patch_main(
     monkeypatch.setattr(
         main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
     )
+    if migration is None:
+        async def migration(*_args: Any, **_kwargs: Any) -> int:
+            return 0
+
+    monkeypatch.setattr(main_module, "migrate_hung_to_idle_on_startup", migration)
 
     clock = [0.0]
 
@@ -160,6 +173,37 @@ def test_main_creates_one_runner_per_repo(
     assert names == ["octo__alpha", "octo__beta"]
     assert all(r.cycles == 1 for r in _FakeRunner.instances)
     assert ctx["sleep_calls"] == [1]
+
+
+def test_main_calls_migration_before_run_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class _TrackingRunner(_FakeRunner):
+        async def run_cycle(self) -> None:
+            calls.append(f"run_cycle:{self.name}")
+            await super().run_cycle()
+
+    async def migration(*_args: Any, **_kwargs: Any) -> int:
+        calls.append("migration")
+        return 1
+
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    _patch_main(
+        monkeypatch,
+        config,
+        runner_cls=_TrackingRunner,
+        migration=migration,
+    )
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    assert calls == ["migration", "run_cycle:octo__alpha"]
 
 
 def test_main_warns_when_no_repos_configured(
