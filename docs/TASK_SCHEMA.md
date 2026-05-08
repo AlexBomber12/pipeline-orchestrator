@@ -43,6 +43,15 @@ For one release cycle, the parser still accepts the legacy tokens
 `queued`, `in_progress`, `in_review`, `merged`, `blocked`, and
 `canceled`. These values are deprecated and will be removed by PR-280.
 
+## Cancellation Availability
+
+The current daemon policy always skip-and-records individual terminal
+failures. Operator availability only controls repo-level attention:
+AVAILABLE mode auto-pauses when the ERROR-rate threshold is reached, and
+AWAY mode never auto-pauses for rate alone. The authoritative policy
+notes live in `docs/roadmap.md` under "Sprint 15b Phase 1 finalized
+decisions (2026-05-07)" and the historical "Cancellation policy" section.
+
 ## Type field
 
 Canonical values:

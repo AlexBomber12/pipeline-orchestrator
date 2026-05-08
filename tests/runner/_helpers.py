@@ -139,6 +139,53 @@ class _FakeRedis:
                 removed += 1
         return removed
 
+    async def zadd(self, key: str, mapping: dict[str, float]) -> int:
+        bucket = self.zsets.setdefault(key, {})
+        added = 0
+        for member, score in mapping.items():
+            if member not in bucket:
+                added += 1
+            bucket[member] = float(score)
+        return added
+
+    async def zcount(self, key: str, min_score: object, max_score: object) -> int:
+        def _bound(value: object) -> float:
+            if value == "-inf":
+                return float("-inf")
+            if value == "+inf":
+                return float("inf")
+            return float(value)
+
+        lower = _bound(min_score)
+        upper = _bound(max_score)
+        return sum(
+            1
+            for score in self.zsets.get(key, {}).values()
+            if lower <= score <= upper
+        )
+
+    async def zremrangebyscore(
+        self, key: str, min_score: object, max_score: object
+    ) -> int:
+        def _bound(value: object) -> float:
+            if value == "-inf":
+                return float("-inf")
+            if value == "+inf":
+                return float("inf")
+            if isinstance(value, str) and value.startswith("("):
+                return float(value[1:])
+            return float(value)
+
+        lower = _bound(min_score)
+        upper = _bound(max_score)
+        bucket = self.zsets.setdefault(key, {})
+        doomed = [
+            member for member, score in bucket.items() if lower <= score <= upper
+        ]
+        for member in doomed:
+            del bucket[member]
+        return len(doomed)
+
     async def getdel(self, key: str) -> str | None:
         self.deleted.append(key)
         return self.store.pop(key, None)

@@ -40,10 +40,18 @@ from src.cancellation import (
     safe_record_cancellation_cause,
     truncate_for_payload,
 )
+from src.cancellation.availability import (
+    ActiveHoursSource,
+    AvailabilityState,
+    HeartbeatSource,
+    ManualOverrideSource,
+    is_operator_available,
+)
 from src.coder_registry import CoderPlugin, CoderRegistry
 from src.coders import build_coder_registry
 from src.config import AppConfig, CoderType, RepoConfig, load_config
 from src.daemon import (
+    error_rate_tracker,
     git_ops,
     scaffolder,  # noqa: F401 — tests reference runner_module.scaffolder
 )
@@ -432,6 +440,68 @@ class PipelineRunner(
         """Swap in the shared daemon-level usage providers."""
         self._claude_usage_provider = claude_usage_provider
         self._codex_usage_provider = codex_usage_provider
+
+    def _availability_sources(self) -> list[Any]:
+        cfg = self.app_config.daemon
+        return [
+            ManualOverrideSource(redis_client=self.redis),
+            HeartbeatSource(redis_client=self.redis),
+            ActiveHoursSource(
+                start_hour=cfg.operator_active_hours_start,
+                end_hour=cfg.operator_active_hours_end,
+                timezone_name=cfg.operator_timezone,
+            ),
+        ]
+
+    async def _auto_pause_repo(self, reason: str) -> None:
+        """Pause the repo until an operator explicitly resumes it."""
+        self.state.state = PipelineState.PAUSED
+        self.state.user_paused = True
+        self.state.error_message = None
+        self.log_event(
+            f"[AUTO-PAUSE] ERROR rate exceeded threshold; manual Resume "
+            f"required ({reason})."
+        )
+        await self.redis.set(pipeline_state(self.name), self.state.model_dump_json())
+        await self.publish_state()
+
+    async def _maybe_auto_pause_for_error_rate(self) -> bool:
+        """Return True when AVAILABLE-mode ERROR rate pauses this repo.
+
+        AWAY mode intentionally absorbs individual skip-and-record
+        failures without repo-level attention; AVAILABLE mode converts a
+        sustained ERROR burst into the same PAUSED state as a manual
+        operator pause so Resume remains the only way forward.
+        """
+        cfg = self.app_config.daemon
+        if not cfg.error_rate_auto_pause_enabled:
+            return False
+        try:
+            availability = await is_operator_available(self._availability_sources())
+        except Exception:
+            availability = AvailabilityState.AVAILABLE
+        if availability is not AvailabilityState.AVAILABLE:
+            return False
+        try:
+            count = await error_rate_tracker.count_recent(
+                self.redis,
+                self.name,
+                cfg.error_rate_window_min,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to read ERROR-rate tracker for %s: %s",
+                self.name,
+                exc,
+            )
+            return False
+        if count < cfg.error_rate_threshold:
+            return False
+        await self._auto_pause_repo(
+            f"{count}/{cfg.error_rate_threshold} in "
+            f"{cfg.error_rate_window_min}min"
+        )
+        return True
 
     def stage_config_reload(
         self,
@@ -2011,6 +2081,8 @@ class PipelineRunner(
                 await self.publish_state()
                 return
             self._user_pause_logged = False
+            if await self._maybe_auto_pause_for_error_rate():
+                return
 
         current = self.state.state
         if current == PipelineState.IDLE:
