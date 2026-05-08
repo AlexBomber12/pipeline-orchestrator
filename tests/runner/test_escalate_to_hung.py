@@ -219,6 +219,25 @@ def test_hydrate_status_write_failed_task_ids_handles_stored_shapes(
         assert runner._status_write_failed_task_pr_ids == set()
 
 
+def test_clear_status_write_failed_task_ids_logs_legacy_delete_failure() -> None:
+    runner = h._make_runner()
+    runner._status_write_failed_task_pr_ids.add("PR-001")
+
+    async def fail_delete(key: str) -> int:
+        raise RuntimeError("redis down")
+
+    runner.redis.delete = fail_delete  # type: ignore[method-assign]
+
+    asyncio.run(runner._clear_status_write_failed_task_ids({"PR-001"}))
+
+    assert runner._status_write_failed_task_pr_ids == set()
+    assert any(
+        "failed to clear legacy status-write fallback markers: redis down"
+        in entry["event"]
+        for entry in runner.state.history
+    )
+
+
 def test_target_state_error_transitions_to_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1335,6 +1335,22 @@ class PipelineRunner(
         )
         self._status_write_failed_task_pr_ids.update(decoded | legacy_decoded)
 
+    async def _clear_status_write_failed_task_ids(
+        self,
+        uploaded_pr_ids: set[str],
+    ) -> None:
+        """Clear fallback markers for task files the operator re-uploaded."""
+        await self._hydrate_status_write_failed_task_pr_ids()
+        self._status_write_failed_task_pr_ids.difference_update(uploaded_pr_ids)
+        await self._persist_status_write_failed_task_pr_ids()
+        try:
+            await self.redis.delete(legacy_recovered_tasks(self.name))
+        except Exception as exc:
+            self.log_event(
+                f"[INFRA] Warning: failed to clear legacy status-write "
+                f"fallback markers: {exc}."
+            )
+
     async def _read_status_write_failed_task_ids(self, key: str) -> set[str]:
         """Return a persisted fallback marker set from one Redis key."""
         try:
