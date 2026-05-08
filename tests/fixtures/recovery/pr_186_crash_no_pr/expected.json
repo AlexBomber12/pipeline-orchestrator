@@ -7,7 +7,7 @@
     {
       "pr_id": "PR-186",
       "title": "Crash before PR",
-      "status": "CANCELED",
+      "status": "ERROR",
       "task_file": "tasks/PR-186.md",
       "depends_on": [],
       "branch": "pr-186-crash-no-pr",

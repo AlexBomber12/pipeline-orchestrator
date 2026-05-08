@@ -141,7 +141,7 @@ async def escalate_fix_no_push_deadlock(
 
     PR-258 (OBS-BB) replaces the prior HUNG transition with a cancellation
     policy v1 transition: write a ``NO_PUSH_DEADLOCK`` cause to Redis,
-    apply the ``canceled`` label to the PR, mark the task CANCELED for the
+    apply the ``canceled`` label to the PR, mark the task ERROR for the
     next IDLE cycle, and return to IDLE so the daemon picks up the next
     pickable task. Looping retrigger via HUNG/WATCH wastes coder budget
     when the missing artifact is a fix push (not a Codex review), so the

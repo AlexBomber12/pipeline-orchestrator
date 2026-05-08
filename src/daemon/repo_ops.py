@@ -310,13 +310,13 @@ return 0
                 f"and pushed to {branch}."
             )
             # PR-186: Re-uploading a task file is the user's signal to retry
-            # a previously-crashed task. Clear the in-memory CANCELED mark
+            # a previously-crashed task. Clear the in-memory ERROR mark
             # for any uploaded PR-id so the next IDLE cycle picks the task
             # again instead of treating it as still crashed. Also flip the
-            # working-tree ``tasks/QUEUE.md`` row from CANCELED to TODO for
+            # working-tree ``tasks/QUEUE.md`` row from ERROR to TODO for
             # those PR-ids: the next IDLE regenerates the queue from
             # headers, but a daemon restart between this upload and that
-            # regeneration would otherwise see the stale CANCELED row,
+            # regeneration would otherwise see the stale ERROR row,
             # rehydrate ``_crashed_task_pr_ids`` from it, and re-cancel the
             # task — losing the retry signal until the user uploads again.
             uploaded_pr_ids = {
@@ -369,7 +369,7 @@ return 0
         return None
 
     def _clear_canceled_in_snapshot(self, uploaded_pr_ids: set[str]) -> None:
-        """Flip CANCELED → TODO in ``state.current_queue`` for re-uploads.
+        """Flip ERROR → TODO in ``state.current_queue`` for re-uploads.
 
         The user re-uploads a task file to retry a previously-crashed
         task. ``crashed_task_pr_ids`` and ``recovered_task_pr_ids`` are
@@ -382,7 +382,7 @@ return 0
         ``current_queue_snapshot_at``; without that, the
         ``/api/repo/{name}/queue`` ``snapshot_at`` change token would
         stay pinned to the pre-upload time and clients could miss the
-        CANCELED→TODO transition until the next IDLE rebuild.
+        ERROR→TODO transition until the next IDLE rebuild.
         """
         snapshot = self.state.current_queue
         if not snapshot:
@@ -391,7 +391,7 @@ return 0
         for index, queued in enumerate(snapshot):
             if (
                 queued.pr_id in uploaded_pr_ids
-                and queued.status == TaskStatus.CANCELED
+                and queued.status == TaskStatus.ERROR
             ):
                 snapshot[index] = queued.model_copy(
                     update={"status": TaskStatus.TODO}

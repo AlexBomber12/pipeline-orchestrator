@@ -131,7 +131,7 @@ def test_dirty_tree_recovery_composes_with_crashed_task_marker(
     assert runner.state.current_task is None
     assert runner.state.current_pr is None
     assert any(
-        e["event"].startswith("[INFRA] Task PR-100 crashed, marking CANCELED. Manually re-upload to retry.")
+        e["event"].startswith("[INFRA] Task PR-100 crashed, marking ERROR. Manually re-upload to retry.")
         for e in runner.state.history
     )
 
@@ -152,7 +152,7 @@ def test_dirty_tree_recovery_composes_with_crashed_task_marker(
     assert runner._consecutive_dirty_cycles == 0
     assert any(cmd[:2] == ["git", "reset"] and "--hard" in cmd for cmd in reset_commands)
     assert any("Auto-recovered from dirty tree" in e["event"] for e in runner.state.history)
-    assert any("PR-100 crashed, marking CANCELED" in e["event"] for e in runner.state.history)
+    assert any("PR-100 crashed, marking ERROR" in e["event"] for e in runner.state.history)
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +165,7 @@ def test_no_push_escalation_cancels_task_and_returns_to_idle(
 ) -> None:
     """PR-258 (OBS-BB) replaces the prior HUNG transition with a
     cancellation policy v1 transition: write a ``NO_PUSH_DEADLOCK``
-    cause, mark the task CANCELED via ``_recovered_task_pr_ids``, and
+    cause, mark the task ERROR via ``_recovered_task_pr_ids``, and
     return to IDLE so the daemon picks up the next pickable task.
     """
     monkeypatch.setattr(
@@ -332,7 +332,7 @@ def test_select_next_task_from_dag_skips_crashed_task_marked_canceled(
     tmp_path: Path,
 ) -> None:
     """PR-186: After recovery marks a task crashed, the next IDLE cycle's
-    selector must override its derived status to CANCELED so
+    selector must override its derived status to ERROR so
     get_eligible_tasks excludes it. Without the override the same crashed
     task would be re-picked as TODO and dispatched into another doomed
     CODING run on the very next cycle."""
@@ -380,7 +380,7 @@ def test_select_next_task_from_dag_skips_crashed_task_marked_canceled(
     assert task.pr_id == "PR-002"
     assert task.status == TaskStatus.TODO
     assert runner._idle_dag_statuses == {
-        "PR-001": TaskStatus.CANCELED,
+        "PR-001": TaskStatus.ERROR,
         "PR-002": TaskStatus.TODO,
     }
 
@@ -391,7 +391,7 @@ def test_select_next_task_from_dag_preserves_doing_for_crashed_task_with_visible
 ) -> None:
     """Codex P1: a crashed task whose open PR becomes visible on a later
     cycle (e.g. ``get_open_prs`` was stale during recovery) must not be
-    downgraded to CANCELED by the selector. Preserve the DOING ruling so
+    downgraded to ERROR by the selector. Preserve the DOING ruling so
     the runner can resume WATCH/merge for the real PR, and clear the
     crashed flag so subsequent cycles treat the task as live again."""
     h._patch_subprocess(monkeypatch)
@@ -436,7 +436,7 @@ def test_select_next_task_from_dag_cancels_recovered_task_with_visible_pr(
     tmp_path: Path,
 ) -> None:
     """PR-247 follow-up: HUNG recover button records the trapped task in
-    ``_recovered_task_pr_ids`` and the IDLE selector must force CANCELED
+    ``_recovered_task_pr_ids`` and the IDLE selector must force ERROR
     even when the still-open PR derives the task back to DOING. Without
     the unconditional override the next IDLE cycle would reattach the
     runner to WATCH on the same stuck PR — defeating the recover button.
@@ -488,7 +488,7 @@ def test_select_next_task_from_dag_cancels_recovered_task_with_visible_pr(
     assert task.pr_id == "PR-002"
     assert task.status == TaskStatus.TODO
     assert runner._idle_dag_statuses == {
-        "PR-001": TaskStatus.CANCELED,
+        "PR-001": TaskStatus.ERROR,
         "PR-002": TaskStatus.TODO,
     }
     assert "PR-001" in runner._recovered_task_pr_ids
@@ -500,7 +500,7 @@ def test_select_next_task_from_dag_clears_recovered_flag_when_done(
 ) -> None:
     """A recovered task that ends up DONE (e.g. the PR was merged after
     the operator hit recover) must clear the recovered flag so the task
-    is not perpetually marked CANCELED in the regenerated QUEUE.md."""
+    is not perpetually marked ERROR in the regenerated QUEUE.md."""
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         idle_module.IdleMixin,
@@ -541,7 +541,7 @@ def test_select_next_task_from_dag_clears_crashed_flag_when_done(
 ) -> None:
     """A crashed task that ends up DONE (e.g. a stale merge surfaced after
     recovery) must clear the crashed flag so the task is not perpetually
-    marked CANCELED in regenerated QUEUE.md, and DONE remains terminal."""
+    marked ERROR in regenerated QUEUE.md, and DONE remains terminal."""
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         idle_module.IdleMixin,
@@ -584,7 +584,7 @@ def test_recover_state_hydrates_recovered_task_pr_ids_from_redis(
     operator-recovery marker is purely process-local and a daemon
     restart between the recover click and the user's task re-upload
     would lose the marker; ``recover_state`` would rehydrate the
-    QUEUE.md ``CANCELED`` row into ``_crashed_task_pr_ids`` instead,
+    QUEUE.md ``ERROR`` row into ``_crashed_task_pr_ids`` instead,
     and the IDLE selector would discard the stricter override on the
     still-open PR re-deriving DOING — reattaching the runner to WATCH
     on the same stuck PR. Hydrating from Redis preserves the
@@ -664,11 +664,11 @@ def test_recover_state_doing_task_in_recovered_set_stays_idle(
     """PR-247 follow-up: a DOING entry in QUEUE.md whose PR-ID is in the
     persisted operator-recovered set must NOT be re-attached to WATCH
     even when a matching open PR is visible. The IDLE cycle that would
-    have rewritten the row to CANCELED never ran (or its snapshot was
+    have rewritten the row to ERROR never ran (or its snapshot was
     not yet visible), so the row still reads DOING. Without this
     bypass, ``recover_state`` would dutifully reattach the runner to
     WATCH on the stuck PR — defeating the recover button across
-    restarts. The IDLE selector's stricter override surfaces CANCELED
+    restarts. The IDLE selector's stricter override surfaces ERROR
     on the next cycle."""
     import json
 

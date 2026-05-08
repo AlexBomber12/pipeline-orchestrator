@@ -202,7 +202,7 @@ def test_recovery_clears_task_on_no_pr_after_crash(
     assert runner.state.error_message is None
     assert runner.state.state == PipelineState.IDLE
     assert "PR-200" in runner._crashed_task_pr_ids
-    assert any("Task PR-200 crashed, marking CANCELED" in e["event"] for e in runner.state.history)
+    assert any("Task PR-200 crashed, marking ERROR" in e["event"] for e in runner.state.history)
 
 
 def test_recovery_clears_task_at_idle_resolution(

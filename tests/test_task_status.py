@@ -85,12 +85,9 @@ def test_derive_done_when_pr_id_is_in_merged_history() -> None:
     assert status == TaskStatus.DONE
 
 
-@pytest.mark.parametrize("frontmatter_status", ["merged", "done"])
-def test_derive_task_status_terminal_done_frontmatter_returns_done(
-    frontmatter_status: str,
-) -> None:
+def test_derive_task_status_done_frontmatter() -> None:
     status = derive_task_status(
-        _header("pr-085-status-from-git", frontmatter_status=frontmatter_status),
+        _header("pr-085-status-from-git", frontmatter_status="done"),
         _merged_state(),
         [],
     )
@@ -98,22 +95,9 @@ def test_derive_task_status_terminal_done_frontmatter_returns_done(
     assert status == TaskStatus.DONE
 
 
-def test_derive_task_status_in_progress_frontmatter_returns_doing() -> None:
+def test_derive_task_status_error_frontmatter() -> None:
     status = derive_task_status(
-        _header("pr-085-status-from-git", frontmatter_status="in_progress"),
-        _merged_state(),
-        [],
-    )
-
-    assert status == TaskStatus.DOING
-
-
-@pytest.mark.parametrize("frontmatter_status", ["blocked", "canceled", "error"])
-def test_derive_task_status_stopped_frontmatter_returns_canceled(
-    frontmatter_status: str,
-) -> None:
-    status = derive_task_status(
-        _header("pr-085-status-from-git", frontmatter_status=frontmatter_status),
+        _header("pr-085-status-from-git", frontmatter_status="error"),
         _merged_state(),
         [
             PRInfo(
@@ -124,20 +108,27 @@ def test_derive_task_status_stopped_frontmatter_returns_canceled(
         ],
     )
 
-    assert status == TaskStatus.CANCELED
+    assert status == TaskStatus.ERROR
 
 
-@pytest.mark.parametrize("frontmatter_status", ["queued", "todo"])
-def test_derive_task_status_todo_frontmatter_returns_todo(
-    frontmatter_status: str,
-) -> None:
+def test_derive_task_status_todo_frontmatter() -> None:
     status = derive_task_status(
-        _header("pr-085-status-from-git", frontmatter_status=frontmatter_status),
+        _header("pr-085-status-from-git", frontmatter_status="todo"),
         _merged_state({"PR-085"}),
         [],
     )
 
     assert status == TaskStatus.TODO
+
+
+def test_derive_task_status_legacy_value_no_longer_recognized() -> None:
+    status = derive_task_status(
+        _header("pr-085-status-from-git", frontmatter_status="queued"),
+        _merged_state({"PR-085"}),
+        [],
+    )
+
+    assert status == TaskStatus.DONE
 
 
 def test_derive_task_status_no_frontmatter_uses_existing_logic() -> None:

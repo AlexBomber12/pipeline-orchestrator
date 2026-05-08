@@ -1,8 +1,10 @@
-"""Migrate legacy Redis ``HUNG`` states after Phase 2 removal.
+"""Migrate legacy Redis states after Phase 2 removals.
 
 PR-276/PR-277 removed ``PipelineState.HUNG`` from the runtime model. This
 startup migration rewrites any already-persisted Redis payloads before the
-daemon validates them through the current enum.
+daemon validates them through the current enum. PR-280 also removed
+``TaskStatus.CANCELED``; persisted queue/task statuses are rewritten to
+``ERROR`` during the same startup scan.
 """
 
 from __future__ import annotations
@@ -63,6 +65,24 @@ def _info(log: Any, message: str) -> None:
         log(message)
 
 
+def _rewrite_legacy_task_statuses(value: Any) -> bool:
+    if isinstance(value, dict):
+        changed = False
+        if value.get("status") == "CANCELED":
+            value["status"] = "ERROR"
+            changed = True
+        nested_changed = False
+        for item in value.values():
+            nested_changed = _rewrite_legacy_task_statuses(item) or nested_changed
+        return nested_changed or changed
+    if isinstance(value, list):
+        changed = False
+        for item in value:
+            changed = _rewrite_legacy_task_statuses(item) or changed
+        return changed
+    return False
+
+
 async def migrate_hung_to_idle_on_startup(redis_client: Any, log: Any) -> int:
     """Rewrite legacy Redis ``state=HUNG`` payloads to ``state=IDLE``.
 
@@ -80,10 +100,21 @@ async def migrate_hung_to_idle_on_startup(redis_client: Any, log: Any) -> int:
             _warn(log, f"[MIGRATION] Skipping malformed pipeline:* key {key}")
             continue
 
-        if not isinstance(payload, dict) or payload.get("state") != "HUNG":
+        if not isinstance(payload, dict):
             continue
 
         repo_slug = _key_to_repo_slug(key)
+        status_migrated = _rewrite_legacy_task_statuses(payload)
+        if payload.get("state") != "HUNG":
+            if status_migrated:
+                await _maybe_await(redis_client.set(key, json.dumps(payload)))
+                migrated += 1
+                _info(
+                    log,
+                    f"[MIGRATION] CANCELED→ERROR task statuses for {repo_slug}",
+                )
+            continue
+
         task_id = _extract_task_id(payload.get("current_task"))
         payload["state"] = "IDLE"
         await _maybe_await(redis_client.set(key, json.dumps(payload)))

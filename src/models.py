@@ -24,7 +24,7 @@ class TaskStatus(str, Enum):
     TODO = "TODO"
     DOING = "DOING"
     DONE = "DONE"
-    CANCELED = "CANCELED"
+    ERROR = "ERROR"
 
 
 class ReviewStatus(str, Enum):

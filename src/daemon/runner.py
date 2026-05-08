@@ -290,12 +290,12 @@ class PipelineRunner(
         self._current_coder_process: asyncio.subprocess.Process | None = None
         self._stop_requested = False
         self._user_stopped_task_pr_ids: set[str] = set()
-        # PR-186: Tasks marked CANCELED by recovery after a crash. The next
-        # IDLE cycle treats these as CANCELED and skips them so the same
+        # PR-186: Tasks marked ERROR by recovery after a crash. The next
+        # IDLE cycle treats these as ERROR and skips them so the same
         # task is not re-picked into a crash loop. Cleared when the user
         # re-uploads the task file.
         self._crashed_task_pr_ids: set[str] = set()
-        # PR-247 follow-up: Tasks the operator explicitly canceled via the
+        # PR-247 follow-up: Tasks the operator explicitly error via the
         # HUNG recover button. Distinct from ``_crashed_task_pr_ids``
         # because this set must NOT be discarded when the task derives
         # back to ``DOING`` from a still-open PR — that PR is the stuck
@@ -1331,7 +1331,7 @@ class PipelineRunner(
         the trapped task until the user re-uploads the task file." A
         daemon restart between the recover click and the re-upload
         would otherwise lose the in-memory marker; ``recover_state``
-        would then read the CANCELED row from QUEUE.md, rehydrate it
+        would then read the ERROR row from QUEUE.md, rehydrate it
         into ``_crashed_task_pr_ids`` (whose IDLE-selector override
         intentionally discards on a still-open PR re-deriving DOING),
         and reattach the runner to WATCH on the same stuck PR. Storing

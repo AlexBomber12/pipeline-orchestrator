@@ -7,7 +7,7 @@
     {
       "pr_id": "PR-220",
       "title": "Unpushed crash work",
-      "status": "CANCELED",
+      "status": "ERROR",
       "task_file": "tasks/PR-220.md",
       "depends_on": [],
       "branch": "pr-220-unpushed",

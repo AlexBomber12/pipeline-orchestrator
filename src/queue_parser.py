@@ -36,17 +36,7 @@ _FRONTMATTER_STATUS_RE = re.compile(r"^status:\s*(.+?)\s*$")
 _STATUS_LINE_RE = re.compile(
     r"^(-\s*status\s*:\s*)(\S*)(.*)$", re.IGNORECASE
 )
-_FRONTMATTER_STATUS_VALUES = {
-    "todo",
-    "done",
-    "error",
-    "queued",
-    "in_progress",
-    "in_review",
-    "merged",
-    "blocked",
-    "canceled",
-}
+_FRONTMATTER_STATUS_VALUES = {"todo", "done", "error"}
 _WRITER_STATUS_VALUES = {"TODO", "DONE", "ERROR"}
 _TASK_TYPE_VALUES = {
     "architecture",
@@ -396,7 +386,7 @@ def parse_task_header(path: str | Path) -> TaskHeader:
     ):
         issues.append(
             f"{task_path}: invalid frontmatter status {frontmatter_status!r}; "
-            f"expected one of {sorted(_FRONTMATTER_STATUS_VALUES)}"
+            "expected one of ['done', 'error', 'todo']"
         )
 
     if issues:

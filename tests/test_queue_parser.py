@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from src.models import TaskStatus
 from src.queue_parser import (
+    _FRONTMATTER_STATUS_VALUES,
     QueueValidationError,
     TaskHeader,
     get_next_task,
@@ -143,8 +144,12 @@ Branch: pr-084-task-header-parser
     )
 
 
-def test_parse_task_header_with_merged_frontmatter(tmp_path: Path) -> None:
-    header = parse_task_header(_write_task_file(tmp_path, _frontmatter_task("merged")))
+def test_frontmatter_status_values_set_has_3_canonical() -> None:
+    assert _FRONTMATTER_STATUS_VALUES == {"todo", "done", "error"}
+
+
+def test_parse_task_header_with_done_frontmatter(tmp_path: Path) -> None:
+    header = parse_task_header(_write_task_file(tmp_path, _frontmatter_task("done")))
 
     assert header == TaskHeader(
         pr_id="PR-100",
@@ -155,49 +160,65 @@ def test_parse_task_header_with_merged_frontmatter(tmp_path: Path) -> None:
         depends_on=[],
         priority=2,
         coder="codex",
-        frontmatter_status="merged",
+        frontmatter_status="done",
     )
 
 
-def test_parse_task_header_with_in_progress_frontmatter(tmp_path: Path) -> None:
-    header = parse_task_header(
-        _write_task_file(tmp_path, _frontmatter_task("in_progress"))
-    )
+def test_parser_accepts_uppercase_TODO(tmp_path: Path) -> None:
+    header = parse_task_header(_write_task_file(tmp_path, _frontmatter_task("TODO")))
 
-    assert header.frontmatter_status == "in_progress"
+    assert header.frontmatter_status == "todo"
 
 
-@pytest.mark.parametrize("status", ['"merged"', "'merged'"])
+def test_parser_accepts_lowercase_todo(tmp_path: Path) -> None:
+    header = parse_task_header(_write_task_file(tmp_path, _frontmatter_task("todo")))
+
+    assert header.frontmatter_status == "todo"
+
+
+@pytest.mark.parametrize("status", ['"done"', "'done'"])
 def test_parse_task_header_with_quoted_frontmatter_status(
     tmp_path: Path,
     status: str,
 ) -> None:
     header = parse_task_header(_write_task_file(tmp_path, _frontmatter_task(status)))
 
-    assert header.frontmatter_status == "merged"
+    assert header.frontmatter_status == "done"
 
 
-@pytest.mark.parametrize("status", ["merged # reviewer override", '"merged" # note'])
+@pytest.mark.parametrize("status", ["done # reviewer override", '"done" # note'])
 def test_parse_task_header_with_commented_frontmatter_status(
     tmp_path: Path,
     status: str,
 ) -> None:
     header = parse_task_header(_write_task_file(tmp_path, _frontmatter_task(status)))
 
-    assert header.frontmatter_status == "merged"
+    assert header.frontmatter_status == "done"
 
 
 def test_parse_task_header_with_long_frontmatter(tmp_path: Path) -> None:
     long_frontmatter = (
         "---\n"
         + "\n".join(f"metadata_{index}: value" for index in range(25))
-        + "\nstatus: merged\n---\n"
+        + "\nstatus: done\n---\n"
     )
     header = parse_task_header(
         _write_task_file(tmp_path, long_frontmatter + _frontmatter_task())
     )
 
-    assert header.frontmatter_status == "merged"
+    assert header.frontmatter_status == "done"
+
+
+@pytest.mark.parametrize("status", ["queued", "canceled"])
+def test_parser_rejects_legacy_frontmatter_tokens(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    with pytest.raises(
+        QueueValidationError,
+        match=r"expected one of \['done', 'error', 'todo'\]",
+    ):
+        parse_task_header(_write_task_file(tmp_path, _frontmatter_task(status)))
 
 
 def test_parse_task_header_without_frontmatter(tmp_path: Path) -> None:

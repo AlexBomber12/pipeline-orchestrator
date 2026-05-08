@@ -78,6 +78,10 @@ class RecoveryMixin:
         if not headers:
             return None
 
+        for header in headers:
+            if header.frontmatter_status == "error":
+                self._crashed_task_pr_ids.add(header.pr_id)
+
         merged_state = _resolve_merged_state(
             self.repo_path,
             self.repo_config.branch,
@@ -113,12 +117,12 @@ class RecoveryMixin:
                 current_task_pr_id=current_task_pr_id,
             )
             if header.pr_id in recovered_task_pr_ids and status != TaskStatus.DONE:
-                status = TaskStatus.CANCELED
+                status = TaskStatus.ERROR
             if (
                 header.pr_id in crashed_task_pr_ids
-                and status in (TaskStatus.TODO, TaskStatus.CANCELED)
+                and status in (TaskStatus.TODO, TaskStatus.ERROR)
             ):
-                status = TaskStatus.CANCELED
+                status = TaskStatus.ERROR
             tasks.append(
                 QueueTask(
                     pr_id=header.pr_id,
@@ -168,7 +172,7 @@ class RecoveryMixin:
         1. If a DOING task is present:
            - Matching open PR on that branch -> WATCH (runner resumes
              polling the existing PR).
-           - No matching PR -> mark crashed/CANCELED and stay IDLE.
+           - No matching PR -> mark crashed/ERROR and stay IDLE.
         2. If no DOING task but an open PR whose branch matches a DONE
            task exists -> WATCH (task marked DONE locally but PR not yet
            merged). Unrelated open PRs are ignored.
@@ -246,7 +250,7 @@ class RecoveryMixin:
         since been closed externally: ``derive_task_status`` would fall
         through to the ``current_task_pr_id`` branch, return ``DOING``,
         and ``_apply_recovery_decisions`` would mark the task
-        ``CANCELED`` and force manual re-upload.
+        ``ERROR`` and force manual re-upload.
 
         Best-effort: Redis read errors, missing snapshots, and corrupt
         payloads all leave ``state.current_task`` untouched. This is
@@ -306,7 +310,7 @@ class RecoveryMixin:
         # the previously DOING task as ``TODO``; ``_apply_recovery_
         # decisions`` only runs the PR-186 crash path on a DOING entry,
         # so the task would be silently re-dispatched into a crash loop
-        # instead of being marked CANCELED pending manual re-upload.
+        # instead of being marked ERROR pending manual re-upload.
         # Run after the ``get_open_prs`` probe so a transient GitHub
         # outage during recovery still surfaces as ERROR with no
         # current_task.
@@ -368,18 +372,18 @@ class RecoveryMixin:
             len(tasks),
         )
 
-        # PR-186 Codex P1: rehydrate the crashed-task set from any CANCELED
+        # PR-186 Codex P1: rehydrate the crashed-task set from any ERROR
         # entries in the parsed queue. The crashed-task cancellation is what
         # tells ``_select_next_task_from_dag`` to skip the task on the next
         # IDLE cycle; without this rehydrate, a daemon restart after one
-        # IDLE cycle has already written CANCELED to QUEUE.md would start
+        # IDLE cycle has already written ERROR to QUEUE.md would start
         # with an empty set, ``recover_state`` would see no DOING entry to
         # re-mark, and the selector would recompute the task as TODO and
         # dispatch it again — defeating the "manual re-upload required"
         # contract and reintroducing the crash loop. The set is cleared
         # only when the user re-uploads the task file (see ``repo_ops``).
         for queued in tasks:
-            if queued.status == TaskStatus.CANCELED:
+            if queued.status == TaskStatus.ERROR:
                 self._crashed_task_pr_ids.add(queued.pr_id)
 
         doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
@@ -410,12 +414,12 @@ class RecoveryMixin:
         # PR-247 follow-up: a DOING entry whose PR-ID is in the operator-
         # recovered set is one the operator already abandoned via the
         # HUNG recover button. The IDLE cycle that would have rewritten
-        # the QUEUE.md row to CANCELED never ran (or its snapshot was
+        # the QUEUE.md row to ERROR never ran (or its snapshot was
         # not yet visible), so the row still reads DOING. Treat it the
         # same as no DOING entry — staying IDLE — so neither the WATCH
         # re-attach nor the PR-186 crashed-task path runs against the
         # abandoned task. The IDLE selector's stricter override will
-        # surface CANCELED on the next cycle.
+        # surface ERROR on the next cycle.
         if doing is not None and doing.pr_id in self._recovered_task_pr_ids:
             ctx = BranchContext.from_runner(self)
             self.log_event(
@@ -491,7 +495,7 @@ class RecoveryMixin:
             # crash signature (subprocess kill, OOM, daemon restart mid-
             # CODING). Re-running CODING here used to loop the same crash
             # forever; instead preserve any unpushed commits on origin so
-            # the work is not lost, then mark the task crashed/CANCELED so
+            # the work is not lost, then mark the task crashed/ERROR so
             # the next IDLE cycle skips it. The user re-uploads the task
             # file to retry.
             if doing.branch and not self._preserve_crashed_run_commits(
@@ -501,7 +505,7 @@ class RecoveryMixin:
                     (
                         f"recover_state: could not preserve crashed-run "
                         f"commits on {doing.branch!r}; refusing to mark "
-                        "CANCELED"
+                        "ERROR"
                     ),
                     save_run_record_as=None,
                     publish=False,
@@ -522,13 +526,13 @@ class RecoveryMixin:
             # the next poll.
             for i, t in enumerate(tasks):
                 if t.pr_id == doing.pr_id and t.status == TaskStatus.DOING:
-                    tasks[i] = t.model_copy(update={"status": TaskStatus.CANCELED})
+                    tasks[i] = t.model_copy(update={"status": TaskStatus.ERROR})
                     break
             self.state.current_task = None
             self._reset_runner_local_task_counters()
             self.state.state = PipelineState.IDLE
             self.log_event(
-                f"[INFRA] Task {doing.pr_id} crashed, marking CANCELED. "
+                f"[INFRA] Task {doing.pr_id} crashed, marking ERROR. "
                 f"Manually re-upload to retry. "
                 f"({ctx.log_summary()})"
             )

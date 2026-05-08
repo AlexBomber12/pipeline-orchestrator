@@ -131,6 +131,52 @@ async def test_migrate_one_hung_repo_rewrites_state() -> None:
     assert cause.payload["migration_note"]
 
 
+async def test_migrate_rewrites_legacy_canceled_task_statuses() -> None:
+    redis = _FakeRedis(
+        {
+            "pipeline:test_repo": json.dumps(
+                {
+                    "state": "IDLE",
+                    "current_task": {
+                        "pr_id": "PR-100",
+                        "title": "legacy canceled task",
+                        "status": "CANCELED",
+                    },
+                    "current_queue": [
+                        {
+                            "pr_id": "PR-100",
+                            "title": "legacy canceled task",
+                            "status": "CANCELED",
+                        },
+                        {
+                            "pr_id": "PR-101",
+                            "title": "active task",
+                            "status": "TODO",
+                        },
+                    ],
+                }
+            )
+        }
+    )
+
+    count = await migrate_hung_to_idle_on_startup(redis, logging.getLogger(__name__))
+    payload = json.loads(redis.values["pipeline:test_repo"])
+
+    assert count == 1
+    assert payload["current_task"]["status"] == "ERROR"
+    assert payload["current_queue"][0]["status"] == "ERROR"
+    assert payload["current_queue"][1]["status"] == "TODO"
+
+
+async def test_migrate_skips_non_object_pipeline_payload() -> None:
+    redis = _FakeRedis({"pipeline:test_repo": json.dumps(["not", "repo", "state"])})
+
+    count = await migrate_hung_to_idle_on_startup(redis, logging.getLogger(__name__))
+
+    assert count == 0
+    assert redis.set_calls == []
+
+
 async def test_migrate_hung_repo_no_current_task() -> None:
     redis = _FakeRedis({"pipeline:test_repo": _state("HUNG", None)})
 

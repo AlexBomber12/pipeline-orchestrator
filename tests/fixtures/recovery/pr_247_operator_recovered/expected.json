@@ -7,7 +7,7 @@
     {
       "pr_id": "PR-247",
       "title": "Operator recovered",
-      "status": "CANCELED",
+      "status": "ERROR",
       "task_file": "tasks/PR-247.md",
       "depends_on": [],
       "branch": "pr-247-operator-recovered",
