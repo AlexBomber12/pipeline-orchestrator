@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 
 from src import claude_cli, codex_cli
 from src.analytics import log_merged_pr
@@ -23,6 +24,7 @@ from src.github import cache as gh_cache
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.models import PipelineState, TaskStatus
+from src.queue_parser import write_frontmatter_status
 from src.retry import retry_transient
 
 # Upper bound on how long an open queue-sync remediation PR may sit
@@ -233,6 +235,24 @@ class MergeMixin:
                 log_message=str(exc),
             )
             return
+
+        current_task = self.state.current_task
+        if current_task is not None and current_task.task_file:
+            try:
+                write_frontmatter_status(
+                    Path(self.repo_path) / current_task.task_file,
+                    "DONE",
+                )
+                await self._commit_task_status_change(
+                    current_task,
+                    "DONE",
+                    "PR merged",
+                )
+            except Exception as exc:
+                self.log_event(
+                    f"[ERROR] Failed to write status:DONE to "
+                    f"{current_task.task_file}: {exc}"
+                )
 
         self._mark_task_done_in_snapshot()
 

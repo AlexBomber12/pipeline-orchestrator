@@ -5,7 +5,11 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
+
+from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap
 
 from src.models import QueueTask, TaskStatus
 
@@ -43,6 +47,7 @@ _FRONTMATTER_STATUS_VALUES = {
     "blocked",
     "canceled",
 }
+_WRITER_STATUS_VALUES = {"TODO", "DONE", "ERROR"}
 _TASK_TYPE_VALUES = {
     "architecture",
     "bugfix",
@@ -84,6 +89,56 @@ def _normalize_frontmatter_status(value: str) -> str:
     if len(status) >= 2 and status[0] == status[-1] and status[0] in {"'", '"'}:
         return status[1:-1]
     return status
+
+
+def write_frontmatter_status(task_path: Path, status: str) -> None:
+    """Write canonical task frontmatter status while preserving body text."""
+    if status not in _WRITER_STATUS_VALUES:
+        raise ValueError(f"unknown frontmatter status {status!r}")
+
+    text = task_path.read_text(encoding="utf-8")
+    yaml = YAML()
+    yaml.preserve_quotes = True
+
+    if not text.startswith("---\n"):
+        task_path.write_text(
+            f"---\nstatus: {status}\n---\n\n{text}",
+            encoding="utf-8",
+        )
+        return
+
+    lines = text.splitlines(keepends=True)
+    closing_index = next(
+        (
+            index
+            for index, line in enumerate(lines[1:], start=1)
+            if line.strip() == "---"
+        ),
+        None,
+    )
+    if closing_index is None:
+        task_path.write_text(
+            f"---\nstatus: {status}\n---\n\n{text}",
+            encoding="utf-8",
+        )
+        return
+
+    frontmatter = "".join(lines[1:closing_index])
+    body = "".join(lines[closing_index + 1 :])
+    data = yaml.load(frontmatter) if frontmatter.strip() else None
+    if not isinstance(data, CommentedMap):
+        data = CommentedMap()
+    if "status" in data:
+        data["status"] = status
+    else:
+        data.insert(len(data), "status", status)
+
+    stream = StringIO()
+    yaml.dump(data, stream)
+    task_path.write_text(
+        f"---\n{stream.getvalue()}---\n{body}",
+        encoding="utf-8",
+    )
 
 
 @dataclass(frozen=True)
