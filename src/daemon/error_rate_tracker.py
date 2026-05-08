@@ -41,11 +41,6 @@ async def record(
     await redis_client.zadd(key(repo_slug), {member: score})
 
 
-async def discard(redis_client: Any, repo_slug: str, member_id: str) -> int:
-    """Remove a previously-recorded ERROR-rate event by member id."""
-    return int(await redis_client.zrem(key(repo_slug), member_id))
-
-
 async def prune(
     redis_client: Any,
     repo_slug: str,

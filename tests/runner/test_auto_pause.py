@@ -123,10 +123,14 @@ async def test_no_auto_pause_when_disabled(
     runner.redis.store["operator_override"] = "AVAILABLE"
     now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
     await _record_errors(runner, 5, now=now)
+    await error_rate_tracker.record(
+        runner.redis, runner.name, now - timedelta(minutes=90)
+    )
     monkeypatch.setattr(error_rate_tracker, "_timestamp", lambda ts=None: now.timestamp())
 
     assert await runner._maybe_auto_pause_for_error_rate() is False
     assert runner.state.state is PipelineState.IDLE
+    assert len(runner.redis.zsets[error_rate_tracker.key(runner.name)]) == 5
 
 
 @pytest.mark.asyncio

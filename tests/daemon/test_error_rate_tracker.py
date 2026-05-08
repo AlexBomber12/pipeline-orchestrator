@@ -111,15 +111,6 @@ async def test_record_with_member_id_counts_each_event() -> None:
 
 
 @pytest.mark.asyncio
-async def test_discard_removes_exact_member_id() -> None:
-    redis = _FakeRedis()
-    await redis.zadd(error_rate_tracker.key("octo__demo"), {"event-1": 1.0})
-
-    assert await error_rate_tracker.discard(redis, "octo__demo", "event-1") == 1
-    assert redis.zsets[error_rate_tracker.key("octo__demo")] == {}
-
-
-@pytest.mark.asyncio
 async def test_last_auto_pause_marker_requires_newer_records() -> None:
     redis = _FakeRedis()
     now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)

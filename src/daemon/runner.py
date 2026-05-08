@@ -476,8 +476,6 @@ class PipelineRunner(
         so Resume remains the only way forward.
         """
         cfg = self.app_config.daemon
-        if not cfg.error_rate_auto_pause_enabled:
-            return False
         try:
             count = await error_rate_tracker.count_recent(
                 self.redis,
@@ -490,6 +488,8 @@ class PipelineRunner(
                 self.name,
                 exc,
             )
+            return False
+        if not cfg.error_rate_auto_pause_enabled:
             return False
         try:
             availability = await is_operator_available(self._availability_sources())
